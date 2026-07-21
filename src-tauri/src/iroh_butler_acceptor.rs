@@ -833,10 +833,23 @@ pub async fn handle_deposit_core(
                 // end-to-end to a grantee device's X25519 key — see
                 // `butler_cannot_open_grant_push`); the recipient decodes +
                 // fans it out on recover via `file_sharing::ingest_grant_push`.
-                // The admission gate (steps 1-3) already authorized the sender
-                // as a friend / live-group co-member, which is the authority to
-                // deposit a grant — no further inner-packet verification is
-                // possible or needed (the butler cannot open the seals).
+                // ZEB-674 converge (Qodo, security): file-share grants are
+                // FRIEND-scoped by design — the send side (`grant_read_impl` /
+                // `build_grant_push`) only deposits to ACTIVE friends, and the
+                // recipient persists into the friend-scoped `received_file_grants`
+                // CRDT on recover. A live group-DM co-member is admitted for
+                // message/invite deposits above, but — exactly like the
+                // revocation branch — is NOT authorized to inject a grant into
+                // another owner's friend-scoped received-grants set. Gate on
+                // Friend admission; reject any other scope fail-closed.
+                if !matches!(admission, Admission::Friend(_)) {
+                    return Err(DepositReject::NotAuthorizedForScope);
+                }
+                // The admission gate authenticated the depositing friend
+                // (`frame.sender_owner`); the grant blobs are sealed end-to-end
+                // to the grantee's device X25519 keys, so no further inner-packet
+                // verification is possible or needed (the butler cannot open the
+                // seals — see `butler_cannot_open_grant_push`).
                 //
                 // The grant is the SOLE payload: reject a non-empty storage_blob
                 // or a stray invite fail-closed (mirrors the invite-only /
@@ -3029,6 +3042,33 @@ mod tests {
             .await
             .expect_err("oversized grant_push must be rejected");
         assert_eq!(err, DepositReject::BadPayload);
+        assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
+    }
+
+    /// ZEB-674 converge (Qodo, security): a grant-only deposit from a live
+    /// group-DM CO-MEMBER who is NOT a friend is rejected
+    /// `NotAuthorizedForScope`, nothing persisted. File-share grants are
+    /// friend-scoped — the send side only deposits to active friends and the
+    /// recipient persists into the friend-scoped `received_file_grants` — so a
+    /// mere co-member (admitted for message/invite deposits) must not be able to
+    /// inject a grant into another owner's received-grants set. Mirrors the
+    /// revocation branch's Friend-only guard.
+    #[tokio::test]
+    async fn handle_deposit_core_rejects_grant_from_co_member() {
+        let f = grant_fixture(b"opaque-per-device-sealed-grant".to_vec(), Vec::new(), None);
+        let mut ctx = TestCtx::for_fixture(&f);
+        // NOT a friend, but a live group-DM co-member of the deposit's own space,
+        // so admission SUCCEEDS via the co-member fallback — the rejection is
+        // purely the grant scope guard, not a failed admission.
+        ctx.friends.clear();
+        ctx.group_co_members.insert(f.sender_owner);
+        ctx.group_co_member_spaces
+            .insert((f.space_id.0, f.sender_owner));
+
+        let err = handle_deposit_core(&f.frame, &ctx)
+            .await
+            .expect_err("a grant deposit from a non-friend co-member must be rejected");
+        assert_eq!(err, DepositReject::NotAuthorizedForScope);
         assert!(ctx.store.lock().unwrap().is_empty(), "nothing persisted");
     }
 

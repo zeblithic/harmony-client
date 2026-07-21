@@ -3007,13 +3007,19 @@
   let fileGrantsReq = 0;
 
   async function refreshFileGrants(cid: string): Promise<void> {
+    // Bind to the selected file, not just the request token: a grant/revoke
+    // action's follow-up refresh for file A can land AFTER switching to B and,
+    // because it increments fileGrantsReq last, would otherwise "win" and paint
+    // A's grantees onto B (and a subsequent revoke could then act on B using A's
+    // displayed row). Guard on selectedFileCid at entry AND before every commit.
+    if (selectedFileCid !== cid) return;
     const req = ++fileGrantsReq;
     try {
       const grants = await fileManagerService.listGrants(cid);
-      if (req !== fileGrantsReq) return; // stale — a newer file/request owns the state
+      if (req !== fileGrantsReq || selectedFileCid !== cid) return; // stale — a newer file/request owns the state
       fileGrants = grants;
     } catch (err) {
-      if (req !== fileGrantsReq) return;
+      if (req !== fileGrantsReq || selectedFileCid !== cid) return;
       console.error('listGrants failed:', err);
       // A failed query is still "resolved" — [] renders the honest
       // fallback empty state rather than leaving the panel stuck hidden.

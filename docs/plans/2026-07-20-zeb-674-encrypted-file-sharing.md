@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- **Gates (CI parity, run from `src-tauri/`):** `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run --locked --workspace --all-targets --features test-fixtures`. Frontend (repo root): `npx tsc --noEmit`; `npx vitest run`. Iterative dev may use `scripts/test-select --context task`; **final pre-PR sweep uses the full commands.**
+- **Gates (CI parity, run from `src-tauri/`):** `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run --locked --workspace --all-targets --features test-fixtures`. Frontend (repo root): `npx tsc --noEmit`; `npx vitest run`. Iterative dev may use `scripts/test-select --context task`; **final pre-PR sweep uses the full commands.** When `scripts/test-select` is used, **paste its printed `round=… bucket=…` summary line into the task report** so the selective run is auditable/reproducible (e.g. `round=3 bucket=1/4 always-run=12 partition=…`).
 - **Tauri IPC naming:** Rust params `snake_case`; JS callers `camelCase` (auto-converted at the boundary). Wrong case → `undefined`.
 - **Tauri IPC error extraction (JS):** `const msg = e instanceof Error ? e.message : String(e)`.
 - **Keychain isolation in tests:** never construct `KeychainStore::new()` in test-reachable code; inject `keychain: None` via the `*_inner` seams; set `HARMONY_PASSPHRASE` in tests touching identity persistence.

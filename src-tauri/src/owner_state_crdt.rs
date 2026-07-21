@@ -136,14 +136,17 @@ pub struct OwnerState {
     /// DEK blob + display metadata.
     ///
     /// Replicates across the owner's own bound devices via Flow A. Merge is a
-    /// GROW-ONLY union, first-writer-wins per CID (see
-    /// `owner_state_sync::merge_remote_into_local`), like `file_deks` and NOT the
-    /// `file_grants` set-union: a received grant per CID is stable in the MVP (one
-    /// grant record per shared CID; a re-share overwrites nothing observable —
-    /// the sealed blob for a given CID unseals to the one DEK that decrypts that
-    /// CID's ciphertext, so which device's copy survives is immaterial). Absent on
-    /// the wire when empty (`skip_serializing_if` + `default`) so pre-ZEB-674
-    /// snapshots load empty.
+    /// GROW-ONLY union with a DETERMINISTIC tie-break per CID (see
+    /// `owner_state_sync::merge_remote_into_local`) — NOT the plain
+    /// first-writer-wins `or_insert` used for `file_deks`. Sibling devices each
+    /// ingest the same grant independently and reseal the DEK with a fresh nonce
+    /// (plus a wall-clock `received_at`), so their `ReceivedFileGrant` BYTES for
+    /// a CID differ even though both unseal to the same DEK; a first-writer-wins
+    /// `or_insert` would be non-commutative and leave the devices' state roots
+    /// permanently divergent. The tie-break keeps the record with the smaller
+    /// `sealed_dek` (then smaller `received_at`), so every device converges on
+    /// the SAME bytes. Absent on the wire when empty (`skip_serializing_if` +
+    /// `default`) so pre-ZEB-674 snapshots load empty.
     #[serde(rename = "rg", skip_serializing_if = "BTreeMap::is_empty", default)]
     pub received_file_grants: BTreeMap<[u8; 32], ReceivedFileGrant>,
 }

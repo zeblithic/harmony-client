@@ -20072,6 +20072,75 @@ pub async fn ingest_content_encrypted_inner(
         .map_err(|e| e.to_string())
 }
 
+/// ZEB-674 converge (Qodo, reliability): cap on the encrypted-upload size.
+/// Whole-blob DEK encryption is NOT streaming — `ingest_content_encrypted` must
+/// hold the whole plaintext (and then its ciphertext) in memory at once, unlike
+/// the non-encrypted `ingest_file_at_path`, which streams through the chunker
+/// with bounded memory (ZEB-161). Without a cap a huge encrypted upload could
+/// OOM the app, and this path is UI-reachable via the "Encrypt (private)"
+/// toggle. This is an MVP guard; lifting it via streaming (chunked-AEAD)
+/// encryption is a tracked follow-up (see the ZEB-674 design's deferrals).
+const MAX_ENCRYPTED_INGEST_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Read a file fully into memory, BOUNDED: read at most `cap` bytes and return
+/// `Err` if the file is larger. `Take` caps the allocation regardless of the
+/// on-disk size (so a huge file can't OOM), and reading rather than trusting
+/// `metadata().len()` closes the stat→read TOCTOU. Used by the non-streaming
+/// encrypted-ingest path ([`MAX_ENCRYPTED_INGEST_BYTES`]).
+async fn read_file_capped(path: &std::path::Path, cap: u64) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("open failed: {e}"))?;
+    let mut buf = Vec::new();
+    // Read at most cap+1 bytes: if the reader yields more than cap, it's over.
+    let read = file
+        .take(cap + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    if read as u64 > cap {
+        return Err(format!(
+            "encrypted upload is limited to {} MiB in this version; \
+             large-file streaming encryption is a tracked follow-up",
+            cap / (1024 * 1024),
+        ));
+    }
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod read_file_capped_tests {
+    use super::read_file_capped;
+
+    #[tokio::test]
+    async fn accepts_within_cap_and_rejects_oversize() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("f.bin");
+
+        // Under cap → returned verbatim.
+        tokio::fs::write(&p, b"hello").await.expect("write");
+        assert_eq!(
+            read_file_capped(&p, 1024).await.expect("within cap"),
+            b"hello"
+        );
+
+        // Exactly cap → allowed (read == cap, not > cap).
+        tokio::fs::write(&p, vec![0xABu8; 8]).await.expect("write");
+        assert_eq!(
+            read_file_capped(&p, 8).await.expect("exactly cap"),
+            vec![0xABu8; 8]
+        );
+
+        // Over cap → rejected with the stable limit message; nothing returned.
+        tokio::fs::write(&p, vec![0u8; 20]).await.expect("write");
+        let err = read_file_capped(&p, 8)
+            .await
+            .expect_err("over cap must be rejected");
+        assert!(err.contains("limited to"), "stable limit message: {err}");
+    }
+}
+
 /// ZEB-674 Task 1 (C1): encrypted-file ingest via the native file picker.
 ///
 /// Mirrors [`ingest_content`] but routes through the per-file-DEK encrypt path
@@ -20129,10 +20198,9 @@ async fn ingest_content_encrypted(
     };
 
     // 3. Read the whole file into memory — whole-blob DEK encryption is not
-    //    streaming (see the inner's NOTE).
-    let plaintext = tokio::fs::read(path)
-        .await
-        .map_err(|e| format!("read failed: {e}"))?;
+    //    streaming (see the inner's NOTE) — but BOUND the read so a huge file
+    //    cannot OOM the app (see `read_file_capped`).
+    let plaintext = read_file_capped(path, MAX_ENCRYPTED_INGEST_BYTES).await?;
 
     ingest_content_encrypted_inner(
         &ingest_tx,
@@ -20515,19 +20583,49 @@ mod file_share_ipc_tests {
 
     #[tokio::test]
     async fn grant_read_rejects_public_and_non_friend_with_stable_prefix() {
-        let store = std::sync::Arc::new(RecordingStore::default());
-        let state = grantable_state(store.clone());
-        let sink = crate::node_event_sink::RecordingSink::new();
+        // Case 1 — PUBLIC (no DEK): clearing file_deks makes CID look public →
+        // INELIGIBLE_PUBLIC. Nothing allowlisted, nothing emitted.
+        {
+            let store = std::sync::Arc::new(RecordingStore::default());
+            let state = grantable_state(store.clone());
+            let sink = crate::node_event_sink::RecordingSink::new();
+            let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
+            crdt.lock().await.file_deks.clear();
+            let err = grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+                .await
+                .expect_err("public cid ineligible");
+            assert!(err.starts_with("ineligible:"), "stable prefix: {err}");
+            assert_eq!(
+                err,
+                crate::file_sharing::INELIGIBLE_PUBLIC,
+                "public CID must be rejected with the stable public reason"
+            );
+            assert!(!store.contains(&CID), "no allowlist on a rejected grant");
+            assert!(sink.frames().is_empty(), "no emit on a rejected grant");
+        }
 
-        // Public CID → ineligible; nothing allowlisted, nothing emitted.
-        let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
-        crdt.lock().await.file_deks.clear();
-        let err = grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
-            .await
-            .expect_err("public cid ineligible");
-        assert!(err.starts_with("ineligible:"), "{err}");
-        assert!(!store.contains(&CID), "no allowlist on a rejected grant");
-        assert!(sink.frames().is_empty(), "no emit on a rejected grant");
+        // Case 2 — NON-FRIEND grantee: the CID's DEK is intact (so it passes the
+        // public gate), but the grantee address is NOT in the friend graph →
+        // INELIGIBLE_NON_FRIEND. Same seam invariants: stable prefix, no
+        // allowlist, no emit. (This is the half the test's name promises; a
+        // stranger address is used, distinct from the Active-friend `grantee()`.)
+        {
+            let store = std::sync::Arc::new(RecordingStore::default());
+            let state = grantable_state(store.clone());
+            let sink = crate::node_event_sink::RecordingSink::new();
+            let stranger = hex::encode([0x99u8; 16]);
+            let err = grant_read_impl(&state, &sink, cid_hex(), stranger)
+                .await
+                .expect_err("non-friend grantee ineligible");
+            assert!(err.starts_with("ineligible:"), "stable prefix: {err}");
+            assert_eq!(
+                err,
+                crate::file_sharing::INELIGIBLE_NON_FRIEND,
+                "non-friend must be rejected with the stable non-friend reason"
+            );
+            assert!(!store.contains(&CID), "no allowlist on a rejected grant");
+            assert!(sink.frames().is_empty(), "no emit on a rejected grant");
+        }
     }
 
     #[tokio::test]

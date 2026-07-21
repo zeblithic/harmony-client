@@ -434,10 +434,18 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // different grant for the same CID (a naive `or_insert` on the whole Vec
     // would keep local's list and silently drop the remote's grants, diverging
     // the "Shared with" list permanently). Union the entries, deduped by
-    // grantee — on a duplicate grantee the smaller `granted_at` wins, which is
-    // a deterministic set→set function and therefore convergent regardless of
+    // grantee — on a duplicate grantee the LATER `granted_at` wins, which is a
+    // deterministic set→set function and therefore convergent regardless of
     // merge order — and keep the list sorted by grantee so the canonically-
     // encoded state-root is byte-identical across the owner's devices.
+    //
+    // max(), not min(): `record_grant` refreshes granted_at FORWARD on a
+    // re-share (it replaces the grantee's entry with the new timestamp), so a
+    // convergent join must keep the LATER time. min() would let a sibling still
+    // holding the pre-re-share timestamp silently revert the refresh on the
+    // next merge, making ShareList times wrong/unstable across devices (Qodo,
+    // ZEB-674 converge). max() preserves the refresh and is equally a
+    // commutative/associative/idempotent semilattice join.
     //
     // Lazy-revoke note (ZEB-674 plan §Task 5): a local revoke just drops the
     // record (no tombstone), so a still-holding sibling re-adds it on the next
@@ -451,7 +459,7 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
                 .position(|e| e.grantee_owner == g.grantee_owner)
             {
                 Some(i) => {
-                    if g.granted_at < entry[i].granted_at {
+                    if g.granted_at > entry[i].granted_at {
                         entry[i].granted_at = g.granted_at;
                     }
                 }
@@ -465,15 +473,33 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         });
     }
 
-    // ZEB-674 Task 4: received-file grants — GROW-ONLY union, first-writer-wins
-    // per CID (like `file_deks`, NOT the `file_grants` set-union). A received
-    // grant per CID is stable in the MVP: the sealed blob a sibling holds for a
-    // given CID unseals (on the device it was sealed to) to the one DEK that
-    // decrypts that CID's ciphertext, so which sibling's copy survives is
-    // immaterial to the observable key. `or_insert` therefore converges
-    // regardless of merge order.
+    // ZEB-674 Task 4 / converge (CodeRabbit, Major): received-file grants —
+    // GROW-ONLY union with a DETERMINISTIC tie-break per CID. A grantee's
+    // sibling devices each ingest the SAME grant_push independently, and
+    // `ingest_grant_push` reseals the DEK under the shared KeyTree with a FRESH
+    // random nonce (and stamps a wall-clock `received_at`), so the two devices'
+    // `ReceivedFileGrant` BYTES for a given CID differ even though both unseal
+    // to the same DEK. A first-writer-wins `or_insert` is NON-commutative
+    // (`merge(A,B)` keeps A's copy, `merge(B,A)` keeps B's), so the devices'
+    // canonically-encoded state roots would never become byte-identical and
+    // owner-state sync would churn forever. Resolve duplicates deterministically
+    // instead — keep the record with the lexicographically smaller `sealed_dek`,
+    // tie-broken by smaller `received_at` — so both devices pick the SAME whole
+    // record (including its `received_at`) and converge byte-for-byte. Both
+    // records unseal to the same DEK, so the observable key is unchanged.
     for (cid, grant) in received_file_grants {
-        local.received_file_grants.entry(cid).or_insert(grant);
+        match local.received_file_grants.get(&cid) {
+            Some(existing) => {
+                let incoming_wins = (grant.sealed_dek.as_slice(), grant.received_at)
+                    < (existing.sealed_dek.as_slice(), existing.received_at);
+                if incoming_wins {
+                    local.received_file_grants.insert(cid, grant);
+                }
+            }
+            None => {
+                local.received_file_grants.insert(cid, grant);
+            }
+        }
     }
 }
 
@@ -2405,8 +2431,9 @@ mod integration_tests {
     /// devices each hold a DIFFERENT grant list for the SAME cid (different
     /// order, an overlapping grantee with a different `granted_at`). B→A and
     /// A→B must both yield the byte-identical list: set-union of grantees,
-    /// `min(granted_at)` per grantee, sorted by `grantee_owner`. This pins
-    /// commutativity + dedup + min + deterministic order in one shot.
+    /// `max(granted_at)` per grantee, sorted by `grantee_owner`. This pins
+    /// commutativity + dedup + max (re-share refresh) + deterministic order in
+    /// one shot.
     #[test]
     fn file_grants_merge_converges_both_directions() {
         use crate::owner_state_types::{GrantEntry, OwnerAddr};
@@ -2417,7 +2444,8 @@ mod integration_tests {
         let y = OwnerAddr([2u8; 16]);
 
         // A: [X@5, Y@3]; B: [Y@7, X@2] — different order, overlapping grantees
-        // with different granted_at (X: min(5,2)=2, Y: min(3,7)=3).
+        // with different granted_at. The later (max) time wins, matching
+        // record_grant's re-share refresh (X: max(5,2)=5, Y: max(3,7)=7).
         let mk = |grants: Vec<GrantEntry>| {
             let mut s = OwnerState::default();
             s.file_grants.insert(cid, grants);
@@ -2444,15 +2472,15 @@ mod integration_tests {
             },
         ]);
 
-        // Deduped set-union with min(granted_at), sorted by grantee_owner.
+        // Deduped set-union with max(granted_at), sorted by grantee_owner.
         let expected = vec![
             GrantEntry {
                 grantee_owner: x,
-                granted_at: 2,
+                granted_at: 5,
             },
             GrantEntry {
                 grantee_owner: y,
-                granted_at: 3,
+                granted_at: 7,
             },
         ];
 
@@ -2473,7 +2501,7 @@ mod integration_tests {
         );
         assert_eq!(
             *a_grants, expected,
-            "union must dedup to min(granted_at) per grantee, sorted by grantee_owner: {a_grants:?}"
+            "union must dedup to max(granted_at) per grantee, sorted by grantee_owner: {a_grants:?}"
         );
         assert_eq!(
             a_grants.len(),
@@ -2482,12 +2510,17 @@ mod integration_tests {
         );
     }
 
-    /// ZEB-674 (C4): `received_file_grants` merges GROW-ONLY first-writer-wins
-    /// per CID (`or_insert`, like `file_deks` — NOT the `file_grants` set-union).
-    /// A CID present locally is never overwritten; a CID absent locally is
-    /// pulled in from the remote. Both merge orders converge.
+    /// ZEB-674 (C4) converge (CodeRabbit, Major): `received_file_grants` merges
+    /// GROW-ONLY with a DETERMINISTIC tie-break per CID, so a grantee's sibling
+    /// devices — which each ingest the same grant and reseal it with a fresh
+    /// nonce, producing DIFFERENT bytes for the same CID — converge
+    /// BYTE-IDENTICALLY, not merely on the CID set. The winner is the record
+    /// with the lexicographically smaller `sealed_dek` (tie-broken by smaller
+    /// `received_at`), so B→A and A→B agree on the SAME whole record for a
+    /// shared CID. (A first-writer-wins `or_insert` would be non-commutative and
+    /// leave the two devices' state roots permanently divergent.)
     #[test]
-    fn received_file_grants_merge_or_insert_first_writer_wins() {
+    fn received_file_grants_merge_converges_deterministically() {
         use crate::owner_state_types::{OwnerAddr, ReceivedFileGrant};
 
         let cid1 = [0x11u8; 32];
@@ -2503,35 +2536,33 @@ mod integration_tests {
         };
 
         // A holds cid1 (tag 0xA1); B holds cid1 (tag 0xB2 — a DIFFERENT record
-        // for the same CID) AND cid2.
+        // for the same CID) AND cid2. 0xA1 < 0xB2, so the smaller-`sealed_dek`
+        // winner for cid1 is the 0xA1 record — on BOTH devices.
         let mut a0 = OwnerState::default();
         a0.received_file_grants.insert(cid1, mk(cid1, 0xA1));
         let mut b0 = OwnerState::default();
         b0.received_file_grants.insert(cid1, mk(cid1, 0xB2));
         b0.received_file_grants.insert(cid2, mk(cid2, 0xB2));
 
-        // Merge B → A: A keeps its own cid1 (first-writer-wins), gains cid2.
+        // Merge B → A: A already holds the winning 0xA1 record; gains cid2.
         let mut a = a0.clone();
         super::merge_remote_into_local(&mut a, b0.clone());
-        assert_eq!(
-            a.received_file_grants.get(&cid1).unwrap().granter_owner,
-            OwnerAddr([0xA1; 16]),
-            "local cid1 record is NOT overwritten by the remote (or_insert)"
-        );
-        assert!(
-            a.received_file_grants.contains_key(&cid2),
-            "a CID absent locally is pulled in from the remote"
-        );
-        assert_eq!(a.received_file_grants.len(), 2);
-
-        // Merge A → B: B keeps its own cid1 (0xB2). Distinct-CID convergence.
+        // Merge A → B: B's local 0xB2 record LOSES to the incoming smaller 0xA1.
         let mut b = b0;
         super::merge_remote_into_local(&mut b, a0);
+
+        let a_cid1 = a.received_file_grants.get(&cid1).expect("A has cid1");
+        let b_cid1 = b.received_file_grants.get(&cid1).expect("B has cid1");
         assert_eq!(
-            b.received_file_grants.get(&cid1).unwrap().granter_owner,
-            OwnerAddr([0xB2; 16]),
-            "each side keeps its own cid1 under first-writer-wins"
+            a_cid1, b_cid1,
+            "sibling devices must converge BYTE-IDENTICALLY on cid1, not diverge:\nA: {a_cid1:?}\nB: {b_cid1:?}"
         );
+        assert_eq!(
+            a_cid1.granter_owner,
+            OwnerAddr([0xA1; 16]),
+            "deterministic tie-break keeps the smaller-sealed_dek (0xA1) record on both devices"
+        );
+        assert_eq!(a.received_file_grants.len(), 2);
         assert_eq!(b.received_file_grants.len(), 2);
         // The union of CIDs converges from both directions.
         let a_cids: std::collections::BTreeSet<_> = a.received_file_grants.keys().collect();
