@@ -1,7 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
-import { FileManagerService, inferCategory, type ContentAnnouncementEvent } from './file-manager-service';
+import {
+  FileManagerService,
+  inferCategory,
+  unreadReceivedCount,
+  nextSharedLastSeen,
+  type ContentAnnouncementEvent,
+} from './file-manager-service';
 import { createMockAdapter } from './test-utils';
-import type { FileGrant } from './types';
+import type { FileGrant, ReceivedFile } from './types';
 
 describe('FileManagerService', () => {
   it('constructs with default settings', () => {
@@ -749,5 +755,137 @@ describe('FileManagerService', () => {
     await svc.connectAdapter(adapter);
 
     await expect(svc.revokeRead('cidX', 'addrY')).rejects.toThrow('ineligible: grant not found');
+  });
+
+  // ── received grants (ZEB-723) ───────────────────────────────────────
+
+  const mkReceived = (cid: string, receivedAt: number): ReceivedFile => ({
+    cid,
+    granterAddress: 'aa',
+    granterDisplay: 'aa',
+    fileName: 'f',
+    fileSize: 1,
+    mime: 'text/plain',
+    receivedAt,
+  });
+
+  it('unreadReceivedCount counts files newer than lastSeen', () => {
+    const files = [mkReceived('a', 100), mkReceived('b', 200), mkReceived('c', 300)];
+    expect(unreadReceivedCount(files, 150)).toBe(2); // b, c
+    expect(unreadReceivedCount(files, 0)).toBe(3);
+    expect(unreadReceivedCount(files, 300)).toBe(0); // strictly-newer
+    expect(unreadReceivedCount([], 0)).toBe(0);
+    expect(unreadReceivedCount(null, 0)).toBe(0); // unresolved → no badge
+  });
+
+  // ── nextSharedLastSeen (ZEB-723 fix-wave) ───────────────────────────
+  // A FAILED/unresolved load (files === null) must NOT advance the "last
+  // seen" watermark — else a grant that arrived while offline gets silently
+  // marked seen and never re-badges, even though the user only saw
+  // "Loading…". The proven-empty ([]) case DOES advance.
+
+  it('nextSharedLastSeen does not advance the watermark on a failed/unresolved load (null)', () => {
+    expect(nextSharedLastSeen(null, 1_000)).toBeNull();
+  });
+
+  it('nextSharedLastSeen advances to nowMs for a proven-empty load ([])', () => {
+    expect(nextSharedLastSeen([], 1_000)).toBe(1_000);
+  });
+
+  it('nextSharedLastSeen advances to the newest receivedAt when it is newer than nowMs', () => {
+    const files = [mkReceived('a', 500), mkReceived('b', 5_000), mkReceived('c', 2_000)];
+    expect(nextSharedLastSeen(files, 1_000)).toBe(5_000);
+  });
+
+  it('nextSharedLastSeen advances to nowMs when it is newer than every receivedAt', () => {
+    const files = [mkReceived('a', 100), mkReceived('b', 200)];
+    expect(nextSharedLastSeen(files, 1_000)).toBe(1_000);
+  });
+
+  it('listReceivedGrants maps the wire DTO', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [],
+      list_received_grants: [
+        {
+          cid: 'ab',
+          granterAddress: 'cd',
+          displayName: 'Alice',
+          fileName: 'q.pdf',
+          fileSize: 9,
+          mime: 'application/pdf',
+          receivedAt: 5,
+        },
+      ],
+    });
+    await svc.connectAdapter(adapter);
+
+    const rows = await svc.listReceivedGrants();
+
+    expect(rows).toEqual([
+      {
+        cid: 'ab',
+        granterAddress: 'cd',
+        granterDisplay: 'Alice',
+        fileName: 'q.pdf',
+        fileSize: 9,
+        mime: 'application/pdf',
+        receivedAt: 5,
+      },
+    ]);
+  });
+
+  it('listReceivedGrants falls back to the address when displayName is null', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [],
+      list_received_grants: [
+        {
+          cid: 'ab',
+          granterAddress: 'cd',
+          displayName: null,
+          fileName: 'q.pdf',
+          fileSize: 9,
+          mime: 'application/pdf',
+          receivedAt: 5,
+        },
+      ],
+    });
+    await svc.connectAdapter(adapter);
+
+    const rows = await svc.listReceivedGrants();
+
+    expect(rows[0].granterDisplay).toBe('cd');
+  });
+
+  it('listReceivedGrants propagates an IPC error (never swallows to [])', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [],
+      list_received_grants: () => Promise.reject(new Error('boom')),
+    });
+    await svc.connectAdapter(adapter);
+
+    await expect(svc.listReceivedGrants()).rejects.toThrow('boom');
+  });
+
+  it('listReceivedGrants returns [] without a connected adapter (demo/test)', async () => {
+    const svc = new FileManagerService();
+    await expect(svc.listReceivedGrants()).resolves.toEqual([]);
+  });
+
+  it('exportReceived invokes export_content with cid and fileName', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+
+    await svc.exportReceived('cid-x', 'file.pdf');
+
+    expect(adapter.invoke).toHaveBeenCalledWith('export_content', { cid: 'cid-x', fileName: 'file.pdf' });
+  });
+
+  it('exportReceived is a no-op without adapter', async () => {
+    const svc = new FileManagerService();
+    await expect(svc.exportReceived('cid-x', 'file.pdf')).resolves.toBeUndefined();
   });
 });

@@ -74,7 +74,7 @@
   import * as stq8ProfileStorage from './lib/stq8-profile-storage';
   import { initialSessionStats } from './lib/flashcard-types';
   import { TrustService } from './lib/trust-service';
-  import { FileManagerService } from './lib/file-manager-service';
+  import { FileManagerService, unreadReceivedCount, nextSharedLastSeen } from './lib/file-manager-service';
   import { StorageBuddyService } from './lib/storage-buddy-service';
   import type { ContributionSummaryDto, StorageBuddyDto } from './lib/storage-buddy-service';
   import StorageBuddySheet from './lib/components/StorageBuddySheet.svelte';
@@ -88,7 +88,7 @@
   import { ChannelNavSyncService } from './lib/channel-nav-sync';
   import { AvatarResolver } from './lib/avatar-resolver';
   import { ProfilePageResolver } from './lib/profile-page-resolver';
-  import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation, FileGrant } from './lib/types';
+  import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation, FileGrant, ReceivedFile } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
   import { findNode, findNearestFolder, resolveChannelSelection } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
@@ -2271,6 +2271,10 @@
       // (vine.hydrate moved below fetchOwnAddress — ZEB-672: own persisted
       // reaction rows must resolve likedByMe, which needs ownAddress.)
       await tryConnect('fileManager', fileManagerService.connectAdapter(adapter));
+      // ZEB-723: prime the "Shared with me" list + unread badge once at startup,
+      // so grants that landed while this device was offline can light the badge
+      // before the user ever opens the tab. Non-fatal; failure leaves null.
+      void refreshReceivedFiles();
       // ZEB-669 S3: storage-buddy meter + manage sheet. The summary stays
       // null on failure (meter renders nothing — never fabricated), and
       // both backend events re-fetch it.
@@ -2721,6 +2725,19 @@
       });
       fileManagerService.addUnlisten(unlistenGrantsUpdated);
 
+      // ── ZEB-723: the sweeper emits `shared-with-me-updated` when a new grant
+      // is recorded for this user. Refresh the received-files list so the badge
+      // can light. Only mark-seen when the user is ALREADY viewing the section —
+      // otherwise the badge must stay lit until they open the tab.
+      const unlistenSharedWithMe = await listen('shared-with-me-updated', () => {
+        void refreshReceivedFiles().then((loaded) => {
+          // Only advance the watermark after a committed refresh, and only while
+          // the user is viewing the section — otherwise the badge stays lit.
+          if (loaded && fileSection === 'sharedWithMe') markSharedSeen();
+        });
+      });
+      fileManagerService.addUnlisten(unlistenSharedWithMe);
+
       // ── ZEB-352 Voice V4: DM-call signaling listeners ───────────────
       // The backend emits these once per call-state transition; route each into
       // the CallSession state machine (built lazily in buildVoiceSession, so
@@ -3040,6 +3057,85 @@
     }
     fileGrants = null; // unresolved for the new file until the query lands
     void refreshFileGrants(cid);
+  });
+
+  // ── ZEB-723: "Shared with me" state ─────────────────────────────────
+  // Files others have shared with this user. `null` until list_received_grants
+  // resolves — and on load FAILURE it stays `null`, NEVER `[]` (a failed load is
+  // not proof of "nothing shared"; SharedWithMeList self-hides the empty copy on
+  // null). The unread badge is a localStorage last-seen watermark.
+  let receivedFiles = $state<ReceivedFile[] | null>(null);
+  let receivedFilesReq = 0; // monotonic staleness guard (mirror fileGrantsReq)
+  const SWM_LAST_SEEN_KEY = 'sharedWithMeLastSeenMs';
+  let sharedUnreadCount = $state(0);
+
+  function swmLastSeen(): number {
+    return Number(localStorage.getItem(SWM_LAST_SEEN_KEY) ?? '0');
+  }
+  function recomputeSharedUnread() {
+    sharedUnreadCount = unreadReceivedCount(receivedFiles, swmLastSeen());
+  }
+
+  // Returns `true` only when THIS call is the newest (non-superseded) refresh
+  // AND it committed a successful load. Callers gate `markSharedSeen()` on this
+  // so a stale/superseded or failed refresh never advances the "seen" watermark.
+  async function refreshReceivedFiles(): Promise<boolean> {
+    const req = ++receivedFilesReq;
+    try {
+      const rows = await fileManagerService.listReceivedGrants();
+      if (req !== receivedFilesReq) return false; // stale — a newer refresh owns the state
+      receivedFiles = rows;
+      recomputeSharedUnread();
+      return true;
+    } catch (err) {
+      if (req !== receivedFilesReq) return false;
+      // Normalize both production (string) and test (Error) rejection shapes
+      // before logging (CLAUDE.md "Tauri IPC error extraction").
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('listReceivedGrants failed:', msg);
+      receivedFiles = null; // unresolved, NOT [] (null-until-resolved honesty)
+      recomputeSharedUnread();
+      return false;
+    }
+  }
+
+  function markSharedSeen() {
+    // Clear the badge: last-seen = the newest received_at we know about (or now,
+    // so a later-clock grant that arrives before this write still can't re-light
+    // a badge the user has already looked at). A FAILED/unresolved load
+    // (receivedFiles === null) must NOT advance the watermark — otherwise a
+    // grant that arrived while this load was failing gets silently marked
+    // seen and never re-badges, even though the user only ever saw "Loading…".
+    const next = nextSharedLastSeen(receivedFiles, Date.now());
+    if (next === null) return;
+    localStorage.setItem(SWM_LAST_SEEN_KEY, String(next));
+    recomputeSharedUnread();
+  }
+
+  async function handleDownloadReceived(file: ReceivedFile): Promise<void> {
+    try {
+      await fileManagerService.exportReceived(file.cid, file.fileName);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error('exportReceived failed:', msg);
+    }
+  }
+
+  // Load-on-open: entering the "Shared with me" section refreshes the list and
+  // clears its unread badge. Only reads `fileSection` synchronously — the state
+  // writes happen in the async continuation, so this effect can't self-retrigger.
+  $effect(() => {
+    if (fileSection !== 'sharedWithMe') return;
+    let active = true;
+    void refreshReceivedFiles().then((loaded) => {
+      // Advance the "seen" watermark only if THIS refresh committed a load AND
+      // the user is still on the tab: a superseded/failed refresh, or one the
+      // user has already navigated away from, must not mark grants seen.
+      if (active && loaded && fileSection === 'sharedWithMe') markSharedSeen();
+    });
+    return () => {
+      active = false;
+    };
   });
 
   // ZEB-674 C5: the "Share with…" picker's friend source — reuses the same
@@ -4075,6 +4171,9 @@
       onBulkRelease={handleBulkRelease}
       onBulkPublish={handleBulkPublish}
       serviceVersion={fileManagerVersion}
+      receivedFiles={receivedFiles}
+      sharedUnreadCount={sharedUnreadCount}
+      onDownloadReceived={handleDownloadReceived}
     />
   {/snippet}
   {#snippet fileDetailPanel()}

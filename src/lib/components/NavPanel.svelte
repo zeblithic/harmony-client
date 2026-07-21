@@ -23,7 +23,7 @@
     presenceOnline,
     appMode = 'messages',
     contentItems,
-    fileSection,
+    fileSection = 'private',
     currentFolderCid,
     onFolderSelect,
     onFilterChange,
@@ -329,7 +329,12 @@
     </div>
     <nav class="nav-tree-container">
       {#if appMode === 'files'}
-        {#if fileSection !== 'published'}
+        {#if fileSection === 'private'}
+          <!-- ZEB-723: the private folder tree + quick filters are private-only
+               navigation aids. They are meaningless for the read-only Published
+               and Shared-with-me sections (received files aren't in the owner's
+               folder tree), so this stays scoped to 'private' rather than the
+               original binary `!== 'published'`. -->
           <FolderTree items={contentItems ?? []} {onFolderSelect} selectedCid={currentFolderCid ?? null} />
           <QuickFilters {onFilterChange} {filters} />
         {/if}

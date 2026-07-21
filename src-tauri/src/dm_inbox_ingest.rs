@@ -1294,10 +1294,20 @@ impl DmInboxIngestCtx for ProdDmInboxIngestCtx {
         // here — ONLY when a grant was actually recorded (`Some`). A `None` (no
         // blob sealed to this device) mutated nothing; a sibling records it and
         // replicates it back to us, so we do not churn a persist.
-        if recorded.is_some() {
+        if let Some(cid) = recorded {
             if let Some(mark) = &self.notify_owner_state_dirty {
                 mark();
             }
+            // ZEB-723: nudge the grantee UI to refresh "Shared with me" + bump
+            // its unread badge. Gated on a genuine new record (Some) exactly like
+            // notify_dirty — an idempotent re-apply (None) mutated nothing and
+            // must not re-emit. Payload mirrors `grants-updated` ({ cid }); the
+            // frontend re-queries `list_received_grants` rather than trusting it.
+            crate::node_event_sink::emit_ser(
+                self.sink.as_ref(),
+                "shared-with-me-updated",
+                &serde_json::json!({ "cid": hex::encode(cid.to_bytes()) }),
+            );
         }
         Ok(())
     }
@@ -2116,12 +2126,15 @@ mod tests {
     }
 
     /// Build a `ProdDmInboxIngestCtx` over stub handles with a counting
-    /// `notify_owner_state_dirty`. Returns `(ctx, crdt_state, dirty_counter)`.
-    fn prod_ctx_with_dirty() -> (
+    /// `notify_owner_state_dirty`, also returning the `RecordingSink` handle
+    /// so callers can assert emitted frames. Returns
+    /// `(ctx, crdt_state, dirty_counter, revoked, sink_handle)`.
+    fn prod_ctx_with_dirty_and_sink() -> (
         ProdDmInboxIngestCtx,
         Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
         Arc<AtomicUsize>,
         crate::revoked_device_projection::RevokedDeviceProjection,
+        Arc<crate::node_event_sink::RecordingSink>,
     ) {
         let crdt_state = Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
         let content_store: Arc<dyn crate::content_store::ContentStore> =
@@ -2152,6 +2165,18 @@ mod tests {
             ),
             owner_keytree: Arc::new(test_owner_keytree()),
         };
+        (ctx, crdt_state, dirty, revoked, sink_handle)
+    }
+
+    /// Build a `ProdDmInboxIngestCtx` over stub handles with a counting
+    /// `notify_owner_state_dirty`. Returns `(ctx, crdt_state, dirty_counter)`.
+    fn prod_ctx_with_dirty() -> (
+        ProdDmInboxIngestCtx,
+        Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
+        Arc<AtomicUsize>,
+        crate::revoked_device_projection::RevokedDeviceProjection,
+    ) {
+        let (ctx, crdt_state, dirty, revoked, _sink) = prod_ctx_with_dirty_and_sink();
         (ctx, crdt_state, dirty, revoked)
     }
 
@@ -2274,6 +2299,70 @@ mod tests {
             via_tree.as_bytes(),
             &dek_bytes,
             "any device with the shared KeyTree opens the re-sealed grant"
+        );
+    }
+
+    /// ZEB-723: a genuinely-recorded grant (the `Some(cid)` branch of
+    /// `apply_grant_push`, same gate as `notify_owner_state_dirty`) must also
+    /// emit `shared-with-me-updated` so the grantee's "Shared with me" UI can
+    /// refresh and bump its unread badge. Drives a REAL per-device-sealed
+    /// `grant_push` through the production sweeper, exactly like
+    /// `sweep_ingests_real_grant_push_via_prod_ctx_device_agnostic`, and
+    /// asserts the emitted frame via the `RecordingSink` handle.
+    #[tokio::test]
+    async fn sweep_ingested_grant_emits_shared_with_me_updated() {
+        use crate::file_sharing::{seal_grant_for_devices, FileGrantInner};
+        let (ctx, _crdt_state, _dirty, _revoked, sink_handle) = prod_ctx_with_dirty_and_sink();
+
+        let cid_bytes = [0xC1u8; 32];
+        let inner = FileGrantInner {
+            cid: cid_bytes,
+            file_name: "shared.md".into(),
+            file_size: 42,
+            mime: "text/markdown".into(),
+            dek: [0x5Au8; 32],
+        };
+        let sealed = seal_grant_for_devices(&inner, &[test_device_x25519_pub()]).expect("seal");
+        let list: Vec<serde_bytes::ByteBuf> =
+            sealed.into_iter().map(serde_bytes::ByteBuf::from).collect();
+        let mut grant_push = Vec::new();
+        ciborium::into_writer(&list, &mut grant_push).expect("encode grant_push");
+
+        let granter = OwnerAddr([0xB0; 16]);
+        let key = DmInboxDoc::grant_key(&granter.0, &grant_push);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let entry = DmInboxEntry {
+            sender_owner: granter.0,
+            cidnotify_packet: None,
+            storage_blob: Vec::new(),
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: Some(grant_push),
+            deposited_at: hlc(now),
+            deposited_by: "butler-device".into(),
+            ingested_by: Default::default(),
+        };
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key, entry);
+
+        let changed = ingest_pending(&mut doc, &ctx).await;
+        assert!(changed, "grant sweep mutated the doc");
+
+        let frames = sink_handle.frames();
+        let matching = frames
+            .iter()
+            .filter(|(name, payload)| {
+                name == "shared-with-me-updated"
+                    && payload["cid"] == serde_json::json!(hex::encode(cid_bytes))
+            })
+            .count();
+        assert_eq!(
+            matching, 1,
+            "exactly one shared-with-me-updated frame for the recorded grant's cid \
+             (cardinality + idempotency — a single record must not double-emit); got {frames:?}"
         );
     }
 

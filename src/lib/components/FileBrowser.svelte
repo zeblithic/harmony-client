@@ -8,6 +8,7 @@
     ReplicationTier,
     ContentItem,
     CleanupRecommendation,
+    ReceivedFile,
   } from '../types';
   import { FileManagerService, type IngestFolderTreeResult } from '../file-manager-service';
   import type { TauriAdapter } from '../zenoh-service';
@@ -21,6 +22,7 @@
   import FolderIngestSummaryModal from './FolderIngestSummaryModal.svelte';
   import QuotaBar from './QuotaBar.svelte';
   import PublishedView from './PublishedView.svelte';
+  import SharedWithMeList from './SharedWithMeList.svelte';
   import CleanupView from './CleanupView.svelte';
 
   // ZEB-162: custom MIME for drag-drop content moves. Deliberately NOT
@@ -72,6 +74,9 @@
     onBulkRelease,
     onBulkPublish,
     serviceVersion = 0,
+    receivedFiles = null,
+    onDownloadReceived,
+    sharedUnreadCount = 0,
   }: {
     service: FileManagerService;
     adapter?: TauriAdapter | null;
@@ -96,6 +101,12 @@
     onBulkRelease?: (cids: string[]) => void;
     onBulkPublish?: (cids: string[]) => void;
     serviceVersion?: number;
+    /** ZEB-723: files others have shared with this user. `null` until
+     *  `list_received_grants` resolves (and on load FAILURE) — SharedWithMeList
+     *  renders a neutral placeholder, never the proven-empty message. */
+    receivedFiles?: ReceivedFile[] | null;
+    onDownloadReceived: (file: ReceivedFile) => void;
+    sharedUnreadCount?: number;
   } = $props();
 
   // Live folder contents fetched from the backend, paired with the cid
@@ -1013,6 +1024,7 @@
     {showCleanup}
     {section}
     {onSectionChange}
+    {sharedUnreadCount}
   />
 
   {#if section === 'private'}
@@ -1114,8 +1126,10 @@
         {onCleanupClick}
       />
     {/if}
-  {:else}
+  {:else if section === 'published'}
     <PublishedView items={publishedItems} />
+  {:else}
+    <SharedWithMeList files={receivedFiles} onDownload={onDownloadReceived} />
   {/if}
 </div>
 

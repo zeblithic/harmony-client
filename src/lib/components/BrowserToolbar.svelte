@@ -13,6 +13,7 @@
     showCleanup = false,
     section,
     onSectionChange,
+    sharedUnreadCount = 0,
   }: {
     viewMode: FileViewMode;
     onViewModeChange: (mode: FileViewMode) => void;
@@ -25,6 +26,9 @@
     showCleanup?: boolean;
     section: ContentSection;
     onSectionChange: (section: ContentSection) => void;
+    /** ZEB-723: count of shared-with-me files newer than last-seen; a
+     *  numeric pill on the "Shared with me" tab when > 0. */
+    sharedUnreadCount?: number;
   } = $props();
 
   // ZEB-674 Gap A: local toggle controlling whether the *next* "Add files"
@@ -51,6 +55,12 @@
       aria-pressed={section === 'published'}
       onclick={() => onSectionChange('published')}
     >Published</button>
+    <button
+      class="section-btn"
+      class:active={section === 'sharedWithMe'}
+      aria-pressed={section === 'sharedWithMe'}
+      onclick={() => onSectionChange('sharedWithMe')}
+    >Shared with me{#if sharedUnreadCount > 0}<span class="section-badge">{sharedUnreadCount}</span>{/if}</button>
   </div>
 
   {#if section === 'private' && !showCleanup}
@@ -146,6 +156,25 @@
     background: var(--accent);
     color: var(--on-accent);
     border-color: var(--accent);
+  }
+
+  /* ZEB-723: unread pill on the "Shared with me" tab. Reuses NavNodeRow's
+     .unread-badge tokens (accent bg / on-accent fg) so count badges read
+     consistently across the app. */
+  .section-badge {
+    display: inline-block;
+    margin-left: 0.4em;
+    background: var(--accent);
+    color: var(--on-accent);
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 8px;
+  }
+
+  .section-btn.active .section-badge {
+    background: var(--on-accent);
+    color: var(--accent);
   }
 
   .search-input {

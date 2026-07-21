@@ -240,7 +240,7 @@ export type MailCounts = Record<MailFolderKind, MailFolderCounts>;
 export type ReplicationTier = 'expendable' | 'light' | 'default' | 'high' | 'ultra';
 export type ContentSensitivity = 'public' | 'private' | 'intimate' | 'confidential';
 export type FileViewMode = 'list' | 'grid';
-export type ContentSection = 'private' | 'published';
+export type ContentSection = 'private' | 'published' | 'sharedWithMe';
 export type PublishMode = 'durable' | 'ephemeral';
 export type CleanupReason = 'stale' | 'duplicate-of-public' | 'over-replicated' | 'expired';
 
@@ -373,6 +373,29 @@ export interface FileGrant {
   granteeAddress: string;
   displayName: string | null;
   grantedAt: number;
+}
+
+/** Wire shape of one `list_received_grants` row (serde camelCase). */
+export interface ReceivedGrantWire {
+  cid: string;
+  granterAddress: string;
+  displayName: string | null;
+  fileName: string;
+  fileSize: number;
+  mime: string;
+  receivedAt: number;
+}
+
+/** One file another owner has shared with this user (view model). */
+export interface ReceivedFile {
+  cid: string;
+  granterAddress: string;
+  /** Friend display name, or the hex address when the granter isn't a friend. */
+  granterDisplay: string;
+  fileName: string;
+  fileSize: number;
+  mime: string;
+  receivedAt: number;
 }
 
 export interface FileManagerSettings {
