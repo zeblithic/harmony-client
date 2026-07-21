@@ -52,6 +52,8 @@ pub enum FileStreamError {
     Aead,
     #[error("io: {0}")]
     Io(String),
+    #[error("ciphertext length overflow")]
+    Overflow,
 }
 
 fn derive_nonce_prefix(dek: &EpochKey) -> [u8; NONCE_PREFIX_LEN] {
@@ -82,12 +84,27 @@ pub fn v3_ciphertext_len(plaintext_len: u64, frame_size: u32) -> Result<u64, Fil
         return Err(FileStreamError::BadFrameSize);
     }
     let fs = frame_size as u64;
+    // Checked throughout: a `u64::MAX`-scale `plaintext_len` (only reachable via
+    // this pub helper — production sizing comes from the actual streamed byte
+    // count, never this formula) must return `Overflow`, never panic in debug
+    // or wrap in release.
     let frames = if plaintext_len == 0 {
         1
     } else {
-        (plaintext_len + fs - 1) / fs
+        // ceil(plaintext_len / fs), guarding the (+fs-1) intermediate add.
+        // fs >= 1 here (frame_size == 0 rejected above), so `fs - 1` can't underflow.
+        plaintext_len
+            .checked_add(fs - 1)
+            .ok_or(FileStreamError::Overflow)?
+            / fs
     };
-    Ok(V3_HEADER_LEN as u64 + plaintext_len + frames * STREAM_TAG_LEN as u64)
+    let tag_bytes = frames
+        .checked_mul(STREAM_TAG_LEN as u64)
+        .ok_or(FileStreamError::Overflow)?;
+    (V3_HEADER_LEN as u64)
+        .checked_add(plaintext_len)
+        .and_then(|s| s.checked_add(tag_bytes))
+        .ok_or(FileStreamError::Overflow)
 }
 
 /// Seals plaintext frames into v3 STREAM ciphertext. The caller emits
@@ -295,8 +312,13 @@ pub fn decrypt_stream_to_path(
     // it here, which drops (and thus removes) the temp file.
     tmp.persist(final_path)
         .map_err(|e| FileStreamError::Io(e.to_string()))?;
-    // Best-effort: fsync the parent directory so the rename is persisted across
-    // a crash. Ignore any error — the export is user-re-triggerable.
+    // Best-effort, Unix-only: fsync the parent directory so the rename is
+    // persisted across a crash. `File::open(dir)` cannot open a directory on
+    // Windows (the call would always fail there), so the dir-fsync is compiled
+    // out on non-Unix — the atomic rename still provides the ordering
+    // guarantee. Any error is ignored regardless — the export is
+    // user-re-triggerable.
+    #[cfg(unix)]
     let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
     Ok(())
 }
@@ -425,6 +447,22 @@ mod tests {
             v3_ciphertext_len(10, 0),
             Err(FileStreamError::BadFrameSize)
         ));
+    }
+
+    #[test]
+    fn v3_ciphertext_len_overflow_is_err() {
+        // CodeRabbit #515: a u64::MAX-scale plaintext with the minimum frame
+        // size overflows the tag-bytes / total-length arithmetic; the pub
+        // helper must return `Overflow`, never panic (debug) or wrap (release).
+        assert!(matches!(
+            v3_ciphertext_len(u64::MAX, 1),
+            Err(FileStreamError::Overflow)
+        ));
+        // And a sane input still computes: 100 bytes @ FS=32 → 4 frames.
+        assert_eq!(
+            v3_ciphertext_len(100, FS).unwrap(),
+            V3_HEADER_LEN as u64 + 100 + 4 * STREAM_TAG_LEN as u64
+        );
     }
 
     #[test]

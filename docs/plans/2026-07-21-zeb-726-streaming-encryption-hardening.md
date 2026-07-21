@@ -19,7 +19,7 @@
   - `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`
   - `cargo nextest run --locked --workspace --all-targets --features test-fixtures`
   - `cargo fmt --all -- --check`
-  - Iterative dev may use `scripts/test-select --context task`; the final pre-PR sweep is the full `--workspace --all-targets` commands above.
+  - Iterative dev may use `scripts/test-select --context task` — paste its printed `round=… bucket=…` summary line into the task report so the selection is auditable (Qodo rule 1601747); the final pre-PR sweep is the full `--workspace --all-targets` commands above.
 
 ---
 
