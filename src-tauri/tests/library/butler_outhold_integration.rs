@@ -538,6 +538,7 @@ impl ButlerDepositClient for InProcessButlerClient {
             storage_blob,
             invite_packet: req.invite_packet.clone(),
             revocation_push: req.revocation_push.clone(),
+            grant_push: None,
         };
         // The EXACT sender construction (Task 8) — sealed to the butler
         // device, signed by the cert-bound enrolled device key.

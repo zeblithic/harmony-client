@@ -9,6 +9,8 @@ import type {
   FileManagerSettings,
   ReplicationTier,
   ContentCategory,
+  IngestOptions,
+  FileGrant,
 } from './types';
 import {
   mockPrivateContent,
@@ -121,6 +123,10 @@ interface ContentItemWire {
   /** ZEB-669 S4: provenance recorded at creation; null for legacy and
    *  manifest-derived rows. Optional: pre-ZEB-669 backends omit it. */
   origin?: ContentOriginInfo | null;
+  /** ZEB-674 T8: whether this CID's content class is encrypted — derived
+   *  backend-side from the CID header flag bit. Always present from a
+   *  ZEB-674+ backend; treated as `false` when omitted (pre-ZEB-674). */
+  encrypted?: boolean;
 }
 
 /** Wire shape of the `get_storage_budget` query (ZEB-612 S3). */
@@ -168,6 +174,7 @@ function wireToContentItem(wire: ContentItemWire): ContentItem {
     isFolder: wire.kind === 'folder',
     backup: wire.backup ?? false,
     origin: wire.origin ?? null,
+    encrypted: wire.encrypted ?? false,
   };
 }
 
@@ -440,6 +447,48 @@ export class FileManagerService {
     this.onChange?.();
   }
 
+  /**
+   * ZEB-674: lists grantees a CID has been shared with. Backend-only —
+   * returns [] without a connected adapter (Storybook/test contexts have
+   * no encrypted-share concept).
+   */
+  async listGrants(cid: string): Promise<FileGrant[]> {
+    if (!this.adapter) return [];
+    return (await this.adapter.invoke('list_grants', { cid })) as FileGrant[];
+  }
+
+  /**
+   * ZEB-674: grants a peer read access to an encrypted CID. Backend is the
+   * eligibility authority — ineligible shares (unencrypted content,
+   * non-friend grantee, unreachable devices) reject with a stable
+   * `ineligible:` prefix. Rejections propagate to the caller so the share
+   * dialog can render the reason inline.
+   */
+  async grantRead(cid: string, granteeAddress: string): Promise<void> {
+    if (!this.adapter) throw new Error('adapter not connected');
+    try {
+      await this.adapter.invoke('grant_read', { cid, granteeAddress });
+    } catch (e) {
+      // Normalize both production (string) + test (Error) rejection shapes
+      // (CLAUDE.md "Tauri IPC error extraction").
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
+  }
+
+  /** ZEB-674: revokes a previously granted peer's read access to a CID. */
+  async revokeRead(cid: string, granteeAddress: string): Promise<void> {
+    if (!this.adapter) throw new Error('adapter not connected');
+    try {
+      await this.adapter.invoke('revoke_read', { cid, granteeAddress });
+    } catch (e) {
+      // Normalize both production (string) + test (Error) rejection shapes
+      // (CLAUDE.md "Tauri IPC error extraction").
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg);
+    }
+  }
+
   /** Clears the pinned flag on a content item. */
   async unpin(sidecarId: string): Promise<void> {
     if (!this.adapter) {
@@ -481,10 +530,17 @@ export class FileManagerService {
 
   /** Open a file picker, ingest the selected file into the content store,
    *  and add it to the private content list.
+   *
+   *  ZEB-674: pass `{ encrypted: true }` to route to `ingest_content_encrypted`,
+   *  which produces a per-file-DEK-encrypted CID (later shareable via
+   *  grantRead). The default (unset/false) keeps the existing unencrypted
+   *  `ingest_content` path unchanged.
+   *
    *  Returns the new ContentItem, or undefined if the user cancels or no adapter. */
-  async ingest(parentCid?: string | null): Promise<ContentItem | undefined> {
+  async ingest(parentCid?: string | null, options?: IngestOptions): Promise<ContentItem | undefined> {
     if (!this.adapter) return undefined;
-    const result = (await this.adapter.invoke('ingest_content')) as IngestResult;
+    const command = options?.encrypted ? 'ingest_content_encrypted' : 'ingest_content';
+    const result = (await this.adapter.invoke(command)) as IngestResult;
     // ZEB-164: CID-based dedupe removed — the backend mints a fresh sidecar_id
     // on every ingest, even for duplicate-content uploads. Multiple sidecar
     // entries per CID are expected and intentional (symlink-style semantics).
@@ -506,6 +562,10 @@ export class FileManagerService {
       archived: false,
       parentCid: parentCid ?? null,
       isFolder: false,
+      // ZEB-674 T8: the optimistic local item must reflect which ingest
+      // command actually ran — a refetch confirms this from the CID's real
+      // header flag, but the pre-refetch row shouldn't lie in the meantime.
+      encrypted: options?.encrypted === true,
     };
     this.privateContent.push(item);
     return item;

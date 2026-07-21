@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { FileManagerService, inferCategory, type ContentAnnouncementEvent } from './file-manager-service';
 import { createMockAdapter } from './test-utils';
+import type { FileGrant } from './types';
 
 describe('FileManagerService', () => {
   it('constructs with default settings', () => {
@@ -626,5 +627,127 @@ describe('FileManagerService', () => {
 
     await svc.ingest();
     expect(svc.onChange).not.toHaveBeenCalled();
+  });
+
+  it('ingest routes to ingest_content_encrypted when encrypted: true is requested', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'ingest_content_encrypted') {
+        return Promise.resolve({ cid: 'enc123', fileName: 'secret.txt', sizeBytes: 256 });
+      }
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+
+    const item = await svc.ingest(null, { encrypted: true });
+
+    expect(adapter.invoke).toHaveBeenCalledWith('ingest_content_encrypted');
+    expect(adapter.invoke).not.toHaveBeenCalledWith('ingest_content');
+    expect(item).toBeDefined();
+    expect(item!.cid).toBe('enc123');
+  });
+
+  // ── grants (ZEB-674) ────────────────────────────────────────────────
+
+  it('listGrants invokes list_grants and maps the DTO array unchanged', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    const dtos: FileGrant[] = [
+      { granteeAddress: 'addr1', displayName: 'Alice', grantedAt: 1_700_000_000_000 },
+      { granteeAddress: 'addr2', displayName: null, grantedAt: 1_700_000_001_000 },
+    ];
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'list_grants') return Promise.resolve(dtos);
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+
+    const result = await svc.listGrants('cidX');
+
+    expect(adapter.invoke).toHaveBeenCalledWith('list_grants', { cid: 'cidX' });
+    expect(result).toEqual(dtos);
+  });
+
+  it('grantRead invokes grant_read with camelCase args', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+
+    await svc.grantRead('cidX', 'addrY');
+
+    expect(adapter.invoke).toHaveBeenCalledWith('grant_read', { cid: 'cidX', granteeAddress: 'addrY' });
+  });
+
+  it('grantRead surfaces the ineligible rejection message unchanged (matches setBackupFlag)', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'grant_read') {
+        return Promise.reject(new Error('ineligible: can only share with friends'));
+      }
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+
+    // setBackupFlag normalizes e instanceof Error / string but does NOT
+    // strip the `ineligible: ` prefix — grantRead mirrors that exactly.
+    await expect(svc.grantRead('cidX', 'addrY')).rejects.toThrow(
+      'ineligible: can only share with friends',
+    );
+  });
+
+  it('grantRead surfaces a string (production-shape) rejection unchanged', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'grant_read') {
+        return Promise.reject('ineligible: recipient\'s devices not yet reachable');
+      }
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+
+    await expect(svc.grantRead('cidX', 'addrY')).rejects.toThrow(
+      "ineligible: recipient's devices not yet reachable",
+    );
+  });
+
+  it('revokeRead invokes revoke_read with camelCase args', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+
+    await svc.revokeRead('cidX', 'addrY');
+
+    expect(adapter.invoke).toHaveBeenCalledWith('revoke_read', { cid: 'cidX', granteeAddress: 'addrY' });
+  });
+
+  it('revokeRead surfaces an Error-shaped rejection unchanged', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'revoke_read') {
+        return Promise.reject(new Error('ineligible: grant not found'));
+      }
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+
+    await expect(svc.revokeRead('cidX', 'addrY')).rejects.toThrow('ineligible: grant not found');
+  });
+
+  it('revokeRead surfaces a string (production-shape) rejection unchanged', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = createMockAdapter();
+    adapter.invoke = vi.fn().mockImplementation((cmd: string) => {
+      if (cmd === 'revoke_read') {
+        return Promise.reject('ineligible: grant not found');
+      }
+      return Promise.resolve(undefined);
+    });
+    await svc.connectAdapter(adapter);
+
+    await expect(svc.revokeRead('cidX', 'addrY')).rejects.toThrow('ineligible: grant not found');
   });
 });

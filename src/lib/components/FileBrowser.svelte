@@ -88,7 +88,7 @@
     onViewModeChange: (mode: FileViewMode) => void;
     onSearchChange: (query: string) => void;
     onSectionChange: (section: ContentSection) => void;
-    onUploadClick: () => void;
+    onUploadClick: (encrypted?: boolean) => void;
     onCleanupClick: () => void;
     onCleanupAction?: (rec: CleanupRecommendation, action: string) => void;
     onBulkBurn?: (recs: CleanupRecommendation[]) => void;

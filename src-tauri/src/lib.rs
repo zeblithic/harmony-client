@@ -177,6 +177,7 @@ pub mod emoji_names;
 pub mod enrollment_verify;
 pub mod event_loop;
 pub mod feed_authority;
+pub mod file_sharing;
 pub mod fleet_key_epoch;
 pub mod fleet_net;
 pub mod fleet_net_persist;
@@ -5461,6 +5462,20 @@ pub async fn start_node_inner(
                             Some(std::sync::Arc::new(move || e.notify_dirty())
                                 as std::sync::Arc<dyn Fn() + Send + Sync>)
                         },
+                        // ZEB-674 (C4): this device's X25519 private — derived
+                        // from the cert-bound ed25519 signing key exactly as the
+                        // butler acceptor derives its seal target
+                        // (`ed25519_priv_to_x25519(&community_signing_key_arc)`),
+                        // so `apply_grant_push` opens the per-device grant blob a
+                        // sender sealed to `birational(vk)` of this device.
+                        device_x25519_priv: crate::dm_signing::ed25519_priv_to_x25519(
+                            &community_signing_key_arc,
+                        ),
+                        // ZEB-674 (C4): the grantee's shared (pinned epoch-0)
+                        // fleet KeyTree — the SAME tree `file_deks` seals under —
+                        // so a received grant re-sealed at ingest opens on any of
+                        // the owner's bound devices (Flow A).
+                        owner_keytree: std::sync::Arc::clone(&kt),
                     });
                     // The ingest sweeper: one startup sweep (entries
                     // deposited while this device was offline), then one
@@ -19044,6 +19059,14 @@ pub struct ContentItemWire {
     /// ZEB-669 S4: provenance recorded at entry creation; `None` for legacy
     /// and manifest-derived rows (the UI renders no "From" row).
     pub origin: Option<content_index::OriginInfo>,
+    /// ZEB-674 T8: whether this CID's content class is encrypted (per-file
+    /// DEK, ZEB-674 C1). Derived from the CID header flag bit — the same
+    /// signal `ContentAttachmentDto`/`ReactionDto` project elsewhere
+    /// (`ContentId::from_bytes(cid).flags().encrypted`) — not from the
+    /// cosmetic `sensitivity` label, which is decoupled and does not imply
+    /// encryption. Drives the FileDetailPanel ShareList gate: the honest
+    /// "Shared with" surface renders only on encrypted files.
+    pub encrypted: bool,
 }
 
 /// ZEB-612 S3: overwrite `replica_count` with 1 (self) + observed peers.
@@ -19218,6 +19241,9 @@ pub(crate) fn list_root(
                 replica_count: 1,
                 backup: e.backup,
                 origin: e.origin.clone(),
+                encrypted: harmony_content::cid::ContentId::from_bytes(e.cid)
+                    .flags()
+                    .encrypted,
             })
             .collect()
     };
@@ -19307,6 +19333,9 @@ pub async fn list_folder(
             replica_count: 1,
             backup: false,
             origin: None,
+            encrypted: harmony_content::cid::ContentId::from_bytes(e.cid)
+                .flags()
+                .encrypted,
         })
         .collect())
 }
@@ -19749,11 +19778,88 @@ async fn set_replication_tier(
     Ok(updated as u32)
 }
 
+/// ZEB-674 Task 12 (Gap B): personal-file decrypt-on-read core.
+///
+/// Given the raw bytes just fetched for `cid`, return the PLAINTEXT when this
+/// node holds a per-file DEK for the CID — the owner's own file (`file_deks`)
+/// is consulted FIRST, else a file shared with us (`received_file_grants`).
+/// Both maps store the DEK sealed under this node's shared `KeyTree`, so
+/// [`file_sharing::open_dek_at_rest`] unseals it and
+/// [`community_state_sync::decrypt_blob`] reverses the whole-blob encrypt done
+/// at ingest ([`ingest_content_encrypted_inner`]).
+///
+/// Pass-through (returns `bytes` unchanged) for:
+/// - a PUBLIC CID (encrypted flag clear) — no decrypt is attempted; and
+/// - an encrypted CID for which NO personal DEK is held. Community/space
+///   artifacts also carry the encrypted flag but decrypt via their own
+///   epoch-key path elsewhere (`decrypt_and_verify_artifact` +
+///   `current_epoch_key_for`); the "no DEK ⇒ return bytes" branch guarantees
+///   they keep flowing through this path unchanged.
+pub fn decrypt_personal_file_if_held(
+    bytes: Vec<u8>,
+    cid: harmony_content::cid::ContentId,
+    state: &crate::owner_state_crdt::OwnerState,
+    keytree: &crate::owner_state_crypto::KeyTree,
+) -> Result<Vec<u8>, String> {
+    if !cid.flags().encrypted {
+        return Ok(bytes);
+    }
+    let key = cid.to_bytes();
+    let sealed = state
+        .file_deks
+        .get(&key)
+        .or_else(|| state.received_file_grants.get(&key).map(|g| &g.sealed_dek));
+    let Some(sealed) = sealed else {
+        // Encrypted, but not a personal file we hold a DEK for — leave the
+        // fetched bytes untouched so the community/space epoch-key path is
+        // undisturbed.
+        return Ok(bytes);
+    };
+    let dek = crate::file_sharing::open_dek_at_rest(keytree, sealed)
+        .map_err(|e| format!("unseal personal file DEK: {e:?}"))?;
+    crate::community_state_sync::decrypt_blob(&dek, &bytes)
+        .map_err(|e| format!("decrypt personal file: {e:?}"))
+}
+
+/// ZEB-674 Task 12: snapshot the owner handles off `NodeState` and apply the
+/// personal-file decrypt (see [`decrypt_personal_file_if_held`]) to bytes just
+/// fetched for `cid_hex`. Returns the fetched `bytes` unchanged when the CID is
+/// public, malformed, when no owner is loaded (pre-mint), or when no personal
+/// DEK is held — so it never turns a successful fetch into a read error.
+async fn maybe_decrypt_personal_file(
+    state: &Mutex<NodeState>,
+    cid_hex: &str,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    // A non-32-byte / malformed CID can't be an encrypted personal file; the
+    // fetch already succeeded, so never surface a parse quirk as a read error.
+    let Ok(cid_bytes) = parse_cid_hex(cid_hex) else {
+        return Ok(bytes);
+    };
+    let cid = harmony_content::cid::ContentId::from_bytes(cid_bytes);
+    if !cid.flags().encrypted {
+        return Ok(bytes);
+    }
+    // Snapshot the owner handles under the std lock, then drop it before the
+    // async crdt lock. Pre-mint (`None`) ⇒ nothing to decrypt with, pass through.
+    let (crdt_state, keytree) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        match (guard.crdt_state.clone(), guard.owner_keytree.clone()) {
+            (Some(c), Some(k)) => (c, k),
+            _ => return Ok(bytes),
+        }
+    };
+    let st = crdt_state.lock().await;
+    decrypt_personal_file_if_held(bytes, cid, &st, &keytree)
+}
+
 /// Export content to the local filesystem via a save dialog.
 ///
 /// Fetches the raw bytes for `cid` through the Zenoh content transport,
 /// opens a native save-file dialog with `file_name` as the suggested name,
-/// and writes the bytes to the chosen path.
+/// and writes the bytes to the chosen path. Encrypted personal files (created
+/// via `ingest_content_encrypted`) are decrypted to plaintext before the write
+/// when this node holds the file's DEK (ZEB-674 T12).
 #[tauri::command]
 async fn export_content(
     app: tauri::AppHandle,
@@ -19780,7 +19886,7 @@ async fn export_content(
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     fetch_tx
         .send(event_loop::FetchRequest {
-            cid_hex: cid,
+            cid_hex: cid.clone(),
             reply: reply_tx,
             max_bytes: None,
             serveable: false,
@@ -19791,6 +19897,10 @@ async fn export_content(
     let bytes = reply_rx
         .await
         .map_err(|_| "event loop dropped fetch request".to_string())??;
+
+    // 1b. ZEB-674 T12: if this is an encrypted personal file we hold a DEK for,
+    // decrypt to plaintext before writing; otherwise the bytes are unchanged.
+    let bytes = maybe_decrypt_personal_file(state.inner(), &cid, bytes).await?;
 
     // 2. Open a native save-file dialog.
     let (path_tx, path_rx) = tokio::sync::oneshot::channel();
@@ -19881,6 +19991,761 @@ async fn ingest_content(
     send_ingest_with_name(&content_index, root.to_bytes(), file_name, size_bytes, None)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// ZEB-674 Task 1 (C1): pure inner for the encrypted-file ingest path.
+///
+/// Generates a FRESH per-file DEK, encrypts the WHOLE plaintext blob under it
+/// (`community_state_sync::encrypt_blob` — deterministic nonce, so a given
+/// (DEK, plaintext) reproduces the same ciphertext/CID), ingests the resulting
+/// ciphertext as an encrypted + serveable artifact, then seals the DEK at rest
+/// under the owner's `KeyTree` and stores it on `OwnerState.file_deks` keyed by
+/// the ingest root CID.
+///
+/// The pipeline does NOT encrypt — it is handed PRE-ENCRYPTED ciphertext.
+/// `ContentFlags{ encrypted: true }` + `serveable: true` stamp every emitted
+/// leaf + bundle CID so decrypt-on-fetch and member-to-member serve behave
+/// (see [`streaming_ingest_with_options`]).
+///
+/// `sync_engine` is the owner-state SyncEngine: `notify_dirty()` is REQUIRED
+/// after the local `file_deks` mutation, or the sealed DEK is dropped on the
+/// floor — never persisted, never replicated (ZEB-709). Pass `None` only in
+/// focused tests that inspect `crdt_state` directly.
+///
+/// NOTE: whole-blob DEK encryption materializes the full plaintext AND
+/// ciphertext in memory (this path is not streaming, unlike [`ingest_content`]).
+/// Callers gate large files upstream.
+pub async fn ingest_content_encrypted_inner(
+    ingest_tx: &tokio::sync::mpsc::Sender<event_loop::IngestRequest>,
+    content_index: &std::sync::Arc<std::sync::Mutex<content_index::ContentIndex>>,
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    keytree: &crate::owner_state_crypto::KeyTree,
+    sync_engine: Option<&std::sync::Arc<crate::owner_state_sync::SyncEngine>>,
+    plaintext: Vec<u8>,
+    file_name: String,
+) -> Result<IngestResult, String> {
+    use harmony_content::chunker::ChunkerConfig;
+
+    // 1. Fresh per-file DEK.
+    let dek = crate::file_sharing::generate_file_dek();
+
+    // 2. Encrypt the whole blob under the DEK. The CID is computed over this
+    //    ciphertext, so a fresh DEK yields a fresh root CID.
+    let ciphertext = crate::community_state_sync::encrypt_blob(&dek, &plaintext)
+        .map_err(|e| format!("encrypt_blob: {e:?}"))?;
+
+    // 3. Ingest the PRE-ENCRYPTED ciphertext as an encrypted + serveable
+    //    artifact (flags stamped onto every leaf + bundle CID).
+    let opts = IngestOptions {
+        flags: harmony_content::cid::ContentFlags {
+            encrypted: true,
+            ..Default::default()
+        },
+        serveable: true,
+    };
+    let (root, size_bytes) = streaming_ingest_with_options(
+        std::io::Cursor::new(ciphertext),
+        ingest_tx,
+        ChunkerConfig::DEFAULT,
+        None,
+        opts,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // 4. Seal the DEK at rest and store it keyed by the root CID. A crdt_state
+    //    mutation without a following notify_dirty would never persist NOR
+    //    replicate (ZEB-709).
+    let sealed = crate::file_sharing::seal_dek_at_rest(keytree, &dek)
+        .map_err(|e| format!("seal DEK at rest: {e:?}"))?;
+    {
+        let mut st = crdt_state.lock().await;
+        st.file_deks.insert(root.to_bytes(), sealed);
+    }
+    if let Some(engine) = sync_engine {
+        engine.notify_dirty();
+    }
+
+    // 5. Insert the sidecar row pointing at the streamed root CID.
+    send_ingest_with_name(content_index, root.to_bytes(), file_name, size_bytes, None)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// ZEB-674 converge (Qodo, reliability): cap on the encrypted-upload size.
+/// Whole-blob DEK encryption is NOT streaming — `ingest_content_encrypted` must
+/// hold the whole plaintext (and then its ciphertext) in memory at once, unlike
+/// the non-encrypted `ingest_file_at_path`, which streams through the chunker
+/// with bounded memory (ZEB-161). Without a cap a huge encrypted upload could
+/// OOM the app, and this path is UI-reachable via the "Encrypt (private)"
+/// toggle. This is an MVP guard; lifting it via streaming (chunked-AEAD)
+/// encryption is a tracked follow-up (see the ZEB-674 design's deferrals).
+const MAX_ENCRYPTED_INGEST_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Read a file fully into memory, BOUNDED: read at most `cap` bytes and return
+/// `Err` if the file is larger. `Take` caps the allocation regardless of the
+/// on-disk size (so a huge file can't OOM), and reading rather than trusting
+/// `metadata().len()` closes the stat→read TOCTOU. Used by the non-streaming
+/// encrypted-ingest path ([`MAX_ENCRYPTED_INGEST_BYTES`]).
+async fn read_file_capped(path: &std::path::Path, cap: u64) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("open failed: {e}"))?;
+    let mut buf = Vec::new();
+    // Read at most cap+1 bytes: if the reader yields more than cap, it's over.
+    let read = file
+        .take(cap + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    if read as u64 > cap {
+        return Err(format!(
+            "encrypted upload is limited to {} MiB in this version; \
+             large-file streaming encryption is a tracked follow-up",
+            cap / (1024 * 1024),
+        ));
+    }
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod read_file_capped_tests {
+    use super::read_file_capped;
+
+    #[tokio::test]
+    async fn accepts_within_cap_and_rejects_oversize() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("f.bin");
+
+        // Under cap → returned verbatim.
+        tokio::fs::write(&p, b"hello").await.expect("write");
+        assert_eq!(
+            read_file_capped(&p, 1024).await.expect("within cap"),
+            b"hello"
+        );
+
+        // Exactly cap → allowed (read == cap, not > cap).
+        tokio::fs::write(&p, vec![0xABu8; 8]).await.expect("write");
+        assert_eq!(
+            read_file_capped(&p, 8).await.expect("exactly cap"),
+            vec![0xABu8; 8]
+        );
+
+        // Over cap → rejected with the stable limit message; nothing returned.
+        tokio::fs::write(&p, vec![0u8; 20]).await.expect("write");
+        let err = read_file_capped(&p, 8)
+            .await
+            .expect_err("over cap must be rejected");
+        assert!(err.contains("limited to"), "stable limit message: {err}");
+    }
+}
+
+/// ZEB-674 Task 1 (C1): encrypted-file ingest via the native file picker.
+///
+/// Mirrors [`ingest_content`] but routes through the per-file-DEK encrypt path
+/// (fresh DEK → whole-blob encrypt → EncryptedDurable + serveable ingest →
+/// sealed DEK on `OwnerState`). Backend-only; Task 6 wires the frontend.
+#[tauri::command]
+async fn ingest_content_encrypted(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<IngestResult, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    // 1. Native file picker dialog.
+    let (path_tx, path_rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_file(move |path| {
+        let _ = path_tx.send(path);
+    });
+    let file_path = path_rx
+        .await
+        .map_err(|_| "dialog error".to_string())?
+        .ok_or_else(|| "upload cancelled".to_string())?;
+
+    let path = file_path
+        .as_path()
+        .ok_or_else(|| "unsupported file path".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // 2. Snapshot the handles the encrypt path needs, then drop the sync lock
+    //    before any await. `owner_keytree`/`crdt_state` are `None` pre-mint.
+    let (ingest_tx, content_index, crdt_state, keytree, sync_engine) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let ingest_tx = guard
+            .ingest_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        let crdt_state = guard
+            .crdt_state
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?;
+        let keytree = guard
+            .owner_keytree
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?;
+        (
+            ingest_tx,
+            guard.content_index.clone(),
+            crdt_state,
+            keytree,
+            guard.sync_engine.clone(),
+        )
+    };
+
+    // 3. Read the whole file into memory — whole-blob DEK encryption is not
+    //    streaming (see the inner's NOTE) — but BOUND the read so a huge file
+    //    cannot OOM the app (see `read_file_capped`).
+    let plaintext = read_file_capped(path, MAX_ENCRYPTED_INGEST_BYTES).await?;
+
+    ingest_content_encrypted_inner(
+        &ingest_tx,
+        &content_index,
+        &crdt_state,
+        &keytree,
+        sync_engine.as_ref(),
+        plaintext,
+        file_name,
+    )
+    .await
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ZEB-674 Task 6 (C2/C5): owner-side share IPC — grant_read / revoke_read /
+// list_grants + share orchestration (the delivery pipe's sender rung).
+//
+// The pure cores (honesty gates, per-device seal, DTO projection, lazy revoke)
+// live in `file_sharing`; these `*_impl` seams snapshot NodeState handles,
+// drive the crdt_state / content_store / sync_engine, emit `grants-updated`,
+// and (grant only) deposit the sealed grant to the grantee's butler set. Thin
+// `#[tauri::command]` wrappers below register them (JS args camelCase).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Parse a 16-byte master `owner_id` from its hex form (the grantee address the
+/// frontend passes — the friend's `owner_id_hex`).
+fn parse_owner_addr(hex_str: &str) -> Result<crate::owner_state_types::OwnerAddr, String> {
+    let bytes = hex::decode(hex_str).map_err(|_| "invalid owner address hex".to_string())?;
+    let arr = <[u8; 16]>::try_from(bytes.as_slice())
+        .map_err(|_| "owner address must be 16 bytes".to_string())?;
+    Ok(crate::owner_state_types::OwnerAddr(arr))
+}
+
+/// `list_grants(cid)` core: project `file_grants[cid]` into DTO rows (grantee
+/// address + friend-resolved display + granted_at). Empty vec for an unknown /
+/// ungranted cid. Read-only.
+pub(crate) async fn list_grants_impl(
+    state: &Mutex<NodeState>,
+    cid: String,
+) -> Result<Vec<crate::file_sharing::FileGrantDto>, String> {
+    let cid = parse_cid_hex(&cid)?;
+    let crdt_state = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .crdt_state
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?
+    };
+    let st = crdt_state.lock().await;
+    Ok(crate::file_sharing::list_grants_inner(&st, cid))
+}
+
+/// `grant_read(cid, granteeAddress)` core: share read access to an encrypted
+/// file with an active friend. Rejects a public CID / non-friend / a grantee
+/// with no resolvable device keys with the stable `ineligible:` prefix (see
+/// `file_sharing::build_grant_push`'s three gates); otherwise unseals the DEK,
+/// seals the grant per grantee device, allowlists the CID's subtree for member
+/// serve, records the owner-local grant (notify_dirty + persist — ZEB-709),
+/// emits `grants-updated`, and (Phase 2) deposits the pure-grant to the
+/// grantee's butler set (best-effort). `build_grant_push`'s `Err` short-circuits
+/// via `?` BEFORE the allowlist/record/emit/deposit steps below, so a rejected
+/// grant leaves no trace — nothing is recorded for a grant the backend cannot
+/// deliver (ZEB-674 T6 review fix).
+pub(crate) async fn grant_read_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    cid: String,
+    grantee_address: String,
+) -> Result<(), String> {
+    let cid_hex = cid;
+    let cid = parse_cid_hex(&cid_hex)?;
+    let grantee_owner = parse_owner_addr(&grantee_address)?;
+
+    // Snapshot NodeState handles under the std lock, then drop before awaiting.
+    let (crdt_state, keytree, content_store, sync_engine, butler, meta) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let crdt_state = guard
+            .crdt_state
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?;
+        let keytree = guard
+            .owner_keytree
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?;
+        let content_store = guard
+            .content_store
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?;
+        let sync_engine = guard.sync_engine.clone();
+        let butler = guard.butler_deposit_client.clone();
+        // File display metadata from the sidecar (first entry for this CID).
+        // There is no MIME column on the sidecar today — default per design.
+        let meta = {
+            let idx = guard
+                .content_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let m = idx
+                .entries_for_cid(&cid)
+                .next()
+                .map(|e| (e.file_name.clone(), e.size_bytes));
+            m
+        };
+        (
+            crdt_state,
+            keytree,
+            content_store,
+            sync_engine,
+            butler,
+            meta,
+        )
+    };
+    let (file_name, file_size) = meta.unwrap_or_default();
+    let mime = "application/octet-stream".to_string();
+
+    // 1. Validate + seal (pure, under the crdt lock; no await held).
+    let grant_push = {
+        let st = crdt_state.lock().await;
+        crate::file_sharing::build_grant_push(
+            &st,
+            &keytree,
+            cid,
+            grantee_owner,
+            file_name,
+            file_size,
+            mime,
+        )?
+    };
+    // 2. Allowlist the encrypted CID's subtree for member serve BEFORE recording
+    //    the grant, so a serve-registration failure aborts with no state change.
+    content_store
+        .allow_serve_subtree(harmony_content::cid::ContentId::from_bytes(cid))
+        .await
+        .map_err(|e| format!("allow_serve_subtree: {e}"))?;
+    // 3. Record the owner-local grant + notify_dirty (ZEB-709: a file_grants
+    //    mutation without notify_dirty is never persisted NOR replicated).
+    let now_ms = crate::file_sharing::now_epoch_ms();
+    {
+        let mut st = crdt_state.lock().await;
+        crate::file_sharing::record_grant(&mut st, cid, grantee_owner, now_ms);
+    }
+    if let Some(engine) = sync_engine {
+        engine.notify_dirty();
+    }
+    crate::node_event_sink::emit_ser(
+        sink,
+        "grants-updated",
+        &serde_json::json!({ "cid": cid_hex }),
+    );
+
+    // Phase 2 — deliver the pure-grant to the grantee's own butler set so an
+    // offline grantee recovers it on reconnect (mirrors `push_revocation_to_
+    // friends`). Best-effort: a `None` butler (iroh unbound) or a failing deposit
+    // simply skips — the grant is already recorded + replicated to the owner's
+    // fleet, and a re-share re-attempts delivery. The client holds this sender's
+    // owner/cert/signing key and builds each per-butler frame internally; the
+    // zero `entry_id`/`space_id` are inert (the acceptor keys a grant by the
+    // sender + a hash of the opaque payload, and acks with `GRANT_DEPOSIT_MARKER`).
+    if let Some(butler) = butler {
+        let req = crate::butler_deposit::ButlerDepositRequest {
+            entry_id: crate::owner_state_types::OutboxEntryId([0u8; 16]),
+            recipient_owner: grantee_owner,
+            space_id: crate::owner_state_types::SpaceId([0u8; 16]),
+            message_cid: None,
+            cidnotify_packet: None,
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: Some(grant_push),
+            now_ms,
+        };
+        // Surface the delivery outcome (do NOT silently discard it). Best-effort
+        // by design: the grant is already recorded + replicated to the owner's
+        // fleet and the CID is allowlisted, so a non-Acked deposit does NOT fail
+        // the grant — the grantee simply hasn't received the DEK yet, and a
+        // re-share re-attempts. Automatic delivery retry + a UI delivery-status
+        // indicator are a tracked follow-up (see ZEB-674 converge round 2).
+        match butler.deposit(&req).await {
+            crate::butler_deposit::DepositRungOutcome::Acked => {
+                tracing::debug!(
+                    recipient = %hex::encode(grantee_owner.0),
+                    "ZEB-674 T6: grant deposited to grantee butler (acked)"
+                );
+            }
+            crate::butler_deposit::DepositRungOutcome::SkippedNoFreshButlerSet => {
+                tracing::debug!(
+                    recipient = %hex::encode(grantee_owner.0),
+                    "ZEB-674 T6: grant recorded; grantee advertises no fresh butler set — delivery deferred to re-share once reachable"
+                );
+            }
+            crate::butler_deposit::DepositRungOutcome::Failed(detail) => {
+                tracing::warn!(
+                    recipient = %hex::encode(grantee_owner.0),
+                    detail = %detail,
+                    "ZEB-674 T6: grant recorded but butler deposit FAILED; delivery deferred to re-share"
+                );
+            }
+        }
+    } else {
+        tracing::debug!(
+            recipient = %hex::encode(grantee_owner.0),
+            "ZEB-674 T6: grant recorded; butler unbound, deposit skipped (re-share retries)"
+        );
+    }
+    Ok(())
+}
+
+/// `revoke_read(cid, granteeAddress)` core: LAZY revoke — TOMBSTONE the
+/// grantee's `GrantEntry` in `file_grants[cid]` (ZEB-725: stamp `revoked_at` so
+/// the grant is inactive AND the revoke converges across the owner's devices),
+/// then notify_dirty + persist and emit `grants-updated`. Does NOT touch the DEK
+/// or the serve allowlist — an already-granted grantee keeps access to this CID
+/// version (design constraint 3); this only removes them from the ShareList and
+/// stops future re-delivery.
+pub(crate) async fn revoke_read_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    cid: String,
+    grantee_address: String,
+) -> Result<(), String> {
+    let cid_hex = cid;
+    let cid = parse_cid_hex(&cid_hex)?;
+    let grantee_owner = parse_owner_addr(&grantee_address)?;
+
+    let (crdt_state, sync_engine) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let crdt_state = guard
+            .crdt_state
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?;
+        (crdt_state, guard.sync_engine.clone())
+    };
+    let now_ms = crate::file_sharing::now_epoch_ms();
+    let removed = {
+        let mut st = crdt_state.lock().await;
+        crate::file_sharing::revoke_grant_inner(&mut st, cid, grantee_owner, now_ms)
+    };
+    if removed {
+        if let Some(engine) = sync_engine {
+            engine.notify_dirty();
+        }
+        crate::node_event_sink::emit_ser(
+            sink,
+            "grants-updated",
+            &serde_json::json!({ "cid": cid_hex }),
+        );
+    }
+    Ok(())
+}
+
+/// ZEB-674 Task 6: project the owner's "Shared with" list for a file.
+#[tauri::command]
+async fn list_grants(
+    state: tauri::State<'_, Mutex<NodeState>>,
+    cid: String,
+) -> Result<Vec<crate::file_sharing::FileGrantDto>, String> {
+    list_grants_impl(state.inner(), cid).await
+}
+
+/// ZEB-674 Task 6: share read access to an encrypted file with a friend.
+#[tauri::command]
+async fn grant_read(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    cid: String,
+    grantee_address: String,
+) -> Result<(), String> {
+    grant_read_impl(state.inner(), &app, cid, grantee_address).await
+}
+
+/// ZEB-674 Task 6: lazily revoke a grantee from a file's ShareList.
+#[tauri::command]
+async fn revoke_read(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    cid: String,
+    grantee_address: String,
+) -> Result<(), String> {
+    revoke_read_impl(state.inner(), &app, cid, grantee_address).await
+}
+
+#[cfg(test)]
+mod file_share_ipc_tests {
+    use super::*;
+    use crate::content_store::{ContentStore, ContentStoreError};
+    use crate::friend_graph::{FriendEntry, FriendOrigin, FriendStatus};
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_crypto::KeyTree;
+    use crate::owner_state_types::{Hlc, OwnerAddr, OwnerDeviceEntry};
+    use harmony_content::cid::ContentId;
+
+    const CID: [u8; 32] = [0xC1u8; 32];
+
+    fn grantee() -> OwnerAddr {
+        OwnerAddr([0x77u8; 16])
+    }
+    fn cid_hex() -> String {
+        hex::encode(CID)
+    }
+    fn grantee_hex() -> String {
+        hex::encode(grantee().0)
+    }
+
+    /// A `ContentStore` that records every `allow_serve_subtree` root — lets the
+    /// tests assert the grant allowlists the CID and that revoke leaves it.
+    #[derive(Default)]
+    struct RecordingStore {
+        allowed: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    }
+    impl RecordingStore {
+        fn contains(&self, cid: &[u8; 32]) -> bool {
+            self.allowed.lock().unwrap().contains(cid)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ContentStore for RecordingStore {
+        async fn put(&self, _cid: ContentId, _blob: Vec<u8>) -> Result<(), ContentStoreError> {
+            Ok(())
+        }
+        async fn get(&self, _cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+            Ok(None)
+        }
+        async fn allow_serve_subtree(&self, root: ContentId) -> Result<usize, ContentStoreError> {
+            self.allowed.lock().unwrap().insert(root.to_bytes());
+            Ok(1)
+        }
+    }
+
+    fn keytree() -> KeyTree {
+        KeyTree::derive(&[0x9Au8; 32]).expect("keytree")
+    }
+
+    /// A NodeState carrying an encrypted-file DEK for [`CID`] and an Active
+    /// friend [`grantee`] with one known device — the grantable happy path.
+    /// `sync_engine`/`butler_deposit_client` stay `None` (Phase-1 unit scope);
+    /// the keychain is never touched (KeyTree is derived, identity unminted).
+    fn grantable_state(store: std::sync::Arc<RecordingStore>) -> Mutex<NodeState> {
+        let tree = keytree();
+        let mut owner = OwnerState::default();
+        let dek = crate::file_sharing::generate_file_dek();
+        owner.file_deks.insert(
+            CID,
+            crate::file_sharing::seal_dek_at_rest(&tree, &dek).expect("seal dek"),
+        );
+        owner.friend_graph.friends.insert(
+            grantee(),
+            FriendEntry {
+                master_ed25519: [0x33; 32],
+                display: Some("Alice".into()),
+                status: FriendStatus::Active,
+                established_via: FriendOrigin::Token,
+                referrable: false,
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                sealed_secret: None,
+            },
+        );
+        let mut dev_pub = [0u8; 64];
+        dev_pub[..32].copy_from_slice(&[0xA1; 32]);
+        owner.owner_device_cache.devices.insert(
+            grantee(),
+            OwnerDeviceEntry {
+                devices: vec![],
+                device_identity_pubs: vec![Some(dev_pub)],
+                learned_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                device_tunnel_contacts: vec![],
+            },
+        );
+        let content_store: std::sync::Arc<dyn ContentStore> = store;
+        Mutex::new(NodeState {
+            crdt_state: Some(std::sync::Arc::new(tokio::sync::Mutex::new(owner))),
+            owner_keytree: Some(std::sync::Arc::new(tree)),
+            content_store: Some(content_store),
+            ..NodeState::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn grant_read_emits_grants_updated() {
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store.clone());
+        let sink = crate::node_event_sink::RecordingSink::new();
+
+        grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("grant to an active friend succeeds");
+
+        // Emitted exactly one `grants-updated` carrying the cid.
+        let frames = sink.frames();
+        assert_eq!(frames.len(), 1, "one event");
+        assert_eq!(frames[0].0, "grants-updated");
+        assert_eq!(frames[0].1["cid"], serde_json::json!(cid_hex()));
+
+        // The CID's subtree was allowlisted for member serve.
+        assert!(store.contains(&CID), "grant allowlists the CID");
+
+        // The ShareList now reflects the grantee with their display name.
+        let list = list_grants_impl(&state, cid_hex()).await.expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].grantee_address, grantee_hex());
+        assert_eq!(list[0].display_name.as_deref(), Some("Alice"));
+    }
+
+    #[tokio::test]
+    async fn grant_read_rejects_public_and_non_friend_with_stable_prefix() {
+        // Case 1 — PUBLIC (no DEK): clearing file_deks makes CID look public →
+        // INELIGIBLE_PUBLIC. Nothing allowlisted, nothing emitted.
+        {
+            let store = std::sync::Arc::new(RecordingStore::default());
+            let state = grantable_state(store.clone());
+            let sink = crate::node_event_sink::RecordingSink::new();
+            let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
+            crdt.lock().await.file_deks.clear();
+            let err = grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+                .await
+                .expect_err("public cid ineligible");
+            assert!(err.starts_with("ineligible:"), "stable prefix: {err}");
+            assert_eq!(
+                err,
+                crate::file_sharing::INELIGIBLE_PUBLIC,
+                "public CID must be rejected with the stable public reason"
+            );
+            assert!(!store.contains(&CID), "no allowlist on a rejected grant");
+            assert!(sink.frames().is_empty(), "no emit on a rejected grant");
+        }
+
+        // Case 2 — NON-FRIEND grantee: the CID's DEK is intact (so it passes the
+        // public gate), but the grantee address is NOT in the friend graph →
+        // INELIGIBLE_NON_FRIEND. Same seam invariants: stable prefix, no
+        // allowlist, no emit. (This is the half the test's name promises; a
+        // stranger address is used, distinct from the Active-friend `grantee()`.)
+        {
+            let store = std::sync::Arc::new(RecordingStore::default());
+            let state = grantable_state(store.clone());
+            let sink = crate::node_event_sink::RecordingSink::new();
+            let stranger = hex::encode([0x99u8; 16]);
+            let err = grant_read_impl(&state, &sink, cid_hex(), stranger)
+                .await
+                .expect_err("non-friend grantee ineligible");
+            assert!(err.starts_with("ineligible:"), "stable prefix: {err}");
+            assert_eq!(
+                err,
+                crate::file_sharing::INELIGIBLE_NON_FRIEND,
+                "non-friend must be rejected with the stable non-friend reason"
+            );
+            assert!(!store.contains(&CID), "no allowlist on a rejected grant");
+            assert!(sink.frames().is_empty(), "no emit on a rejected grant");
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_read_is_lazy_and_keeps_allowlist() {
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store.clone());
+        let sink = crate::node_event_sink::RecordingSink::new();
+
+        grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("grant");
+        assert!(store.contains(&CID));
+
+        revoke_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("revoke");
+
+        // ShareList omits the grantee (tombstoned, hidden from the list)...
+        assert!(
+            list_grants_impl(&state, cid_hex())
+                .await
+                .unwrap()
+                .is_empty(),
+            "revoke hides the record from the ShareList"
+        );
+        // ...the DEK survives (lazy — access not withdrawn)...
+        let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
+        assert!(
+            crdt.lock().await.file_deks.contains_key(&CID),
+            "DEK untouched by revoke"
+        );
+        // ...and the CID stays allowlisted (removing it would break remaining
+        // authorized viewers — constraint 3).
+        assert!(store.contains(&CID), "revoke does not de-allowlist");
+
+        // Both grant + revoke emitted a `grants-updated`.
+        let events: Vec<_> = sink.frames().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(events, vec!["grants-updated", "grants-updated"]);
+    }
+
+    /// A `ButlerDepositClient` that captures the last request — asserts Phase 2
+    /// fires a PURE-grant deposit (grant_push Some; every other sub-payload None;
+    /// zero space) at the resolved grantee.
+    #[derive(Default)]
+    struct CapturingButler {
+        last: std::sync::Mutex<Option<crate::butler_deposit::ButlerDepositRequest>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::butler_deposit::ButlerDepositClient for CapturingButler {
+        async fn deposit(
+            &self,
+            req: &crate::butler_deposit::ButlerDepositRequest,
+        ) -> crate::butler_deposit::DepositRungOutcome {
+            *self.last.lock().unwrap() = Some(req.clone());
+            crate::butler_deposit::DepositRungOutcome::Acked
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_read_deposits_pure_grant_to_grantee() {
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store.clone());
+        let butler = std::sync::Arc::new(CapturingButler::default());
+        state.lock().unwrap().butler_deposit_client =
+            Some(butler.clone() as std::sync::Arc<dyn crate::butler_deposit::ButlerDepositClient>);
+        let sink = crate::node_event_sink::RecordingSink::new();
+
+        grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("grant");
+
+        let req = butler
+            .last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a deposit was sent");
+        // PURE-grant shape: only grant_push is Some; zero space; grantee target.
+        assert_eq!(req.recipient_owner, grantee());
+        assert_eq!(req.space_id, crate::owner_state_types::SpaceId([0u8; 16]));
+        assert!(req.message_cid.is_none());
+        assert!(req.cidnotify_packet.is_none());
+        assert!(req.invite_packet.is_none());
+        assert!(req.revocation_push.is_none());
+        // The grant_push decodes to exactly one sealed per-device blob and acks
+        // with the grant marker on the acceptor side (`GRANT_DEPOSIT_MARKER`).
+        let gp = req.grant_push.expect("grant_push carried");
+        let blobs: Vec<serde_bytes::ByteBuf> =
+            ciborium::from_reader(gp.as_slice()).expect("grant_push decodes");
+        assert_eq!(blobs.len(), 1, "one sealed blob per known device");
+    }
 }
 
 /// ZEB-343: ingest an in-memory byte buffer (a normalized avatar PNG from the
@@ -23184,7 +24049,7 @@ async fn fetch_content(
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     fetch_tx
         .send(event_loop::FetchRequest {
-            cid_hex: cid,
+            cid_hex: cid.clone(),
             reply: reply_tx,
             max_bytes: None,
             serveable: false,
@@ -23192,9 +24057,13 @@ async fn fetch_content(
         .await
         .map_err(|_| "event loop not running".to_string())?;
 
-    reply_rx
+    let bytes = reply_rx
         .await
-        .map_err(|_| "event loop dropped fetch request".to_string())?
+        .map_err(|_| "event loop dropped fetch request".to_string())??;
+
+    // ZEB-674 T12: decrypt an encrypted personal file to plaintext when this
+    // node holds its DEK; public / non-personal CIDs pass through unchanged.
+    maybe_decrypt_personal_file(state.inner(), &cid, bytes).await
 }
 
 /// ZEB-344: avatar-semantic CAS fetch. Identical to `fetch_content` but caps the
@@ -63229,6 +64098,10 @@ pub fn run() {
             fetch_profile_doc,
             export_content,
             ingest_content,
+            ingest_content_encrypted,
+            list_grants,
+            grant_read,
+            revoke_read,
             ingest_avatar_bytes,
             ingest_vine_video,
             ingest_profile_doc,
@@ -65106,6 +65979,7 @@ mod pin_persistence_tests {
                 kind: content_index::OriginKind::SelfIngest,
                 introducer: None,
             }),
+            encrypted: false,
         };
         let json = serde_json::to_string(&wire).expect("serialize");
         assert!(
@@ -65140,6 +66014,7 @@ mod pin_persistence_tests {
             replica_count: 1,
             backup: false,
             origin: None,
+            encrypted: false,
         }
     }
 
@@ -65168,6 +66043,93 @@ mod pin_persistence_tests {
         assert!(parse_sidecar_id(&id).is_ok());
         assert!(parse_sidecar_id("").is_err(), "empty rejected");
         assert!(parse_sidecar_id("not-a-uuid").is_err(), "garbage rejected");
+    }
+
+    /// ZEB-674 T8: `encrypted` on the `list_content`/`list_root` wire DTO must
+    /// come from the CID header's flag bit (`ContentId::from_bytes(cid)
+    /// .flags().encrypted`), NOT from the cosmetic `sensitivity` label — both
+    /// fixture entries below share `sensitivity` values that don't line up
+    /// with their encrypted-ness, so a projection that reads `sensitivity`
+    /// instead of the CID flag would flip this assertion.
+    #[test]
+    fn list_root_derives_encrypted_flag_from_cid_header() {
+        let enc_cid = harmony_content::cid::ContentId::for_book(
+            b"secret bytes",
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid")
+        .to_bytes();
+        let pub_cid = harmony_content::cid::ContentId::for_book(
+            b"public bytes",
+            harmony_content::cid::ContentFlags::default(),
+        )
+        .expect("cid")
+        .to_bytes();
+
+        let mut idx = content_index::ContentIndex::load(std::path::Path::new(""));
+        idx.insert(content_index::ContentIndexEntry {
+            sidecar_id: content_index::SidecarId::new(),
+            cid: enc_cid,
+            file_name: "secret.txt".into(),
+            size_bytes: 12,
+            stored_at_ms: 1,
+            // Deliberately mismatched vs. the CID's encrypted flag (Public
+            // sensitivity, encrypted CID) to prove the projection isn't
+            // reading this field.
+            sensitivity: content_index::Sensitivity::Public,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+            kind: content_index::ContentKind::Leaf,
+            backup: false,
+            origin: None,
+        });
+        idx.insert(content_index::ContentIndexEntry {
+            sidecar_id: content_index::SidecarId::new(),
+            cid: pub_cid,
+            file_name: "public.txt".into(),
+            size_bytes: 12,
+            stored_at_ms: 2,
+            sensitivity: content_index::Sensitivity::Private,
+            replication_tier: content_index::ReplicationTier::Default,
+            licensed: false,
+            archived: false,
+            pinned: false,
+            kind: content_index::ContentKind::Leaf,
+            backup: false,
+            origin: None,
+        });
+
+        let app = tauri::test::mock_builder()
+            .manage(Mutex::new(NodeState {
+                content_index: std::sync::Arc::new(std::sync::Mutex::new(idx)),
+                ..NodeState::default()
+            }))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        use tauri::Manager as _;
+
+        let items = list_root(app.state::<Mutex<NodeState>>()).expect("list_root");
+        let enc_item = items
+            .iter()
+            .find(|i| i.cid == hex::encode(enc_cid))
+            .expect("encrypted entry present");
+        let pub_item = items
+            .iter()
+            .find(|i| i.cid == hex::encode(pub_cid))
+            .expect("public entry present");
+        assert!(
+            enc_item.encrypted,
+            "encrypted-ingested CID must project encrypted: true"
+        );
+        assert!(
+            !pub_item.encrypted,
+            "public CID must project encrypted: false"
+        );
     }
 }
 

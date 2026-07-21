@@ -64,4 +64,36 @@ describe('BrowserToolbar', () => {
     await fireEvent.click(pubBtn);
     expect(onSectionChange).toHaveBeenCalledWith('published');
   });
+
+  // ── ZEB-674 Gap A: encrypt-on-upload toggle ─────────────────────────
+
+  it('shows the encrypt toggle, unchecked by default, for the private section', () => {
+    render(BrowserToolbar, { props: baseProps });
+    const toggle = screen.getByLabelText('Encrypt (private)') as HTMLInputElement;
+    expect(toggle).toBeTruthy();
+    expect(toggle.checked).toBe(false);
+  });
+
+  it('hides the encrypt toggle when section is published', () => {
+    render(BrowserToolbar, { props: { ...baseProps, section: 'published' as const } });
+    expect(screen.queryByLabelText('Encrypt (private)')).toBeNull();
+  });
+
+  it('calls onUploadClick with encrypted=false when the toggle is left off', async () => {
+    const onUploadClick = vi.fn();
+    render(BrowserToolbar, { props: { ...baseProps, onUploadClick } });
+    const uploadBtn = screen.getByLabelText('Add files');
+    await fireEvent.click(uploadBtn);
+    expect(onUploadClick).toHaveBeenCalledWith(false);
+  });
+
+  it('calls onUploadClick with encrypted=true when the toggle is checked before uploading', async () => {
+    const onUploadClick = vi.fn();
+    render(BrowserToolbar, { props: { ...baseProps, onUploadClick } });
+    const toggle = screen.getByLabelText('Encrypt (private)');
+    await fireEvent.click(toggle);
+    const uploadBtn = screen.getByLabelText('Add files');
+    await fireEvent.click(uploadBtn);
+    expect(onUploadClick).toHaveBeenCalledWith(true);
+  });
 });

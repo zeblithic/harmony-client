@@ -597,6 +597,66 @@ pub fn decrypt_friend_secret(
     Ok(out)
 }
 
+/// Domain-separated AAD for per-file DEK sealing at rest (ZEB-674). DISTINCT
+/// from `AAD_FRIEND_SECRET` so a sealed DEK can never be opened as a friend
+/// secret (or vice versa) even though both seal under `friend_aead` — the AAD
+/// mismatch fails the Poly1305 tag. Unlike the friend-secret AAD there is no
+/// per-target suffix: a file DEK is sealed to SELF, not bound to a counterparty.
+const AAD_FILE_DEK: &[u8] = b"zeb-674-file-dek-at-rest";
+
+/// Seal a 32-byte per-file DEK for at-rest storage in `OwnerState.file_deks`.
+/// Mirrors [`encrypt_friend_secret`] exactly (random nonce; layout
+/// `nonce(12) || ChaCha20-Poly1305 ciphertext+tag(48)`) but binds `AAD_FILE_DEK`
+/// so the sealed blob is domain-separated from friend secrets. Reuses
+/// `friend_aead` — the owner's KeyTree is shared across their bound devices, so
+/// any of them can unseal, which is exactly the Flow-A replication contract for
+/// `file_deks`.
+pub fn encrypt_file_dek(keys: &KeyTree, dek: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
+    let mut nonce_bytes = [0u8; 12];
+    OsRng
+        .try_fill_bytes(&mut nonce_bytes)
+        .map_err(|e| CryptoError::Rng(e.to_string()))?;
+    let cipher = ChaCha20Poly1305::new_from_slice(keys.friend_aead.as_ref())
+        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: dek,
+                aad: AAD_FILE_DEK,
+            },
+        )
+        .map_err(|_| CryptoError::AeadEncrypt)?;
+    let mut blob = Vec::with_capacity(12 + ciphertext.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ciphertext);
+    Ok(blob)
+}
+
+/// Open a blob produced by [`encrypt_file_dek`]. Returns the 32-byte DEK
+/// (zeroizing) or `CryptoError::AeadDecrypt` on wrong key/AAD/corruption.
+pub fn decrypt_file_dek(keys: &KeyTree, blob: &[u8]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    if blob.len() != 12 + 32 + 16 {
+        return Err(CryptoError::AeadDecrypt);
+    }
+    let (nonce_bytes, ciphertext) = blob.split_at(12);
+    let cipher = ChaCha20Poly1305::new_from_slice(keys.friend_aead.as_ref())
+        .expect("ChaCha20-Poly1305 accepts a 32-byte key");
+    let mut plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(nonce_bytes),
+            chacha20poly1305::aead::Payload {
+                msg: ciphertext,
+                aad: AAD_FILE_DEK,
+            },
+        )
+        .map_err(|_| CryptoError::AeadDecrypt)?;
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&plaintext);
+    plaintext.zeroize();
+    Ok(out)
+}
+
 /// Per-publisher HLC tracker for state-root replay protection.
 ///
 /// Per ZEB-211 round-5: "last accepted" is keyed by `at.device_id`,

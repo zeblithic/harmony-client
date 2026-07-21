@@ -1315,6 +1315,7 @@ async fn push_revocation_to_friends(
                 cidnotify_packet: None,
                 invite_packet: None,
                 revocation_push: Some(wire.clone()),
+                grant_push: None,
                 now_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()

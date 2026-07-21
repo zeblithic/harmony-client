@@ -75,6 +75,7 @@ mod tests {
             storage_blob: vec![4, 5, 6],
             invite_packet: None,
             revocation_push: None,
+            grant_push: None,
             deposited_at: Hlc {
                 wall_ms: 4242,
                 logical: 0,

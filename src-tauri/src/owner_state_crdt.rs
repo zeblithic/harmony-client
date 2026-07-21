@@ -6,9 +6,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::owner_state_types::{
-    DedupeKey, DeliveryStatus, DeviceIdentityHash, DmContentKey, Hlc, InboxEntry, InboxKey,
-    LibraryEntry, OutboxEntry, OutboxEntryId, OwnerAddr, OwnerDeviceCache, OwnerDeviceEntry,
-    ReadMarker, Space, SpaceId, SpaceKind, MAX_DEVICES_PER_OWNER, MAX_PRIOR_CONTENT_KEYS,
+    DedupeKey, DeliveryStatus, DeviceIdentityHash, DmContentKey, GrantEntry, Hlc, InboxEntry,
+    InboxKey, LibraryEntry, OutboxEntry, OutboxEntryId, OwnerAddr, OwnerDeviceCache,
+    OwnerDeviceEntry, ReadMarker, ReceivedFileGrant, Space, SpaceId, SpaceKind,
+    MAX_DEVICES_PER_OWNER, MAX_PRIOR_CONTENT_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +87,70 @@ pub struct OwnerState {
     /// pruned outright. So the store is NOT grow-only — it can shrink.
     #[serde(rename = "rd", skip_serializing_if = "BTreeMap::is_empty", default)]
     pub revoked_dm_devices: BTreeMap<crate::owner_state_types::OwnerAddr, BTreeSet<[u8; 32]>>,
+    /// ZEB-674 Task 1 (C1): per-file Data Encryption Keys for encrypted
+    /// personal-file sharing, each sealed AT REST under the owner's `KeyTree`
+    /// (via `owner_state_crypto::encrypt_file_dek`, the `FriendEntry`
+    /// sealed-secret idiom). Keyed by the ingest ROOT ContentId's canonical
+    /// 32-byte form (`ContentId::to_bytes()`); `ContentId` is not `Ord`, so
+    /// the key is its byte form, which round-trips losslessly via
+    /// `ContentId::from_bytes`. The value is NEVER the raw DEK — always the
+    /// sealed blob.
+    ///
+    /// Replicates across the owner's own bound devices via Flow A. Merge is a
+    /// GROW-ONLY union, first-writer-wins per CID (see
+    /// `owner_state_sync::merge_remote_into_local`): a CID is content-addressed
+    /// over its ciphertext, so any sealed blob a sibling device holds for it
+    /// unseals — under the owner's shared KeyTree — to the one DEK that
+    /// decrypts that ciphertext; which sealed blob survives is therefore
+    /// immaterial to the observable key. Absent on the wire when empty
+    /// (`skip_serializing_if` + `default`) so pre-ZEB-674 snapshots load empty.
+    #[serde(rename = "fd", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub file_deks: BTreeMap<[u8; 32], Vec<u8>>,
+    /// ZEB-674 Task 2 (C2): per-file read-access grant records — the owner's
+    /// "Shared with" list. Keyed by the shared file's ROOT ContentId's
+    /// canonical 32-byte form (same `[u8; 32]` = `ContentId::to_bytes()`
+    /// keying as `file_deks`, because `ContentId` is not `Ord`). The value is
+    /// the set of [`GrantEntry`] records for that CID. The sealed key is NOT
+    /// stored here — sealing happens at share time from the DEK (see
+    /// `file_sharing`).
+    ///
+    /// Replicates across the owner's own bound devices via Flow A. Merge is a
+    /// GROW-ONLY UNION per CID (see `owner_state_sync::merge_remote_into_local`),
+    /// NOT the first-writer-wins `or_insert` used for `file_deks`: a CID's grant
+    /// list is a growable SET, so a grant appended on one device must survive a
+    /// merge with a sibling holding a different grant for the same CID (plain
+    /// `or_insert` would silently drop it, diverging the list permanently).
+    /// Revoke is LAZY but CONVERGENT (ZEB-725): this is an LWW-element-set. Each
+    /// `GrantEntry` carries `granted_at` and `revoked_at` (both merged by `max`);
+    /// the grant is ACTIVE iff `granted_at > revoked_at`. A revoke TOMBSTONES the
+    /// entry (bumps `revoked_at`) rather than dropping it, so a still-holding
+    /// sibling can no longer resurrect it on merge — the revoke converges across
+    /// the owner's devices. (Crypto access is unchanged: an already-delivered DEK
+    /// can't be withdrawn without rotation.) Absent on the wire when empty
+    /// (`skip_serializing_if` + `default`) so pre-ZEB-674 snapshots load empty.
+    #[serde(rename = "fr", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub file_grants: BTreeMap<[u8; 32], Vec<GrantEntry>>,
+    /// ZEB-674 Task 4 (C4): grants this owner RECEIVED — encrypted files other
+    /// owners shared with this owner. Keyed by the shared file's ROOT ContentId's
+    /// canonical 32-byte form (same `[u8; 32]` = `ContentId::to_bytes()` keying
+    /// as `file_deks` / `file_grants`, because `ContentId` is not `Ord`). The
+    /// value is the [`ReceivedFileGrant`] carrying the matched per-device sealed
+    /// DEK blob + display metadata.
+    ///
+    /// Replicates across the owner's own bound devices via Flow A. Merge is a
+    /// GROW-ONLY union with a DETERMINISTIC tie-break per CID (see
+    /// `owner_state_sync::merge_remote_into_local`) — NOT the plain
+    /// first-writer-wins `or_insert` used for `file_deks`. Sibling devices each
+    /// ingest the same grant independently and reseal the DEK with a fresh nonce
+    /// (plus a wall-clock `received_at`), so their `ReceivedFileGrant` BYTES for
+    /// a CID differ even though both unseal to the same DEK; a first-writer-wins
+    /// `or_insert` would be non-commutative and leave the devices' state roots
+    /// permanently divergent. The tie-break keeps the record with the smaller
+    /// `sealed_dek` (then smaller `received_at`), so every device converges on
+    /// the SAME bytes. Absent on the wire when empty (`skip_serializing_if` +
+    /// `default`) so pre-ZEB-674 snapshots load empty.
+    #[serde(rename = "rg", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub received_file_grants: BTreeMap<[u8; 32], ReceivedFileGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

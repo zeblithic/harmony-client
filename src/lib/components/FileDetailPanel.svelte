@@ -1,14 +1,16 @@
 <script lang="ts">
-  import type { ContentDetail, ContentOriginInfo, ContentSensitivity, ReplicationTier } from '../types';
+  import type { ContentDetail, ContentOriginInfo, ContentSensitivity, FileGrant, ReplicationTier } from '../types';
   import FileMetadata from './FileMetadata.svelte';
   import SensitivityBadge from './SensitivityBadge.svelte';
   import ReplicationStatus from './ReplicationStatus.svelte';
   import FileActions from './FileActions.svelte';
+  import ShareList from './ShareList.svelte';
 
   // ZEB-612 S3 removed the mock-backed ShareList/StorageBuddyList/origin;
-  // ZEB-669 restores backup (S3) + origin (S4) against real backends. The
-  // sharedWith viewer-ACL surface remains deferred (encrypted key-sharing —
-  // its own ticket).
+  // ZEB-669 restores backup (S3) + origin (S4) against real backends.
+  // ZEB-674 C5 restores ShareList as an honest per-file viewer ACL — it
+  // only exists (and is only coherent) for files encrypted at ingest, so
+  // it renders only when `detail.encrypted`.
   let {
     detail,
     usedByVines = 0,
@@ -22,6 +24,10 @@
     onUnpin,
     onExport,
     onSetBackup,
+    fileGrants = null,
+    availableGrantFriends = [],
+    onGrantRead,
+    onRevokeRead,
   }: {
     detail: ContentDetail;
     /** Vines referencing this CID (client-computed, real descriptors). */
@@ -38,6 +44,13 @@
     /** ZEB-669 S3: toggle "back up with buddies". Rejections (stable
      *  `ineligible:` prefix) render inline; absent → section hidden. */
     onSetBackup?: (sidecarId: string, backup: boolean) => Promise<void>;
+    /** ZEB-674 C5: the current file's grant list. `null` until `listGrants`
+     *  resolves for `detail.cid` — see `ShareList`'s honesty contract. */
+    fileGrants?: FileGrant[] | null;
+    /** ZEB-674 C5: friends eligible for the "Share with…" picker. */
+    availableGrantFriends?: { address: string; displayName: string | null }[];
+    onGrantRead?: (address: string) => Promise<void>;
+    onRevokeRead?: (address: string) => Promise<void>;
   } = $props();
 
   // ZEB-669 S3: frontend proxy gate for backup eligibility — the backend
@@ -195,6 +208,23 @@
       {#if backupError}
         <p class="backup-error" role="alert">{backupError}</p>
       {/if}
+    </section>
+  {/if}
+
+  {#if detail.encrypted && onGrantRead && onRevokeRead}
+    <!-- ZEB-674 C5: honest per-file viewer ACL. Only coherent for a file
+         encrypted at ingest (a public CID has no key to gate on) — public
+         files render no ShareList at all, not an empty one. Same gating
+         idiom as the backup section above: no handler wired → no section
+         (never render a control the caller can't actually invoke). -->
+    <section class="panel-section" data-testid="share-list-section">
+      <ShareList
+        grants={fileGrants}
+        availableFriends={availableGrantFriends}
+        isEncrypted={detail.encrypted}
+        onGrant={onGrantRead}
+        onRevoke={onRevokeRead}
+      />
     </section>
   {/if}
 

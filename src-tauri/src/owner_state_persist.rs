@@ -127,6 +127,24 @@ struct CrdtFileV2 {
     /// `skip_serializing_if` keeps existing file shapes compact.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     revoked_dm_devices: BTreeMap<crate::owner_state_types::OwnerAddr, BTreeSet<[u8; 32]>>,
+    /// ZEB-674 Task 1 (C1): persisted per-file sealed DEK store (root CID
+    /// bytes → KeyTree-sealed DEK blob). Absent in pre-ZEB-674 V2 files;
+    /// `serde(default)` loads those as empty (no schema-version bump — absent
+    /// == empty). `skip_serializing_if` keeps existing file shapes compact.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    file_deks: BTreeMap<[u8; 32], Vec<u8>>,
+    /// ZEB-674 Task 2 (C2): persisted per-file grant records (root CID bytes →
+    /// grant list). Absent in pre-Task-2 V2 files; `serde(default)` loads those
+    /// as empty (no schema-version bump — absent == empty). `skip_serializing_if`
+    /// keeps existing file shapes compact.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    file_grants: BTreeMap<[u8; 32], Vec<crate::owner_state_types::GrantEntry>>,
+    /// ZEB-674 Task 4 (C4): persisted received-file grants (root CID bytes →
+    /// received grant record). Absent in pre-Task-4 V2 files; `serde(default)`
+    /// loads those as empty (no schema-version bump — absent == empty).
+    /// `skip_serializing_if` keeps existing file shapes compact.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    received_file_grants: BTreeMap<[u8; 32], crate::owner_state_types::ReceivedFileGrant>,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -142,6 +160,9 @@ impl From<&OwnerState> for CrdtFileV2 {
             outbox_tombstones: s.outbox_tombstones.clone(),
             friend_graph: s.friend_graph.clone(),
             revoked_dm_devices: s.revoked_dm_devices.clone(),
+            file_deks: s.file_deks.clone(),
+            file_grants: s.file_grants.clone(),
+            received_file_grants: s.received_file_grants.clone(),
         }
     }
 }
@@ -159,6 +180,9 @@ impl From<CrdtFileV2> for OwnerState {
             outbox_tombstones: f.outbox_tombstones,
             friend_graph: f.friend_graph,
             revoked_dm_devices: f.revoked_dm_devices,
+            file_deks: f.file_deks,
+            file_grants: f.file_grants,
+            received_file_grants: f.received_file_grants,
         }
     }
 }
@@ -438,6 +462,50 @@ mod tests {
         let loaded = load_crdt(&path).unwrap();
         assert_eq!(loaded.revoked_dm_devices, s.revoked_dm_devices);
         assert_eq!(loaded.revoked_dm_devices.get(&owner).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn crdt_file_v2_round_trips_received_file_grants() {
+        // ZEB-674 (C4): the grantee-side received-file-grants store must survive
+        // save->load or a restart drops "shared with me" grants (they have no
+        // deposit-rung backstop). Guards the CrdtFileV2 threading + both From
+        // impls. The `sk` (sealed_dek) value is the KeyTree-sealed DEK.
+        let mut s = OwnerState::default();
+        let cid = [0x66u8; 32];
+        s.received_file_grants.insert(
+            cid,
+            crate::owner_state_types::ReceivedFileGrant {
+                granter_owner: crate::owner_state_types::OwnerAddr([0x88; 16]),
+                cid,
+                file_name: "shared.md".into(),
+                file_size: 4242,
+                mime: "text/markdown".into(),
+                sealed_dek: vec![0xDE, 0xAD, 0xBE, 0xEF],
+                received_at: 1_700_000_000_000,
+            },
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert_eq!(loaded.received_file_grants, s.received_file_grants);
+        assert_eq!(
+            loaded.received_file_grants.get(&cid).unwrap().file_size,
+            4242
+        );
+    }
+
+    #[test]
+    fn pre_received_file_grants_snapshot_loads_empty() {
+        // A V2 file serialized WITHOUT the received-file-grants store (skipped on
+        // the wire when empty) must load to an empty map — backward-compat with
+        // snapshots written before ZEB-674 Task 4.
+        let s = OwnerState::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert!(loaded.received_file_grants.is_empty());
     }
 
     #[test]

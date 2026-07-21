@@ -1074,6 +1074,7 @@ impl crate::community_relay::CommunityRelayDepositClient for ProdCommunityRelayD
             // ZEB-691: revocation pushes route via the butler deposit rung
             // only — this community-relay path never carries them.
             revocation_push: None,
+            grant_push: None,
         };
 
         // 4. Fan out: the FIRST relay that acks ≥1 sealed copy wins. For each
@@ -2072,6 +2073,7 @@ mod tests {
             cidnotify_packet: Some(vec![0x01, 0x02, 0x03]),
             invite_packet: None,
             revocation_push: None,
+            grant_push: None,
             now_ms: TEST_NOW,
         }
     }
@@ -3337,6 +3339,7 @@ mod tests {
             storage_blob,
             invite_packet: Some(invite_wire),
             revocation_push: None,
+            grant_push: None,
         };
 
         // Bob's state: NO Space (offline-at-create). Alice's signing device is

@@ -2507,6 +2507,97 @@ impl LibraryEntry {
     }
 }
 
+/// ZEB-674 Task 2 (C2): one owner-local record that the owner shared read
+/// access to an encrypted file with a specific grantee — a row in the
+/// owner's "Shared with" list. Stored in `OwnerState.file_grants` keyed by
+/// the file's root ContentId, and replicated across the owner's own devices
+/// via Flow A.
+///
+/// The sealed key is intentionally NOT stored here: sealing to the grantee's
+/// devices happens at share time from the DEK (see `file_sharing`), so this
+/// record only names WHO was granted, WHEN, and (if applicable) when it was
+/// revoked.
+///
+/// This is one element of an LWW-element-set (ZEB-725): the grant is ACTIVE iff
+/// `granted_at > revoked_at`. A re-share bumps `granted_at` forward (reactivate);
+/// a revoke bumps `revoked_at` forward (deactivate). Both timestamps merge by
+/// `max`, so a revoke CONVERGES across the owner's devices — a stale sibling can
+/// no longer resurrect a revoked grant (the pre-ZEB-725 "drop the record"
+/// approach let a union re-add it). Crypto access is a separate matter: an
+/// already-delivered DEK cannot be withdrawn without rotation.
+///
+/// 2-char field keys (codebase convention; satisfies `canonical_cbor_encode`'s
+/// same-length-keys precondition — mirrors `ReadMarker` / `LibraryEntry`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantEntry {
+    /// The grantee's master `OwnerAddr` (their `owner_id`).
+    #[serde(rename = "go")]
+    pub grantee_owner: OwnerAddr,
+    /// Wall-clock milliseconds when this grant was last (re-)recorded.
+    #[serde(rename = "ga")]
+    pub granted_at: u64,
+    /// Wall-clock milliseconds of the latest revoke of this grantee for this
+    /// file, or `0` if never revoked. The grant is ACTIVE iff
+    /// `granted_at > revoked_at`. Absent on the wire when `0` (so a
+    /// never-revoked grant encodes exactly as it did pre-ZEB-725, and
+    /// pre-tombstone snapshots load with `revoked_at = 0`).
+    #[serde(rename = "gv", default, skip_serializing_if = "is_zero_u64")]
+    pub revoked_at: u64,
+}
+
+/// serde `skip_serializing_if` predicate: drop a `u64` field from the wire when
+/// it is zero (keeps never-revoked `GrantEntry`s byte-identical to pre-tombstone
+/// encoding and satisfies the equal-length-key canonical-encode precondition
+/// whether or not `gv` is present).
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// ZEB-674 Task 4 (C4): one grant the local owner RECEIVED — an encrypted file
+/// another owner shared with one of this owner's devices. Stored in
+/// `OwnerState.received_file_grants` keyed by the shared file's root ContentId
+/// bytes, and replicated across the owner's own devices via Flow A. Because the
+/// DEK is RE-SEALED under the grantee's own shared `KeyTree` at ingest (see
+/// `file_sharing::ingest_grant_push`), ANY of the owner's bound devices can
+/// render "shared with me" AND open the file — exactly like `file_deks` — not
+/// only the device the deposit was originally sealed to.
+///
+/// `sealed_dek` is the KeyTree-sealed DEK
+/// (`file_sharing::seal_dek_at_rest(keytree, dek)`), stored so
+/// `open_received_file` can unseal it lazily on demand rather than caching the
+/// raw DEK at rest. Confidentiality rests on the grantee's shared KeyTree — the
+/// DEK never lands unsealed in `OwnerState`.
+///
+/// 2-char field keys (codebase convention; satisfies `canonical_cbor_encode`'s
+/// same-length-keys precondition — mirrors `GrantEntry` / `FileGrantInner`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceivedFileGrant {
+    /// The granting owner's master `OwnerAddr` (who shared the file).
+    #[serde(rename = "gr")]
+    pub granter_owner: OwnerAddr,
+    /// The shared file's encrypted root ContentId, canonical 32-byte form.
+    #[serde(rename = "ci")]
+    pub cid: [u8; 32],
+    /// Display file name (for the grantee's received-files UI).
+    #[serde(rename = "nm")]
+    pub file_name: String,
+    /// Stored (CAS) byte length of the file's content — for encrypted content
+    /// this includes the AEAD nonce+tag overhead (`encrypt_blob` prepends a
+    /// 12-byte nonce and appends a 16-byte tag, so it is plaintext length + 28).
+    #[serde(rename = "sz")]
+    pub file_size: u64,
+    /// MIME type string.
+    #[serde(rename = "mt")]
+    pub mime: String,
+    /// The KeyTree-sealed DEK (opaque; opens with the grantee's shared KeyTree
+    /// on any bound device). NEVER the raw DEK — always the sealed envelope.
+    #[serde(rename = "sk")]
+    pub sealed_dek: Vec<u8>,
+    /// Wall-clock milliseconds when this grant was ingested.
+    #[serde(rename = "ra")]
+    pub received_at: u64,
+}
+
 #[cfg(test)]
 mod inbox_tests {
     use super::*;
