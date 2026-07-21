@@ -1,7 +1,7 @@
 //! ZEB-724: streaming chunked-AEAD ingest round-trips across MANY frames and
 //! MANY FastCDC chunks (unlike the ZEB-674 single-chunk case). Drives the real
 //! `ingest_content_encrypted_inner` with a recording store, then reassembles
-//! the stored leaves in ingest order and decrypts via the v2 stream decryptor.
+//! the stored leaves in ingest order and decrypts via the v3 stream decryptor.
 //!
 //! Keychain-free (ZEB-428): the KeyTree comes from `KeyTree::derive`.
 
@@ -22,7 +22,7 @@ fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
 }
 
 /// Drive the real `ingest_content_encrypted_inner`, then reassemble the
-/// recorded ciphertext DAG and decrypt it with the v2 stream decryptor. The
+/// recorded ciphertext DAG and decrypt it with the v3 stream decryptor. The
 /// invariant under test: the streamed round-trip must recover `plaintext`
 /// byte-for-byte, across many frames and many FastCDC chunks.
 async fn round_trip(plaintext: Vec<u8>) {
@@ -57,7 +57,7 @@ async fn round_trip(plaintext: Vec<u8>) {
     let dek = harmony_app::file_sharing::open_dek_at_rest(&keytree, &sealed).expect("unseal dek");
 
     // Reassemble the ciphertext from the recorded chunks via the content DAG,
-    // then decrypt with the v2 stream decryptor.
+    // then decrypt with the v3 stream decryptor.
     let ciphertext = reassemble_from_store(&store, &root_bytes);
     let recovered =
         harmony_app::file_stream_crypto::decrypt_stream(&dek, &ciphertext).expect("v3 decrypt");

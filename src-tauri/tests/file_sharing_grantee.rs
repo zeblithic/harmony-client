@@ -178,15 +178,15 @@ fn grantee_ingest_no_matching_device_is_none() {
     );
 }
 
-// --- ZEB-724 Task 3: grantee decrypt-on-read of a MULTI-FRAME v2 file. -----
+// --- ZEB-724 Task 3: grantee decrypt-on-read of a MULTI-FRAME v3 file. -----
 //
 // Everything below drives the real streaming ingest (`ingest_content_encrypted_inner`)
-// so the ciphertext is the actual v2 STREAM byte-stream (crossing several 64 KiB
+// so the ciphertext is the actual v3 STREAM byte-stream (crossing several 64 KiB
 // frames), then wires up a grantee `OwnerState.received_file_grants` entry the
 // way a real grant delivery would (minus the sealed-envelope wire format, which
 // `grantee_ingest_then_decrypt` above already covers) and proves
 // `decrypt_personal_file_if_held` recovers the original plaintext through the
-// v2 path. Mirrors the reassembly pattern in `tests/file_sharing_streaming.rs`
+// v3 path. Mirrors the reassembly pattern in `tests/file_sharing_streaming.rs`
 // and `tests/file_sharing_dek.rs`.
 
 fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
@@ -196,11 +196,11 @@ fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
     Arc::new(Mutex::new(idx))
 }
 
-/// A grantee decrypting a MULTI-FRAME v2 file (crosses several 64 KiB frames)
+/// A grantee decrypting a MULTI-FRAME v3 file (crosses several 64 KiB frames)
 /// via `decrypt_personal_file_if_held` must recover the original plaintext.
 /// This is the read-side counterpart to `grantee_ingest_then_decrypt` — that
 /// test proves the sealed-envelope grant delivery mechanics; this one proves
-/// the actual bytes-on-the-wire decrypt through the v2 STREAM path once the
+/// the actual bytes-on-the-wire decrypt through the v3 STREAM path once the
 /// grant is recorded on `OwnerState.received_file_grants`.
 #[tokio::test]
 async fn grantee_decrypts_multi_frame_file() {
@@ -270,9 +270,9 @@ async fn grantee_decrypts_multi_frame_file() {
 
     let recovered =
         harmony_app::decrypt_personal_file_if_held(ciphertext, cid, &grantee_state, &keytree)
-            .expect("grantee decrypts the multi-frame v2 file");
+            .expect("grantee decrypts the multi-frame v3 file");
     assert_eq!(
         recovered, plaintext,
-        "grantee must recover the original plaintext through the v2 path"
+        "grantee must recover the original plaintext through the v3 path"
     );
 }
