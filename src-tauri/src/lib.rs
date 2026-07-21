@@ -19790,8 +19790,11 @@ async fn set_replication_tier(
 /// is consulted FIRST, else a file shared with us (`received_file_grants`).
 /// Both maps store the DEK sealed under this node's shared `KeyTree`, so
 /// [`file_sharing::open_dek_at_rest`] unseals it and
-/// [`community_state_sync::decrypt_blob`] reverses the whole-blob encrypt done
-/// at ingest ([`ingest_content_encrypted_inner`]).
+/// [`file_stream_crypto::decrypt_stream`] reverses the v2 chunked-AEAD stream
+/// encrypt done at ingest ([`ingest_content_encrypted_inner`], ZEB-724). A v1
+/// whole-blob ciphertext (pre-ZEB-724) fails loud via
+/// `FileStreamError::UnsupportedLegacyFormat` rather than silently
+/// misparsing — callers should surface the "re-ingest this file" message.
 ///
 /// Pass-through (returns `bytes` unchanged) for:
 /// - a PUBLIC CID (encrypted flag clear) — no decrypt is attempted; and
@@ -19822,8 +19825,8 @@ pub fn decrypt_personal_file_if_held(
     };
     let dek = crate::file_sharing::open_dek_at_rest(keytree, sealed)
         .map_err(|e| format!("unseal personal file DEK: {e:?}"))?;
-    crate::community_state_sync::decrypt_blob(&dek, &bytes)
-        .map_err(|e| format!("decrypt personal file: {e:?}"))
+    crate::file_stream_crypto::decrypt_stream(&dek, &bytes)
+        .map_err(|e| format!("decrypt personal file: {e}"))
 }
 
 /// ZEB-674 Task 12: snapshot the owner handles off `NodeState` and apply the
@@ -19858,13 +19861,44 @@ async fn maybe_decrypt_personal_file(
     decrypt_personal_file_if_held(bytes, cid, &st, &keytree)
 }
 
+/// Resolve the unsealed per-file DEK for an encrypted personal CID, if this
+/// node holds it (own `file_deks` or a received grant). `None` = not held.
+async fn resolve_personal_file_dek(
+    state: &Mutex<NodeState>,
+    cid: &harmony_content::cid::ContentId,
+) -> Result<Option<crate::owner_state_types::EpochKey>, String> {
+    if !cid.flags().encrypted {
+        return Ok(None);
+    }
+    let (crdt_state, keytree) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        match (guard.crdt_state.clone(), guard.owner_keytree.clone()) {
+            (Some(c), Some(k)) => (c, k),
+            _ => return Ok(None),
+        }
+    };
+    let key = cid.to_bytes();
+    let st = crdt_state.lock().await;
+    let sealed = st
+        .file_deks
+        .get(&key)
+        .or_else(|| st.received_file_grants.get(&key).map(|g| &g.sealed_dek));
+    let Some(sealed) = sealed else {
+        return Ok(None);
+    };
+    let dek = crate::file_sharing::open_dek_at_rest(&keytree, sealed)
+        .map_err(|e| format!("unseal personal file DEK: {e:?}"))?;
+    Ok(Some(dek))
+}
+
 /// Export content to the local filesystem via a save dialog.
 ///
 /// Fetches the raw bytes for `cid` through the Zenoh content transport,
 /// opens a native save-file dialog with `file_name` as the suggested name,
 /// and writes the bytes to the chosen path. Encrypted personal files (created
-/// via `ingest_content_encrypted`) are decrypted to plaintext before the write
-/// when this node holds the file's DEK (ZEB-674 T12).
+/// via `ingest_content_encrypted`) are stream-decrypted to plaintext directly
+/// to disk when this node holds the file's DEK (ZEB-674 T12; streamed to disk
+/// as of ZEB-724, so the whole plaintext is never also resident in memory).
 #[tauri::command]
 async fn export_content(
     app: tauri::AppHandle,
@@ -19903,10 +19937,6 @@ async fn export_content(
         .await
         .map_err(|_| "event loop dropped fetch request".to_string())??;
 
-    // 1b. ZEB-674 T12: if this is an encrypted personal file we hold a DEK for,
-    // decrypt to plaintext before writing; otherwise the bytes are unchanged.
-    let bytes = maybe_decrypt_personal_file(state.inner(), &cid, bytes).await?;
-
     // 2. Open a native save-file dialog.
     let (path_tx, path_rx) = tokio::sync::oneshot::channel();
     app.dialog()
@@ -19921,10 +19951,39 @@ async fn export_content(
         .map_err(|_| "dialog error".to_string())?
         .ok_or_else(|| "export cancelled".to_string())?;
 
-    // 3. Write bytes to disk.
+    // 3. Write to disk. ZEB-674 T12 / ZEB-724: an encrypted personal file we
+    // hold the DEK for is stream-decrypted directly to disk (the whole
+    // plaintext is never also resident in memory); everything else (public
+    // content, or encrypted content we hold no DEK for) writes the fetched
+    // bytes unchanged.
     let path = file_path
         .as_path()
         .ok_or_else(|| "unsupported file path".to_string())?;
+
+    let cid_parsed = parse_cid_hex(&cid)
+        .ok()
+        .map(harmony_content::cid::ContentId::from_bytes);
+    if let Some(cid_obj) = cid_parsed {
+        if let Some(dek) = resolve_personal_file_dek(state.inner(), &cid_obj).await? {
+            // Stream-decrypt: ciphertext is already resident; write plaintext
+            // frame-by-frame so the whole plaintext is never also resident.
+            let out_path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                use std::io::Write as _;
+                let mut f =
+                    std::fs::File::create(&out_path).map_err(|e| format!("create failed: {e}"))?;
+                crate::file_stream_crypto::decrypt_stream_to_writer(&dek, &bytes, &mut f)
+                    .map_err(|e| format!("decrypt personal file: {e}"))?;
+                f.flush().map_err(|e| format!("flush failed: {e}"))?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| format!("decrypt task: {e}"))??;
+            return Ok(true);
+        }
+    }
+
+    // Public (or encrypted-but-not-held) content: write bytes unchanged.
     tokio::fs::write(path, &bytes)
         .await
         .map_err(|e| format!("write failed: {e}"))?;
@@ -20159,7 +20218,8 @@ pub async fn ingest_content_encrypted_inner(
 /// ZEB-674 Task 1 (C1): encrypted-file ingest via the native file picker.
 ///
 /// Mirrors [`ingest_content`] but routes through the per-file-DEK encrypt path
-/// (fresh DEK → whole-blob encrypt → EncryptedDurable + serveable ingest →
+/// (fresh DEK → streamed v2 chunked-AEAD frame-by-frame encrypt via
+/// `file_stream_crypto::FrameSealer`, ZEB-724 → encrypted + serveable ingest →
 /// sealed DEK on `OwnerState`). Backend-only; Task 6 wires the frontend.
 #[tauri::command]
 async fn ingest_content_encrypted(

@@ -201,13 +201,10 @@ async fn sealed_dek_at_rest_is_not_plaintext() {
 /// stores the ciphertext + sealed DEK, a fetch of that CID must return the
 /// ORIGINAL PLAINTEXT once `decrypt_personal_file_if_held` runs.
 ///
-/// ZEB-724: `decrypt_personal_file_if_held` still calls the whole-blob v1
-/// `community_state_sync::decrypt_blob` on bytes handed to it — it does not
-/// yet reassemble the DAG nor understand the v2 STREAM format this task's
-/// ingest now produces. Reworking it to reassemble + `file_stream_crypto::
-/// decrypt_stream` is Task 3's job, so the decrypt-on-read assertion is
-/// deferred there. This test keeps the ingest half green: the encrypted
-/// ingest succeeds and the stored bytes are ciphertext, not plaintext.
+/// ZEB-724 Task 3: `decrypt_personal_file_if_held` is now v2 STREAM-aware
+/// (`file_stream_crypto::decrypt_stream`), so this reassembles the recorded
+/// DAG into the real ciphertext and asserts the full decrypt-on-read
+/// round-trip through the production function, not just the ingest half.
 #[tokio::test]
 async fn owner_encrypted_file_decrypts_to_plaintext() {
     let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
@@ -239,9 +236,14 @@ async fn owner_encrypted_file_decrypts_to_plaintext() {
         "fetched bytes are ciphertext pre-decrypt"
     );
 
-    // reworked in Task 3: decrypt_personal_file_if_held must reassemble the
-    // DAG + call file_stream_crypto::decrypt_stream before this can assert
-    // `recovered == plaintext` again.
+    let cid = ContentId::from_bytes(root_bytes);
+    let st = crdt_state.lock().await;
+    let recovered = harmony_app::decrypt_personal_file_if_held(ciphertext, cid, &st, &keytree)
+        .expect("owner decrypts their own encrypted file");
+    assert_eq!(
+        recovered, plaintext,
+        "decrypt-on-read must recover the original plaintext through the v2 path"
+    );
 }
 
 /// A PUBLIC (unencrypted-flag) CID is never decrypted: the fetched bytes pass
@@ -268,10 +270,9 @@ fn public_file_passes_through_unchanged() {
 /// own) also decrypts on read. Proves the second lookup branch: `file_deks` is
 /// empty, the sealed DEK is only in the grant map.
 ///
-/// ZEB-724: like `owner_encrypted_file_decrypts_to_plaintext`, the actual
-/// decrypt-on-read assertion via `decrypt_personal_file_if_held` is deferred
-/// to Task 3 (v2 STREAM + DAG-reassembly awareness). This test keeps the
-/// ingest + grantee-state-setup half green.
+/// ZEB-724 Task 3: like `owner_encrypted_file_decrypts_to_plaintext`, this
+/// now asserts the full decrypt-on-read round-trip through the v2-aware
+/// `decrypt_personal_file_if_held`, not just the ingest + grantee-state setup.
 #[tokio::test]
 async fn received_grant_file_decrypts_to_plaintext() {
     let keytree = KeyTree::derive(&[0x42u8; 32]).expect("keytree");
@@ -326,9 +327,12 @@ async fn received_grant_file_decrypts_to_plaintext() {
         "grantee owns no file_deks entry"
     );
 
-    // reworked in Task 3: decrypt_personal_file_if_held must reassemble the
-    // DAG + call file_stream_crypto::decrypt_stream before this can assert
-    // the grantee recovers `plaintext` again.
+    let recovered = harmony_app::decrypt_personal_file_if_held(ciphertext, cid, &grantee, &keytree)
+        .expect("grantee decrypts a file shared with them");
+    assert_eq!(
+        recovered, plaintext,
+        "grantee decrypt-on-read must recover the original plaintext through the v2 path"
+    );
 }
 
 /// COMMUNITY-SAFETY guarantee: a community/space artifact also carries the
