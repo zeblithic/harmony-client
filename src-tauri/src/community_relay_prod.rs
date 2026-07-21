@@ -2073,6 +2073,7 @@ mod tests {
             cidnotify_packet: Some(vec![0x01, 0x02, 0x03]),
             invite_packet: None,
             revocation_push: None,
+            grant_push: None,
             now_ms: TEST_NOW,
         }
     }

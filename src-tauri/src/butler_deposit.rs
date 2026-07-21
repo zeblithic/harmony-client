@@ -434,6 +434,12 @@ pub struct ButlerDepositRequest {
     /// revocation deposit — `cidnotify_packet`/`invite_packet`/`message_cid` are
     /// all `None` and the ack binds to `REVOCATION_DEPOSIT_MARKER`.
     pub revocation_push: Option<Vec<u8>>,
+    /// ZEB-674 (C3): opaque `grant_push` wire bytes (canonical CBOR of the
+    /// per-device sealed `FileGrantInner` blobs — `file_sharing::encode_grant_push`).
+    /// When `Some`, this is a pure file-share grant deposit —
+    /// `message_cid`/`cidnotify_packet`/`invite_packet`/`revocation_push` are all
+    /// `None`, `space_id` is zero, and the ack binds to `GRANT_DEPOSIT_MARKER`.
+    pub grant_push: Option<Vec<u8>>,
     /// Wall-clock now (ms) at candidacy time — drives the `bs_at` freshness
     /// check against the resolved routing blob.
     pub now_ms: u64,
@@ -690,10 +696,12 @@ impl ButlerDepositClient for IrohButlerDepositClient {
                 (blob, message_cid.to_bytes().to_vec())
             }
             // ZEB-691: a revocation deposit has no message CID and its own ack
-            // marker; an invite-only deposit keeps the ZEB-505 marker.
+            // marker; ZEB-674: a pure grant deposit likewise; an invite-only
+            // deposit keeps the ZEB-505 marker.
             None if req.revocation_push.is_some() => {
                 (Vec::new(), REVOCATION_DEPOSIT_MARKER.to_vec())
             }
+            None if req.grant_push.is_some() => (Vec::new(), GRANT_DEPOSIT_MARKER.to_vec()),
             None => (Vec::new(), INVITE_ONLY_DEPOSIT_MARKER.to_vec()),
         };
         let payload = DepositPayload {
@@ -701,10 +709,11 @@ impl ButlerDepositClient for IrohButlerDepositClient {
             storage_blob,
             invite_packet: req.invite_packet.clone(),
             revocation_push: req.revocation_push.clone(),
-            // ZEB-674 Task 4 wires `ButlerDepositRequest.grant_push` (or an
-            // equivalent request field) through to this sender rung; T3 adds
-            // only the wire field + demux-free round-trip.
-            grant_push: None,
+            // ZEB-674 Task 6 (C3): carry the opaque per-device sealed grant
+            // through to the acceptor's grant-only arm (which acks with
+            // `GRANT_DEPOSIT_MARKER` and persists under `grant_key`). The butler
+            // cannot open the seals (`butler_cannot_open_grant_push`).
+            grant_push: req.grant_push.clone(),
         };
 
         // 3. Priority order, first ack wins. The frame is rebuilt per

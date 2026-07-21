@@ -20115,7 +20115,7 @@ pub(crate) async fn grant_read_impl(
     let grantee_owner = parse_owner_addr(&grantee_address)?;
 
     // Snapshot NodeState handles under the std lock, then drop before awaiting.
-    let (crdt_state, keytree, content_store, sync_engine, meta) = {
+    let (crdt_state, keytree, content_store, sync_engine, butler, meta) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let crdt_state = guard
             .crdt_state
@@ -20130,6 +20130,7 @@ pub(crate) async fn grant_read_impl(
             .clone()
             .ok_or_else(|| "not connected".to_string())?;
         let sync_engine = guard.sync_engine.clone();
+        let butler = guard.butler_deposit_client.clone();
         // File display metadata from the sidecar (first entry for this CID).
         // There is no MIME column on the sidecar today — default per design.
         let meta = {
@@ -20143,7 +20144,14 @@ pub(crate) async fn grant_read_impl(
                 .map(|e| (e.file_name.clone(), e.size_bytes));
             m
         };
-        (crdt_state, keytree, content_store, sync_engine, meta)
+        (
+            crdt_state,
+            keytree,
+            content_store,
+            sync_engine,
+            butler,
+            meta,
+        )
     };
     let (file_name, file_size) = meta.unwrap_or_default();
     let mime = "application/octet-stream".to_string();
@@ -20183,16 +20191,33 @@ pub(crate) async fn grant_read_impl(
         &serde_json::json!({ "cid": cid_hex }),
     );
 
-    // Phase 2 wires the pure-grant butler deposit send here (delivering
-    // `grant_push` to the grantee's own butler set, mirroring
-    // `push_revocation_to_friends`). Phase 1 seals + records + allowlists but
-    // does not yet transmit; the grant is already replicated to the owner's own
-    // fleet, so the ShareList is live even before the send lands.
-    tracing::debug!(
-        grant_bytes = grant_push.len(),
-        recipient = %hex::encode(grantee_owner.0),
-        "ZEB-674 T6 Phase 1: grant sealed + recorded; deposit send lands in Phase 2"
-    );
+    // Phase 2 — deliver the pure-grant to the grantee's own butler set so an
+    // offline grantee recovers it on reconnect (mirrors `push_revocation_to_
+    // friends`). Best-effort: a `None` butler (iroh unbound) or a failing deposit
+    // simply skips — the grant is already recorded + replicated to the owner's
+    // fleet, and a re-share re-attempts delivery. The client holds this sender's
+    // owner/cert/signing key and builds each per-butler frame internally; the
+    // zero `entry_id`/`space_id` are inert (the acceptor keys a grant by the
+    // sender + a hash of the opaque payload, and acks with `GRANT_DEPOSIT_MARKER`).
+    if let Some(butler) = butler {
+        let req = crate::butler_deposit::ButlerDepositRequest {
+            entry_id: crate::owner_state_types::OutboxEntryId([0u8; 16]),
+            recipient_owner: grantee_owner,
+            space_id: crate::owner_state_types::SpaceId([0u8; 16]),
+            message_cid: None,
+            cidnotify_packet: None,
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: Some(grant_push),
+            now_ms,
+        };
+        let _ = butler.deposit(&req).await;
+    } else {
+        tracing::debug!(
+            recipient = %hex::encode(grantee_owner.0),
+            "ZEB-674 T6: grant recorded; butler unbound, deposit skipped (re-share retries)"
+        );
+    }
     Ok(())
 }
 
@@ -20449,6 +20474,58 @@ mod file_share_ipc_tests {
         // Both grant + revoke emitted a `grants-updated`.
         let events: Vec<_> = sink.frames().into_iter().map(|(n, _)| n).collect();
         assert_eq!(events, vec!["grants-updated", "grants-updated"]);
+    }
+
+    /// A `ButlerDepositClient` that captures the last request — asserts Phase 2
+    /// fires a PURE-grant deposit (grant_push Some; every other sub-payload None;
+    /// zero space) at the resolved grantee.
+    #[derive(Default)]
+    struct CapturingButler {
+        last: std::sync::Mutex<Option<crate::butler_deposit::ButlerDepositRequest>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::butler_deposit::ButlerDepositClient for CapturingButler {
+        async fn deposit(
+            &self,
+            req: &crate::butler_deposit::ButlerDepositRequest,
+        ) -> crate::butler_deposit::DepositRungOutcome {
+            *self.last.lock().unwrap() = Some(req.clone());
+            crate::butler_deposit::DepositRungOutcome::Acked
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_read_deposits_pure_grant_to_grantee() {
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store.clone());
+        let butler = std::sync::Arc::new(CapturingButler::default());
+        state.lock().unwrap().butler_deposit_client =
+            Some(butler.clone() as std::sync::Arc<dyn crate::butler_deposit::ButlerDepositClient>);
+        let sink = crate::node_event_sink::RecordingSink::new();
+
+        grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect("grant");
+
+        let req = butler
+            .last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a deposit was sent");
+        // PURE-grant shape: only grant_push is Some; zero space; grantee target.
+        assert_eq!(req.recipient_owner, grantee());
+        assert_eq!(req.space_id, crate::owner_state_types::SpaceId([0u8; 16]));
+        assert!(req.message_cid.is_none());
+        assert!(req.cidnotify_packet.is_none());
+        assert!(req.invite_packet.is_none());
+        assert!(req.revocation_push.is_none());
+        // The grant_push decodes to exactly one sealed per-device blob and acks
+        // with the grant marker on the acceptor side (`GRANT_DEPOSIT_MARKER`).
+        let gp = req.grant_push.expect("grant_push carried");
+        let blobs: Vec<serde_bytes::ByteBuf> =
+            ciborium::from_reader(gp.as_slice()).expect("grant_push decodes");
+        assert_eq!(blobs.len(), 1, "one sealed blob per known device");
     }
 }
 
