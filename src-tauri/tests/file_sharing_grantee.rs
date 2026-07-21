@@ -12,16 +12,18 @@
 
 use harmony_app::community_state_sync::{decrypt_blob, encrypt_blob};
 use harmony_app::content_index::ContentIndex;
-use harmony_app::event_loop::IngestRequest;
 use harmony_app::file_sharing::{
     ingest_grant_push, open_dek_at_rest, open_received_file, seal_grant_for_devices, FileGrantInner,
 };
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_crypto::KeyTree;
 use harmony_app::owner_state_types::{EpochKey, OwnerAddr, ReceivedFileGrant};
-use harmony_content::book::{BookStore, MemoryBookStore};
 use harmony_content::cid::ContentId;
 use std::sync::{Arc, Mutex};
+
+#[path = "common/file_sharing_helpers.rs"]
+mod file_sharing_helpers;
+use file_sharing_helpers::{reassemble_from_store, spawn_recording_store, write_temp};
 
 /// Deterministic grantee shared KeyTree (mirrors `file_sharing_dek.rs`). A fresh
 /// derivation from the same material models a DIFFERENT device of the same owner
@@ -176,35 +178,16 @@ fn grantee_ingest_no_matching_device_is_none() {
     );
 }
 
-// --- ZEB-724 Task 3: grantee decrypt-on-read of a MULTI-FRAME v2 file. -----
+// --- ZEB-724 Task 3: grantee decrypt-on-read of a MULTI-FRAME v3 file. -----
 //
 // Everything below drives the real streaming ingest (`ingest_content_encrypted_inner`)
-// so the ciphertext is the actual v2 STREAM byte-stream (crossing several 64 KiB
+// so the ciphertext is the actual v3 STREAM byte-stream (crossing several 64 KiB
 // frames), then wires up a grantee `OwnerState.received_file_grants` entry the
 // way a real grant delivery would (minus the sealed-envelope wire format, which
 // `grantee_ingest_then_decrypt` above already covers) and proves
 // `decrypt_personal_file_if_held` recovers the original plaintext through the
-// v2 path. Mirrors the reassembly pattern in `tests/file_sharing_streaming.rs`
+// v3 path. Mirrors the reassembly pattern in `tests/file_sharing_streaming.rs`
 // and `tests/file_sharing_dek.rs`.
-
-/// Records each ingested `(cid_hex, bytes)` — a stand-in content store.
-type Store = Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>;
-
-fn spawn_recording_store() -> (tokio::sync::mpsc::Sender<IngestRequest>, Store) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<IngestRequest>(256);
-    let store: Store = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let store_c = store.clone();
-    tokio::spawn(async move {
-        while let Some(req) = rx.recv().await {
-            store_c
-                .lock()
-                .unwrap()
-                .insert(req.cid_hex.clone(), req.data);
-            let _ = req.reply.send(Ok(()));
-        }
-    });
-    (tx, store)
-}
 
 fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -213,32 +196,11 @@ fn fresh_content_index() -> Arc<Mutex<ContentIndex>> {
     Arc::new(Mutex::new(idx))
 }
 
-async fn write_temp(bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("input.bin");
-    tokio::fs::write(&path, bytes).await.unwrap();
-    (dir, path)
-}
-
-/// Reassemble the DAG the recording store captured, via the real
-/// `harmony_content::dag::reassemble` (`&dyn BookStore`). Mirrors
-/// `tests/file_sharing_streaming.rs::reassemble_from_store`.
-fn reassemble_from_store(store: &Store, root: &[u8; 32]) -> Vec<u8> {
-    let mut book_store = MemoryBookStore::new();
-    for (cid_hex, data) in store.lock().unwrap().iter() {
-        let bytes: [u8; 32] =
-            <[u8; 32]>::try_from(hex::decode(cid_hex).expect("cid hex")).expect("cid 32 bytes");
-        book_store.store(ContentId::from_bytes(bytes), data.clone());
-    }
-    let root_cid = ContentId::from_bytes(*root);
-    harmony_content::dag::reassemble(&root_cid, &book_store).expect("reassemble")
-}
-
-/// A grantee decrypting a MULTI-FRAME v2 file (crosses several 64 KiB frames)
+/// A grantee decrypting a MULTI-FRAME v3 file (crosses several 64 KiB frames)
 /// via `decrypt_personal_file_if_held` must recover the original plaintext.
 /// This is the read-side counterpart to `grantee_ingest_then_decrypt` — that
 /// test proves the sealed-envelope grant delivery mechanics; this one proves
-/// the actual bytes-on-the-wire decrypt through the v2 STREAM path once the
+/// the actual bytes-on-the-wire decrypt through the v3 STREAM path once the
 /// grant is recorded on `OwnerState.received_file_grants`.
 #[tokio::test]
 async fn grantee_decrypts_multi_frame_file() {
@@ -247,7 +209,7 @@ async fn grantee_decrypts_multi_frame_file() {
     let content_index = fresh_content_index();
     let (ingest_tx, store) = spawn_recording_store();
 
-    // ~200 KiB: crosses several 64 KiB v2 frames (DEFAULT_FRAME_SIZE).
+    // ~200 KiB: crosses several 64 KiB v3 frames (DEFAULT_FRAME_SIZE).
     let plaintext: Vec<u8> = (0..200_000u32)
         .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
         .collect();
@@ -308,9 +270,9 @@ async fn grantee_decrypts_multi_frame_file() {
 
     let recovered =
         harmony_app::decrypt_personal_file_if_held(ciphertext, cid, &grantee_state, &keytree)
-            .expect("grantee decrypts the multi-frame v2 file");
+            .expect("grantee decrypts the multi-frame v3 file");
     assert_eq!(
         recovered, plaintext,
-        "grantee must recover the original plaintext through the v2 path"
+        "grantee must recover the original plaintext through the v3 path"
     );
 }
