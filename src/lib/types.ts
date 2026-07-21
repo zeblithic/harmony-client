@@ -350,6 +350,24 @@ export interface UploadCandidate {
   replicationTier: ReplicationTier;
 }
 
+/** Options accepted by FileManagerService.ingest (ZEB-674: encrypted file
+ *  sharing). */
+export interface IngestOptions {
+  /** When true, routes to the `ingest_content_encrypted` Tauri command
+   *  instead of `ingest_content`, producing a per-file-DEK-encrypted CID
+   *  that can later be shared via grantRead. Default (unset/false) keeps
+   *  the existing unencrypted ingest path. */
+  encrypted?: boolean;
+}
+
+/** One grantee entry for a shared (encrypted) content item (ZEB-674).
+ *  Mirrors the Rust `FileGrantDto` (serde rename_all = "camelCase"). */
+export interface FileGrant {
+  granteeAddress: string;
+  displayName: string | null;
+  grantedAt: number;
+}
+
 export interface FileManagerSettings {
   defaultReplicationTier: ReplicationTier;
   defaultViewMode: FileViewMode;
