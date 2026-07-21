@@ -168,6 +168,25 @@ pub struct OwnerState {
     /// `default`) so pre-ZEB-722 snapshots load empty.
     #[serde(rename = "bt", skip_serializing_if = "BTreeSet::is_empty", default)]
     pub burned_content: BTreeSet<[u8; 32]>,
+    /// ZEB-727: received-grant dismiss tombstones — `cid -> dismissed_at_ms`. A
+    /// grantee-local "hide this shared-with-me entry" that GCs the grow-only
+    /// `received_file_grants` entry for the CID AND keeps a stale sibling device
+    /// from resurrecting it on the add-wins union merge
+    /// (`owner_state_sync::merge_remote_into_local` sweeps `received_file_grants`
+    /// against this map after unioning it). A grant is ACTIVE iff
+    /// `received_at > dismissed_at`.
+    ///
+    /// LWW-timestamped, NOT a permanent set (contrast `burned_content`): the key
+    /// is the shared file's STABLE root ContentId, so the owner can legitimately
+    /// re-share the same file. A re-share ingests with a FRESH wall-clock
+    /// `received_at` (`ingest_grant_push`), so `received_at > dismissed_at`
+    /// reactivates it over an older dismissal — exactly ZEB-725's
+    /// `granted_at > revoked_at` idiom, and why a permanent tombstone (which would
+    /// suppress every future re-share of a once-dismissed file) is WRONG here.
+    /// Absent on the wire when empty (`skip_serializing_if` + `default`) so
+    /// pre-ZEB-727 snapshots load empty.
+    #[serde(rename = "dg", skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub dismissed_received_grants: BTreeMap<[u8; 32], u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

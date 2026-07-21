@@ -151,6 +151,12 @@ struct CrdtFileV2 {
     /// existing file shapes compact.
     #[serde(skip_serializing_if = "BTreeSet::is_empty", default)]
     burned_content: BTreeSet<[u8; 32]>,
+    /// ZEB-727: persisted received-grant dismiss tombstones (root CID bytes →
+    /// dismissed_at ms). Absent in pre-ZEB-727 V2 files; `serde(default)` loads
+    /// those as empty (no schema-version bump — absent == empty).
+    /// `skip_serializing_if` keeps existing file shapes compact.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    dismissed_received_grants: BTreeMap<[u8; 32], u64>,
 }
 
 impl From<&OwnerState> for CrdtFileV2 {
@@ -170,6 +176,7 @@ impl From<&OwnerState> for CrdtFileV2 {
             file_grants: s.file_grants.clone(),
             received_file_grants: s.received_file_grants.clone(),
             burned_content: s.burned_content.clone(),
+            dismissed_received_grants: s.dismissed_received_grants.clone(),
         }
     }
 }
@@ -191,6 +198,7 @@ impl From<CrdtFileV2> for OwnerState {
             file_grants: f.file_grants,
             received_file_grants: f.received_file_grants,
             burned_content: f.burned_content,
+            dismissed_received_grants: f.dismissed_received_grants,
         }
     }
 }
@@ -520,6 +528,30 @@ mod tests {
         let loaded = load_crdt(&path).unwrap();
         assert_eq!(loaded.burned_content, s.burned_content);
         assert_eq!(loaded.burned_content.len(), 2);
+    }
+
+    #[test]
+    fn crdt_file_v2_round_trips_dismissed_received_grants() {
+        // ZEB-727: the dismiss tombstone map must survive save->load, or a restart
+        // re-loads a dismissed "shared with me" grant as live (it has no
+        // deposit-rung backstop) and it resurrects across restarts. Guards the
+        // CrdtFileV2 threading + both From impls. A default OwnerState (empty map,
+        // skipped on the wire) implicitly covers the pre-ZEB-727 backward-compat
+        // "loads empty" case.
+        let mut s = OwnerState::default();
+        s.dismissed_received_grants
+            .insert([0x5eu8; 32], 1_700_000_000_000);
+        s.dismissed_received_grants
+            .insert([0x5fu8; 32], 1_700_000_000_042);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner_state_crdt.cbor");
+        save_crdt(&path, &s).unwrap();
+        let loaded = load_crdt(&path).unwrap();
+        assert_eq!(
+            loaded.dismissed_received_grants,
+            s.dismissed_received_grants
+        );
+        assert_eq!(loaded.dismissed_received_grants.len(), 2);
     }
 
     #[test]

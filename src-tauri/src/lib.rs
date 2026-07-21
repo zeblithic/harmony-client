@@ -20600,6 +20600,49 @@ pub(crate) async fn revoke_read_impl(
     Ok(())
 }
 
+/// `dismiss_received_grant(cid)` core (ZEB-727): grantee-local "hide this
+/// shared-with-me entry". Removes the `received_file_grants` entry AND records an
+/// LWW dismiss tombstone so the removal converges across the grantee's own bound
+/// devices (a plain remove is resurrected by the add-wins union merge). On a real
+/// change: `notify_dirty` (load-bearing — `received_file_grants` has no
+/// deposit-rung re-delivery backstop, so persistence + Flow-A replication depend
+/// on it) + emit `shared-with-me-updated` (same event the ingest path emits, so
+/// the grantee surface refreshes). Does NOT withdraw crypto access — an
+/// already-delivered DEK stays valid (state hygiene, not revocation).
+pub(crate) async fn dismiss_received_grant_impl(
+    state: &Mutex<NodeState>,
+    sink: &dyn crate::node_event_sink::NodeEventSink,
+    cid: String,
+) -> Result<(), String> {
+    let cid_hex = cid;
+    let cid = parse_cid_hex(&cid_hex)?;
+
+    let (crdt_state, sync_engine) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let crdt_state = guard
+            .crdt_state
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?;
+        (crdt_state, guard.sync_engine.clone())
+    };
+    let now_ms = crate::file_sharing::now_epoch_ms();
+    let changed = {
+        let mut st = crdt_state.lock().await;
+        crate::file_sharing::dismiss_received_grant_inner(&mut st, cid, now_ms)
+    };
+    if changed {
+        if let Some(engine) = sync_engine {
+            engine.notify_dirty();
+        }
+        crate::node_event_sink::emit_ser(
+            sink,
+            "shared-with-me-updated",
+            &serde_json::json!({ "cid": cid_hex }),
+        );
+    }
+    Ok(())
+}
+
 /// ZEB-674 Task 6: project the owner's "Shared with" list for a file.
 #[tauri::command]
 async fn list_grants(
@@ -20637,6 +20680,17 @@ async fn revoke_read(
     grantee_address: String,
 ) -> Result<(), String> {
     revoke_read_impl(state.inner(), &app, cid, grantee_address).await
+}
+
+/// ZEB-727: grantee-local dismiss of a "Shared with me" entry (converges across
+/// the grantee's own devices; does not withdraw crypto access).
+#[tauri::command]
+async fn dismiss_received_grant(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Mutex<NodeState>>,
+    cid: String,
+) -> Result<(), String> {
+    dismiss_received_grant_impl(state.inner(), &app, cid).await
 }
 
 #[cfg(test)]
@@ -21011,6 +21065,53 @@ mod file_share_ipc_tests {
         assert_eq!(rows[0].file_size, 42);
         assert_eq!(rows[0].mime, "text/plain");
         assert_eq!(rows[0].received_at, 1_234);
+    }
+
+    #[tokio::test]
+    async fn dismiss_received_grant_impl_gcs_and_emits() {
+        use crate::owner_state_types::ReceivedFileGrant;
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store);
+        let cid = [0x5D; 32];
+        {
+            let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
+            crdt.lock().await.received_file_grants.insert(
+                cid,
+                ReceivedFileGrant {
+                    granter_owner: crate::owner_state_types::OwnerAddr([0x77; 16]),
+                    cid,
+                    file_name: "shared.txt".into(),
+                    file_size: 42,
+                    mime: "text/plain".into(),
+                    sealed_dek: vec![9, 9, 9],
+                    received_at: 1_234,
+                },
+            );
+        }
+
+        let sink = crate::node_event_sink::RecordingSink::new();
+        dismiss_received_grant_impl(&state, &sink, hex::encode(cid))
+            .await
+            .expect("dismiss ok");
+
+        // Entry GC'd + tombstone recorded.
+        {
+            let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
+            let st = crdt.lock().await;
+            assert!(
+                !st.received_file_grants.contains_key(&cid),
+                "dismiss GCs the received-grant entry"
+            );
+            assert!(
+                st.dismissed_received_grants.contains_key(&cid),
+                "dismiss records the tombstone"
+            );
+        }
+        // The grantee "shared with me" surface is nudged to refresh.
+        let frames = sink.frames();
+        assert_eq!(frames.len(), 1, "exactly one refresh event emitted");
+        assert_eq!(frames[0].0, "shared-with-me-updated");
+        assert_eq!(frames[0].1, serde_json::json!({ "cid": hex::encode(cid) }));
     }
 }
 
@@ -64369,6 +64470,7 @@ pub fn run() {
             list_received_grants,
             grant_read,
             revoke_read,
+            dismiss_received_grant,
             ingest_avatar_bytes,
             ingest_vine_video,
             ingest_profile_doc,
