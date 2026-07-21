@@ -2730,8 +2730,10 @@
       // can light. Only mark-seen when the user is ALREADY viewing the section —
       // otherwise the badge must stay lit until they open the tab.
       const unlistenSharedWithMe = await listen('shared-with-me-updated', () => {
-        void refreshReceivedFiles().then(() => {
-          if (fileSection === 'sharedWithMe') markSharedSeen();
+        void refreshReceivedFiles().then((loaded) => {
+          // Only advance the watermark after a committed refresh, and only while
+          // the user is viewing the section — otherwise the badge stays lit.
+          if (loaded && fileSection === 'sharedWithMe') markSharedSeen();
         });
       });
       fileManagerService.addUnlisten(unlistenSharedWithMe);
@@ -3074,18 +3076,24 @@
     sharedUnreadCount = unreadReceivedCount(receivedFiles, swmLastSeen());
   }
 
-  async function refreshReceivedFiles(): Promise<void> {
+  // Returns `true` only when THIS call is the newest (non-superseded) refresh
+  // AND it committed a successful load. Callers gate `markSharedSeen()` on this
+  // so a stale/superseded or failed refresh never advances the "seen" watermark.
+  async function refreshReceivedFiles(): Promise<boolean> {
     const req = ++receivedFilesReq;
     try {
       const rows = await fileManagerService.listReceivedGrants();
-      if (req !== receivedFilesReq) return; // stale — a newer refresh owns the state
+      if (req !== receivedFilesReq) return false; // stale — a newer refresh owns the state
       receivedFiles = rows;
+      recomputeSharedUnread();
+      return true;
     } catch (err) {
-      if (req !== receivedFilesReq) return;
+      if (req !== receivedFilesReq) return false;
       console.error('listReceivedGrants failed:', err);
       receivedFiles = null; // unresolved, NOT [] (null-until-resolved honesty)
+      recomputeSharedUnread();
+      return false;
     }
-    recomputeSharedUnread();
   }
 
   function markSharedSeen() {
@@ -3114,9 +3122,17 @@
   // clears its unread badge. Only reads `fileSection` synchronously — the state
   // writes happen in the async continuation, so this effect can't self-retrigger.
   $effect(() => {
-    if (fileSection === 'sharedWithMe') {
-      void refreshReceivedFiles().then(markSharedSeen);
-    }
+    if (fileSection !== 'sharedWithMe') return;
+    let active = true;
+    void refreshReceivedFiles().then((loaded) => {
+      // Advance the "seen" watermark only if THIS refresh committed a load AND
+      // the user is still on the tab: a superseded/failed refresh, or one the
+      // user has already navigated away from, must not mark grants seen.
+      if (active && loaded && fileSection === 'sharedWithMe') markSharedSeen();
+    });
+    return () => {
+      active = false;
+    };
   });
 
   // ZEB-674 C5: the "Share with…" picker's friend source — reuses the same

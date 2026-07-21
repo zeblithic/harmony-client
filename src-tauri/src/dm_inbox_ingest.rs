@@ -2352,12 +2352,17 @@ mod tests {
         assert!(changed, "grant sweep mutated the doc");
 
         let frames = sink_handle.frames();
-        assert!(
-            frames
-                .iter()
-                .any(|(name, payload)| name == "shared-with-me-updated"
-                    && payload["cid"] == serde_json::json!(hex::encode(cid_bytes))),
-            "a newly recorded grant emits shared-with-me-updated with its cid; got {frames:?}"
+        let matching = frames
+            .iter()
+            .filter(|(name, payload)| {
+                name == "shared-with-me-updated"
+                    && payload["cid"] == serde_json::json!(hex::encode(cid_bytes))
+            })
+            .count();
+        assert_eq!(
+            matching, 1,
+            "exactly one shared-with-me-updated frame for the recorded grant's cid \
+             (cardinality + idempotency — a single record must not double-emit); got {frames:?}"
         );
     }
 

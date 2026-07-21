@@ -20807,7 +20807,10 @@ mod file_share_ipc_tests {
         let rows = list_received_grants_impl(&state).await.expect("list ok");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cid, hex::encode(cid));
+        assert_eq!(rows[0].granter_address, hex::encode([0x77u8; 16]));
         assert_eq!(rows[0].file_name, "shared.txt");
+        assert_eq!(rows[0].file_size, 42);
+        assert_eq!(rows[0].mime, "text/plain");
         assert_eq!(rows[0].received_at, 1_234);
     }
 }
