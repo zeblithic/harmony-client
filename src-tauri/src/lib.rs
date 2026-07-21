@@ -20253,6 +20253,25 @@ pub(crate) async fn list_grants_impl(
     Ok(crate::file_sharing::list_grants_inner(&st, cid))
 }
 
+/// `list_received_grants()` core: project `received_file_grants` into DTO rows
+/// (granter address + friend-resolved display + file meta + received_at) for the
+/// grantee's "Shared with me" surface. Read-only; newest first. `Err("no owner
+/// loaded")` pre-mint — the frontend treats any error as "unresolved", never as
+/// proven-empty.
+pub(crate) async fn list_received_grants_impl(
+    state: &Mutex<NodeState>,
+) -> Result<Vec<crate::file_sharing::ReceivedGrantDto>, String> {
+    let crdt_state = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .crdt_state
+            .clone()
+            .ok_or_else(|| "no owner loaded".to_string())?
+    };
+    let st = crdt_state.lock().await;
+    Ok(crate::file_sharing::list_received_grants_inner(&st))
+}
+
 /// `grant_read(cid, granteeAddress)` core: share read access to an encrypted
 /// file with an active friend. Rejects a public CID / non-friend / a grantee
 /// with no resolvable device keys with the stable `ineligible:` prefix (see
@@ -20457,6 +20476,14 @@ async fn list_grants(
     cid: String,
 ) -> Result<Vec<crate::file_sharing::FileGrantDto>, String> {
     list_grants_impl(state.inner(), cid).await
+}
+
+/// ZEB-723: project the grantee's "Shared with me" list.
+#[tauri::command]
+async fn list_received_grants(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<crate::file_sharing::ReceivedGrantDto>, String> {
+    list_received_grants_impl(state.inner()).await
 }
 
 /// ZEB-674 Task 6: share read access to an encrypted file with a friend.
@@ -20745,6 +20772,43 @@ mod file_share_ipc_tests {
         let blobs: Vec<serde_bytes::ByteBuf> =
             ciborium::from_reader(gp.as_slice()).expect("grant_push decodes");
         assert_eq!(blobs.len(), 1, "one sealed blob per known device");
+    }
+
+    #[tokio::test]
+    async fn list_received_grants_impl_errors_pre_mint() {
+        let state = Mutex::new(NodeState::default());
+        let err = list_received_grants_impl(&state)
+            .await
+            .expect_err("no owner loaded pre-mint");
+        assert_eq!(err, "no owner loaded");
+    }
+
+    #[tokio::test]
+    async fn list_received_grants_impl_projects_received_map() {
+        use crate::owner_state_types::ReceivedFileGrant;
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store);
+        let cid = [0x5C; 32];
+        {
+            let crdt = state.lock().unwrap().crdt_state.clone().unwrap();
+            crdt.lock().await.received_file_grants.insert(
+                cid,
+                ReceivedFileGrant {
+                    granter_owner: crate::owner_state_types::OwnerAddr([0x77; 16]),
+                    cid,
+                    file_name: "shared.txt".into(),
+                    file_size: 42,
+                    mime: "text/plain".into(),
+                    sealed_dek: vec![9, 9, 9],
+                    received_at: 1_234,
+                },
+            );
+        }
+        let rows = list_received_grants_impl(&state).await.expect("list ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cid, hex::encode(cid));
+        assert_eq!(rows[0].file_name, "shared.txt");
+        assert_eq!(rows[0].received_at, 1_234);
     }
 }
 
@@ -64100,6 +64164,7 @@ pub fn run() {
             ingest_content,
             ingest_content_encrypted,
             list_grants,
+            list_received_grants,
             grant_read,
             revoke_read,
             ingest_avatar_bytes,
