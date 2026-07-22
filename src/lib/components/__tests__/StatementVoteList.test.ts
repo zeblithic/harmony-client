@@ -104,6 +104,35 @@ describe('StatementVoteList', () => {
     expect(queryByText('A bridging idea')).toBeNull();
   });
 
+  it('renders the 3-bucket tally bar with per-bucket widths when counts are non-zero', () => {
+    // ZEB-648 item 2: the observer read-only branch renders TallyBar only
+    // when agree+disagree+pass > 0. Every other fixture is 0-count, so this
+    // net-new ZEB-607 render path was previously uncovered.
+    const adapter = new VotingAdapter();
+    const tallied: DeliberationStatementExport = {
+      ...stmt,
+      agreeCount: 3,
+      disagreeCount: 1,
+      passCount: 0,
+    };
+    const { container, getByLabelText } = render(StatementVoteList, {
+      props: {
+        detail: { ...baseDetail, myRole: 'observer', deliberationStatements: [tallied] },
+        adapter,
+        myAddr: 'zz'.repeat(32),
+        onChange: () => {},
+      },
+    });
+    const fills = container.querySelectorAll('.tally-fill');
+    expect(fills.length).toBe(3);
+    // total = 4 → 75% agree / 25% disagree / 0% pass.
+    expect((fills[0] as HTMLElement).style.width).toBe('75%');
+    expect((fills[1] as HTMLElement).style.width).toBe('25%');
+    expect((fills[2] as HTMLElement).style.width).toBe('0%');
+    // aria-label carries the counts, not a bare "Statement votes".
+    expect(getByLabelText('Statement votes: 3 agree, 1 disagree, 0 pass')).toBeTruthy();
+  });
+
   it('hides tri-button on own statement and shows "yours" chip', () => {
     const adapter = new VotingAdapter();
     // myAddr === stmt.author → self-vote case (Greptile bot-pass 2 P2).

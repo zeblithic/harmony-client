@@ -55,6 +55,21 @@ describe('ConvictionProposalCard', () => {
     expect(screen.getByLabelText('Lifecycle').textContent).toBe('Open');
   });
 
+  it('shows a sub-day half-life as hours (not "0d") and a whole-percent readout', () => {
+    // ZEB-648 item 3: half-life <~12h used to render "0d"; percent readout
+    // now whole-number (was toFixed(1)) so it matches the chip.
+    render(ConvictionProposalCard, {
+      props: {
+        communityId: COMMUNITY_ID,
+        proposal: makeProposal({ half_life_seconds: 6 * 3600 }),
+        adapter,
+      },
+    });
+    expect(screen.getByLabelText('Half-life').textContent).toContain('half-life 6h');
+    // 250 / 1000 = 25% of threshold, no decimals.
+    expect(screen.getByLabelText('Percent of threshold').textContent?.trim()).toBe('25%');
+  });
+
   it('shows "▲ Support" when the caller has not yet signaled', () => {
     render(ConvictionProposalCard, {
       props: {

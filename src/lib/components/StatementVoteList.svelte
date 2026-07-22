@@ -127,7 +127,7 @@
             <div class="chips-tally">
               <TallyBar
                 height={5}
-                label="Statement votes"
+                label={`Statement votes: ${s.agreeCount} agree, ${s.disagreeCount} disagree, ${s.passCount} pass`}
                 segments={[
                   { pct: (s.agreeCount / total) * 100, token: '--vote-for' },
                   { pct: (s.disagreeCount / total) * 100, token: '--vote-against' },

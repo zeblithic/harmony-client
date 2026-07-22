@@ -179,12 +179,21 @@ describe('CommunityProposalsPanel', () => {
       // Sanity: the delegation widget is part of the hub chrome, so the
       // detail-view assertion below is only meaningful if it's present now.
       expect(screen.queryByLabelText('Delegation')).toBeTruthy();
+      // ZEB-648 item 4: the hub "Open ballot →" button carries a
+      // per-proposal accessible name (was a shared bare name).
+      expect(screen.getByRole('button', { name: /open ballot for proposal/i })).toBeTruthy();
 
       await fireEvent.click(screen.getByText(/open ballot/i));
 
       // Doc column + on-record composed from real DTO fields.
       expect(screen.getByText('On the record')).toBeTruthy();
       expect(screen.getByText('✓ 3 keys')).toBeTruthy();
+      // ZEB-648 item 1: the doc-column breadcrumb pill and the vote-column
+      // card header pill render the SAME unified lifecycle label (previously
+      // "● Open" vs "Open").
+      const lifecyclePills = screen.getAllByLabelText('Lifecycle');
+      expect(lifecyclePills.length).toBe(2);
+      for (const pill of lifecyclePills) expect(pill.textContent).toBe('Open');
       // Scoped to the doc column's Method row — the vote-column card also
       // renders a bare "half-life 7d" chip, so match its fuller string.
       expect(screen.getByText(/conviction · half-life 7d/)).toBeTruthy();

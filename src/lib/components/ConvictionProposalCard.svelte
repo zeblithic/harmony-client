@@ -27,11 +27,12 @@
 
   import { convictionPercent, type Tier2ProposalExport } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
-  import { shortId } from '../short-addr';
   import { showSignalCastToast } from '../voting-toast-wiring';
-  import StatusPill, { type StatusPillVariant } from './governance/StatusPill.svelte';
+  import StatusPill from './governance/StatusPill.svelte';
   import TallyBar from './governance/TallyBar.svelte';
   import CountChip from './governance/CountChip.svelte';
+  import IdPill from './governance/IdPill.svelte';
+  import { tier2LifecyclePill, formatHalfLife } from './governance/proposal-format';
 
   let {
     communityId: _communityId,
@@ -110,38 +111,12 @@
     convictionPercent(proposal.total_conviction_ms, proposal.threshold_conviction_ms),
   );
 
-  /** Human label for the lifecycle badge. Spec §5: ThresholdReached
-   *  enters a 24h contestability window before finalize — the badge
-   *  copy reflects that. */
-  let lifecycleLabel = $derived.by(() => {
-    switch (proposal.lifecycle) {
-      case 'Open':
-        return 'Open';
-      case 'ThresholdReached':
-        return 'Threshold reached — 24h window';
-      case 'Finalized':
-        return 'Finalized';
-      case 'Archived':
-        return 'Archived';
-      default:
-        return proposal.lifecycle;
-    }
-  });
-
-  /** ZEB-607 D3: lifecycle → Commons pill variant. */
-  let lifecycleVariant = $derived.by((): StatusPillVariant => {
-    switch (proposal.lifecycle) {
-      case 'Open':
-        return 'open';
-      case 'ThresholdReached':
-        return 'passing';
-      case 'Finalized':
-        return 'passed';
-      default:
-        return 'archived';
-    }
-  });
-  let halfLifeDays = $derived(Math.round(proposal.half_life_seconds / 86_400));
+  /** ZEB-648: single {variant, label} shared with the panel breadcrumb so
+   *  one proposal never shows two different lifecycle labels on one screen.
+   *  (Spec §5: ThresholdReached's label spells out the 24h contestability
+   *  window.) */
+  let lifecyclePill = $derived(tier2LifecyclePill(proposal.lifecycle));
+  let halfLifeText = $derived(formatHalfLife(proposal.half_life_seconds));
 
   async function toggleSignal() {
     if (signaling || !canSignal) return;
@@ -179,9 +154,9 @@
   aria-label="Conviction proposal"
 >
   <header class="cp-header">
-    <span class="cp-id-pill" aria-label="Proposal id">{shortId(proposal.proposal_id)}</span>
-    <StatusPill variant={lifecycleVariant} label={lifecycleLabel} ariaLabel="Lifecycle" />
-    <span class="cp-half-life" aria-label="Half-life">half-life {halfLifeDays}d</span>
+    <IdPill id={proposal.proposal_id} ariaLabel="Proposal id" />
+    <StatusPill variant={lifecyclePill.variant} label={lifecyclePill.label} ariaLabel="Lifecycle" />
+    <span class="cp-half-life" aria-label="Half-life">half-life {halfLifeText}</span>
   </header>
 
   {#if !hideText}
@@ -191,10 +166,10 @@
   <div class="cp-bar-wrap" aria-label="Conviction progress">
     <TallyBar
       segments={[{ pct: pctFilled, token: pctFilled >= 100 ? '--gov-clay' : '--vote-for' }]}
-      label="Conviction vs threshold"
+      label={`Conviction ${pctFilled.toFixed(0)}% of threshold`}
     />
     <span class="cp-bar-pct" aria-label="Percent of threshold">
-      {pctFilled.toFixed(1)}%
+      {pctFilled.toFixed(0)}%
     </span>
   </div>
 
@@ -265,15 +240,6 @@
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
-  }
-  .cp-id-pill {
-    font-family: var(--font-mono);
-    font-weight: 600;
-    font-size: 0.62rem;
-    color: var(--text-bright);
-    background: var(--gov-clay);
-    padding: 2px 6px;
-    border-radius: 3px;
   }
   .cp-half-life {
     margin-left: auto;
