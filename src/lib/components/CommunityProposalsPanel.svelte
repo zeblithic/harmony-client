@@ -33,7 +33,7 @@
   import DelegationWidget from './DelegationWidget.svelte';
   import StatusPill from './governance/StatusPill.svelte';
   import IdPill from './governance/IdPill.svelte';
-  import { tier2LifecyclePill, formatHalfLife } from './governance/proposal-format';
+  import { tier2LifecyclePill, formatHalfLife, thresholdPercent } from './governance/proposal-format';
 
   let {
     communityId,
@@ -281,7 +281,7 @@
             <dt>Method</dt>
             <dd>conviction · half-life {formatHalfLife(selectedProposal.half_life_seconds)}</dd>
             <dt>Threshold</dt>
-            <dd>{selectedPct.toFixed(0)}% reached</dd>
+            <dd>{thresholdPercent(selectedPct)}% reached</dd>
             <dt>Signed by</dt>
             <dd class="or-keys">✓ {selectedProposal.voter_count} keys</dd>
           </dl>

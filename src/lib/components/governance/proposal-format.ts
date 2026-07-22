@@ -40,6 +40,19 @@ export function tier2LifecyclePill(lifecycle: Tier2Lifecycle): {
 }
 
 /**
+ * Whole-number threshold percent for display. Floors (does not round) so a
+ * proposal still below threshold never displays "100% reached" next to an
+ * "Open" lifecycle pill — threshold-reached fires only at an exact 100, and
+ * `toFixed(0)` would round anything in [99.5, 100) up to a premature "100".
+ * Input is already clamped to [0, 100] by `convictionPercent`; the clamp
+ * here is defensive.
+ */
+export function thresholdPercent(pct: number): number {
+  if (!Number.isFinite(pct)) return 0;
+  return Math.max(0, Math.min(100, Math.floor(pct)));
+}
+
+/**
  * Human half-life for a conviction proposal. `Math.round(s / 86_400)` alone
  * printed "0d" for any half-life under ~12h (ZEB-648 item 3); step down to
  * hours, then minutes, so a real duration always shows.

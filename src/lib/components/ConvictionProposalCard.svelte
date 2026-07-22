@@ -32,7 +32,7 @@
   import TallyBar from './governance/TallyBar.svelte';
   import CountChip from './governance/CountChip.svelte';
   import IdPill from './governance/IdPill.svelte';
-  import { tier2LifecyclePill, formatHalfLife } from './governance/proposal-format';
+  import { tier2LifecyclePill, formatHalfLife, thresholdPercent } from './governance/proposal-format';
 
   let {
     communityId: _communityId,
@@ -166,15 +166,15 @@
   <div class="cp-bar-wrap" aria-label="Conviction progress">
     <TallyBar
       segments={[{ pct: pctFilled, token: pctFilled >= 100 ? '--gov-clay' : '--vote-for' }]}
-      label={`Conviction ${pctFilled.toFixed(0)}% of threshold`}
+      label={`Conviction ${thresholdPercent(pctFilled)}% of threshold`}
     />
     <span class="cp-bar-pct" aria-label="Percent of threshold">
-      {pctFilled.toFixed(0)}%
+      {thresholdPercent(pctFilled)}%
     </span>
   </div>
 
   <div class="cp-chips">
-    <CountChip tone="sage" label="Threshold" value={`${pctFilled.toFixed(0)}% reached`} />
+    <CountChip tone="sage" label="Threshold" value={`${thresholdPercent(pctFilled)}% reached`} />
     <CountChip
       tone="clay"
       label="Supporters"

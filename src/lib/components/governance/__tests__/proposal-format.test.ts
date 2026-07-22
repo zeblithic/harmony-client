@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { tier2LifecyclePill, formatHalfLife } from '../proposal-format';
+import { tier2LifecyclePill, formatHalfLife, thresholdPercent } from '../proposal-format';
 
 describe('tier2LifecyclePill', () => {
   it('maps each Tier-2 lifecycle to a single {variant, label} used by both pills', () => {
@@ -13,6 +13,25 @@ describe('tier2LifecyclePill', () => {
     });
     expect(tier2LifecyclePill('Finalized')).toEqual({ variant: 'passed', label: 'Finalized' });
     expect(tier2LifecyclePill('Archived')).toEqual({ variant: 'archived', label: 'Archived' });
+  });
+});
+
+describe('thresholdPercent', () => {
+  it('floors so a sub-threshold proposal never displays a premature "100"', () => {
+    // toFixed(0) would round [99.5, 100) up to 100 — but threshold-reached
+    // fires only at an exact 100, so "100% reached" must not appear next to
+    // an "Open" pill.
+    expect(thresholdPercent(99.9)).toBe(99);
+    expect(thresholdPercent(99.5)).toBe(99);
+    expect(thresholdPercent(100)).toBe(100);
+    expect(thresholdPercent(25)).toBe(25);
+    expect(thresholdPercent(0.9)).toBe(0);
+  });
+
+  it('clamps out-of-range / non-finite input defensively', () => {
+    expect(thresholdPercent(150)).toBe(100);
+    expect(thresholdPercent(-5)).toBe(0);
+    expect(thresholdPercent(Number.NaN)).toBe(0);
   });
 });
 
