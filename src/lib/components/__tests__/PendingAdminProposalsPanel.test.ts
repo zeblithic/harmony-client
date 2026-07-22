@@ -72,6 +72,23 @@ describe('PendingAdminProposalsPanel', () => {
     expect(getByText(/Signed 1 of 2/)).toBeTruthy();
   });
 
+  it('renders_change_thresholds_proposal_summary', async () => {
+    const { invoke } = await import('@tauri-apps/api/core');
+    (invoke as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      makeProposal({
+        proposal_kind: { kind: 'ChangeThresholds', invite: 25, kick: 60, set_power: 100 },
+      }),
+    ]);
+
+    const { getByText } = render(PendingAdminProposalsPanel, {
+      props: { communityId: 'community-x', canAdmin: true },
+    });
+
+    await waitFor(() => {
+      expect(getByText('Change thresholds to invite 25 / kick 60 / set-power 100')).toBeTruthy();
+    });
+  });
+
   it('countersign_button_disabled_when_self_already_signed', async () => {
     const { invoke } = await import('@tauri-apps/api/core');
     (invoke as ReturnType<typeof vi.fn>).mockResolvedValueOnce([

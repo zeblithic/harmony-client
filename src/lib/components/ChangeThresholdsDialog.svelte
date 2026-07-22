@@ -196,7 +196,6 @@
     font-family: var(--font-mono);
   }
   .of-label { white-space: nowrap; font-size: 0.9rem; color: var(--text-muted); }
-  .quorum-preview { margin-block: 0.75rem; }
   .quorum-warning {
     background: var(--gov-clay-soft);
     border: 1px solid color-mix(in srgb, var(--gov-clay) 35%, var(--surface-raised));

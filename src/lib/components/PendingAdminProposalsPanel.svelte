@@ -7,6 +7,7 @@
     | { kind: 'SetPower'; target_addr: string; target_display_name: string | null; level: number }
     | { kind: 'Kick'; target_addr: string; target_display_name: string | null; reason: string | null }
     | { kind: 'ChangeQuorum'; new_quorum: number }
+    | { kind: 'ChangeThresholds'; invite: number; kick: number; set_power: number }
     | {
         kind: 'SetRecoveryDesignates';
         designate_addrs: string[];
@@ -152,6 +153,8 @@
       }
       case 'ChangeQuorum':
         return `Change quorum to ${kind.new_quorum}`;
+      case 'ChangeThresholds':
+        return `Change thresholds to invite ${kind.invite} / kick ${kind.kick} / set-power ${kind.set_power}`;
       case 'SetRecoveryDesignates': {
         // Exact when whole days; one decimal with an explicit "~" when
         // fractional — never silently round 7.5 days up to "8".

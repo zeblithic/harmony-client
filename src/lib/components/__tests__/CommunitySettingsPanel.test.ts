@@ -434,6 +434,43 @@ describe('CommunitySettingsPanel', () => {
     expect(queryByText('Change quorum…')).toBeNull();
   });
 
+  // ── ZEB-251: per-community power thresholds wiring ─────────────────────────
+
+  it('admin_governance_section_shows_change_thresholds_button_for_admin', () => {
+    const { getByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, myPower: 100 },
+    });
+    expect(getByText('Change thresholds…')).toBeTruthy();
+  });
+
+  it('admin_governance_section_hides_change_thresholds_button_for_non_admin', () => {
+    const { queryByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, myPower: 0, myAddress: plainMember.address },
+    });
+    expect(queryByText('Change thresholds…')).toBeNull();
+  });
+
+  it('clicking Change thresholds… opens ChangeThresholdsDialog with current thresholds', async () => {
+    const { getByText, getByLabelText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, myPower: 100, thresholds: { invite: 10, kick: 40, setPower: 90 } },
+    });
+    await fireEvent.click(getByText('Change thresholds…'));
+    expect(getByLabelText('Change power thresholds')).toBeTruthy();
+    expect((getByLabelText('Invite threshold number') as HTMLInputElement).value).toBe('10');
+    expect((getByLabelText('Kick threshold number') as HTMLInputElement).value).toBe('40');
+    expect((getByLabelText('Set-power threshold number') as HTMLInputElement).value).toBe('90');
+  });
+
+  it('per-community invite threshold overrides the POWER_THRESHOLDS default (ZEB-251)', () => {
+    // Default invite threshold is 0 (everyone can invite). A customized
+    // community raising invite to 50 must hide the Invites section for a
+    // caller whose power (10) is below the custom threshold.
+    const { queryByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, myPower: 10, thresholds: { invite: 50, kick: 50, setPower: 100 } },
+    });
+    expect(queryByText('Invites')).toBeNull();
+  });
+
   it('pending_promotion_badge_renders_on_target_member_row', async () => {
     const { invoke } = vi.mocked(await import('@tauri-apps/api/core'));
     const adminProposal = {
