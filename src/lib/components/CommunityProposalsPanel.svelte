@@ -32,6 +32,8 @@
   import DelegationGraph from './DelegationGraph.svelte';
   import DelegationWidget from './DelegationWidget.svelte';
   import StatusPill from './governance/StatusPill.svelte';
+  import IdPill from './governance/IdPill.svelte';
+  import { tier2LifecyclePill, formatHalfLife, thresholdPercent } from './governance/proposal-format';
 
   let {
     communityId,
@@ -258,24 +260,18 @@
 
 <section class="community-proposals" aria-label="Community proposals">
   {#if selectedProposal}
+    {@const breadcrumbPill = tier2LifecyclePill(selectedProposal.lifecycle)}
     <button type="button" class="detail-back" onclick={() => (selectedProposalId = null)}>
       ← All proposals
     </button>
     <div class="detail-grid">
       <article class="doc-col" aria-label="Proposal document">
         <div class="doc-breadcrumb">
-          <span class="doc-id-pill">{shortId(selectedProposal.proposal_id)}</span>
+          <IdPill id={selectedProposal.proposal_id} />
           <StatusPill
-            variant={selectedProposal.lifecycle === 'Open'
-              ? 'open'
-              : selectedProposal.lifecycle === 'ThresholdReached'
-                ? 'passing'
-                : selectedProposal.lifecycle === 'Finalized'
-                  ? 'passed'
-                  : 'archived'}
-            label={selectedProposal.lifecycle === 'ThresholdReached'
-              ? 'Threshold reached'
-              : undefined}
+            variant={breadcrumbPill.variant}
+            label={breadcrumbPill.label}
+            ariaLabel="Lifecycle"
           />
         </div>
         <p class="doc-text">{selectedProposal.proposal_text}</p>
@@ -283,9 +279,9 @@
           <h5 class="or-heading">On the record</h5>
           <dl class="or-rows">
             <dt>Method</dt>
-            <dd>conviction · half-life {Math.round(selectedProposal.half_life_seconds / 86_400)}d</dd>
+            <dd>conviction · half-life {formatHalfLife(selectedProposal.half_life_seconds)}</dd>
             <dt>Threshold</dt>
-            <dd>{selectedPct.toFixed(1)}% reached</dd>
+            <dd>{thresholdPercent(selectedPct)}% reached</dd>
             <dt>Signed by</dt>
             <dd class="or-keys">✓ {selectedProposal.voter_count} keys</dd>
           </dl>
@@ -383,6 +379,7 @@
           <button
             type="button"
             class="hub-open-link"
+            aria-label={`Open ballot for proposal ${shortId(proposal.proposal_id)}`}
             onclick={() => (selectedProposalId = proposal.proposal_id)}
           >
             Open ballot →
@@ -527,15 +524,6 @@
     display: flex;
     align-items: center;
     gap: 8px;
-  }
-  .doc-id-pill {
-    font-family: var(--font-mono);
-    font-weight: 600;
-    font-size: 0.62rem;
-    color: var(--text-bright);
-    background: var(--gov-clay);
-    padding: 2px 6px;
-    border-radius: 3px;
   }
   .doc-text {
     margin: 0;

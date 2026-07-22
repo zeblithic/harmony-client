@@ -1,13 +1,6 @@
 <script lang="ts" module>
-  export type StatusPillVariant =
-    | 'drafting'
-    | 'open'
-    | 'passing'
-    | 'failing'
-    | 'passed'
-    | 'failed'
-    | 'archived'
-    | 'recalled';
+  import type { StatusPillVariant } from './status-pill-variant';
+  export type { StatusPillVariant };
 
   const DEFAULT_LABELS: Record<StatusPillVariant, string> = {
     drafting: 'Drafting',
