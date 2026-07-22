@@ -99,8 +99,10 @@ impl NodeHandle {
             .env("HARMONY_PASSPHRASE", &config.passphrase)
             .env("HARMONY_RETICULUM_PORT", "0")
             .env("HARMONY_API_PORT", "0")
-            // ZEB-720: per-node extra env (e.g. short voting cadence). Layered
-            // last so a scenario can override, but never the isolation vars above.
+            // ZEB-720: per-node extra env (e.g. short voting cadence), layered
+            // LAST — chained after the isolation `.env(...)` calls above, so a
+            // colliding key would win. Keep `extra_env` to non-isolation vars
+            // (today only the two HARMONY_VOTING_* cadence knobs).
             .envs(
                 config
                     .extra_env
