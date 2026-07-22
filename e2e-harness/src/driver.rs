@@ -1183,9 +1183,11 @@ pub fn recovery_proposal<'a>(
 // ── Tier-2 Conviction voting (ZEB-720) ───────────────────────────────
 
 /// Create a Tier-2 Conviction proposal whose finalization auto-execs
-/// `SetPower{target, new_power}`. `threshold_min` is the raw ms-scale
-/// conviction floor (small ⇒ threshold crosses quickly). `min_power` gates
-/// signal eligibility. Returns the hex proposal id.
+/// `SetPower{target, new_power}`. `threshold_min`/`threshold_max` are the raw
+/// ms-scale conviction band (small ⇒ threshold crosses quickly — a test uses a
+/// tiny band so a single signal finalizes in seconds, since conviction is a
+/// real-time integral that otherwise takes days). `min_power` gates signal
+/// eligibility. Returns the hex proposal id.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_tier2_setpower_proposal(
     node: &NodeHandle,
@@ -1195,6 +1197,7 @@ pub async fn create_tier2_setpower_proposal(
     target_addr: &str,
     new_power: u32,
     threshold_min: i64,
+    threshold_max: i64,
     min_power: u32,
 ) -> anyhow::Result<String> {
     let v = node
@@ -1205,6 +1208,7 @@ pub async fn create_tier2_setpower_proposal(
                 "channelId": channel_id,
                 "proposalText": proposal_text,
                 "thresholdMin": threshold_min,
+                "thresholdMax": threshold_max,
                 "minPower": min_power,
                 "setPowerTarget": target_addr,
                 "setPowerNewPower": new_power,
