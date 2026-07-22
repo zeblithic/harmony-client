@@ -2881,6 +2881,34 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     }
 }
 
+/// ZEB-316: deterministic, replica-identical HLC for an engine-auto mint.
+///
+/// Strictly newer than `base`; the `device_id` is a poll-derived lane
+/// (`engine-auto-{kind}-{poll_prefix}`) so every replica reacting to the
+/// SAME `base` produces a bit-identical HLC → bit-identical signing_bytes →
+/// bit-identical event_hash. Unlike `reserve_next_local_hlc`, this reads NO
+/// wall-clock, NO `self.device_id`, and does NOT touch the hlc_tracker — all
+/// three diverge per replica. `kind` ∈ {"cl","sf","rs"}.
+fn engine_auto_hlc_from_base(base: &Hlc, pid: &PollId, kind: &str) -> Hlc {
+    let lane = format!("engine-auto-{kind}-{}", hex::encode(&pid.0[..4]));
+    // Strictly newer by (wall_ms, logical, device_id): logical+1 at equal wall.
+    // Saturation guard (astronomically unlikely — logical resets on wall advance):
+    // if logical is maxed, bump wall and reset logical so it stays strictly newer.
+    if base.logical == u32::MAX {
+        Hlc {
+            wall_ms: base.wall_ms.saturating_add(1),
+            logical: 0,
+            device_id: lane,
+        }
+    } else {
+        Hlc {
+            wall_ms: base.wall_ms,
+            logical: base.logical + 1,
+            device_id: lane,
+        }
+    }
+}
+
 // ── Inbound eligibility helper ──────────────────────────────────────────────
 
 /// Per-tier inbound eligibility check called from `process_inbound` between
@@ -5805,5 +5833,45 @@ mod tests {
             "payload must have exactly 4 keys (pollId, communityId, approver, \
              targetEventHash); got {obj:?}"
         );
+    }
+
+    // ── ZEB-316: deterministic engine-auto HLC derivation ──────────────────
+
+    #[test]
+    fn engine_auto_hlc_from_base_is_deterministic_and_strictly_newer() {
+        let pid = PollId([0xAB; 32]);
+        let base = Hlc {
+            wall_ms: 1_000,
+            logical: 3,
+            device_id: "engine".into(),
+        };
+
+        let a = engine_auto_hlc_from_base(&base, &pid, "cl");
+        let b = engine_auto_hlc_from_base(&base, &pid, "cl");
+        // Deterministic: identical (base, pid, kind) → identical HLC.
+        assert_eq!(a, b);
+        // Strictly newer than base.
+        assert!(a.is_strictly_newer_than(&base), "must be strictly newer");
+        // Poll-derived lane (first 4 bytes of poll_id hex).
+        assert_eq!(a.device_id, "engine-auto-cl-abababab");
+        // Same wall, logical+1 in the common case.
+        assert_eq!(a.wall_ms, 1_000);
+        assert_eq!(a.logical, 4);
+
+        // Distinct kinds → distinct lanes, but both strictly newer than base.
+        let rs = engine_auto_hlc_from_base(&base, &pid, "rs");
+        assert_eq!(rs.device_id, "engine-auto-rs-abababab");
+        assert!(rs.is_strictly_newer_than(&base));
+
+        // Saturation guard: logical at u32::MAX bumps wall instead.
+        let maxed = Hlc {
+            wall_ms: 5,
+            logical: u32::MAX,
+            device_id: "x".into(),
+        };
+        let d = engine_auto_hlc_from_base(&maxed, &pid, "cl");
+        assert_eq!(d.wall_ms, 6);
+        assert_eq!(d.logical, 0);
+        assert!(d.is_strictly_newer_than(&maxed));
     }
 }
