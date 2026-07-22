@@ -252,8 +252,22 @@ impl VotingReplayTracker {
     /// distinct-coordinate peer mint passes to the apply-time monotonic +
     /// terminal-state gates (the real correctness filter). This matches the
     /// coordinate dedup the ZEB-718 backfill path already uses.
+    ///
+    /// Classification requires BOTH the reserved lane prefix AND an engine-auto
+    /// terminal kind (kd=cl/kd=rs/kd=sf — the only events ever minted on these
+    /// lanes). `Hlc.device_id` is an unvalidated `String`, so a real
+    /// single-writer device lane that merely happens to share the prefix (or an
+    /// engine-auto lane carrying an unexpected kind) must keep the cheap,
+    /// monotone high-water gate rather than silently weaken to coordinate dedup.
     pub fn is_inbound_duplicate(&self, event: &SignedVotingEvent) -> bool {
-        if event.hlc.device_id.starts_with(ENGINE_AUTO_LANE_PREFIX) {
+        let is_multi_writer_engine_auto = event.hlc.device_id.starts_with(ENGINE_AUTO_LANE_PREFIX)
+            && matches!(
+                event.kind,
+                PollEventKindCode::PollClose
+                    | PollEventKindCode::PollResult
+                    | PollEventKindCode::SortitionFailed
+            );
+        if is_multi_writer_engine_auto {
             self.seen_coord(event)
         } else {
             self.contains(event)
@@ -3432,6 +3446,26 @@ mod tests {
         }
     }
 
+    /// A kd=rs (PollResult) event on `lane` — the terminal engine-auto kind
+    /// carried by the multi-writer poll-derived lanes. Used by the
+    /// `is_inbound_duplicate` lane-classification tests.
+    fn engine_auto_result_event(actor: OwnerAddr, lane: &str, wall_ms: u64) -> SignedVotingEvent {
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollResult,
+            hlc: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: lane.into(),
+            },
+            actor,
+            payload: Vec::new(),
+            sig: vec![0u8; 64],
+        }
+    }
+
     fn encode_event(event: &SignedVotingEvent) -> Vec<u8> {
         let mut buf = Vec::new();
         ciborium::into_writer(event, &mut buf).expect("encode event");
@@ -3677,8 +3711,8 @@ mod tests {
         let mut tracker = VotingReplayTracker::new();
         let actor = OwnerAddr([0xaa; 16]);
         let lane = "engine-auto-rs-abababab";
-        let hi = poll_create_event(actor, lane, 2_000); // higher ordinal, recorded
-        let lo = poll_create_event(actor, lane, 1_000); // distinct, lower ordinal
+        let hi = engine_auto_result_event(actor, lane, 2_000); // higher ordinal, recorded
+        let lo = engine_auto_result_event(actor, lane, 1_000); // distinct, lower ordinal
 
         tracker.record(&hi);
 
@@ -3689,7 +3723,8 @@ mod tests {
             "high-water gate would drop the lower-ordinal peer mint"
         );
         // ...but the lane-aware predicate does NOT: `lo` is a distinct
-        // coordinate, so it passes through to the apply-time gates.
+        // coordinate on a multi-writer engine-auto terminal (kd=rs) lane, so it
+        // passes through to the apply-time gates.
         assert!(
             !tracker.is_inbound_duplicate(&lo),
             "engine-auto lane must dedup by exact coordinate, not high-water"
@@ -3698,6 +3733,29 @@ mod tests {
         assert!(
             tracker.is_inbound_duplicate(&hi),
             "exact-coordinate redelivery on the engine-auto lane is still a duplicate"
+        );
+    }
+
+    #[test]
+    fn is_inbound_duplicate_requires_terminal_kind_not_just_lane_prefix() {
+        // ZEB-731 (Qodo bug 1): `Hlc.device_id` is an unvalidated String, so a
+        // real single-writer device lane could happen to share the reserved
+        // `engine-auto-` prefix. Classification must require BOTH the prefix AND
+        // an engine-auto terminal kind (kd=cl/kd=rs/kd=sf) — a non-terminal kind
+        // (here PollCreate) on such a lane must keep the high-water gate, not
+        // silently weaken to coordinate dedup.
+        let mut tracker = VotingReplayTracker::new();
+        let actor = OwnerAddr([0xaa; 16]);
+        let lane = "engine-auto-lookalike-device";
+        let hi = poll_create_event(actor, lane, 2_000); // PollCreate — NOT a terminal kind
+        let lo = poll_create_event(actor, lane, 1_000);
+
+        tracker.record(&hi);
+        // High-water gate applies (kind is non-terminal despite the prefix), so
+        // the lower-ordinal event is treated as a duplicate.
+        assert!(
+            tracker.is_inbound_duplicate(&lo),
+            "prefix without a terminal kind must keep the high-water gate"
         );
     }
 
