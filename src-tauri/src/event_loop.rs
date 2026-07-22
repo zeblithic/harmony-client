@@ -1661,7 +1661,7 @@ pub async fn run(
                                 // thus adapter teardown) past the ~1s closing
                                 // SLA. `None` = reply abandoned; on a
                                 // closing-abandon break now.
-                                match recv_root_reply_bounded(reply_rx, &closing_qbl).await {
+                                match recv_root_reply_bounded(reply_rx, &closing_qbl, &topic_qbl).await {
                                     Some(wire) => {
                                         if let Err(e) = query.reply(query.key_expr(), wire).await {
                                             tracing::warn!(topic = %topic_qbl, error = %e,
@@ -9087,14 +9087,17 @@ mod vine_tombstone_routing_tests {
 /// (mirroring the sibling root-fetch drain loop below) so a node-stop unblocks
 /// teardown within one tick, plus an overall ~5s cap so a wedged (non-closing)
 /// engine can't pin the queryable indefinitely. `Some(packet)` is the servable
-/// wire; `None` means the reply was abandoned — `closing` flipped, the cap
-/// elapsed, the engine dropped the oneshot, or the engine reported an encode
-/// error — and in every `None` case the caller withholds the zenoh reply so the
-/// querier's latch backs off and retries (possibly against another responder).
+/// wire; `None` means the reply was abandoned — `closing` flipped (silent,
+/// routine shutdown), the cap elapsed (warned, since a non-closing wedged
+/// engine is a real fault), the engine dropped the oneshot, or the engine
+/// reported an encode error — and in every `None` case the caller withholds the
+/// zenoh reply so the querier's latch backs off and retries (possibly against
+/// another responder).
 /// The biased reply arm means the normal fast path pays no tick.
 async fn recv_root_reply_bounded<E>(
     mut reply_rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, E>>,
     closing: &AtomicBool,
+    topic: &str,
 ) -> Option<Vec<u8>> {
     // Closing-poll cadence; matches the root-fetch drain loop below.
     const POLL: Duration = Duration::from_millis(500);
@@ -9110,7 +9113,23 @@ async fn recv_root_reply_bounded<E>(
             r = &mut reply_rx => return r.ok().and_then(|inner| inner.ok()),
             _ = tokio::time::sleep(POLL) => {
                 ticks += 1;
-                if closing.load(Ordering::SeqCst) || ticks >= MAX_TICKS {
+                // A `closing`-triggered abandon is routine (every stop_node)
+                // and stays silent — logging it would spam a warning on every
+                // shutdown. The cap firing while NOT closing is a genuinely
+                // degraded condition (a wedged / non-responsive engine), so
+                // warn once with the topic so an operator debugging silent
+                // state-root stalls has a log line to find. Same `!closing`
+                // discipline as this adapter's publish/subscriber warnings.
+                if closing.load(Ordering::SeqCst) {
+                    return None;
+                }
+                if ticks >= MAX_TICKS {
+                    tracing::warn!(
+                        %topic,
+                        timeout = ?(POLL * MAX_TICKS),
+                        "state-root queryable abandoned reply: engine did not \
+                         respond within the cap (wedged?); querier will retry"
+                    );
                     return None;
                 }
             }
@@ -9140,7 +9159,7 @@ mod root_reply_bounded_tests {
         tx.send(Ok(vec![1, 2, 3])).unwrap();
         let closing = Arc::new(AtomicBool::new(false));
         let start = tokio::time::Instant::now();
-        let got = recv_root_reply_bounded(rx, &closing).await;
+        let got = recv_root_reply_bounded(rx, &closing, "harmony/test/state-root-v1").await;
         assert_eq!(got, Some(vec![1, 2, 3]));
         assert_eq!(start.elapsed(), Duration::ZERO, "fast path pays no tick");
     }
@@ -9152,7 +9171,7 @@ mod root_reply_bounded_tests {
         let (tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
         tx.send(Err("encode boom".to_string())).unwrap();
         let closing = Arc::new(AtomicBool::new(false));
-        let got = recv_root_reply_bounded(rx, &closing).await;
+        let got = recv_root_reply_bounded(rx, &closing, "harmony/test/state-root-v1").await;
         assert_eq!(got, None);
     }
 
@@ -9163,7 +9182,7 @@ mod root_reply_bounded_tests {
         let (tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
         drop(tx);
         let closing = Arc::new(AtomicBool::new(false));
-        let got = recv_root_reply_bounded(rx, &closing).await;
+        let got = recv_root_reply_bounded(rx, &closing, "harmony/test/state-root-v1").await;
         assert_eq!(got, None);
     }
 
@@ -9176,7 +9195,7 @@ mod root_reply_bounded_tests {
         let (_tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
         let closing = Arc::new(AtomicBool::new(true));
         let start = tokio::time::Instant::now();
-        let got = recv_root_reply_bounded(rx, &closing).await;
+        let got = recv_root_reply_bounded(rx, &closing, "harmony/test/state-root-v1").await;
         assert_eq!(got, None);
         assert_eq!(
             start.elapsed(),
@@ -9192,7 +9211,7 @@ mod root_reply_bounded_tests {
         let (_tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
         let closing = Arc::new(AtomicBool::new(false));
         let start = tokio::time::Instant::now();
-        let got = recv_root_reply_bounded(rx, &closing).await;
+        let got = recv_root_reply_bounded(rx, &closing, "harmony/test/state-root-v1").await;
         assert_eq!(got, None);
         assert_eq!(
             start.elapsed(),
@@ -9216,7 +9235,7 @@ mod root_reply_bounded_tests {
             let _ = tx.send(Ok(vec![7, 7]));
         });
         let start = tokio::time::Instant::now();
-        let got = recv_root_reply_bounded(rx, &closing).await;
+        let got = recv_root_reply_bounded(rx, &closing, "harmony/test/state-root-v1").await;
         assert_eq!(got, Some(vec![7, 7]));
         assert_eq!(
             start.elapsed(),
@@ -9371,7 +9390,7 @@ pub fn spawn_community_state_zenoh_adapter(
                         // error, engine gone, closing, or the wedged-engine
                         // cap). On a closing-abandon, break now instead of
                         // looping back to pay the outer 1s poll.
-                        match recv_root_reply_bounded(reply_rx, &closing_qbl).await {
+                        match recv_root_reply_bounded(reply_rx, &closing_qbl, &topic_qbl).await {
                             Some(packet) => {
                                 if let Err(e) = query.reply(query.key_expr(), packet).await {
                                     tracing::warn!(topic = %topic_qbl, error = %e,
