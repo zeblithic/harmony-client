@@ -45,13 +45,14 @@ Both the deletion mechanic and the no-registry fallback already exist and are re
 1. **`#[tauri::command] async fn clear_space_local_cache(state_lock, community_id: String) -> Result<(), String>`** delegating to `clear_space_local_cache_impl` — mirror `remove_space` wrapper (`lib.rs:42147-42153`). Register in `generate_handler!` at `lib.rs:64745` (next to `remove_space,`).
    - Param is `community_id` (JS camelCase `communityId`) — this op is community-only, unlike `remove_space`'s generic `space_id`.
 2. **Headless verb** in `api/rpc.rs`: an `rpc!(m, "clear_space_local_cache", CommunityIdArgs, |state, _sink, a| async move { crate::clear_space_local_cache_impl(state, a.community_id).await })` next to the `remove_space` verb (`rpc.rs:758-763`). Uses `CommunityIdArgs` (community-only), NOT `SpaceIdArgs`. Add the verb name to the verb-name assertion list near `rpc.rs:2256` if one gates registration.
-3. **Unit tests** — a `#[cfg(test)] mod clear_space_local_cache_tests` mirroring `remove_space_tests` (`lib.rs:42155`):
+3. **Unit tests** — a `#[cfg(test)] mod clear_space_local_cache_tests` mirroring `remove_space_tests` (`lib.rs:42155`). Six shipped:
+   - unknown id → `Err("no space … to clear")`;
+   - oversized hex (≠ 32 chars) → `Err` via the length-guard, before any decode (Qodo PR #530);
    - not-a-community kind → `Err`;
-   - community not left (`left_at.is_none()`) → `Err` (dir untouched);
-   - still-active member (engine shows `Joined`) → `Err`;
+   - community not left (`left_at.is_none()`) → `Err`, **and a planted dir survives** (destructive-safety: a refused op deletes nothing);
    - **happy path**: left community with an on-disk dir → `Ok`, dir gone, **Space row still present with `left_at` still set** (the load-bearing invariant vs `remove_space`), **no tombstone written**;
-   - **idempotent**: second call (dir already absent) → `Ok`;
-   - unknown id → `Err("no space … to clear")`.
+   - **idempotent**: plant a dir, clear (dir deleted), clear again (dir absent) → `Ok`, row + `left_at` kept.
+   - **Waived** — a live-engine *still-active-member* (`Joined`) refusal test: the active-member path reuses the already-tested pure guard `remove_space_community_guard` (`remove_space_tests::guard_refuses_only_active_members`), matching the sibling's coverage posture; standing up a live `CommunitySyncEngine` fixture here is disproportionate. The node-generation-abort concurrency seam is likewise impractical to unit-test (identical to `remove_space`).
 
 ## Out of scope (explicitly deferred)
 

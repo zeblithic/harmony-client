@@ -42169,11 +42169,16 @@ pub(crate) async fn clear_space_local_cache_impl(
     state: &std::sync::Mutex<NodeState>,
     community_id: String,
 ) -> Result<(), String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    // Length-check BEFORE decoding so an oversized, attacker-controlled hex
+    // string can't force a large allocation on this externally-invokable
+    // RPC/IPC surface (repo convention — PR #463/#313). Decode straight into the
+    // fixed 16-byte buffer; no intermediate `Vec`.
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let mut id_bytes = [0u8; 16];
+    hex::decode_to_slice(&community_id, &mut id_bytes)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
     let id_hex = hex::encode(space_id.0);
 
@@ -42347,6 +42352,18 @@ mod clear_space_local_cache_tests {
             .await
             .unwrap_err();
         assert!(err.contains("no space"), "{err}");
+    }
+
+    /// Qodo (PR #530): an oversized hex string is rejected by the length guard
+    /// BEFORE any decode/allocation happens.
+    #[tokio::test]
+    async fn oversized_hex_is_rejected_before_decode() {
+        let node = node_with(OwnerState::default());
+        // 64 hex chars (32 bytes) — twice the allowed length.
+        let err = clear_space_local_cache_impl(&node, "ab".repeat(32))
+            .await
+            .unwrap_err();
+        assert!(err.contains("16 bytes"), "{err}");
     }
 
     #[tokio::test]
