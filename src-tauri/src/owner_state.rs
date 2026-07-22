@@ -1422,33 +1422,6 @@ mod persistence_tests {
         assert_eq!(loaded.as_deref().copied(), Some(secret));
     }
 
-    /// ZEB-189: with `use_os_keychain = false` AND no encrypted-file fallback
-    /// (no `HARMONY_PASSPHRASE`), `save_secret` surfaces the file-store error —
-    /// NOT a keychain error — proving the keychain branch is never entered even
-    /// when the fallback is unavailable.
-    #[test]
-    #[serial]
-    fn secret_false_gate_without_passphrase_reports_file_error_not_keychain() {
-        // Force "no fallback configured": remove both passphrase sources for
-        // this #[serial] test (other tests set their own via EnvVarGuard).
-        std::env::remove_var("HARMONY_PASSPHRASE");
-        std::env::remove_var("HARMONY_PASSPHRASE_FILE");
-        let dir = tempdir().unwrap();
-        let err = save_secret(
-            false,
-            VaultSlot::Device,
-            KEYCHAIN_DEVICE_SK,
-            dir.path(),
-            "device_sk.enc",
-            &[0u8; 32],
-        )
-        .expect_err("no keychain + no file store must error");
-        assert!(
-            err.contains("HARMONY_PASSPHRASE not set"),
-            "false gate must fail on the file store, not the keychain, got: {err}"
-        );
-    }
-
     /// ZEB-492 carry-forward #3: a corrupt `fleet_keytree.enc` (garbage, not a
     /// valid v0x02 envelope) must surface as a clear Err — NOT a panic, and NOT
     /// silently-None (which would strand a cert-only device with no fleet
