@@ -869,7 +869,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// In Phase 4a-main this implements kd=sf only. ZEB-310 Tasks 10 + 11
     /// extend with kd=cl (drafting timeout / approval threshold) and
     /// kd=rs (ratification window close → STAR tally).
-    async fn maybe_trigger_engine_auto_orchestration(self: &Arc<Self>, pid: &PollId) {
+    async fn maybe_trigger_engine_auto_orchestration(
+        self: &Arc<Self>,
+        pid: &PollId,
+        base_hlc: &Hlc,
+    ) {
         // (1) Short-circuit: no local signing key ⇒ read-only peer.
         let (signing_key, self_owner) = {
             let r = self.local_signing.read().await;
@@ -938,7 +942,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
 
         if trigger_kd_sf {
             // (3) Mint a signed kd=sf event using the local signing key.
-            let hlc = self.reserve_next_local_hlc().await;
+            // ZEB-316: deterministic HLC derived from the triggering event's
+            // HLC (poll-derived lane, no wall-clock / device_id / tracker) so
+            // every replica reacting to the same base produces a bit-identical
+            // kd=sf event_hash.
+            let hlc = engine_auto_hlc_from_base(base_hlc, pid, "sf");
             let sf_ev = match crate::community_voting_core::build_signed_sortition_failed(
                 &signing_key,
                 self_owner,
@@ -1054,7 +1062,10 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         };
 
         if trigger_kd_cl {
-            let hlc = self.reserve_next_local_hlc().await;
+            // ZEB-316: deterministic HLC derived from the triggering event's
+            // HLC so the minted kd=cl (and hence `close_hlc`, which anchors the
+            // downstream kd=rs mint) is replica-identical.
+            let hlc = engine_auto_hlc_from_base(base_hlc, pid, "cl");
             let cl_ev = match crate::community_voting_core::build_signed_poll_close_tier3(
                 &signing_key,
                 self_owner,
@@ -1102,7 +1113,10 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // slice, derive advancers via `drafting_advancers`, then sort via
         // `ratification_candidates_ordering`. This ensures bit-identical
         // tally inputs across all engines that ever drive this code path.
-        let trigger_kd_rs_args: Option<crate::community_voting_star::StarResult> = {
+        // ZEB-316: carry `close_hlc` (the applied kd=cl event's HLC, snapshotted
+        // under the same lock) out of the block so the kd=rs mint below can
+        // anchor its deterministic HLC on it after the lock is dropped.
+        let trigger_kd_rs_args: Option<(crate::community_voting_star::StarResult, Option<Hlc>)> = {
             let log = self.voting_log.lock().await;
             let state = match log.polls.get(pid) {
                 Some(s) => s,
@@ -1153,12 +1167,26 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 );
                 let ballots = crate::community_voting_tier3::collect_ratification_ballots(t3);
                 let result = crate::community_voting_star::tally_star(&ordered, ballots);
-                Some(result)
+                // ZEB-316: snapshot close_hlc under the lock alongside result.
+                Some((result, t3.close_hlc.clone()))
             }
         };
 
-        if let Some(result) = trigger_kd_rs_args {
-            let hlc = self.reserve_next_local_hlc().await;
+        if let Some((result, close_hlc)) = trigger_kd_rs_args {
+            // ZEB-316: anchor the kd=rs mint on the poll's `close_hlc` (the
+            // applied kd=cl event's HLC) rather than a wall-clock reservation,
+            // so every replica derives a bit-identical kd=rs event_hash. If
+            // close_hlc is absent (no kd=cl applied), skip — the trigger gate
+            // above already requires close_event_hash.is_some(), so this is a
+            // defensive guard.
+            let Some(close_hlc) = close_hlc else {
+                tracing::debug!(
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=rs: close_hlc absent; skip"
+                );
+                return;
+            };
+            let hlc = engine_auto_hlc_from_base(&close_hlc, pid, "rs");
             let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
                 &signing_key,
                 self_owner,
@@ -1523,7 +1551,10 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     ) {
         // (1) Snapshot under lock, compute result, drop lock before
         // recursive publish_event.
-        let trigger_result: Option<crate::community_voting_star::StarResult> = {
+        // ZEB-316: carry `close_hlc` (the applied kd=cl event's HLC) out of the
+        // locked block so the se-mode kd=rs mint anchors its deterministic HLC
+        // on it after the lock is dropped.
+        let trigger_result: Option<(crate::community_voting_star::StarResult, Option<Hlc>)> = {
             let log = self.voting_log.lock().await;
             let state = match log.polls.get(pid) {
                 Some(s) => s,
@@ -1558,12 +1589,24 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 let ordered = crate::community_voting_tier3::ratification_candidates_ordering(
                     &advancers, sq_hash,
                 );
+                // ZEB-316: snapshot close_hlc under the lock alongside result.
                 crate::community_voting_tier3::recover_secret_tally(t3, &ordered)
+                    .map(|r| (r, t3.close_hlc.clone()))
             }
         };
 
-        if let Some(result) = trigger_result {
-            let hlc = self.reserve_next_local_hlc().await;
+        if let Some((result, close_hlc)) = trigger_result {
+            // ZEB-316: anchor the se-mode kd=rs mint on the poll's `close_hlc`
+            // (the applied kd=cl event's HLC) so every replica that crosses the
+            // tally-share threshold derives a bit-identical kd=rs event_hash.
+            let Some(close_hlc) = close_hlc else {
+                tracing::debug!(
+                    poll_id = %hex::encode(pid.0),
+                    "engine-auto kd=rs (secret): close_hlc absent; skip"
+                );
+                return;
+            };
+            let hlc = engine_auto_hlc_from_base(&close_hlc, pid, "rs");
             let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
                 signing_key,
                 self_owner,
@@ -1828,7 +1871,9 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // publish_event the hook triggers broadcasts in the natural order:
         // outer event first on the wire, then any follow-ups.
         if event.tier == Tier::Sortition {
-            self.maybe_trigger_engine_auto_orchestration(&applied_poll_id)
+            // ZEB-316: thread the just-applied event's HLC as the deterministic
+            // base for engine-auto kd=sf/kd=cl mints.
+            self.maybe_trigger_engine_auto_orchestration(&applied_poll_id, &event.hlc)
                 .await;
             // ZEB-310 Task 12: emit Tauri lifecycle events for Tier 3.
             // Runs AFTER orchestration so any kd=cl / kd=rs minted by the

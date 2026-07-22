@@ -1115,6 +1115,24 @@ async fn ipc_tier3_engine_auto_kd_cl_kd_rs_race_tolerant() {
         "CONVERGENCE: bit-identical StarResult across both engines"
     );
 
+    // ZEB-316: the engine-auto kd=cl HLC is deterministic — derived purely
+    // from the triggering kd=ss HLC, not wall-clock. Both replicas converge
+    // on the same close_hlc.
+    let expected_close_hlc = Hlc {
+        wall_ms: ss_hlc_wall,
+        logical: 1, // hlc_at(..) uses logical 0 → derived logical 1
+        device_id: format!("engine-auto-cl-{}", hex::encode(&poll_id.0[..4])),
+    };
+    assert_eq!(
+        t3_a.close_hlc.as_ref(),
+        Some(&expected_close_hlc),
+        "kd=cl HLC must be the deterministic derivation of the kd=ss trigger HLC"
+    );
+    assert_eq!(
+        t3_a.close_hlc, t3_b.close_hlc,
+        "both replicas converge on the same close_hlc"
+    );
+
     drop(engines);
 }
 
