@@ -104,6 +104,12 @@ pub struct VotingTickContext {
     /// ZEB-718: identity_dir for persisting a pruned log after the archive
     /// sweep. `None` ⇒ no persistence (test/headless contexts).
     pub identity_dir: Option<std::path::PathBuf>,
+    /// ZEB-720: contestability window before a ThresholdReached Tier-2 poll
+    /// finalizes. Defaults to `CONTESTABILITY_WINDOW_MS` (24h) at every
+    /// production bringup; overridable via `HARMONY_VOTING_CONTESTABILITY_WINDOW_MS`
+    /// for deterministic e2e finalization. Read as pure config — the tick
+    /// never reads the constant directly.
+    pub contestability_window_ms: i128,
 }
 
 /// Run one tick cycle. Returns aggregated stats for testing/observability.
@@ -268,7 +274,7 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                     };
                     let uncontested_since =
                         reached_at.max(t2.last_unsignal_after_threshold_ms.unwrap_or(reached_at));
-                    if (now_ms - uncontested_since) >= CONTESTABILITY_WINDOW_MS {
+                    if (now_ms - uncontested_since) >= ctx.contestability_window_ms {
                         to_finalize.push((*cid, *pid));
                     }
                 }
@@ -303,7 +309,7 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                                             t2.last_unsignal_after_threshold_ms
                                                 .unwrap_or(reached_at),
                                         );
-                                        (now_ms - uncontested_since) >= CONTESTABILITY_WINDOW_MS
+                                        (now_ms - uncontested_since) >= ctx.contestability_window_ms
                                     })
                                 });
                             if window_still_clear {
@@ -697,6 +703,7 @@ mod tests {
             emit,
             auto_exec_set_power,
             identity_dir: None,
+            contestability_window_ms: CONTESTABILITY_WINDOW_MS,
         };
         (ctx, captured_events, captured_auto_exec)
     }
@@ -876,6 +883,68 @@ mod tests {
             "expected voting-proposal-finalized event, got {:?}",
             events.iter().map(|(n, _)| n).collect::<Vec<_>>()
         );
+    }
+
+    // ZEB-720: finalization is gated on `ctx.contestability_window_ms`, not the
+    // bare constant. Same known-good fixture as the 24h test (a well-charged
+    // supporting voter, ticked at +25h where conviction stays above threshold);
+    // only the window differs between the two cases, so the window value is
+    // provably the deciding factor — in BOTH directions. This is the mechanism
+    // the e2e scenario relies on to finalize without a real 24h wait.
+    #[tokio::test]
+    async fn tier2_finalize_respects_ctx_contestability_window() {
+        let cid = SpaceId([0x33; 16]);
+        let pid = PollId([0x44; 32]);
+        let reached_at = 1_000i128;
+        let now_ms = reached_at + 25 * 60 * 60 * 1000; // +25h, like the 24h test
+
+        let build = || {
+            let cfg = make_tier2_config(AutoExecAction::None);
+            let mut t2 = Tier2ProposalState::new(cfg, 1);
+            let mut vs = crate::community_voting_conviction::VoterConvictionState::default();
+            vs.apply_signal(true, 0, 0, 86_400_000);
+            t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
+            t2.threshold_reached_at_ms = Some(reached_at);
+            let mut log = VotingLog::new();
+            log.polls.insert(
+                pid,
+                make_tier2_poll(cid, pid, Lifecycle::ThresholdReached, t2),
+            );
+            let mut logs = HashMap::new();
+            logs.insert(cid, Arc::new(Mutex::new(log)));
+            logs
+        };
+
+        // Short window (2s): +25h clears it → finalizes.
+        let (mut ctx_short, _e, _a) = make_ctx_with_logs(build(), reached_at);
+        ctx_short.contestability_window_ms = 2_000;
+        let s = run_voting_tick(&ctx_short, now_ms).await.unwrap();
+        assert_eq!(
+            s.tier2_proposals_finalized, 1,
+            "short window: +25h finalizes"
+        );
+
+        // Long window (30h > 25h): same now, NOT yet finalized.
+        let (mut ctx_long, _e, _a) = make_ctx_with_logs(build(), reached_at);
+        ctx_long.contestability_window_ms = 30 * 60 * 60 * 1000;
+        let s = run_voting_tick(&ctx_long, now_ms).await.unwrap();
+        assert_eq!(
+            s.tier2_proposals_finalized, 0,
+            "30h window: +25h is too soon"
+        );
+    }
+
+    // ZEB-720: the bringup env-parse expression falls back to the 24h default
+    // on a missing or unparseable override.
+    #[test]
+    fn contestability_window_env_parse_falls_back_to_default() {
+        let parse = |v: Option<&str>| -> i128 {
+            v.and_then(|s| s.parse::<i128>().ok())
+                .unwrap_or(CONTESTABILITY_WINDOW_MS)
+        };
+        assert_eq!(parse(None), CONTESTABILITY_WINDOW_MS);
+        assert_eq!(parse(Some("not-a-number")), CONTESTABILITY_WINDOW_MS);
+        assert_eq!(parse(Some("2000")), 2000);
     }
 
     #[tokio::test]
