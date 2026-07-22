@@ -164,6 +164,22 @@ applied the same triggering event:
 
 LWW then has a single hash to select; `close_event_hash` and `result` converge bit-identically.
 
+**Scope of the byte-identity guarantee (I-1).** The proof above is conditional on its premise —
+"both applied *the same* triggering event." Byte-identical `close_event_hash`/`kd=sf` therefore
+holds when the same event first satisfies the trigger on every replica, which is the common case
+(a single `kd=ss` pushing past the deadline fires both engines; verified by the strengthened
+race-tolerant + 100× tests). Under network reordering a *different* event may first cross the
+`kd=cl` deadline (`last_hlc.wall > created + window`) or the `kd=sf` decline-capacity threshold on
+different replicas; those replicas then mint on the same lane but with different ordinals →
+divergent `close_event_hash` (and, via a divergent `close_hlc`, a divergent pu-mode `kd=rs`
+*event*). This is **benign and non-regressive**: the vote *outcome* always converges — the tally is
+deterministic and both replicas reach `Finalized`/`Failed`, with late lifecycle duplicates absorbed
+by the terminal-state + monotonic apply gates — and `close_event_hash` is terminal materialized
+state, not compared in any cross-peer state-root, so a mismatch causes no fault. It is exactly the
+pre-ZEB-316 wall-clock outcome (different lanes, LWW winner). **Future code must not treat a
+`close_event_hash` mismatch across peers as corruption** (e.g. a backfill reconciler): only `result`
++ terminal `stage` are guaranteed peer-identical.
+
 ## Blast radius
 
 All production `reserve_next_local_hlc` call sites are in `community_voting_log_engine.rs`:
@@ -200,6 +216,8 @@ engine file.
 
 ## Acceptance (from ticket)
 
-1. Two engines holding local_signing converge bit-identically on `close_event_hash` + `result`.
+1. Two engines holding local_signing converge bit-identically on `close_event_hash` + `result`
+   **when they share the triggering event** (the common case); under a split trigger they still
+   converge on `result` + terminal `stage` via LWW (see §6 "Scope of the byte-identity guarantee").
 2. `maybe_trigger_engine_auto_orchestration` re-enabled from `process_inbound_dispatch`.
 3. `ipc_tier3_engine_auto_kd_cl_kd_rs_race_tolerant` passes deterministically (100×).

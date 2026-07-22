@@ -1065,6 +1065,15 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             // ZEB-316: deterministic HLC derived from the triggering event's
             // HLC so the minted kd=cl (and hence `close_hlc`, which anchors the
             // downstream kd=rs mint) is replica-identical.
+            //
+            // I-1 scope: this is byte-identical across replicas only when the
+            // SAME event first satisfies the trigger everywhere (the common
+            // case — one kd=ss past the deadline). Under reordering a different
+            // event may trip the deadline per replica → same lane, different
+            // ordinal → divergent close_event_hash. That is benign: `result` +
+            // terminal `stage` still converge via LWW + the terminal-state gate,
+            // and close_event_hash is not in any cross-peer state-root. Do NOT
+            // treat a peer close_event_hash mismatch as corruption.
             let hlc = engine_auto_hlc_from_base(base_hlc, pid, "cl");
             let cl_ev = match crate::community_voting_core::build_signed_poll_close_tier3(
                 &signing_key,
@@ -1528,15 +1537,17 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// ZEB-295 Phase 6 Task 8: finalize a se-mode poll by minting kd=rs
     /// once enough kd=ts have accumulated.
     ///
-    /// CodeRabbit PR #155 major: this method is the single source of
-    /// truth for the kd=rs (se-mode) emit, called from BOTH the outbound
-    /// orchestration cascade (`maybe_trigger_engine_auto_orchestration`)
-    /// and the inbound dispatch hook (`process_inbound_dispatch`). The
-    /// inbound path is load-bearing because a node that is NOT in the
-    /// committee never publishes kd=ts itself, so its outbound cascade
-    /// never executes; without the inbound invocation, a non-committee
-    /// node would observe ≥t kd=ts events from peers but never finalize
-    /// its own log → permanent divergence.
+    /// CodeRabbit PR #155 major: this method is the single source of truth
+    /// for the kd=rs (se-mode) emit. It has ONE direct caller — the tail of
+    /// `maybe_trigger_engine_auto_orchestration` — which since ZEB-316 fires
+    /// from BOTH the local publish path AND the re-enabled inbound dispatch
+    /// path (`process_inbound_dispatch`); the former standalone inbound call
+    /// was removed as redundant (the cascade tail subsumes it). The inbound
+    /// coverage is load-bearing because a node that is NOT in the committee
+    /// never publishes kd=ts itself, so its *locally-triggered* cascade never
+    /// executes; without the inbound-driven invocation, a non-committee node
+    /// would observe ≥t kd=ts events from peers but never finalize its own
+    /// log → permanent divergence.
     ///
     /// Convergence: `recover_secret_tally` deterministically picks a
     /// canonical size-`threshold` subset of (i, x_i) shares (Lagrange
