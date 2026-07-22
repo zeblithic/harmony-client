@@ -133,7 +133,7 @@
   let forkError = $state<string | null>(null);
   // Holds an admin-threshold-crossing power change pending tier-2
   // confirmation. Populated by SetPowerDialog onSubmit when the new
-  // power crosses POWER_THRESHOLDS.setPower in either direction; the
+  // power crosses the community's thresholds.setPower in either direction; the
   // ConfirmationModal it drives commits the change on accept (or
   // discards on cancel). Promote-to-admin is effectively irreversible
   // through the current UI — once two users are both at power 100,
