@@ -1655,12 +1655,23 @@ pub async fn run(
                                 if root_serve_tx_qbl.send(reply_tx).await.is_err() {
                                     break; // engine gone
                                 }
-                                // Only Ok(Ok(_)) is servable; an encode error is
-                                // logged engine-side and simply not answered.
-                                if let Ok(Ok(wire)) = reply_rx.await {
-                                    if let Err(e) = query.reply(query.key_expr(), wire).await {
-                                        tracing::warn!(topic = %topic_qbl, error = %e,
-                                            "owner-state root queryable reply failed");
+                                // ZEB-437: bounded wait — same rationale as the
+                                // community state-root queryable. A mid-encode
+                                // stop_node must not pin this queryable (and
+                                // thus adapter teardown) past the ~1s closing
+                                // SLA. `None` = reply abandoned; on a
+                                // closing-abandon break now.
+                                match recv_root_reply_bounded(reply_rx, &closing_qbl).await {
+                                    Some(wire) => {
+                                        if let Err(e) = query.reply(query.key_expr(), wire).await {
+                                            tracing::warn!(topic = %topic_qbl, error = %e,
+                                                "owner-state root queryable reply failed");
+                                        }
+                                    }
+                                    None => {
+                                        if closing_qbl.load(Ordering::SeqCst) {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -9060,6 +9071,161 @@ mod vine_tombstone_routing_tests {
     }
 }
 
+/// ZEB-437: bounded wait for a state-root queryable's engine reply.
+///
+/// A state-root queryable forwards each inbound query to the engine's
+/// single-writer task and awaits a freshly-encoded root packet over
+/// `reply_rx`. The engine's `select!` commits fully to that serve arm while it
+/// encodes (CRDT clone + CBOR + AEAD + CAS pin + replay fsync; 500ms–2s on a
+/// degraded path), so it cannot observe `stop_node` until the encode finishes.
+/// A queryable parked on a bare `reply_rx.await` is therefore pinned for that
+/// whole duration — and because the adapter's outer task joins the queryable
+/// sub-task, that pins adapter teardown too, beyond the ~1s closing-poll SLA
+/// the publisher, subscriber, and root-fetch sub-tasks honor.
+///
+/// This races the engine's oneshot against a repeating 500ms closing-poll
+/// (mirroring the sibling root-fetch drain loop below) so a node-stop unblocks
+/// teardown within one tick, plus an overall ~5s cap so a wedged (non-closing)
+/// engine can't pin the queryable indefinitely. `Some(packet)` is the servable
+/// wire; `None` means the reply was abandoned — `closing` flipped, the cap
+/// elapsed, the engine dropped the oneshot, or the engine reported an encode
+/// error — and in every `None` case the caller withholds the zenoh reply so the
+/// querier's latch backs off and retries (possibly against another responder).
+/// The biased reply arm means the normal fast path pays no tick.
+async fn recv_root_reply_bounded<E>(
+    mut reply_rx: tokio::sync::oneshot::Receiver<Result<Vec<u8>, E>>,
+    closing: &AtomicBool,
+) -> Option<Vec<u8>> {
+    // Closing-poll cadence; matches the root-fetch drain loop below.
+    const POLL: Duration = Duration::from_millis(500);
+    // Overall cap for a wedged, non-closing engine: 10 × 500ms = 5s.
+    const MAX_TICKS: u32 = 10;
+    let mut ticks: u32 = 0;
+    loop {
+        tokio::select! {
+            biased;
+            // Ok(Ok(packet)) → servable; RecvError (engine gone) and an
+            // engine-side encode Err both collapse to None, exactly as the
+            // former `if let Ok(Ok(_))` withheld the reply.
+            r = &mut reply_rx => return r.ok().and_then(|inner| inner.ok()),
+            _ = tokio::time::sleep(POLL) => {
+                ticks += 1;
+                if closing.load(Ordering::SeqCst) || ticks >= MAX_TICKS {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod root_reply_bounded_tests {
+    //! ZEB-437: `recv_root_reply_bounded` races a state-root queryable's engine
+    //! reply against a closing-poll (+ a wedged-engine cap) so a mid-encode
+    //! `stop_node` can't pin adapter teardown past the ~1s closing SLA. Paused
+    //! virtual time drives the polls deterministically (model:
+    //! `epoch_republish_tests`).
+    use super::recv_root_reply_bounded;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    /// Happy path: the reply is already available, so the biased reply arm wins
+    /// on the first poll — the servable packet is returned with zero
+    /// virtual-clock advance (no closing-poll tick paid on the fast path).
+    #[tokio::test(start_paused = true)]
+    async fn returns_packet_when_engine_replies() {
+        let (tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
+        tx.send(Ok(vec![1, 2, 3])).unwrap();
+        let closing = Arc::new(AtomicBool::new(false));
+        let start = tokio::time::Instant::now();
+        let got = recv_root_reply_bounded(rx, &closing).await;
+        assert_eq!(got, Some(vec![1, 2, 3]));
+        assert_eq!(start.elapsed(), Duration::ZERO, "fast path pays no tick");
+    }
+
+    /// An engine-side encode error (`Ok(Err(_))`) is not servable → `None`,
+    /// exactly as the old `if let Ok(Ok(_))` withheld the reply.
+    #[tokio::test(start_paused = true)]
+    async fn none_on_encode_error() {
+        let (tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
+        tx.send(Err("encode boom".to_string())).unwrap();
+        let closing = Arc::new(AtomicBool::new(false));
+        let got = recv_root_reply_bounded(rx, &closing).await;
+        assert_eq!(got, None);
+    }
+
+    /// Engine dropped the oneshot (shutdown race / engine gone) → `RecvError`
+    /// → `None`, matching the old code's non-`Ok(Ok)` drop.
+    #[tokio::test(start_paused = true)]
+    async fn none_when_sender_dropped() {
+        let (tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
+        drop(tx);
+        let closing = Arc::new(AtomicBool::new(false));
+        let got = recv_root_reply_bounded(rx, &closing).await;
+        assert_eq!(got, None);
+    }
+
+    /// The bug's case: the engine never replies (mid-encode) and `closing`
+    /// flips. The helper must abandon within one 500ms poll tick — not hang for
+    /// the unbounded encode duration. `_tx` stays alive so this exercises the
+    /// closing path, not the dropped-sender path.
+    #[tokio::test(start_paused = true)]
+    async fn abandons_on_closing_within_one_tick() {
+        let (_tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
+        let closing = Arc::new(AtomicBool::new(true));
+        let start = tokio::time::Instant::now();
+        let got = recv_root_reply_bounded(rx, &closing).await;
+        assert_eq!(got, None);
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(500),
+            "closing observed at the first poll tick"
+        );
+    }
+
+    /// A wedged (non-closing) engine can't pin the queryable forever: the
+    /// overall cap (10 × 500ms = 5s) frees it even though `closing` never flips.
+    #[tokio::test(start_paused = true)]
+    async fn caps_wedged_engine_at_five_seconds() {
+        let (_tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
+        let closing = Arc::new(AtomicBool::new(false));
+        let start = tokio::time::Instant::now();
+        let got = recv_root_reply_bounded(rx, &closing).await;
+        assert_eq!(got, None);
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(5),
+            "wedged engine freed at the 5s cap"
+        );
+    }
+
+    /// A slow-but-legitimate encode: the reply arrives after several
+    /// closing-poll ticks while `closing` stays false. The helper must return
+    /// it (not abandon) at the moment it lands — this is the fix's core
+    /// interleaving, distinct from the already-ready fast path, and it must
+    /// resolve before the 5s cap would fire.
+    #[tokio::test(start_paused = true)]
+    async fn returns_packet_that_arrives_mid_wait() {
+        let (tx, rx) = oneshot::channel::<Result<Vec<u8>, String>>();
+        let closing = Arc::new(AtomicBool::new(false));
+        // Deliver the reply 1.2s in — past two 500ms poll ticks, well under cap.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let _ = tx.send(Ok(vec![7, 7]));
+        });
+        let start = tokio::time::Instant::now();
+        let got = recv_root_reply_bounded(rx, &closing).await;
+        assert_eq!(got, Some(vec![7, 7]));
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(1200),
+            "reply returned when it arrived, not at a poll tick or the cap"
+        );
+    }
+}
+
 // ── ZEB-217 Sub-C Phase 2 Task 12: per-community state Zenoh adapter ──────
 //
 // Mirrors the owner-state adapter at lines 273-385 above, with the topic
@@ -9199,13 +9365,23 @@ pub fn spawn_community_state_zenoh_adapter(
                             // Engine gone — stop serving.
                             break;
                         }
-                        // Non-Ok(Ok(..)) outcomes are skipped: encode
-                        // error already logged engine-side; dropped
-                        // oneshot = engine shutdown race.
-                        if let Ok(Ok(packet)) = reply_rx.await {
-                            if let Err(e) = query.reply(query.key_expr(), packet).await {
-                                tracing::warn!(topic = %topic_qbl, error = %e,
-                                    "community state-root queryable reply failed");
+                        // ZEB-437: bounded wait so a mid-encode stop_node can't
+                        // pin this queryable (and thus adapter teardown) past
+                        // the ~1s closing SLA. `None` = reply abandoned (encode
+                        // error, engine gone, closing, or the wedged-engine
+                        // cap). On a closing-abandon, break now instead of
+                        // looping back to pay the outer 1s poll.
+                        match recv_root_reply_bounded(reply_rx, &closing_qbl).await {
+                            Some(packet) => {
+                                if let Err(e) = query.reply(query.key_expr(), packet).await {
+                                    tracing::warn!(topic = %topic_qbl, error = %e,
+                                        "community state-root queryable reply failed");
+                                }
+                            }
+                            None => {
+                                if closing_qbl.load(Ordering::SeqCst) {
+                                    break;
+                                }
                             }
                         }
                     }
