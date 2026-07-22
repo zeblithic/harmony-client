@@ -2225,6 +2225,60 @@ fn stop_handles(
     }
 }
 
+/// ZEB-681: shut down one `FleetSyncEngine<T>` from the sync `stop_inner`
+/// context, via the fresh-OS-thread ephemeral-runtime pattern.
+///
+/// `stop_inner` is sync but reachable from async contexts (e.g. `start_node`'s
+/// restart path). Calling `Runtime::block_on` on a thread already inside a
+/// Tokio runtime panics with "Cannot start a runtime from within a runtime";
+/// hosting the shutdown on a fresh OS thread via `thread::scope` gives the new
+/// current-thread runtime a context with no outer runtime. On a runtime-build
+/// failure the final publish + persist are skipped — surfacing that loudly is
+/// the best we can do, since silently dropping the last delta would corrupt
+/// next-boot state (build failure is essentially OOM / thread-exhaustion only,
+/// so this path is defensive). `label` carries the per-engine wording so the
+/// emitted log lines are byte-identical to the hand-written blocks this
+/// replaces (only the 10 uniform `FleetSyncEngine` engines delegate here; the
+/// bespoke `SyncEngine` / `MintSyncEngine` shutdowns keep their own wording).
+fn shutdown_fleet_sync_blocking<T>(
+    engine: std::sync::Arc<crate::fleet_sync::FleetSyncEngine<T>>,
+    label: &'static str,
+) where
+    // Matches `FleetSyncEngine::shutdown`'s impl bound (fleet_sync.rs) — the
+    // `shutdown()` method lives in an `impl<S> where S: CanonicalPayload + …`
+    // block, so the helper needs the same bound to call it generically.
+    T: crate::owner_state_crypto::CanonicalPayload
+        + serde::de::DeserializeOwned
+        + Clone
+        + Send
+        + 'static,
+{
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => {
+                    if let Err(e) = rt.block_on(engine.shutdown()) {
+                        tracing::error!(
+                            error = %e,
+                            "{label} FleetSyncEngine shutdown failed during stop_inner"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "could not build ephemeral tokio runtime for {label} \
+                         FleetSyncEngine shutdown — final flush skipped"
+                    );
+                }
+            }
+        });
+    });
+}
+
 /// Stop the running node (if any). Returns after the event loop thread exits.
 /// Returns `true` if a node was actually stopped, `false` if it was a no-op.
 pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) -> bool {
@@ -2990,30 +3044,7 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // its final debounced publish + persist pass runs before the event-loop
     // thread is joined. Same ephemeral-runtime pattern as mint/owner.
     if let Some(notes_engine) = notes_sync_for_shutdown {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        if let Err(e) = rt.block_on(notes_engine.shutdown()) {
-                            tracing::error!(
-                                error = %e,
-                                "Notes FleetSyncEngine shutdown failed during stop_inner"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "could not build ephemeral tokio runtime for Notes \
-                             FleetSyncEngine shutdown — final flush skipped"
-                        );
-                    }
-                }
-            });
-        });
+        shutdown_fleet_sync_blocking(notes_engine, "Notes");
     }
     // ZEB-418 SP2 P1: shut down the dm-inbox fleet-sync engine alongside
     // notes so its final debounced publish + persist pass runs before the
@@ -3021,30 +3052,7 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // mint/notes. This also stops the ingest sweeper (the engine task's
     // exit drops the only strong nudge sender — see the take above).
     if let Some(dm_inbox_engine) = dm_inbox_sync_for_shutdown {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        if let Err(e) = rt.block_on(dm_inbox_engine.shutdown()) {
-                            tracing::error!(
-                                error = %e,
-                                "dm-inbox FleetSyncEngine shutdown failed during stop_inner"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "could not build ephemeral tokio runtime for dm-inbox \
-                             FleetSyncEngine shutdown — final flush skipped"
-                        );
-                    }
-                }
-            });
-        });
+        shutdown_fleet_sync_blocking(dm_inbox_engine, "dm-inbox");
     }
     // ZEB-495 (ZEB-340 Part 2): shut down the community-device-intro fleet-sync
     // engine alongside dm-inbox so its final debounced publish + persist runs
@@ -3052,30 +3060,7 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // This also stops the relay sweeper (the engine task's exit drops the only
     // strong nudge sender — see the take above).
     if let Some(community_device_intro_engine) = community_device_intro_sync_for_shutdown {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        if let Err(e) = rt.block_on(community_device_intro_engine.shutdown()) {
-                            tracing::error!(
-                                error = %e,
-                                "community-device-intro FleetSyncEngine shutdown failed during stop_inner"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "could not build ephemeral tokio runtime for community-device-intro \
-                             FleetSyncEngine shutdown — final flush skipped"
-                        );
-                    }
-                }
-            });
-        });
+        shutdown_fleet_sync_blocking(community_device_intro_engine, "community-device-intro");
     }
     // ZEB-418 SP2 P2: shut down the dm-outhold fleet-sync engine alongside
     // dm-inbox so its final debounced publish + persist pass runs before
@@ -3083,199 +3068,38 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // This also stops the apply sweeper (the engine task's exit drops the
     // only nudge sender — see the take above).
     if let Some(dm_outhold_engine) = dm_outhold_sync_for_shutdown {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        if let Err(e) = rt.block_on(dm_outhold_engine.shutdown()) {
-                            tracing::error!(
-                                error = %e,
-                                "dm-outhold FleetSyncEngine shutdown failed during stop_inner"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "could not build ephemeral tokio runtime for dm-outhold \
-                             FleetSyncEngine shutdown — final flush skipped"
-                        );
-                    }
-                }
-            });
-        });
+        shutdown_fleet_sync_blocking(dm_outhold_engine, "dm-outhold");
     }
     // ZEB-418 SP2 P2: shut down the fleet-net fleet-sync engine the same way.
     if let Some(fleet_net_engine) = fleet_net_sync_for_shutdown {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        if let Err(e) = rt.block_on(fleet_net_engine.shutdown()) {
-                            tracing::error!(
-                                error = %e,
-                                "fleet-net FleetSyncEngine shutdown failed during stop_inner"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "could not build ephemeral tokio runtime for fleet-net \
-                             FleetSyncEngine shutdown — final flush skipped"
-                        );
-                    }
-                }
-            });
-        });
+        shutdown_fleet_sync_blocking(fleet_net_engine, "fleet-net");
     }
     // ZEB-677 S3: shut down the quorum-request engine the same way, so the
     // final debounced request publish + doc persist run before the zenoh
     // session dies.
     if let Some(quorum_engine) = owner_quorum_sync_for_shutdown {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        if let Err(e) = rt.block_on(quorum_engine.shutdown()) {
-                            tracing::error!(
-                                error = %e,
-                                "owner-quorum FleetSyncEngine shutdown failed during stop_inner"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "could not build ephemeral tokio runtime for owner-quorum \
-                             FleetSyncEngine shutdown — final flush skipped"
-                        );
-                    }
-                }
-            });
-        });
+        shutdown_fleet_sync_blocking(quorum_engine, "owner-quorum");
     }
     // ZEB-668 S1: shut down the owner-trust fleet-sync engine the same way,
     // so the final debounced trust publish + owner_state.cbor persist run
     // before the zenoh session dies.
     if let Some(trust_engine) = owner_trust_sync_for_shutdown {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        if let Err(e) = rt.block_on(trust_engine.shutdown()) {
-                            tracing::error!(
-                                error = %e,
-                                "owner-trust FleetSyncEngine shutdown failed during stop_inner"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "could not build ephemeral tokio runtime for owner-trust \
-                             FleetSyncEngine shutdown — final flush skipped"
-                        );
-                    }
-                }
-            });
-        });
+        shutdown_fleet_sync_blocking(trust_engine, "owner-trust");
     }
     // ZEB-668 S5: shut down the fleet-keys carrier engine the same way, so a
     // just-issued bump's final publish + doc persist land before the zenoh
     // session dies.
     if let Some(carrier_engine) = fleet_key_epoch_sync_for_shutdown {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        if let Err(e) = rt.block_on(carrier_engine.shutdown()) {
-                            tracing::error!(
-                                error = %e,
-                                "fleet-keys FleetSyncEngine shutdown failed during stop_inner"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "could not build ephemeral tokio runtime for fleet-keys \
-                             FleetSyncEngine shutdown — final flush skipped"
-                        );
-                    }
-                }
-            });
-        });
+        shutdown_fleet_sync_blocking(carrier_engine, "fleet-keys");
     }
     // ZEB-458 P4 Phase B: shut down the relay-hold + relay-optin fleet-sync
     // engines so their final debounced publish + persist pass runs before the
     // event-loop thread is joined. Same ephemeral-runtime pattern as fleet-net.
     if let Some(relay_hold_engine) = relay_hold_sync_for_shutdown {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        if let Err(e) = rt.block_on(relay_hold_engine.shutdown()) {
-                            tracing::error!(
-                                error = %e,
-                                "relay-hold FleetSyncEngine shutdown failed during stop_inner"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "could not build ephemeral tokio runtime for relay-hold \
-                             FleetSyncEngine shutdown — final flush skipped"
-                        );
-                    }
-                }
-            });
-        });
+        shutdown_fleet_sync_blocking(relay_hold_engine, "relay-hold");
     }
     if let Some(relay_optin_engine) = relay_optin_sync_for_shutdown {
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => {
-                        if let Err(e) = rt.block_on(relay_optin_engine.shutdown()) {
-                            tracing::error!(
-                                error = %e,
-                                "relay-optin FleetSyncEngine shutdown failed during stop_inner"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "could not build ephemeral tokio runtime for relay-optin \
-                             FleetSyncEngine shutdown — final flush skipped"
-                        );
-                    }
-                }
-            });
-        });
+        shutdown_fleet_sync_blocking(relay_optin_engine, "relay-optin");
     }
     stop_handles(shutdown_tx, thread);
     had_node
