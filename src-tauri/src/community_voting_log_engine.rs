@@ -1199,9 +1199,13 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             // HLC is frozen, EVERY re-mint (and every byte-identical peer copy) is
             // then rejected forever → the poll never finalizes via engine-auto on
             // that replica (per-replica stall + cross-replica divergence). A
-            // freshly-reserved HLC is always ≥ the receive watermark, so it always
-            // applies. (kd=cl is immune: it re-anchors on the moving close
-            // watermark each hook re-fire, so it self-heals.)
+            // freshly-reserved HLC is NOT frozen: each hook re-fire re-reserves an
+            // HLC that strictly advances the engine lane (wall forward, or logical+1
+            // at equal wall), so it self-heals — successive re-mints necessarily
+            // exceed any fixed `last_received_hlc` and clear the monotonic gate (and
+            // in the common case `wall_now_ms >= last_received_hlc.wall`, so it
+            // clears on the first attempt). (kd=cl is immune for the same reason: it
+            // re-anchors on the moving close watermark each hook re-fire.)
             //
             // A deterministic HLC is unnecessary here anyway: the pu-mode RESULT
             // converges bit-identically across replicas via the deterministic
