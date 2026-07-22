@@ -5902,7 +5902,12 @@ pub async fn apply_auto_exec_set_power(
 
     let event = {
         let outbox_g = dm_outbox.lock().await;
-        let signing_key = outbox_g.signing_key.as_ref();
+        // ZEB-720: SetPower is a steady-state membership event — sign with the
+        // ENROLLED community device key (#2), NOT the DM outbox `signing_key`.
+        // The direct `set_power_level` IPC path (ZEB-339) signs the same way;
+        // using `signing_key` here minted events the CRDT rejected as
+        // `SignerNotEnrolledForActor`, so headless auto-exec never applied.
+        let signing_key = outbox_g.community_signing_key.as_ref();
         crate::mint_set_power_event(
             community_id,
             self_owner,
