@@ -22,6 +22,10 @@ pub struct NodeConfig {
     pub passphrase: String,
     /// Optional dir to capture child stdout/stderr into (artifacts).
     pub log_dir: Option<PathBuf>,
+    /// ZEB-720: extra env vars injected into the spawned node (e.g. short
+    /// voting cadence). Layered on top of the hardcoded `.env(...)` set in
+    /// `spawn`; the child already inherits the parent env (no env_clear).
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl NodeConfig {
@@ -31,6 +35,7 @@ impl NodeConfig {
             profile: profile.to_string(),
             passphrase: "e2e-test-passphrase".to_string(),
             log_dir: None,
+            extra_env: Vec::new(),
         }
     }
 }
@@ -94,6 +99,14 @@ impl NodeHandle {
             .env("HARMONY_PASSPHRASE", &config.passphrase)
             .env("HARMONY_RETICULUM_PORT", "0")
             .env("HARMONY_API_PORT", "0")
+            // ZEB-720: per-node extra env (e.g. short voting cadence). Layered
+            // last so a scenario can override, but never the isolation vars above.
+            .envs(
+                config
+                    .extra_env
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str())),
+            )
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr)

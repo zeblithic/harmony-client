@@ -1180,6 +1180,78 @@ pub fn recovery_proposal<'a>(
     Ok(None)
 }
 
+// ── Tier-2 Conviction voting (ZEB-720) ───────────────────────────────
+
+/// Create a Tier-2 Conviction proposal whose finalization auto-execs
+/// `SetPower{target, new_power}`. `threshold_min` is the raw ms-scale
+/// conviction floor (small ⇒ threshold crosses quickly). `min_power` gates
+/// signal eligibility. Returns the hex proposal id.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_tier2_setpower_proposal(
+    node: &NodeHandle,
+    community_id: &str,
+    channel_id: &str,
+    proposal_text: &str,
+    target_addr: &str,
+    new_power: u32,
+    threshold_min: i64,
+    min_power: u32,
+) -> anyhow::Result<String> {
+    let v = node
+        .rpc(
+            "voting_create_tier2_proposal",
+            json!({
+                "communityId": community_id,
+                "channelId": channel_id,
+                "proposalText": proposal_text,
+                "thresholdMin": threshold_min,
+                "minPower": min_power,
+                "setPowerTarget": target_addr,
+                "setPowerNewPower": new_power,
+            }),
+        )
+        .await?;
+    as_str(&v)
+}
+
+/// Cast (support=true) or withdraw (support=false) a Tier-2 conviction signal.
+pub async fn signal_tier2(
+    node: &NodeHandle,
+    proposal_id: &str,
+    support: bool,
+) -> anyhow::Result<()> {
+    node.rpc(
+        "voting_signal_tier2",
+        json!({ "proposalId": proposal_id, "support": support }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Full Tier-2 proposal export (lifecycle, tally). Raw DTO for assertions.
+pub async fn get_tier2_proposal(node: &NodeHandle, proposal_id: &str) -> anyhow::Result<Value> {
+    node.rpc(
+        "voting_get_tier2_proposal",
+        json!({ "proposalId": proposal_id }),
+    )
+    .await
+}
+
+/// A member's materialized power from the roster, or `None` if absent.
+/// Non-array roster ⇒ loud error (mirrors `list_community_members`).
+pub async fn member_power(
+    node: &NodeHandle,
+    community_id: &str,
+    member_owner: &str,
+) -> anyhow::Result<Option<u64>> {
+    let members = list_community_members(node, community_id).await?;
+    Ok(members.iter().find_map(|m| {
+        (m.get("addr").and_then(Value::as_str) == Some(member_owner))
+            .then(|| m.get("power").and_then(Value::as_u64))
+            .flatten()
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::assert_sas_match;
