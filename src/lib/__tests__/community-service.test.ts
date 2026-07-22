@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from '../community-service';
 import type { TauriAdapter } from '../zenoh-service';
+import type { CommunityGovernance } from '../types';
 
 function makeAdapter(): TauriAdapter & { listeners: Map<string, Function> } {
   const listeners = new Map<string, Function>();
@@ -451,6 +452,19 @@ describe('CommunityService', () => {
       communityId: 'aa'.repeat(16),
     });
     expect(result.adminQuorum).toBe(2);
+  });
+
+  it('getCommunityGovernance returns per-community thresholds (ZEB-251)', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue({
+      adminQuorum: 1,
+      invite: 25,
+      kick: 60,
+      setPower: 100,
+      max: 100,
+    });
+    const gov: CommunityGovernance = await service.getCommunityGovernance('00'.repeat(16));
+    expect(gov).toEqual({ adminQuorum: 1, invite: 25, kick: 60, setPower: 100, max: 100 });
   });
 });
 

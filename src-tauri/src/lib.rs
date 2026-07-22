@@ -35855,6 +35855,10 @@ where
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            // ZEB-251: not part of the epoch snapshot; the hint is
+            // superseded by CRDT replay once events arrive, same as
+            // admin_quorum above.
+            power_thresholds: crate::community_membership::default_power_thresholds(),
             // ZEB-713: recovery state is not part of the epoch snapshot;
             // the hint is superseded by CRDT replay once events arrive.
             recovery_designates: None,
@@ -42887,6 +42891,36 @@ pub fn mint_admin_proposal_change_quorum_event(
     sign_event(&payload, signing_key).map_err(|e| format!("sign admin_proposal_change_quorum: {e}"))
 }
 
+/// ZEB-251: mint a signed AdminProposal carrying a ChangeThresholds proposal_kind.
+pub fn mint_admin_proposal_change_thresholds_event(
+    community_id: crate::owner_state_types::SpaceId,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    new_thresholds: crate::community_membership::PowerThresholds,
+    signing_key: &ed25519_dalek::SigningKey,
+    hlc: crate::owner_state_types::Hlc,
+) -> Result<crate::community_membership::SignedMembershipEvent, String> {
+    use crate::community_membership::{
+        sign_event, EventPayload, MembershipEventKind, ProposalKind,
+    };
+    use rand::RngCore;
+
+    let mut rng = rand::thread_rng();
+    let mut event_id_bytes = [0u8; 16];
+    rng.fill_bytes(&mut event_id_bytes);
+
+    let payload = EventPayload {
+        id: event_id_bytes,
+        community_id,
+        kind: MembershipEventKind::AdminProposal {
+            proposal_kind: ProposalKind::ChangeThresholds { new_thresholds },
+        },
+        actor: self_owner,
+        at: hlc,
+    };
+    sign_event(&payload, signing_key)
+        .map_err(|e| format!("sign admin_proposal_change_thresholds: {e}"))
+}
+
 /// ZEB-714: mint a signed `AdminProposal { SetRecoveryDesignates }`
 /// event — the healthy-admin recovery-config ceremony (spec §3.1),
 /// routed through the unchanged ZEB-250 quorum machinery. Same
@@ -44319,6 +44353,11 @@ pub fn filter_recent_counter_signs(
 pub struct CommunityGovernanceDto {
     /// Current materialized admin quorum (ZEB-250). Default 1.
     pub admin_quorum: u8,
+    /// ZEB-251: current materialized power thresholds. Default {0,50,100,100}.
+    pub invite: u8,
+    pub kick: u8,
+    pub set_power: u8,
+    pub max: u8,
 }
 
 /// Pure extraction: caller must be a Joined member — any power level; the
@@ -44336,6 +44375,10 @@ pub fn compute_community_governance(
     }
     Ok(CommunityGovernanceDto {
         admin_quorum: materialized.admin_quorum,
+        invite: materialized.power_thresholds.invite,
+        kick: materialized.power_thresholds.kick,
+        set_power: materialized.power_thresholds.set_power,
+        max: materialized.power_thresholds.max,
     })
 }
 
@@ -44441,6 +44484,15 @@ pub enum ProposalKindDto {
         designate_addrs: Vec<String>,
         threshold: u8,
         veto_window_ms: u64,
+    },
+    /// ZEB-251: per-community power-threshold change proposal. `max` is
+    /// fixed at 100 (enforced at verify_event AT1) and intentionally
+    /// omitted from the DTO — the frontend only ever surfaces the three
+    /// customizable tiers.
+    ChangeThresholds {
+        invite: u8,
+        kick: u8,
+        set_power: u8,
     },
 }
 
@@ -44756,6 +44808,13 @@ pub fn compute_pending_admin_proposals(
                 threshold: *threshold,
                 veto_window_ms: *veto_window_ms,
             },
+            ProposalKind::ChangeThresholds { new_thresholds } => {
+                ProposalKindDto::ChangeThresholds {
+                    invite: new_thresholds.invite,
+                    kick: new_thresholds.kick,
+                    set_power: new_thresholds.set_power,
+                }
+            }
         };
 
         dtos.push(PendingAdminProposalDto {
@@ -45186,6 +45245,168 @@ async fn propose_change_quorum(
     ) {
         return Err(membership_outcome_err(
             "propose_change_quorum (AdminProposal)",
+            &outcome,
+        ));
+    }
+
+    if admin_quorum == 1 {
+        Ok(AdminActionResult::Completed)
+    } else {
+        Ok(AdminActionResult::Pending {
+            proposal_event_id: proposal_id_hex,
+            signers_so_far: 1,
+            quorum_required: admin_quorum,
+        })
+    }
+}
+
+// ── ZEB-251: propose_change_thresholds IPC ────────────────────────────────
+
+/// ZEB-251: admin IPC that proposes changing the community's per-community
+/// power thresholds (`invite`/`kick`/`set_power`/`max`). Validates the
+/// ordering invariant `0 <= invite <= kick <= set_power <= 100` client-side
+/// (`verify_event` is authoritative). Mints an
+/// `AdminProposal { ChangeThresholds { new_thresholds } }` event and returns
+/// `AdminActionResult::Completed` when the current quorum is 1 (proposer's
+/// signature self-satisfies), or `Pending` otherwise.
+///
+/// Authorization: caller must be Joined with power ≥ 100. Cloned from
+/// `propose_change_quorum` — see that function's comments for the
+/// HLC-reservation / generation-fence / engine-lookup / outbox blocks.
+#[tauri::command]
+async fn propose_change_thresholds(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+    invite: u8,
+    kick: u8,
+    set_power: u8,
+) -> Result<AdminActionResult, String> {
+    // Cheap client-side invariant (verify_event is authoritative).
+    if !(invite <= kick && kick <= set_power && set_power <= 100) {
+        return Err(
+            "propose_change_thresholds: require 0 <= invite <= kick <= set_power <= 100"
+                .to_string(),
+        );
+    }
+    let new_thresholds = crate::community_membership::PowerThresholds {
+        invite,
+        kick,
+        set_power,
+        max: 100,
+    };
+
+    // Length-check BEFORE decoding — bound work on attacker-controlled input at
+    // the IPC boundary (repo convention, PR #530/#463/#313).
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let mut id_bytes = [0u8; 16];
+    hex::decode_to_slice(&community_id, &mut id_bytes)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
+            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.generation,
+        )
+    };
+
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // ZEB-267: atomic HLC reservation.
+    let event_hlc =
+        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+
+    // Generation + registry fence.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during propose_change_thresholds (was {}, now {})",
+                snapshot_generation, g.generation
+            ));
+        }
+        if g.community_registry.is_none() {
+            return Err(
+                "community_registry detached during propose_change_thresholds (node stopped?)"
+                    .to_string(),
+            );
+        }
+    }
+
+    let engine_arc = community_registry
+        .engine_arc(&space_id)
+        .await
+        .ok_or_else(|| {
+            format!(
+                "no engine for community {} — not currently joined",
+                hex::encode(space_id.0)
+            )
+        })?;
+
+    let admin_addr = engine_arc.admin_addr();
+
+    // Auth: caller Joined + power >= 100, and read current admin_quorum.
+    let admin_quorum = {
+        let state = engine_arc.state();
+        let state_g = state.lock().await;
+        let m = state_g.materialize_now(admin_addr);
+
+        let caller_status = m.members.get(&self_owner).map(|ms| ms.status);
+        if !matches!(
+            caller_status,
+            Some(crate::community_membership::MemberStatus::Joined)
+        ) {
+            return Err("propose_change_thresholds: caller is not a Joined member".to_string());
+        }
+        let caller_power = m.power_levels.get(&self_owner).copied().unwrap_or(0);
+        if caller_power < 100 {
+            return Err(format!(
+                "propose_change_thresholds: caller power {caller_power} below admin threshold 100"
+            ));
+        }
+
+        m.admin_quorum
+    };
+
+    // Mint AdminProposal{ChangeThresholds}.
+    let proposal = {
+        let outbox_g = dm_outbox.lock().await;
+        // ZEB-339: AdminProposal(ChangeThresholds) steady-state membership
+        // event — enrolled device key (#2), no cert.
+        let signing_key = outbox_g.community_signing_key.as_ref();
+        mint_admin_proposal_change_thresholds_event(
+            space_id,
+            self_owner,
+            new_thresholds,
+            signing_key,
+            event_hlc,
+        )?
+    };
+    let proposal_id_hex = hex::encode(proposal.id);
+    let outcome = engine_arc
+        .insert_local_event(proposal)
+        .await
+        .map_err(|e| format!("engine.insert_local_event (AdminProposal change_thresholds): {e}"))?;
+    if matches!(
+        outcome,
+        crate::community_state_crdt::InsertOutcome::Rejected(_)
+    ) {
+        return Err(membership_outcome_err(
+            "propose_change_thresholds (AdminProposal)",
             &outcome,
         ));
     }
@@ -47359,6 +47580,7 @@ mod community_member_dto_tests {
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            power_thresholds: crate::community_membership::POWER_THRESHOLDS,
             recovery_designates: None,
             recovery_proposals: Vec::new(),
         };
@@ -47408,6 +47630,7 @@ mod community_member_dto_tests {
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            power_thresholds: crate::community_membership::POWER_THRESHOLDS,
             recovery_designates: None,
             recovery_proposals: Vec::new(),
         };
@@ -65099,6 +65322,7 @@ pub fn run() {
             get_community_governance,
             countersign_admin_proposal,
             propose_change_quorum,
+            propose_change_thresholds,
             get_recovery_state,
             set_recovery_designates,
             initiate_admin_recovery,
@@ -72831,9 +73055,36 @@ mod get_community_governance_tests {
     #[test]
     fn dto_serializes_admin_quorum_camel_case() {
         // Pins the wire key the TS binding reads (e2e camelCase rule).
-        let dto = CommunityGovernanceDto { admin_quorum: 2 };
+        let dto = CommunityGovernanceDto {
+            admin_quorum: 2,
+            invite: 0,
+            kick: 50,
+            set_power: 100,
+            max: 100,
+        };
         let json = serde_json::to_string(&dto).expect("serialize");
-        assert_eq!(json, r#"{"adminQuorum":2}"#);
+        assert_eq!(
+            json,
+            r#"{"adminQuorum":2,"invite":0,"kick":50,"setPower":100,"max":100}"#
+        );
+    }
+
+    #[test]
+    fn compute_governance_surfaces_power_thresholds() {
+        // ZEB-251: the read-only governance DTO must surface the
+        // materialized per-community power thresholds, not just admin_quorum.
+        let caller = OwnerAddr([0x01; 16]);
+        let mut m = MaterializedMembership::default();
+        m.members.insert(caller, member(MemberStatus::Joined));
+        m.power_thresholds = crate::community_membership::PowerThresholds {
+            invite: 25,
+            kick: 60,
+            set_power: 100,
+            max: 100,
+        };
+
+        let dto = compute_community_governance(&m, caller).expect("joined member");
+        assert_eq!((dto.invite, dto.kick, dto.set_power), (25, 60, 100));
     }
 }
 

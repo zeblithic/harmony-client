@@ -20,6 +20,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import PendingAdminProposalsPanel from './PendingAdminProposalsPanel.svelte';
   import ChangeQuorumDialog from './ChangeQuorumDialog.svelte';
+  import ChangeThresholdsDialog from './ChangeThresholdsDialog.svelte';
   import RoleBadge from './governance/RoleBadge.svelte';
   import PipMeter from './governance/PipMeter.svelte';
   import RecoveryConfigDialog from './RecoveryConfigDialog.svelte';
@@ -55,6 +56,12 @@
     onForkLineageNavigate,
     resolveLocalCommunityName,
     adminQuorum = 1,
+    thresholds = {
+      invite: POWER_THRESHOLDS.invite,
+      kick: POWER_THRESHOLDS.kick,
+      setPower: POWER_THRESHOLDS.setPower,
+    },
+    thresholdsLoaded = false,
   }: {
     communityId: string;
     communityName: string;
@@ -73,6 +80,16 @@
     /** ZEB-250: current admin quorum threshold for this community.
      *  When not provided, defaults to 1 (no multi-sig required). */
     adminQuorum?: number;
+    /** ZEB-251: per-community power thresholds (invite / kick / setPower).
+     *  When not provided, defaults to the global POWER_THRESHOLDS consts so
+     *  an un-customized community behaves exactly as before per-community
+     *  thresholds existed. */
+    thresholds?: { invite: number; kick: number; setPower: number };
+    /** ZEB-251: true once `thresholds` reflects loaded governance data (vs the
+     *  fallback defaults). The "Change thresholds…" affordance stays disabled
+     *  until then, so an admin can't propose a change built from stale fallback
+     *  values before getCommunityGovernance resolves. */
+    thresholdsLoaded?: boolean;
     /** Optional: if provided, a "Manage members" button appears in the Members
      *  section that opens the full CommunityMembersPanel overlay (with recent
      *  moderation history). Callers that don't yet thread through communityService
@@ -112,6 +129,8 @@
   let setPowerTarget = $state<CommunityMember | null>(null);
   // ZEB-250: change-quorum dialog state
   let showChangeQuorumDialog = $state(false);
+  // ZEB-251: change-thresholds dialog state
+  let showChangeThresholdsDialog = $state(false);
   // ZEB-285: fork dialog state
   let forkDialogOpen = $state(false);
   // ZEB-649: the 2D genealogy graph modal (design Frame A / Frame D's
@@ -120,7 +139,7 @@
   let forkError = $state<string | null>(null);
   // Holds an admin-threshold-crossing power change pending tier-2
   // confirmation. Populated by SetPowerDialog onSubmit when the new
-  // power crosses POWER_THRESHOLDS.setPower in either direction; the
+  // power crosses the admin tier (ADMIN_TIER, power 100) in either direction; the
   // ConfirmationModal it drives commits the change on accept (or
   // discards on cancel). Promote-to-admin is effectively irreversible
   // through the current UI — once two users are both at power 100,
@@ -132,8 +151,17 @@
   let lastAdminLeaveDialogOpen = $state(false);
   const titleId = `community-settings-title-${Math.random().toString(36).slice(2)}`;
 
+  // ZEB-251: the admin tier is FIXED at power 100 (= POWER_THRESHOLDS.max),
+  // independent of the per-community `set_power` action threshold. Backend
+  // admin governance (AdminProposal / quorum / recovery) authorizes on
+  // power == 100, so admin-IDENTITY gates key off ADMIN_TIER — only the
+  // per-action gates (canKick / canSetPower / invite) use per-community
+  // thresholds. Lowering set_power must NOT make a non-admin look like an
+  // admin in the UI while the backend still rejects their governance actions.
+  const ADMIN_TIER = POWER_THRESHOLDS.max;
+
   function crossesAdminThreshold(currentPower: number, newPower: number): boolean {
-    const threshold = POWER_THRESHOLDS.setPower;
+    const threshold = ADMIN_TIER;
     return (currentPower < threshold && newPower >= threshold)
         || (currentPower >= threshold && newPower < threshold);
   }
@@ -184,16 +212,16 @@
   });
 
   let joinedMembers = $derived(members.filter((m) => m.status === 'joined'));
-  let adminCount = $derived(joinedMembers.filter((m) => m.power >= POWER_THRESHOLDS.setPower).length);
+  let adminCount = $derived(joinedMembers.filter((m) => m.power >= ADMIN_TIER).length);
   let amOnlyAdmin = $derived(
-    myPower >= POWER_THRESHOLDS.setPower &&
+    myPower >= ADMIN_TIER &&
     adminCount === 1 &&
-    joinedMembers.some((m) => m.address === myAddress && m.power >= POWER_THRESHOLDS.setPower)
+    joinedMembers.some((m) => m.address === myAddress && m.power >= ADMIN_TIER)
   );
   let myRole = $derived(powerToRole(myPower));
-  let canModerate = $derived(myPower >= POWER_THRESHOLDS.setPower);
+  let canModerate = $derived(myPower >= ADMIN_TIER);
   // ZEB-250: admin governance section
-  let canAdmin = $derived(myPower >= POWER_THRESHOLDS.setPower);
+  let canAdmin = $derived(myPower >= ADMIN_TIER);
   let currentAdminCount = $derived(adminCount);
   let currentAdminQuorum = $derived(adminQuorum);
 
@@ -356,13 +384,13 @@
 
   function canKick(target: CommunityMember): boolean {
     return target.address !== myAddress
-      && myPower >= POWER_THRESHOLDS.kick
+      && myPower >= thresholds.kick
       && myPower > target.power;
   }
 
   function canSetPower(target: CommunityMember): boolean {
     return target.address !== myAddress
-      && myPower >= POWER_THRESHOLDS.setPower
+      && myPower >= thresholds.setPower
       && myPower > target.power;
   }
 
@@ -554,7 +582,7 @@
       {/if}
     </div>
 
-    {#if myPower >= POWER_THRESHOLDS.invite}
+    {#if myPower >= thresholds.invite}
       <div class="section">
         <div class="section-label">Invites</div>
         <InviteLinkManager kind={communityKind} onGenerate={onGenerateInvite} />
@@ -583,6 +611,14 @@
         />
         <button class="change-quorum-btn" onclick={() => (showChangeQuorumDialog = true)}>
           Change quorum…
+        </button>
+        <button
+          class="change-quorum-btn"
+          disabled={!thresholdsLoaded}
+          title={thresholdsLoaded ? undefined : 'Loading current thresholds…'}
+          onclick={() => (showChangeThresholdsDialog = true)}
+        >
+          Change thresholds…
         </button>
         <PendingAdminProposalsPanel {communityId} {canAdmin} />
       </div>
@@ -651,6 +687,14 @@
         currentQuorum={currentAdminQuorum}
         currentAdminCount={currentAdminCount}
         onClose={() => (showChangeQuorumDialog = false)}
+      />
+    {/if}
+
+    {#if showChangeThresholdsDialog && canAdmin && thresholdsLoaded}
+      <ChangeThresholdsDialog
+        {communityId}
+        currentThresholds={{ invite: thresholds.invite, kick: thresholds.kick, setPower: thresholds.setPower }}
+        onClose={() => (showChangeThresholdsDialog = false)}
       />
     {/if}
 
@@ -771,7 +815,7 @@
 {/if}
 
 {#if pendingAdminChange}
-  {@const promoting = pendingAdminChange.newPower >= POWER_THRESHOLDS.setPower}
+  {@const promoting = pendingAdminChange.newPower >= ADMIN_TIER}
   {@const targetName = pendingAdminChange.target.displayName ?? pendingAdminChange.target.address.slice(0, 8)}
   <ConfirmationModal
     title={promoting

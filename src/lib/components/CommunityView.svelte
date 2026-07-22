@@ -3,7 +3,7 @@
   import { get } from 'svelte/store';
   import type { CommunityService, ChannelInfo, PreForkSnapshotDto } from '../community-service';
   import type { ChannelMessageService } from '../channel-message-service';
-  import type { CommunityMember } from '../types';
+  import { POWER_THRESHOLDS, type CommunityMember, type CommunityGovernance } from '../types';
   import { resolveMentionLabel } from '../mention-render';
   import type { TrustService } from '../trust-service';
   import type { NavService } from '../nav-service';
@@ -172,12 +172,26 @@
   // Loaded once per community view. null = non-fork community; undefined = not yet loaded.
   let preForkSnapshot = $state<PreForkSnapshotDto | null | undefined>(undefined);
 
-  // ZEB-608 D1: per-community governance snapshot (admin quorum). Loaded on
-  // every community switch, stale-guarded like the other per-community loads.
-  // null until the IPC resolves or on failure. The charter treats null as
-  // "not loaded" (shows '…', staying honest about live state); the settings
-  // panel keeps its operational `?? 1` fallback (its long-standing contract).
-  let governance = $state<{ adminQuorum: number } | null>(null);
+  // ZEB-608 D1 / ZEB-251: per-community governance snapshot (admin quorum +
+  // per-community power thresholds). Loaded on every community switch,
+  // stale-guarded like the other per-community loads. null until the IPC
+  // resolves or on failure. The charter treats null as "not loaded" (shows
+  // '…', staying honest about live state); the settings panel keeps its
+  // operational `?? 1` / `?? POWER_THRESHOLDS.*` fallback (its long-standing
+  // contract).
+  let governance = $state<CommunityGovernance | null>(null);
+
+  // ZEB-251: per-community power thresholds derived from the governance
+  // snapshot, falling back field-by-field to the global POWER_THRESHOLDS
+  // consts (both when governance hasn't loaded yet and — defensively — if a
+  // caller ever supplies a partial governance object). An un-customized
+  // community's thresholds always equal these consts, so this never changes
+  // gate behavior before ZEB-251 governance data is available.
+  let thresholds = $derived({
+    invite: governance?.invite ?? POWER_THRESHOLDS.invite,
+    kick: governance?.kick ?? POWER_THRESHOLDS.kick,
+    setPower: governance?.setPower ?? POWER_THRESHOLDS.setPower,
+  });
 
   $effect(() => {
     const cid = communityId;
@@ -550,6 +564,8 @@
     {isDegraded}
     {sharedInProfile}
     adminQuorum={governance?.adminQuorum ?? 1}
+    {thresholds}
+    thresholdsLoaded={governance != null}
     {onToggleSharedInProfile}
     onClose={() => { settingsModalOpen = false; }}
     onKick={onKickMember}

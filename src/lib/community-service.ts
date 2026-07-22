@@ -2,6 +2,7 @@ import type { TauriAdapter } from './zenoh-service';
 import {
   POWER_THRESHOLDS,
   type AdminActionResult,
+  type CommunityGovernance,
   type CommunityLineageDto,
   type CommunityMember,
   type ForkDescendantDto,
@@ -615,9 +616,9 @@ export class CommunityService {
    * card and the settings panel's real quorum display (fixes the
    * always-shows-1 default, spec §0.2).
    */
-  async getCommunityGovernance(communityId: string): Promise<{ adminQuorum: number }> {
+  async getCommunityGovernance(communityId: string): Promise<CommunityGovernance> {
     try {
-      return await this.invoke<{ adminQuorum: number }>('get_community_governance', { communityId });
+      return await this.invoke<CommunityGovernance>('get_community_governance', { communityId });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       throw new Error(`getCommunityGovernance: ${msg}`);
