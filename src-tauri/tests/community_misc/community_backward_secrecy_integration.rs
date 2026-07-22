@@ -854,9 +854,7 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
             false,
             pub_tx,
             sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("engine spawn");
@@ -1245,9 +1243,7 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
             true, // INVITE-ONLY — the scenario under test
             pub_tx,
             sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("engine spawn");

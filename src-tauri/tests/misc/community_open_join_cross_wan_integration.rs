@@ -465,9 +465,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
             false, // OPEN
             alice_pub_tx,
             alice_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn alice engine");
@@ -493,9 +491,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
             false, // OPEN
             bob_pub_tx,
             bob_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn bob engine");

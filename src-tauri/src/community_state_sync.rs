@@ -921,6 +921,51 @@ pub struct CommunityMembershipDelta {
 /// string for logging).
 pub type RootServeRequest = tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>;
 
+/// ZEB-438: the three engine-side catch-up channels ZEB-434 added to the
+/// community-engine spawn path, bundled so `spawn_engine_inner_now` /
+/// `spawn_engine_with_guard` don't carry them as three loose positional
+/// `Option`s. Legacy/test callers that want no catch-up wiring pass
+/// [`CatchUpChannels::none()`] instead of `None, None, None` — which also
+/// self-documents the intent at the call site.
+///
+/// These are strictly the halves the *engine* consumes; the matching
+/// *adapter* halves (`root_serve_tx`, `fetch_request_rx`) stay explicit on
+/// `spawn_engine_with_guard` because they're required and flow into the
+/// `CommunityAdapterRequest`, not the engine.
+#[derive(Default)]
+pub struct CatchUpChannels {
+    /// Engine half of the state-root queryable-serve channel (ZEB-434
+    /// D1/D2). `Some` wires the queryable; `None` for legacy/test callers.
+    pub root_serve_rx: Option<mpsc::Receiver<RootServeRequest>>,
+    /// Engine→adapter root-fetch request sender (ZEB-434 D3/D4). `Some`
+    /// spawns the per-community `run_root_fetch_driver`; `None` skips it.
+    pub fetch_request_tx: Option<mpsc::Sender<crate::event_loop::CommunityRootFetchRequest>>,
+    /// Transport-epoch re-arm watch for the root-fetch driver. `None` in
+    /// legacy/test callers or the restart-race window.
+    pub transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
+}
+
+impl CatchUpChannels {
+    /// No catch-up wiring: every channel `None`. Replaces the historical
+    /// `None, None, None` positional trio at legacy/test call sites.
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(test)]
+mod catch_up_channels_tests {
+    use super::CatchUpChannels;
+
+    #[test]
+    fn none_sets_every_channel_to_none() {
+        let c = CatchUpChannels::none();
+        assert!(c.root_serve_rx.is_none());
+        assert!(c.fetch_request_tx.is_none());
+        assert!(c.transport_epoch_rx.is_none());
+    }
+}
+
 /// Construction-time config bag for `CommunitySyncEngine::new`. Bundles
 /// the per-community key + identity, the shared CRDT + tracker arcs,
 /// the wire channels, the persist paths, and the optional degraded-path
@@ -4556,7 +4601,7 @@ impl CommunitySyncRegistry {
     /// **ZEB-434**: mirrors `spawn_engine_inner_now`'s catch-up params —
     /// `root_serve_rx` / `fetch_request_tx` / `transport_epoch_rx` are
     /// the engine/driver halves forwarded to the inner spawn (legacy/
-    /// test callers pass `None, None, None`); `root_serve_tx` /
+    /// test callers pass `CatchUpChannels::none()`); `root_serve_tx` /
     /// `fetch_request_rx` are the adapter halves packed into the
     /// `CommunityAdapterRequest`. On the idempotent path all five are
     /// dropped alongside the pub/sub adapter halves (the existing
@@ -4574,9 +4619,7 @@ impl CommunitySyncRegistry {
         publisher_rx: mpsc::Receiver<Vec<u8>>,
         subscriber_tx: mpsc::Sender<Vec<u8>>,
         community_adapter_tx: mpsc::Sender<crate::event_loop::CommunityAdapterRequest>,
-        root_serve_rx: Option<mpsc::Receiver<RootServeRequest>>,
-        fetch_request_tx: Option<mpsc::Sender<crate::event_loop::CommunityRootFetchRequest>>,
-        transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
+        catch_up: CatchUpChannels,
         root_serve_tx: mpsc::Sender<RootServeRequest>,
         fetch_request_rx: mpsc::Receiver<crate::event_loop::CommunityRootFetchRequest>,
     ) -> Result<std::sync::Arc<CommunitySyncEngine>, CommunitySyncError> {
@@ -4663,9 +4706,7 @@ impl CommunitySyncRegistry {
                 is_invite_only,
                 publisher_tx,
                 subscriber_rx,
-                root_serve_rx,
-                fetch_request_tx,
-                transport_epoch_rx,
+                catch_up,
             )
             .await?;
 
@@ -4920,7 +4961,8 @@ impl CommunitySyncRegistry {
     /// IPC-handler RAII surface; the method stays `pub` (not
     /// `pub(crate)`) so those tests compile against the public API.
     ///
-    /// **ZEB-434**: `root_serve_rx` is the engine half of the
+    /// **ZEB-434** (ZEB-438: now bundled into `catch_up`, destructured
+    /// below): `root_serve_rx` is the engine half of the
     /// queryable-serve channel (threaded into the engine config);
     /// `fetch_request_tx` is the driver half of the fetch-request
     /// channel — when `Some`, a `run_root_fetch_driver` task is spawned
@@ -4928,7 +4970,12 @@ impl CommunitySyncRegistry {
     /// re-arm watch; `None` in legacy/test callers or the restart-race
     /// window, where the generation fence prevents the spawn from
     /// completing anyway).
-    /// Legacy/test callers pass `None, None, None`.
+    /// Legacy/test callers pass [`CatchUpChannels::none()`].
+    // ZEB-438: bundling the catch-up trio into `CatchUpChannels` drops this
+    // from 9 to 7 explicit params, but a method still counts `self`, so 8
+    // exceeds clippy's threshold of 7 — the allow stays (same rationale as
+    // `spawn_engine_with_guard`). The win here is a self-documenting bundle
+    // and a single update site for the catch-up channels, not lint removal.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_engine_inner_now(
         &self,
@@ -4938,10 +4985,16 @@ impl CommunitySyncRegistry {
         is_invite_only: bool,
         publisher_tx: mpsc::Sender<Vec<u8>>,
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
-        root_serve_rx: Option<mpsc::Receiver<RootServeRequest>>,
-        fetch_request_tx: Option<mpsc::Sender<crate::event_loop::CommunityRootFetchRequest>>,
-        transport_epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
+        catch_up: CatchUpChannels,
     ) -> Result<bool, CommunitySyncError> {
+        // ZEB-438: unbundle the engine-side catch-up channels (previously
+        // three loose positional `Option`s on this signature).
+        let CatchUpChannels {
+            root_serve_rx,
+            fetch_request_tx,
+            transport_epoch_rx,
+        } = catch_up;
+
         // Phase 1: blocking disk I/O off the runtime entirely. Both
         // load_crdt and load_replay call std::fs::read, so even with
         // the registry mutex released they'd block the tokio worker
@@ -5773,7 +5826,7 @@ mod tests {
     /// ZEB-434: adapter-half stand-ins for guard tests. The matching
     /// engine/driver halves are dropped immediately — these fixtures
     /// never spawn the zenoh adapter, and the spawn itself gets
-    /// `None, None, None` for the engine-side catch-up params.
+    /// [`CatchUpChannels::none()`] for the engine-side catch-up params.
     fn dummy_root_serve_tx() -> mpsc::Sender<RootServeRequest> {
         mpsc::channel(8).0
     }
@@ -5808,9 +5861,7 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )
@@ -5947,9 +5998,7 @@ mod tests {
                     pub_rx,
                     sub_tx,
                     fix.community_adapter_tx.clone(),
-                    None,
-                    None,
-                    None,
+                    CatchUpChannels::none(),
                     dummy_root_serve_tx(),
                     dummy_fetch_request_rx(),
                 )
@@ -6029,9 +6078,7 @@ mod tests {
                     pub_rx,
                     sub_tx,
                     fix.community_adapter_tx.clone(),
-                    None,
-                    None,
-                    None,
+                    CatchUpChannels::none(),
                     dummy_root_serve_tx(),
                     dummy_fetch_request_rx(),
                 )
@@ -6110,9 +6157,7 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )
@@ -6175,9 +6220,7 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )
@@ -6253,9 +6296,7 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )
@@ -6323,9 +6364,7 @@ mod tests {
                     pub_rx,
                     sub_tx,
                     fix.community_adapter_tx.clone(),
-                    None,
-                    None,
-                    None,
+                    CatchUpChannels::none(),
                     dummy_root_serve_tx(),
                     dummy_fetch_request_rx(),
                 )
@@ -6376,9 +6415,7 @@ mod tests {
                 pub_rx_a,
                 sub_tx_a,
                 fix.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )
@@ -6403,9 +6440,7 @@ mod tests {
                     pub_rx_b,
                     sub_tx_b,
                     fix.community_adapter_tx.clone(),
-                    None,
-                    None,
-                    None,
+                    CatchUpChannels::none(),
                     dummy_root_serve_tx(),
                     dummy_fetch_request_rx(),
                 )
@@ -6443,9 +6478,7 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )
@@ -6493,9 +6526,7 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )
@@ -6570,9 +6601,7 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )
@@ -6640,9 +6669,7 @@ mod tests {
                 pub_rx_a,
                 sub_tx_a,
                 fix.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )
@@ -6664,9 +6691,7 @@ mod tests {
                 pub_rx_b,
                 sub_tx_b,
                 fix.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )
@@ -6724,9 +6749,7 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix_b.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )
@@ -6788,9 +6811,7 @@ mod tests {
                 pub_rx,
                 sub_tx,
                 fix.community_adapter_tx.clone(),
-                None,
-                None,
-                None,
+                CatchUpChannels::none(),
                 dummy_root_serve_tx(),
                 dummy_fetch_request_rx(),
             )

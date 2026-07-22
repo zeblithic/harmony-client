@@ -248,9 +248,7 @@ async fn two_members_dag_sync_full_event_log() {
             false,
             a_pub_tx,
             a_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn a");
@@ -262,9 +260,7 @@ async fn two_members_dag_sync_full_event_log() {
             false,
             b_pub_tx,
             b_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn b");
@@ -464,9 +460,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
             false,
             b_pub_tx,
             b_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn b");
@@ -708,9 +702,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
             false,
             a_pub_tx,
             a_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn a");
@@ -722,9 +714,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
             false,
             b_pub_tx,
             b_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn b");
@@ -929,9 +919,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
             false,
             a_pub_tx,
             a_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn a");
@@ -943,9 +931,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
             false,
             b_pub_tx,
             b_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn b");
@@ -1255,9 +1241,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
             false,
             a_pub_tx,
             a_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn a");
@@ -1269,9 +1253,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
             false,
             b_pub_tx,
             b_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn b");
@@ -1718,9 +1700,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
             false,
             a_pub_tx,
             a_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn a");
@@ -1732,9 +1712,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
             false,
             b_pub_tx,
             b_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn b");

@@ -201,6 +201,13 @@ struct PublishedSnapshot {
 pub struct ProfileBroadcastPublisher {
     notify: Arc<Notify>,
     /// Most recent published snapshot. `None` until first publish.
+    ///
+    /// ZEB-188: this field is the test-visible mirror of the `Arc` the
+    /// background task writes through (`last_published_for_task`); its only
+    /// reader is `last_published_for_test`. Gated to that same predicate so a
+    /// bare (`--no-default-features`) `-D warnings` build doesn't see it as
+    /// dead code — the live snapshot always lives in the task's own clone.
+    #[cfg(any(test, feature = "test-fixtures"))]
     last_published: Arc<Mutex<Option<PublishedSnapshot>>>,
     /// Background task driving debounce + refresh. Aborted on `shutdown()`.
     task: Mutex<Option<JoinHandle<()>>>,
@@ -272,6 +279,7 @@ impl ProfileBroadcastPublisher {
 
         Arc::new(Self {
             notify,
+            #[cfg(any(test, feature = "test-fixtures"))]
             last_published,
             task: Mutex::new(Some(task)),
         })

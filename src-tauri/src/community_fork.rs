@@ -616,9 +616,11 @@ pub async fn fork_community(
             pub_rx,
             sub_tx,
             community_adapter_tx,
-            Some(root_serve_rx),
-            Some(fetch_request_tx),
-            transport_epoch_rx,
+            crate::community_state_sync::CatchUpChannels {
+                root_serve_rx: Some(root_serve_rx),
+                fetch_request_tx: Some(fetch_request_tx),
+                transport_epoch_rx,
+            },
             root_serve_tx,
             fetch_request_rx,
         )

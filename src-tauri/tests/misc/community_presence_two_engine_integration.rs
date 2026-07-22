@@ -125,9 +125,7 @@ async fn seeded_registry(
             /* is_invite_only */ false,
             pub_tx,
             sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn membership engine");
