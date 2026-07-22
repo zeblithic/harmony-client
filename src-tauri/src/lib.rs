@@ -50405,6 +50405,22 @@ pub(crate) async fn voting_create_tier2_proposal_impl(
             proposal_text.len()
         ));
     }
+    // ZEB-720 (Greptile R2): reject an out-of-range SetPower target power at
+    // CREATE. `apply_auto_exec_set_power` caps `new_power` at 100 only at
+    // execution, so without this a proposal could finalize yet silently leave
+    // power unchanged. Validated in the shared _impl so the Tauri IPC path is
+    // covered too — not just the RPC handler.
+    if let Some(crate::community_voting_conviction::AutoExecAction::SetPower {
+        new_power, ..
+    }) = auto_exec.as_ref()
+    {
+        if *new_power > crate::community_membership::POWER_THRESHOLDS.max as u32 {
+            return Err(format!(
+                "voting_create_tier2_proposal: SetPower new_power must be 0..={} (got {new_power})",
+                crate::community_membership::POWER_THRESHOLDS.max
+            ));
+        }
+    }
     let mp_u8: u8 = min_power.unwrap_or(0).min(100) as u8;
     let cfg = crate::community_voting_conviction::Tier2PollConfig {
         proposal_text,
@@ -50500,6 +50516,52 @@ pub(crate) async fn voting_create_tier2_proposal_impl(
     };
     crate::node_event_sink::emit_ser(sink.as_ref(), "voting-tier2-proposal-created", &payload);
     Ok(poll_id_hex)
+}
+
+/// ZEB-720 (Greptile R2): the create seam must reject an out-of-range SetPower
+/// target power BEFORE publishing — otherwise the proposal finalizes yet
+/// `apply_auto_exec_set_power` silently no-ops it at execution.
+#[cfg(test)]
+mod voting_create_tier2_validation_tests {
+    use super::*;
+
+    /// A SetPower `new_power` above the power-table cap is rejected at create.
+    /// The guard runs before the engine `extract`, so a bare
+    /// `NodeState::default()` (no wired voting engine) reaches it.
+    #[tokio::test]
+    async fn create_rejects_out_of_range_setpower_new_power() {
+        let state = std::sync::Mutex::new(NodeState::default());
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
+        let auto_exec = Some(
+            crate::community_voting_conviction::AutoExecAction::SetPower {
+                target_pubkey: crate::owner_state_types::OwnerAddr([0x33u8; 16]),
+                new_power: 150,
+            },
+        );
+
+        let err = voting_create_tier2_proposal_impl(
+            &state,
+            sink,
+            hex::encode([0x11u8; 16]),
+            hex::encode([0x22u8; 16]),
+            "Promote Alice".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            auto_exec,
+            None,
+        )
+        .await
+        .expect_err("out-of-range SetPower new_power must be rejected at create");
+
+        assert!(
+            err.contains("new_power must be 0..=100"),
+            "expected range-rejection error, got: {err}"
+        );
+    }
 }
 
 /// Tauri IPC: cast (or withdraw) a Tier 2 Signal on a Conviction proposal.
