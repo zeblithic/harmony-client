@@ -550,38 +550,6 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         crate::dm_outbox::reserve_next_hlc_for_device(tracker, device_id, wall_now_ms).await
     }
 
-    /// ZEB-316 (Greptile P1 fix): reserve the next HLC on the local device's
-    /// lane like `reserve_next_local_hlc`, but with the reservation wall floored
-    /// at `floor_wall_ms` (`wall_now_ms = max(SystemTime::now(), floor_wall_ms)`).
-    ///
-    /// `reserve_next_hlc_for_device` returns `wall = max(wall_now_ms, own_prev_wall)`,
-    /// so passing `floor_wall_ms = watermark.wall + 1` guarantees the reserved
-    /// HLC's `wall_ms >= watermark.wall + 1 > watermark.wall` → strictly newer
-    /// than the watermark by the wall field alone (no logical / device-id tiebreak
-    /// needed). The engine-auto kd=rs mints use this to stay above the poll's live
-    /// `last_received_hlc` even when an accepted trigger is future-walled (clock
-    /// skew) and the plain `SystemTime::now()` reservation would otherwise sit
-    /// below the watermark and be rejected by the apply-time monotonic gate.
-    ///
-    /// Same pre-condition as `reserve_next_local_hlc`: `hlc_tracker` + `device_id`
-    /// installed; panics on its `.expect(...)` otherwise (misconfigured fixture).
-    pub async fn reserve_next_local_hlc_above(&self, floor_wall_ms: u64) -> Hlc {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let wall_now_ms = std::cmp::max(now_ms, floor_wall_ms);
-        let tracker = self
-            .hlc_tracker
-            .as_ref()
-            .expect("reserve_next_local_hlc_above called without hlc_tracker installed");
-        let device_id = self
-            .device_id
-            .as_deref()
-            .expect("reserve_next_local_hlc_above called without device_id installed");
-        crate::dm_outbox::reserve_next_hlc_for_device(tracker, device_id, wall_now_ms).await
-    }
-
     /// ZEB-310 Task 10: read-only "now" HLC estimate.
     ///
     /// Returns the engine's best estimate of "now" as an `Hlc` derived from
@@ -1216,55 +1184,61 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         };
 
         if let Some((result, last_received)) = trigger_kd_rs_result {
-            // ZEB-316 (qbug1 fix + Greptile P1 fix): pu-mode kd=rs mints on a
-            // WALL-CLOCK HLC (non-deterministic), NOT a deterministic
-            // close-anchored HLC — but reserved strictly ABOVE the poll's live
-            // receive watermark (`last_received_hlc`). This is the SAME approach
-            // used by se-mode kd=rs (see `try_finalize_secret_tally`).
+            // ZEB-731: pu-mode kd=rs mints on a POLL-DERIVED lane strictly above
+            // the poll's LIVE receive watermark (`last_received_hlc`), via the
+            // same `engine_auto_hlc_from_base` primitive kd=cl/kd=sf use —
+            // `(watermark.wall, watermark.logical + 1, "engine-auto-rs-{prefix}")`.
             //
             // Monotonicity: kd=rs must be minted ABOVE the current receive
             // watermark or the apply-time monotonic gate (`community_voting_tier3.rs`
-            // → `HlcNotMonotonic`) rejects it. A close-anchored HLC — pinned forever
-            // to `(close.wall, close.logical+1)` — can stall BELOW that watermark
-            // because the kd=cl→kd=rs cascade is NOT serialized: the `voting_log`
-            // mutex is released per-apply, and the post-apply hook re-fires after
-            // release with real yields at `persist_now().await` (which holds the log
-            // lock across a `spawn_blocking`) and `publisher_tx.send().await`. On the
-            // multi-threaded runtime a concurrent IPC ballot-cast or backfill apply
-            // can slip a higher-HLC event in between kd=cl and kd=rs, advancing
-            // `last_received_hlc` past the close HLC.
+            // → `HlcNotMonotonic`) rejects it. `logical + 1` at equal wall is
+            // strictly greater than the watermark by the logical field alone
+            // (which the tuple order breaks before device_id), so this clears the
+            // gate regardless of clock skew — including a FUTURE-walled trigger
+            // (kd=cl is deterministic and anchors on the trigger's HLC, so an
+            // accepted future-dated trigger makes `last_received_hlc` future; a
+            // `logical+1` mint is still strictly above it, where a
+            // `SystemTime::now()` mint would sit below and stall).
             //
-            // A plain `reserve_next_local_hlc()` (wall = `SystemTime::now()`) cures
-            // the REAL-TIME concurrent-event case, but NOT a future-walled trigger:
-            // kd=cl is deterministic and anchors on the triggering event's HLC, so
-            // when an accepted inbound trigger has a wall AHEAD of this node's local
-            // clock (clock skew, or a future-dated event) the resulting kd=cl becomes
-            // `last_received_hlc` at that future wall, and a `now`-reserved kd=rs sits
-            // BELOW it → permanently stalled until local time catches up. We instead
-            // reserve ABOVE the watermark: floor the reservation wall at
-            // `last_received.wall + 1`, so the minted HLC's wall strictly exceeds the
-            // watermark's wall regardless of clock skew → monotonic-safe on the first
-            // attempt. (kd=cl/kd=sf already satisfy this: they anchor on the trigger,
-            // which just BECAME the watermark.)
+            // Why the LIVE watermark, re-read each invocation, and NOT a frozen
+            // close HLC: the kd=cl→kd=rs cascade is NOT serialized (the
+            // `voting_log` mutex is released per-apply; the post-apply hook
+            // re-fires after release with real yields at `persist_now().await` —
+            // which holds the log lock across a `spawn_blocking` — and
+            // `publisher_tx.send().await`). A concurrent ballot-cast/backfill can
+            // advance `last_received_hlc` past the close HLC between kd=cl and
+            // kd=rs, so a close-anchored (frozen) base would stall below the
+            // watermark. Re-snapshotting the live watermark each mint self-heals:
+            // the interfering event re-fires this hook, which re-mints at the
+            // now-higher watermark's `logical+1`.
             //
-            // Residual window: we snapshot `last_received` under the lock, release it,
-            // then re-acquire for the kd=rs apply. Another event could advance the
-            // watermark further in between — that self-heals: the interfering event
-            // re-fires this hook, which re-snapshots the now-higher watermark and
-            // re-mints above it. Inherent to the lock-release-before-publish
-            // architecture and acceptable; the point of THIS floor is to remove the
-            // clock-dependent PERMANENT stall, not the transient re-mint.
-            //
-            // kd=rs remains wall-clock-based / non-deterministic; a deterministic HLC
-            // is unnecessary because the pu-mode RESULT converges bit-identically
-            // across replicas via the deterministic `StarResult` payload + the
-            // apply-time LWW/terminal-state gate that keeps the first finalizing kd=rs
-            // and drops the rest — identical to how se-mode converges.
-            let floor = last_received
-                .as_ref()
-                .map(|h| h.wall_ms.saturating_add(1))
-                .unwrap_or(0);
-            let hlc = self.reserve_next_local_hlc_above(floor).await;
+            // Why the poll-derived lane and NOT `reserve_next_local_hlc_above`
+            // (ZEB-731): `engine_auto_hlc_from_base` reads no wall clock and does
+            // NOT touch the shared per-device HLC tracker, so a future-walled
+            // watermark stays confined to THIS poll — it cannot leak into the
+            // device's global outbound lane and wedge other polls/channels/DMs
+            // forward (the reserve-on-device-lane approach did). As a bonus this
+            // recovers common-case determinism: when replicas' watermarks coincide
+            // (the common case — the shared kd=cl is the last event) the kd=rs is
+            // byte-identical across replicas. When watermarks diverge, kd=rs
+            // diverges but the RESULT still converges via the deterministic
+            // `StarResult` payload + the apply-time LWW/terminal-state gate that
+            // keeps the first finalizing kd=rs and drops the rest.
+            let base = match last_received.as_ref() {
+                Some(w) => w,
+                None => {
+                    // Unreachable: `close_event_hash.is_some()` (gated above)
+                    // implies kd=cl was received, which set `last_received_hlc`.
+                    // Bail rather than mint an unanchored kd=rs; the next applied
+                    // event re-fires this hook with the watermark populated.
+                    tracing::warn!(
+                        poll_id = %hex::encode(pid.0),
+                        "engine-auto kd=rs: no receive watermark despite kd=cl applied; skipping"
+                    );
+                    return;
+                }
+            };
+            let hlc = engine_auto_hlc_from_base(base, pid, "rs");
             let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
                 &signing_key,
                 self_owner,
@@ -1680,47 +1654,52 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         };
 
         if let Some((result, last_received)) = trigger_result {
-            // ZEB-316 (C1 fix + Greptile P1 fix): se-mode kd=rs mints on a
-            // WALL-CLOCK HLC (non-deterministic), NOT a deterministic
-            // close-anchored HLC — reserved strictly ABOVE the poll's live
-            // receive watermark (`last_received_hlc`).
+            // ZEB-731: se-mode kd=rs mints on a POLL-DERIVED lane strictly above
+            // the poll's LIVE receive watermark (`last_received_hlc`), via the
+            // same `engine_auto_hlc_from_base` primitive kd=cl/kd=sf use —
+            // `(watermark.wall, watermark.logical + 1, "engine-auto-rs-{prefix}")`.
             //
             // kd=rs must be minted ABOVE the current receive watermark or the
             // apply-time monotonic gate rejects it. In secret mode the committee
             // kd=ts (tally-share) events land AFTER the close carrying per-replica
             // wall-clock HLCs whose wall exceeds the close event's wall, so a
             // close-anchored kd=rs would be non-monotonic and rejected → the poll
-            // would never finalize via engine-auto. No deterministic base is also
-            // ≥ every applied kd=ts, because the shares are per-replica, not
-            // replica-identical.
+            // would never finalize via engine-auto. Anchoring on the LIVE watermark
+            // (which already reflects every applied kd=ts) at `logical + 1` is
+            // strictly above it by the logical field alone — monotonic-safe even
+            // when the watermark is future-walled (clock skew / future-dated
+            // trigger), where a `SystemTime::now()` mint would sit below and stall.
             //
-            // A plain `reserve_next_local_hlc()` (wall = `SystemTime::now()`) can
-            // still stall if an accepted trigger is future-walled (clock skew /
-            // future-dated event): its wall becomes `last_received_hlc` ahead of
-            // this node's local clock, and a `now`-reserved kd=rs sits below it
-            // until local time catches up. We instead floor the reservation wall at
-            // `last_received.wall + 1`, so the minted HLC's wall strictly exceeds
-            // the watermark's wall regardless of clock skew → monotonic-safe on the
-            // first attempt.
+            // Re-read the watermark each invocation (never a frozen close HLC): the
+            // watermark advances as kd=ts events arrive; the residual window between
+            // snapshot and the kd=rs apply self-heals by re-firing this hook
+            // (re-snapshot the higher watermark, re-mint at its `logical + 1`).
             //
-            // Residual window: `last_received` is snapshotted under the lock, then
-            // the lock is released before the kd=rs apply re-acquires it; an event
-            // that advances the watermark in between self-heals by re-firing this
-            // hook (re-snapshot the higher watermark, re-mint above it). Inherent to
-            // the lock-release-before-publish architecture and acceptable.
-            //
-            // A deterministic HLC is unnecessary here anyway: the kd=rs RESULT
-            // already converges bit-identically across replicas via Lagrange
-            // invariance in `recover_secret_tally` (a canonical size-`threshold`
-            // share subset) + the apply-time LWW/terminal-state gate that keeps
-            // the first finalizing kd=rs and drops the rest. (pu-mode kd=rs floors
-            // above the watermark for the same monotonicity reason — see
+            // Poll-derived lane, not `reserve_next_local_hlc_above` (ZEB-731):
+            // `engine_auto_hlc_from_base` touches no wall clock and no shared
+            // per-device HLC tracker, so a future-walled watermark stays confined
+            // to THIS poll instead of leaking into the device's global outbound
+            // lane. The kd=rs RESULT still converges bit-identically across
+            // replicas via Lagrange invariance in `recover_secret_tally` (a
+            // canonical size-`threshold` share subset) + the apply-time
+            // LWW/terminal-state gate that keeps the first finalizing kd=rs and
+            // drops the rest. (pu-mode kd=rs uses the same primitive — see
             // `maybe_trigger_engine_auto_orchestration`.)
-            let floor = last_received
-                .as_ref()
-                .map(|h| h.wall_ms.saturating_add(1))
-                .unwrap_or(0);
-            let hlc = self.reserve_next_local_hlc_above(floor).await;
+            let base = match last_received.as_ref() {
+                Some(w) => w,
+                None => {
+                    // Unreachable: `close_event_hash.is_some()` (gated above)
+                    // implies kd=cl was received, which set `last_received_hlc`.
+                    // Bail rather than mint an unanchored kd=rs; the next applied
+                    // event re-fires this hook with the watermark populated.
+                    tracing::warn!(
+                        poll_id = %hex::encode(pid.0),
+                        "engine-auto kd=rs (secret): no receive watermark despite kd=cl applied; skipping"
+                    );
+                    return;
+                }
+            };
+            let hlc = engine_auto_hlc_from_base(base, pid, "rs");
             let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
                 signing_key,
                 self_owner,
@@ -5999,59 +5978,34 @@ mod tests {
         .await
     }
 
-    /// A floor ABOVE the current wall clock (as when an accepted trigger is
-    /// future-walled) forces the reserved HLC's wall up to the floor — the
-    /// core guarantee that keeps engine-auto kd=rs above the poll's receive
-    /// watermark and clears the apply-time monotonic gate.
+    /// The plain reserve tags the local `device_id` and advances the shared
+    /// device lane monotonically. (kd=ts mints use this primitive; kd=cl/kd=sf
+    /// and — post-ZEB-731 — kd=rs mint via `engine_auto_hlc_from_base` instead,
+    /// which touches no device lane.)
     #[tokio::test]
-    async fn reserve_next_local_hlc_above_floors_wall_at_future_floor() {
-        let engine = start_hlc_reserve_test_engine("dev-reserve-hi").await;
-
-        // ~year 33658 in ms — comfortably above any real `SystemTime::now()`.
-        let far_future_ms = 1_000_000_000_000_000u64;
-        let hlc = engine.reserve_next_local_hlc_above(far_future_ms).await;
-
-        assert_eq!(hlc.device_id, "dev-reserve-hi");
-        assert!(
-            hlc.wall_ms >= far_future_ms,
-            "reserved wall {} must be floored at {far_future_ms}",
-            hlc.wall_ms
-        );
-    }
-
-    /// A floor of 0 (i.e. below `now`) makes the floored reserve behave like
-    /// the plain `reserve_next_local_hlc`: wall ≈ now, and the shared device
-    /// lane advances monotonically across both.
-    #[tokio::test]
-    async fn reserve_next_local_hlc_above_zero_floor_tracks_wall_clock() {
-        let engine = start_hlc_reserve_test_engine("dev-reserve-lo").await;
+    async fn reserve_next_local_hlc_advances_device_lane_monotonically() {
+        let engine = start_hlc_reserve_test_engine("dev-reserve").await;
 
         let before_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let floored = engine.reserve_next_local_hlc_above(0).await;
-        let after_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        assert_eq!(floored.device_id, "dev-reserve-lo");
+        let first = engine.reserve_next_local_hlc().await;
+        assert_eq!(first.device_id, "dev-reserve");
         assert!(
-            floored.wall_ms >= before_ms && floored.wall_ms <= after_ms,
-            "0-floor wall {} should sit within [{before_ms}, {after_ms}] (≈ now)",
-            floored.wall_ms
+            first.wall_ms >= before_ms,
+            "reserved wall {} must be >= now {before_ms}",
+            first.wall_ms
         );
 
-        // Same device lane: a subsequent plain reserve must not regress —
-        // confirming the floored reserve advanced the shared tracker exactly
-        // like the plain path would.
-        let plain = engine.reserve_next_local_hlc().await;
+        // A second reserve on the same lane must strictly advance (wall bumps,
+        // or logical increments within the same millisecond).
+        let second = engine.reserve_next_local_hlc().await;
         assert!(
-            (plain.wall_ms, plain.logical) >= (floored.wall_ms, floored.logical),
-            "plain reserve {:?} after floored reserve {:?} must not regress",
-            (plain.wall_ms, plain.logical),
-            (floored.wall_ms, floored.logical)
+            (second.wall_ms, second.logical) > (first.wall_ms, first.logical),
+            "second reserve {:?} must strictly advance past first {:?}",
+            (second.wall_ms, second.logical),
+            (first.wall_ms, first.logical)
         );
     }
 }

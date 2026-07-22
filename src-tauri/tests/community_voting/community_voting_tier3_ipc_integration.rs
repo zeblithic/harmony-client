@@ -190,6 +190,12 @@ pub struct TwoVotingEngines {
     pub log_a: Arc<Mutex<VotingLog>>,
     pub log_b: Arc<Mutex<VotingLog>>,
     pub resolvers: Arc<BridgeTestResolvers>,
+    /// ZEB-731: the shared per-device HLC trackers handed to each engine.
+    /// Exposed so tests can assert that engine-auto kd=rs mints do NOT bump
+    /// the device lane (the poll-derived-lane fix keeps a future-walled poll
+    /// watermark out of the device's global outbound lane).
+    pub a_hlc_tracker: Arc<Mutex<std::collections::BTreeMap<String, Hlc>>>,
+    pub b_hlc_tracker: Arc<Mutex<std::collections::BTreeMap<String, Hlc>>>,
 }
 
 async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingEngines {
@@ -236,7 +242,7 @@ async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingEngin
         voting_log: Arc::clone(&log_a),
         publisher_tx: a_pub_tx,
         subscriber_rx: a_sub_rx,
-        hlc_tracker: Some(a_hlc_tracker),
+        hlc_tracker: Some(Arc::clone(&a_hlc_tracker)),
         device_id: Some("engine-a".into()),
         app_handle: None,
         identity_resolver: Some(id_resolver_a),
@@ -249,7 +255,7 @@ async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingEngin
         voting_log: Arc::clone(&log_b),
         publisher_tx: b_pub_tx,
         subscriber_rx: b_sub_rx,
-        hlc_tracker: Some(b_hlc_tracker),
+        hlc_tracker: Some(Arc::clone(&b_hlc_tracker)),
         device_id: Some("engine-b".into()),
         app_handle: None,
         identity_resolver: Some(id_resolver_b),
@@ -263,6 +269,8 @@ async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingEngin
         log_a,
         log_b,
         resolvers,
+        a_hlc_tracker,
+        b_hlc_tracker,
     }
 }
 
@@ -983,9 +991,15 @@ async fn ipc_tier3_engine_auto_kd_sf_on_mass_decline() {
 ///
 /// Runs the full scenario, asserts complete cross-engine convergence
 /// (identical stage, byte-identical close_event_hash, and identical
-/// StarResult), and returns the finalized `close_event_hash` so callers can
-/// additionally assert determinism ACROSS runs (see the repeat test below).
-async fn run_race_tolerant_and_return_close_hash() -> Option<[u8; 32]> {
+/// StarResult), and returns the live engines plus the finalized
+/// `close_event_hash` so callers can additionally assert determinism ACROSS
+/// runs (see the repeat test below) or inspect post-finalize engine state
+/// (e.g. the shared HLC trackers — ZEB-731).
+///
+/// `ss_hlc_wall` is the wall (ms) of the injected kd=ss trigger. It must be
+/// past the ratification deadline (`t0 + total_window`); a far-future value
+/// also exercises the ZEB-731 future-walled-watermark path.
+async fn run_race_tolerant_inner(ss_hlc_wall: u64) -> (TwoVotingEngines, Option<[u8; 32]>) {
     const SORTITION_SIZE: u16 = 20;
     const N_IDENTITIES: usize = 50;
     const COMMUNITY_ID: SpaceId = SpaceId([0xF3; 16]);
@@ -1047,10 +1061,11 @@ async fn run_race_tolerant_and_return_close_hash() -> Option<[u8; 32]> {
     }
 
     // Inject kd=ss with HLC well past the ratification deadline
-    // (t0 + total_window = t0 + 180_000). t0 + 500_000 leaves 320_000ms of
-    // safety margin. BOTH engines apply kd=ss and BOTH fire engine-auto
-    // kd=cl + kd=rs from their own apply hook. The HLC-driven "now" view
-    // is the kd=ss HLC, so both engines see ratification as expired.
+    // (t0 + total_window = t0 + 180_000). The caller-supplied `ss_hlc_wall`
+    // (default t0 + 500_000 leaves 320_000ms of safety margin; a far-future
+    // value exercises the ZEB-731 path). BOTH engines apply kd=ss and BOTH
+    // fire engine-auto kd=cl + kd=rs from their own apply hook. The
+    // HLC-driven "now" view is the kd=ss HLC, so both see ratification expired.
     let vrf_output: [u8; 32] = [0xF3; 32];
     let sortition_result = fisher_yates_select(
         &vrf_output,
@@ -1063,7 +1078,6 @@ async fn run_race_tolerant_and_return_close_hash() -> Option<[u8; 32]> {
         engines.resolvers.add_identity(id);
     }
 
-    let ss_hlc_wall = t0 + 500_000;
     let ss_event = build_sortition_selection_event(
         proposer,
         poll_id,
@@ -1139,10 +1153,24 @@ async fn run_race_tolerant_and_return_close_hash() -> Option<[u8; 32]> {
         "CONVERGENCE: bit-identical StarResult across both engines"
     );
 
-    drop(engines);
-
     // The winning kd=cl close_event_hash — deterministic across runs.
-    t3_a.close_event_hash
+    // Return the live engines so callers can inspect post-finalize state
+    // (ZEB-731 tracker inspection); default callers just drop them.
+    (engines, t3_a.close_event_hash)
+}
+
+/// Default kd=ss trigger wall for the standard race-tolerant tests: past the
+/// ratification deadline but in the PAST relative to real `SystemTime::now()`
+/// (t0 = 6_000_000, + 500_000 margin).
+const RACE_TOLERANT_DEFAULT_SS_WALL: u64 = 6_500_000;
+
+/// Thin wrapper preserving the pre-ZEB-731 signature for the convergence +
+/// determinism-repeat callers: runs with the default trigger wall, drops the
+/// engines, and returns only the finalized `close_event_hash`.
+async fn run_race_tolerant_and_return_close_hash() -> Option<[u8; 32]> {
+    let (engines, close_hash) = run_race_tolerant_inner(RACE_TOLERANT_DEFAULT_SS_WALL).await;
+    drop(engines);
+    close_hash
 }
 
 /// Thin wrapper preserving the original test name; drives the scenario once
@@ -1176,6 +1204,70 @@ async fn ipc_tier3_engine_auto_kd_cl_kd_rs_deterministic_repeat() {
         "close_event_hash must be identical across 100 independent runs; got {} distinct",
         hashes.len()
     );
+}
+
+/// ZEB-731 regression guard. When the poll's receive watermark is FUTURE-walled
+/// (clock skew or a future-dated trigger), the engine-auto kd=rs mint must NOT
+/// bump the shared per-device HLC tracker to that future wall — otherwise the
+/// future wall leaks into the device's *global* outbound lane and can
+/// transiently wedge every other poll/channel/DM mint on that device forward.
+///
+/// The poll-derived-lane fix mints kd=rs via
+/// `engine_auto_hlc_from_base(&watermark, pid, "rs")` — strictly above the
+/// watermark by `logical+1`, WITHOUT reading the wall clock or touching the
+/// device tracker — so the future wall stays poll-scoped. RED against the
+/// shipped wall-clock floor (`reserve_next_local_hlc_above` reserved on the
+/// device lane, leaking the future wall); GREEN after the fix.
+///
+/// Also proves LIVENESS: the poll still reaches Stage::Finalized under a
+/// future-walled watermark (the helper's Finalized waits would time out
+/// otherwise).
+#[tokio::test]
+async fn ipc_tier3_engine_auto_kd_rs_future_walled_no_device_lane_leak() {
+    // ~year 33658 in ms — far above any real `SystemTime::now()`, so a mint
+    // that floored on this wall is trivially detectable in the device tracker.
+    const FUTURE_WALL: u64 = 1_000_000_000_000_000;
+
+    let (engines, close_hash) = run_race_tolerant_inner(FUTURE_WALL).await;
+
+    // Liveness: the poll finalized despite the future-walled watermark.
+    assert!(
+        close_hash.is_some(),
+        "poll must finalize (record a kd=cl close_event_hash) even when the \
+         trigger — and thus the receive watermark — is future-walled"
+    );
+
+    // Core ZEB-731 guard: engine_a auto-minted kd=cl + kd=rs off a future-walled
+    // watermark. kd=cl/kd=sf never touch the device tracker; the fixed kd=rs
+    // mints on a poll-derived lane and must not either. So neither engine's own
+    // device lane may have been advanced to the future wall. (Under the shipped
+    // wall-clock floor engine_a's lane read >= FUTURE_WALL — the device-wide
+    // leak; engine_a is the kd=ss originator so it deterministically mints its
+    // own kd=rs before adopting a peer's.)
+    //
+    // Post-fix both trackers stay empty for a pu-mode poll (poll-lane kd=rs
+    // touches no device lane; kd=ts is se-mode only), so `< FUTURE_WALL` holds
+    // via the `unwrap_or(0)` absent-lane default.
+    let lane_wall = |tr: &std::collections::BTreeMap<String, Hlc>, dev: &str| {
+        tr.get(dev).map(|h| h.wall_ms).unwrap_or(0)
+    };
+    let (engine_a_lane_wall, engine_b_lane_wall) = {
+        let ta = engines.a_hlc_tracker.lock().await;
+        let tb = engines.b_hlc_tracker.lock().await;
+        (lane_wall(&ta, "engine-a"), lane_wall(&tb, "engine-b"))
+    };
+    assert!(
+        engine_a_lane_wall < FUTURE_WALL,
+        "ZEB-731: future-walled kd=rs mint leaked into engine_a's shared device \
+         lane — engine-a lane wall {engine_a_lane_wall} >= future {FUTURE_WALL}"
+    );
+    assert!(
+        engine_b_lane_wall < FUTURE_WALL,
+        "ZEB-731: future-walled kd=rs mint leaked into engine_b's shared device \
+         lane — engine-b lane wall {engine_b_lane_wall} >= future {FUTURE_WALL}"
+    );
+
+    drop(engines);
 }
 
 // ─── TEST 4: retry_of via IPC ─────────────────────────────────────────────────
