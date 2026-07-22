@@ -42152,6 +42152,299 @@ async fn remove_space(
     remove_space_impl(state_lock.inner(), space_id).await
 }
 
+/// ZEB-581: reclaim a LEFT community's on-disk dataset
+/// (`~/.harmony/communities/<id>/`) WITHOUT tombstoning it — the community
+/// stays rejoinable (a later rejoin re-backfills from peers, ZEB-418 P3a).
+///
+/// A strict subset of [`remove_space_impl`]: same `left_at` precondition, the
+/// active-member defense-in-depth (reuses `remove_space_community_guard`), and
+/// the node-generation re-check — but writes NO tombstone and leaves `left_at`
+/// untouched. There is therefore no tombstone durability to fence (the whole
+/// `fence_remove_space_flush` path is absent), so — unlike `remove_space` — the
+/// delete is never deferred. Deletion reuses `cleanup_community_data`
+/// (stop-engine → `remove_dir_all`, with the no-registry filesystem fallback).
+/// Community-only (DMs/channels have no dataset dir). Idempotent: dir already
+/// absent → `Ok`.
+pub(crate) async fn clear_space_local_cache_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<(), String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+    let id_hex = hex::encode(space_id.0);
+
+    let (self_owner, community_registry, crdt_state, snapshot_generation) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.dm_self_owner,
+            g.community_registry.clone(),
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.generation,
+        )
+    };
+
+    // Re-validate node generation right before the destructive delete: a
+    // concurrent stop_node/start_node swaps in a fresh engine + live community
+    // for this id, and deleting its dir would be data loss (ZEB-427 split-brain).
+    let check_generation = || -> Result<(), String> {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err(format!(
+                "node generation changed during clear_space_local_cache \
+                 (was {snapshot_generation}, now {})",
+                g.generation
+            ));
+        }
+        Ok(())
+    };
+
+    use crate::owner_state_types::SpaceKind;
+    let (kind, already_left) = {
+        let g = crdt_state.lock().await;
+        match g.spaces.get(&space_id) {
+            Some(s) => (s.kind, s.left_at.is_some()),
+            None => return Err(format!("no space {id_hex} to clear")),
+        }
+    };
+
+    if kind != SpaceKind::Community {
+        return Err(format!(
+            "clear_space_local_cache: {id_hex} is not a community \
+             (only communities have a local dataset dir)"
+        ));
+    }
+    // Durable gate: owner-state must record a completed leave — holds even with
+    // no live engine (a stopped/never-started community).
+    if !already_left {
+        return Err(format!(
+            "community {id_hex} has not been left — call leave_community before \
+             clearing its local cache"
+        ));
+    }
+    // Defense-in-depth: if an engine is live, materialize self and refuse if the
+    // membership CRDT still shows us active (`left_at` can be set locally before
+    // the Leave actually commits). Reuses remove_space's pure guard.
+    let self_status = match (&community_registry, self_owner) {
+        (Some(registry), Some(self_owner)) => match registry.engine_arc(&space_id).await {
+            Some(engine_arc) => {
+                let admin_addr = engine_arc.admin_addr();
+                let materialized = {
+                    let st = engine_arc.state();
+                    let g = st.lock().await;
+                    g.materialize_now(admin_addr)
+                };
+                materialized.members.get(&self_owner).map(|m| m.status)
+            }
+            None => None,
+        },
+        _ => None,
+    };
+    remove_space_community_guard(self_status)?;
+
+    // Reclaim disk. NO tombstone, `left_at` untouched → still rejoinable.
+    check_generation()?;
+    cleanup_community_data(&community_registry, &space_id, &id_hex).await;
+    Ok(())
+}
+
+/// ZEB-581: Tauri IPC — see [`clear_space_local_cache_impl`].
+#[tauri::command]
+async fn clear_space_local_cache(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: String,
+) -> Result<(), String> {
+    clear_space_local_cache_impl(state_lock.inner(), community_id).await
+}
+
+#[cfg(test)]
+mod clear_space_local_cache_tests {
+    use super::*;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::{Hlc, Space, SpaceId, SpaceKind};
+    use serial_test::serial;
+
+    fn hlc() -> Hlc {
+        Hlc {
+            wall_ms: 1,
+            logical: 0,
+            device_id: "t".into(),
+        }
+    }
+
+    fn space(id: u8, kind: SpaceKind, left: bool) -> Space {
+        Space {
+            id: SpaceId([id; 16]),
+            kind,
+            parent: None,
+            community_id: None,
+            name: "T".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: if left { Some(hlc()) } else { None },
+            created_at: hlc(),
+            updated_at: hlc(),
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: Some(false),
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    fn node_with(os: OwnerState) -> std::sync::Mutex<NodeState> {
+        let mut ns = NodeState::default();
+        ns.set_test_crdt_state(std::sync::Arc::new(tokio::sync::Mutex::new(os)));
+        std::sync::Mutex::new(ns)
+    }
+
+    /// Restore HOME/USERPROFILE on drop (panic-safe) for the dir-delete tests.
+    struct HomeGuard {
+        home: Option<String>,
+        up: Option<String>,
+    }
+    impl HomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let g = Self {
+                home: std::env::var("HOME").ok(),
+                up: std::env::var("USERPROFILE").ok(),
+            };
+            std::env::set_var("HOME", path);
+            std::env::set_var("USERPROFILE", path);
+            g
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.up {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_space_errs() {
+        let node = node_with(OwnerState::default());
+        let err = clear_space_local_cache_impl(&node, hex::encode([9u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("no space"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn non_community_is_refused() {
+        let mut os = OwnerState::default();
+        os.spaces
+            .insert(SpaceId([3; 16]), space(3, SpaceKind::Dm, true));
+        let node = node_with(os);
+        let err = clear_space_local_cache_impl(&node, hex::encode([3u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a community"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn community_not_left_is_refused() {
+        let mut os = OwnerState::default();
+        os.spaces
+            .insert(SpaceId([1; 16]), space(1, SpaceKind::Community, false));
+        let node = node_with(os);
+        let err = clear_space_local_cache_impl(&node, hex::encode([1u8; 16]))
+            .await
+            .unwrap_err();
+        assert!(err.contains("has not been left"), "{err}");
+        let cs = node.lock().unwrap().crdt_state.clone().unwrap();
+        assert!(
+            cs.lock().await.spaces.contains_key(&SpaceId([1; 16])),
+            "row untouched"
+        );
+    }
+
+    /// The reversibility guarantee: with NO engine, and unlike `remove_space`,
+    /// there is no tombstone to fence — so the dir is deleted immediately while
+    /// the Space row + `left_at` survive and NO tombstone is written.
+    #[tokio::test]
+    #[serial]
+    async fn left_community_cache_cleared_dir_deleted_row_and_left_at_kept_no_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let id = [2u8; 16];
+        let id_hex = hex::encode(id);
+        let dir = tmp
+            .path()
+            .join(".harmony")
+            .join("communities")
+            .join(&id_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("crdt.cbor"), b"x").unwrap();
+
+        let mut os = OwnerState::default();
+        os.spaces
+            .insert(SpaceId(id), space(2, SpaceKind::Community, true)); // left
+        let node = node_with(os);
+
+        clear_space_local_cache_impl(&node, id_hex.clone())
+            .await
+            .unwrap();
+
+        assert!(!dir.exists(), "cache dir deleted");
+        let cs = node.lock().unwrap().crdt_state.clone().unwrap();
+        let g = cs.lock().await;
+        let s = g
+            .spaces
+            .get(&SpaceId(id))
+            .expect("Space row still present (rejoinable)");
+        assert!(s.left_at.is_some(), "left_at untouched");
+        assert!(!g.tombstones.contains(&SpaceId(id)), "NO tombstone written");
+    }
+
+    /// Idempotent: a call with the dir already absent is a clean Ok, row kept.
+    #[tokio::test]
+    #[serial]
+    async fn clear_is_idempotent_when_dir_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let id = [7u8; 16];
+        let id_hex = hex::encode(id);
+
+        let mut os = OwnerState::default();
+        os.spaces
+            .insert(SpaceId(id), space(7, SpaceKind::Community, true));
+        let node = node_with(os);
+
+        // No dir on disk at all → first call is a no-op Ok.
+        clear_space_local_cache_impl(&node, id_hex.clone())
+            .await
+            .unwrap();
+        // Second call likewise.
+        clear_space_local_cache_impl(&node, id_hex).await.unwrap();
+
+        let cs = node.lock().unwrap().crdt_state.clone().unwrap();
+        assert!(
+            cs.lock().await.spaces.contains_key(&SpaceId(id)),
+            "row still present"
+        );
+    }
+}
+
 #[cfg(test)]
 mod remove_space_tests {
     use super::*;
@@ -64743,6 +65036,7 @@ pub fn run() {
             join_open_community,
             leave_community,
             remove_space,
+            clear_space_local_cache,
             list_left_communities,
             kick_from_community,
             community_fork::fork_community,

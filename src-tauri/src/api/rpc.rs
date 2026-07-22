@@ -761,6 +761,16 @@ pub fn build_registry() -> RpcRegistry {
         SpaceIdArgs,
         |state, _sink, a| async move { crate::remove_space_impl(state, a.space_id).await }
     );
+    // ZEB-581: clear a LEFT community's on-disk cache WITHOUT tombstoning
+    // (keeps it rejoinable). Community-only; refuses not-yet-left communities.
+    rpc!(
+        m,
+        "clear_space_local_cache",
+        CommunityIdArgs,
+        |state, _sink, a| async move {
+            crate::clear_space_local_cache_impl(state, a.community_id).await
+        }
+    );
 
     // community moderation (ZEB-527)
     rpc!(
@@ -2256,6 +2266,7 @@ mod tests {
             "leave_community",
             "list_left_communities",
             "remove_space",
+            "clear_space_local_cache",
             // community moderation (ZEB-527)
             "list_pending_joins",
             "list_recent_counter_signs",
