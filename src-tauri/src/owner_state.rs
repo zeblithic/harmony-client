@@ -524,10 +524,15 @@ pub fn load_owner_state(
     let state: OwnerState =
         cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
 
+    // ZEB-189: the secret helpers only need "attempt the OS keychain?" — derive
+    // the gate once. (`load_fleet_keytree` below still takes `Option` — its
+    // pub(crate) callers weren't converted; see ZEB-189 scope note.)
+    let use_os_keychain = keychain.is_some();
+
     // Inconsistent-state checks: state present implies signing key MUST be
     // findable; master seed MAY be absent (degraded but functional).
     let signing_key_bytes = load_secret(
-        &keychain,
+        use_os_keychain,
         VaultSlot::Device,
         KEYCHAIN_DEVICE_SK,
         identity_dir,
@@ -542,7 +547,7 @@ pub fn load_owner_state(
     let device_signing_key = SigningKey::from_bytes(&signing_key_bytes);
 
     let master_seed = load_secret(
-        &keychain,
+        use_os_keychain,
         VaultSlot::OwnerMasterSeed,
         KEYCHAIN_MASTER_SEED,
         identity_dir,
@@ -595,8 +600,10 @@ pub fn save_owner_state_atomic(
     // failure). On a fresh install (mint) both read back as `None` and the
     // rollback below is a no-op. Best-effort: an unreadable prior secret simply
     // cannot be rolled back (the status quo before this guard).
+    // ZEB-189: the secret helpers only need "attempt the OS keychain?" gate.
+    let use_os_keychain = keychain.is_some();
     let prev_device = load_secret(
-        &keychain,
+        use_os_keychain,
         VaultSlot::Device,
         KEYCHAIN_DEVICE_SK,
         identity_dir,
@@ -605,7 +612,7 @@ pub fn save_owner_state_atomic(
     .ok()
     .flatten();
     let prev_seed = load_secret(
-        &keychain,
+        use_os_keychain,
         VaultSlot::OwnerMasterSeed,
         KEYCHAIN_MASTER_SEED,
         identity_dir,
@@ -616,7 +623,7 @@ pub fn save_owner_state_atomic(
 
     let write = || -> Result<(), String> {
         save_secret(
-            &keychain,
+            use_os_keychain,
             VaultSlot::Device,
             KEYCHAIN_DEVICE_SK,
             identity_dir,
@@ -625,7 +632,7 @@ pub fn save_owner_state_atomic(
         )?;
         if let Some(seed) = master_seed {
             save_secret(
-                &keychain,
+                use_os_keychain,
                 VaultSlot::OwnerMasterSeed,
                 KEYCHAIN_MASTER_SEED,
                 identity_dir,
@@ -637,7 +644,7 @@ pub fn save_owner_state_atomic(
             // from a previous identity behind; if we did, `load_owner_state` would
             // pick it up and `canBackUp` would lie about backup eligibility.
             clear_secret(
-                &keychain,
+                use_os_keychain,
                 VaultSlot::OwnerMasterSeed,
                 KEYCHAIN_MASTER_SEED,
                 identity_dir,
@@ -663,7 +670,7 @@ pub fn save_owner_state_atomic(
         match prev_device.as_deref() {
             Some(prev) => {
                 let _ = save_secret(
-                    &keychain,
+                    use_os_keychain,
                     VaultSlot::Device,
                     KEYCHAIN_DEVICE_SK,
                     identity_dir,
@@ -673,7 +680,7 @@ pub fn save_owner_state_atomic(
             }
             None => {
                 let _ = clear_secret(
-                    &keychain,
+                    use_os_keychain,
                     VaultSlot::Device,
                     KEYCHAIN_DEVICE_SK,
                     identity_dir,
@@ -684,7 +691,7 @@ pub fn save_owner_state_atomic(
         match prev_seed.as_deref() {
             Some(prev) => {
                 let _ = save_secret(
-                    &keychain,
+                    use_os_keychain,
                     VaultSlot::OwnerMasterSeed,
                     KEYCHAIN_MASTER_SEED,
                     identity_dir,
@@ -694,7 +701,7 @@ pub fn save_owner_state_atomic(
             }
             None => {
                 let _ = clear_secret(
-                    &keychain,
+                    use_os_keychain,
                     VaultSlot::OwnerMasterSeed,
                     KEYCHAIN_MASTER_SEED,
                     identity_dir,
@@ -975,11 +982,15 @@ pub fn refresh_self_liveness(
 /// hard-failing — matches the pattern in `crate::identity` which made
 /// keychain integration robust on partially-broken systems.
 ///
-/// TODO(ZEB-189): the `keychain` parameter is currently used as a boolean
-/// sentinel; the injected `KeychainStore` value is bypassed in favor of a
-/// raw `keyring::Entry::new(...)`. Future cleanup will properly delegate.
+/// `use_os_keychain` (ZEB-189) gates the OS-keychain attempt: `true` tries the
+/// consolidated `harmony`/`identity` vault slot (via
+/// `crate::identity::vault_load_slot`, which owns its own `KeychainStore`)
+/// before the encrypted-file fallback; `false` goes straight to the file. Tests
+/// pass `false` — the ZEB-428 isolation gate — so the real credential store is
+/// never touched. (Previously an `Option<KeychainStore>` used only as a boolean
+/// sentinel: the injected value was never delegated to.)
 fn load_secret(
-    keychain: &Option<KeychainStore>,
+    use_os_keychain: bool,
     slot: VaultSlot,
     keychain_name: &str,
     identity_dir: &Path,
@@ -989,7 +1000,7 @@ fn load_secret(
     // than silently masking a locked/permission-denied keychain as an
     // un-minted state when no encrypted-file fallback is configured.
     let mut keychain_err: Option<String> = None;
-    if keychain.is_some() {
+    if use_os_keychain {
         // ZEB-363: this owner secret is consolidated into the single
         // `harmony`/`identity` keychain vault slot. `vault_load_slot` reads the
         // slot, folding in (and deleting after a verified read-back) the legacy
@@ -1031,11 +1042,14 @@ fn load_secret(
     }
 }
 
-// TODO(ZEB-189): the `keychain` parameter is currently used as a boolean
-// sentinel; the injected `KeychainStore` value is bypassed in favor of a
-// raw `keyring::Entry::new(...)`. Future cleanup will properly delegate.
+// `use_os_keychain` (ZEB-189) gates the OS-keychain attempt: `true` writes the
+// consolidated `harmony`/`identity` vault slot (via
+// `crate::identity::vault_save_slot`, which owns its own `KeychainStore`) with
+// the encrypted-file fallback; `false` writes only the file. Tests pass `false`
+// (the ZEB-428 isolation gate). (Previously an `Option<KeychainStore>` used
+// only as a boolean sentinel: the injected value was never delegated to.)
 fn save_secret(
-    keychain: &Option<KeychainStore>,
+    use_os_keychain: bool,
     slot: VaultSlot,
     keychain_name: &str,
     identity_dir: &Path,
@@ -1056,7 +1070,7 @@ fn save_secret(
     // value we are about to write to the file. We clear it after a successful
     // file write (below). (Cursor.)
     let mut fell_through_to_enc = false;
-    if keychain.is_some() {
+    if use_os_keychain {
         // ZEB-363: write into the consolidated harmony/identity vault slot
         // (read-modify-write, preserving the other slots). Ok(false) => there is
         // no keychain vault item (keychain-less seed) — fall through to the file.
@@ -1132,14 +1146,14 @@ fn save_secret(
 /// when the other fails. The function still ultimately returns the
 /// keychain error so callers know the keychain side wasn't fully cleared.
 fn clear_secret(
-    keychain: &Option<KeychainStore>,
+    use_os_keychain: bool,
     slot: VaultSlot,
     keychain_name: &str,
     identity_dir: &Path,
     fallback_filename: &str,
 ) -> Result<(), String> {
     let mut keychain_err: Option<String> = None;
-    if keychain.is_some() {
+    if use_os_keychain {
         // ZEB-363: clear the consolidated vault slot AND best-effort delete the
         // legacy `harmony.owner` item, so a stale legacy entry can't resurrect
         // the master seed on a later no-keychain load.
@@ -1374,6 +1388,38 @@ mod persistence_tests {
         assert!(load_fleet_keytree(&None, dir.path())
             .expect("load")
             .is_none());
+    }
+
+    /// ZEB-189: `use_os_keychain = false` routes secret persistence entirely
+    /// through the encrypted-file fallback — the OS keychain branch is never
+    /// entered (the ZEB-428 isolation gate). Round-trips a 32-byte secret and
+    /// confirms it landed in the file.
+    #[test]
+    #[serial]
+    fn secret_false_gate_round_trips_via_encrypted_file_only() {
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "zeb189-false-gate-pp");
+        let dir = tempdir().unwrap();
+        let secret = [0x5Au8; 32];
+        save_secret(
+            false,
+            VaultSlot::Device,
+            KEYCHAIN_DEVICE_SK,
+            dir.path(),
+            "device_sk.enc",
+            &secret,
+        )
+        .expect("save via file");
+        // The secret landed in the encrypted file (keychain path skipped).
+        assert!(dir.path().join("device_sk.enc").exists());
+        let loaded = load_secret(
+            false,
+            VaultSlot::Device,
+            KEYCHAIN_DEVICE_SK,
+            dir.path(),
+            "device_sk.enc",
+        )
+        .expect("load via file");
+        assert_eq!(loaded.as_deref().copied(), Some(secret));
     }
 
     /// ZEB-492 carry-forward #3: a corrupt `fleet_keytree.enc` (garbage, not a
