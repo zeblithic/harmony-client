@@ -5826,7 +5826,7 @@ mod tests {
     /// ZEB-434: adapter-half stand-ins for guard tests. The matching
     /// engine/driver halves are dropped immediately — these fixtures
     /// never spawn the zenoh adapter, and the spawn itself gets
-    /// `None, None, None` for the engine-side catch-up params.
+    /// [`CatchUpChannels::none()`] for the engine-side catch-up params.
     fn dummy_root_serve_tx() -> mpsc::Sender<RootServeRequest> {
         mpsc::channel(8).0
     }
