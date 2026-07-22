@@ -44446,6 +44446,15 @@ pub enum ProposalKindDto {
         threshold: u8,
         veto_window_ms: u64,
     },
+    /// ZEB-251: per-community power-threshold change proposal. `max` is
+    /// fixed at 100 (enforced at verify_event AT1) and intentionally
+    /// omitted from the DTO — the frontend only ever surfaces the three
+    /// customizable tiers.
+    ChangeThresholds {
+        invite: u8,
+        kick: u8,
+        set_power: u8,
+    },
 }
 
 /// ZEB-250 §6.2: admin governance feed — all AdminProposal events for a
@@ -44760,6 +44769,13 @@ pub fn compute_pending_admin_proposals(
                 threshold: *threshold,
                 veto_window_ms: *veto_window_ms,
             },
+            ProposalKind::ChangeThresholds { new_thresholds } => {
+                ProposalKindDto::ChangeThresholds {
+                    invite: new_thresholds.invite,
+                    kick: new_thresholds.kick,
+                    set_power: new_thresholds.set_power,
+                }
+            }
         };
 
         dtos.push(PendingAdminProposalDto {

@@ -101,6 +101,17 @@ pub enum ProposalKind {
         #[serde(rename = "vw")]
         veto_window_ms: u64,
     },
+    /// ZEB-251: change the community's per-action power thresholds
+    /// (invite/kick/set_power). Routed through the AdminProposal quorum
+    /// machinery (AP1–AP5 unchanged; always admin-affecting, like
+    /// ChangeQuorum). Validity gate AT1 at verify_event. Materializes as
+    /// `MaterializedMembership.power_thresholds`. Variant tag "t" (1-char,
+    /// unused before this); inner field key "th" (2-char).
+    #[serde(rename = "t")]
+    ChangeThresholds {
+        #[serde(rename = "th")]
+        new_thresholds: PowerThresholds,
+    },
 }
 
 /// The five membership event kinds. Adjacently tagged so the wire
@@ -988,6 +999,10 @@ pub enum VerifyError {
     /// Must route through AdminProposal + AdminCountersign quorum.
     KickRequiresQuorum,
 
+    /// ZEB-251 AT1: ChangeThresholds new_thresholds violate the invariant
+    /// 0 <= invite <= kick <= set_power <= max, or max != 100.
+    AdminProposalThresholdsInvalid,
+
     // ── ZEB-713 (ZEB-212 D1) admin-recovery verify rules ──
     /// ZEB-713 RD1: SetRecoveryDesignates designate list is empty or
     /// contains duplicates.
@@ -1285,6 +1300,10 @@ impl std::fmt::Display for VerifyError {
             }
             VerifyError::SetPowerRequiresQuorum => write!(f, "ZEB-250: direct admin-affecting SetPower rejected (admin_quorum > 1 — use AdminProposal)"),
             VerifyError::KickRequiresQuorum => write!(f, "ZEB-250: direct Kick of an admin rejected (admin_quorum > 1 — use AdminProposal)"),
+            VerifyError::AdminProposalThresholdsInvalid => write!(
+                f,
+                "ZEB-251 AdminProposal ChangeThresholds invariant violated (need 0 <= invite <= kick <= set_power <= max == 100)"
+            ),
             VerifyError::RecoveryDesignatesMalformed => {
                 write!(f, "ZEB-713 RD1: designate list empty or contains duplicates")
             }
@@ -4001,12 +4020,12 @@ pub fn verify_event(
     //    rule — the community would otherwise be unbootstrappable
     //    since no Joined member exists to countersign).
     //
-    // Note: under v1's hardcoded POWER_THRESHOLDS.invite = 0, the
-    // power check below is unreachable (any owner addr defaults to
-    // power 0 ≥ 0). The check exists because per-community threshold
-    // customization (ZEB-251) will make it firable when invite_threshold
-    // > 0. Keeping the rule structurally in place now means ZEB-251
-    // doesn't need to revisit verify_event.
+    // Note: `power_thresholds.invite` is per-community (ZEB-251) and
+    // defaults to 0, so the power check below is a no-op (any owner
+    // addr defaults to power 0 >= 0) until a community customizes
+    // `invite` above 0 via a quorum-approved `ChangeThresholds`
+    // proposal — at which point it fires today, using this same
+    // materialized field.
     //
     // The Joined-membership check on the countersigner is the security-
     // critical gate in v1: without it, any non-member with a valid
@@ -4258,6 +4277,17 @@ pub fn verify_event(
                         return Err(VerifyError::AdminProposalQuorumOutOfRange);
                     }
                     // ChangeQuorum is always admin-affecting; no AP4 distinction.
+                }
+                ProposalKind::ChangeThresholds { new_thresholds } => {
+                    // AT1: ordering invariant + fixed ceiling. Authoritative —
+                    // every member rejects an invalid change identically.
+                    let t = new_thresholds;
+                    if !(t.invite <= t.kick && t.kick <= t.set_power && t.set_power <= t.max)
+                        || t.max != POWER_THRESHOLDS.max
+                    {
+                        return Err(VerifyError::AdminProposalThresholdsInvalid);
+                    }
+                    // ChangeThresholds is always admin-affecting; no AP4 distinction.
                 }
             }
         }
@@ -5519,6 +5549,12 @@ fn apply_admin_proposal_effect(
                 set_at: effective_event.at.clone(),
             });
         }
+        ProposalKind::ChangeThresholds { new_thresholds } => {
+            // Mutates running power_thresholds so subsequent events in the
+            // same replay verify against the updated values (single-pass-
+            // with-running-state, mirrors ChangeQuorum).
+            m.power_thresholds = *new_thresholds;
+        }
     }
 }
 
@@ -5595,7 +5631,12 @@ pub enum AutoExecOutcome {
 /// must be currently Joined.
 pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: OwnerAddr) -> bool {
     let actor_power = mat.power_levels.get(&self_owner).copied().unwrap_or(0);
-    if actor_power < POWER_THRESHOLDS.set_power {
+    // ZEB-251: read the per-community threshold (already available on
+    // `mat`), not the global POWER_THRESHOLDS const — a community that
+    // customizes `set_power` downward would otherwise leave this guard
+    // stuck rejecting a mint that `verify_event` (which already reads
+    // `prior_state.power_thresholds.set_power`) would accept.
+    if actor_power < mat.power_thresholds.set_power {
         return false;
     }
     matches!(
@@ -5614,6 +5655,15 @@ pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: 
 /// Uses `POWER_THRESHOLDS.max` (the admin-tier cap), NOT
 /// `POWER_THRESHOLDS.set_power` (the minimum power to CALL SetPower). These
 /// are coincidentally equal (100) in v1 but conceptually distinct.
+///
+/// ZEB-251: intentionally still reads the global `POWER_THRESHOLDS.max`
+/// rather than `mat.power_thresholds.max` — `max` is NOT customizable
+/// (verify_event's ChangeThresholds AT1 gate rejects any proposal where
+/// `new_thresholds.max != POWER_THRESHOLDS.max`), so `mat.power_thresholds.max`
+/// is always structurally equal to this constant. Unlike
+/// `local_actor_can_mint_set_power` (which reads the customizable
+/// `set_power` tier and was updated to thread `mat.power_thresholds`
+/// through), there is no per-community value to diverge from here.
 pub(crate) fn is_admin_affecting_set_power(
     mat: &MaterializedMembership,
     target: OwnerAddr,
@@ -14494,6 +14544,532 @@ mod zeb_713_recovery_verify_tests {
         assert_eq!(
             verify_event(&evt, &w.prior, &w.ctx),
             Err(VerifyError::RecoveryVetoTargetIdMalformed)
+        );
+    }
+}
+
+// ── ZEB-251 Task 2: ChangeThresholds AT1 verify_event gate tests ─────────────
+
+#[cfg(test)]
+mod zeb_251_change_thresholds_verify_tests {
+    use super::*;
+
+    fn make_identity(seed_byte: u8) -> (TestOwner, OwnerAddr) {
+        let owner = mint_test_owner(seed_byte);
+        let addr = owner.owner;
+        (owner, addr)
+    }
+
+    fn make_admin_proposal_event(
+        id: [u8; 16],
+        actor_priv: &TestOwner,
+        actor_addr: OwnerAddr,
+        proposal_kind: ProposalKind,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::AdminProposal { proposal_kind },
+            actor: actor_addr,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+        };
+        sign_event(&payload, &actor_priv.device_key).expect("sign_event must succeed")
+    }
+
+    /// A single Joined admin (power 100), enrolled so their own signature
+    /// resolves. Mirrors `zeb_250_admin_proposal_verify_tests`' fixture shape.
+    fn admin_prior(admin: &TestOwner, admin_addr: OwnerAddr) -> MaterializedMembership {
+        let mut prior = MaterializedMembership::default();
+        prior.members.insert(
+            admin_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 0,
+                    logical: 0,
+                    device_id: "a".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
+            },
+        );
+        prior.power_levels.insert(admin_addr, 100);
+        test_enroll_member(&mut prior, admin);
+        prior
+    }
+
+    /// AT1 positive control: a well-formed threshold change (ordering holds,
+    /// max stays 100) must be accepted — proves the gate doesn't over-reject.
+    #[test]
+    fn change_thresholds_valid_is_accepted_at_verify() {
+        let (admin_priv, admin_addr) = make_identity(0x01);
+        let prior = admin_prior(&admin_priv, admin_addr);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin_priv,
+            admin_addr,
+            ProposalKind::ChangeThresholds {
+                new_thresholds: PowerThresholds {
+                    invite: 25,
+                    kick: 50,
+                    set_power: 100,
+                    max: 100,
+                },
+            },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+        };
+        assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
+    }
+
+    /// AT1: kick(40) < invite(50) violates the required ordering
+    /// `invite <= kick <= set_power <= max` — rejected regardless of signer.
+    #[test]
+    fn change_thresholds_invalid_ordering_is_rejected_at_verify() {
+        let (admin_priv, admin_addr) = make_identity(0x01);
+        let prior = admin_prior(&admin_priv, admin_addr);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin_priv,
+            admin_addr,
+            ProposalKind::ChangeThresholds {
+                new_thresholds: PowerThresholds {
+                    invite: 50,
+                    kick: 40,
+                    set_power: 100,
+                    max: 100,
+                },
+            },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+        };
+        let err = verify_event(&evt, &prior, &ctx).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::AdminProposalThresholdsInvalid),
+            "got {err:?}"
+        );
+    }
+
+    /// AT1: set_power(40) < kick(50) also violates the ordering invariant.
+    #[test]
+    fn change_thresholds_set_power_below_kick_is_rejected_at_verify() {
+        let (admin_priv, admin_addr) = make_identity(0x01);
+        let prior = admin_prior(&admin_priv, admin_addr);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin_priv,
+            admin_addr,
+            ProposalKind::ChangeThresholds {
+                new_thresholds: PowerThresholds {
+                    invite: 0,
+                    kick: 50,
+                    set_power: 40,
+                    max: 100,
+                },
+            },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+        };
+        let err = verify_event(&evt, &prior, &ctx).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::AdminProposalThresholdsInvalid),
+            "got {err:?}"
+        );
+    }
+
+    /// AT1: `max` is fixed at 100 — any other value is rejected even when
+    /// the rest of the tuple is internally ordered.
+    #[test]
+    fn change_thresholds_max_not_100_is_rejected_at_verify() {
+        let (admin_priv, admin_addr) = make_identity(0x01);
+        let prior = admin_prior(&admin_priv, admin_addr);
+        let evt = make_admin_proposal_event(
+            [0x10; 16],
+            &admin_priv,
+            admin_addr,
+            ProposalKind::ChangeThresholds {
+                new_thresholds: PowerThresholds {
+                    invite: 0,
+                    kick: 50,
+                    set_power: 100,
+                    max: 99,
+                },
+            },
+            1_000,
+        );
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr,
+            is_invite_only: false,
+        };
+        let err = verify_event(&evt, &prior, &ctx).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::AdminProposalThresholdsInvalid),
+            "got {err:?}"
+        );
+    }
+
+    /// CBOR wire roundtrip for the new variant — mirrors
+    /// `admin_proposal_change_quorum_roundtrip`. Pins tag "t" / field "th".
+    #[test]
+    fn change_thresholds_roundtrip() {
+        use crate::owner_state_crypto::canonical_cbor_encode;
+        let kind = MembershipEventKind::AdminProposal {
+            proposal_kind: ProposalKind::ChangeThresholds {
+                new_thresholds: PowerThresholds {
+                    invite: 10,
+                    kick: 40,
+                    set_power: 90,
+                    max: 100,
+                },
+            },
+        };
+        let bytes = canonical_cbor_encode(&kind).expect("encode");
+        let decoded: MembershipEventKind = ciborium::de::from_reader(&bytes[..]).expect("decode");
+        assert_eq!(decoded, kind);
+    }
+}
+
+// ── ZEB-251 Task 2: ChangeThresholds materialize tests ───────────────────────
+
+#[cfg(test)]
+mod zeb_251_change_thresholds_materialize_tests {
+    use super::*;
+
+    const COM: SpaceId = SpaceId([0xc0; 16]);
+
+    fn ev(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        wall_ms: u64,
+        kind: MembershipEventKind,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: COM,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            kind,
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    /// Single admin (admin_quorum defaults to 1) proposes invite=25; the
+    /// sole-signer proposal self-satisfies and materializes into
+    /// `power_thresholds`. Then proves the field actually GOVERNS
+    /// verify_event (not just materialized-but-inert): a power-10 actor's
+    /// Invite that would have verified fine under the default invite=0
+    /// threshold now fails on the SAME materialized state.
+    #[test]
+    fn change_thresholds_at_quorum1_materializes_and_governs() {
+        let community_id = COM;
+        let admin = mint_test_owner(0xa1);
+        let low = mint_test_owner(0xb2);
+
+        let events = vec![ev(
+            [0xD0; 16],
+            admin.owner,
+            10_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::ChangeThresholds {
+                    new_thresholds: PowerThresholds {
+                        invite: 25,
+                        kick: 50,
+                        set_power: 100,
+                        max: 100,
+                    },
+                },
+            },
+        )];
+
+        let mut m = materialize(&events, admin.owner);
+        assert_eq!(
+            m.power_thresholds.invite, 25,
+            "quorum=1 self-satisfying ChangeThresholds must materialize into power_thresholds"
+        );
+
+        m.members.insert(
+            low.owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
+            },
+        );
+        test_enroll_member(&mut m, &low);
+        m.power_levels.insert(low.owner, 10);
+
+        let target = OwnerAddr([0xd1; 16]);
+        let invite_payload = EventPayload {
+            id: [0xaa; 16],
+            community_id,
+            kind: MembershipEventKind::Invite { target },
+            actor: low.owner,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let invite_ev = sign_event(&invite_payload, &low.device_key).expect("sign invite");
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: admin.owner,
+            is_invite_only: false,
+        };
+        let err = verify_event(&invite_ev, &m, &ctx).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::ActorPowerInsufficient),
+            "got {err:?}"
+        );
+    }
+
+    /// Mirrors `materialize_proposal_without_countersigns_pending_when_quorum_above_1`:
+    /// under admin_quorum=2, a sole-signer ChangeThresholds proposal (1
+    /// signer) must NOT apply — power_thresholds stays at the default until
+    /// a second admin countersigns.
+    #[test]
+    fn change_thresholds_below_quorum_stays_pending() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+
+        // Bootstrap: quorum=1 -> raise to 2 via sole-signer ChangeQuorum
+        // (admin2 must Join + be promoted first so ChangeQuorum's AP5
+        // live-admin-count gate — evaluated structurally the same way at
+        // materialize time — has 2 live admins to count).
+        let mut events = vec![
+            ev([0x80; 16], admin2, 1_000, MembershipEventKind::Join),
+            ev(
+                [0x81; 16],
+                admin1,
+                2_000,
+                MembershipEventKind::SetPower {
+                    target: admin2,
+                    level: 100,
+                },
+            ),
+            ev(
+                [0xCC; 16],
+                admin1,
+                3_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 2 },
+                },
+            ),
+        ];
+
+        // Under quorum=2: admin1 alone proposes ChangeThresholds. No countersign.
+        events.push(ev(
+            [0xDD; 16],
+            admin1,
+            10_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::ChangeThresholds {
+                    new_thresholds: PowerThresholds {
+                        invite: 25,
+                        kick: 50,
+                        set_power: 100,
+                        max: 100,
+                    },
+                },
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+        assert_eq!(
+            m.power_thresholds, POWER_THRESHOLDS,
+            "ChangeThresholds proposal lacking countersign must not apply under admin_quorum=2"
+        );
+    }
+
+    /// One countersign from admin2 satisfies quorum=2 for a ChangeThresholds
+    /// proposal — companion positive case to the pending test above.
+    #[test]
+    fn change_thresholds_effective_when_countersigned_reaches_quorum() {
+        let admin1 = OwnerAddr([0x01; 16]);
+        let admin2 = OwnerAddr([0x02; 16]);
+
+        let mut events = vec![
+            ev([0x80; 16], admin2, 1_000, MembershipEventKind::Join),
+            ev(
+                [0x81; 16],
+                admin1,
+                2_000,
+                MembershipEventKind::SetPower {
+                    target: admin2,
+                    level: 100,
+                },
+            ),
+            ev(
+                [0xCC; 16],
+                admin1,
+                3_000,
+                MembershipEventKind::AdminProposal {
+                    proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 2 },
+                },
+            ),
+        ];
+
+        let prop_id = [0xDD; 16];
+        events.push(ev(
+            prop_id,
+            admin1,
+            10_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::ChangeThresholds {
+                    new_thresholds: PowerThresholds {
+                        invite: 25,
+                        kick: 50,
+                        set_power: 100,
+                        max: 100,
+                    },
+                },
+            },
+        ));
+        events.push(ev(
+            [0xEE; 16],
+            admin2,
+            11_000,
+            MembershipEventKind::AdminCountersign {
+                target_event_id: prop_id,
+            },
+        ));
+
+        let m = materialize(&events, admin1);
+        assert_eq!(
+            m.power_thresholds.invite, 25,
+            "countersign reaching quorum=2 must apply the ChangeThresholds effect"
+        );
+    }
+
+    /// Single-pass-with-running-state (spec §5.2, same rule ChangeQuorum
+    /// uses): replaying the SAME log, an Invite ordered BEFORE the
+    /// ChangeThresholds proposal's HLC verifies against the OLD (default)
+    /// threshold, and one ordered AFTER verifies against the NEW threshold.
+    #[test]
+    fn change_thresholds_at_hlc_boundary_governs_ordering() {
+        let admin = mint_test_owner(0xa1);
+        let low = mint_test_owner(0xb2);
+        let community_id = COM;
+        let target = OwnerAddr([0xd1; 16]);
+
+        // low Joins with a real cert (so materialize populates
+        // enrolled_device_keys and the later Invite's signer resolves),
+        // then admin sets low's power to 10, then admin's sole-signer
+        // ChangeThresholds{invite: 25} self-satisfies (admin_quorum == 1
+        // default) at wall_ms 10_000.
+        let low_join = SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id: [0x50; 16],
+            community_id,
+            actor: low.owner,
+            at: Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "t".into(),
+            },
+            kind: MembershipEventKind::Join,
+            sig: [0; 64],
+            countersig: None,
+            enrollment: Some(low.cert.clone()),
+        };
+        let set_low_power = ev(
+            [0x51; 16],
+            admin.owner,
+            2_000,
+            MembershipEventKind::SetPower {
+                target: low.owner,
+                level: 10,
+            },
+        );
+        let change_thresholds = ev(
+            [0xD0; 16],
+            admin.owner,
+            10_000,
+            MembershipEventKind::AdminProposal {
+                proposal_kind: ProposalKind::ChangeThresholds {
+                    new_thresholds: PowerThresholds {
+                        invite: 25,
+                        kick: 50,
+                        set_power: 100,
+                        max: 100,
+                    },
+                },
+            },
+        );
+
+        let all_events = vec![low_join, set_low_power, change_thresholds];
+
+        let make_invite = |id: [u8; 16], wall_ms: u64| -> SignedMembershipEvent {
+            let payload = EventPayload {
+                id,
+                community_id,
+                kind: MembershipEventKind::Invite { target },
+                actor: low.owner,
+                at: Hlc {
+                    wall_ms,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+            };
+            sign_event(&payload, &low.device_key).expect("sign invite")
+        };
+
+        let before_ev = make_invite([0xaa; 16], 5_000); // before the raise (t=10_000)
+        let after_ev = make_invite([0xbb; 16], 20_000); // after the raise
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: admin.owner,
+            is_invite_only: false,
+        };
+
+        // BEFORE the threshold-raise: prior state has invite=0 (default) —
+        // power-10 `low` may Invite.
+        let prior_before = prior_state_at_event(&all_events, &before_ev, admin.owner);
+        assert_eq!(prior_before.power_thresholds.invite, 0);
+        assert_eq!(verify_event(&before_ev, &prior_before, &ctx), Ok(()));
+
+        // AFTER the threshold-raise: prior state has invite=25 — the SAME
+        // power-10 `low` may no longer Invite.
+        let prior_after = prior_state_at_event(&all_events, &after_ev, admin.owner);
+        assert_eq!(prior_after.power_thresholds.invite, 25);
+        let err = verify_event(&after_ev, &prior_after, &ctx).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::ActorPowerInsufficient),
+            "got {err:?}"
         );
     }
 }
