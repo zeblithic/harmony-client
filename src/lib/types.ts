@@ -482,7 +482,7 @@ export interface ForkDescendantDto {
   reason: string | null;
 }
 
-// Mirrors backend POWER_THRESHOLDS in src-tauri/src/community_membership.rs:1108.
+// Mirrors backend POWER_THRESHOLDS in src-tauri/src/community_membership.rs.
 export const POWER_THRESHOLDS = {
   invite: 0,
   kick: 50,
@@ -496,6 +496,15 @@ export function powerToRole(power: number): PowerRole {
   if (power >= POWER_THRESHOLDS.setPower) return 'admin';
   if (power >= POWER_THRESHOLDS.kick) return 'mod';
   return 'member';
+}
+
+/** ZEB-608/ZEB-251: read-only governance snapshot for a community. */
+export interface CommunityGovernance {
+  adminQuorum: number;
+  invite: number;
+  kick: number;
+  setPower: number;
+  max: number;
 }
 
 /**
