@@ -156,3 +156,11 @@ If Component 1-5 land cleanly with budget to spare, a delegation sub-case is the
 - ZEB-464 / ZEB-552 / ZEB-527 — precedent "headless api: add X RPC surface" PRs
 - ZEB-447 — two-agent scripted E2E scenario-suite pattern
 - Precedent scenario shape: `e2e-harness/tests/e2e_two_node.rs` S11/S12 (admin-recovery)
+
+## Converge refinements (2026-07-22, post-review)
+
+Three robustness refinements from the PR #526 review, on top of the design above:
+
+- **Driver `create_tier2_setpower_proposal` gained a `threshold_max` param** (raw ms band, alongside `threshold_min`). The e2e sets a tiny band (`min=1, max=10`) so a single admin signal crosses the participation-shaped dynamic threshold in <1s — Tier-2 conviction is a real-time integral, so without a low band a finalize would take days. The RPC already accepted `thresholdMax`.
+- **Partial `SetPower` args are rejected.** The `voting_create_tier2_proposal` RPC handler now errors when exactly one of `setPowerTarget` / `setPowerNewPower` is supplied (only both-present or both-absent are valid), instead of silently minting a proposal whose finalize changes no power.
+- **The two cadence env overrides are validated strictly positive** via a shared, unit-tested `parse_positive_ms(Option<String>, default)` helper (community_voting_tick.rs). Absent / unparseable / non-positive input falls back to the production constant. The positive filter is load-bearing: a `0` `HARMONY_VOTING_TICK_INTERVAL_MS` would panic `tokio::time::interval` ("period must be non-zero").

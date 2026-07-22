@@ -24,6 +24,20 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
 /// Tier 2 contestability window per spec §5: 24h after threshold reached
 /// (or last unsignal-after-threshold) before the proposal finalizes.
 pub const CONTESTABILITY_WINDOW_MS: i128 = 24 * 60 * 60 * 1000;
+
+/// ZEB-720: parse a strictly-**positive** millisecond value from a raw env
+/// string, falling back to `default` on absent / unparseable / non-positive
+/// input. Used for the two voting-cadence overrides at node bringup:
+/// `HARMONY_VOTING_CONTESTABILITY_WINDOW_MS` and `HARMONY_VOTING_TICK_INTERVAL_MS`.
+/// The positive filter is load-bearing — a `0` tick interval would panic
+/// `tokio::time::interval` ("period must be non-zero"), and a `0`/negative
+/// window is meaningless. Pure (takes the raw `Option`) so bringup stays a
+/// one-liner and this is unit-testable without mutating process env.
+pub fn parse_positive_ms(raw: Option<String>, default: u64) -> u64 {
+    raw.and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
 /// Archive sweep cadence per spec §2: at-most-once per 24h across all logs.
 pub const ARCHIVE_SWEEP_INTERVAL_MS: i128 = 24 * 60 * 60 * 1000;
 
@@ -934,17 +948,17 @@ mod tests {
         );
     }
 
-    // ZEB-720: the bringup env-parse expression falls back to the 24h default
-    // on a missing or unparseable override.
+    // ZEB-720: the shared bringup parser falls back to the default on absent,
+    // unparseable, or non-positive input (the non-positive case guards a `0`
+    // tick interval from panicking tokio's timer), and honors a valid positive
+    // override. Tests the actual production helper, not a copy of its logic.
     #[test]
-    fn contestability_window_env_parse_falls_back_to_default() {
-        let parse = |v: Option<&str>| -> i128 {
-            v.and_then(|s| s.parse::<i128>().ok())
-                .unwrap_or(CONTESTABILITY_WINDOW_MS)
-        };
-        assert_eq!(parse(None), CONTESTABILITY_WINDOW_MS);
-        assert_eq!(parse(Some("not-a-number")), CONTESTABILITY_WINDOW_MS);
-        assert_eq!(parse(Some("2000")), 2000);
+    fn parse_positive_ms_falls_back_on_absent_bad_or_nonpositive() {
+        assert_eq!(parse_positive_ms(None, 24), 24);
+        assert_eq!(parse_positive_ms(Some("not-a-number".into()), 24), 24);
+        assert_eq!(parse_positive_ms(Some("0".into()), 24), 24);
+        assert_eq!(parse_positive_ms(Some("-5".into()), 24), 24);
+        assert_eq!(parse_positive_ms(Some("2000".into()), 24), 2000);
     }
 
     #[tokio::test]

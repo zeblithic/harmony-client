@@ -652,7 +652,17 @@ pub fn build_registry() -> RpcRegistry {
                         },
                     )
                 }
-                _ => None,
+                (None, None) => None,
+                // Reject a PARTIAL SetPower: supplying exactly one of the pair
+                // would otherwise mint a proposal that silently never changes
+                // power on finalize — a caller footgun.
+                _ => {
+                    return Err(
+                        "voting_create_tier2_proposal: setPowerTarget and setPowerNewPower \
+                         must both be provided or both omitted"
+                            .to_string(),
+                    )
+                }
             };
             crate::voting_create_tier2_proposal_impl(
                 state,

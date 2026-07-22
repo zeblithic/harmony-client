@@ -12773,21 +12773,23 @@ pub async fn start_node_inner(
                         auto_exec_set_power: auto_exec_fn,
                         // ZEB-718: persist a log pruned by the archive sweep.
                         identity_dir: crate::owner_commands::resolve_identity_dir().ok(),
-                        // ZEB-720: default 24h; short override only when the
-                        // operator sets the env (never in production).
-                        contestability_window_ms: std::env::var(
-                            "HARMONY_VOTING_CONTESTABILITY_WINDOW_MS",
-                        )
-                        .ok()
-                        .and_then(|s| s.parse::<i128>().ok())
-                        .unwrap_or(crate::community_voting_tick::CONTESTABILITY_WINDOW_MS),
+                        // ZEB-720: default 24h; short (strictly positive)
+                        // override only when the operator sets the env (never
+                        // in production). Non-positive/garbage → default.
+                        contestability_window_ms: crate::community_voting_tick::parse_positive_ms(
+                            std::env::var("HARMONY_VOTING_CONTESTABILITY_WINDOW_MS").ok(),
+                            crate::community_voting_tick::CONTESTABILITY_WINDOW_MS as u64,
+                        ) as i128,
                     };
-                    // ZEB-720: default 60s; short override only for e2e.
-                    let tick_interval = std::env::var("HARMONY_VOTING_TICK_INTERVAL_MS")
-                        .ok()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(std::time::Duration::from_millis)
-                        .unwrap_or(crate::community_voting_tick::DEFAULT_TICK_INTERVAL);
+                    // ZEB-720: default 60s; short override only for e2e. The
+                    // positive filter guards `tokio::time::interval`, which
+                    // panics on a zero period.
+                    let tick_interval = std::time::Duration::from_millis(
+                        crate::community_voting_tick::parse_positive_ms(
+                            std::env::var("HARMONY_VOTING_TICK_INTERVAL_MS").ok(),
+                            crate::community_voting_tick::DEFAULT_TICK_INTERVAL.as_millis() as u64,
+                        ),
+                    );
                     let handle =
                         crate::community_voting_tick::spawn_voting_tick(tick_ctx, tick_interval);
                     // Replace any prior handle (a leftover from a racing
