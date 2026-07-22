@@ -2843,3 +2843,140 @@ async fn s12_recovery_time_locked_execution() {
     run.mark_success();
     drop((alice, bob, ah, bh));
 }
+
+/// ZEB-720: two-node Tier-2 Conviction SetPower finalize. Alice (admin) creates a
+/// Tier-2 proposal to raise Bob's power; both signal support; the short-window
+/// voting tick finalizes and auto-execs SetPower; both replicas converge to the
+/// new materialized power. Nodes run with a short voting cadence so finalization
+/// is deterministic without a real 24h wait and without a wall-clock sleep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s13_tier2_conviction_setpower() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    // window (1500ms) >> tick interval (250ms): the poll is observed
+    // ThresholdReached before it finalizes; poll_until absorbs tick jitter.
+    let voting_env = vec![
+        (
+            "HARMONY_VOTING_CONTESTABILITY_WINDOW_MS".to_string(),
+            "1500".to_string(),
+        ),
+        (
+            "HARMONY_VOTING_TICK_INTERVAL_MS".to_string(),
+            "250".to_string(),
+        ),
+    ];
+
+    let mut run = RunDir::new("s13-tier2-setpower").expect("run dir");
+    let log_dir = run.log_dir();
+    let alice_home = fresh_home("s13-tier2-a");
+    let bob_home = fresh_home("s13-tier2-b");
+    let mk = |home: &tempfile::TempDir, profile: &str| {
+        let mut cfg = NodeConfig::new(PathBuf::from(home.path()), profile);
+        cfg.log_dir = Some(log_dir.clone());
+        cfg.extra_env = voting_env.clone();
+        cfg
+    };
+    let alice = NodeHandle::spawn(mk(&alice_home, "alice"))
+        .await
+        .expect("spawn alice");
+    let bob = NodeHandle::spawn(mk(&bob_home, "bob"))
+        .await
+        .expect("spawn bob");
+    alice
+        .rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("alice mint");
+    bob.rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("bob mint");
+
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    // Community + channel + join + roster convergence (s11 skeleton).
+    let community = create_community(&alice, "s13-community", true)
+        .await
+        .expect("create community");
+    // NB: create_community auto-creates a "general" channel, so use a distinct
+    // name for the proposal channel.
+    let channel = create_channel(&alice, &community, "proposals", 0)
+        .await
+        .expect("create channel");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins via iroh first-contact");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("alice sees bob joined");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&bob, &community, &alice_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("bob sees alice joined");
+
+    // Baseline: Bob's power must differ from the target (60) for a real change.
+    let bob_power_before = member_power(&alice, &community, &bob_owner)
+        .await
+        .expect("read bob power")
+        .expect("bob in roster");
+    assert_ne!(bob_power_before, 60, "target 60 must differ from baseline");
+
+    // Alice (admin, power 100) creates a Tier-2 SetPower{bob -> 60} proposal.
+    // 60 < POWER_THRESHOLDS.max ⇒ NOT admin-affecting ⇒ direct-mint at
+    // admin_quorum==1 (no AdminProposal route). thresholdMin=1 (raw ms floor)
+    // so a support signal crosses the dynamic threshold quickly; minPower=0 so
+    // bob is eligible to signal regardless of his power.
+    let proposal = create_tier2_setpower_proposal(
+        &alice,
+        &community,
+        &channel,
+        "raise bob to 60",
+        &bob_owner,
+        60, // new_power
+        1,  // threshold_min
+        10, // threshold_max — tiny band; conviction (~1k/s) crosses in <1s.
+        0,  // min_power
+    )
+    .await
+    .expect("create tier-2 proposal");
+
+    // Alice signals support. With admin power 100 and thresholdMin=1 her
+    // conviction crosses the threshold within a tick or two. Bob need not
+    // signal or even subscribe to voting: the finalize's SetPower reaches him
+    // over the membership-log sync, not the voting topic.
+    signal_tier2(&alice, &proposal, true)
+        .await
+        .expect("alice signals support");
+
+    // Alice's short-window tick drives Open → ThresholdReached → Finalized.
+    poll_until(Duration::from_secs(90), || async {
+        let dto = get_tier2_proposal(&alice, &proposal).await?;
+        Ok((dto.get("lifecycle").and_then(|v| v.as_str()) == Some("Finalized")).then_some(()))
+    })
+    .await
+    .expect("alice's proposal reaches Finalized");
+
+    // Finalization auto-execs SetPower{bob -> 60}; assert the materialized power
+    // changed on BOTH replicas (alice minted it; bob converges via sync).
+    for (name, node) in [("alice", &alice), ("bob", &bob)] {
+        poll_until(Duration::from_secs(120), || async {
+            let p = member_power(node, &community, &bob_owner).await?;
+            Ok((p == Some(60)).then_some(()))
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{name} sees bob power == 60: {e}"));
+    }
+
+    run.mark_success();
+    drop((alice, bob, alice_home, bob_home));
+}

@@ -11434,8 +11434,11 @@ pub async fn start_node_inner(
                         // ZEB-298+ZEB-312 PR 2 Task 2: capture the typed Wry
                         // AppHandle so IPC handlers (generic over R) can hand
                         // the voting engine a concrete `AppHandle<Wry>` for
-                        // Tier 3 lifecycle event emission. ZEB-445: `None`
-                        // in serve mode (voting IPCs stay Tauri-bound).
+                        // Tier 3 lifecycle event emission. ZEB-445/ZEB-720:
+                        // `None` in serve mode. Voting handle extraction no
+                        // longer requires this (ZEB-720 made it Optional);
+                        // the Tier-2 create/signal/get verbs are now
+                        // headless-capable over the RPC surface.
                         guard.app_handle_wry = wry_handle.clone();
                         // ZEB-270 Phase 3 Task 4.5: store the channel-log
                         // registry handle so stop_inner can flip every
@@ -12770,11 +12773,25 @@ pub async fn start_node_inner(
                         auto_exec_set_power: auto_exec_fn,
                         // ZEB-718: persist a log pruned by the archive sweep.
                         identity_dir: crate::owner_commands::resolve_identity_dir().ok(),
+                        // ZEB-720: default 24h; short (strictly positive)
+                        // override only when the operator sets the env (never
+                        // in production). Non-positive/garbage → default.
+                        contestability_window_ms: crate::community_voting_tick::parse_positive_ms(
+                            std::env::var("HARMONY_VOTING_CONTESTABILITY_WINDOW_MS").ok(),
+                            crate::community_voting_tick::CONTESTABILITY_WINDOW_MS as u64,
+                        ) as i128,
                     };
-                    let handle = crate::community_voting_tick::spawn_voting_tick(
-                        tick_ctx,
-                        crate::community_voting_tick::DEFAULT_TICK_INTERVAL,
+                    // ZEB-720: default 60s; short override only for e2e. The
+                    // positive filter guards `tokio::time::interval`, which
+                    // panics on a zero period.
+                    let tick_interval = std::time::Duration::from_millis(
+                        crate::community_voting_tick::parse_positive_ms(
+                            std::env::var("HARMONY_VOTING_TICK_INTERVAL_MS").ok(),
+                            crate::community_voting_tick::DEFAULT_TICK_INTERVAL.as_millis() as u64,
+                        ),
                     );
+                    let handle =
+                        crate::community_voting_tick::spawn_voting_tick(tick_ctx, tick_interval);
                     // Replace any prior handle (a leftover from a racing
                     // start_node would already have been aborted by
                     // stop_inner; this is defense-in-depth).
@@ -48058,7 +48075,7 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
         .map_err(|e| format!("voting_create_tier3_proposal: invalid config: {e:?}"))?;
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
-    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
+    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
 
     // Build snapshot + check eligibility BEFORE signing. If we're not
     // eligible to participate in our own proposal, the UI should surface that
@@ -48276,7 +48293,7 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
     }
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
-    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
+    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
 
     // Resolve space_id from the poll_id by scanning open polls.
     let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
@@ -48368,7 +48385,7 @@ async fn voting_cast_deliberation_vote<R: tauri::Runtime>(
         })?;
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
-    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
+    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
 
     // Resolve space_id from the poll_id by scanning open polls.
     let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
@@ -48440,7 +48457,7 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
     }
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
-    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
+    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
 
     let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
 
@@ -48513,7 +48530,7 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
         })?;
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
-    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
+    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
 
     let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
 
@@ -48611,7 +48628,7 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
         .map_err(|e| format!("voting_decline_sortition: invalid reason: {e:?}"))?;
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
-    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
+    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
 
     let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
 
@@ -48673,7 +48690,7 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
-    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
+    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
 
     let space_id = voting_resolve_community_for_poll(&handles.voting_logs, &pid).await?;
 
@@ -49793,7 +49810,9 @@ async fn ensure_voting_engine_for(
     // lifecycle emit. IPCs read this from `NodeState.app_handle_wry`
     // (captured at start_node) so the generic `AppHandle<R>` from the
     // IPC's own param doesn't need an unsafe downcast.
-    app_handle: tauri::AppHandle<tauri::Wry>,
+    // ZEB-720: `None` in headless `serve`; the engine's `app_handle` field
+    // is already `Option`, so Tier-3/delegate emits no-op without a GUI.
+    app_handle: Option<tauri::AppHandle<tauri::Wry>>,
     // Existing trailing params:
     dfrost_log_registry: Option<
         std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
@@ -49874,7 +49893,8 @@ async fn ensure_voting_engine_for(
             // lifecycle emit. IPCs read this from NodeState.app_handle_wry
             // (captured at start_node, so the generic AppHandle<R> from
             // the IPC's own param doesn't need an unsafe downcast).
-            app_handle: Some(app_handle.clone()),
+            // ZEB-720: already-`Option`; `None` runs the engine headless.
+            app_handle: app_handle.clone(),
             identity_resolver,
             membership_resolver: Some(membership_resolver),
         },
@@ -50015,7 +50035,10 @@ struct VotingEngineNodeHandles {
     voting_log_adapter_request_tx:
         tokio::sync::mpsc::Sender<crate::event_loop::VotingLogAdapterRequest>,
     self_identity_pub_64: [u8; 64],
-    app_handle_wry: tauri::AppHandle<tauri::Wry>,
+    // ZEB-720: Optional so headless `serve` (no GUI AppHandle) can extract
+    // voting handles. `None` ⇒ engine runs headless; Tier-3 + delegate-on-
+    // behalf emits (already `if let Some(app)`-gated) simply no-op.
+    app_handle_wry: Option<tauri::AppHandle<tauri::Wry>>,
     /// Only `voting_create_tier3_proposal`'s chat fanout reads this; `None`
     /// in test contexts that bypass `start_node` (fanout call-sites no-op).
     channel_log_registry:
@@ -50030,7 +50053,7 @@ impl VotingEngineNodeHandles {
     /// Single-lock `NodeState` capture. Field-granular error strings keep
     /// the pre-refactor per-field failure messages so callers' error modes
     /// are unchanged.
-    fn extract(state_lock: &tauri::State<'_, Mutex<NodeState>>) -> Result<Self, String> {
+    fn extract(state_lock: &std::sync::Mutex<NodeState>) -> Result<Self, String> {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -50055,7 +50078,8 @@ impl VotingEngineNodeHandles {
             self_identity_pub_64: g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
             // Typed Wry AppHandle captured at start_node so generic IPC
             // handlers never downcast their own `AppHandle<R>`.
-            app_handle_wry: g.app_handle_wry.clone().ok_or("app_handle_wry missing")?,
+            // ZEB-720: no longer required — headless nodes have no AppHandle.
+            app_handle_wry: g.app_handle_wry.clone(),
             channel_log_registry: g.channel_log_registry.clone(),
             identity_dir: g.identity_dir.clone(),
         })
@@ -50318,6 +50342,41 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
     auto_exec: Option<crate::community_voting_conviction::AutoExecAction>,
     min_power: Option<u32>,
 ) -> Result<String, String> {
+    // ZEB-720: thin Tauri wrapper → shared _impl (also called by the RPC layer).
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    voting_create_tier2_proposal_impl(
+        state_lock.inner(),
+        sink,
+        community_id,
+        channel_id,
+        proposal_text,
+        half_life_seconds,
+        threshold_min,
+        threshold_max,
+        beta,
+        delegation_allowed,
+        auto_exec,
+        min_power,
+    )
+    .await
+}
+
+/// ZEB-720: shared IPC/RPC seam.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn voting_create_tier2_proposal_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    community_id: String,
+    channel_id: String,
+    proposal_text: String,
+    half_life_seconds: Option<u32>,
+    threshold_min: Option<i64>,
+    threshold_max: Option<i64>,
+    beta: Option<u8>,
+    delegation_allowed: Option<bool>,
+    auto_exec: Option<crate::community_voting_conviction::AutoExecAction>,
+    min_power: Option<u32>,
+) -> Result<String, String> {
     // ── 1. Decode hex ids ──────────────────────────────────────────────
     let cid_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
@@ -50345,6 +50404,22 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
             "voting_create_tier2_proposal: proposal_text too long ({} bytes; max 4096)",
             proposal_text.len()
         ));
+    }
+    // ZEB-720 (Greptile R2): reject an out-of-range SetPower target power at
+    // CREATE. `apply_auto_exec_set_power` caps `new_power` at 100 only at
+    // execution, so without this a proposal could finalize yet silently leave
+    // power unchanged. Validated in the shared _impl so the Tauri IPC path is
+    // covered too — not just the RPC handler.
+    if let Some(crate::community_voting_conviction::AutoExecAction::SetPower {
+        new_power, ..
+    }) = auto_exec.as_ref()
+    {
+        if *new_power > crate::community_membership::POWER_THRESHOLDS.max as u32 {
+            return Err(format!(
+                "voting_create_tier2_proposal: SetPower new_power must be 0..={} (got {new_power})",
+                crate::community_membership::POWER_THRESHOLDS.max
+            ));
+        }
     }
     let mp_u8: u8 = min_power.unwrap_or(0).min(100) as u8;
     let cfg = crate::community_voting_conviction::Tier2PollConfig {
@@ -50380,7 +50455,7 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
     }
 
     // ── 3. Extract NodeState handles (ZEB-317 shared helper) ──────────
-    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
+    let handles = VotingEngineNodeHandles::extract(state_lock)?;
 
     // ── 4. Build snapshot + verify creator eligibility ────────────────
     let snapshot = voting_build_snapshot_for_community(
@@ -50439,10 +50514,54 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         proposal_id: poll_id_hex.clone(),
         community_id: hex::encode(space_id.0),
     };
-    if let Err(e) = app.emit("voting-tier2-proposal-created", &payload) {
-        tracing::warn!(error = %e, "voting-tier2-proposal-created emit failed");
-    }
+    crate::node_event_sink::emit_ser(sink.as_ref(), "voting-tier2-proposal-created", &payload);
     Ok(poll_id_hex)
+}
+
+/// ZEB-720 (Greptile R2): the create seam must reject an out-of-range SetPower
+/// target power BEFORE publishing — otherwise the proposal finalizes yet
+/// `apply_auto_exec_set_power` silently no-ops it at execution.
+#[cfg(test)]
+mod voting_create_tier2_validation_tests {
+    use super::*;
+
+    /// A SetPower `new_power` above the power-table cap is rejected at create.
+    /// The guard runs before the engine `extract`, so a bare
+    /// `NodeState::default()` (no wired voting engine) reaches it.
+    #[tokio::test]
+    async fn create_rejects_out_of_range_setpower_new_power() {
+        let state = std::sync::Mutex::new(NodeState::default());
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
+        let auto_exec = Some(
+            crate::community_voting_conviction::AutoExecAction::SetPower {
+                target_pubkey: crate::owner_state_types::OwnerAddr([0x33u8; 16]),
+                new_power: 150,
+            },
+        );
+
+        let err = voting_create_tier2_proposal_impl(
+            &state,
+            sink,
+            hex::encode([0x11u8; 16]),
+            hex::encode([0x22u8; 16]),
+            "Promote Alice".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            auto_exec,
+            None,
+        )
+        .await
+        .expect_err("out-of-range SetPower new_power must be rejected at create");
+
+        assert!(
+            err.contains("new_power must be 0..=100"),
+            "expected range-rejection error, got: {err}"
+        );
+    }
 }
 
 /// Tauri IPC: cast (or withdraw) a Tier 2 Signal on a Conviction proposal.
@@ -50457,6 +50576,18 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
     proposal_id: String,
     support: bool,
 ) -> Result<(), String> {
+    // ZEB-720: thin Tauri wrapper → shared _impl (also called by the RPC layer).
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    voting_signal_tier2_impl(state_lock.inner(), sink, proposal_id, support).await
+}
+
+/// ZEB-720: shared IPC/RPC seam.
+pub(crate) async fn voting_signal_tier2_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    proposal_id: String,
+    support: bool,
+) -> Result<(), String> {
     let pid_bytes: [u8; 32] = hex::decode(&proposal_id)
         .map_err(|e| format!("invalid proposal_id hex: {e}"))?
         .as_slice()
@@ -50468,7 +50599,7 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
     // previously extracted only 7 fields (it never touched the engine);
     // ZEB-318 routes it through `engine.publish_event`, so it now needs the
     // full engine plumbing the helper carries.
-    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
+    let handles = VotingEngineNodeHandles::extract(state_lock)?;
 
     // ── Lookup proposal + verify lifecycle (S1) ────────────────────────
     let log_arcs: Vec<(
@@ -50565,9 +50696,7 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
         voter: hex::encode(handles.self_owner.0),
         support,
     };
-    if let Err(e) = app.emit("voting-tier2-signal-cast", &payload) {
-        tracing::warn!(error = %e, "voting-tier2-signal-cast emit failed");
-    }
+    crate::node_event_sink::emit_ser(sink.as_ref(), "voting-tier2-signal-cast", &payload);
     Ok(())
 }
 
@@ -50596,7 +50725,7 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
     let to_addr = crate::owner_state_types::OwnerAddr(delegate_addr_bytes);
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
-    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
+    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
 
     // Membership check: both caller AND delegate must currently be in
     // the community. Both surfaces use 16-byte OwnerAddr keys.
@@ -50668,7 +50797,7 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
     let space_id = crate::owner_state_types::SpaceId(cid_bytes);
 
     // ZEB-317: single-lock NodeState capture via the shared helper.
-    let handles = VotingEngineNodeHandles::extract(&state_lock)?;
+    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
 
     // Lazy-register the engine so the per-community log exists.
     let engine_arc = handles.ensure_engine(space_id).await?;
@@ -50867,6 +50996,14 @@ async fn voting_list_tier2_proposals(
 #[tauri::command]
 async fn voting_get_tier2_proposal(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
+    proposal_id: String,
+) -> Result<Tier2ProposalExport, String> {
+    voting_get_tier2_proposal_impl(state_lock.inner(), proposal_id).await
+}
+
+/// ZEB-720: shared IPC/RPC seam (headless-capable; no GUI AppHandle needed).
+pub(crate) async fn voting_get_tier2_proposal_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
     proposal_id: String,
 ) -> Result<Tier2ProposalExport, String> {
     let pid_bytes: [u8; 32] = hex::decode(&proposal_id)
