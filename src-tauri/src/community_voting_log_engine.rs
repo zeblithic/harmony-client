@@ -2831,22 +2831,23 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 .await;
         }
 
-        // (2) Tier 3 lifecycle emit. Cheap tier gate avoids touching
-        // app_handle for non-Tier-3 traffic.
+        // (2) Engine-auto orchestration + Tier 3 lifecycle emit. Cheap
+        // tier gate avoids touching app_handle for non-Tier-3 traffic.
         //
-        // NOTE: `maybe_trigger_engine_auto_orchestration` is deliberately
-        // NOT called from the inbound path. When two engines both hold
-        // the local_signing key, having both auto-mint kd=cl / kd=rs from
-        // their independent post-apply hooks creates a real-time HLC race
-        // (each engine's `reserve_next_local_hlc` uses real `wall_now_ms`,
-        // so the two mints get distinct device_id-tagged HLCs and LWW
-        // picks differently per run). A proper fix needs a deterministic
-        // HLC for engine-auto mints (e.g. derived from the triggering
-        // event's HLC) so peer replicas mint bit-identical events. Filed
-        // as a follow-up; peer replicas still converge in the common case
-        // because the originating node's kd=cl / kd=rs flow through
-        // Zenoh and apply via `apply_with_snapshot`'s LWW gate.
+        // ZEB-316: peer engines holding local_signing now auto-orchestrate
+        // from the inbound path too. The mint HLC is derived deterministically
+        // from `event.hlc` (this applied trigger, byte-identical on every
+        // replica), so independent peer mints are bit-identical → trivial LWW.
+        // This mirrors `publish_event`'s ordering (orchestration BEFORE the
+        // lifecycle emit) so the emitted stage reflects the post-orchestration
+        // end state, and its cascade tail (`maybe_emit_tally_share` +
+        // `try_finalize_secret_tally`) subsumes the former standalone se-mode
+        // finalize block — a node that crosses the kd=ts threshold via peer
+        // inbound now finalizes independently regardless of committee
+        // membership.
         if event.tier == Tier::Sortition {
+            self.maybe_trigger_engine_auto_orchestration(&applied_poll_id, &event.hlc)
+                .await;
             self.maybe_emit_tier3_lifecycle_events(
                 &applied_poll_id,
                 &event,
@@ -2855,68 +2856,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             .await;
         }
 
-        // (3) CodeRabbit PR #155 major: inbound kd=ts must drive kd=rs
-        // finalization for nodes that are NOT in the committee. Such
-        // nodes never publish kd=ts themselves, so the outbound
-        // orchestration cascade (which runs only on
-        // `publish_event`-driven mints) never fires for them. Without
-        // this hook, a non-committee node would receive ≥t kd=ts events
-        // from peers, hold all the inputs `recover_secret_tally` needs,
-        // and never finalize its own log → permanent divergence with
-        // peers that DID finalize.
-        //
-        // Scope: ONLY `try_finalize_secret_tally` runs here (NOT the
-        // full orchestration cascade). The full cascade includes
-        // outbound kd=cl / kd=sf / pu-mode kd=rs minting, which was
-        // intentionally excluded from inbound dispatch (see note above)
-        // because cross-engine HLC races there cause divergence. The
-        // se-mode kd=rs path is safe to run from both sides because:
-        //   1. Lagrange invariance + canonical share-subset selection
-        //      guarantees bit-identical kd=rs envelopes across replicas
-        //      that cross threshold, so the apply LWW gate cleanly
-        //      resolves any race.
-        //   2. Race-losers are silently rejected by the apply-time
-        //      `PollInFinalizedState` gate (the kd=rs apply path
-        //      transitions to `Stage::Finalized`).
-        //
-        // Gated on (Tier::Sortition + kind ∈ {TallyShare, PollClose}) to
-        // skip the lock-acquire on every non-Tier3 inbound event. The
-        // method itself silently returns if `local_signing` is unset,
-        // privacy_mode is not "se", or `result.is_some()`, so the
-        // operation is cheap on irrelevant polls even within the gate.
-        if event.tier == Tier::Sortition
-            && matches!(
-                event.kind,
-                PollEventKindCode::TallyShare | PollEventKindCode::PollClose
-            )
-        {
-            let local_signing_opt = {
-                let r = self.local_signing.read().await;
-                r.as_ref().map(|(k, o)| (k.clone(), *o))
-            };
-            // Skip silently if we lack signing material (read-only peer)
-            // or have no HLC tracker installed for engine-auto mints.
-            if let Some((signing_key, self_owner)) = local_signing_opt {
-                if self.hlc_tracker.is_some() && self.device_id.is_some() {
-                    // CodeRabbit PR #155 review-round-3 (F24): a committee
-                    // member that learns of kd=cl via PEER inbound (rather
-                    // than initiating it locally) never executes the
-                    // outbound orchestration cascade, so without minting
-                    // here it would never publish its kd=ts. With
-                    // threshold > 1, secret-mode polls stall indefinitely.
-                    // Mint our share first, then attempt finalize — the
-                    // emit's apply-time replay path will trigger
-                    // finalize again via the normal inbound dispatch on
-                    // the just-published event.
-                    self.maybe_emit_tally_share(&applied_poll_id, &signing_key, self_owner)
-                        .await;
-                    self.try_finalize_secret_tally(&applied_poll_id, &signing_key, self_owner)
-                        .await;
-                }
-            }
-        }
-
-        // (4) ZEB-298 Tier 2 delegate-on-behalf notify. Internally
+        // (3) ZEB-298 Tier 2 delegate-on-behalf notify. Internally
         // gated on (Tier::Conviction, Signal) + policy + delegate
         // edge; non-matching traffic short-circuits cheaply.
         self.maybe_emit_delegate_on_behalf(&event, &applied_poll_id)
