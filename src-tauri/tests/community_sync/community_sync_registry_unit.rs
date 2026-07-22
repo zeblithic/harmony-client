@@ -56,8 +56,13 @@ async fn registry_spawns_and_tears_down_per_community() {
     let (_a_sub_tx, a_sub_rx) = mpsc::channel(8);
     registry
         .spawn_engine_inner_now(
-            cid_a, mk_a, admin_a, /* is_invite_only */ false, a_pub_tx, a_sub_rx, None, None,
-            None,
+            cid_a,
+            mk_a,
+            admin_a,
+            /* is_invite_only */ false,
+            a_pub_tx,
+            a_sub_rx,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn a");
@@ -114,9 +119,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
             false,
             b_pub_tx,
             b_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn b");
@@ -128,9 +131,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
             false,
             a_pub_tx,
             a_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn a");
@@ -146,9 +147,7 @@ async fn registry_spawn_is_idempotent_and_known_ids_is_sorted() {
             false,
             a2_pub_tx,
             a2_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("re-spawn idempotent");
@@ -247,7 +246,15 @@ async fn shutdown_engine_and_cleanup_persistence_removes_dir_after_engine_stops(
     let (pub_tx, mut pub_rx) = mpsc::channel(8);
     let (_sub_tx, sub_rx) = mpsc::channel(8);
     registry
-        .spawn_engine_inner_now(cid, mk, admin, false, pub_tx, sub_rx, None, None, None)
+        .spawn_engine_inner_now(
+            cid,
+            mk,
+            admin,
+            false,
+            pub_tx,
+            sub_rx,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
+        )
         .await
         .expect("spawn");
 
@@ -354,7 +361,13 @@ async fn pending_redemption_oneshot_not_fired_by_own_event_insert() {
     let (_sub_tx, sub_rx) = mpsc::channel(8);
     registry
         .spawn_engine_inner_now(
-            cid, mk, admin_addr, /* is_invite_only */ false, pub_tx, sub_rx, None, None, None,
+            cid,
+            mk,
+            admin_addr,
+            /* is_invite_only */ false,
+            pub_tx,
+            sub_rx,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn");
@@ -463,7 +476,13 @@ async fn pending_redemption_unregistered_when_no_match() {
     let (_sub_tx, sub_rx) = mpsc::channel(8);
     registry
         .spawn_engine_inner_now(
-            cid, mk, admin_addr, /* is_invite_only */ false, pub_tx, sub_rx, None, None, None,
+            cid,
+            mk,
+            admin_addr,
+            /* is_invite_only */ false,
+            pub_tx,
+            sub_rx,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn");

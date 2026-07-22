@@ -247,9 +247,7 @@ async fn setup_one_community(
             false, // open community: plain self-Join is authorized
             pub_tx,
             sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn engine");

@@ -7848,9 +7848,11 @@ pub async fn start_node_inner(
                                 is_invite_only,
                                 pub_tx,
                                 sub_rx,
-                                Some(root_serve_rx),
-                                Some(fetch_request_tx),
-                                Some(transport_epoch_rx.clone()),
+                                crate::community_state_sync::CatchUpChannels {
+                                    root_serve_rx: Some(root_serve_rx),
+                                    fetch_request_tx: Some(fetch_request_tx),
+                                    transport_epoch_rx: Some(transport_epoch_rx.clone()),
+                                },
                             )
                             .await
                         {
@@ -31785,9 +31787,11 @@ pub async fn create_community_inner(
             pub_rx,
             sub_tx,
             community_adapter_tx,
-            Some(root_serve_rx),
-            Some(fetch_request_tx),
-            transport_epoch_rx,
+            crate::community_state_sync::CatchUpChannels {
+                root_serve_rx: Some(root_serve_rx),
+                fetch_request_tx: Some(fetch_request_tx),
+                transport_epoch_rx,
+            },
             root_serve_tx,
             fetch_request_rx,
         )
@@ -34414,9 +34418,7 @@ mod zeb_315_membership_at_event_hlc_tests {
                 /* is_invite_only */ true,
                 pub_tx,
                 sub_rx,
-                None,
-                None,
-                None,
+                crate::community_state_sync::CatchUpChannels::none(),
             )
             .await
             .expect("spawn community engine");
@@ -34644,9 +34646,7 @@ mod list_bootstrap_hint_tests {
                 /* is_invite_only */ true,
                 pub_tx,
                 sub_rx,
-                None,
-                None,
-                None,
+                crate::community_state_sync::CatchUpChannels::none(),
             )
             .await
             .expect("spawn community engine");
@@ -35811,9 +35811,11 @@ where
             pub_rx,
             sub_tx,
             community_adapter_tx,
-            Some(root_serve_rx),
-            Some(fetch_request_tx),
-            transport_epoch_rx,
+            crate::community_state_sync::CatchUpChannels {
+                root_serve_rx: Some(root_serve_rx),
+                fetch_request_tx: Some(fetch_request_tx),
+                transport_epoch_rx,
+            },
             root_serve_tx,
             fetch_request_rx,
         )
@@ -75144,7 +75146,15 @@ mod zeb_687_revoked_feed_boot_tests {
         let (pub_tx, _pub_rx) = tokio::sync::mpsc::channel(16);
         let (_sub_tx, sub_rx) = tokio::sync::mpsc::channel(16);
         registry
-            .spawn_engine_inner_now(cid, mk, admin, false, pub_tx, sub_rx, None, None, None)
+            .spawn_engine_inner_now(
+                cid,
+                mk,
+                admin,
+                false,
+                pub_tx,
+                sub_rx,
+                crate::community_state_sync::CatchUpChannels::none(),
+            )
             .await
             .expect("spawn bare membership engine");
         let engine = registry

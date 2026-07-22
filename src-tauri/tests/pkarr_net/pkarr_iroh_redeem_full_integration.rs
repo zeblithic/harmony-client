@@ -440,9 +440,7 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
             true,
             alice_pub_tx,
             alice_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn alice engine");

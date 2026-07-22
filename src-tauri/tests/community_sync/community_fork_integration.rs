@@ -197,9 +197,7 @@ async fn run_fork_inner(
             false,
             fork_pub_tx,
             fork_sub_rx,
-            None,
-            None,
-            None,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
         )
         .await
         .expect("spawn fork engine");
@@ -474,9 +472,7 @@ impl PairedEngines {
                 false,
                 a_pub_tx,
                 a_sub_rx,
-                None,
-                None,
-                None,
+                harmony_app::community_state_sync::CatchUpChannels::none(),
             )
             .await
             .expect("spawn original engine on A");
@@ -491,9 +487,7 @@ impl PairedEngines {
                 false,
                 b_pub_tx,
                 b_sub_rx,
-                None,
-                None,
-                None,
+                harmony_app::community_state_sync::CatchUpChannels::none(),
             )
             .await
             .expect("spawn original engine on B");
