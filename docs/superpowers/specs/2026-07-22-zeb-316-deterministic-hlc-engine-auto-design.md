@@ -5,9 +5,11 @@
 **Scope decision:** *Thorough* — deterministic HLC for every double-mintable engine-auto event
 reachable from the re-enabled inbound path where determinism is achievable: **kd=cl and kd=sf
 only**. kd=ts (per-committee-member, intentionally distinct) and **BOTH kd=rs modes** (pu- and
-se-mode — qbug1 + C1 refinement: a close-anchored HLC stalls below the receive watermark under
-concurrent post-close events → non-monotonic stall; result converges via LWW, see §3) are
-explicitly left on `reserve_next_local_hlc`. Single repo (harmony-client).
+se-mode — qbug1 + C1 + Greptile-P1 refinement: a close-anchored HLC stalls below the receive
+watermark under concurrent post-close events → non-monotonic stall; result converges via LWW, see
+§3) are left on a **wall-clock reservation floored above the poll's live `last_received_hlc`**
+(`reserve_next_local_hlc_above`), which is monotonic-safe even under clock skew / a future-walled
+trigger (a plain `reserve_next_local_hlc` is not — see §3). Single repo (harmony-client).
 
 ## Problem
 
@@ -101,8 +103,8 @@ causal order and never collide at the LWW layer.
 |-------|----------|--------------|
 | kd=sf | triggering event's `.hlc` | **threaded** from caller |
 | kd=cl | triggering event's `.hlc` | **threaded** from caller |
-| kd=rs pu-mode | **EXCLUDED** — wall-clock | `reserve_next_local_hlc` (qbug1 fix) |
-| kd=rs se-mode (`try_finalize_secret_tally`) | **EXCLUDED** — wall-clock | `reserve_next_local_hlc` (C1 fix) |
+| kd=rs pu-mode | **EXCLUDED** — wall-clock, floored above watermark | `reserve_next_local_hlc_above(last_received.wall+1)` (qbug1 + Greptile-P1 fix) |
+| kd=rs se-mode (`try_finalize_secret_tally`) | **EXCLUDED** — wall-clock, floored above watermark | `reserve_next_local_hlc_above(last_received.wall+1)` (C1 + Greptile-P1 fix) |
 
 **close/sortition-failed anchor to the trigger** (threaded), pinning them to the exact event that
 fired the hook — race-free even if another event applies between trigger-apply and mint under
@@ -126,12 +128,31 @@ forever to `(close.wall, close.logical+1)` — can stall BELOW that watermark:
   — so no deterministic base is ≥ every applied kd=ts.
 
 kd=cl is immune to this (it re-anchors on the moving close watermark each hook re-fire, so it
-self-heals); only the close-*frozen* kd=rs stalls. A freshly-reserved HLC is always ≥ the receive
-watermark, so it always applies. A deterministic HLC is unnecessary anyway: the kd=rs **result**
-converges bit-identically across replicas via the deterministic `StarResult` payload (pu) / Lagrange
-invariance in `recover_secret_tally` (se) + the apply-time LWW/terminal-state gate that keeps the
-first finalizing kd=rs and drops the rest — the pre-ZEB-316 wall-clock behavior, which is
-monotonic-safe.
+self-heals); only the close-*frozen* kd=rs stalls.
+
+**Greptile-P1 refinement — floor the reservation above the watermark.** A plain
+`reserve_next_local_hlc` (wall = `SystemTime::now()`) cures the real-time concurrent-event case but
+is NOT always ≥ the receive watermark: kd=cl is deterministic and anchors on the triggering event's
+HLC, so an accepted inbound trigger whose wall is AHEAD of this node's local clock (clock skew, or a
+future-dated event) makes kd=cl — hence `last_received_hlc` — sit at that future wall, and a
+`now`-reserved kd=rs is then BELOW it → the monotonic gate rejects it and the poll stays
+closed-but-not-finalized until local time catches up. The fix mints via
+`reserve_next_local_hlc_above(floor)` with `floor = last_received.wall_ms + 1`, snapshotting
+`last_received_hlc` under the same `voting_log` lock that reads `t3`. Because
+`reserve_next_hlc_for_device` returns `wall = max(wall_now_ms, own_prev_wall)`, flooring `wall_now_ms`
+at `watermark.wall + 1` guarantees the reserved wall `> watermark.wall` → strictly newer than the
+watermark by the wall field alone (no logical/device tiebreak). **Invariant:** every engine-auto mint
+produces an HLC strictly greater than the poll's live `last_received_hlc` (kd=cl/kd=sf already satisfy
+it by anchoring on the trigger, which just became the watermark; kd=rs now does too). Residual window:
+between the snapshot (lock released) and the kd=rs apply (lock re-acquired) another event can advance
+the watermark further — self-heals, because the interfering event re-fires the hook, which re-snapshots
+the higher watermark and re-mints above it; inherent to the lock-release-before-publish architecture
+and acceptable, since the point of the floor is to remove the clock-dependent *permanent* stall.
+
+kd=rs remains wall-clock-based / non-deterministic — a deterministic HLC is unnecessary because the
+kd=rs **result** converges bit-identically across replicas via the deterministic `StarResult` payload
+(pu) / Lagrange invariance in `recover_secret_tally` (se) + the apply-time LWW/terminal-state gate
+that keeps the first finalizing kd=rs and drops the rest.
 
 ### 4. State field: `close_hlc` — REMOVED (qbug1 fix)
 
@@ -197,12 +218,15 @@ pre-ZEB-316 wall-clock outcome (different lanes, LWW winner). **Future code must
 
 ## Blast radius
 
-All production `reserve_next_local_hlc` call sites are in `community_voting_log_engine.rs`: kd=sf,
-kd=cl, kd=rs(pu), kd=ts (**keep**), kd=rs(se) (**keep**). After the qbug1 fix only **kd=sf and
-kd=cl** are deterministic (`engine_auto_hlc_from_base`); kd=rs(pu), kd=rs(se), and kd=ts all stay on
-wall-clock `reserve_next_local_hlc` (their *results* converge via LWW). Plus: the hook signature +
-its two callers and the inbound re-enable. (The `close_hlc` state field the original design added
-was removed by the qbug1 fix — see §4.) No call sites outside the engine file.
+All production `reserve_next_local_hlc` / `reserve_next_local_hlc_above` call sites are in
+`community_voting_log_engine.rs`: kd=sf, kd=cl, kd=rs(pu), kd=ts (**keep**), kd=rs(se) (**keep**).
+After the qbug1 fix only **kd=sf and kd=cl** are deterministic (`engine_auto_hlc_from_base`); kd=ts
+stays on plain wall-clock `reserve_next_local_hlc`; and **kd=rs(pu) + kd=rs(se)** mint on a
+wall-clock reservation floored above the poll's live watermark
+(`reserve_next_local_hlc_above(last_received.wall+1)`, Greptile-P1 fix) — still non-deterministic,
+their *results* converge via LWW. Plus: the hook signature + its two callers and the inbound
+re-enable. (The `close_hlc` state field the original design added was removed by the qbug1 fix — see
+§4.) No call sites outside the engine file.
 
 ## Testing
 
@@ -215,6 +239,13 @@ was removed by the qbug1 fix — see §4.) No call sites outside the engine file
 3. **Unit test** `engine_auto_hlc_from_base`: (a) strictly-newer than base for representative
    inputs, (b) identical output for identical `(base, lane)`, (c) the `logical == u32::MAX`
    saturation guard bumps `wall_ms`.
+3a. **Unit test** `reserve_next_local_hlc_above` (Greptile-P1 fix): (a) a floor above `now` forces
+   the reserved `wall_ms >= floor` (the guarantee that keeps kd=rs above the receive watermark under
+   clock skew / a future-walled trigger), (b) a floor of `0`/below-now tracks the wall clock like the
+   plain `reserve_next_local_hlc`, advancing the shared device lane monotonically. This is the
+   mechanical guard for the fix; a full future-walled RED→GREEN integration fixture is real-clock
+   flaky/awkward to construct, so we rely on this helper test plus the existing race-tolerant + se-mode
+   integration tests staying green (they now drive the floored mint path).
 4. **se-mode** (C1 refinement): a two-engine test where both cross the share threshold with the
    committee kd=ts at walls **strictly greater than the close** (the realistic production case), and
    assert both engines reach `Finalized` with an identical recovered **`StarResult`**. Do NOT assert

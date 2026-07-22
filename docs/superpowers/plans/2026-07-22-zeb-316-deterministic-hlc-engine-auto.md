@@ -14,6 +14,22 @@
 > payload + LWW), and the `close_hlc` state field (its only prod consumer) is removed. Net scope:
 > **only kd=cl + kd=sf are deterministic**; kd=rs (pu + se) and kd=ts are wall-clock. Tasks 2, 3(d),
 > and the Task-3/4 `close_hlc` test assertions below are superseded accordingly (see inline notes).
+>
+> **⚠ FURTHER AMENDMENT (Greptile P1 — future-peer HLC stalls finalization).** Plain wall-clock
+> `reserve_next_local_hlc` cured the *real-time* concurrent-event case but NOT a **future-walled
+> trigger**: kd=cl is deterministic and anchors on the triggering event's HLC, so an accepted inbound
+> trigger whose wall is AHEAD of this node's local clock (clock skew / future-dated event) makes
+> `last_received_hlc` sit at that future wall, and a `now`-reserved kd=rs is then BELOW it → the
+> monotonic gate rejects it and the poll stays closed-but-not-finalized until local time catches up.
+> **Fix:** BOTH kd=rs mints (pu + se) now reserve via a new engine method
+> `reserve_next_local_hlc_above(floor)` with `floor = last_received.wall_ms + 1` (snapshotting
+> `t3.last_received_hlc` under the same `voting_log` lock that reads `t3`). Because
+> `reserve_next_hlc_for_device` returns `wall = max(wall_now_ms, own_prev_wall)`, this guarantees the
+> reserved wall `> watermark.wall` → strictly newer than the watermark → monotonic-safe on the first
+> attempt, regardless of clock skew. kd=rs stays non-deterministic (result-convergent via LWW /
+> Lagrange invariance). Residual snapshot→apply window self-heals (interfering event re-fires the
+> hook → re-snapshots the higher watermark → re-mints above it). Tasks 1, 3(d), 3(e) below are
+> refined accordingly.
 
 **Goal:** Make engine-auto Tier-3 mints (**kd=cl, kd=sf**) derive their HLC deterministically from replica-identical state so peer engines produce bit-identical events, then re-enable the orchestration hook on the inbound dispatch path. **BOTH kd=rs modes (pu + se) are excluded** (qbug1 + C1 refinement — stay on wall-clock `reserve_next_local_hlc`; results converge via LWW / Lagrange invariance, and a deterministic close-anchored base is non-monotonic under concurrent post-close events — see the amendment above and Task 3 (d)/(e)).
 
