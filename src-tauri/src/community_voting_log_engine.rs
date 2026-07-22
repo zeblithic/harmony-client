@@ -135,6 +135,13 @@ pub type BeaconRequester = Arc<
 
 // ── Replay tracker ──────────────────────────────────────────────────────────
 
+/// Device-id prefix for engine-auto poll-derived HLC lanes
+/// (`engine-auto-{kind}-{poll_prefix}`, minted by `engine_auto_hlc_from_base`).
+/// Unlike a real device lane (single-writer, monotone HLC), these lanes are
+/// MULTI-writer: every signer reacting to the same trigger mints on the same
+/// lane at its own receive watermark. See `is_inbound_duplicate`.
+const ENGINE_AUTO_LANE_PREFIX: &str = "engine-auto-";
+
 /// Dedup table keyed on `(actor, device_id)` → max HLC `(wall_ms, logical)`
 /// tuple seen.
 ///
@@ -222,6 +229,35 @@ impl VotingReplayTracker {
     /// recovers in-lane gaps a cross-rotation drop left behind.
     pub fn seen_coord(&self, event: &SignedVotingEvent) -> bool {
         self.seen_coords.contains(&Self::coord(event))
+    }
+
+    /// ZEB-731: live-inbound dedup predicate, lane-aware.
+    ///
+    /// Single-writer **device** lanes use the cheap high-water `contains`
+    /// gate — a device's HLC is monotone, so anything `<=` its high-water is a
+    /// genuine loopback/redelivery.
+    ///
+    /// Engine-auto **poll-derived** lanes (`engine-auto-{kind}-{prefix}`) are
+    /// MULTI-writer: every signer reacting to the same trigger mints on the
+    /// same lane at its own receive watermark, so those ordinals do NOT form a
+    /// single monotone sequence. High-water dedup would then wrongly drop a
+    /// peer's lower-ordinal (but legitimate) mint — e.g. after a signer's own
+    /// kd=rs mint recorded a high-water via `publish_event` (record precedes
+    /// apply) but that apply then failed `HlcNotMonotonic` (a backfilled event
+    /// advanced the watermark in the residual window, firing no orchestration
+    /// hook), the poll stays un-finalized yet a peer's finalizing kd=rs at a
+    /// lower ordinal would be swallowed → permanent stall. These lanes carry
+    /// idempotent, deterministic terminal events, so exact-coordinate dedup is
+    /// correct: byte-identical redeliveries are still dropped, while a
+    /// distinct-coordinate peer mint passes to the apply-time monotonic +
+    /// terminal-state gates (the real correctness filter). This matches the
+    /// coordinate dedup the ZEB-718 backfill path already uses.
+    pub fn is_inbound_duplicate(&self, event: &SignedVotingEvent) -> bool {
+        if event.hlc.device_id.starts_with(ENGINE_AUTO_LANE_PREFIX) {
+            self.seen_coord(event)
+        } else {
+            self.contains(event)
+        }
     }
 }
 
@@ -1688,13 +1724,15 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             let base = match last_received.as_ref() {
                 Some(w) => w,
                 None => {
-                    // Unreachable: `close_event_hash.is_some()` (gated above)
-                    // implies kd=cl was received, which set `last_received_hlc`.
-                    // Bail rather than mint an unanchored kd=rs; the next applied
-                    // event re-fires this hook with the watermark populated.
+                    // Unreachable: reaching this mint means a tally recovered
+                    // from >= threshold applied kd=ts shares — which only exist
+                    // after an applied kd=cl — so many events already advanced
+                    // `last_received_hlc`. Bail rather than mint an unanchored
+                    // kd=rs; the next applied event re-fires this hook with the
+                    // watermark populated.
                     tracing::warn!(
                         poll_id = %hex::encode(pid.0),
-                        "engine-auto kd=rs (secret): no receive watermark despite kd=cl applied; skipping"
+                        "engine-auto kd=rs (secret): no receive watermark at finalize; skipping"
                     );
                     return;
                 }
@@ -2682,10 +2720,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         let event: SignedVotingEvent =
             ciborium::from_reader(packet).map_err(|e| format!("decode: {e}"))?;
 
-        // Dedup gate.
+        // Dedup gate (ZEB-731: lane-aware — high-water for single-writer device
+        // lanes, exact-coordinate for multi-writer engine-auto poll lanes).
         {
             let tracker = tracker.lock().await;
-            if tracker.contains(&event) {
+            if tracker.is_inbound_duplicate(&event) {
                 // Self-loopback or peer redelivery; drop silently.
                 return Ok(None);
             }
@@ -2968,7 +3007,10 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
 /// wall-clock, NO `self.device_id`, and does NOT touch the hlc_tracker — all
 /// three diverge per replica. `kind` ∈ {"cl","sf","rs"}.
 fn engine_auto_hlc_from_base(base: &Hlc, pid: &PollId, kind: &str) -> Hlc {
-    let lane = format!("engine-auto-{kind}-{}", hex::encode(&pid.0[..4]));
+    let lane = format!(
+        "{ENGINE_AUTO_LANE_PREFIX}{kind}-{}",
+        hex::encode(&pid.0[..4])
+    );
     // Strictly newer by (wall_ms, logical, device_id): logical+1 at equal wall.
     // Saturation guard (astronomically unlikely — logical resets on wall advance):
     // if logical is maxed, bump wall and reset logical so it stays strictly newer.
@@ -3621,6 +3663,67 @@ mod tests {
         assert!(
             !tracker.contains(&newer),
             "newer event on same lane must not be marked seen yet"
+        );
+    }
+
+    #[test]
+    fn is_inbound_duplicate_coordinate_dedups_multi_writer_engine_auto_lane() {
+        // ZEB-731: an engine-auto poll-derived lane is MULTI-writer — every
+        // signer mints on it at its own receive watermark — so inbound dedup
+        // must use exact-coordinate matching, NOT the high-water gate. Else a
+        // peer's lower-ordinal but legitimate kd=rs is dropped once a
+        // higher-ordinal self-mint poisoned the high-water (e.g. a failed
+        // apply), stalling finalization.
+        let mut tracker = VotingReplayTracker::new();
+        let actor = OwnerAddr([0xaa; 16]);
+        let lane = "engine-auto-rs-abababab";
+        let hi = poll_create_event(actor, lane, 2_000); // higher ordinal, recorded
+        let lo = poll_create_event(actor, lane, 1_000); // distinct, lower ordinal
+
+        tracker.record(&hi);
+
+        // The high-water gate WOULD swallow `lo` (this pins the hazard the
+        // lane-aware predicate exists to avoid)...
+        assert!(
+            tracker.contains(&lo),
+            "high-water gate would drop the lower-ordinal peer mint"
+        );
+        // ...but the lane-aware predicate does NOT: `lo` is a distinct
+        // coordinate, so it passes through to the apply-time gates.
+        assert!(
+            !tracker.is_inbound_duplicate(&lo),
+            "engine-auto lane must dedup by exact coordinate, not high-water"
+        );
+        // A byte-identical redelivery of `hi` IS still a duplicate.
+        assert!(
+            tracker.is_inbound_duplicate(&hi),
+            "exact-coordinate redelivery on the engine-auto lane is still a duplicate"
+        );
+    }
+
+    #[test]
+    fn is_inbound_duplicate_uses_high_water_for_single_writer_device_lane() {
+        // A real device lane is single-writer + monotone, so the cheap
+        // high-water gate stays correct: anything <= the high-water is a
+        // genuine loopback/redelivery, and a strictly-newer event is not.
+        let mut tracker = VotingReplayTracker::new();
+        let actor = OwnerAddr([0xaa; 16]);
+        let hi = poll_create_event(actor, "real-device", 2_000);
+        let lo = poll_create_event(actor, "real-device", 1_000);
+
+        tracker.record(&hi);
+        assert!(
+            tracker.is_inbound_duplicate(&lo),
+            "device lane: <= high-water is a duplicate"
+        );
+        assert!(
+            tracker.is_inbound_duplicate(&hi),
+            "device lane: the recorded event itself is a duplicate"
+        );
+        let newer = poll_create_event(actor, "real-device", 3_000);
+        assert!(
+            !tracker.is_inbound_duplicate(&newer),
+            "device lane: strictly-newer event is not a duplicate"
         );
     }
 
