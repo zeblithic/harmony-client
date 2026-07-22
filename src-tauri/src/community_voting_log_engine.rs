@@ -550,6 +550,38 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         crate::dm_outbox::reserve_next_hlc_for_device(tracker, device_id, wall_now_ms).await
     }
 
+    /// ZEB-316 (Greptile P1 fix): reserve the next HLC on the local device's
+    /// lane like `reserve_next_local_hlc`, but with the reservation wall floored
+    /// at `floor_wall_ms` (`wall_now_ms = max(SystemTime::now(), floor_wall_ms)`).
+    ///
+    /// `reserve_next_hlc_for_device` returns `wall = max(wall_now_ms, own_prev_wall)`,
+    /// so passing `floor_wall_ms = watermark.wall + 1` guarantees the reserved
+    /// HLC's `wall_ms >= watermark.wall + 1 > watermark.wall` → strictly newer
+    /// than the watermark by the wall field alone (no logical / device-id tiebreak
+    /// needed). The engine-auto kd=rs mints use this to stay above the poll's live
+    /// `last_received_hlc` even when an accepted trigger is future-walled (clock
+    /// skew) and the plain `SystemTime::now()` reservation would otherwise sit
+    /// below the watermark and be rejected by the apply-time monotonic gate.
+    ///
+    /// Same pre-condition as `reserve_next_local_hlc`: `hlc_tracker` + `device_id`
+    /// installed; panics on its `.expect(...)` otherwise (misconfigured fixture).
+    pub async fn reserve_next_local_hlc_above(&self, floor_wall_ms: u64) -> Hlc {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let wall_now_ms = std::cmp::max(now_ms, floor_wall_ms);
+        let tracker = self
+            .hlc_tracker
+            .as_ref()
+            .expect("reserve_next_local_hlc_above called without hlc_tracker installed");
+        let device_id = self
+            .device_id
+            .as_deref()
+            .expect("reserve_next_local_hlc_above called without device_id installed");
+        crate::dm_outbox::reserve_next_hlc_for_device(tracker, device_id, wall_now_ms).await
+    }
+
     /// ZEB-310 Task 10: read-only "now" HLC estimate.
     ///
     /// Returns the engine's best estimate of "now" as an `Hlc` derived from
@@ -869,7 +901,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// In Phase 4a-main this implements kd=sf only. ZEB-310 Tasks 10 + 11
     /// extend with kd=cl (drafting timeout / approval threshold) and
     /// kd=rs (ratification window close → STAR tally).
-    async fn maybe_trigger_engine_auto_orchestration(self: &Arc<Self>, pid: &PollId) {
+    async fn maybe_trigger_engine_auto_orchestration(
+        self: &Arc<Self>,
+        pid: &PollId,
+        base_hlc: &Hlc,
+    ) {
         // (1) Short-circuit: no local signing key ⇒ read-only peer.
         let (signing_key, self_owner) = {
             let r = self.local_signing.read().await;
@@ -938,7 +974,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
 
         if trigger_kd_sf {
             // (3) Mint a signed kd=sf event using the local signing key.
-            let hlc = self.reserve_next_local_hlc().await;
+            // ZEB-316: deterministic HLC derived from the triggering event's
+            // HLC (poll-derived lane, no wall-clock / device_id / tracker) so
+            // every replica reacting to the same base produces a bit-identical
+            // kd=sf event_hash.
+            let hlc = engine_auto_hlc_from_base(base_hlc, pid, "sf");
             let sf_ev = match crate::community_voting_core::build_signed_sortition_failed(
                 &signing_key,
                 self_owner,
@@ -1054,7 +1094,20 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         };
 
         if trigger_kd_cl {
-            let hlc = self.reserve_next_local_hlc().await;
+            // ZEB-316: deterministic HLC derived from the triggering event's
+            // HLC so the minted kd=cl is replica-identical — the kd=cl HLC is
+            // in `signing_bytes`, so a deterministic HLC yields a byte-identical
+            // `close_event_hash` across replicas (acceptance #1).
+            //
+            // I-1 scope: this is byte-identical across replicas only when the
+            // SAME event first satisfies the trigger everywhere (the common
+            // case — one kd=ss past the deadline). Under reordering a different
+            // event may trip the deadline per replica → same lane, different
+            // ordinal → divergent close_event_hash. That is benign: `result` +
+            // terminal `stage` still converge via LWW + the terminal-state gate,
+            // and close_event_hash is not in any cross-peer state-root. Do NOT
+            // treat a peer close_event_hash mismatch as corruption.
+            let hlc = engine_auto_hlc_from_base(base_hlc, pid, "cl");
             let cl_ev = match crate::community_voting_core::build_signed_poll_close_tier3(
                 &signing_key,
                 self_owner,
@@ -1102,7 +1155,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // slice, derive advancers via `drafting_advancers`, then sort via
         // `ratification_candidates_ordering`. This ensures bit-identical
         // tally inputs across all engines that ever drive this code path.
-        let trigger_kd_rs_args: Option<crate::community_voting_star::StarResult> = {
+        let trigger_kd_rs_result: Option<(crate::community_voting_star::StarResult, Option<Hlc>)> = {
             let log = self.voting_log.lock().await;
             let state = match log.polls.get(pid) {
                 Some(s) => s,
@@ -1121,6 +1174,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             {
                 None
             } else {
+                // ZEB-316 (Greptile P1 fix): snapshot the poll's live receive
+                // watermark while we still hold the `voting_log` lock, so the
+                // kd=rs mint below can be floored strictly above it. See the
+                // mint-site comment for why a floor (not plain `now`) is needed.
+                let last_received = t3.last_received_hlc.clone();
                 // Build candidate ordering. Same pattern as verify_sr.
                 let sq = crate::community_voting_tier3::synthesize_status_quo(&t3.meta.poll_id);
                 let sq_hash = sq.event_hash;
@@ -1153,12 +1211,60 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 );
                 let ballots = crate::community_voting_tier3::collect_ratification_ballots(t3);
                 let result = crate::community_voting_star::tally_star(&ordered, ballots);
-                Some(result)
+                Some((result, last_received))
             }
         };
 
-        if let Some(result) = trigger_kd_rs_args {
-            let hlc = self.reserve_next_local_hlc().await;
+        if let Some((result, last_received)) = trigger_kd_rs_result {
+            // ZEB-316 (qbug1 fix + Greptile P1 fix): pu-mode kd=rs mints on a
+            // WALL-CLOCK HLC (non-deterministic), NOT a deterministic
+            // close-anchored HLC — but reserved strictly ABOVE the poll's live
+            // receive watermark (`last_received_hlc`). This is the SAME approach
+            // used by se-mode kd=rs (see `try_finalize_secret_tally`).
+            //
+            // Monotonicity: kd=rs must be minted ABOVE the current receive
+            // watermark or the apply-time monotonic gate (`community_voting_tier3.rs`
+            // → `HlcNotMonotonic`) rejects it. A close-anchored HLC — pinned forever
+            // to `(close.wall, close.logical+1)` — can stall BELOW that watermark
+            // because the kd=cl→kd=rs cascade is NOT serialized: the `voting_log`
+            // mutex is released per-apply, and the post-apply hook re-fires after
+            // release with real yields at `persist_now().await` (which holds the log
+            // lock across a `spawn_blocking`) and `publisher_tx.send().await`. On the
+            // multi-threaded runtime a concurrent IPC ballot-cast or backfill apply
+            // can slip a higher-HLC event in between kd=cl and kd=rs, advancing
+            // `last_received_hlc` past the close HLC.
+            //
+            // A plain `reserve_next_local_hlc()` (wall = `SystemTime::now()`) cures
+            // the REAL-TIME concurrent-event case, but NOT a future-walled trigger:
+            // kd=cl is deterministic and anchors on the triggering event's HLC, so
+            // when an accepted inbound trigger has a wall AHEAD of this node's local
+            // clock (clock skew, or a future-dated event) the resulting kd=cl becomes
+            // `last_received_hlc` at that future wall, and a `now`-reserved kd=rs sits
+            // BELOW it → permanently stalled until local time catches up. We instead
+            // reserve ABOVE the watermark: floor the reservation wall at
+            // `last_received.wall + 1`, so the minted HLC's wall strictly exceeds the
+            // watermark's wall regardless of clock skew → monotonic-safe on the first
+            // attempt. (kd=cl/kd=sf already satisfy this: they anchor on the trigger,
+            // which just BECAME the watermark.)
+            //
+            // Residual window: we snapshot `last_received` under the lock, release it,
+            // then re-acquire for the kd=rs apply. Another event could advance the
+            // watermark further in between — that self-heals: the interfering event
+            // re-fires this hook, which re-snapshots the now-higher watermark and
+            // re-mints above it. Inherent to the lock-release-before-publish
+            // architecture and acceptable; the point of THIS floor is to remove the
+            // clock-dependent PERMANENT stall, not the transient re-mint.
+            //
+            // kd=rs remains wall-clock-based / non-deterministic; a deterministic HLC
+            // is unnecessary because the pu-mode RESULT converges bit-identically
+            // across replicas via the deterministic `StarResult` payload + the
+            // apply-time LWW/terminal-state gate that keeps the first finalizing kd=rs
+            // and drops the rest — identical to how se-mode converges.
+            let floor = last_received
+                .as_ref()
+                .map(|h| h.wall_ms.saturating_add(1))
+                .unwrap_or(0);
+            let hlc = self.reserve_next_local_hlc_above(floor).await;
             let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
                 &signing_key,
                 self_owner,
@@ -1500,21 +1606,27 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// ZEB-295 Phase 6 Task 8: finalize a se-mode poll by minting kd=rs
     /// once enough kd=ts have accumulated.
     ///
-    /// CodeRabbit PR #155 major: this method is the single source of
-    /// truth for the kd=rs (se-mode) emit, called from BOTH the outbound
-    /// orchestration cascade (`maybe_trigger_engine_auto_orchestration`)
-    /// and the inbound dispatch hook (`process_inbound_dispatch`). The
-    /// inbound path is load-bearing because a node that is NOT in the
-    /// committee never publishes kd=ts itself, so its outbound cascade
-    /// never executes; without the inbound invocation, a non-committee
-    /// node would observe ≥t kd=ts events from peers but never finalize
-    /// its own log → permanent divergence.
+    /// CodeRabbit PR #155 major: this method is the single source of truth
+    /// for the kd=rs (se-mode) emit. It has ONE direct caller — the tail of
+    /// `maybe_trigger_engine_auto_orchestration` — which since ZEB-316 fires
+    /// from BOTH the local publish path AND the re-enabled inbound dispatch
+    /// path (`process_inbound_dispatch`); the former standalone inbound call
+    /// was removed as redundant (the cascade tail subsumes it). The inbound
+    /// coverage is load-bearing because a node that is NOT in the committee
+    /// never publishes kd=ts itself, so its *locally-triggered* cascade never
+    /// executes; without the inbound-driven invocation, a non-committee node
+    /// would observe ≥t kd=ts events from peers but never finalize its own
+    /// log → permanent divergence.
     ///
-    /// Determinism: `recover_secret_tally` deterministically picks a
+    /// Convergence: `recover_secret_tally` deterministically picks a
     /// canonical size-`threshold` subset of (i, x_i) shares (Lagrange
-    /// invariance) so all replicas that cross the threshold reconstruct
-    /// bit-identical kd=rs envelopes — late arrivals are silently
-    /// rejected by the apply-time terminal-state gate.
+    /// invariance) so every replica that crosses the threshold reconstructs
+    /// a bit-identical kd=rs *result* (StarResult payload). The kd=rs *HLC*
+    /// is a wall-clock reservation and therefore differs per replica (see
+    /// the mint site below for why se-mode cannot use a deterministic
+    /// close-anchored HLC); the apply-time LWW/terminal-state gate keeps the
+    /// first finalizing kd=rs and silently rejects the rest, so the polls
+    /// still converge on one terminal result.
     async fn try_finalize_secret_tally(
         self: &Arc<Self>,
         pid: &PollId,
@@ -1523,7 +1635,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     ) {
         // (1) Snapshot under lock, compute result, drop lock before
         // recursive publish_event.
-        let trigger_result: Option<crate::community_voting_star::StarResult> = {
+        let trigger_result: Option<(crate::community_voting_star::StarResult, Option<Hlc>)> = {
             let log = self.voting_log.lock().await;
             let state = match log.polls.get(pid) {
                 Some(s) => s,
@@ -1536,6 +1648,10 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             if t3.meta.config.privacy_mode != "se" || t3.result.is_some() {
                 None
             } else {
+                // ZEB-316 (Greptile P1 fix): snapshot the poll's live receive
+                // watermark under the log lock so the kd=rs mint below can floor
+                // strictly above it (see mint-site comment).
+                let last_received = t3.last_received_hlc.clone();
                 // Build candidate ordering (mirror kd=rs pu-mode path).
                 let sq = crate::community_voting_tier3::synthesize_status_quo(&t3.meta.poll_id);
                 let sq_hash = sq.event_hash;
@@ -1559,11 +1675,52 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                     &advancers, sq_hash,
                 );
                 crate::community_voting_tier3::recover_secret_tally(t3, &ordered)
+                    .map(|result| (result, last_received))
             }
         };
 
-        if let Some(result) = trigger_result {
-            let hlc = self.reserve_next_local_hlc().await;
+        if let Some((result, last_received)) = trigger_result {
+            // ZEB-316 (C1 fix + Greptile P1 fix): se-mode kd=rs mints on a
+            // WALL-CLOCK HLC (non-deterministic), NOT a deterministic
+            // close-anchored HLC — reserved strictly ABOVE the poll's live
+            // receive watermark (`last_received_hlc`).
+            //
+            // kd=rs must be minted ABOVE the current receive watermark or the
+            // apply-time monotonic gate rejects it. In secret mode the committee
+            // kd=ts (tally-share) events land AFTER the close carrying per-replica
+            // wall-clock HLCs whose wall exceeds the close event's wall, so a
+            // close-anchored kd=rs would be non-monotonic and rejected → the poll
+            // would never finalize via engine-auto. No deterministic base is also
+            // ≥ every applied kd=ts, because the shares are per-replica, not
+            // replica-identical.
+            //
+            // A plain `reserve_next_local_hlc()` (wall = `SystemTime::now()`) can
+            // still stall if an accepted trigger is future-walled (clock skew /
+            // future-dated event): its wall becomes `last_received_hlc` ahead of
+            // this node's local clock, and a `now`-reserved kd=rs sits below it
+            // until local time catches up. We instead floor the reservation wall at
+            // `last_received.wall + 1`, so the minted HLC's wall strictly exceeds
+            // the watermark's wall regardless of clock skew → monotonic-safe on the
+            // first attempt.
+            //
+            // Residual window: `last_received` is snapshotted under the lock, then
+            // the lock is released before the kd=rs apply re-acquires it; an event
+            // that advances the watermark in between self-heals by re-firing this
+            // hook (re-snapshot the higher watermark, re-mint above it). Inherent to
+            // the lock-release-before-publish architecture and acceptable.
+            //
+            // A deterministic HLC is unnecessary here anyway: the kd=rs RESULT
+            // already converges bit-identically across replicas via Lagrange
+            // invariance in `recover_secret_tally` (a canonical size-`threshold`
+            // share subset) + the apply-time LWW/terminal-state gate that keeps
+            // the first finalizing kd=rs and drops the rest. (pu-mode kd=rs floors
+            // above the watermark for the same monotonicity reason — see
+            // `maybe_trigger_engine_auto_orchestration`.)
+            let floor = last_received
+                .as_ref()
+                .map(|h| h.wall_ms.saturating_add(1))
+                .unwrap_or(0);
+            let hlc = self.reserve_next_local_hlc_above(floor).await;
             let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
                 signing_key,
                 self_owner,
@@ -1828,7 +1985,9 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // publish_event the hook triggers broadcasts in the natural order:
         // outer event first on the wire, then any follow-ups.
         if event.tier == Tier::Sortition {
-            self.maybe_trigger_engine_auto_orchestration(&applied_poll_id)
+            // ZEB-316: thread the just-applied event's HLC as the deterministic
+            // base for engine-auto kd=sf/kd=cl mints.
+            self.maybe_trigger_engine_auto_orchestration(&applied_poll_id, &event.hlc)
                 .await;
             // ZEB-310 Task 12: emit Tauri lifecycle events for Tier 3.
             // Runs AFTER orchestration so any kd=cl / kd=rs minted by the
@@ -2786,22 +2945,23 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 .await;
         }
 
-        // (2) Tier 3 lifecycle emit. Cheap tier gate avoids touching
-        // app_handle for non-Tier-3 traffic.
+        // (2) Engine-auto orchestration + Tier 3 lifecycle emit. Cheap
+        // tier gate avoids touching app_handle for non-Tier-3 traffic.
         //
-        // NOTE: `maybe_trigger_engine_auto_orchestration` is deliberately
-        // NOT called from the inbound path. When two engines both hold
-        // the local_signing key, having both auto-mint kd=cl / kd=rs from
-        // their independent post-apply hooks creates a real-time HLC race
-        // (each engine's `reserve_next_local_hlc` uses real `wall_now_ms`,
-        // so the two mints get distinct device_id-tagged HLCs and LWW
-        // picks differently per run). A proper fix needs a deterministic
-        // HLC for engine-auto mints (e.g. derived from the triggering
-        // event's HLC) so peer replicas mint bit-identical events. Filed
-        // as a follow-up; peer replicas still converge in the common case
-        // because the originating node's kd=cl / kd=rs flow through
-        // Zenoh and apply via `apply_with_snapshot`'s LWW gate.
+        // ZEB-316: peer engines holding local_signing now auto-orchestrate
+        // from the inbound path too. The mint HLC is derived deterministically
+        // from `event.hlc` (this applied trigger, byte-identical on every
+        // replica), so independent peer mints are bit-identical → trivial LWW.
+        // This mirrors `publish_event`'s ordering (orchestration BEFORE the
+        // lifecycle emit) so the emitted stage reflects the post-orchestration
+        // end state, and its cascade tail (`maybe_emit_tally_share` +
+        // `try_finalize_secret_tally`) subsumes the former standalone se-mode
+        // finalize block — a node that crosses the kd=ts threshold via peer
+        // inbound now finalizes independently regardless of committee
+        // membership.
         if event.tier == Tier::Sortition {
+            self.maybe_trigger_engine_auto_orchestration(&applied_poll_id, &event.hlc)
+                .await;
             self.maybe_emit_tier3_lifecycle_events(
                 &applied_poll_id,
                 &event,
@@ -2810,74 +2970,41 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             .await;
         }
 
-        // (3) CodeRabbit PR #155 major: inbound kd=ts must drive kd=rs
-        // finalization for nodes that are NOT in the committee. Such
-        // nodes never publish kd=ts themselves, so the outbound
-        // orchestration cascade (which runs only on
-        // `publish_event`-driven mints) never fires for them. Without
-        // this hook, a non-committee node would receive ≥t kd=ts events
-        // from peers, hold all the inputs `recover_secret_tally` needs,
-        // and never finalize its own log → permanent divergence with
-        // peers that DID finalize.
-        //
-        // Scope: ONLY `try_finalize_secret_tally` runs here (NOT the
-        // full orchestration cascade). The full cascade includes
-        // outbound kd=cl / kd=sf / pu-mode kd=rs minting, which was
-        // intentionally excluded from inbound dispatch (see note above)
-        // because cross-engine HLC races there cause divergence. The
-        // se-mode kd=rs path is safe to run from both sides because:
-        //   1. Lagrange invariance + canonical share-subset selection
-        //      guarantees bit-identical kd=rs envelopes across replicas
-        //      that cross threshold, so the apply LWW gate cleanly
-        //      resolves any race.
-        //   2. Race-losers are silently rejected by the apply-time
-        //      `PollInFinalizedState` gate (the kd=rs apply path
-        //      transitions to `Stage::Finalized`).
-        //
-        // Gated on (Tier::Sortition + kind ∈ {TallyShare, PollClose}) to
-        // skip the lock-acquire on every non-Tier3 inbound event. The
-        // method itself silently returns if `local_signing` is unset,
-        // privacy_mode is not "se", or `result.is_some()`, so the
-        // operation is cheap on irrelevant polls even within the gate.
-        if event.tier == Tier::Sortition
-            && matches!(
-                event.kind,
-                PollEventKindCode::TallyShare | PollEventKindCode::PollClose
-            )
-        {
-            let local_signing_opt = {
-                let r = self.local_signing.read().await;
-                r.as_ref().map(|(k, o)| (k.clone(), *o))
-            };
-            // Skip silently if we lack signing material (read-only peer)
-            // or have no HLC tracker installed for engine-auto mints.
-            if let Some((signing_key, self_owner)) = local_signing_opt {
-                if self.hlc_tracker.is_some() && self.device_id.is_some() {
-                    // CodeRabbit PR #155 review-round-3 (F24): a committee
-                    // member that learns of kd=cl via PEER inbound (rather
-                    // than initiating it locally) never executes the
-                    // outbound orchestration cascade, so without minting
-                    // here it would never publish its kd=ts. With
-                    // threshold > 1, secret-mode polls stall indefinitely.
-                    // Mint our share first, then attempt finalize — the
-                    // emit's apply-time replay path will trigger
-                    // finalize again via the normal inbound dispatch on
-                    // the just-published event.
-                    self.maybe_emit_tally_share(&applied_poll_id, &signing_key, self_owner)
-                        .await;
-                    self.try_finalize_secret_tally(&applied_poll_id, &signing_key, self_owner)
-                        .await;
-                }
-            }
-        }
-
-        // (4) ZEB-298 Tier 2 delegate-on-behalf notify. Internally
+        // (3) ZEB-298 Tier 2 delegate-on-behalf notify. Internally
         // gated on (Tier::Conviction, Signal) + policy + delegate
         // edge; non-matching traffic short-circuits cheaply.
         self.maybe_emit_delegate_on_behalf(&event, &applied_poll_id)
             .await;
 
         Ok(())
+    }
+}
+
+/// ZEB-316: deterministic, replica-identical HLC for an engine-auto mint.
+///
+/// Strictly newer than `base`; the `device_id` is a poll-derived lane
+/// (`engine-auto-{kind}-{poll_prefix}`) so every replica reacting to the
+/// SAME `base` produces a bit-identical HLC → bit-identical signing_bytes →
+/// bit-identical event_hash. Unlike `reserve_next_local_hlc`, this reads NO
+/// wall-clock, NO `self.device_id`, and does NOT touch the hlc_tracker — all
+/// three diverge per replica. `kind` ∈ {"cl","sf","rs"}.
+fn engine_auto_hlc_from_base(base: &Hlc, pid: &PollId, kind: &str) -> Hlc {
+    let lane = format!("engine-auto-{kind}-{}", hex::encode(&pid.0[..4]));
+    // Strictly newer by (wall_ms, logical, device_id): logical+1 at equal wall.
+    // Saturation guard (astronomically unlikely — logical resets on wall advance):
+    // if logical is maxed, bump wall and reset logical so it stays strictly newer.
+    if base.logical == u32::MAX {
+        Hlc {
+            wall_ms: base.wall_ms.saturating_add(1),
+            logical: 0,
+            device_id: lane,
+        }
+    } else {
+        Hlc {
+            wall_ms: base.wall_ms,
+            logical: base.logical + 1,
+            device_id: lane,
+        }
     }
 }
 
@@ -5804,6 +5931,127 @@ mod tests {
             4,
             "payload must have exactly 4 keys (pollId, communityId, approver, \
              targetEventHash); got {obj:?}"
+        );
+    }
+
+    // ── ZEB-316: deterministic engine-auto HLC derivation ──────────────────
+
+    #[test]
+    fn engine_auto_hlc_from_base_is_deterministic_and_strictly_newer() {
+        let pid = PollId([0xAB; 32]);
+        let base = Hlc {
+            wall_ms: 1_000,
+            logical: 3,
+            device_id: "engine".into(),
+        };
+
+        let a = engine_auto_hlc_from_base(&base, &pid, "cl");
+        let b = engine_auto_hlc_from_base(&base, &pid, "cl");
+        // Deterministic: identical (base, pid, kind) → identical HLC.
+        assert_eq!(a, b);
+        // Strictly newer than base.
+        assert!(a.is_strictly_newer_than(&base), "must be strictly newer");
+        // Poll-derived lane (first 4 bytes of poll_id hex).
+        assert_eq!(a.device_id, "engine-auto-cl-abababab");
+        // Same wall, logical+1 in the common case.
+        assert_eq!(a.wall_ms, 1_000);
+        assert_eq!(a.logical, 4);
+
+        // Distinct kinds → distinct lanes, but both strictly newer than base.
+        let rs = engine_auto_hlc_from_base(&base, &pid, "rs");
+        assert_eq!(rs.device_id, "engine-auto-rs-abababab");
+        assert!(rs.is_strictly_newer_than(&base));
+
+        // Saturation guard: logical at u32::MAX bumps wall instead.
+        let maxed = Hlc {
+            wall_ms: 5,
+            logical: u32::MAX,
+            device_id: "x".into(),
+        };
+        let d = engine_auto_hlc_from_base(&maxed, &pid, "cl");
+        assert_eq!(d.wall_ms, 6);
+        assert_eq!(d.logical, 0);
+        assert!(d.is_strictly_newer_than(&maxed));
+    }
+
+    // ── ZEB-316 (Greptile P1): watermark-floored kd=rs reservation ─────────
+
+    /// Start a minimal engine with an installed `hlc_tracker` + `device_id`
+    /// so the `reserve_next_local_hlc[_above]` reservation path can run.
+    /// Resolvers are omitted — the reservation path never touches them.
+    async fn start_hlc_reserve_test_engine(
+        device_id: &str,
+    ) -> Arc<VotingLogEngine<tauri::test::MockRuntime>> {
+        let (publisher_tx, _publisher_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (_subscriber_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(8);
+        let app = tauri::test::mock_app();
+        VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+            community_id: SpaceId([0x9a; 16]),
+            voting_log: Arc::new(Mutex::new(VotingLog::new())),
+            publisher_tx,
+            subscriber_rx,
+            hlc_tracker: Some(Arc::new(Mutex::new(BTreeMap::new()))),
+            device_id: Some(device_id.to_string()),
+            app_handle: Some(app.handle().clone()),
+            identity_resolver: None,
+            membership_resolver: None,
+        })
+        .await
+    }
+
+    /// A floor ABOVE the current wall clock (as when an accepted trigger is
+    /// future-walled) forces the reserved HLC's wall up to the floor — the
+    /// core guarantee that keeps engine-auto kd=rs above the poll's receive
+    /// watermark and clears the apply-time monotonic gate.
+    #[tokio::test]
+    async fn reserve_next_local_hlc_above_floors_wall_at_future_floor() {
+        let engine = start_hlc_reserve_test_engine("dev-reserve-hi").await;
+
+        // ~year 33658 in ms — comfortably above any real `SystemTime::now()`.
+        let far_future_ms = 1_000_000_000_000_000u64;
+        let hlc = engine.reserve_next_local_hlc_above(far_future_ms).await;
+
+        assert_eq!(hlc.device_id, "dev-reserve-hi");
+        assert!(
+            hlc.wall_ms >= far_future_ms,
+            "reserved wall {} must be floored at {far_future_ms}",
+            hlc.wall_ms
+        );
+    }
+
+    /// A floor of 0 (i.e. below `now`) makes the floored reserve behave like
+    /// the plain `reserve_next_local_hlc`: wall ≈ now, and the shared device
+    /// lane advances monotonically across both.
+    #[tokio::test]
+    async fn reserve_next_local_hlc_above_zero_floor_tracks_wall_clock() {
+        let engine = start_hlc_reserve_test_engine("dev-reserve-lo").await;
+
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let floored = engine.reserve_next_local_hlc_above(0).await;
+        let after_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        assert_eq!(floored.device_id, "dev-reserve-lo");
+        assert!(
+            floored.wall_ms >= before_ms && floored.wall_ms <= after_ms,
+            "0-floor wall {} should sit within [{before_ms}, {after_ms}] (≈ now)",
+            floored.wall_ms
+        );
+
+        // Same device lane: a subsequent plain reserve must not regress —
+        // confirming the floored reserve advanced the shared tracker exactly
+        // like the plain path would.
+        let plain = engine.reserve_next_local_hlc().await;
+        assert!(
+            (plain.wall_ms, plain.logical) >= (floored.wall_ms, floored.logical),
+            "plain reserve {:?} after floored reserve {:?} must not regress",
+            (plain.wall_ms, plain.logical),
+            (floored.wall_ms, floored.logical)
         );
     }
 }

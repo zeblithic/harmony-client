@@ -42,18 +42,35 @@ use std::time::Duration;
 use harmony_app::community_state_sync::IdentityResolver;
 use harmony_app::community_voting_core::{
     build_signed_draft_approval, build_signed_draft_candidate, build_signed_mini_public_decline,
-    build_signed_poll_create_tier3, build_signed_ratification_ballot,
-    build_signed_sortition_selection, derive_poll_id, CandidateEventHash, Eligibility, MemberAttrs,
-    MembershipSnapshot, PollId, SignedVotingEvent, Tier3PollConfigPayload, VotingIdentityResolver,
+    build_signed_poll_close_tier3, build_signed_poll_create_tier3,
+    build_signed_ratification_ballot, build_signed_ratification_ballot_payload,
+    build_signed_sortition_selection, build_signed_tally_share, derive_poll_id, BallotNIZKProof,
+    CandidateEventHash, Eligibility, MemberAttrs, MembershipSnapshot, PollId,
+    RatificationBallotPayload, SignedVotingEvent, TallyShareEntry, TallySharePayload,
+    Tier3PollConfigPayload, VotingIdentityResolver,
 };
 use harmony_app::community_voting_log::{
     MembershipSnapshotResolver, SnapshotResolverError, VotingLog,
 };
 use harmony_app::community_voting_log_engine::{VotingLogEngine, VotingLogEngineParams};
 use harmony_app::community_voting_sortition::fisher_yates_select;
-use harmony_app::community_voting_tier3::Stage;
+use harmony_app::community_voting_tier3::{
+    aggregate_se_ballots, CommitteeOracle, CommitteePublicState, DraftCandidateState, Stage,
+};
+use harmony_app::community_voting_tier3_crypto::{
+    compress_point, decompress_point, partial_decrypt_share,
+};
+use harmony_app::community_voting_tier3_nizk::{
+    dleq_prove, prove_ballot_bundle_with_outputs_with_score_nonces,
+};
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+
+use curve25519_dalek::{
+    constants::RISTRETTO_BASEPOINT_POINT, ristretto::RistrettoPoint, scalar::Scalar,
+};
+use frost_ristretto255::rand_core::OsRng;
 use harmony_app::{add_dm_ipc_handlers, mock_context_with_full_acl, NodeState, LOCAL_IPC_URL};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use tauri::ipc::{CallbackFn, InvokeBody};
 use tauri::test::{get_ipc_response, mock_builder, INVOKE_KEY};
@@ -956,12 +973,19 @@ async fn ipc_tier3_engine_auto_kd_sf_on_mass_decline() {
 
 /// IPC-equivalent race-tolerant orchestration (Path C). BOTH engines have
 /// the proposer's signing key installed; both independently emit kd=cl +
-/// kd=rs when their post-apply hook sees the ratification window expired.
-/// First-by-HLC wins (per design spec §10 idempotency rule), and kd=rs
-/// `result` payload is bit-identical because StarResult is deterministic
-/// over the same ballot set.
-#[tokio::test]
-async fn ipc_tier3_engine_auto_kd_cl_kd_rs_race_tolerant() {
+/// kd=rs from their own post-apply hook — engine_a via `publish_event`,
+/// engine_b via the ZEB-316 re-enabled INBOUND dispatch hook. Because the
+/// mint HLCs are now derived deterministically from the triggering kd=ss HLC
+/// (no wall-clock), the two independent mints are byte-identical, so the
+/// `close_event_hash_a == close_event_hash_b` equality below proves
+/// convergence of INDEPENDENT mints (not merely one engine adopting the
+/// other's broadcast).
+///
+/// Runs the full scenario, asserts complete cross-engine convergence
+/// (identical stage, byte-identical close_event_hash, and identical
+/// StarResult), and returns the finalized `close_event_hash` so callers can
+/// additionally assert determinism ACROSS runs (see the repeat test below).
+async fn run_race_tolerant_and_return_close_hash() -> Option<[u8; 32]> {
     const SORTITION_SIZE: u16 = 20;
     const N_IDENTITIES: usize = 50;
     const COMMUNITY_ID: SpaceId = SpaceId([0xF3; 16]);
@@ -1116,6 +1140,42 @@ async fn ipc_tier3_engine_auto_kd_cl_kd_rs_race_tolerant() {
     );
 
     drop(engines);
+
+    // The winning kd=cl close_event_hash — deterministic across runs.
+    t3_a.close_event_hash
+}
+
+/// Thin wrapper preserving the original test name; drives the scenario once
+/// and asserts a winning kd=cl close_event_hash was recorded. All the
+/// cross-engine convergence assertions live in the helper above.
+#[tokio::test]
+async fn ipc_tier3_engine_auto_kd_cl_kd_rs_race_tolerant() {
+    let close_hash = run_race_tolerant_and_return_close_hash().await;
+    assert!(
+        close_hash.is_some(),
+        "a finalized race-tolerant poll must record the winning kd=cl close_event_hash"
+    );
+}
+
+/// ZEB-316 determinism proof. Run the two-engine race-tolerant scenario 100×;
+/// a wall-clock-derived mint HLC would make the kd=cl event (and hence its
+/// `close_event_hash`) vary run-to-run. Structural determinism — the mint HLC
+/// is derived purely from the triggering kd=ss HLC — implies a single distinct
+/// `close_event_hash` across every run. Lightweight: reuses the same fixtures,
+/// a fresh pair of engines per iteration, and the scenario itself finalizes in
+/// tens of milliseconds.
+#[tokio::test]
+async fn ipc_tier3_engine_auto_kd_cl_kd_rs_deterministic_repeat() {
+    let mut hashes = std::collections::HashSet::new();
+    for _ in 0..100 {
+        hashes.insert(run_race_tolerant_and_return_close_hash().await);
+    }
+    assert_eq!(
+        hashes.len(),
+        1,
+        "close_event_hash must be identical across 100 independent runs; got {} distinct",
+        hashes.len()
+    );
 }
 
 // ─── TEST 4: retry_of via IPC ─────────────────────────────────────────────────
@@ -1457,4 +1517,424 @@ fn ipc_tier3_error_extraction_string_and_error() {
             "voting_approve_draft_candidate invalid-hash must surface hex error; got: {err_str}"
         );
     }
+}
+
+// ─── TEST 6: se-mode two-engine result-convergence (ZEB-316 payoff) ───────────
+//
+// Proves the RE-ENABLED inbound orchestration hook drives secret-tally
+// finalization on a peer replica in the REALISTIC production arrangement where
+// committee kd=ts (tally-share) events land AFTER the close carrying per-replica
+// wall-clock HLCs whose `wall > close.wall`. The design is deliberately
+// ASYMMETRIC so the test is *load-bearing* for the inbound re-enable — a
+// symmetric both-signing setup would let engine_b lean on engine_a's broadcast
+// kd=rs and pass even if the hook were still disabled:
+//
+//   * engine_a holds NO signing key — a pure relay that publishes the
+//     committee's kd=ts shares onto the bridge. Its own post-apply cascade
+//     short-circuits at the `local_signing` gate, so it never mints kd=rs.
+//   * engine_b holds the proposer signing key. It receives the ≥t kd=ts shares
+//     via the INBOUND dispatch path and — only because ZEB-316 re-enabled
+//     `maybe_trigger_engine_auto_orchestration` there — its cascade tail runs
+//     `try_finalize_secret_tally`, minting kd=rs on a WALL-CLOCK HLC
+//     (`reserve_next_local_hlc`). se-mode does NOT anchor kd=rs on the close
+//     event's HLC: the kd=ts above already sit at a wall > close, so a
+//     close-anchored kd=rs would be non-monotonic and rejected by the
+//     apply-time gate (ZEB-316 C1).
+//   * engine_a then finalizes by applying engine_b's broadcast kd=rs.
+//
+// If the inbound hook were still disabled engine_b would store both shares but
+// never finalize → no kd=rs → engine_a never finalizes → the waits below time
+// out. A green run confirms the re-enabled cascade (which subsumes the removed
+// standalone se-mode block) finalizes secret polls through inbound dispatch.
+//
+// RED→GREEN evidence (ZEB-316 C1 fix): with kd=ts.wall > close.wall (below),
+// this test FAILS against the pre-fix close-anchored se-mode kd=rs — engine_b
+// mints kd=rs at close.wall, the apply-time monotonic gate rejects it (an
+// applied kd=ts sits higher), engine_b never finalizes, the wait times out. It
+// PASSES once se-mode kd=rs reverts to a wall-clock HLC. The kd=rs *result*
+// (StarResult) still converges bit-identically across replicas via Lagrange
+// invariance + the apply-time LWW gate — which is what the assertions check.
+
+/// A `threshold`-of-`n` mock threshold-ElGamal committee over Ristretto255.
+/// `members` is sorted ascending by `OwnerAddr` so FROST identifier `i+1`
+/// matches the BTreeMap iteration order `recover_secret_tally` derives.
+struct SeCommittee {
+    joint_y: RistrettoPoint,
+    members: Vec<OwnerAddr>,
+    shares: BTreeMap<u16, Scalar>,
+    verifying_shares: BTreeMap<u16, RistrettoPoint>,
+    threshold: u16,
+}
+
+/// Build a `threshold`-of-`members.len()` committee from a random
+/// degree-(threshold-1) polynomial. `members` MUST be sorted ascending.
+fn build_se_committee(members: &[OwnerAddr], threshold: u16) -> SeCommittee {
+    assert!(
+        members.windows(2).all(|w| w[0] < w[1]),
+        "committee members must be sorted ascending and distinct"
+    );
+    let n = members.len() as u16;
+    assert!((1..=n).contains(&threshold));
+    let coeffs: Vec<Scalar> = (0..threshold).map(|_| Scalar::random(&mut OsRng)).collect();
+    let joint_y = RISTRETTO_BASEPOINT_POINT * coeffs[0];
+    let mut shares = BTreeMap::new();
+    let mut verifying_shares = BTreeMap::new();
+    for i in 1u16..=n {
+        let id = Scalar::from(i as u64);
+        let mut acc = Scalar::ZERO;
+        let mut id_pow = Scalar::ONE;
+        for c in &coeffs {
+            acc += c * id_pow;
+            id_pow *= id;
+        }
+        shares.insert(i, acc);
+        verifying_shares.insert(i, RISTRETTO_BASEPOINT_POINT * acc);
+    }
+    SeCommittee {
+        joint_y,
+        members: members.to_vec(),
+        shares,
+        verifying_shares,
+        threshold,
+    }
+}
+
+#[derive(Debug)]
+struct SeMockOracle {
+    joint_verifying_key: [u8; 32],
+    verifying_shares: BTreeMap<OwnerAddr, [u8; 32]>,
+    threshold: u16,
+    latest: u64,
+}
+
+impl CommitteeOracle for SeMockOracle {
+    fn committee_at_epoch(&self, epoch: u64) -> Option<CommitteePublicState> {
+        Some(CommitteePublicState {
+            epoch,
+            joint_verifying_key: self.joint_verifying_key,
+            verifying_shares: self.verifying_shares.clone(),
+            threshold: self.threshold,
+        })
+    }
+    fn latest_epoch(&self) -> Option<u64> {
+        Some(self.latest)
+    }
+}
+
+fn se_oracle_for(committee: &SeCommittee, latest: u64) -> Arc<SeMockOracle> {
+    let mut verifying_shares = BTreeMap::new();
+    for (i, addr) in committee.members.iter().enumerate() {
+        verifying_shares.insert(
+            *addr,
+            compress_point(&committee.verifying_shares[&((i + 1) as u16)]),
+        );
+    }
+    Arc::new(SeMockOracle {
+        joint_verifying_key: compress_point(&committee.joint_y),
+        verifying_shares,
+        threshold: committee.threshold,
+        latest,
+    })
+}
+
+/// Real se-mode encrypted ballot (NIZK-proven) bound to `poll_id`.
+fn build_se_ballot(
+    committee: &SeCommittee,
+    poll_id: PollId,
+    scores: &[u64],
+) -> RatificationBallotPayload {
+    let r_scores: Vec<Scalar> = (0..scores.len())
+        .map(|_| Scalar::random(&mut OsRng))
+        .collect();
+    let (bundle, cs, ci) =
+        prove_ballot_bundle_with_outputs_with_score_nonces(&committee.joint_y, scores, &r_scores);
+    RatificationBallotPayload {
+        poll_id,
+        scores: None,
+        ciphertexts_scores: Some(cs),
+        ciphertexts_indicators: Some(ci),
+        proof: Some(BallotNIZKProof {
+            range_proofs: bundle.range_proofs,
+            consistency_proofs: bundle.consistency_proofs,
+        }),
+    }
+}
+
+/// Real kd=ts payload: per-aggregate partial decryption shares + DLEQ proofs
+/// for committee member `member_idx`, computed against the homomorphic
+/// aggregate of `ballots` (n score-sum + C(n,2) indicator aggregates).
+fn build_se_ts_payload(
+    committee: &SeCommittee,
+    ballots: &[RatificationBallotPayload],
+    member_idx: usize,
+    poll_id: PollId,
+    n: usize,
+    epoch: u64,
+) -> TallySharePayload {
+    let aggregates = aggregate_se_ballots(ballots, n).expect("aggregate_se_ballots");
+    let frost_id = (member_idx + 1) as u16;
+    let x_i = committee.shares[&frost_id];
+    let y_i = committee.verifying_shares[&frost_id];
+    let g = RISTRETTO_BASEPOINT_POINT;
+    let entries: Vec<TallyShareEntry> = aggregates
+        .iter()
+        .map(|agg| {
+            let c1_agg = decompress_point(&agg.c1).expect("c1 decompress");
+            let share_pt = partial_decrypt_share(&c1_agg, &x_i);
+            let proof = dleq_prove(&g, &y_i, &c1_agg, &share_pt, &x_i);
+            TallyShareEntry {
+                share: compress_point(&share_pt),
+                dleq_proof: proof.to_bytes(),
+            }
+        })
+        .collect();
+    TallySharePayload {
+        poll_id,
+        committee_epoch: epoch,
+        entries,
+    }
+}
+
+#[tokio::test]
+async fn ipc_tier3_engine_auto_se_mode_two_engine_finalize() {
+    const COMMUNITY_ID: SpaceId = SpaceId([0xE5; 16]);
+    // se-mode config dw=fw=rw=60s (PollCreate validation requires ≥60) →
+    // ratification window [120_000, 180_000] ms with create at wall=0.
+    const RATIFICATION_OPEN_MS: u64 = 120_000;
+    const RATIFICATION_END_MS: u64 = 180_000;
+    // Committee kd=ts land AFTER the close carrying per-replica wall-clock HLCs
+    // — the normal production arrangement (kd=ts.wall > close.wall). This is the
+    // case the pre-C1-fix close-anchored se-mode kd=rs could NOT finalize
+    // (the deterministic kd=rs at close.wall is non-monotonic once a kd=ts at a
+    // higher wall has been applied). staggered per member to mirror per-replica
+    // wall-clock arrival.
+    const TS_WALL_BASE_MS: u64 = RATIFICATION_END_MS + 5_000; // 185_000 > close
+    const N_TOTAL: usize = 3; // 2 explicit candidates + status_quo
+    const N: usize = N_TOTAL;
+
+    // engine_a = relay (no signing); engine_b = signer (finalizer).
+    let engines = setup_two_voting_engine_bridge(COMMUNITY_ID).await;
+
+    // 3-member committee from real identities, sorted ascending so FROST id
+    // order matches the oracle's BTreeMap iteration order.
+    let mut committee_ids: Vec<TestIdentity> = (100u8..103).map(fixture_identity).collect();
+    committee_ids.sort_by_key(|id| id.owner);
+    let member_addrs: Vec<OwnerAddr> = committee_ids.iter().map(|id| id.owner).collect();
+    let committee = build_se_committee(&member_addrs, 2);
+
+    // The proposer signs the seeded kd=cl and — on engine_b — the auto-minted
+    // kd=rs. Distinct from the committee; kd=rs is a public result event.
+    let proposer = fixture_identity(200);
+
+    // Register every actor whose signed events cross the bridge: kd=ts from
+    // committee members, kd=rs from the proposer. (Ballots / kd=ss / kd=cl are
+    // injected directly into both logs and never verified.)
+    for id in &committee_ids {
+        engines.resolvers.add_identity(id);
+    }
+    engines.resolvers.add_identity(&proposer);
+
+    // engine_b alone holds the proposer's signing key.
+    engines
+        .engine_b
+        .install_local_signing_key(Arc::new(proposer.signing_key.clone()), proposer.owner)
+        .await;
+
+    let config = Tier3PollConfigPayload {
+        proposal_text: "se-mode two-engine determinism".into(),
+        sortition_size: 20,
+        deliberation_window_seconds: 60,
+        drafting_window_seconds: 60,
+        ratification_window_seconds: 60,
+        privacy_mode: "se".into(),
+        incentive_mode: "d".into(),
+        eligibility: Eligibility {
+            min_power: 0,
+            min_vouching_depth: None,
+            sortition_size: None,
+        },
+        retry_of: None,
+    };
+    // Create at wall=0 so ratification_end = 180_000.
+    let create_event = build_tier3_poll_create_event(&proposer, &config, hlc_at(0, "proposer"));
+    let poll_id = derive_poll_id(
+        &COMMUNITY_ID,
+        &create_event.signing_bytes().expect("signing_bytes"),
+    );
+
+    // Electorate = the committee.
+    let snapshot = MembershipSnapshot {
+        members: member_addrs
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    // Pre-build the shared setup events ONCE so both logs reach byte-identical
+    // pre-finalize state: kd=ss (leave Sortition), real se ballots, kd=cl
+    // (seeds close_event_hash).
+    let ss_event = build_sortition_selection_event(
+        &proposer,
+        poll_id,
+        member_addrs.clone(),
+        vec![],
+        hlc_at(10, "ss"),
+    );
+    // c0 wins clearly; scores [c0, c1, status_quo] per voter.
+    let ballot_scores: [[u64; N]; 3] = [[5, 1, 0], [5, 2, 0], [5, 3, 0]];
+    let ballots: Vec<RatificationBallotPayload> = ballot_scores
+        .iter()
+        .map(|s| build_se_ballot(&committee, poll_id, s))
+        .collect();
+    let ballot_events: Vec<SignedVotingEvent> = ballots
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            build_signed_ratification_ballot_payload(
+                &committee_ids[i].signing_key,
+                committee_ids[i].owner,
+                p.clone(),
+                hlc_at(RATIFICATION_OPEN_MS + i as u64, "rb"),
+            )
+            .expect("build_signed_ratification_ballot_payload")
+        })
+        .collect();
+    let close_hlc = hlc_at(RATIFICATION_END_MS, "close");
+    let cl_event = build_signed_poll_close_tier3(
+        &proposer.signing_key,
+        proposer.owner,
+        poll_id,
+        close_hlc.clone(),
+    )
+    .expect("build_signed_poll_close_tier3");
+
+    // Synthetic candidate approvals: ceil(sortition_size/2) = 10 approvers each
+    // so both candidates advance through drafting → n = 3.
+    let approvals: std::collections::HashSet<OwnerAddr> =
+        (0..10u8).map(|i| OwnerAddr([0xA0 | i; 16])).collect();
+
+    // Seed BOTH logs identically.
+    for log in [&engines.log_a, &engines.log_b] {
+        let mut g = log.lock().await;
+        g.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
+            .expect("PollCreate apply");
+        let t3 = g
+            .polls
+            .get_mut(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3_mut())
+            .expect("tier3 state");
+        t3.install_committee_oracle(se_oracle_for(&committee, 0));
+        for i in 0..(N_TOTAL - 1) {
+            t3.candidates.push(DraftCandidateState {
+                event_hash: [0xC0 | (i as u8); 32],
+                text: format!("candidate {i}"),
+                proposer: Some(member_addrs[0]),
+                approvals: approvals.clone(),
+            });
+        }
+        t3.apply_event(&ss_event).expect("kd=ss apply");
+        for rb in &ballot_events {
+            t3.apply_event(rb).expect("kd=rb apply");
+        }
+        t3.apply_event(&cl_event).expect("kd=cl apply");
+    }
+
+    // Publish the 2 kd=ts shares via engine_a (the relay). engine_a self-applies
+    // them (crossing the threshold in its own log, but never minting — no
+    // signing key); the bridge forwards both to engine_b's inbound path.
+    //
+    // HLC ORDERING — the REALISTIC production case (ZEB-316 C1). Both kd=ts land
+    // at walls STRICTLY GREATER than the close (`TS_WALL_BASE_MS > close.wall`),
+    // staggered per member to mirror the per-replica wall-clock HLCs committee
+    // members actually stamp (kd=ts is minted well after the ratification close).
+    // The apply-time monotonic gate (`Tier3PollState::apply_event` /
+    // `last_received_hlc`) rejects any event whose (wall, logical, device_id) is
+    // strictly below the last applied — so after these kd=ts apply, the poll's
+    // watermark sits above `close.wall`. A close-anchored se-mode kd=rs (the
+    // pre-C1-fix behavior) would therefore be non-monotonic and REJECTED, and
+    // engine_b would never finalize (the waits below would time out) — that is
+    // this test's RED. The fix mints se-mode kd=rs on a wall-clock HLC
+    // (`reserve_next_local_hlc`, real "now" ≫ these synthetic walls), which is
+    // monotonically applicable; both replicas then converge on the same terminal
+    // StarResult via Lagrange invariance + the apply-time LWW gate — GREEN.
+    for member_idx in [0usize, 1] {
+        let ts_payload = build_se_ts_payload(&committee, &ballots, member_idx, poll_id, N, 0);
+        let ts_ev = build_signed_tally_share(
+            &committee_ids[member_idx].signing_key,
+            committee_ids[member_idx].owner,
+            ts_payload,
+            hlc_at(
+                TS_WALL_BASE_MS + member_idx as u64 * 1_000,
+                &format!("ts{member_idx}"),
+            ),
+        )
+        .expect("build_signed_tally_share");
+        engines
+            .engine_a
+            .publish_event(ts_ev, None)
+            .await
+            .expect("engine_a publish kd=ts");
+    }
+
+    // engine_b finalizes via the re-enabled inbound cascade; engine_a then
+    // finalizes by applying engine_b's broadcast kd=rs.
+    wait_for_log("engine_b: se Finalized", &engines.log_b, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.stage == Stage::Finalized)
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_b must finalize the se poll via the inbound cascade");
+    wait_for_log("engine_a: se Finalized", &engines.log_a, |log| {
+        log.polls
+            .get(&poll_id)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .map(|t3| t3.stage == Stage::Finalized)
+            .unwrap_or(false)
+    })
+    .await
+    .expect("engine_a must finalize via engine_b's broadcast kd=rs");
+
+    let (t3_a, t3_b) = {
+        let la = engines.log_a.lock().await;
+        let lb = engines.log_b.lock().await;
+        (
+            la.polls[&poll_id]
+                .tier_state
+                .as_tier3()
+                .expect("log_a tier3")
+                .clone(),
+            lb.polls[&poll_id]
+                .tier_state
+                .as_tier3()
+                .expect("log_b tier3")
+                .clone(),
+        )
+    };
+    assert_eq!(t3_a.stage, Stage::Finalized);
+    assert_eq!(t3_b.stage, Stage::Finalized);
+    let result_a = t3_a.result.as_ref().expect("engine_a result");
+    let result_b = t3_b.result.as_ref().expect("engine_b result");
+    // Result-convergence is the load-bearing invariant for se-mode: the kd=rs
+    // *result* (StarResult) is bit-identical across both engines via Lagrange
+    // invariance in `recover_secret_tally` + the apply-time LWW gate. The kd=rs
+    // *HLC* is intentionally NOT deterministic in se-mode (wall-clock mint —
+    // ZEB-316 C1), so we deliberately do NOT assert byte-identity of the kd=rs
+    // event / its HLC across engines; only the recovered result must converge.
+    assert_eq!(
+        result_a, result_b,
+        "se-mode: bit-identical recovered StarResult across both engines"
+    );
+
+    drop(engines);
 }
