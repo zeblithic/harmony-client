@@ -50340,6 +50340,41 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
     auto_exec: Option<crate::community_voting_conviction::AutoExecAction>,
     min_power: Option<u32>,
 ) -> Result<String, String> {
+    // ZEB-720: thin Tauri wrapper → shared _impl (also called by the RPC layer).
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    voting_create_tier2_proposal_impl(
+        state_lock.inner(),
+        sink,
+        community_id,
+        channel_id,
+        proposal_text,
+        half_life_seconds,
+        threshold_min,
+        threshold_max,
+        beta,
+        delegation_allowed,
+        auto_exec,
+        min_power,
+    )
+    .await
+}
+
+/// ZEB-720: shared IPC/RPC seam.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn voting_create_tier2_proposal_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    community_id: String,
+    channel_id: String,
+    proposal_text: String,
+    half_life_seconds: Option<u32>,
+    threshold_min: Option<i64>,
+    threshold_max: Option<i64>,
+    beta: Option<u8>,
+    delegation_allowed: Option<bool>,
+    auto_exec: Option<crate::community_voting_conviction::AutoExecAction>,
+    min_power: Option<u32>,
+) -> Result<String, String> {
     // ── 1. Decode hex ids ──────────────────────────────────────────────
     let cid_bytes: [u8; 16] = hex::decode(&community_id)
         .map_err(|e| format!("invalid community_id hex: {e}"))?
@@ -50402,7 +50437,7 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
     }
 
     // ── 3. Extract NodeState handles (ZEB-317 shared helper) ──────────
-    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
+    let handles = VotingEngineNodeHandles::extract(state_lock)?;
 
     // ── 4. Build snapshot + verify creator eligibility ────────────────
     let snapshot = voting_build_snapshot_for_community(
@@ -50461,9 +50496,7 @@ async fn voting_create_tier2_proposal<R: tauri::Runtime>(
         proposal_id: poll_id_hex.clone(),
         community_id: hex::encode(space_id.0),
     };
-    if let Err(e) = app.emit("voting-tier2-proposal-created", &payload) {
-        tracing::warn!(error = %e, "voting-tier2-proposal-created emit failed");
-    }
+    crate::node_event_sink::emit_ser(sink.as_ref(), "voting-tier2-proposal-created", &payload);
     Ok(poll_id_hex)
 }
 
@@ -50479,6 +50512,18 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
     proposal_id: String,
     support: bool,
 ) -> Result<(), String> {
+    // ZEB-720: thin Tauri wrapper → shared _impl (also called by the RPC layer).
+    let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
+    voting_signal_tier2_impl(state_lock.inner(), sink, proposal_id, support).await
+}
+
+/// ZEB-720: shared IPC/RPC seam.
+pub(crate) async fn voting_signal_tier2_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    proposal_id: String,
+    support: bool,
+) -> Result<(), String> {
     let pid_bytes: [u8; 32] = hex::decode(&proposal_id)
         .map_err(|e| format!("invalid proposal_id hex: {e}"))?
         .as_slice()
@@ -50490,7 +50535,7 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
     // previously extracted only 7 fields (it never touched the engine);
     // ZEB-318 routes it through `engine.publish_event`, so it now needs the
     // full engine plumbing the helper carries.
-    let handles = VotingEngineNodeHandles::extract(state_lock.inner())?;
+    let handles = VotingEngineNodeHandles::extract(state_lock)?;
 
     // ── Lookup proposal + verify lifecycle (S1) ────────────────────────
     let log_arcs: Vec<(
@@ -50587,9 +50632,7 @@ async fn voting_signal_tier2<R: tauri::Runtime>(
         voter: hex::encode(handles.self_owner.0),
         support,
     };
-    if let Err(e) = app.emit("voting-tier2-signal-cast", &payload) {
-        tracing::warn!(error = %e, "voting-tier2-signal-cast emit failed");
-    }
+    crate::node_event_sink::emit_ser(sink.as_ref(), "voting-tier2-signal-cast", &payload);
     Ok(())
 }
 
@@ -50889,6 +50932,14 @@ async fn voting_list_tier2_proposals(
 #[tauri::command]
 async fn voting_get_tier2_proposal(
     state_lock: tauri::State<'_, Mutex<NodeState>>,
+    proposal_id: String,
+) -> Result<Tier2ProposalExport, String> {
+    voting_get_tier2_proposal_impl(state_lock.inner(), proposal_id).await
+}
+
+/// ZEB-720: shared IPC/RPC seam (headless-capable; no GUI AppHandle needed).
+pub(crate) async fn voting_get_tier2_proposal_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
     proposal_id: String,
 ) -> Result<Tier2ProposalExport, String> {
     let pid_bytes: [u8; 32] = hex::decode(&proposal_id)

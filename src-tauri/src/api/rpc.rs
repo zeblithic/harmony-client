@@ -231,6 +231,48 @@ struct CreateCommunityArgs {
     is_invite_only: bool,
 }
 
+// ── Tier-2 conviction voting (ZEB-720) ───────────────────────────────
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VotingCreateTier2Args {
+    community_id: String,
+    channel_id: String,
+    proposal_text: String,
+    #[serde(default)]
+    half_life_seconds: Option<u32>,
+    #[serde(default)]
+    threshold_min: Option<i64>,
+    #[serde(default)]
+    threshold_max: Option<i64>,
+    #[serde(default)]
+    beta: Option<u8>,
+    #[serde(default)]
+    delegation_allowed: Option<bool>,
+    #[serde(default)]
+    min_power: Option<u32>,
+    /// Hex-encoded 16-byte OwnerAddr of the SetPower target. When present
+    /// (with `set_power_new_power`), the handler builds an
+    /// `AutoExecAction::SetPower`; otherwise auto_exec is None. Hex avoids
+    /// pushing the OwnerAddr bstr encoding across the JSON boundary.
+    #[serde(default)]
+    set_power_target: Option<String>,
+    #[serde(default)]
+    set_power_new_power: Option<u32>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VotingSignalTier2Args {
+    proposal_id: String,
+    support: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VotingGetTier2Args {
+    proposal_id: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GenerateInviteArgs {
@@ -587,6 +629,63 @@ pub fn build_registry() -> RpcRegistry {
         "list_community_members",
         CommunityIdArgs,
         |state, _sink, a| async move { crate::list_community_members_impl(state, a.community_id).await }
+    );
+    // tier-2 conviction voting (ZEB-720)
+    rpc!(
+        m,
+        "voting_create_tier2_proposal",
+        VotingCreateTier2Args,
+        |state, sink, a| async move {
+            let auto_exec = match (a.set_power_target, a.set_power_new_power) {
+                (Some(hex_target), Some(np)) => {
+                    let bytes: [u8; 16] = hex::decode(&hex_target)
+                        .map_err(|e| format!("invalid setPowerTarget hex: {e}"))?
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| {
+                            "setPowerTarget must be 16 bytes (32 hex chars)".to_string()
+                        })?;
+                    Some(
+                        crate::community_voting_conviction::AutoExecAction::SetPower {
+                            target_pubkey: crate::owner_state_types::OwnerAddr(bytes),
+                            new_power: np,
+                        },
+                    )
+                }
+                _ => None,
+            };
+            crate::voting_create_tier2_proposal_impl(
+                state,
+                sink,
+                a.community_id,
+                a.channel_id,
+                a.proposal_text,
+                a.half_life_seconds,
+                a.threshold_min,
+                a.threshold_max,
+                a.beta,
+                a.delegation_allowed,
+                auto_exec,
+                a.min_power,
+            )
+            .await
+        }
+    );
+    rpc!(
+        m,
+        "voting_signal_tier2",
+        VotingSignalTier2Args,
+        |state, sink, a| async move {
+            crate::voting_signal_tier2_impl(state, sink, a.proposal_id, a.support).await
+        }
+    );
+    rpc!(
+        m,
+        "voting_get_tier2_proposal",
+        VotingGetTier2Args,
+        |state, _sink, a| async move {
+            crate::voting_get_tier2_proposal_impl(state, a.proposal_id).await
+        }
     );
     rpc!(
         m,
@@ -2160,6 +2259,10 @@ mod tests {
             "initiate_admin_recovery",
             "cosign_admin_recovery",
             "veto_admin_recovery",
+            // tier-2 conviction voting (ZEB-720)
+            "voting_create_tier2_proposal",
+            "voting_signal_tier2",
+            "voting_get_tier2_proposal",
             // channels
             "create_channel",
             "list_channels",
