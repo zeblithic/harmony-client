@@ -42361,19 +42361,36 @@ mod clear_space_local_cache_tests {
         assert!(err.contains("not a community"), "{err}");
     }
 
+    /// Destructive-safety: a refused op (not-left) must NOT perform the delete —
+    /// the guard aborts before `cleanup_community_data`, so a planted dir
+    /// survives and the row is untouched.
     #[tokio::test]
-    async fn community_not_left_is_refused() {
+    #[serial]
+    async fn community_not_left_is_refused_and_dir_survives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let id = [1u8; 16];
+        let id_hex = hex::encode(id);
+        let dir = tmp
+            .path()
+            .join(".harmony")
+            .join("communities")
+            .join(&id_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+
         let mut os = OwnerState::default();
         os.spaces
-            .insert(SpaceId([1; 16]), space(1, SpaceKind::Community, false));
+            .insert(SpaceId(id), space(1, SpaceKind::Community, false)); // not left
         let node = node_with(os);
-        let err = clear_space_local_cache_impl(&node, hex::encode([1u8; 16]))
+
+        let err = clear_space_local_cache_impl(&node, id_hex)
             .await
             .unwrap_err();
         assert!(err.contains("has not been left"), "{err}");
+        assert!(dir.exists(), "a refused op must not delete the dir");
         let cs = node.lock().unwrap().crdt_state.clone().unwrap();
         assert!(
-            cs.lock().await.spaces.contains_key(&SpaceId([1; 16])),
+            cs.lock().await.spaces.contains_key(&SpaceId(id)),
             "row untouched"
         );
     }
@@ -42416,32 +42433,44 @@ mod clear_space_local_cache_tests {
         assert!(!g.tombstones.contains(&SpaceId(id)), "NO tombstone written");
     }
 
-    /// Idempotent: a call with the dir already absent is a clean Ok, row kept.
+    /// True post-delete idempotency: clear once (dir deleted), then clear again
+    /// (dir already gone) — the second call is a clean Ok and the row + `left_at`
+    /// still survive, so the community stays rejoinable.
     #[tokio::test]
     #[serial]
-    async fn clear_is_idempotent_when_dir_absent() {
+    async fn clear_then_reclear_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(tmp.path());
         let id = [7u8; 16];
         let id_hex = hex::encode(id);
+        let dir = tmp
+            .path()
+            .join(".harmony")
+            .join("communities")
+            .join(&id_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("crdt.cbor"), b"x").unwrap();
 
         let mut os = OwnerState::default();
         os.spaces
             .insert(SpaceId(id), space(7, SpaceKind::Community, true));
         let node = node_with(os);
 
-        // No dir on disk at all → first call is a no-op Ok.
+        // First clear deletes the dir.
         clear_space_local_cache_impl(&node, id_hex.clone())
             .await
             .unwrap();
-        // Second call likewise.
+        assert!(!dir.exists(), "first clear deleted the dir");
+        // Second clear (dir already gone) is a clean no-op Ok.
         clear_space_local_cache_impl(&node, id_hex).await.unwrap();
 
         let cs = node.lock().unwrap().crdt_state.clone().unwrap();
-        assert!(
-            cs.lock().await.spaces.contains_key(&SpaceId(id)),
-            "row still present"
-        );
+        let g = cs.lock().await;
+        let s = g
+            .spaces
+            .get(&SpaceId(id))
+            .expect("row still present after re-clear");
+        assert!(s.left_at.is_some(), "left_at still set (rejoinable)");
     }
 }
 
