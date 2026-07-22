@@ -107,6 +107,18 @@ pub enum ProposalKind {
     /// ChangeQuorum). Validity gate AT1 at verify_event. Materializes as
     /// `MaterializedMembership.power_thresholds`. Variant tag "t" (1-char,
     /// unused before this); inner field key "th" (2-char).
+    ///
+    /// FORWARD-INCOMPAT (upgrade-before-adopt): `ProposalKind` has no
+    /// `#[serde(other)]` fallback and the community-state blob decodes
+    /// all-or-nothing, so a client that predates this variant rejects the
+    /// ENTIRE state-root of any community that has emitted a ChangeThresholds
+    /// event — loudly (`wire_decode_failed`, replay tracker not advanced),
+    /// never silently diverging on an authorization decision. This is the same
+    /// intentional stale-client posture as Townhall channels / ZEB-349 Voice:
+    /// adopting a custom threshold makes that community undecodable to
+    /// un-upgraded peers until they upgrade. The loud refusal is deliberate — a
+    /// graceful skip-unknown-event would REINTRODUCE the silent cross-version
+    /// authorization divergence this design otherwise avoids.
     #[serde(rename = "t")]
     ChangeThresholds {
         #[serde(rename = "th")]
@@ -1841,10 +1853,18 @@ pub struct MaterializedMembership {
 
     /// ZEB-251: per-community power thresholds, materialized from
     /// AdminProposal{ChangeThresholds} events (Task 2). Default =
-    /// POWER_THRESHOLDS (Sub-C v1 hardcoded). Byte-compat with pre-ZEB-251
-    /// cached snapshots — the `default`/`skip_serializing_if` pair means a
-    /// never-customized community serializes no "pt" key and decodes to the
-    /// hardcoded defaults, exactly as before.
+    /// POWER_THRESHOLDS (Sub-C v1 hardcoded).
+    ///
+    /// This lives on the DERIVED, LOCAL-ONLY materialized view: it is never
+    /// gossiped or persisted (MaterializedMembership rides only `#[serde(skip)]`
+    /// fields on CommunityState; the event log is the source of truth and this
+    /// is re-folded from it on every load). So no peer ever ingests a `pt`
+    /// snapshot field — there is no stale-snapshot path that could hand a wrong
+    /// threshold to another client. The only cross-peer carrier of a threshold
+    /// change is the signed `ChangeThresholds` event itself (see its
+    /// forward-incompat note). The `default`/`skip_serializing_if` pair is
+    /// defensive byte-compat for the encode helpers (tests/conversion), keeping
+    /// a never-customized community's encoding identical to pre-ZEB-251.
     #[serde(
         rename = "pt",
         default = "default_power_thresholds",
