@@ -202,10 +202,6 @@ pub struct Tier3PollState {
     pub ratification_ballots: Vec<RatificationBallotPayload>,
     /// SHA-256 of signing_bytes of the kd=cl PollClose event, if applied.
     pub close_event_hash: Option<[u8; 32]>,
-    /// ZEB-316: HLC of the applied kd=cl close event. Replica-canonical
-    /// (the close is deterministic once minted), so engine-auto result mints
-    /// (pu- and se-mode kd=rs) anchor to it for bit-identical events.
-    pub close_hlc: Option<Hlc>,
     /// Set by kd=rs PollResult event (StarResult decoded from payload).
     pub result: Option<StarResult>,
     /// Phase 5 (Tier 3b) deliberation projection. Populated by `kd=ds`
@@ -253,7 +249,6 @@ impl std::fmt::Debug for Tier3PollState {
             .field("candidates", &self.candidates)
             .field("ratification_ballots", &self.ratification_ballots)
             .field("close_event_hash", &self.close_event_hash)
-            .field("close_hlc", &self.close_hlc)
             .field("result", &self.result)
             .field("deliberation", &self.deliberation)
             .field("last_hlc", &self.last_hlc)
@@ -422,7 +417,6 @@ impl Tier3PollState {
             candidates: Vec::new(),
             ratification_ballots: Vec::new(),
             close_event_hash: None,
-            close_hlc: None,
             result: None,
             deliberation: DeliberationState::default(),
             last_hlc: None,
@@ -1029,7 +1023,6 @@ impl Tier3PollState {
             PollEventKindCode::PollClose => {
                 let hash = sha256_of_signing_bytes(ev);
                 self.close_event_hash = Some(hash);
-                self.close_hlc = Some(ev.hlc.clone());
             }
 
             // kd=rs PollResult (Tier 3): decode StarResult from payload;
@@ -2249,25 +2242,6 @@ mod tests {
         // current_stage_at should now return Deliberation (within dw window).
         let stage = poll.current_stage_at(&hlc(500));
         assert_eq!(stage, Stage::Deliberation);
-    }
-
-    // ── Test 2b: apply kd=cl sets close_hlc from the event's HLC (ZEB-316) ────
-    // close_hlc anchors engine-auto result mints (kd=rs) to a replica-canonical
-    // HLC (Tasks 3/4 consume it); this test pins that apply populates it.
-
-    #[test]
-    fn apply_kd_cl_sets_close_hlc_from_event_hlc() {
-        let mut poll = new_poll(0);
-        let close_ev = make_event(PollEventKindCode::PollClose, 20_000, addr(0xff));
-        let close_hlc_in = close_ev.hlc.clone();
-        poll.apply_event(&close_ev).expect("apply cl");
-
-        assert_eq!(
-            poll.close_hlc,
-            Some(close_hlc_in),
-            "close_hlc must be set from the applied PollClose event's HLC"
-        );
-        assert!(poll.close_event_hash.is_some());
     }
 
     // ── Test 3: current_stage_at before sortition returns Sortition ───────────

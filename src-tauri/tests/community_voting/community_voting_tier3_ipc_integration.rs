@@ -982,8 +982,8 @@ async fn ipc_tier3_engine_auto_kd_sf_on_mass_decline() {
 /// other's broadcast).
 ///
 /// Runs the full scenario, asserts complete cross-engine convergence
-/// (identical stage, close_event_hash, StarResult, and the deterministic
-/// close_hlc), and returns the finalized `close_event_hash` so callers can
+/// (identical stage, byte-identical close_event_hash, and identical
+/// StarResult), and returns the finalized `close_event_hash` so callers can
 /// additionally assert determinism ACROSS runs (see the repeat test below).
 async fn run_race_tolerant_and_return_close_hash() -> Option<[u8; 32]> {
     const SORTITION_SIZE: u16 = 20;
@@ -1137,24 +1137,6 @@ async fn run_race_tolerant_and_return_close_hash() -> Option<[u8; 32]> {
     assert_eq!(
         result_a, result_b,
         "CONVERGENCE: bit-identical StarResult across both engines"
-    );
-
-    // ZEB-316: the engine-auto kd=cl HLC is deterministic — derived purely
-    // from the triggering kd=ss HLC, not wall-clock. Both replicas converge
-    // on the same close_hlc.
-    let expected_close_hlc = Hlc {
-        wall_ms: ss_hlc_wall,
-        logical: 1, // hlc_at(..) uses logical 0 → derived logical 1
-        device_id: format!("engine-auto-cl-{}", hex::encode(&poll_id.0[..4])),
-    };
-    assert_eq!(
-        t3_a.close_hlc.as_ref(),
-        Some(&expected_close_hlc),
-        "kd=cl HLC must be the deterministic derivation of the kd=ss trigger HLC"
-    );
-    assert_eq!(
-        t3_a.close_hlc, t3_b.close_hlc,
-        "both replicas converge on the same close_hlc"
     );
 
     drop(engines);
@@ -1554,9 +1536,10 @@ fn ipc_tier3_error_extraction_string_and_error() {
 //     via the INBOUND dispatch path and — only because ZEB-316 re-enabled
 //     `maybe_trigger_engine_auto_orchestration` there — its cascade tail runs
 //     `try_finalize_secret_tally`, minting kd=rs on a WALL-CLOCK HLC
-//     (`reserve_next_local_hlc`). se-mode does NOT anchor kd=rs on close_hlc:
-//     the kd=ts above already sit at a wall > close, so a close-anchored kd=rs
-//     would be non-monotonic and rejected by the apply-time gate (ZEB-316 C1).
+//     (`reserve_next_local_hlc`). se-mode does NOT anchor kd=rs on the close
+//     event's HLC: the kd=ts above already sit at a wall > close, so a
+//     close-anchored kd=rs would be non-monotonic and rejected by the
+//     apply-time gate (ZEB-316 C1).
 //   * engine_a then finalizes by applying engine_b's broadcast kd=rs.
 //
 // If the inbound hook were still disabled engine_b would store both shares but
@@ -1591,7 +1574,7 @@ fn build_se_committee(members: &[OwnerAddr], threshold: u16) -> SeCommittee {
         "committee members must be sorted ascending and distinct"
     );
     let n = members.len() as u16;
-    assert!(threshold >= 1 && threshold <= n);
+    assert!((1..=n).contains(&threshold));
     let coeffs: Vec<Scalar> = (0..threshold).map(|_| Scalar::random(&mut OsRng)).collect();
     let joint_y = RISTRETTO_BASEPOINT_POINT * coeffs[0];
     let mut shares = BTreeMap::new();
@@ -1797,7 +1780,7 @@ async fn ipc_tier3_engine_auto_se_mode_two_engine_finalize() {
 
     // Pre-build the shared setup events ONCE so both logs reach byte-identical
     // pre-finalize state: kd=ss (leave Sortition), real se ballots, kd=cl
-    // (seeds the deterministic close_hlc).
+    // (seeds close_event_hash).
     let ss_event = build_sortition_selection_event(
         &proposer,
         poll_id,

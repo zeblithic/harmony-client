@@ -1063,8 +1063,9 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
 
         if trigger_kd_cl {
             // ZEB-316: deterministic HLC derived from the triggering event's
-            // HLC so the minted kd=cl (and hence `close_hlc`, which anchors the
-            // downstream kd=rs mint) is replica-identical.
+            // HLC so the minted kd=cl is replica-identical — the kd=cl HLC is
+            // in `signing_bytes`, so a deterministic HLC yields a byte-identical
+            // `close_event_hash` across replicas (acceptance #1).
             //
             // I-1 scope: this is byte-identical across replicas only when the
             // SAME event first satisfies the trigger everywhere (the common
@@ -1122,10 +1123,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // slice, derive advancers via `drafting_advancers`, then sort via
         // `ratification_candidates_ordering`. This ensures bit-identical
         // tally inputs across all engines that ever drive this code path.
-        // ZEB-316: carry `close_hlc` (the applied kd=cl event's HLC, snapshotted
-        // under the same lock) out of the block so the kd=rs mint below can
-        // anchor its deterministic HLC on it after the lock is dropped.
-        let trigger_kd_rs_args: Option<(crate::community_voting_star::StarResult, Option<Hlc>)> = {
+        let trigger_kd_rs_result: Option<crate::community_voting_star::StarResult> = {
             let log = self.voting_log.lock().await;
             let state = match log.polls.get(pid) {
                 Some(s) => s,
@@ -1176,26 +1174,41 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 );
                 let ballots = crate::community_voting_tier3::collect_ratification_ballots(t3);
                 let result = crate::community_voting_star::tally_star(&ordered, ballots);
-                // ZEB-316: snapshot close_hlc under the lock alongside result.
-                Some((result, t3.close_hlc.clone()))
+                Some(result)
             }
         };
 
-        if let Some((result, close_hlc)) = trigger_kd_rs_args {
-            // ZEB-316: anchor the kd=rs mint on the poll's `close_hlc` (the
-            // applied kd=cl event's HLC) rather than a wall-clock reservation,
-            // so every replica derives a bit-identical kd=rs event_hash. If
-            // close_hlc is absent (no kd=cl applied), skip — the trigger gate
-            // above already requires close_event_hash.is_some(), so this is a
-            // defensive guard.
-            let Some(close_hlc) = close_hlc else {
-                tracing::debug!(
-                    poll_id = %hex::encode(pid.0),
-                    "engine-auto kd=rs: close_hlc absent; skip"
-                );
-                return;
-            };
-            let hlc = engine_auto_hlc_from_base(&close_hlc, pid, "rs");
+        if let Some(result) = trigger_kd_rs_result {
+            // ZEB-316 (qbug1 fix): pu-mode kd=rs mints on a WALL-CLOCK HLC
+            // (`reserve_next_local_hlc`), NOT a deterministic close-anchored HLC.
+            // This is the SAME revert already applied to se-mode kd=rs (see
+            // `try_finalize_secret_tally`).
+            //
+            // Monotonicity: kd=rs must be minted ABOVE the current receive
+            // watermark (`last_received_hlc`) or the apply-time monotonic gate
+            // (`community_voting_tier3.rs` → `HlcNotMonotonic`) rejects it. A
+            // close-anchored HLC — pinned forever to `(close.wall, close.logical+1)`
+            // — can stall BELOW that watermark because the kd=cl→kd=rs cascade is
+            // NOT serialized: the `voting_log` mutex is released per-apply, and the
+            // post-apply hook re-fires after release with real yields at
+            // `persist_now().await` (which holds the log lock across a
+            // `spawn_blocking`) and `publisher_tx.send().await`. On the
+            // multi-threaded runtime a concurrent IPC ballot-cast or backfill apply
+            // can slip a higher-HLC event in between kd=cl and kd=rs, advancing
+            // `last_received_hlc` past the close HLC. Because the close-anchored
+            // HLC is frozen, EVERY re-mint (and every byte-identical peer copy) is
+            // then rejected forever → the poll never finalizes via engine-auto on
+            // that replica (per-replica stall + cross-replica divergence). A
+            // freshly-reserved HLC is always ≥ the receive watermark, so it always
+            // applies. (kd=cl is immune: it re-anchors on the moving close
+            // watermark each hook re-fire, so it self-heals.)
+            //
+            // A deterministic HLC is unnecessary here anyway: the pu-mode RESULT
+            // converges bit-identically across replicas via the deterministic
+            // `StarResult` payload + the apply-time LWW/terminal-state gate that
+            // keeps the first finalizing kd=rs and drops the rest — identical to
+            // how se-mode converges.
+            let hlc = self.reserve_next_local_hlc().await;
             let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
                 &signing_key,
                 self_owner,
@@ -1607,13 +1620,13 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
 
         if let Some(result) = trigger_result {
             // ZEB-316 (C1 fix): se-mode kd=rs mints on a WALL-CLOCK HLC
-            // (`reserve_next_local_hlc`), NOT the deterministic close-anchored
-            // HLC used by pu-mode. This is a determinism-vs-monotonicity
-            // tension unique to secret mode: the committee kd=ts (tally-share)
-            // events land AFTER the close carrying per-replica wall-clock HLCs
-            // whose `wall > close_hlc.wall`, so a close-anchored kd=rs would be
-            // non-monotonic and rejected by the apply-time monotonic gate
-            // (`last_received_hlc`) → the poll would never finalize via
+            // (`reserve_next_local_hlc`), NOT a deterministic close-anchored HLC.
+            // kd=rs must be minted ABOVE the current receive watermark
+            // (`last_received_hlc`) or the apply-time monotonic gate rejects it.
+            // In secret mode the committee kd=ts (tally-share) events land AFTER
+            // the close carrying per-replica wall-clock HLCs whose wall exceeds
+            // the close event's wall, so a close-anchored kd=rs would be
+            // non-monotonic and rejected → the poll would never finalize via
             // engine-auto. No deterministic base is also ≥ every applied kd=ts,
             // because the shares are per-replica, not replica-identical.
             //
@@ -1621,9 +1634,9 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             // already converges bit-identically across replicas via Lagrange
             // invariance in `recover_secret_tally` (a canonical size-`threshold`
             // share subset) + the apply-time LWW/terminal-state gate that keeps
-            // the first finalizing kd=rs and drops the rest. (Pu-mode kd=rs
-            // correctly stays on the deterministic close_hlc: there kd=cl→kd=rs
-            // are minted back-to-back with nothing higher-wall between them.)
+            // the first finalizing kd=rs and drops the rest. (pu-mode kd=rs is
+            // wall-clock for the same monotonicity reason — see
+            // `maybe_trigger_engine_auto_orchestration`.)
             let hlc = self.reserve_next_local_hlc().await;
             let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
                 signing_key,
