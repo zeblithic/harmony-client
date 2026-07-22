@@ -1537,13 +1537,15 @@ fn ipc_tier3_error_extraction_string_and_error() {
     }
 }
 
-// ─── TEST 6: se-mode two-engine determinism (ZEB-316 payoff) ──────────────────
+// ─── TEST 6: se-mode two-engine result-convergence (ZEB-316 payoff) ───────────
 //
 // Proves the RE-ENABLED inbound orchestration hook drives secret-tally
-// finalization on a peer replica. The design is deliberately ASYMMETRIC so the
-// test is *load-bearing* for the inbound re-enable — a symmetric both-signing
-// setup would let engine_b lean on engine_a's broadcast kd=rs and pass even if
-// the hook were still disabled:
+// finalization on a peer replica in the REALISTIC production arrangement where
+// committee kd=ts (tally-share) events land AFTER the close carrying per-replica
+// wall-clock HLCs whose `wall > close.wall`. The design is deliberately
+// ASYMMETRIC so the test is *load-bearing* for the inbound re-enable — a
+// symmetric both-signing setup would let engine_b lean on engine_a's broadcast
+// kd=rs and pass even if the hook were still disabled:
 //
 //   * engine_a holds NO signing key — a pure relay that publishes the
 //     committee's kd=ts shares onto the bridge. Its own post-apply cascade
@@ -1551,14 +1553,24 @@ fn ipc_tier3_error_extraction_string_and_error() {
 //   * engine_b holds the proposer signing key. It receives the ≥t kd=ts shares
 //     via the INBOUND dispatch path and — only because ZEB-316 re-enabled
 //     `maybe_trigger_engine_auto_orchestration` there — its cascade tail runs
-//     `try_finalize_secret_tally`, deterministically minting kd=rs anchored on
-//     the poll's `close_hlc`.
+//     `try_finalize_secret_tally`, minting kd=rs on a WALL-CLOCK HLC
+//     (`reserve_next_local_hlc`). se-mode does NOT anchor kd=rs on close_hlc:
+//     the kd=ts above already sit at a wall > close, so a close-anchored kd=rs
+//     would be non-monotonic and rejected by the apply-time gate (ZEB-316 C1).
 //   * engine_a then finalizes by applying engine_b's broadcast kd=rs.
 //
 // If the inbound hook were still disabled engine_b would store both shares but
 // never finalize → no kd=rs → engine_a never finalizes → the waits below time
 // out. A green run confirms the re-enabled cascade (which subsumes the removed
 // standalone se-mode block) finalizes secret polls through inbound dispatch.
+//
+// RED→GREEN evidence (ZEB-316 C1 fix): with kd=ts.wall > close.wall (below),
+// this test FAILS against the pre-fix close-anchored se-mode kd=rs — engine_b
+// mints kd=rs at close.wall, the apply-time monotonic gate rejects it (an
+// applied kd=ts sits higher), engine_b never finalizes, the wait times out. It
+// PASSES once se-mode kd=rs reverts to a wall-clock HLC. The kd=rs *result*
+// (StarResult) still converges bit-identically across replicas via Lagrange
+// invariance + the apply-time LWW gate — which is what the assertions check.
 
 /// A `threshold`-of-`n` mock threshold-ElGamal committee over Ristretto255.
 /// `members` is sorted ascending by `OwnerAddr` so FROST identifier `i+1`
@@ -1707,6 +1719,13 @@ async fn ipc_tier3_engine_auto_se_mode_two_engine_finalize() {
     // ratification window [120_000, 180_000] ms with create at wall=0.
     const RATIFICATION_OPEN_MS: u64 = 120_000;
     const RATIFICATION_END_MS: u64 = 180_000;
+    // Committee kd=ts land AFTER the close carrying per-replica wall-clock HLCs
+    // — the normal production arrangement (kd=ts.wall > close.wall). This is the
+    // case the pre-C1-fix close-anchored se-mode kd=rs could NOT finalize
+    // (the deterministic kd=rs at close.wall is non-monotonic once a kd=ts at a
+    // higher wall has been applied). staggered per member to mirror per-replica
+    // wall-clock arrival.
+    const TS_WALL_BASE_MS: u64 = RATIFICATION_END_MS + 5_000; // 185_000 > close
     const N_TOTAL: usize = 3; // 2 explicit candidates + status_quo
     const N: usize = N_TOTAL;
 
@@ -1753,7 +1772,7 @@ async fn ipc_tier3_engine_auto_se_mode_two_engine_finalize() {
         },
         retry_of: None,
     };
-    // Create at wall=0 so ratification_end = 30_000.
+    // Create at wall=0 so ratification_end = 180_000.
     let create_event = build_tier3_poll_create_event(&proposer, &config, hlc_at(0, "proposer"));
     let poll_id = derive_poll_id(
         &COMMUNITY_ID,
@@ -1849,28 +1868,30 @@ async fn ipc_tier3_engine_auto_se_mode_two_engine_finalize() {
     // them (crossing the threshold in its own log, but never minting — no
     // signing key); the bridge forwards both to engine_b's inbound path.
     //
-    // HLC ORDERING (see report — ZEB-316 se-mode monotonicity caveat): the
-    // engine-auto se-mode kd=rs derives its HLC from `close_hlc`
-    // (`engine_auto_hlc_from_base(close_hlc, "rs")` → same wall, logical+1). The
-    // apply-time monotonic gate (`Tier3PollState::apply_event` /
+    // HLC ORDERING — the REALISTIC production case (ZEB-316 C1). Both kd=ts land
+    // at walls STRICTLY GREATER than the close (`TS_WALL_BASE_MS > close.wall`),
+    // staggered per member to mirror the per-replica wall-clock HLCs committee
+    // members actually stamp (kd=ts is minted well after the ratification close).
+    // The apply-time monotonic gate (`Tier3PollState::apply_event` /
     // `last_received_hlc`) rejects any event whose (wall, logical, device_id) is
-    // strictly below the last applied. Because a kd=rs anchored on `close_hlc`
-    // sits at `close_hlc.wall`, it is monotonically applicable ONLY when no
-    // already-applied kd=ts has a wall > `close_hlc.wall`. kd=ts must also carry
-    // `wall >= ratification_end`. The unique wall satisfying both is
-    // `close_hlc.wall == ratification_end == every kd=ts wall`, which is what we
-    // use here (events differentiated by logical/device). A realistic run where
-    // committee kd=ts land at a *later* wall than the close would leave the
-    // deterministic kd=rs non-monotonic and un-appliable — flagged as a Task 3
-    // follow-up, and orthogonal to this task's re-enable (the removed standalone
-    // block minted via the identical `try_finalize_secret_tally`).
+    // strictly below the last applied — so after these kd=ts apply, the poll's
+    // watermark sits above `close.wall`. A close-anchored se-mode kd=rs (the
+    // pre-C1-fix behavior) would therefore be non-monotonic and REJECTED, and
+    // engine_b would never finalize (the waits below would time out) — that is
+    // this test's RED. The fix mints se-mode kd=rs on a wall-clock HLC
+    // (`reserve_next_local_hlc`, real "now" ≫ these synthetic walls), which is
+    // monotonically applicable; both replicas then converge on the same terminal
+    // StarResult via Lagrange invariance + the apply-time LWW gate — GREEN.
     for member_idx in [0usize, 1] {
         let ts_payload = build_se_ts_payload(&committee, &ballots, member_idx, poll_id, N, 0);
         let ts_ev = build_signed_tally_share(
             &committee_ids[member_idx].signing_key,
             committee_ids[member_idx].owner,
             ts_payload,
-            hlc_at(RATIFICATION_END_MS, &format!("ts{member_idx}")),
+            hlc_at(
+                TS_WALL_BASE_MS + member_idx as u64 * 1_000,
+                &format!("ts{member_idx}"),
+            ),
         )
         .expect("build_signed_tally_share");
         engines
@@ -1921,20 +1942,15 @@ async fn ipc_tier3_engine_auto_se_mode_two_engine_finalize() {
     assert_eq!(t3_b.stage, Stage::Finalized);
     let result_a = t3_a.result.as_ref().expect("engine_a result");
     let result_b = t3_b.result.as_ref().expect("engine_b result");
+    // Result-convergence is the load-bearing invariant for se-mode: the kd=rs
+    // *result* (StarResult) is bit-identical across both engines via Lagrange
+    // invariance in `recover_secret_tally` + the apply-time LWW gate. The kd=rs
+    // *HLC* is intentionally NOT deterministic in se-mode (wall-clock mint —
+    // ZEB-316 C1), so we deliberately do NOT assert byte-identity of the kd=rs
+    // event / its HLC across engines; only the recovered result must converge.
     assert_eq!(
         result_a, result_b,
         "se-mode: bit-identical recovered StarResult across both engines"
-    );
-    // ZEB-316: the se-mode kd=rs anchors on the deterministic close_hlc; both
-    // replicas converge on it.
-    assert_eq!(
-        t3_a.close_hlc.as_ref(),
-        Some(&close_hlc),
-        "close_hlc must equal the seeded kd=cl HLC"
-    );
-    assert_eq!(
-        t3_a.close_hlc, t3_b.close_hlc,
-        "both replicas converge on the same close_hlc"
     );
 
     drop(engines);

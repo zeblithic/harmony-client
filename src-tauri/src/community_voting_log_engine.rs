@@ -1538,11 +1538,15 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// node would observe ≥t kd=ts events from peers but never finalize
     /// its own log → permanent divergence.
     ///
-    /// Determinism: `recover_secret_tally` deterministically picks a
+    /// Convergence: `recover_secret_tally` deterministically picks a
     /// canonical size-`threshold` subset of (i, x_i) shares (Lagrange
-    /// invariance) so all replicas that cross the threshold reconstruct
-    /// bit-identical kd=rs envelopes — late arrivals are silently
-    /// rejected by the apply-time terminal-state gate.
+    /// invariance) so every replica that crosses the threshold reconstructs
+    /// a bit-identical kd=rs *result* (StarResult payload). The kd=rs *HLC*
+    /// is a wall-clock reservation and therefore differs per replica (see
+    /// the mint site below for why se-mode cannot use a deterministic
+    /// close-anchored HLC); the apply-time LWW/terminal-state gate keeps the
+    /// first finalizing kd=rs and silently rejects the rest, so the polls
+    /// still converge on one terminal result.
     async fn try_finalize_secret_tally(
         self: &Arc<Self>,
         pid: &PollId,
@@ -1551,10 +1555,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     ) {
         // (1) Snapshot under lock, compute result, drop lock before
         // recursive publish_event.
-        // ZEB-316: carry `close_hlc` (the applied kd=cl event's HLC) out of the
-        // locked block so the se-mode kd=rs mint anchors its deterministic HLC
-        // on it after the lock is dropped.
-        let trigger_result: Option<(crate::community_voting_star::StarResult, Option<Hlc>)> = {
+        let trigger_result: Option<crate::community_voting_star::StarResult> = {
             let log = self.voting_log.lock().await;
             let state = match log.polls.get(pid) {
                 Some(s) => s,
@@ -1589,24 +1590,30 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 let ordered = crate::community_voting_tier3::ratification_candidates_ordering(
                     &advancers, sq_hash,
                 );
-                // ZEB-316: snapshot close_hlc under the lock alongside result.
                 crate::community_voting_tier3::recover_secret_tally(t3, &ordered)
-                    .map(|r| (r, t3.close_hlc.clone()))
             }
         };
 
-        if let Some((result, close_hlc)) = trigger_result {
-            // ZEB-316: anchor the se-mode kd=rs mint on the poll's `close_hlc`
-            // (the applied kd=cl event's HLC) so every replica that crosses the
-            // tally-share threshold derives a bit-identical kd=rs event_hash.
-            let Some(close_hlc) = close_hlc else {
-                tracing::debug!(
-                    poll_id = %hex::encode(pid.0),
-                    "engine-auto kd=rs (secret): close_hlc absent; skip"
-                );
-                return;
-            };
-            let hlc = engine_auto_hlc_from_base(&close_hlc, pid, "rs");
+        if let Some(result) = trigger_result {
+            // ZEB-316 (C1 fix): se-mode kd=rs mints on a WALL-CLOCK HLC
+            // (`reserve_next_local_hlc`), NOT the deterministic close-anchored
+            // HLC used by pu-mode. This is a determinism-vs-monotonicity
+            // tension unique to secret mode: the committee kd=ts (tally-share)
+            // events land AFTER the close carrying per-replica wall-clock HLCs
+            // whose `wall > close_hlc.wall`, so a close-anchored kd=rs would be
+            // non-monotonic and rejected by the apply-time monotonic gate
+            // (`last_received_hlc`) → the poll would never finalize via
+            // engine-auto. No deterministic base is also ≥ every applied kd=ts,
+            // because the shares are per-replica, not replica-identical.
+            //
+            // A deterministic HLC is unnecessary here anyway: the kd=rs RESULT
+            // already converges bit-identically across replicas via Lagrange
+            // invariance in `recover_secret_tally` (a canonical size-`threshold`
+            // share subset) + the apply-time LWW/terminal-state gate that keeps
+            // the first finalizing kd=rs and drops the rest. (Pu-mode kd=rs
+            // correctly stays on the deterministic close_hlc: there kd=cl→kd=rs
+            // are minted back-to-back with nothing higher-wall between them.)
+            let hlc = self.reserve_next_local_hlc().await;
             let rs_ev = match crate::community_voting_core::build_signed_poll_result_tier3(
                 signing_key,
                 self_owner,

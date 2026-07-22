@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make engine-auto Tier-3 mints (kd=cl, kd=rs pu+se, kd=sf) derive their HLC deterministically from replica-identical state so peer engines produce bit-identical events, then re-enable the orchestration hook on the inbound dispatch path.
+**Goal:** Make engine-auto Tier-3 mints (kd=cl, kd=rs **pu-mode**, kd=sf) derive their HLC deterministically from replica-identical state so peer engines produce bit-identical events, then re-enable the orchestration hook on the inbound dispatch path. **se-mode kd=rs is excluded** (C1 refinement — stays on wall-clock `reserve_next_local_hlc`; its result converges via Lagrange invariance + LWW, and a deterministic-monotonic base is unachievable — see Task 3 (e)).
 
-**Architecture:** A pure `engine_auto_hlc_from_base(base, pid, kind)` produces an HLC strictly-newer than `base` with a poll-derived device-id lane. Close/sortition-failed mints anchor to the *triggering event's* HLC (threaded from the caller); result mints anchor to a new `close_hlc` state field read from poll state. With identical signing key + actor + payload already guaranteed, an identical HLC makes the whole signed event byte-identical → trivial LWW.
+**Architecture:** A pure `engine_auto_hlc_from_base(base, pid, kind)` produces an HLC strictly-newer than `base` with a poll-derived device-id lane. Close/sortition-failed mints anchor to the *triggering event's* HLC (threaded from the caller); the **pu-mode** result mint anchors to a new `close_hlc` state field read from poll state. With identical signing key + actor + payload already guaranteed, an identical HLC makes the whole signed event byte-identical → trivial LWW. (se-mode kd=rs cannot use this: its committee kd=ts land after the close at per-replica walls above it, so a deterministic close-anchored kd=rs would be non-monotonic — it keeps wall-clock and relies on result-convergence + LWW.)
 
 **Tech Stack:** Rust (tokio async), `ed25519_dalek`, the harmony-client voting engine (`community_voting_log_engine.rs`, `community_voting_tier3.rs`, `community_voting_core.rs`).
 
@@ -190,7 +190,7 @@ git commit -m "ZEB-316: record close_hlc on Tier3PollState at PollClose apply"
 ## Task 3: Switch engine-auto mints to deterministic HLC + thread base (inbound still disabled)
 
 **Files:**
-- Modify: `src-tauri/src/community_voting_log_engine.rs` — `maybe_trigger_engine_auto_orchestration` signature + kd=sf/kd=cl/pu-kd=rs mints; `try_finalize_secret_tally` se-mode kd=rs mint; the local caller at ~:1831.
+- Modify: `src-tauri/src/community_voting_log_engine.rs` — `maybe_trigger_engine_auto_orchestration` signature + kd=sf/kd=cl/pu-kd=rs mints; the local caller at ~:1831. (`try_finalize_secret_tally` se-mode kd=rs stays on wall-clock — C1 refinement, see Task 3 (e).)
 - Test: `src-tauri/tests/community_voting/community_voting_tier3_ipc_integration.rs` — assert single-engine deterministic close_hlc.
 
 **Interfaces:**
@@ -252,7 +252,7 @@ In `community_voting_log_engine.rs`:
             let hlc = engine_auto_hlc_from_base(&close_hlc, pid, "rs");
 ```
 
-(e) `try_finalize_secret_tally` se-mode kd=rs mint (~:1566) — the function already locks and reads `t3` in its trigger-snapshot block; capture `let close_hlc = t3.close_hlc.clone();` there, then replace the mint's `reserve_next_local_hlc` with the same `Some(close_hlc) else { return }` + `engine_auto_hlc_from_base(&close_hlc, pid, "rs")` pattern.
+(e) `try_finalize_secret_tally` se-mode kd=rs mint (~:1566) — **EXCLUDED from deterministic HLC (C1 refinement); keep `let hlc = self.reserve_next_local_hlc().await;` (wall-clock), do NOT anchor on `close_hlc`.** A deterministic-monotonic base is unachievable: committee kd=ts land AFTER the close at per-replica walls `> close_hlc.wall` and aren't replica-identical, so a close-anchored kd=rs is non-monotonic and rejected by the apply-time gate → the poll never finalizes via engine-auto. Determinism is unneeded anyway — the kd=rs *result* converges bit-identically via Lagrange invariance in `recover_secret_tally` + the apply-time LWW gate. (This is the pre-ZEB-316 wall-clock behavior; leave it in place. `close_hlc` remains snapshotted/used only by pu-kd=rs.)
 
 (f) Local caller (~:1831) — thread the applied event's HLC:
 ```rust
@@ -331,9 +331,9 @@ async fn ipc_tier3_engine_auto_kd_cl_kd_rs_deterministic_repeat() {
 ```
 Refactor the body of `ipc_tier3_engine_auto_kd_cl_kd_rs_race_tolerant` into `run_race_tolerant_and_return_close_hash()` returning the finalized `close_event_hash`, and have the original test assert on it too (DRY).
 
-- [ ] **Step 4: Add an se-mode two-engine determinism test**
+- [ ] **Step 4: Add an se-mode two-engine result-convergence test** (C1 refinement)
 
-Model on the race-tolerant test but with `privacy_mode: "se"`, a threshold committee, both engines crossing the ≥t share threshold. Assert both engines finalize AND the finalized `result` is identical AND (the ZEB-316 upgrade) both `close_hlc` values match. If a suitable se-mode two-engine bridge fixture exists in this file, reuse it; otherwise extend `setup_two_voting_engine_bridge_with_both_signing`. Keep committee `t` small (e.g. 2) to bound cost.
+Model on the race-tolerant test but with `privacy_mode: "se"`, a threshold committee, both engines crossing the ≥t share threshold. Publish the committee kd=ts at walls **strictly greater than the close** (`kd=ts.wall > close.wall` — the realistic production arrangement) and assert both engines reach `Finalized` with an **identical recovered `StarResult`**. Do NOT assert the se-mode kd=rs `event_hash`/HLC or `close_hlc` is byte-identical across engines — se-mode kd=rs is intentionally wall-clock (non-deterministic HLC); convergence is on the *result* only, via Lagrange invariance + the LWW gate. This test is the C1 RED→GREEN evidence: it FAILS against the pre-fix close-anchored se-mode kd=rs (engine won't finalize — the close-anchored kd=rs is non-monotonic once a higher-wall kd=ts is applied) and PASSES after reverting se-mode kd=rs to wall-clock. Drive finalization through the re-enabled inbound cascade (engine_a as no-signing-key relay, engine_b mints). If a suitable se-mode two-engine bridge fixture exists in this file, reuse it; otherwise extend `setup_two_voting_engine_bridge`. Keep committee `t` small (e.g. 2) to bound cost.
 
 - [ ] **Step 5: Run the full voting integration suite**
 
@@ -356,7 +356,7 @@ git commit -m "ZEB-316: re-enable inbound engine-auto orchestration (determinist
 
 ## Self-Review Notes
 
-- **Spec coverage:** Task 1 = the helper; Task 2 = `close_hlc`; Task 3 = all four mint switches + base threading + local caller; Task 4 = inbound re-enable + the 3 acceptance criteria (bit-identical convergence, hook re-enabled, deterministic 100× pass). kd=ts explicitly untouched.
+- **Spec coverage:** Task 1 = the helper; Task 2 = `close_hlc`; Task 3 = **three** mint switches (kd=sf, kd=cl, pu-kd=rs) + base threading + local caller; Task 4 = inbound re-enable + the 3 acceptance criteria (bit-identical convergence, hook re-enabled, deterministic 100× pass). kd=ts and se-mode kd=rs (C1 refinement) explicitly untouched (stay on wall-clock).
 - **Determinism proof lives in Task 4** (two engines mint independently); Task 3's single-engine `close_hlc` assertion proves the derivation is wired at the mint site.
 - **Type consistency:** helper signature `engine_auto_hlc_from_base(&Hlc, &PollId, &str) -> Hlc` is stable across Tasks 1/3/4; `close_hlc: Option<Hlc>` stable across Tasks 2/3/4; hook signature `(…, base_hlc: &Hlc)` stable across Tasks 3/4.
 - **Open naming item** (from spec): `engine_auto_hlc_from_base` chosen over the ticket's `reserve_next_local_hlc_from_base` (no reservation happens). Flag in PR description.

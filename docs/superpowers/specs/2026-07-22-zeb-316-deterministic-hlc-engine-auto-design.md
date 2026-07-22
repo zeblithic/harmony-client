@@ -3,9 +3,10 @@
 **Status:** design (awaiting review)
 **Ticket:** ZEB-316 (umbrella ZEB-289 voting) · **Branch:** `zeb-316-deterministic-hlc-engine-auto`
 **Scope decision:** *Thorough* — deterministic HLC for every double-mintable engine-auto event
-reachable from the re-enabled inbound path (kd=cl, kd=rs pu-mode, kd=sf, kd=rs se-mode).
-kd=ts (per-committee-member, intentionally distinct) is explicitly left as-is.
-Single repo (harmony-client).
+reachable from the re-enabled inbound path where determinism is achievable: kd=cl, kd=rs pu-mode,
+kd=sf. kd=ts (per-committee-member, intentionally distinct) and **kd=rs se-mode** (C1 refinement —
+deterministic-monotonic base unachievable; result converges via Lagrange invariance + LWW, see §3)
+are explicitly left on `reserve_next_local_hlc`. Single repo (harmony-client).
 
 ## Problem
 
@@ -99,17 +100,28 @@ causal order and never collide at the LWW layer.
 | kd=sf (`:941`) | triggering event's `.hlc` | **threaded** from caller |
 | kd=cl (`:1057`) | triggering event's `.hlc` | **threaded** from caller |
 | kd=rs pu-mode (`:1161`) | close event's `.hlc` | `t3.close_hlc` (state) |
-| kd=rs se-mode (`:1566`, `try_finalize_secret_tally`) | close event's `.hlc` | `t3.close_hlc` (state) |
+| kd=rs se-mode (`:1566`, `try_finalize_secret_tally`) | **EXCLUDED** — wall-clock | `reserve_next_local_hlc` (unchanged) |
 
 **close/sortition-failed anchor to the trigger** (threaded), pinning them to the exact event that
 fired the hook — race-free even if another event applies between trigger-apply and mint under
 concurrent dispatch.
 
-**result events anchor to the close** because se-mode kd=rs's *real* trigger is "crossing the ≥t
-share threshold," which fires on a **different kd=ts per replica** and thus cannot be a base. The
-close (kd=cl) HLC is replica-canonical once kd=cl is deterministic, and is the natural causal
-parent of the result. Anchoring pu-kd=rs the same way is uniform and makes the recursive/outer
-kd=rs attempts (see §5) byte-identical duplicates rather than an HLC race.
+**pu-mode kd=rs anchors to the close** (`t3.close_hlc`). Its real trigger fires in the same cascade
+as the close: kd=cl → kd=rs are minted back-to-back with nothing higher-wall applied between them,
+so a close-anchored kd=rs stays monotonic. This makes the recursive/outer kd=rs attempts (see §5)
+byte-identical duplicates rather than an HLC race.
+
+**se-mode kd=rs is EXCLUDED from deterministic HLC** (C1 refinement — was originally slated to anchor
+on `close_hlc`; it stays on `reserve_next_local_hlc`). A deterministic-monotonic base is
+*unachievable* here: the committee kd=ts (tally-share) events that actually cross the ≥t threshold
+land AFTER the close carrying **per-replica wall-clock HLCs whose `wall > close_hlc.wall`**, and they
+are not replica-identical. A `close_hlc`-anchored kd=rs would therefore be non-monotonic and rejected
+by the apply-time gate (`last_received_hlc`), so the poll would never finalize via engine-auto; and
+no deterministic base is also ≥ every applied kd=ts. A deterministic HLC is unnecessary anyway: the
+kd=rs **result** already converges bit-identically across replicas via Lagrange invariance in
+`recover_secret_tally` (canonical size-`threshold` share subset) + the apply-time LWW gate, which
+keeps the first finalizing kd=rs and drops the rest — the pre-ZEB-316 wall-clock behavior, which is
+monotonic-safe.
 
 ### 4. New state field: `close_hlc`
 
@@ -127,9 +139,9 @@ is race-free.
       → `event.hlc` (already in scope, destructured `:2760`).
   - Inside: kd=cl and kd=sf use `engine_auto_hlc_from_base(base_hlc, …)`; pu-kd=rs reads
     `t3.close_hlc`. kd=sf remains its own trigger (Stage::Sortition, `proposer == self_owner`).
-- `try_finalize_secret_tally` (se-mode kd=rs) reads `t3.close_hlc` internally — **no base param
-  threaded** (its two call sites `:1212` orchestration-tail and `:2868` inbound stay as-is
-  signature-wise).
+- `try_finalize_secret_tally` (se-mode kd=rs) keeps **`reserve_next_local_hlc` (wall-clock)** — it is
+  EXCLUDED from deterministic HLC (§3, C1 refinement); no base param threaded (its call site in the
+  orchestration tail stays as-is signature-wise).
 - kd=ts (`maybe_emit_tally_share`, `:1466`) is **unchanged** — per-member shares are meant to be
   distinct; they must keep `reserve_next_local_hlc`.
 
@@ -155,9 +167,12 @@ LWW then has a single hash to select; `close_event_hash` and `result` converge b
 ## Blast radius
 
 All production `reserve_next_local_hlc` call sites are in `community_voting_log_engine.rs`:
-`:941` kd=sf, `:1057` kd=cl, `:1161` kd=rs(pu), `:1466` kd=ts (**keep**), `:1566` kd=rs(se). This
-change touches four of the five (all but kd=ts) plus: the hook signature + its two callers, the
-inbound re-enable, and the `close_hlc` field + its set-site. No call sites outside the engine file.
+`:941` kd=sf, `:1057` kd=cl, `:1161` kd=rs(pu), `:1466` kd=ts (**keep**), `:1566` kd=rs(se)
+(**keep** — C1 refinement; se-mode result convergence needs no deterministic HLC and a
+deterministic-monotonic base is unachievable, see §3). This change touches **three** of the five
+(kd=sf, kd=cl, pu-kd=rs; kd=ts and se-kd=rs stay on wall-clock) plus: the hook signature + its two
+callers, the inbound re-enable, and the `close_hlc` field + its set-site. No call sites outside the
+engine file.
 
 ## Testing
 
@@ -170,8 +185,11 @@ inbound re-enable, and the `close_hlc` field + its set-site. No call sites outsi
 3. **Unit test** `engine_auto_hlc_from_base`: (a) strictly-newer than base for representative
    inputs, (b) identical output for identical `(base, lane)`, (c) the `logical == u32::MAX`
    saturation guard bumps `wall_ms`.
-4. **se-mode**: a two-engine test that both cross the share threshold and assert the kd=rs
-   `event_hash` (not just the result) is identical across replicas.
+4. **se-mode** (C1 refinement): a two-engine test where both cross the share threshold with the
+   committee kd=ts at walls **strictly greater than the close** (the realistic production case), and
+   assert both engines reach `Finalized` with an identical recovered **`StarResult`**. Do NOT assert
+   the kd=rs `event_hash`/HLC is identical — se-mode kd=rs is intentionally wall-clock (non-
+   deterministic HLC); convergence is on the result only, via Lagrange invariance + the LWW gate.
 5. Full CI gates from `src-tauri/` (fmt, clippy `--all-targets`, nextest) before PR.
 
 ## Out of scope
