@@ -35855,6 +35855,10 @@ where
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            // ZEB-251: not part of the epoch snapshot; the hint is
+            // superseded by CRDT replay once events arrive, same as
+            // admin_quorum above.
+            power_thresholds: crate::community_membership::default_power_thresholds(),
             // ZEB-713: recovery state is not part of the epoch snapshot;
             // the hint is superseded by CRDT replay once events arrive.
             recovery_designates: None,
@@ -47359,6 +47363,7 @@ mod community_member_dto_tests {
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            power_thresholds: crate::community_membership::POWER_THRESHOLDS,
             recovery_designates: None,
             recovery_proposals: Vec::new(),
         };
@@ -47408,6 +47413,7 @@ mod community_member_dto_tests {
             pending_rotation_for: std::collections::BTreeSet::new(),
             pending_catchup_for: std::collections::BTreeSet::new(),
             admin_quorum: 1,
+            power_thresholds: crate::community_membership::POWER_THRESHOLDS,
             recovery_designates: None,
             recovery_proposals: Vec::new(),
         };

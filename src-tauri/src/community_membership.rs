@@ -1820,6 +1820,19 @@ pub struct MaterializedMembership {
     )]
     pub admin_quorum: u8,
 
+    /// ZEB-251: per-community power thresholds, materialized from
+    /// AdminProposal{ChangeThresholds} events (Task 2). Default =
+    /// POWER_THRESHOLDS (Sub-C v1 hardcoded). Byte-compat with pre-ZEB-251
+    /// cached snapshots — the `default`/`skip_serializing_if` pair means a
+    /// never-customized community serializes no "pt" key and decodes to the
+    /// hardcoded defaults, exactly as before.
+    #[serde(
+        rename = "pt",
+        default = "default_power_thresholds",
+        skip_serializing_if = "is_default_power_thresholds"
+    )]
+    pub power_thresholds: PowerThresholds,
+
     /// ZEB-713: recovery-designate configuration, set only via a
     /// quorum-approved `SetRecoveryDesignates` proposal. `None` =
     /// recovery disabled (pre-ZEB-713 behavior). Default-elided on the
@@ -1846,6 +1859,7 @@ impl Default for MaterializedMembership {
             pending_rotation_for: BTreeSet::new(),
             pending_catchup_for: BTreeSet::new(),
             admin_quorum: 1,
+            power_thresholds: POWER_THRESHOLDS,
             recovery_designates: None,
             recovery_proposals: Vec::new(),
         }
@@ -1858,6 +1872,14 @@ pub(crate) fn default_admin_quorum() -> u8 {
 
 pub(crate) fn is_default_admin_quorum(q: &u8) -> bool {
     *q == 1
+}
+
+pub(crate) fn default_power_thresholds() -> PowerThresholds {
+    POWER_THRESHOLDS
+}
+
+pub(crate) fn is_default_power_thresholds(t: &PowerThresholds) -> bool {
+    *t == POWER_THRESHOLDS
 }
 
 /// ZEB-713: materialized recovery-designate configuration, set only via
@@ -3107,7 +3129,8 @@ pub fn materialize_with_now(
                 // admin_addr in the None case.
                 let issuer_is_effective_member =
                     issuer_is_joined || (issuer_member_status.is_none() && issuer == admin_addr);
-                let is_admin = issuer_power >= POWER_THRESHOLDS.kick && issuer_is_effective_member;
+                let is_admin =
+                    issuer_power >= m.power_thresholds.kick && issuer_is_effective_member;
                 // Cooperative-leaver path: the leaver themselves may issue the
                 // rotation. After the Leave arm above, the leaver's status is
                 // Left (or Banned if banned — but verify_event rejects Leave
@@ -3214,7 +3237,8 @@ pub fn materialize_with_now(
                 let issuer_is_joined = matches!(issuer_member_status, Some(MemberStatus::Joined));
                 let issuer_is_effective_member =
                     issuer_is_joined || (issuer_member_status.is_none() && issuer == admin_addr);
-                let is_admin = issuer_power >= POWER_THRESHOLDS.kick && issuer_is_effective_member;
+                let is_admin =
+                    issuer_power >= m.power_thresholds.kick && issuer_is_effective_member;
                 if !is_admin {
                     continue;
                 }
@@ -3885,12 +3909,12 @@ pub struct VerifyContext {
 /// Power lookups treat unset entries as 0 (the default per the spec).
 /// Bootstrap (admin_addr → 100) is already baked into prior_state by
 /// `materialize`, so the lookup here is uniform across all actors.
-// allow: POWER_THRESHOLDS.invite is hardcoded 0 in v1, so `power < invite`
-// is always false for u8. The comparisons are structural placeholders for
-// ZEB-251 per-community threshold customization where invite_threshold > 0
-// will make them firable. Suppressing avoids the lint while keeping the
-// rule shape correct for the planned extension.
-#[allow(clippy::absurd_extreme_comparisons)]
+///
+/// ZEB-251: the invite-threshold comparisons below read
+/// `prior_state.power_thresholds.invite`, a runtime per-community value
+/// (default 0, customizable via a future ChangeThresholds proposal — Task
+/// 2) — no longer the hardcoded-0 constant, so `clippy::absurd_extreme_comparisons`
+/// no longer fires and the prior suppression has been removed.
 pub fn verify_event(
     event: &SignedMembershipEvent,
     prior_state: &MaterializedMembership,
@@ -4007,7 +4031,7 @@ pub fn verify_event(
             .get(&cs.signer)
             .copied()
             .unwrap_or(0);
-        if signer_power < POWER_THRESHOLDS.invite {
+        if signer_power < prior_state.power_thresholds.invite {
             return Err(VerifyError::CounterSigPowerInsufficient);
         }
     }
@@ -4133,7 +4157,7 @@ pub fn verify_event(
                     if !prior_state.members.contains_key(target) {
                         return Err(VerifyError::AdminProposalKindInvalid);
                     }
-                    if *level > POWER_THRESHOLDS.max {
+                    if *level > prior_state.power_thresholds.max {
                         return Err(VerifyError::AdminProposalKindInvalid);
                     }
                     // AP4: admin-affecting iff level == 100 OR target was admin.
@@ -4489,7 +4513,7 @@ pub fn verify_event(
             // Leave is always allowed for the actor themselves.
         }
         MembershipEventKind::Invite { target } => {
-            if actor_power < POWER_THRESHOLDS.invite {
+            if actor_power < prior_state.power_thresholds.invite {
                 return Err(VerifyError::ActorPowerInsufficient);
             }
             // Inviting a Banned target is a no-op in materialize
@@ -4503,7 +4527,7 @@ pub fn verify_event(
             }
         }
         MembershipEventKind::Kick { target, reason } => {
-            if actor_power < POWER_THRESHOLDS.kick {
+            if actor_power < prior_state.power_thresholds.kick {
                 return Err(VerifyError::ActorPowerInsufficient);
             }
             // Target must have a member record (Joined / Invited /
@@ -4533,10 +4557,10 @@ pub fn verify_event(
             }
         }
         MembershipEventKind::SetPower { target, level } => {
-            if actor_power < POWER_THRESHOLDS.set_power {
+            if actor_power < prior_state.power_thresholds.set_power {
                 return Err(VerifyError::ActorPowerInsufficient);
             }
-            if *level > POWER_THRESHOLDS.max {
+            if *level > prior_state.power_thresholds.max {
                 return Err(VerifyError::PowerLevelOutOfRange);
             }
             // ZEB-250 §4.5: direct SetPower of admin-affecting target
@@ -4551,7 +4575,7 @@ pub fn verify_event(
         }
         MembershipEventKind::Unban { target, reason } => {
             // Admin-tier: actor must have power >= set_power threshold (100).
-            if actor_power < POWER_THRESHOLDS.set_power {
+            if actor_power < prior_state.power_thresholds.set_power {
                 return Err(VerifyError::ActorPowerInsufficient);
             }
             // Target must have a member record. Use the Unban-specific
@@ -4581,7 +4605,7 @@ pub fn verify_event(
             // field, not here).
             kind: _,
         } => {
-            if actor_power < POWER_THRESHOLDS.kick {
+            if actor_power < prior_state.power_thresholds.kick {
                 return Err(VerifyError::ChannelAdminInsufficientPower);
             }
             // Validate name length (1-32 chars per spec §12.3).
@@ -4589,7 +4613,7 @@ pub fn verify_event(
                 return Err(VerifyError::ChannelNameInvalid);
             }
             // Validate write_power range.
-            if *write_power > POWER_THRESHOLDS.max {
+            if *write_power > prior_state.power_thresholds.max {
                 return Err(VerifyError::PowerLevelOutOfRange);
             }
             // Note: duplicate channel_id is NOT rejected here. Cross-blob
@@ -4605,7 +4629,7 @@ pub fn verify_event(
             name,
             write_power,
         } => {
-            if actor_power < POWER_THRESHOLDS.kick {
+            if actor_power < prior_state.power_thresholds.kick {
                 return Err(VerifyError::ChannelAdminInsufficientPower);
             }
             // Reject all-None ChannelModify — content-intrinsic, no
@@ -4622,7 +4646,7 @@ pub fn verify_event(
             }
             // Validate write_power range when Some — content-intrinsic.
             if let Some(wp) = write_power {
-                if *wp > POWER_THRESHOLDS.max {
+                if *wp > prior_state.power_thresholds.max {
                     return Err(VerifyError::PowerLevelOutOfRange);
                 }
             }
@@ -4640,7 +4664,7 @@ pub fn verify_event(
             // materialize safely no-ops on unknown.
         }
         MembershipEventKind::ChannelDelete { channel_id: _ } => {
-            if actor_power < POWER_THRESHOLDS.kick {
+            if actor_power < prior_state.power_thresholds.kick {
                 return Err(VerifyError::ChannelAdminInsufficientPower);
             }
             // Note: NO prior_state-dependent rejection on the receive
@@ -4682,7 +4706,7 @@ pub fn verify_event(
             let issuer_is_joined = matches!(issuer_member_status, Some(MemberStatus::Joined));
             let issuer_is_bootstrap_admin =
                 issuer_member_status.is_none() && event.actor == ctx.admin_addr;
-            let issuer_is_admin = issuer_power >= POWER_THRESHOLDS.kick
+            let issuer_is_admin = issuer_power >= prior_state.power_thresholds.kick
                 && (issuer_is_joined || issuer_is_bootstrap_admin);
             let issuer_is_member = prior_state.members.contains_key(&event.actor);
             if !issuer_is_admin && !issuer_is_member {
@@ -4704,7 +4728,7 @@ pub fn verify_event(
             let issuer_is_joined = matches!(issuer_member_status, Some(MemberStatus::Joined));
             let issuer_is_bootstrap_admin =
                 issuer_member_status.is_none() && event.actor == ctx.admin_addr;
-            let issuer_is_effective_admin = issuer_power >= POWER_THRESHOLDS.kick
+            let issuer_is_effective_admin = issuer_power >= prior_state.power_thresholds.kick
                 && (issuer_is_joined || issuer_is_bootstrap_admin);
             if !issuer_is_effective_admin {
                 return Err(VerifyError::EpochEventUnauthorized);
@@ -4723,7 +4747,7 @@ pub fn verify_event(
             // validation required: fork_space_id is a self-reported value
             // from the forker; receivers don't (and can't) verify the fork's
             // existence on the forker's device.
-            if actor_power < POWER_THRESHOLDS.invite {
+            if actor_power < prior_state.power_thresholds.invite {
                 return Err(VerifyError::ActorPowerInsufficient);
             }
             // ZEB-649: bound the reason at the CRDT layer (same
@@ -4754,7 +4778,7 @@ pub fn verify_event(
             if !is_joined_member(prior_state, &event.actor) {
                 return Err(VerifyError::JoinCountersignActorNotJoined);
             }
-            if actor_power < POWER_THRESHOLDS.invite {
+            if actor_power < prior_state.power_thresholds.invite {
                 return Err(VerifyError::JoinCountersignActorPowerInsufficient);
             }
         }
@@ -5256,11 +5280,15 @@ fn is_joined_member(state: &MaterializedMembership, addr: &OwnerAddr) -> bool {
 
 /// Per-community power thresholds. v1 hardcoded; per-community
 /// customization is deferred to ZEB-251.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PowerThresholds {
+    #[serde(rename = "iv")]
     pub invite: u8,
+    #[serde(rename = "kk")]
     pub kick: u8,
+    #[serde(rename = "sp")]
     pub set_power: u8,
+    #[serde(rename = "mx")]
     pub max: u8,
 }
 
@@ -9168,6 +9196,75 @@ mod tests {
             "decoded MemberState.enrolled_device_keys must be empty when `ek` was absent"
         );
         assert_eq!(back.status, MemberStatus::Joined);
+    }
+
+    /// ZEB-251 Task 1: `verify_event`'s Invite power check must read the
+    /// community's materialized `power_thresholds` field, not the global
+    /// `POWER_THRESHOLDS` const — proven by hand-raising the materialized
+    /// invite threshold and observing the SAME event flip from Ok to
+    /// `ActorPowerInsufficient`.
+    #[test]
+    fn verify_event_reads_invite_threshold_from_materialized_field() {
+        let community_id = SpaceId([0xc0; 16]);
+        let admin = mint_test_owner(0xa1);
+        let low = mint_test_owner(0xb2);
+
+        let mut prior = MaterializedMembership {
+            power_thresholds: POWER_THRESHOLDS,
+            ..Default::default()
+        };
+        prior.members.insert(
+            low.owner,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: BTreeSet::new(),
+                revoked_device_keys: BTreeSet::new(),
+            },
+        );
+        test_enroll_member(&mut prior, &low);
+        prior.power_levels.insert(low.owner, 10);
+
+        let target = OwnerAddr([0xd1; 16]);
+        let invite_payload = EventPayload {
+            id: [0xaa; 16],
+            community_id,
+            kind: MembershipEventKind::Invite { target },
+            actor: low.owner,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let ev = sign_event(&invite_payload, &low.device_key).expect("sign invite");
+
+        let ctx = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr: admin.owner,
+            is_invite_only: false,
+        };
+
+        // Baseline: invite=0 (default) → a power-10 invite verifies OK.
+        prior.power_thresholds = POWER_THRESHOLDS; // invite = 0
+        assert!(verify_event(&ev, &prior, &ctx).is_ok());
+
+        // Raise the community's invite threshold to 25 in the materialized
+        // state → the SAME event must now fail on insufficient power.
+        prior.power_thresholds = PowerThresholds {
+            invite: 25,
+            ..POWER_THRESHOLDS
+        };
+        let err = verify_event(&ev, &prior, &ctx).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::ActorPowerInsufficient),
+            "got {err:?}"
+        );
     }
 }
 
