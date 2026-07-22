@@ -21,7 +21,15 @@
 
   // Bidirectional sync: each slider + number pair shares the same $state.
 
-  let orderingOk = $derived(invite <= kick && kick <= setPower && setPower <= 100);
+  // ZEB-251: the number inputs let a user type negatives or decimals that
+  // satisfy the ordering check but fail at the u8 IPC boundary. Reject them
+  // here so submit only enables for whole numbers in [0, 100].
+  let allWholeInRange = $derived(
+    [invite, kick, setPower].every((v) => Number.isInteger(v) && v >= 0 && v <= 100)
+  );
+  let orderingOk = $derived(
+    allWholeInRange && invite <= kick && kick <= setPower && setPower <= 100
+  );
 
   // ZEB-250 R2 Fix 4: bind to <dialog> element so we can call showModal().
   // showModal() enables the browser's native focus trap and Escape-to-close
@@ -56,7 +64,7 @@
 
   async function propose() {
     if (!orderingOk) {
-      errorMessage = 'Require 0 ≤ invite ≤ kick ≤ set power ≤ 100.';
+      errorMessage = 'Thresholds must be whole numbers with 0 ≤ invite ≤ kick ≤ set power ≤ 100.';
       return;
     }
     submitting = true;

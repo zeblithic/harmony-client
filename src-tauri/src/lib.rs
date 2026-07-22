@@ -45295,11 +45295,14 @@ async fn propose_change_thresholds(
         max: 100,
     };
 
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    // Length-check BEFORE decoding — bound work on attacker-controlled input at
+    // the IPC boundary (repo convention, PR #530/#463/#313).
+    if community_id.len() != 32 {
+        return Err("community_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let mut id_bytes = [0u8; 16];
+    hex::decode_to_slice(&community_id, &mut id_bytes)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
     let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {

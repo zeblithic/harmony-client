@@ -452,13 +452,45 @@ describe('CommunitySettingsPanel', () => {
 
   it('clicking Change thresholds… opens ChangeThresholdsDialog with current thresholds', async () => {
     const { getByText, getByLabelText } = render(CommunitySettingsPanel, {
-      props: { ...baseProps, myPower: 100, thresholds: { invite: 10, kick: 40, setPower: 90 } },
+      props: {
+        ...baseProps,
+        myPower: 100,
+        thresholds: { invite: 10, kick: 40, setPower: 90 },
+        thresholdsLoaded: true,
+      },
     });
     await fireEvent.click(getByText('Change thresholds…'));
     expect(getByLabelText('Change power thresholds')).toBeTruthy();
     expect((getByLabelText('Invite threshold number') as HTMLInputElement).value).toBe('10');
     expect((getByLabelText('Kick threshold number') as HTMLInputElement).value).toBe('40');
     expect((getByLabelText('Set-power threshold number') as HTMLInputElement).value).toBe('90');
+  });
+
+  it('Change thresholds… button is disabled until governance thresholds load (ZEB-251)', () => {
+    // Guards against proposing a change built from the fallback-default snapshot
+    // before getCommunityGovernance resolves (would revert un-edited fields).
+    const { getByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, myPower: 100 /* thresholdsLoaded defaults false */ },
+    });
+    expect((getByText('Change thresholds…') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('admin gates key off the FIXED power-100 tier, not a lowered set_power (ZEB-251)', () => {
+    // A community that lowers set_power to 50 must NOT show admin governance to
+    // a power-60 member: the backend still authorizes admin actions on power
+    // == 100, so admin-identity UI must track the fixed tier, not set_power.
+    const { queryByText } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        myPower: 60,
+        myAddress: plainMember.address,
+        thresholds: { invite: 0, kick: 50, setPower: 50 },
+        thresholdsLoaded: true,
+      },
+    });
+    expect(queryByText('Admin governance')).toBeNull();
+    expect(queryByText('Change quorum…')).toBeNull();
+    expect(queryByText('Change thresholds…')).toBeNull();
   });
 
   it('per-community invite threshold overrides the POWER_THRESHOLDS default (ZEB-251)', () => {

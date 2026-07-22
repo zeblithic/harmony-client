@@ -86,6 +86,32 @@ describe('ChangeThresholdsDialog', () => {
     expect(btn).not.toBeDisabled();
   });
 
+  it('propose_button_disabled_for_fractional_or_negative_values', async () => {
+    // A u8 IPC boundary can't take -1 or 2.5; the dialog must reject them
+    // rather than enable submit and fail server-side (ZEB-251 / Qodo).
+    render(ChangeThresholdsDialog, {
+      props: {
+        communityId: 'c-x',
+        currentThresholds: { invite: 0, kick: 50, setPower: 100 },
+        onClose: vi.fn(),
+      },
+    });
+    const btn = screen.getByRole('button', { name: /Propose/i });
+    const inviteNumber = screen.getByLabelText('Invite threshold number') as HTMLInputElement;
+
+    // Fractional → disabled (ordering alone would have accepted 2.5 ≤ 50 ≤ 100).
+    await fireEvent.input(inviteNumber, { target: { value: '2.5' } });
+    expect(btn).toBeDisabled();
+
+    // Negative → disabled.
+    await fireEvent.input(inviteNumber, { target: { value: '-1' } });
+    expect(btn).toBeDisabled();
+
+    // Whole number in range → enabled.
+    await fireEvent.input(inviteNumber, { target: { value: '10' } });
+    expect(btn).not.toBeDisabled();
+  });
+
   it('cancel_button_does_not_close_while_submitting', async () => {
     const { invoke } = await import('@tauri-apps/api/core');
     const mockInvoke = invoke as ReturnType<typeof vi.fn>;

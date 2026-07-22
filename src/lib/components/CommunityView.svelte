@@ -565,6 +565,7 @@
     {sharedInProfile}
     adminQuorum={governance?.adminQuorum ?? 1}
     {thresholds}
+    thresholdsLoaded={governance != null}
     {onToggleSharedInProfile}
     onClose={() => { settingsModalOpen = false; }}
     onKick={onKickMember}
