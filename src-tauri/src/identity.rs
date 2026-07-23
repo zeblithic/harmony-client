@@ -3617,11 +3617,16 @@ mod tests {
         rx_started
             .recv_timeout(Duration::from_secs(30))
             .expect("writer thread must start");
-        // It MUST NOT complete while we hold the lock. Short window on purpose:
-        // a blocked thread provably can't finish regardless of machine load, so
-        // this is robust; a broken lock would let the tiny write finish in ~ms.
+        // It MUST NOT complete while we hold the lock. The window has to clear
+        // the real work-time of an *unblocked* writer so a silently-dropped lock
+        // is actually caught: this write runs a real Argon2id KDF (m=64MiB, t=3)
+        // that is ~100-300ms, so a 200ms window could let a broken lock's write
+        // still miss the deadline and pass by coincidence (CodeRabbit). 1s sits
+        // well above the KDF cost yet far under the completion budget below; a
+        // correctly-held lock keeps the writer blocked the whole window
+        // regardless of machine load, so this stays robust in both directions.
         assert!(
-            rx_done.recv_timeout(Duration::from_millis(200)).is_err(),
+            rx_done.recv_timeout(Duration::from_millis(1000)).is_err(),
             "a concurrent encrypted-file writer must block while IDENTITY_FILE_WRITE_LOCK is held"
         );
 

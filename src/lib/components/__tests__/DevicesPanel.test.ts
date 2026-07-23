@@ -725,6 +725,38 @@ describe('DevicesPanel — ZEB-196 revoke unconsumed token on cancel', () => {
     );
     expect(revokeCalls.length).toBe(0);
   });
+
+  it('revokes a token that resolves AFTER the modal was cancelled (in-flight guard)', async () => {
+    // ZEB-196 (Qodo): if the user cancels while issueRecoveryToken() is still
+    // pending, closeBackup can't revoke a token it doesn't hold yet. The
+    // generation guard must revoke the token when it finally arrives, and must
+    // not populate recoveryToken while the modal is closed.
+    mockedInvoke.mockResolvedValueOnce(populatedOwner); // mount refresh
+    // openBackup's issue: a promise we resolve only AFTER cancel.
+    let resolveIssue!: (v: { recoveryToken: string }) => void;
+    const issuePromise = new Promise<{ recoveryToken: string }>((r) => {
+      resolveIssue = r;
+    });
+    mockedInvoke.mockReturnValueOnce(issuePromise); // issue_owner_recovery_token (pending)
+    mockedInvoke.mockResolvedValueOnce(undefined); // revoke_owner_recovery_token
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn); // openBackup → issue starts, stays pending
+    // Cancel BEFORE the token resolves — closeBackup bumps the generation.
+    const cancelBtn = await screen.findByRole('button', { name: /cancel/i });
+    await fireEvent.click(cancelBtn);
+
+    // The token now arrives: it must be revoked (stale generation), not stored.
+    resolveIssue({ recoveryToken: 'late-tok' });
+    await waitFor(() => {
+      const revokeCalls = mockedInvoke.mock.calls.filter(
+        (c) => c[0] === 'revoke_owner_recovery_token',
+      );
+      expect(revokeCalls.length).toBe(1);
+      expect(revokeCalls[0][1]).toEqual({ recoveryToken: 'late-tok' });
+    });
+  });
 });
 
 describe('DevicesPanel — comment byte-cap validates trimmed value', () => {
