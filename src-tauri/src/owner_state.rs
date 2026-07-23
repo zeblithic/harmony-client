@@ -1723,11 +1723,16 @@ mod persistence_tests {
             let _ = tx_b.send(r);
         });
 
+        // Generous budgets: these only turn a true (infinite) deadlock into a
+        // clean failure. Each writer does real Argon2id KDF encrypted-file
+        // writes that are seconds-slow and highly variable under loaded CI (a
+        // 4-vCPU runner executing the full suite), so the bound must be >> that
+        // legit work-time — a tight bound false-fires without any deadlock.
         let ra = rx_a
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(60))
             .expect("thread A (OWNER⊃IDENTITY) must complete — no deadlock");
         let rb = rx_b
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(60))
             .expect("thread B (IDENTITY) must complete — no deadlock");
         assert!(ra.is_ok(), "save_owner_state_atomic must succeed: {ra:?}");
         assert!(

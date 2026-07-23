@@ -3615,18 +3615,24 @@ mod tests {
 
         // The writer thread is alive and (about to be) blocked on lock-acquire.
         rx_started
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(30))
             .expect("writer thread must start");
-        // It MUST NOT complete while we hold the lock.
+        // It MUST NOT complete while we hold the lock. Short window on purpose:
+        // a blocked thread provably can't finish regardless of machine load, so
+        // this is robust; a broken lock would let the tiny write finish in ~ms.
         assert!(
             rx_done.recv_timeout(Duration::from_millis(200)).is_err(),
             "a concurrent encrypted-file writer must block while IDENTITY_FILE_WRITE_LOCK is held"
         );
 
-        // Release the lock; the writer now proceeds and completes.
+        // Release the lock; the writer now proceeds and completes. Generous
+        // budget: this only converts a true (infinite) hang into a clean
+        // failure, and the write does a real Argon2id KDF that is seconds-slow
+        // and highly variable under loaded CI — so the bound must be >> that
+        // legit work-time, not a tight perf assertion.
         drop(guard);
         let result = rx_done
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(60))
             .expect("writer must finish once the lock is released");
         assert!(
             result.is_ok(),
