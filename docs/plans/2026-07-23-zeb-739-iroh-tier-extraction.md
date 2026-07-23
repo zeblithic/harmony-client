@@ -369,12 +369,12 @@ Then open PR `zeblithic/harmony` with the body from a drafted PR-body file; trig
 
 Run: `cargo fmt --all -- --check`
 Run: `cargo clippy --locked --all-targets --features test-fixtures -- -D warnings`
-Run the transport-focused tests via `scripts/test-select --context task` (endpoint, tunnel round-trip, simultaneous-dial collision, framing).
+Run the transport-focused tests. NOTE: Step 1 bumped the pins + added two crate deps — a dependency-graph change, after which `scripts/test-select` deliberately refuses (its module map is unreliable once `Cargo.toml`/`Cargo.lock` move; per the repo guideline, dep-graph changes require full selection, not the iterative/module-mapped selector). So for the scoped iteration use an explicit filter that does NOT rely on module mapping: `cargo nextest run --locked -p harmony-app --lib --features test-fixtures -E 'test(tunnel) + test(iroh_endpoint) + test(dm_transport) + test(dm_outbox)'` (endpoint, tunnel round-trip, simultaneous-dial collision, framing, DM transport). The full sweep is Step 7.
 Expected: fmt clean, clippy clean, targeted transport tests green (the preservation anchor).
 
 - [ ] **Step 6: Commit.** `git commit -am "iroh_endpoint/tunnel: delegate to harmony-iroh + harmony-tunnel-iroh; bump pins to R (ZEB-739)"`
 
-- [ ] **Step 7: Full client gate + open PR.** Run the full suite once (`scripts/test-select --context round` or the full nextest) as the final gate; push `zeb-739-delegate-iroh-tier`; open the client PR (body notes "Closes ZEB-739"); converge Qodo (auto) + CI (3-shard + gate roll-up); CodeRabbit only if un-throttled. Hand to Jake to merge. **Do NOT auto-merge.**
+- [ ] **Step 7: Full client gate + open PR.** Run the full sweep as the final gate — because Step 1 changed the dependency graph, use the CI-parity full form `scripts/test-select --full` (NOT `--context round`, the iterative/module-mapped selector, which refuses after a dep-graph change) or the equivalent `cargo nextest run --locked --workspace --all-targets --features test-fixtures`. In practice CI's 3-shard `rust-test` is the authoritative full-suite gate (faster wall-clock than the ~50-min local single-machine run), so the local final gate can be the full lib suite (`cargo nextest run --locked -p harmony-app --lib --features test-fixtures`) with the integration tests covered by CI. Push `zeb-739-delegate-iroh-tier`; open the client PR (body notes "Closes ZEB-739"); converge Qodo (auto) + CI (3-shard + gate roll-up); CodeRabbit only if un-throttled. Hand to Jake to merge. **Do NOT auto-merge.**
 
 ---
 
