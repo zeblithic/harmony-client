@@ -58,6 +58,14 @@ pub struct TickStats {
     /// returned `Err`). Each Tier 2 finalization with a SetPower auto-
     /// exec increments exactly one of these four on every replica.
     pub tier2_auto_execs_skipped_not_admin: u32,
+    /// ZEB-734: number of `AutoExecAction::SetPower` dispatches skipped because
+    /// the local actor clears the (possibly lowered) `set_power` threshold but
+    /// lacks admin power (`max`) and the change is admin-affecting — a direct
+    /// SetPower would self-reject and AdminProposal is unavailable (AP2). The
+    /// replica defers to an admin. Tracked separately from
+    /// `tier2_auto_execs_skipped_not_admin` (which counts actors below the
+    /// `set_power` floor) so the two deferral reasons stay distinguishable.
+    pub tier2_auto_execs_skipped_admin_affecting_requires_admin: u32,
     /// ZEB-300: number of `AutoExecAction::SetPower` dispatches on an
     /// admin-affecting change under `admin_quorum > 1` where this replica
     /// minted a fresh `AdminProposal::SetPower` (no prior live proposal for
@@ -445,6 +453,17 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
                     // propagates here via the existing membership log sync.
                     stats.tier2_auto_execs_attempted += 1;
                     stats.tier2_auto_execs_skipped_not_admin += 1;
+                }
+                Ok(
+                    crate::community_membership::AutoExecOutcome::SkippedAdminAffectingRequiresAdmin,
+                ) => {
+                    // ZEB-734: local actor clears the (possibly lowered)
+                    // set_power threshold but lacks admin power; an
+                    // admin-affecting SetPower can only be executed directly by
+                    // an admin (and AdminProposal needs proposer power == max),
+                    // so this replica defers to an admin replica.
+                    stats.tier2_auto_execs_attempted += 1;
+                    stats.tier2_auto_execs_skipped_admin_affecting_requires_admin += 1;
                 }
                 Ok(crate::community_membership::AutoExecOutcome::RoutedProposalMinted) => {
                     // ZEB-300: admin_quorum > 1 + admin-affecting; this
@@ -1152,6 +1171,68 @@ mod tests {
         assert_eq!(
             stats.tier2_auto_execs_skipped_not_admin, 1,
             "skip path must bump the dedicated skip counter exactly once"
+        );
+    }
+
+    /// ZEB-734: when the auto-exec callback returns
+    /// `SkippedAdminAffectingRequiresAdmin` (the local actor clears the
+    /// possibly-lowered `set_power` threshold but lacks admin power for an
+    /// admin-affecting change), the tick must bump the dedicated
+    /// `tier2_auto_execs_skipped_admin_affecting_requires_admin` counter — NOT
+    /// `skipped_not_admin` (the below-`set_power`-floor case) or `succeeded`.
+    /// Keeps the two deferral reasons distinguishable in telemetry.
+    #[tokio::test]
+    async fn community_voting_tick_tier2_auto_exec_set_power_skipped_admin_affecting_requires_admin(
+    ) {
+        let cid = SpaceId([0x55; 16]);
+        let pid = PollId([0x66; 32]);
+        let target = OwnerAddr([0xcc; 16]);
+        let new_power = 100; // admin-affecting (promotion to admin)
+        let cfg = make_tier2_config(AutoExecAction::SetPower {
+            target_pubkey: target,
+            new_power,
+        });
+        let mut t2 = Tier2ProposalState::new(cfg, 1);
+        use crate::community_voting_conviction::VoterConvictionState;
+        let mut vs = VoterConvictionState::default();
+        vs.apply_signal(true, 0, 0, 86_400_000);
+        t2.per_voter.insert(OwnerAddr([0xbb; 16]), vs);
+        let reached_at = 1_000i128;
+        t2.threshold_reached_at_ms = Some(reached_at);
+
+        let mut log = VotingLog::new();
+        log.polls.insert(
+            pid,
+            make_tier2_poll(cid, pid, Lifecycle::ThresholdReached, t2),
+        );
+
+        let mut logs = HashMap::new();
+        logs.insert(cid, Arc::new(Mutex::new(log)));
+        let now_ms = reached_at + 25 * 60 * 60 * 1000;
+        let (mut ctx, _events, _auto_exec_calls) = make_ctx_with_logs(logs, now_ms);
+
+        // Simulate a sub-admin moderator replica: clears set_power but lacks
+        // admin power for an admin-affecting change → defers to an admin race.
+        ctx.auto_exec_set_power = Arc::new(|_cid, _target, _power| {
+            Box::pin(async {
+                Ok(crate::community_membership::AutoExecOutcome::SkippedAdminAffectingRequiresAdmin)
+            })
+        });
+
+        let stats = run_voting_tick(&ctx, now_ms).await.unwrap();
+        assert_eq!(stats.tier2_proposals_finalized, 1);
+        assert_eq!(stats.tier2_auto_execs_attempted, 1);
+        assert_eq!(
+            stats.tier2_auto_execs_succeeded, 0,
+            "deferral must NOT bump the success counter"
+        );
+        assert_eq!(
+            stats.tier2_auto_execs_skipped_not_admin, 0,
+            "ZEB-734 deferral must NOT be conflated with the below-set_power skip"
+        );
+        assert_eq!(
+            stats.tier2_auto_execs_skipped_admin_affecting_requires_admin, 1,
+            "ZEB-734 deferral must bump its dedicated counter exactly once"
         );
     }
 
