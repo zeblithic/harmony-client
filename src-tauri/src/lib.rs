@@ -41886,25 +41886,34 @@ async fn fence_remove_space_flush(
 /// (Cursor). Best-effort: a failure warns — the owner-state tombstone already
 /// blocks resurrection. The no-registry fallback (owner loaded but node not
 /// started, so no live engines) is a plain filesystem delete.
+///
+/// ZEB-732: `gen_check` is the node-generation re-check invoked at the LAST
+/// safe moment before the destructive delete — after `stop_engine().await` on
+/// the registry path, and before the plain `remove_dir_all` on the no-registry
+/// path. A mismatch aborts the delete (a concurrent stop/start installed a
+/// fresh live community for this id). Callers with no generation to guard pass
+/// `|| Ok(())`.
 async fn cleanup_community_data(
     community_registry: &Option<std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>>,
     space_id: &crate::owner_state_types::SpaceId,
     id_hex: &str,
+    gen_check: impl FnOnce() -> Result<(), String> + Send,
 ) {
     match community_registry {
         Some(registry) => {
             if let Err(e) = registry
-                .shutdown_engine_and_cleanup_persistence(space_id)
+                .shutdown_engine_and_cleanup_persistence(space_id, gen_check)
                 .await
             {
                 tracing::warn!(
                     space_id = %id_hex, error = %e,
-                    "remove_space: stop-engine + cleanup-persistence failed; the \
-                     community dir may persist (the tombstone still blocks resurrection)"
+                    "remove_space: stop-engine + cleanup-persistence failed or was \
+                     aborted; the community dir may persist (the tombstone still \
+                     blocks resurrection)"
                 );
             }
         }
-        None => delete_community_dir(id_hex),
+        None => delete_community_dir(id_hex, gen_check),
     }
 }
 
@@ -41936,7 +41945,15 @@ async fn cleanup_community_data_if_durable(
     // so a concurrent stop/start_node in that gap would leave these snapshot
     // handles detached while the LIVE node has a fresh engine + active community
     // for this id — deleting its dir would be data loss. Abort instead.
-    {
+    //
+    // ZEB-732: build the check ONCE and use it twice. The early `gen_check()?`
+    // preserves the existing surface — an already-visible generation change
+    // aborts before we touch the engine/disk and surfaces to the caller (→
+    // retry on the current node). The SAME closure is threaded into
+    // `cleanup_community_data`, where it re-fires at the LAST safe moment
+    // (after `stop_engine().await`, right before `remove_dir_all`) to close the
+    // sub-second TOCTOU window the engine teardown opens.
+    let gen_check = move || -> Result<(), String> {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -41947,8 +41964,10 @@ async fn cleanup_community_data_if_durable(
                 g.generation
             ));
         }
-    }
-    cleanup_community_data(community_registry, space_id, id_hex).await;
+        Ok(())
+    };
+    gen_check()?;
+    cleanup_community_data(community_registry, space_id, id_hex, gen_check).await;
     Ok(())
 }
 
@@ -41957,7 +41976,18 @@ async fn cleanup_community_data_if_durable(
 /// [`cleanup_community_data`]. The owner-state tombstone already blocks any
 /// re-invite (`apply_space` rejects tombstoned ids), so a failed unlink only
 /// leaves bytes the tombstone makes unreachable (warn, don't err).
-fn delete_community_dir(id_hex: &str) {
+fn delete_community_dir(id_hex: &str, gen_check: impl FnOnce() -> Result<(), String>) {
+    // ZEB-732: guard the no-registry delete too. Its window is smaller (no
+    // `stop_engine().await` precedes it), but a concurrent `start_node`
+    // between the caller's generation snapshot and here could still install a
+    // fresh dir for this id — abort rather than delete it.
+    if let Err(reason) = gen_check() {
+        tracing::warn!(
+            space_id = %id_hex, reason = %reason,
+            "remove_space: node generation changed; skipped no-registry community-dir delete"
+        );
+        return;
+    }
     let dir = match crate::owner_commands::resolve_identity_dir() {
         Ok(d) => d.join("communities").join(id_hex),
         Err(e) => {
@@ -42259,8 +42289,11 @@ pub(crate) async fn clear_space_local_cache_impl(
     remove_space_community_guard(self_status)?;
 
     // Reclaim disk. NO tombstone, `left_at` untouched → still rejoinable.
+    // ZEB-732: early out here, AND thread the same check into
+    // `cleanup_community_data` so it re-fires after `stop_engine().await`,
+    // immediately before `remove_dir_all` — closing the TOCTOU window.
     check_generation()?;
-    cleanup_community_data(&community_registry, &space_id, &id_hex).await;
+    cleanup_community_data(&community_registry, &space_id, &id_hex, check_generation).await;
     Ok(())
 }
 
@@ -42686,8 +42719,41 @@ mod remove_space_tests {
         let no_registry: Option<
             std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
         > = None;
-        cleanup_community_data(&no_registry, &SpaceId(id), &id_hex).await;
+        cleanup_community_data(&no_registry, &SpaceId(id), &id_hex, || Ok(())).await;
         assert!(!dir.exists(), "community dir deleted via fs fallback");
+    }
+
+    // ZEB-732: the no-registry fs-fallback delete must ALSO honor the
+    // generation re-check — a `gen_check` that reports a changed generation
+    // aborts the delete and leaves the dir intact (a concurrent start_node may
+    // have installed a fresh community for this id).
+    #[tokio::test]
+    #[serial]
+    async fn cleanup_community_data_fs_fallback_aborts_on_gen_check_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let id = [7u8; 16];
+        let id_hex = hex::encode(id);
+        let dir = tmp
+            .path()
+            .join(".harmony")
+            .join("communities")
+            .join(&id_hex);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("crdt.cbor"), b"x").unwrap();
+
+        let no_registry: Option<
+            std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+        > = None;
+        // gen_check reports a mismatch → the delete must be skipped.
+        cleanup_community_data(&no_registry, &SpaceId(id), &id_hex, || {
+            Err("node generation changed during remove_space".to_string())
+        })
+        .await;
+        assert!(
+            dir.exists(),
+            "community dir must survive when gen_check aborts the fs-fallback delete"
+        );
     }
 
     #[tokio::test]
@@ -44070,16 +44136,20 @@ pub(crate) async fn list_pending_joins_impl(
         ) {
             return Err("list_pending_joins: caller is not a Joined member".to_string());
         }
-        let caller_power = materialized
-            .power_levels
-            .get(&self_owner)
-            .copied()
-            .unwrap_or(0);
-        if caller_power < crate::community_membership::POWER_THRESHOLDS.kick {
+        // ZEB-733: gate on the community's per-community moderator (kick) tier
+        // off `materialized`, not the global const — a community that raised
+        // its kick floor gates this audit feed the same way `verify_event`
+        // does. Raw values are read only for the error message.
+        if !crate::community_membership::actor_power_meets_moderator_tier(&materialized, self_owner)
+        {
+            let caller_power = materialized
+                .power_levels
+                .get(&self_owner)
+                .copied()
+                .unwrap_or(0);
             return Err(format!(
                 "list_pending_joins: caller power {} is below moderator threshold {}",
-                caller_power,
-                crate::community_membership::POWER_THRESHOLDS.kick
+                caller_power, materialized.power_thresholds.kick
             ));
         }
     }
@@ -44243,16 +44313,18 @@ pub(crate) async fn list_recent_counter_signs_impl(
         ) {
             return Err("list_recent_counter_signs: caller is not a Joined member".to_string());
         }
-        let caller_power = materialized
-            .power_levels
-            .get(&self_owner)
-            .copied()
-            .unwrap_or(0);
-        if caller_power < crate::community_membership::POWER_THRESHOLDS.kick {
+        // ZEB-733: gate on the per-community moderator (kick) tier off
+        // `materialized`, not the global const (mirrors `list_pending_joins`).
+        if !crate::community_membership::actor_power_meets_moderator_tier(&materialized, self_owner)
+        {
+            let caller_power = materialized
+                .power_levels
+                .get(&self_owner)
+                .copied()
+                .unwrap_or(0);
             return Err(format!(
                 "list_recent_counter_signs: caller power {} is below moderator threshold {}",
-                caller_power,
-                crate::community_membership::POWER_THRESHOLDS.kick
+                caller_power, materialized.power_thresholds.kick
             ));
         }
     }
@@ -47025,12 +47097,11 @@ pub async fn self_heal_community_observer(
     };
 
     // Power gate: only admins synthesize rotations/catchups.
-    let local_power = materialized
-        .power_levels
-        .get(&self_owner)
-        .copied()
-        .unwrap_or(0);
-    if local_power < crate::community_membership::POWER_THRESHOLDS.kick {
+    // ZEB-733: per-community moderator (kick) tier off `materialized`, not the
+    // global const. (In practice the observer's actor is the power-100 admin,
+    // so a threshold ≤ max=100 never changes the outcome; the swap keeps this
+    // gate consistent with the customizable source of truth.)
+    if !crate::community_membership::actor_power_meets_moderator_tier(&materialized, self_owner) {
         return;
     }
 
