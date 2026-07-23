@@ -1006,6 +1006,19 @@ pub enum VerifyError {
     /// Must route through AdminProposal + AdminCountersign quorum.
     SetPowerRequiresQuorum,
 
+    /// ZEB-734: direct SetPower that grants or removes admin power (new level
+    /// == `max`, or target currently holds `max`) was rejected because the
+    /// actor does not already hold admin power. Independent of `admin_quorum`
+    /// and of any lowered per-community `set_power` threshold: creating or
+    /// removing an admin ALWAYS requires the actor to already be an admin.
+    /// Without this, an admin who lowers `set_power` below `max` would
+    /// delegate admin-granting to sub-admin members — at `admin_quorum == 1`
+    /// letting them seize admin control with no countersignature. A
+    /// sub-`max` actor can neither direct-mint this (here) nor route it via
+    /// AdminProposal (AP2 requires proposer power == `max`), so it is a hard
+    /// authorization failure, not a "use quorum instead" redirect.
+    SetPowerAdminAffectingRequiresAdmin,
+
     /// ZEB-250 §4.6: direct Kick of an admin (target power==100) was
     /// rejected because admin_quorum > 1.
     /// Must route through AdminProposal + AdminCountersign quorum.
@@ -1311,6 +1324,7 @@ impl std::fmt::Display for VerifyError {
                 write!(f, "ZEB-250 AdminCountersign target_event_id is malformed")
             }
             VerifyError::SetPowerRequiresQuorum => write!(f, "ZEB-250: direct admin-affecting SetPower rejected (admin_quorum > 1 — use AdminProposal)"),
+            VerifyError::SetPowerAdminAffectingRequiresAdmin => write!(f, "ZEB-734: granting or removing admin power requires the actor to already be an admin (a lowered set_power threshold does not delegate admin-granting)"),
             VerifyError::KickRequiresQuorum => write!(f, "ZEB-250: direct Kick of an admin rejected (admin_quorum > 1 — use AdminProposal)"),
             VerifyError::AdminProposalThresholdsInvalid => write!(
                 f,
@@ -4613,14 +4627,30 @@ pub fn verify_event(
             if *level > prior_state.power_thresholds.max {
                 return Err(VerifyError::PowerLevelOutOfRange);
             }
-            // ZEB-250 §4.5: direct SetPower of admin-affecting target
-            // is rejected when admin_quorum > 1. Must route via AdminProposal.
-            if prior_state.admin_quorum > 1 {
-                let target_power = prior_state.power_levels.get(target).copied().unwrap_or(0);
-                let admin_affecting = *level == 100 || target_power == 100;
-                if admin_affecting {
-                    return Err(VerifyError::SetPowerRequiresQuorum);
-                }
+            // ZEB-250 §4.5 / ZEB-734: is this SetPower "admin-affecting" —
+            // does it grant top power (`level == max`) or touch a member who
+            // currently holds it? `is_admin_affecting_set_power` is the shared
+            // predicate (keyed on the immovable `max` tier, AT1-locked at 100,
+            // NOT the customizable `set_power`) that the AdminProposal-routing
+            // planner and the local mint pre-checks also use.
+            let admin_affecting = is_admin_affecting_set_power(prior_state, *target, *level);
+            // ZEB-734: granting or removing admin ALWAYS requires the actor to
+            // already hold admin power (`max`), regardless of how low
+            // `set_power` was customized. Without this, an admin who lowers
+            // `set_power` below `max` delegates admin-granting to every member
+            // at/above the new threshold — and at `admin_quorum == 1` (the
+            // default) such a member could promote themselves to admin or
+            // demote the sitting admin with no countersignature. Checked
+            // before the quorum gate so a sub-`max` actor gets the accurate
+            // "you must be an admin" error rather than a misleading
+            // "use AdminProposal" one (which AP2 would reject anyway).
+            if admin_affecting && actor_power < prior_state.power_thresholds.max {
+                return Err(VerifyError::SetPowerAdminAffectingRequiresAdmin);
+            }
+            // ZEB-250 §4.5: direct admin-affecting SetPower is rejected when
+            // admin_quorum > 1. Must route via AdminProposal.
+            if prior_state.admin_quorum > 1 && admin_affecting {
+                return Err(VerifyError::SetPowerRequiresQuorum);
             }
         }
         MembershipEventKind::Unban { target, reason } => {
@@ -5755,6 +5785,31 @@ pub fn setpower_mint_admin_blocked_by_quorum(
     is_admin_affecting_set_power(mat, target, level)
 }
 
+/// ZEB-734: local mirror of `verify_event`'s admin-affecting-requires-admin
+/// gate. Returns `true` when this `(actor, target, level)` direct SetPower
+/// would be rejected as `SetPowerAdminAffectingRequiresAdmin` — i.e. it grants
+/// or removes admin power (`is_admin_affecting_set_power`) yet `actor` does not
+/// already hold admin power (`< max`). Lets the local mint paths
+/// (`set_power_level` IPC, Tier 2 `apply_auto_exec_set_power`) decline BEFORE
+/// minting, upholding the surrounding no-doomed-mint discipline.
+///
+/// Intentionally independent of `admin_quorum`: a sub-`max` actor can neither
+/// direct-mint an admin-affecting SetPower (this gate) nor route one through
+/// `AdminProposal` (AP2 requires proposer power == `max`), so declining is the
+/// only correct local action at every quorum. Reads `POWER_THRESHOLDS.max`
+/// (the AT1-immovable admin tier), matching `is_admin_affecting_set_power`.
+pub fn setpower_admin_affecting_denied_to_non_admin(
+    mat: &MaterializedMembership,
+    actor: OwnerAddr,
+    target: OwnerAddr,
+    level: u8,
+) -> bool {
+    if !is_admin_affecting_set_power(mat, target, level) {
+        return false;
+    }
+    mat.power_levels.get(&actor).copied().unwrap_or(0) < POWER_THRESHOLDS.max
+}
+
 /// ZEB-300: what (if anything) this admin replica should mint to advance a
 /// finalized admin-affecting Tier 2 SetPower toward AdminProposal quorum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5979,12 +6034,13 @@ pub async fn apply_auto_exec_set_power(
     // re-dispatch would otherwise re-mint. Returning
     // `AlreadyApplied` BEFORE the admin / quorum / mint logic makes
     // re-dispatch idempotent on every replica.
-    let (is_admin, blocked_by_quorum, already_at_level) = {
+    let (is_admin, denied_admin_affecting, blocked_by_quorum, already_at_level) = {
         let state_arc = engine_arc.state();
         let state_g = state_arc.lock().await;
         let mat = state_g.materialized(engine_arc.admin_addr());
         (
             local_actor_can_mint_set_power(&mat, self_owner),
+            setpower_admin_affecting_denied_to_non_admin(&mat, self_owner, target_pubkey, level),
             setpower_mint_admin_blocked_by_quorum(&mat, target_pubkey, level),
             mat.power_levels.get(&target_pubkey).copied() == Some(level),
         )
@@ -5998,6 +6054,22 @@ pub async fn apply_auto_exec_set_power(
             target = %hex::encode(target_pubkey.0),
             new_power,
             "auto_exec_set_power: skipping — local actor is not admin in this community (deferring to admin race)"
+        );
+        return Ok(AutoExecOutcome::SkippedNotAdmin);
+    }
+    // ZEB-734: this replica clears the (possibly lowered) set_power threshold
+    // but does NOT hold admin power, and the outcome grants/removes admin. A
+    // direct SetPower would self-reject at verify_event
+    // (SetPowerAdminAffectingRequiresAdmin), and AdminProposal is equally
+    // unavailable (AP2 requires proposer power == max). Defer to an admin
+    // replica — mirrors the not-admin skip above, checked before the
+    // blocked_by_quorum routing so a sub-admin never mints a doomed proposal.
+    if denied_admin_affecting {
+        tracing::info!(
+            community = %hex::encode(community_id.0),
+            target = %hex::encode(target_pubkey.0),
+            new_power,
+            "auto_exec_set_power: skipping — admin-affecting change requires admin power (local actor is a sub-admin moderator; deferring to admin race)"
         );
         return Ok(AutoExecOutcome::SkippedNotAdmin);
     }
@@ -6493,6 +6565,68 @@ mod auto_exec_tests {
         };
         mat.power_levels.insert(target, POWER_THRESHOLDS.max);
         assert!(setpower_mint_admin_blocked_by_quorum(&mat, target, 50));
+    }
+
+    /// ZEB-734: a sub-`max` actor (e.g. a moderator in a community that
+    /// lowered `set_power`) is DENIED admin-affecting SetPower — promoting
+    /// anyone to `max` grants admin, which requires already holding `max`.
+    #[test]
+    fn setpower_admin_affecting_denied_to_non_admin_true_for_mod_promoting_to_admin() {
+        let actor = OwnerAddr([0xaa; 16]);
+        let target = OwnerAddr([0xbb; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels.insert(actor, 50); // moderator, below max
+        assert!(setpower_admin_affecting_denied_to_non_admin(
+            &mat,
+            actor,
+            target,
+            POWER_THRESHOLDS.max
+        ));
+    }
+
+    /// ZEB-734: demoting an existing admin (target currently at `max`) is
+    /// admin-affecting too — a sub-`max` actor is denied.
+    #[test]
+    fn setpower_admin_affecting_denied_to_non_admin_true_for_mod_demoting_admin() {
+        let actor = OwnerAddr([0xaa; 16]);
+        let target = OwnerAddr([0xbb; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels.insert(actor, 50);
+        mat.power_levels.insert(target, POWER_THRESHOLDS.max);
+        assert!(setpower_admin_affecting_denied_to_non_admin(
+            &mat, actor, target, 20
+        ));
+    }
+
+    /// ZEB-734: an actor who already holds admin power (`max`) is NEVER
+    /// denied — the lone-admin direct-SetPower path is unchanged.
+    #[test]
+    fn setpower_admin_affecting_denied_to_non_admin_false_for_admin_actor() {
+        let actor = OwnerAddr([0xaa; 16]);
+        let target = OwnerAddr([0xbb; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels.insert(actor, POWER_THRESHOLDS.max);
+        assert!(!setpower_admin_affecting_denied_to_non_admin(
+            &mat,
+            actor,
+            target,
+            POWER_THRESHOLDS.max
+        ));
+    }
+
+    /// ZEB-734: a non-admin-affecting change (level < max, target not an
+    /// admin) is allowed for a sub-`max` actor — the whole point of a
+    /// lowered `set_power` (delegating sub-admin member management) survives.
+    #[test]
+    fn setpower_admin_affecting_denied_to_non_admin_false_for_non_admin_affecting() {
+        let actor = OwnerAddr([0xaa; 16]);
+        let target = OwnerAddr([0xbb; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels.insert(actor, 50);
+        mat.power_levels.insert(target, 10);
+        assert!(!setpower_admin_affecting_denied_to_non_admin(
+            &mat, actor, target, 40
+        ));
     }
 
     /// ZEB-297 R2: multi-admin-quorum but non-admin-affecting change
@@ -12236,6 +12370,139 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let ctx = VerifyContext {
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
+            is_invite_only: false,
+        };
+        assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
+    }
+
+    /// ZEB-734 helper: a community with a distinct owner (admin, power 100),
+    /// a moderator actor at `mod_power`, and a target at `target_power`, under
+    /// a customized `set_power` threshold and given `admin_quorum`. All three
+    /// are Joined. Power entries are omitted when 0 (absent == 0 per spec §4).
+    fn prior_owner_mod_target(
+        owner_addr: OwnerAddr,
+        mod_addr: OwnerAddr,
+        mod_power: u8,
+        target_addr: OwnerAddr,
+        target_power: u8,
+        set_power_threshold: u8,
+        admin_quorum: u8,
+    ) -> MaterializedMembership {
+        let mut prior = MaterializedMembership {
+            admin_quorum,
+            power_thresholds: PowerThresholds {
+                invite: 0,
+                kick: set_power_threshold,
+                set_power: set_power_threshold,
+                max: 100,
+            },
+            ..Default::default()
+        };
+        for (addr, dev) in [(owner_addr, "o"), (mod_addr, "m"), (target_addr, "t")] {
+            prior.members.insert(
+                addr,
+                MemberState {
+                    status: MemberStatus::Joined,
+                    joined_at: Hlc {
+                        wall_ms: 0,
+                        logical: 0,
+                        device_id: dev.into(),
+                    },
+                    left_at: None,
+                    enrolled_device_keys: BTreeSet::new(),
+                    revoked_device_keys: BTreeSet::new(),
+                },
+            );
+        }
+        prior.power_levels.insert(owner_addr, 100);
+        if mod_power > 0 {
+            prior.power_levels.insert(mod_addr, mod_power);
+        }
+        if target_power > 0 {
+            prior.power_levels.insert(target_addr, target_power);
+        }
+        prior
+    }
+
+    /// ZEB-734: in a community that lowered `set_power` to 50, a power-50
+    /// moderator promoting a member to admin (level == 100) is rejected —
+    /// granting admin always requires already holding admin power, even
+    /// though the moderator clears the (lowered) set_power threshold and
+    /// `admin_quorum == 1` skips the quorum gate.
+    #[test]
+    fn zeb734_admin_affecting_promote_rejected_for_sub_max_actor_when_set_power_lowered() {
+        let (_, _, owner_addr) = make_identity(0x01);
+        let (mod_priv, _, mod_addr) = make_identity(0x02);
+        let (_, _, target_addr) = make_identity(0x03);
+        let mut prior = prior_owner_mod_target(owner_addr, mod_addr, 50, target_addr, 10, 50, 1);
+        let evt = make_setpower_event([0x10; 16], &mod_priv, mod_addr, target_addr, 100, 1_000);
+        test_enroll_member(&mut prior, &mod_priv);
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr: owner_addr,
+            is_invite_only: false,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::SetPowerAdminAffectingRequiresAdmin)
+        );
+    }
+
+    /// ZEB-734: a power-50 moderator demoting an existing admin (target
+    /// currently at power 100) is also rejected — touching the admin tier is
+    /// admin-affecting regardless of the new level.
+    #[test]
+    fn zeb734_admin_affecting_demote_rejected_for_sub_max_actor_when_set_power_lowered() {
+        let (_, _, owner_addr) = make_identity(0x01);
+        let (mod_priv, _, mod_addr) = make_identity(0x02);
+        let (_, _, target_addr) = make_identity(0x03);
+        // Target is a second admin (power 100).
+        let mut prior = prior_owner_mod_target(owner_addr, mod_addr, 50, target_addr, 100, 50, 1);
+        let evt = make_setpower_event([0x11; 16], &mod_priv, mod_addr, target_addr, 20, 1_000);
+        test_enroll_member(&mut prior, &mod_priv);
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr: owner_addr,
+            is_invite_only: false,
+        };
+        assert_eq!(
+            verify_event(&evt, &prior, &ctx),
+            Err(VerifyError::SetPowerAdminAffectingRequiresAdmin)
+        );
+    }
+
+    /// ZEB-734: the delegation a lowered `set_power` was FOR still works — a
+    /// power-50 moderator adjusting a member's power within the sub-admin
+    /// range (level 40, target not an admin) is accepted.
+    #[test]
+    fn zeb734_non_admin_affecting_setpower_allowed_for_sub_max_actor() {
+        let (_, _, owner_addr) = make_identity(0x01);
+        let (mod_priv, _, mod_addr) = make_identity(0x02);
+        let (_, _, target_addr) = make_identity(0x03);
+        let mut prior = prior_owner_mod_target(owner_addr, mod_addr, 50, target_addr, 10, 50, 1);
+        let evt = make_setpower_event([0x12; 16], &mod_priv, mod_addr, target_addr, 40, 1_000);
+        test_enroll_member(&mut prior, &mod_priv);
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr: owner_addr,
+            is_invite_only: false,
+        };
+        assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));
+    }
+
+    /// ZEB-734 regression guard: a lone admin (power 100) at the default
+    /// `admin_quorum == 1` still promotes a member to admin via a DIRECT
+    /// SetPower — the new gate must add no ceremony to the common case.
+    #[test]
+    fn zeb734_admin_affecting_promote_allowed_for_admin_actor_at_quorum_1() {
+        let (owner_priv, _, owner_addr) = make_identity(0x01);
+        let (_, _, target_addr) = make_identity(0x03);
+        let mut prior = prior_with_admin_and_target(owner_addr, target_addr, 10, 1);
+        let evt = make_setpower_event([0x13; 16], &owner_priv, owner_addr, target_addr, 100, 1_000);
+        test_enroll_member(&mut prior, &owner_priv);
+        let ctx = VerifyContext {
+            expected_community_id: SpaceId([0xc0; 16]),
+            admin_addr: owner_addr,
             is_invite_only: false,
         };
         assert_eq!(verify_event(&evt, &prior, &ctx), Ok(()));

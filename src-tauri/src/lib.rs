@@ -43765,18 +43765,32 @@ async fn set_power_level(
     // ZEB-250: read materialized state to determine admin_quorum + target's
     // current power level. This read is done BEFORE minting any event so
     // the routing decision reflects the current CRDT state.
-    let (admin_quorum, target_power_now) = {
+    let (admin_quorum, target_power_now, self_power_now) = {
         let state = engine_arc.state();
         let state_g = state.lock().await;
         let admin_addr = engine_arc.admin_addr();
         let m = state_g.materialize_now(admin_addr);
         let tpow = m.power_levels.get(&target).copied().unwrap_or(0);
-        (m.admin_quorum, tpow)
+        let spow = m.power_levels.get(&self_owner).copied().unwrap_or(0);
+        (m.admin_quorum, tpow, spow)
     };
 
     // ZEB-250: admin-affecting SetPower = new level is 100 (promoting to admin)
     // OR target is currently an admin (power == 100, i.e. a demotion).
     let admin_affecting = level == 100 || target_power_now == 100;
+
+    // ZEB-734: granting or removing admin requires the caller to already hold
+    // admin power (100), independent of a lowered per-community `set_power`
+    // threshold. Reject early (before minting) so we neither burn work on a
+    // direct SetPower that verify_event would reject as
+    // SetPowerAdminAffectingRequiresAdmin, nor route a sub-admin into an
+    // AdminProposal they cannot propose (AP2 requires proposer power 100).
+    // Mirrors `setpower_admin_affecting_denied_to_non_admin`.
+    if admin_affecting && self_power_now < crate::community_membership::POWER_THRESHOLDS.max {
+        return Err("granting or removing admin power requires admin power \
+             (a lowered set_power threshold does not delegate admin-granting)"
+            .to_string());
+    }
 
     if admin_quorum > 1 && admin_affecting {
         // Route via AdminProposal — the proposer counts as signer 1.
