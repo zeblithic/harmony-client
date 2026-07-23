@@ -4018,7 +4018,7 @@ mod revoke_tests {
     async fn test_tunnel_manager() -> std::sync::Arc<crate::tunnel_manager::TunnelManager> {
         let endpoint = {
             let sk = iroh::SecretKey::generate();
-            crate::iroh_endpoint::IrohEndpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
+            crate::iroh_endpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
                 .await
                 .expect("bind loopback iroh endpoint")
         };
@@ -4027,10 +4027,11 @@ mod revoke_tests {
         ));
         let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
         std::sync::Arc::new(crate::tunnel_manager::TunnelManager::new(
-            endpoint,
+            std::sync::Arc::new(endpoint),
             local_pq,
             ingest_tx,
-            std::sync::Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
+            std::sync::Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default())
+                as std::sync::Arc<dyn crate::tunnel_manager::CompatSink>,
         ))
     }
 

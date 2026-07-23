@@ -60,7 +60,7 @@ async fn build_hermetic_endpoint_for_accept() -> Arc<IrohEndpoint> {
         .bind()
         .await
         .expect("bind iroh endpoint");
-    Arc::new(IrohEndpoint::from_endpoint_for_integration_test(inner))
+    Arc::new(IrohEndpoint::from_endpoint_for_test(inner))
 }
 
 /// Build endpoint B with a `MemoryLookup` address-lookup service so
@@ -88,7 +88,7 @@ async fn build_hermetic_endpoint_for_dial() -> (Arc<IrohEndpoint>, MemoryLookup)
         .await
         .expect("bind iroh endpoint");
     (
-        Arc::new(IrohEndpoint::from_endpoint_for_integration_test(inner)),
+        Arc::new(IrohEndpoint::from_endpoint_for_test(inner)),
         lookup,
     )
 }

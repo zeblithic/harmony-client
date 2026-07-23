@@ -144,7 +144,7 @@ async fn build_hermetic_endpoint() -> Arc<IrohEndpoint> {
         .bind()
         .await
         .expect("bind iroh endpoint");
-    Arc::new(IrohEndpoint::from_endpoint_for_integration_test(inner))
+    Arc::new(IrohEndpoint::from_endpoint_for_test(inner))
 }
 
 fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
