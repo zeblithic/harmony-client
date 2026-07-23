@@ -62,10 +62,19 @@ pub(crate) const INLINE_BLOB_MAX: usize = 1_572_864; // 1.5 MiB
 const MAX_CONCURRENT_TUNNEL_SENDS: usize = 64;
 
 /// Resolve a recipient owner's reachable per-device tunnel targets:
-/// `(NodeId = blake3(pq_dsa_pubkey), contact)` for each bound device that
-/// advertised a [`DeviceTunnelContact`](crate::owner_state_types::DeviceTunnelContact).
+/// `(NodeId = blake3(pq_dsa_pubkey), peer)` for each bound device that advertised
+/// a [`DeviceTunnelContact`](crate::owner_state_types::DeviceTunnelContact).
 /// Devices with no contact yet (`None`) are skipped — the tunnel can't reach
 /// them, and the deposit rung covers them.
+///
+/// ZEB-739: the app's `DeviceTunnelContact` is mapped into the crate-owned
+/// [`TunnelPeer`](crate::tunnel_manager::TunnelPeer) here (Seam A), so the
+/// `send_dm` boundary takes the already-reconstructed peer. The tunnel
+/// session-map key stays `blake3(pq_dsa_pubkey)`; the `TunnelPeer` carries the
+/// peer's iroh EndpointId + reconstructed PQ identity. A contact whose PQ keys
+/// can't be reconstructed is skipped (unreachable over the tunnel; deposit rung
+/// covers durability — same net effect as the old driver's `note_dial_failed`
+/// bail).
 ///
 /// Pure over the passed `&OwnerState` (no lock taken here); the caller holds
 /// (or has snapshotted out of) the owner-state lock and must NOT hold it across
@@ -74,7 +83,7 @@ const MAX_CONCURRENT_TUNNEL_SENDS: usize = 64;
 pub(crate) fn resolve_owner_tunnel_targets(
     state: &OwnerState,
     recipient: OwnerAddr,
-) -> Vec<([u8; 32], crate::owner_state_types::DeviceTunnelContact)> {
+) -> Vec<([u8; 32], crate::tunnel_manager::TunnelPeer)> {
     let Some(entry) = state.owner_device_cache.devices.get(&recipient) else {
         return Vec::new();
     };
@@ -82,9 +91,18 @@ pub(crate) fn resolve_owner_tunnel_targets(
         .device_tunnel_contacts
         .iter()
         .filter_map(|maybe| maybe.as_ref())
-        .map(|contact| {
+        .filter_map(|contact| {
             let node_id = node_id_from_dsa_pubkey(&contact.pq_dsa_pubkey);
-            (node_id, contact.clone())
+            match crate::tunnel_manager::tunnel_peer_from_contact(contact) {
+                Ok(peer) => Some((node_id, peer)),
+                Err(reason) => {
+                    tracing::trace!(
+                        %reason,
+                        "ZEB-739: skip tunnel target with unmappable device contact"
+                    );
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -486,17 +504,18 @@ mod tests {
     async fn test_manager() -> Arc<TunnelManager> {
         let endpoint = {
             let sk = iroh::SecretKey::generate();
-            crate::iroh_endpoint::IrohEndpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
+            crate::iroh_endpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
                 .await
                 .expect("bind loopback iroh endpoint")
         };
         let local_pq = Arc::new(PqPrivateIdentity::generate(&mut rand::rngs::OsRng));
         let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
         Arc::new(TunnelManager::new(
-            endpoint,
+            Arc::new(endpoint),
             local_pq,
             ingest_tx,
-            Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
+            Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default())
+                as Arc<dyn crate::tunnel_manager::CompatSink>,
         ))
     }
 
@@ -579,13 +598,13 @@ mod tests {
 
         let mgr = test_manager().await;
         let recipient = OwnerAddr([0x11; 16]);
-        let dsa_pubkey = vec![0x07u8; 32];
+        let dsa_pubkey = vec![0x07u8; 1952];
         let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
         let contact = DeviceTunnelContact {
             iroh_node_id: [0x09; 32],
             home_relay_url: None,
             pq_dsa_pubkey: dsa_pubkey.clone(),
-            pq_kem_pubkey: vec![0x08u8; 32],
+            pq_kem_pubkey: vec![0x08u8; 1184],
         };
         let mut owner_state = OwnerState::default();
         owner_state.owner_device_cache.devices.insert(
@@ -700,7 +719,7 @@ mod tests {
             iroh_node_id: [0x09; 32],
             home_relay_url: None,
             pq_dsa_pubkey: dsa_pubkey.to_vec(),
-            pq_kem_pubkey: vec![0x08u8; 32],
+            pq_kem_pubkey: vec![0x08u8; 1184],
         };
         let mut owner_state = OwnerState::default();
         owner_state.owner_device_cache.devices.insert(
@@ -731,7 +750,7 @@ mod tests {
     async fn send_routes_bootstrap_invite_before_cidnotify_when_unacked() {
         let mgr = test_manager().await;
         let recipient = OwnerAddr([0x11; 16]);
-        let dsa_pubkey = vec![0x07u8; 32];
+        let dsa_pubkey = vec![0x07u8; 1952];
         let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
         let space = SpaceId([0xcc; 16]);
 
@@ -798,7 +817,7 @@ mod tests {
     async fn send_routes_invite_only_entry_as_bare_invite() {
         let mgr = test_manager().await;
         let recipient = OwnerAddr([0x11; 16]);
-        let dsa_pubkey = vec![0x07u8; 32];
+        let dsa_pubkey = vec![0x07u8; 1952];
         let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
         let space = SpaceId([0xcc; 16]);
 
@@ -855,7 +874,7 @@ mod tests {
     async fn send_invite_only_with_failed_invite_rebuild_returns_no_live_attempt() {
         let mgr = test_manager().await;
         let recipient = OwnerAddr([0x11; 16]);
-        let dsa_pubkey = vec![0x07u8; 32];
+        let dsa_pubkey = vec![0x07u8; 1952];
         let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
 
         // Reachable tunnel contact, but NO DM Space installed → the ZEB-504
@@ -864,7 +883,7 @@ mod tests {
             iroh_node_id: [0x09; 32],
             home_relay_url: None,
             pq_dsa_pubkey: dsa_pubkey.clone(),
-            pq_kem_pubkey: vec![0x08u8; 32],
+            pq_kem_pubkey: vec![0x08u8; 1184],
         };
         let mut owner_state = OwnerState::default();
         owner_state.owner_device_cache.devices.insert(
@@ -921,7 +940,7 @@ mod tests {
     async fn send_omits_invite_once_recipient_acked() {
         let mgr = test_manager().await;
         let recipient = OwnerAddr([0x11; 16]);
-        let dsa_pubkey = vec![0x07u8; 32];
+        let dsa_pubkey = vec![0x07u8; 1952];
         let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
         let space = SpaceId([0xcc; 16]);
 
@@ -980,7 +999,7 @@ mod tests {
     async fn send_invite_carries_full_inviter_device_set() {
         let mgr = test_manager().await;
         let recipient = OwnerAddr([0x11; 16]);
-        let dsa_pubkey = vec![0x07u8; 32];
+        let dsa_pubkey = vec![0x07u8; 1952];
         let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
         let space = SpaceId([0xcc; 16]);
 
@@ -1053,12 +1072,12 @@ mod tests {
         let mgr = test_manager().await;
 
         let recipient = OwnerAddr([0x11; 16]);
-        let dsa_pubkey = vec![0x07u8; 32]; // any non-empty DSA pub
+        let dsa_pubkey = vec![0x07u8; 1952]; // any non-empty DSA pub
         let contact = DeviceTunnelContact {
             iroh_node_id: [0x09; 32],
             home_relay_url: None,
             pq_dsa_pubkey: dsa_pubkey.clone(),
-            pq_kem_pubkey: vec![0x08u8; 32],
+            pq_kem_pubkey: vec![0x08u8; 1184],
         };
         let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
 
@@ -1119,10 +1138,15 @@ mod tests {
         let expected = build_dm_packet(signed, &signing_key).expect("build expected packet");
         assert_eq!(routed, expected, "routed packet must match build_dm_packet");
 
-        // And no spurious session for any other NodeId.
+        // Exactly one packet routes for this single (un-invited, acked-Space-less)
+        // DM — no spurious extra send. (ZEB-739: the manager's session map is no
+        // longer client-inspectable; observing the registered handle's cmd channel
+        // is the behavior-equivalent check.)
+        let extra =
+            tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv()).await;
         assert!(
-            mgr.test_pending_packets(&[0x00; 32]).is_none(),
-            "no session for an unrelated NodeId"
+            extra.is_err(),
+            "exactly one packet must route for a single DM (no spurious send)"
         );
     }
 
@@ -1171,38 +1195,26 @@ mod tests {
         // releases it before send_dm.
         let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
         let payload = b"arbitrary DmInvite wire bytes".to_vec();
+
+        // ZEB-739: the manager's session map is no longer client-inspectable, so
+        // pre-register an Active handle for the derived NodeId and observe the
+        // routed packet over its cmd channel — behavior-equivalent to the old
+        // `test_pending_packets` read of the dialing handle's pending buffer.
+        let (mut cmd_rx, _ep) = mgr.register_inbound(expected_node_id);
         send_packet_to_owner_tunnels(&crdt_state, &mgr, recipient, &payload).await;
 
-        let pending = mgr
-            .test_pending_packets(&expected_node_id)
-            .expect("helper must register a session for the derived NodeId");
-        assert_eq!(pending.len(), 1, "exactly one packet routed to the tunnel");
-        assert_eq!(
-            pending[0], payload,
-            "routed bytes must be the passed packet"
-        );
+        let routed = wait_for_routed(&mut cmd_rx).await;
+        assert_eq!(routed, payload, "routed bytes must be the passed packet");
 
-        // An unknown recipient routes nothing — neither a spurious new session
-        // NOR a misrouted packet to the EXISTING target. Capture the resolved
-        // target's pending count first, fire at an unknown recipient, then assert
-        // both invariants: no `[0;32]` session was created AND the real target's
-        // pending count is unchanged (catches a regression that routes unknown
-        // recipients to an existing target).
-        let target_pending_before = mgr
-            .test_pending_packets(&expected_node_id)
-            .map(|p| p.len())
-            .expect("the resolved target session exists from the first send");
+        // An unknown recipient (no cached device entry) resolves to zero targets,
+        // so nothing new routes — the existing target's channel receives no further
+        // packet (catches a regression that routes unknown recipients to an
+        // existing target).
         send_packet_to_owner_tunnels(&crdt_state, &mgr, OwnerAddr([0xEE; 16]), &payload).await;
+        let extra =
+            tokio::time::timeout(std::time::Duration::from_millis(200), cmd_rx.recv()).await;
         assert!(
-            mgr.test_pending_packets(&[0x00; 32]).is_none(),
-            "no session for an unrelated NodeId"
-        );
-        let target_pending_after = mgr
-            .test_pending_packets(&expected_node_id)
-            .map(|p| p.len())
-            .expect("the resolved target session must still exist");
-        assert_eq!(
-            target_pending_after, target_pending_before,
+            extra.is_err(),
             "an unknown recipient must NOT route anything to the existing target"
         );
     }
@@ -1407,12 +1419,12 @@ mod tests {
         let mgr = test_manager().await;
 
         let recipient = OwnerAddr([0x11; 16]);
-        let dsa_pubkey = vec![0x07u8; 32];
+        let dsa_pubkey = vec![0x07u8; 1952];
         let contact = DeviceTunnelContact {
             iroh_node_id: [0x09; 32],
             home_relay_url: None,
             pq_dsa_pubkey: dsa_pubkey.clone(),
-            pq_kem_pubkey: vec![0x08u8; 32],
+            pq_kem_pubkey: vec![0x08u8; 1184],
         };
         let expected_node_id = node_id_from_dsa_pubkey(&dsa_pubkey);
 

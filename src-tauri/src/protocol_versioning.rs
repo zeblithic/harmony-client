@@ -146,6 +146,28 @@ impl ProtocolCompatRegistry {
     }
 }
 
+/// ZEB-739 Seam B: bridge the crate-owned `CompatSink` the tunnel driver reports
+/// through onto this concrete registry (the Network-Health read side). The driver
+/// emits exactly one [`HandshakeOutcome`](crate::tunnel_manager::HandshakeOutcome)
+/// per peer — keyed by the peer's IROH EndpointId (the Network Health join key) —
+/// at the two sites the client formerly called `note_incompatible` /
+/// `note_compatible` directly (incompatible-hello rejection; successful
+/// handshake, which clears).
+impl crate::tunnel_manager::CompatSink for ProtocolCompatRegistry {
+    fn record_handshake_outcome(
+        &self,
+        peer: [u8; 32],
+        outcome: crate::tunnel_manager::HandshakeOutcome,
+    ) {
+        match outcome {
+            crate::tunnel_manager::HandshakeOutcome::Compatible => self.note_compatible(peer),
+            crate::tunnel_manager::HandshakeOutcome::Incompatible { reason } => {
+                self.note_incompatible(peer, reason)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

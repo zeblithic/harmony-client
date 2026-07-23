@@ -50,7 +50,7 @@ use zenoh_link::{EndPoint, LinkManagerUnicastTrait, LinkUnicast};
 
 /// Build a hermetic iroh endpoint on loopback with no address-lookup, no pkarr
 /// publisher, no DERP relays. Identical to the helper in the two-engine
-/// integration test: goes through [`IrohEndpoint::from_endpoint_for_integration_test`]
+/// integration test: goes through [`IrohEndpoint::from_endpoint_for_test`]
 /// (gated behind `feature = "test-fixtures"`) so the rest of the test uses the
 /// same `IrohEndpoint` wrapper production code uses.
 async fn build_hermetic_endpoint() -> Arc<IrohEndpoint> {
@@ -66,7 +66,7 @@ async fn build_hermetic_endpoint() -> Arc<IrohEndpoint> {
         .bind()
         .await
         .expect("bind iroh endpoint");
-    Arc::new(IrohEndpoint::from_endpoint_for_integration_test(inner))
+    Arc::new(IrohEndpoint::from_endpoint_for_test(inner))
 }
 
 /// Build the `iroh/<hex>` `EndPoint` locator for an endpoint's own node id.

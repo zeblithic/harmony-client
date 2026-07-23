@@ -9387,7 +9387,7 @@ mod tests {
         // Build the live tunnel transport over a real loopback iroh endpoint.
         let endpoint = {
             let sk = iroh::SecretKey::generate();
-            crate::iroh_endpoint::IrohEndpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
+            crate::iroh_endpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
                 .await
                 .expect("bind loopback iroh endpoint")
         };
@@ -9396,10 +9396,11 @@ mod tests {
         ));
         let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
         let mgr = Arc::new(crate::tunnel_manager::TunnelManager::new(
-            endpoint,
+            Arc::new(endpoint),
             local_pq,
             ingest_tx,
-            Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
+            Arc::new(crate::protocol_versioning::ProtocolCompatRegistry::default())
+                as Arc<dyn crate::tunnel_manager::CompatSink>,
         ));
 
         // CR4: seed Bob's cached tunnel contact into the transport's resolution

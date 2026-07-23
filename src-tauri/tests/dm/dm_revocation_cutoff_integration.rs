@@ -128,7 +128,7 @@ async fn build_hermetic_endpoint() -> Arc<IrohEndpoint> {
         .bind()
         .await
         .expect("bind iroh endpoint");
-    Arc::new(IrohEndpoint::from_endpoint_for_integration_test(inner))
+    Arc::new(IrohEndpoint::from_endpoint_for_test(inner))
 }
 
 /// 64-byte composite identity_pub for a transport signing key (used only to

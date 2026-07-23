@@ -191,7 +191,7 @@ async fn build_node_endpoint() -> Arc<IrohEndpoint> {
         .bind()
         .await
         .expect("bind node iroh endpoint");
-    Arc::new(IrohEndpoint::from_endpoint_for_integration_test(inner))
+    Arc::new(IrohEndpoint::from_endpoint_for_test(inner))
 }
 
 /// Build a hermetic RAW client iroh endpoint (the dialer You uses to send its

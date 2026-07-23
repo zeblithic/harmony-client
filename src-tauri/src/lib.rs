@@ -4529,7 +4529,7 @@ pub async fn start_node_inner(
                     let custom_iroh_relays =
                         connectivity_settings::effective_iroh_relays(&iroh_settings)
                             .map(|urls| parse_iroh_relay_urls(&urls));
-                    match crate::iroh_endpoint::IrohEndpoint::new_with_secret_and_relays(
+                    match crate::iroh_endpoint::new_with_secret_and_relays(
                         secret,
                         custom_iroh_relays,
                     )
@@ -10022,10 +10022,11 @@ pub async fn start_node_inner(
                             );
                             let tunnel_manager =
                                 std::sync::Arc::new(crate::tunnel_manager::TunnelManager::new(
-                                    (**ep_arc).clone(),
+                                    std::sync::Arc::clone(ep_arc),
                                     std::sync::Arc::clone(&pq_identity),
                                     tunnel_ingest_tx.clone(),
-                                    std::sync::Arc::clone(&protocol_compat),
+                                    std::sync::Arc::clone(&protocol_compat)
+                                        as std::sync::Arc<dyn crate::tunnel_manager::CompatSink>,
                                 ));
                             let tunnel_acceptor: std::sync::Arc<
                                 dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
@@ -14852,7 +14853,7 @@ mod add_space_tunnel_routing_tests {
     async fn test_manager() -> StdArc<TunnelManager> {
         let endpoint = {
             let sk = iroh::SecretKey::generate();
-            crate::iroh_endpoint::IrohEndpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
+            crate::iroh_endpoint::new_with_secret_and_relays_hermetic_dns(sk, None)
                 .await
                 .expect("bind loopback iroh endpoint")
         };
@@ -14861,10 +14862,11 @@ mod add_space_tunnel_routing_tests {
         ));
         let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel(16);
         StdArc::new(TunnelManager::new(
-            endpoint,
+            StdArc::new(endpoint),
             local_pq,
             ingest_tx,
-            StdArc::new(crate::protocol_versioning::ProtocolCompatRegistry::default()),
+            StdArc::new(crate::protocol_versioning::ProtocolCompatRegistry::default())
+                as StdArc<dyn crate::tunnel_manager::CompatSink>,
         ))
     }
 
@@ -14960,6 +14962,13 @@ mod add_space_tunnel_routing_tests {
         let mgr = test_manager().await;
         let (node, recipient, recipient_node_id) =
             wire_node_state(Some(StdArc::clone(&mgr)), None).await;
+
+        // ZEB-739: the manager's session map is no longer client-inspectable, so
+        // pre-register an Active handle for the recipient NodeId and observe the
+        // routed invite over its cmd channel (behavior-equivalent to the old
+        // `test_pending_packets` read).
+        let (mut cmd_rx, _ep) = mgr.register_inbound(recipient_node_id);
+
         let state = std::sync::Mutex::new(node);
 
         let space_id_hex = add_space_impl(
@@ -14973,12 +14982,20 @@ mod add_space_tunnel_routing_tests {
         let space_bytes: [u8; 16] = hex::decode(&space_id_hex).unwrap().try_into().unwrap();
         let created_space_id = crate::owner_state_types::SpaceId(space_bytes);
 
-        // The recipient's tunnel session received exactly one packet: the invite.
-        let pending = mgr
-            .test_pending_packets(&recipient_node_id)
-            .expect("the invite must route to the recipient's tunnel NodeId");
-        assert_eq!(pending.len(), 1, "exactly one DmInvite routed");
-        match crate::dm_envelope::decode_packet(&pending[0]).expect("routed bytes decode") {
+        // The recipient's tunnel session received the invite. `add_space`'s tunnel
+        // fan-out may be spawned, so park on the cmd channel under a timeout.
+        let routed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match cmd_rx.recv().await {
+                    Some(crate::tunnel_manager::TunnelCommand::SendDm(p)) => break p,
+                    Some(_) => continue,
+                    None => panic!("tunnel command channel closed before routing the invite"),
+                }
+            }
+        })
+        .await
+        .expect("the invite must route to the recipient's tunnel NodeId within 5s");
+        match crate::dm_envelope::decode_packet(&routed).expect("routed bytes decode") {
             crate::dm_envelope::DmPacket::Invite { signed, .. } => {
                 assert_eq!(
                     signed.space_id, created_space_id,
