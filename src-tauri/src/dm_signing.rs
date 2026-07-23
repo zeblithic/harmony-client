@@ -13,15 +13,18 @@
 //! computed hash match `DeviceIdentityHash` values stored in
 //! OwnerDeviceCache.devices — an Ed25519-only hash would diverge.
 
-use chacha20poly1305::aead::Aead;
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use sha2::{Digest, Sha256};
-use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
-use zeroize::Zeroizing;
 
 use crate::dm_outbox::DmReceiveError;
 use crate::owner_state_types::DeviceIdentityHash;
+
+// The sealed-box PKE and the ed25519↔x25519 conversions now live in core
+// `harmony_crypto` (ZEB-738 / harmony#290). This module keeps the client
+// domain layer: the `DmSignError` taxonomy, the frozen `info` domain constant,
+// and thin delegating wrappers so the ~dozens of `crate::dm_signing::…` call
+// sites are unchanged. The core construction is byte-identical (it composes the
+// same HKDF-SHA256 + ChaCha20-Poly1305 primitives with empty AAD).
 
 /// Errors from epoch-key sealing operations (`seal_to_owner` / `open_from_owner`).
 /// Distinct from `DmReceiveError` because these helpers are used in
@@ -81,35 +84,13 @@ pub fn seal_to_owner_with_info(
     plaintext: &[u8],
     info: &[u8],
 ) -> Result<Vec<u8>, DmSignError> {
-    let recipient_pub = PublicKey::from(*recipient_x25519_pub);
-    let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
-    let ephemeral_pub_bytes = *PublicKey::from(&ephemeral).as_bytes();
-
-    let shared = ephemeral.diffie_hellman(&recipient_pub);
-    // C1: reject low-order recipient pubkeys. A recipient X25519 pubkey
-    // that is a small-order (torsion) point yields an all-zero ECDH
-    // output regardless of our ephemeral scalar, so any two senders
-    // using the same nonce would produce the same ciphertext. Reject
-    // immediately rather than encrypting under a predictable key.
-    if shared.as_bytes() == &[0u8; 32] {
-        return Err(DmSignError::InvalidPublicKey);
-    }
-    let key_bytes = derive_seal_key_with_info(shared.as_bytes(), info);
-    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key_bytes.as_ref()));
-
-    let mut nonce_bytes = [0u8; 12];
-    use rand::RngCore;
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
-        .map_err(|_| DmSignError::EncryptionFailed)?;
-
-    let mut out = Vec::with_capacity(32 + 12 + ciphertext.len());
-    out.extend_from_slice(&ephemeral_pub_bytes);
-    out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
+    harmony_crypto::sealed_box::seal(
+        recipient_x25519_pub,
+        plaintext,
+        info,
+        &mut rand::rngs::OsRng,
+    )
+    .map_err(|e| map_sealed_box_err(e, DmSignError::EncryptionFailed))
 }
 
 /// Open a sealed envelope using the recipient's X25519 private key.
@@ -130,32 +111,8 @@ pub fn open_from_owner_with_info(
     sealed: &[u8],
     info: &[u8],
 ) -> Result<Vec<u8>, DmSignError> {
-    if sealed.len() < 32 + 12 + 16 {
-        return Err(DmSignError::MalformedSealedEnvelope);
-    }
-    let ephemeral_pub_bytes: [u8; 32] = sealed[0..32]
-        .try_into()
-        .map_err(|_| DmSignError::MalformedSealedEnvelope)?;
-    let nonce_bytes: [u8; 12] = sealed[32..44]
-        .try_into()
-        .map_err(|_| DmSignError::MalformedSealedEnvelope)?;
-    let ciphertext = &sealed[44..];
-
-    let recipient_secret = StaticSecret::from(*recipient_x25519_priv);
-    let ephemeral_pub = PublicKey::from(ephemeral_pub_bytes);
-    let shared = recipient_secret.diffie_hellman(&ephemeral_pub);
-    // C1: reject low-order ephemeral pubkeys. An all-zero shared secret
-    // means the sender used a small-order (torsion) ephemeral point;
-    // any ciphertext produced under such a key is trivially forgeable.
-    if shared.as_bytes() == &[0u8; 32] {
-        return Err(DmSignError::InvalidPublicKey);
-    }
-    let key_bytes = derive_seal_key_with_info(shared.as_bytes(), info);
-    let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(key_bytes.as_ref()));
-
-    cipher
-        .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext)
-        .map_err(|_| DmSignError::DecryptionFailed)
+    harmony_crypto::sealed_box::open(recipient_x25519_priv, sealed, info)
+        .map_err(|e| map_sealed_box_err(e, DmSignError::DecryptionFailed))
 }
 
 /// Convert an Ed25519 public key to an X25519 public key via the
@@ -165,19 +122,8 @@ pub fn open_from_owner_with_info(
 /// The Ed25519 curve point is the Twisted Edwards curve point y → u
 /// Montgomery form: u = (1 + y) / (1 - y) mod p.
 pub fn ed25519_pub_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], DmSignError> {
-    use curve25519_dalek::edwards::CompressedEdwardsY;
-    let edwards = CompressedEdwardsY(*ed25519_pub)
-        .decompress()
-        .ok_or(DmSignError::InvalidEd25519Pubkey)?;
-    // C2: reject small-order (torsion) Edwards points. If the Ed25519
-    // pubkey is in the low-order subgroup (8 known small-order points
-    // on the Twisted Edwards curve), to_montgomery() maps them to
-    // small-order Montgomery points, which then produce all-zero ECDH
-    // outputs. Reject here before the conversion, not after.
-    if edwards.is_small_order() {
-        return Err(DmSignError::InvalidEd25519Pubkey);
-    }
-    Ok(edwards.to_montgomery().to_bytes())
+    harmony_crypto::x25519::ed25519_pub_to_x25519(ed25519_pub)
+        .ok_or(DmSignError::InvalidEd25519Pubkey)
 }
 
 /// Convert an Ed25519 signing key to an X25519 private key via the
@@ -189,17 +135,7 @@ pub fn ed25519_pub_to_x25519(ed25519_pub: &[u8; 32]) -> Result<[u8; 32], DmSignE
 pub fn ed25519_priv_to_x25519(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> zeroize::Zeroizing<[u8; 32]> {
-    // `to_scalar_bytes` is ed25519-dalek 2.x's canonical accessor for the
-    // SHA-512-derived, low-half-clamped scalar — exactly the X25519 private
-    // scalar per RFC 7748 §5. Using the library API avoids an extra SHA-512
-    // call and ensures we stay in sync with dalek's own clamping logic.
-    let mut x_priv = zeroize::Zeroizing::new(signing_key.to_scalar_bytes());
-    // Apply RFC 7748 §5 clamping (dalek's to_scalar_bytes returns the
-    // raw low-half before clamping; we clamp here before use).
-    x_priv[0] &= 248;
-    x_priv[31] &= 127;
-    x_priv[31] |= 64;
-    x_priv
+    harmony_crypto::x25519::ed25519_priv_to_x25519(signing_key)
 }
 
 /// HKDF info string for ZEB-249 epoch-key sealed envelopes — the original
@@ -208,27 +144,21 @@ pub fn ed25519_priv_to_x25519(
 /// AEAD key from it.
 const ZEB_249_EPOCH_KEY_SEAL_INFO: &[u8] = b"harmony-zeb-249-epoch-key-seal";
 
-/// HKDF-derive a 32-byte ChaCha20-Poly1305 key from a 32-byte ECDH
-/// shared secret, using the ZEB-249 epoch-key-seal domain. Kept as the
-/// named single entry point for the legacy domain; delegates to
-/// [`derive_seal_key_with_info`].
-#[allow(dead_code)] // retained for symmetry with seal_to_owner/open_from_owner
-fn derive_seal_key(shared_secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
-    derive_seal_key_with_info(shared_secret, ZEB_249_EPOCH_KEY_SEAL_INFO)
-}
-
-/// HKDF-derive a 32-byte ChaCha20-Poly1305 key from a 32-byte ECDH
-/// shared secret. Empty salt, caller-supplied domain-separation `info`
-/// string. Returns `Zeroizing<[u8; 32]>` so the HKDF-derived material is
-/// zeroized on drop, matching the protection level of EpochKey itself.
-fn derive_seal_key_with_info(shared_secret: &[u8; 32], info: &[u8]) -> Zeroizing<[u8; 32]> {
-    use hkdf::Hkdf;
-
-    let hk = Hkdf::<Sha256>::new(None, shared_secret);
-    let mut okm = Zeroizing::new([0u8; 32]);
-    hk.expand(info, okm.as_mut())
-        .expect("HKDF expand to 32 bytes always succeeds");
-    okm
+/// Map a `harmony_crypto` sealed-box error onto this module's `DmSignError`
+/// taxonomy. The explicit arms are operation-agnostic (`sealed_box::seal`/`open`
+/// only ever produce these four today); `fallback` is the operation-appropriate
+/// default for any future `CryptoError` variant, so a seal error never surfaces
+/// as a decryption failure (or vice versa). The fixed 32-byte HKDF output length
+/// can never trip `HkdfLengthExceeded`, so the fallback is currently unreachable.
+fn map_sealed_box_err(e: harmony_crypto::CryptoError, fallback: DmSignError) -> DmSignError {
+    use harmony_crypto::CryptoError;
+    match e {
+        CryptoError::AeadEncryptFailed => DmSignError::EncryptionFailed,
+        CryptoError::AeadDecryptFailed => DmSignError::DecryptionFailed,
+        CryptoError::CiphertextTooShort => DmSignError::MalformedSealedEnvelope,
+        CryptoError::InvalidPublicKey => DmSignError::InvalidPublicKey,
+        _ => fallback,
+    }
 }
 
 /// Reticulum app+aspect for DM-protocol packets. The full destination
@@ -539,6 +469,28 @@ mod epoch_seal_tests {
         assert!(
             matches!(err, DmSignError::InvalidPublicKey),
             "expected InvalidPublicKey, got {err:?}"
+        );
+    }
+
+    /// ZEB-738 cross-repo byte-preservation anchor. This is the SAME frozen
+    /// envelope asserted by harmony-crypto's `sealed_box::tests::frozen_open_kat`
+    /// (recipient derived from Ed25519 seed `[0x24; 32]`, info = the zeb-249
+    /// default). Decrypting it here proves the client's delegating `open` path
+    /// recovers byte-identical plaintext to core's — pinning framing offsets,
+    /// the HKDF schedule, and the ChaCha20-Poly1305 layer identical across both
+    /// crates. DO NOT regenerate: it anchors the sealed-blob wire format.
+    #[test]
+    fn zeb738_frozen_sealed_envelope_opens_cross_repo() {
+        let sk = SigningKey::from_bytes(&[0x24u8; 32]);
+        let recipient_priv = *ed25519_priv_to_x25519(&sk);
+        const FROZEN_ENVELOPE: &str = "0021bf9fce0c9b89eb3cf5f4c77cefa61c97cde1a8000902a9f86f03dc53bc158188f93da1cff420a0dda47f0b533087cc2812a74aaefe84df65cfe51315577cf0cecb77a5bc86d85ee14bdabfd0278e014adc2126a821557947423eaae99e177c97cf069c0fc6";
+        const EXPECTED_PLAINTEXT: &[u8] = b"harmony sealed-box known-answer test vector";
+        let sealed = hex::decode(FROZEN_ENVELOPE).expect("valid hex fixture");
+        let opened = open_from_owner(&recipient_priv, &sealed)
+            .expect("client open must recover the core-sealed envelope");
+        assert_eq!(
+            opened, EXPECTED_PLAINTEXT,
+            "cross-repo sealed-box decrypt path must be byte-identical"
         );
     }
 }
