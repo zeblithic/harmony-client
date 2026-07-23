@@ -2761,22 +2761,25 @@ fn load_or_generate_with_stores(
             }
         }
     }
-    load_or_generate_with_stores_post_probe(keychain, keychain_healthy, encrypted)
+    // `None` lock target: this variant is test-only (hermetic, single-process,
+    // isolated stores) — the cross-process generate guard is exercised through
+    // `read_seed_from_disk_with_keychain`, which passes a real path.
+    load_or_generate_with_stores_post_probe(None, keychain, keychain_healthy, encrypted)
 }
 
-fn load_or_generate_with_stores_post_probe(
+/// Generate a fresh random 32-byte seed and persist it via
+/// [`save_with_fallback`] (keychain preferred, encrypted-file fallback).
+///
+/// Callers that need cross-process safety (the production boot path) MUST run
+/// this while holding [`with_identity_write_guards`] and MUST have re-probed
+/// both stores under the guards first — this function unconditionally overwrites
+/// via `save_with_fallback`, so a concurrent writer's identity would be clobbered
+/// without that double-check.
+fn generate_and_save_seed(
     keychain: Option<&KeychainStore>,
     keychain_healthy: bool,
     encrypted: Option<&EncryptedFileStore>,
 ) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
-    if let Some(enc) = encrypted {
-        match enc.load() {
-            Ok(Some(seed)) => return Ok(seed),
-            Ok(None) => { /* fall through to fresh-generate */ }
-            Err(e) => return Err(e),
-        }
-    }
-
     let mut seed_buf: Zeroizing<[u8; BLOB_LEN]> = Zeroizing::new([0u8; BLOB_LEN]);
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(seed_buf.as_mut());
@@ -2795,6 +2798,80 @@ fn load_or_generate_with_stores_post_probe(
         },
     )?;
     Ok(seed_buf)
+}
+
+/// Resolve the seed from an already-keychain-probed set of stores: return an
+/// existing encrypted-file identity, or generate + persist a fresh one.
+///
+/// `lock_target` is the identity path used to derive the `identity.enc.lock`
+/// sibling. Production callers pass `Some(path)`: when generation is needed this
+/// closes the cross-process generate-vs-restore race (ZEB-735) by acquiring the
+/// shared [`with_identity_write_guards`] and **double-checking** both stores
+/// under them — a concurrent `restore` that wrote between our lock-free probe
+/// and the guard is observed and returned instead of being clobbered. The
+/// initial `enc.load()` probe stays *outside* the guard so the common
+/// already-exists boot path (every boot after the first) never touches the lock.
+/// Hermetic unit tests pass `None` (single-process, isolated tempdirs) to skip
+/// the guard and avoid serializing parallel tests on the process-global mutex.
+fn load_or_generate_with_stores_post_probe(
+    lock_target: Option<&Path>,
+    keychain: Option<&KeychainStore>,
+    keychain_healthy: bool,
+    encrypted: Option<&EncryptedFileStore>,
+) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
+    // Lock-free fast path: an existing encrypted identity is returned without
+    // ever taking the write guards (this is the hot every-boot read path).
+    if let Some(enc) = encrypted {
+        match enc.load() {
+            Ok(Some(seed)) => return Ok(seed),
+            Ok(None) => { /* fall through to guarded generate */ }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let generate = || generate_and_save_seed(keychain, keychain_healthy, encrypted);
+
+    match lock_target {
+        // Production, with a writable destination: serialize the generate
+        // against every other identity writer and re-probe under the guard
+        // before writing.
+        Some(identity_path) if keychain_healthy || encrypted.is_some() => {
+            with_identity_write_guards(identity_path, || {
+                // Double-check under the lock: a concurrent restore/generate may
+                // have written between our lock-free probe above and acquiring
+                // the guard. Mirror each store's first-probe error policy exactly
+                // — keychain errors warn-and-continue (as in the caller's probe),
+                // but an encrypted-file load ERROR must hard-fail, never silently
+                // regenerate over a present-but-unreadable file (the resolution
+                // chain's "wrong passphrase / corruption ⇒ never regenerate"
+                // invariant, same as the lock-free fast path above).
+                if let Some(kc) = keychain {
+                    match kc.load() {
+                        Ok(Some(seed)) => return Ok(seed),
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(
+                            "keychain re-probe under identity write-lock failed ({e}); \
+                             proceeding to generate"
+                        ),
+                    }
+                }
+                if let Some(enc) = encrypted {
+                    match enc.load() {
+                        Ok(Some(seed)) => return Ok(seed),
+                        Ok(None) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                generate()
+            })
+        }
+        // No writable destination (a doomed boot: no keychain AND no encrypted
+        // store) — or a hermetic test (`None` lock target). There is no write to
+        // race, so skip the guard: `generate()` fails fast with the no-store
+        // error WITHOUT creating a lockfile / identity dir on a boot that was
+        // going to fail anyway (tests write to their isolated store directly).
+        _ => generate(),
+    }
 }
 
 /// After an encrypted-file force-restore, reconcile a stale keychain vault so it
@@ -2976,7 +3053,14 @@ pub fn read_seed_from_disk_with_keychain(
     // Use _post_probe variant: we already probed the keychain above (single
     // round-trip). The non-post-probe variant probes again, which is a real
     // perf regression on macOS Keychain / Linux Secret Service.
+    //
+    // `Some(identity_path)`: the production boot path. When no identity exists
+    // yet, the fresh-generate is serialized (and double-checked) against a
+    // concurrent cross-process `restore` / `rotate` on the same `~/.harmony`
+    // via `identity.enc.lock` (ZEB-735). An existing identity returns on the
+    // lock-free fast path inside `_post_probe`, so the common boot never locks.
     load_or_generate_with_stores_post_probe(
+        Some(identity_path),
         keychain.as_ref(),
         keychain_probe_ok,
         encrypted.as_ref(),
@@ -2998,7 +3082,8 @@ pub fn write_seed_to_disk(
 
 /// Process-wide mutex serializing **all writers of the at-rest encrypted-file
 /// identity material** — [`write_seed_to_disk_with_keychain`],
-/// [`rotate_passphrase`], and the secret-writing body of
+/// [`rotate_passphrase`], first-boot generation (via
+/// [`read_seed_from_disk_with_keychain`]), and the secret-writing body of
 /// `owner_state::save_owner_state_atomic`.
 ///
 /// Sibling of `owner_commands::OWNER_STATE_WRITE_LOCK` (ZEB-199), which guards
@@ -3015,82 +3100,93 @@ pub fn write_seed_to_disk(
 /// uses atomic rename so the file never tears, but without serialization one
 /// writer's update is silently lost — the "loser" overwrites the "winner"
 /// mid-RMW. Holding this across each writer's whole critical section closes
-/// that window. (This is the intra-process serialization; the cross-process
-/// file+keychain TOCTOU on the `!force` probe remains tracked under ZEB-179.)
+/// that window. This is the intra-process half; the cross-process file+keychain
+/// TOCTOU on the `!force` probe is closed by the `fd_lock` on `identity.enc.lock`
+/// that [`with_identity_write_guards`] layers *inside* this mutex for the
+/// restore, rotate, and first-boot-generate writers (ZEB-179 / ZEB-735).
 ///
 /// **Lock ordering (deadlock-free by construction):** whenever both locks are
 /// held, `OWNER_STATE_WRITE_LOCK` is the OUTER lock and this is the INNER.
 /// `save_owner_state_atomic` (called under `OWNER_STATE_WRITE_LOCK` by mint /
 /// pairing-persist / mnemonic-restore) acquires this internally; whereas
-/// [`rotate_passphrase`] / [`write_seed_to_disk_with_keychain`] acquire ONLY
-/// this. No path acquires `OWNER_STATE_WRITE_LOCK` while holding this, so the
-/// order can never invert. None of the three writers calls another, so this
+/// [`with_identity_write_guards`] (the restore / rotate / first-boot-generate
+/// writers) acquires this and then the `fd_lock` — never
+/// `OWNER_STATE_WRITE_LOCK` — so the OwnerState↔identity order can never invert.
+/// None of these writers calls another while holding the lock, so this
 /// non-reentrant `Mutex` is never re-acquired on one thread. Recover from
 /// poisoning so a panic in one writer doesn't brick future ones (mirrors
 /// `OWNER_STATE_WRITE_LOCK`).
 pub(crate) static IDENTITY_FILE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// **Cross-process write serialization (ZEB-179).** The probe-and-write
-/// critical section below is a check-then-act: the `!force` existence probes
-/// (keychain `load()`, `enc_path.exists()`) run before `save_with_fallback`,
-/// so without coordination two concurrent processes could both pass the probe
-/// and both write, the second silently clobbering the first. The in-process
-/// `IDENTITY_FILE_WRITE_LOCK` above closes this only *within* one process; to
-/// close it *across* processes — the realistic case being an operator
-/// accidentally running two `harmony-app restore` / `mint` invocations against
-/// the same `~/.harmony` — this function also takes an `fd_lock` OS advisory
-/// write lock on `identity.enc.lock` spanning the whole probe-and-write.
-/// Mirrors `api::lock` (ZEB-445); `fd_lock` releases the lock on process
-/// death, so a crashed peer never strands it (no PID-liveness / stale-lock
-/// reclaim logic needed — the reason this was deferrable in April, before
-/// fd-lock landed).
+/// Acquire both identity-write guards and run `critical_section` while they are
+/// held, releasing them on return. This is the single acquisition point shared
+/// by every writer of the at-rest identity material —
+/// [`write_seed_to_disk_with_keychain`] (restore / mint), [`rotate_passphrase`],
+/// and first-boot generation (via [`read_seed_from_disk_with_keychain`]) — so
+/// all three flock the *same* `identity.enc.lock` in the *same* order and
+/// therefore mutually exclude across processes without any risk of deadlock
+/// (ZEB-179 restore-path fix, extended to generate + rotate by ZEB-735).
 ///
-/// Layered INSIDE the in-process mutex on purpose: `flock` / `LockFileEx` are
-/// per-open-file-description and self-conflict between two handles in one
-/// process, so the mutex (always acquired first) guarantees a single thread
-/// per process ever reaches the fd-lock — no intra-process self-deadlock. The
-/// acquire is non-blocking (`try_write`): a loser fails fast with a clear
-/// "another process is writing" error rather than hanging, and on retry simply
-/// observes the now-existing file (the ordinary "already exists" refusal).
+/// - **OUTER — in-process [`IDENTITY_FILE_WRITE_LOCK`]:** serializes against
+///   every other encrypted-file writer within this process (ZEB-201). Acquired
+///   first, it guarantees exactly one thread per process ever reaches the
+///   `fd_lock` — `flock` / `LockFileEx` are per-open-file-description and would
+///   self-conflict between two handles in one process otherwise, so this
+///   ordering is what makes the cross-process lock intra-process-safe.
+/// - **INNER — cross-process `fd_lock` on `identity.enc.lock`:** closes the
+///   check-then-act TOCTOU between the caller's existence probe and its write.
+///   Non-blocking (`try_write`): a loser fails fast with a clear "another
+///   process is writing" error instead of hanging — essential on the
+///   boot-generate path, where blocking could stall node startup. `fd_lock`
+///   releases the lock on process death, so a crashed peer never strands it (no
+///   PID-liveness / stale-lock reclaim needed).
 ///
-/// Residual, documented and accepted: the keychain side has no atomic
-/// add-if-absent (`keyring::set_password` is an unconditional overwrite), so
-/// two *force* writes to the keychain remain last-writer-wins. The fd-lock
-/// still serializes them (both take it before touching the keychain), so the
-/// outcome is a clean last-writer-wins of an operator-supplied identity —
-/// never an interleaved half-state, and AEAD authentication of the file is
-/// unaffected. Closing the keychain race outright needs an upstream `keyring`
-/// change; out of scope per ZEB-179.
-///
-/// Scope note: this cross-process guard lives only in this function.
-/// [`rotate_passphrase`] and first-boot generation
-/// ([`load_or_generate_with_stores_post_probe`]) take only the in-process
-/// `IDENTITY_FILE_WRITE_LOCK`, so a cross-process `rotate` or boot-generate
-/// racing a `restore` is not yet serialized — tracked as ZEB-735. Do not
-/// over-generalize "cross-process serialized" to those paths.
-pub fn write_seed_to_disk_with_keychain(
+/// The lock path is derived as the `identity.enc.lock` sibling of
+/// `identity_path`, matching `enc_path`; callers on the rotate path pass
+/// `old.path()` (the `identity.enc` file), whose sibling is the same lockfile.
+fn with_identity_write_guards<T>(
     identity_path: &Path,
-    seed: &[u8; BLOB_LEN],
-    force: bool,
-    keychain: Option<KeychainStore>,
-) -> Result<(), String> {
-    // ZEB-201: serialize against every other encrypted-file writer
-    // (`rotate_passphrase`, `save_owner_state_atomic`) for this writer's whole
-    // probe-and-write critical section. INNER lock — see
-    // `IDENTITY_FILE_WRITE_LOCK` ordering docs.
+    critical_section: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    // OUTER: in-process serialization — see fn docs. Recover from poisoning so a
+    // panic in one writer doesn't brick future ones (mirrors OWNER_STATE lock).
     let _identity_file_guard = IDENTITY_FILE_WRITE_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
 
-    // ZEB-179: cross-process guard spanning the probe-and-write below. See the
-    // fn rustdoc for why this layers inside IDENTITY_FILE_WRITE_LOCK and why the
-    // acquire is non-blocking. Held (via `_cross_process_guard`) to fn return.
+    // INNER: cross-process advisory lock spanning the caller's critical section.
     let lock_path = identity_path.with_file_name("identity.enc.lock");
     // Filter empty parents (a bare relative `identity_path` yields `Some("")`,
     // and `create_dir_all("")` errors) — same guard as `write_atomic_0600`.
+    // Harden the identity directory to 0o700 the same way `write_atomic_0600`
+    // does: on first-boot generation this guard can be the FIRST code path to
+    // create it, so it must not leave it umask-derived.
     if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Best-effort: ignore failures (dir may pre-exist / be other-owned).
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
+    // Create the lockfile 0o600 on Unix (mirrors `write_atomic_0600`). It holds
+    // no secrets, but a world-readable lockfile in the identity dir is needless
+    // metadata exposure and undercuts the dir's 0o700 intent. `mode()` applies
+    // only when the file is created; a pre-existing lockfile is left as-is.
+    #[cfg(unix)]
+    let lock_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|e| format!("open identity write-lock {}: {e}", lock_path.display()))?
+    };
+    #[cfg(not(unix))]
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -3114,6 +3210,53 @@ pub fn write_seed_to_disk_with_keychain(
         }
     })?;
 
+    critical_section()
+}
+
+/// **Cross-process + in-process write serialization.** Runs the entire
+/// probe-and-write below inside [`with_identity_write_guards`], so the
+/// check-then-act between the `!force` existence probes (keychain `load()`,
+/// `enc_path.exists()`) and `save_with_fallback` is atomic against every other
+/// identity writer — within this process (the in-process mutex) and across
+/// processes (the `fd_lock` on `identity.enc.lock`). The realistic race this
+/// closes is an operator accidentally running two `harmony-app restore` / `mint`
+/// invocations against the same `~/.harmony`: the loser fails fast with "another
+/// process is writing" and, on retry, simply observes the now-existing file (the
+/// ordinary "already exists" refusal). See [`with_identity_write_guards`] for
+/// the lock-ordering and non-blocking-acquire rationale.
+///
+/// Residual, documented and accepted: the keychain side has no atomic
+/// add-if-absent (`keyring::set_password` is an unconditional overwrite), so
+/// two *force* writes to the keychain remain last-writer-wins. The guards still
+/// serialize them (both are taken before touching the keychain), so the outcome
+/// is a clean last-writer-wins of an operator-supplied identity — never an
+/// interleaved half-state, and AEAD authentication of the file is unaffected.
+/// Closing the keychain race outright needs an upstream `keyring` change; out of
+/// scope per ZEB-179.
+pub fn write_seed_to_disk_with_keychain(
+    identity_path: &Path,
+    seed: &[u8; BLOB_LEN],
+    force: bool,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
+    // Hold both the in-process and cross-process identity-write guards across
+    // the whole probe-and-write. Shared with `rotate_passphrase` and the
+    // first-boot generate path so all three mutually exclude (ZEB-179 / ZEB-735).
+    with_identity_write_guards(identity_path, move || {
+        write_seed_probe_and_write(identity_path, seed, force, keychain)
+    })
+}
+
+/// The probe-and-write body of [`write_seed_to_disk_with_keychain`], run inside
+/// [`with_identity_write_guards`]. Split out so the guard acquisition is shared
+/// verbatim with the other identity writers; never call this without holding the
+/// guards (it performs the check-then-act the guards make atomic).
+fn write_seed_probe_and_write(
+    identity_path: &Path,
+    seed: &[u8; BLOB_LEN],
+    force: bool,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
     let enc_path = identity_path.with_file_name("identity.enc");
     let mut keychain_healthy = false;
 
@@ -3232,45 +3375,46 @@ pub(crate) fn rotate_passphrase(
     old: &EncryptedFileStore,
     new_passphrase: SecretString,
 ) -> Result<(), String> {
-    // ZEB-201: INNER encrypted-file-write lock — serialize the
-    // load→re-encrypt→atomic-write RMW against concurrent `write_seed_*` /
-    // `save_owner_state_atomic` writers so neither silently overwrites the
-    // other mid-RMW. See `IDENTITY_FILE_WRITE_LOCK` ordering docs.
-    let _identity_file_guard = IDENTITY_FILE_WRITE_LOCK
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    // ZEB-363: rotate the WHOLE vault (preserving app-local keys), not just the
-    // seed. The new store has a different passphrase, so a seed-level RMW save
-    // would try to read the old-passphrase file with the new passphrase and fail
-    // — load the full vault with the old passphrase and re-encrypt it under the
-    // new one.
-    let vault = old.load_vault()?.ok_or_else(|| {
-        format!(
-            "no encrypted identity to rotate at {}",
-            old.path().display()
-        )
-    })?;
-    let seed = Zeroizing::new(vault.seed);
+    // Hold both the in-process and cross-process identity-write guards across
+    // the whole load→re-encrypt→atomic-write RMW, so no concurrent `write_seed_*`
+    // / `save_owner_state_atomic` / boot-generate writer overwrites this one
+    // mid-RMW — within this process AND across processes (ZEB-201 / ZEB-179 /
+    // ZEB-735). The lockfile is the `identity.enc.lock` sibling of `old.path()`,
+    // the same one every other identity writer takes.
+    with_identity_write_guards(old.path(), move || {
+        // ZEB-363: rotate the WHOLE vault (preserving app-local keys), not just
+        // the seed. The new store has a different passphrase, so a seed-level RMW
+        // save would try to read the old-passphrase file with the new passphrase
+        // and fail — load the full vault with the old passphrase and re-encrypt
+        // it under the new one.
+        let vault = old.load_vault()?.ok_or_else(|| {
+            format!(
+                "no encrypted identity to rotate at {}",
+                old.path().display()
+            )
+        })?;
+        let seed = Zeroizing::new(vault.seed);
 
-    let new_store = EncryptedFileStore::new(old.path().to_path_buf(), new_passphrase);
-    new_store.save_vault(&vault)?;
-    // After save() returns Ok, the file at `old.path()` has been atomically
-    // replaced and is now decryptable ONLY by the new passphrase. A
-    // verify-after-write failure here is a transient I/O / corruption signal,
-    // not a "rotation didn't happen" signal — the operator MUST keep the new
-    // passphrase or they lose access to their identity. Rewrite the error so
-    // a panicked operator doesn't discard the new passphrase file.
-    verify_round_trip(&new_store, &seed).map_err(|e| {
-        format!(
-            "{} was rewritten with the new passphrase, but the verify-after-write \
-             read-back failed: {e}. The new passphrase is now REQUIRED to decrypt \
-             this file — do NOT discard the new passphrase file. Investigate the \
-             read-back failure (disk error? concurrent writer?) and re-run \
-             rotate-passphrase if needed once the underlying issue is resolved.",
-            old.path().display()
-        )
-    })?;
-    Ok(())
+        let new_store = EncryptedFileStore::new(old.path().to_path_buf(), new_passphrase);
+        new_store.save_vault(&vault)?;
+        // After save() returns Ok, the file at `old.path()` has been atomically
+        // replaced and is now decryptable ONLY by the new passphrase. A
+        // verify-after-write failure here is a transient I/O / corruption signal,
+        // not a "rotation didn't happen" signal — the operator MUST keep the new
+        // passphrase or they lose access to their identity. Rewrite the error so
+        // a panicked operator doesn't discard the new passphrase file.
+        verify_round_trip(&new_store, &seed).map_err(|e| {
+            format!(
+                "{} was rewritten with the new passphrase, but the verify-after-write \
+                 read-back failed: {e}. The new passphrase is now REQUIRED to decrypt \
+                 this file — do NOT discard the new passphrase file. Investigate the \
+                 read-back failure (disk error? concurrent writer?) and re-run \
+                 rotate-passphrase if needed once the underlying issue is resolved.",
+                old.path().display()
+            )
+        })?;
+        Ok(())
+    })
 }
 
 /// A `CredentialApi` implementation that always returns `NoEntry` on reads
@@ -3753,6 +3897,161 @@ mod tests {
         assert_eq!(
             *reloaded, [0x99u8; 32],
             "the seed must round-trip after the lock frees"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn generate_refuses_while_another_process_holds_the_write_lock() {
+        // ZEB-735: first-boot identity generation now takes the same
+        // cross-process fd-lock as restore. With a peer holding
+        // `identity.enc.lock`, the boot generate must fail fast rather than
+        // write a fresh (throwaway) identity that could clobber the peer's
+        // concurrent restore. Deterministic — no spawned binaries (see the
+        // write_seed variant above for why a second in-process fd-lock handle
+        // conflicts exactly as another process would).
+        std::env::set_var("HARMONY_PASSPHRASE", "zeb735-generate-fdlock");
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.key");
+        let enc_path = identity_path.with_file_name("identity.enc");
+        let lock_path = identity_path.with_file_name("identity.enc.lock");
+
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        let mut external = fd_lock::RwLock::new(lock_file);
+        let held = external
+            .try_write()
+            .expect("external holder acquires the write lock");
+
+        // No identity exists yet -> read_seed hits the generate path -> refuse.
+        let err = read_seed_from_disk_with_keychain(&identity_path, None)
+            .expect_err("boot generate must refuse while another writer holds the lock");
+        assert!(
+            err.contains("another harmony-app process is writing"),
+            "actual: {err}"
+        );
+        assert!(
+            !enc_path.exists(),
+            "no identity.enc may be generated while the write is blocked"
+        );
+
+        // Release the peer; generation now succeeds and persists a stable
+        // identity that reloads identically.
+        drop(held);
+        let first = read_seed_from_disk_with_keychain(&identity_path, None)
+            .expect("generate must succeed once the lock frees");
+        assert!(enc_path.exists(), "generate must persist identity.enc");
+        let second = read_seed_from_disk_with_keychain(&identity_path, None)
+            .expect("reload existing identity");
+        assert_eq!(
+            *first, *second,
+            "the generated seed must persist and reload identically"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn boot_generate_completes_and_reread_is_lock_free() {
+        // ZEB-735 boot-deadlock regression: an UNCONTENDED first-boot generate
+        // must complete (not hang) under the new guard, and every subsequent
+        // boot must take the lock-free read fast path. If the guard could
+        // deadlock the boot path this test would HANG (nextest timeout) rather
+        // than fail — a completing run is itself the no-deadlock assertion.
+        std::env::set_var("HARMONY_PASSPHRASE", "zeb735-boot-nodeadlock");
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.key");
+        let lock_path = identity_path.with_file_name("identity.enc.lock");
+
+        // First boot: generates + persists. Completing at all proves no deadlock.
+        let generated = read_seed_from_disk_with_keychain(&identity_path, None)
+            .expect("first-boot generate must complete");
+        assert!(
+            lock_path.exists(),
+            "the generate path must have taken identity.enc.lock"
+        );
+
+        // Delete the lockfile, then re-read: an existing-identity boot returns
+        // on the lock-free fast path and must NOT re-create the lockfile.
+        std::fs::remove_file(&lock_path).unwrap();
+        let reread = read_seed_from_disk_with_keychain(&identity_path, None)
+            .expect("second-boot read must complete");
+        assert_eq!(
+            *generated, *reread,
+            "an existing identity must reload identically"
+        );
+        assert!(
+            !lock_path.exists(),
+            "an existing-identity read must not take the write lock"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn boot_generate_with_no_store_fails_without_creating_lockfile() {
+        // ZEB-735: a doomed boot (no keychain AND no HARMONY_PASSPHRASE) has no
+        // writable destination, so no write can race — the guard is skipped and
+        // the boot fails fast with the no-store error WITHOUT creating the
+        // identity dir or an empty lockfile (restores the pre-change behavior).
+        std::env::remove_var("HARMONY_PASSPHRASE");
+        std::env::remove_var("HARMONY_PASSPHRASE_FILE");
+        let dir = tempfile::tempdir().unwrap();
+        // Nested path so the parent dir does not pre-exist: if the guard were
+        // taken it would `create_dir_all` this and drop a lockfile in it.
+        let identity_path = dir.path().join("sub").join("identity.key");
+        let lock_path = identity_path.with_file_name("identity.enc.lock");
+
+        let err = read_seed_from_disk_with_keychain(&identity_path, None)
+            .expect_err("a boot with no identity store must fail");
+        assert!(err.contains("no identity store available"), "actual: {err}");
+        assert!(
+            !lock_path.exists(),
+            "a doomed no-store boot must not create identity.enc.lock"
+        );
+        assert!(
+            !identity_path.parent().unwrap().exists(),
+            "a doomed no-store boot must not create the identity dir"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn boot_generate_hardens_lockfile_and_dir_permissions() {
+        // ZEB-735: on first-boot generation the write guard can be the first
+        // code path to create the identity dir + lockfile, so it must harden
+        // them like `write_atomic_0600` (dir 0o700, file 0o600) rather than
+        // leave them umask-derived. The lockfile assertion isolates the guard's
+        // own hardening (write_atomic_0600 never touches the lockfile).
+        use std::os::unix::fs::PermissionsExt;
+        std::env::set_var("HARMONY_PASSPHRASE", "zeb735-perms");
+        let dir = tempfile::tempdir().unwrap();
+        // Nested parent so the guard is what creates (and must harden) it.
+        let identity_path = dir.path().join("nested").join("identity.key");
+        let lock_path = identity_path.with_file_name("identity.enc.lock");
+        let parent = identity_path.parent().unwrap().to_path_buf();
+
+        read_seed_from_disk_with_keychain(&identity_path, None).expect("first-boot generate");
+
+        let dir_mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "identity dir must be hardened to 0o700, got {dir_mode:#o}"
+        );
+        let lock_mode = std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            lock_mode, 0o600,
+            "identity.enc.lock must be created 0o600, got {lock_mode:#o}"
         );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
@@ -4585,6 +4884,67 @@ mod tests {
                 err.contains("no encrypted identity to rotate"),
                 "got: {err}"
             );
+        }
+
+        #[test]
+        fn rotate_refuses_while_another_process_holds_the_write_lock() {
+            // ZEB-735: rotate_passphrase now takes the same cross-process
+            // fd-lock as restore / generate (on the `identity.enc.lock` sibling
+            // of the store path). A peer holding the lock must make rotate fail
+            // fast, leaving the file untouched; once released it succeeds.
+            // Deterministic — explicit passphrases, no env vars, no spawned
+            // binaries (a second in-process fd-lock handle conflicts exactly as
+            // another process would).
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("identity.enc");
+            let lock_path = path.with_file_name("identity.enc.lock");
+            let pass_a = SecretString::from("pass_a".to_string());
+            let pass_b = SecretString::from("pass_b".to_string());
+            let seed = fresh_seed();
+
+            EncryptedFileStore::new(path.clone(), pass_a.clone())
+                .save(&seed)
+                .unwrap();
+
+            let lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap();
+            let mut external = fd_lock::RwLock::new(lock_file);
+            let held = external
+                .try_write()
+                .expect("external holder acquires the write lock");
+
+            let store_a = EncryptedFileStore::new(path.clone(), pass_a.clone());
+            let err = rotate_passphrase(&store_a, pass_b.clone())
+                .expect_err("rotate must refuse while another writer holds the lock");
+            assert!(
+                err.contains("another harmony-app process is writing"),
+                "actual: {err}"
+            );
+            // The RMW never ran: still decryptable with the OLD passphrase.
+            let still_a = EncryptedFileStore::new(path.clone(), pass_a.clone())
+                .load()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                *still_a, seed,
+                "rotate must not have modified the file while blocked"
+            );
+
+            // Release the peer; rotate now succeeds and the new passphrase
+            // decrypts the same seed.
+            drop(held);
+            rotate_passphrase(&store_a, pass_b.clone())
+                .expect("rotate must succeed once the lock frees");
+            let loaded = EncryptedFileStore::new(path, pass_b)
+                .load()
+                .unwrap()
+                .unwrap();
+            assert_eq!(*loaded, seed, "rotated file must decrypt to the same seed");
         }
     }
 
