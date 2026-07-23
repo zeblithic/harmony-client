@@ -174,9 +174,20 @@ export HARMONY_RECOVERY_PASSPHRASE="$(cat recovery.passphrase)"
 harmony-app restore recovery-file --in /mnt/usb/recovery.bin --force
 
 # Output (stderr):
+# recovery-file minted-at: 2026-05-14T18:32:11Z
+# recovery-file comment: 2026-05-14 paired
 # restored identity-hash: 1a2b3c4d...
 # owner-state snapshot: 47 spaces, exported 1715600000000 ms wall-clock
 ```
+
+The `minted-at` line (RFC 3339 UTC, stamped at export time) and the
+`comment` line (the export's `--comment` text) echo the recovery file's
+metadata as a **post-restore confirmation** — the identity has already
+been written by the time these print, so they confirm *which* backup was
+applied (and let you notice after the fact that a stale one was used), not
+as a pre-commit preview. Either line is omitted when the file carries no
+such metadata — e.g. `--comment` was not passed, or the file predates
+metadata stamping.
 
 If a `PATH.state` sidecar (derived from the recovery file passed as `--in PATH`) exists, it is auto-detected and restored alongside the main recovery file.
 
@@ -216,6 +227,23 @@ existing file is overwritten in place via the same atomic
 tmp-then-rename pattern used elsewhere. **This is destructive** —
 verify the identity-hash before passing `--force` on a machine that has
 a real identity you want to keep.
+
+### Concurrent identity writes
+
+The `restore mnemonic` and `restore recovery-file` commands take an OS
+advisory lock on `~/.harmony/identity.enc.lock` spanning their whole
+check-and-write, so two `restore` invocations racing the same `~/.harmony`
+cannot silently clobber each other: the loser fails fast with `another
+harmony-app process is writing the identity store; retry once it finishes`
+rather than overwriting the winner. The lock is released automatically if
+the holder process dies, so a crash never strands it — no manual lockfile
+cleanup is needed.
+
+First-boot identity **generation** (when no identity exists yet) is a
+separate code path that does not take this lock; concurrent `serve` / GUI
+boots are instead mutually excluded by the per-profile `serve.lock`.
+Fully serializing a first-boot generate against a concurrent standalone
+`restore` in another process is tracked as ZEB-735.
 
 ### Why two formats?
 

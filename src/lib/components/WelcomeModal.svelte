@@ -96,7 +96,7 @@
   async function handleSaveBackup() {
     if (mintResult === null) return;
     if ([...backupPassphrase].length < MIN_RECOVERY_PASSPHRASE_LEN) {
-      backupError = `Passphrase must be at least ${MIN_RECOVERY_PASSPHRASE_LEN} characters.`;
+      backupError = `Recovery passphrase must be at least ${MIN_RECOVERY_PASSPHRASE_LEN} characters.`;
       return;
     }
     if (backupInFlight) return;

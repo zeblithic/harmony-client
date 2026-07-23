@@ -1637,7 +1637,10 @@ pub async fn export_owner_recovery_file_to_path(
         let artifact = RecoveryArtifact::from_seed(*seed);
         let id_hash = artifact.master_pubkey_bundle().identity_hash();
         let metadata = RecoveryMetadata {
-            mint_at: None,
+            // ZEB-180: stamp the export time on the GUI backup path too (the
+            // CLI exporters already do), so a later GUI restore can surface it
+            // via RestoreInfo.minted_at. Same source-of-truth helper.
+            mint_at: Some(crate::recovery_cli::mint_timestamp_secs()),
             comment: comment_validated,
         };
         let bytes = artifact
@@ -2042,6 +2045,46 @@ mod tests {
         // ExportInfo.path must echo the chosen path.
         let info = result.unwrap();
         assert_eq!(info.path, out.display().to_string());
+    }
+
+    #[test]
+    #[serial]
+    fn export_stamps_mint_at_on_gui_path() {
+        // ZEB-180: the GUI export command must stamp mint_at (not leave it
+        // None), so a later GUI restore surfaces the backup date. Decode the
+        // written file and assert the metadata carries a recent timestamp.
+        clear_token_cache();
+        clear_path_token_cache();
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "owner-cmd-test-pp");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("recovery.bin");
+        let recovery_uuid = insert_token(Zeroizing::new([0xC1u8; 32]));
+        let path_uuid = insert_path_token(out.clone());
+        let before = crate::recovery_cli::mint_timestamp_secs();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(export_owner_recovery_file_to_path(
+            recovery_uuid.to_string(),
+            path_uuid.to_string(),
+            "passphrase-12+".into(),
+            Some("gui-backup".into()),
+        ))
+        .expect("export must succeed");
+
+        let bytes = std::fs::read(&out).unwrap();
+        let restored = RecoveryArtifact::from_encrypted_file(
+            &bytes,
+            &SecretString::from("passphrase-12+".to_string()),
+        )
+        .expect("decode");
+        let minted = restored
+            .metadata
+            .mint_at
+            .expect("GUI export must stamp mint_at");
+        assert!(
+            minted >= before,
+            "mint_at ({minted}) must be >= the pre-export timestamp ({before})"
+        );
+        assert_eq!(restored.metadata.comment.as_deref(), Some("gui-backup"));
     }
 
     // ── ZEB-196: revoke_owner_recovery_token ─────────────────────────────

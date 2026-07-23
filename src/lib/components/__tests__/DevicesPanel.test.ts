@@ -882,14 +882,21 @@ describe('DevicesPanel — stale backupError cleared between attempts', () => {
     await fireEvent.input(confirmInput, { target: { value: 'short' } });
     const saveBtn = screen.getByRole('button', { name: /save backup/i });
     await fireEvent.click(saveBtn);
-    expect(screen.getByText(/at least 12 characters/i)).toBeInTheDocument();
+    // ZEB-203: wording matches the canonical copy in IdentityPanel + backend
+    // ("Recovery passphrase must be at least N characters."), not a divergent
+    // DevicesPanel-only string.
+    expect(
+      screen.getByText(/Recovery passphrase must be at least 12 characters/i),
+    ).toBeInTheDocument();
 
-    // Second attempt: long enough but mismatched. The "at least 12 characters"
-    // string MUST be gone; only "do not match" should render.
+    // Second attempt: long enough but mismatched. The length-error string MUST
+    // be gone; only "do not match" should render.
     await fireEvent.input(passInput, { target: { value: 'twelve-char-passphrase' } });
     await fireEvent.input(confirmInput, { target: { value: 'different-passphrase' } });
     await fireEvent.click(saveBtn);
-    expect(screen.queryByText(/at least 12 characters/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Recovery passphrase must be at least 12 characters/i),
+    ).not.toBeInTheDocument();
     expect(screen.getByText(/do not match/i)).toBeInTheDocument();
   });
 });
