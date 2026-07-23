@@ -8,15 +8,15 @@
 //!
 //! `epoch_auth = HMAC( HKDF(epoch_key, "open-join-auth"),
 //!                     community_id || joiner_identity_pub || nonce || timestamp_be )`
+//!
+//! The generic HKDF -> HMAC -> constant-time-verify kernel lives in
+//! `harmony_crypto::capability` (ZEB-736); this module supplies only the
+//! open-join-specific preimage layout and domain label.
 
 use crate::owner_state_types::{EpochKey, SpaceId};
-use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use harmony_crypto::capability::{capability_tag, verify_capability_tag};
 
 pub const EPOCH_AUTH_INFO: &[u8] = b"open-join-auth";
-
-type HmacSha256 = Hmac<Sha256>;
 
 fn auth_preimage(
     community_id: &SpaceId,
@@ -39,20 +39,12 @@ pub fn mint_epoch_auth(
     nonce: &[u8; 16],
     timestamp_ms: u64,
 ) -> [u8; 32] {
-    // HKDF-Extract+Expand a per-purpose MAC key from the epoch key.
-    let mut mac_key = zeroize::Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(&community_id.0), epoch_key.as_bytes())
-        .expand(EPOCH_AUTH_INFO, mac_key.as_mut())
-        .expect("32 <= 8160");
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(mac_key.as_ref()).expect("HMAC accepts any key length");
-    mac.update(&auth_preimage(
-        community_id,
-        joiner_identity_pub,
-        nonce,
-        timestamp_ms,
-    ));
-    mac.finalize().into_bytes().into()
+    capability_tag(
+        epoch_key.as_bytes(),
+        Some(&community_id.0),
+        EPOCH_AUTH_INFO,
+        &auth_preimage(community_id, joiner_identity_pub, nonce, timestamp_ms),
+    )
 }
 
 pub fn verify_epoch_auth(
@@ -63,19 +55,13 @@ pub fn verify_epoch_auth(
     timestamp_ms: u64,
     presented: &[u8; 32],
 ) -> bool {
-    let expected = mint_epoch_auth(
-        epoch_key,
-        community_id,
-        joiner_identity_pub,
-        nonce,
-        timestamp_ms,
-    );
-    // Constant-time compare (no early-exit on first mismatched byte).
-    let mut diff = 0u8;
-    for (a, b) in expected.iter().zip(presented.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+    verify_capability_tag(
+        epoch_key.as_bytes(),
+        Some(&community_id.0),
+        EPOCH_AUTH_INFO,
+        &auth_preimage(community_id, joiner_identity_pub, nonce, timestamp_ms),
+        presented,
+    )
 }
 
 #[cfg(test)]
@@ -137,5 +123,23 @@ mod tests {
             1000,
             &tag
         ));
+    }
+
+    #[test]
+    fn mint_matches_golden_vector() {
+        // Byte-preservation anchor (ZEB-736): the epoch-auth tag is a frozen
+        // wire field, so this exact value must survive extraction of the
+        // HKDF->HMAC->constant-time-verify kernel into harmony-crypto. This is
+        // the same tag asserted by
+        // harmony-crypto `capability::tests::golden_vector_pins_the_construction`.
+        let tag = mint_epoch_auth(&ek(), &cid(), &[5u8; 64], &[9u8; 16], 1000);
+        assert_eq!(
+            tag,
+            [
+                0xd1, 0x7d, 0x12, 0xde, 0x45, 0x61, 0x7c, 0x28, 0x20, 0x87, 0xe4, 0x1e, 0x36, 0x78,
+                0x50, 0x5d, 0x6b, 0xbb, 0x11, 0xf0, 0xfa, 0x9d, 0xef, 0xd5, 0x5f, 0x1c, 0xfb, 0xc2,
+                0x0a, 0x2c, 0x07, 0xed,
+            ]
+        );
     }
 }
