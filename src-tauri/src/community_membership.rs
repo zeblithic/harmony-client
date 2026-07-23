@@ -5665,6 +5665,31 @@ pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: 
     )
 }
 
+/// ZEB-733: does `actor`'s power meet the community's INVITE tier?
+///
+/// Local pre-check helper for the auto-counter-sign path. Reads
+/// `mat.power_thresholds.invite` (the per-community value already on `mat`),
+/// NOT the global `POWER_THRESHOLDS` const — a community that raised its invite
+/// floor must gate locally the same way `verify_event` (which reads
+/// `prior_state.power_thresholds.invite`) does. Missing power entry treated as
+/// 0 per spec §4.
+pub fn actor_power_meets_invite_tier(mat: &MaterializedMembership, actor: OwnerAddr) -> bool {
+    mat.power_levels.get(&actor).copied().unwrap_or(0) >= mat.power_thresholds.invite
+}
+
+/// ZEB-733: does `actor`'s power meet the community's MODERATOR (kick) tier?
+///
+/// Shared local pre-check for the moderation audit-feed gates
+/// (`list_pending_joins`, `list_recent_counter_signs`) and the self-heal
+/// observer. Reads `mat.power_thresholds.kick` (the per-community value already
+/// on `mat`), NOT the global `POWER_THRESHOLDS` const — a community that
+/// customized its moderator floor must gate locally the same way
+/// `verify_event` (which reads `prior_state.power_thresholds.kick`) does.
+/// Missing power entry treated as 0 per spec §4.
+pub fn actor_power_meets_moderator_tier(mat: &MaterializedMembership, actor: OwnerAddr) -> bool {
+    mat.power_levels.get(&actor).copied().unwrap_or(0) >= mat.power_thresholds.kick
+}
+
 /// ZEB-250 §4.3 / ZEB-300 T1: a SetPower is "admin-affecting" when it grants
 /// top power (`level == max`) or touches a member who currently holds top
 /// power. Extracted so the direct-SetPower quorum guard and the
@@ -6261,6 +6286,73 @@ mod auto_exec_tests {
             },
         );
         assert!(local_actor_can_mint_set_power(&mat, self_owner));
+    }
+
+    /// ZEB-733: `actor_power_meets_moderator_tier` reads the PER-COMMUNITY
+    /// `kick` threshold, not the global const. A member whose power sits
+    /// between the default (50) and a community-customized floor (75) must be
+    /// gated OUT once the community raises the threshold — proving the local
+    /// audit-feed / self-heal gates track the customized value the way
+    /// `verify_event` does.
+    #[test]
+    fn actor_power_meets_moderator_tier_reads_per_community_kick() {
+        let actor = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+        mat.power_levels.insert(actor, 60);
+
+        // Default kick == 50: a power-60 member meets the moderator tier.
+        assert_eq!(mat.power_thresholds.kick, POWER_THRESHOLDS.kick);
+        assert!(
+            actor_power_meets_moderator_tier(&mat, actor),
+            "power 60 meets the default moderator tier (50)"
+        );
+
+        // Community raises kick to 75: the same power-60 member is gated out.
+        mat.power_thresholds.kick = 75;
+        assert!(
+            !actor_power_meets_moderator_tier(&mat, actor),
+            "power 60 must NOT meet a customized moderator tier of 75"
+        );
+
+        // At exactly the customized threshold: boundary is inclusive (>=).
+        mat.power_levels.insert(actor, 75);
+        assert!(
+            actor_power_meets_moderator_tier(&mat, actor),
+            "power == customized kick (75) meets the tier (>= boundary)"
+        );
+
+        // Missing power entry is treated as 0 → never meets a positive tier.
+        let stranger = OwnerAddr([0xbb; 16]);
+        assert!(!actor_power_meets_moderator_tier(&mat, stranger));
+    }
+
+    /// ZEB-733: `actor_power_meets_invite_tier` reads the PER-COMMUNITY
+    /// `invite` threshold. Default invite == 0 (any member), so it is a no-op
+    /// gate; a community that raises the invite floor gates lower-power members
+    /// out — the behavior the auto-counter-sign path must honor.
+    #[test]
+    fn actor_power_meets_invite_tier_reads_per_community_invite() {
+        let actor = OwnerAddr([0xaa; 16]);
+        let mut mat = MaterializedMembership::default();
+
+        // Default invite == 0: even a power-0 (absent) member meets the tier.
+        assert_eq!(mat.power_thresholds.invite, POWER_THRESHOLDS.invite);
+        assert!(
+            actor_power_meets_invite_tier(&mat, actor),
+            "default invite tier (0) is met by any member"
+        );
+
+        // Community raises the invite floor to 25: a power-10 member is gated out.
+        mat.power_thresholds.invite = 25;
+        mat.power_levels.insert(actor, 10);
+        assert!(
+            !actor_power_meets_invite_tier(&mat, actor),
+            "power 10 must NOT meet a customized invite tier of 25"
+        );
+
+        // At/above the customized floor: allowed.
+        mat.power_levels.insert(actor, 25);
+        assert!(actor_power_meets_invite_tier(&mat, actor));
     }
 
     /// ZEB-297 R1 (CodeRabbit Major): the guard must mirror

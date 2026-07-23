@@ -194,7 +194,7 @@ async fn shutdown_engine_and_cleanup_persistence_idempotent_on_unknown_id() {
 
     let unknown_id = SpaceId([0xff; 16]);
     registry
-        .shutdown_engine_and_cleanup_persistence(&unknown_id)
+        .shutdown_engine_and_cleanup_persistence(&unknown_id, || Ok(()))
         .await
         .expect("idempotent on unknown id must return Ok");
 }
@@ -274,7 +274,7 @@ async fn shutdown_engine_and_cleanup_persistence_removes_dir_after_engine_stops(
     );
 
     registry
-        .shutdown_engine_and_cleanup_persistence(&cid)
+        .shutdown_engine_and_cleanup_persistence(&cid, || Ok(()))
         .await
         .expect("teardown");
 

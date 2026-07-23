@@ -622,6 +622,26 @@ pub enum CommunitySyncError {
     /// (PR #267) flagged the earlier dir-exists heuristic as non-causal.
     #[error("persist: directory missing: {0}")]
     PersistDirMissing(String),
+    /// ZEB-732: a node-generation re-check inside
+    /// `shutdown_engine_and_cleanup_persistence` failed, so the destructive
+    /// `remove_dir_all` was ABORTED rather than run. `stop_engine().await`
+    /// opens a window in which a concurrent `stop_node`/`start_node` can bump
+    /// `NodeState.generation` and install a fresh live community for this id;
+    /// deleting its dir would be data loss. Distinct from `Persist` because
+    /// nothing failed on disk — the cleanup was intentionally skipped.
+    ///
+    /// The caller path (`cleanup_community_data`) treats this like any other
+    /// cleanup miss: warn-and-continue, best-effort — identical to how a failed
+    /// unlink is handled (the owner-state tombstone still blocks resurrection,
+    /// and an explicit later `remove_space` retries the on-disk cleanup via the
+    /// idempotent already-tombstoned path). The EARLY generation check in
+    /// `cleanup_community_data_if_durable` / `clear_space_local_cache_impl`
+    /// still surfaces a *pre*-cleanup generation change to the caller as `Err`;
+    /// only the deep in-flight abort is swallowed here (Qodo #2: intentional,
+    /// consistent with the established best-effort cleanup semantics). Carries
+    /// the reason.
+    #[error("cleanup aborted: {0}")]
+    CleanupAborted(String),
     /// Decoded blob's `community_id` doesn't match the engine's
     /// expected community. Distinct from `CborDecode` because the
     /// wire form parsed cleanly — the failure is routing/integrity,
@@ -2032,18 +2052,22 @@ async fn spawn_auto_counter_sign_task(
     // until the event round-trips back through state-root sync.
     delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
 ) {
-    use crate::community_membership::{
-        EventPayload, MemberStatus, MembershipEventKind, POWER_THRESHOLDS,
-    };
+    use crate::community_membership::{EventPayload, MemberStatus, MembershipEventKind};
 
     // --- Eligibility + idempotency check under the state lock. ---
-    let (self_joined, self_power, already_signed) = {
+    let (self_joined, power_ok, already_signed) = {
         let state_g = state.lock().await;
         let mat = state_g.materialize_now(admin_addr);
 
         let self_status = mat.members.get(&self_owner).map(|m| m.status);
         let joined = matches!(self_status, Some(MemberStatus::Joined));
-        let power = mat.power_levels.get(&self_owner).copied().unwrap_or(0);
+        // ZEB-733: read the community's per-community invite tier off `mat`
+        // (defaults to 0, historically a no-op) rather than the global
+        // `POWER_THRESHOLDS` const — a community that raised its invite floor
+        // gates local counter-signing the same way `verify_event` does.
+        // Computed here, while `mat` is still in scope; only the boolean
+        // escapes the block.
+        let power_ok = crate::community_membership::actor_power_meets_invite_tier(&mat, self_owner);
 
         let signed_already = state_g.events.values().any(|e| {
             e.actor == self_owner
@@ -2053,13 +2077,9 @@ async fn spawn_auto_counter_sign_task(
                     if *target_event_id == pending_id
                 )
         });
-        (joined, power, signed_already)
+        (joined, power_ok, signed_already)
     };
 
-    // Note: POWER_THRESHOLDS.invite == 0 in v1, so the power guard is a no-op
-    // on u8 but retained for forward-compatibility when the threshold changes.
-    #[allow(clippy::absurd_extreme_comparisons)]
-    let power_ok = self_power >= POWER_THRESHOLDS.invite;
     if !self_joined || !power_ok || already_signed {
         return;
     }
@@ -4227,6 +4247,9 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
         CommunitySyncError::PublisherSigInvalid { .. } => "publisher_sig_invalid",
         CommunitySyncError::PublishRetryExhausted => "publish_retry_exhausted",
         CommunitySyncError::LiveEpochKeyMissing(_) => "live_epoch_key_missing",
+        // ZEB-732: local cleanup-abort; never produced by the incoming-sync
+        // path this classifier serves, but the match must stay exhaustive.
+        CommunitySyncError::CleanupAborted(_) => "cleanup_aborted",
     }
 }
 
@@ -4236,6 +4259,24 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
 /// layout without a registry instance.
 fn community_root_resync_dir(identity_dir: &std::path::Path, id: &SpaceId) -> std::path::PathBuf {
     identity_dir.join("communities").join(hex::encode(id.0))
+}
+
+/// ZEB-732: a process-unique suffix for the detach-then-delete temp name.
+/// Used by both [`CommunitySyncRegistry::shutdown_engine_and_cleanup_persistence`]
+/// (registry path) and `lib.rs::delete_community_dir` (no-registry path). The
+/// monotonic `SEQ` guarantees uniqueness within a run; the wall-clock nanos
+/// disambiguate across process restarts, so a temp dir orphaned by a crash
+/// mid-delete cannot collide with a fresh detach (a collision would make the
+/// `rename` fail and leave the community dir un-deleted).
+pub(crate) fn unique_detach_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos}.{seq}")
 }
 
 /// Test-only re-export of `classify_incoming_error`. Lets the unit
@@ -4872,30 +4913,64 @@ impl CommunitySyncRegistry {
         if preserve_persistence {
             self.stop_engine(community_id).await
         } else {
-            self.shutdown_engine_and_cleanup_persistence(community_id)
+            // No NodeState generation to guard here — this rolls back a
+            // freshly-spawned engine synchronously (ZEB-732 gen_check is a
+            // no-op for the spawn-rollback path).
+            self.shutdown_engine_and_cleanup_persistence(community_id, || Ok(()))
                 .await
         }
     }
 
+    /// `gen_check` (ZEB-732): re-validates that the destructive delete is
+    /// still safe, invoked AFTER `stop_engine().await` and IMMEDIATELY before
+    /// `remove_dir_all`. Callers that snapshot a `NodeState.generation` pass a
+    /// closure comparing the live generation against their snapshot; a mismatch
+    /// aborts the delete (a concurrent stop/start installed a fresh live
+    /// community whose dir this would otherwise destroy). Callers with no
+    /// generation to guard (e.g. `rollback_fresh_spawn`, tests) pass
+    /// `|| Ok(())`. The closure runs synchronously and is the last checkpoint
+    /// before the delete — everything from here to `remove_dir_all` is
+    /// non-awaiting, so no task can bump generation after it passes.
     pub async fn shutdown_engine_and_cleanup_persistence(
         &self,
         community_id: &SpaceId,
+        gen_check: impl FnOnce() -> Result<(), String> + Send,
     ) -> Result<(), CommunitySyncError> {
         // Phase 1: stop the engine task (idempotent on missing).
         self.stop_engine(community_id).await?;
 
-        // Phase 2: remove the per-community persistence directory.
-        // `tokio::fs::remove_dir_all` so we don't park a worker thread
-        // on the synchronous `std::fs::remove_dir_all`.
-        let dir = self
-            .cfg
-            .identity_dir
-            .join("communities")
-            .join(hex::encode(community_id.0));
+        // ZEB-732: re-check the node generation AFTER stop_engine's await
+        // (its `e.shutdown().await` is the TOCTOU window) and BEFORE the
+        // destructive delete below. Abort — do NOT delete — on a mismatch.
+        gen_check().map_err(CommunitySyncError::CleanupAborted)?;
+
+        // Phase 2: remove the per-community persistence directory via
+        // DETACH-THEN-DELETE (Qodo #1 / CodeRabbit).
+        //
+        // The recursive delete is async (`tokio::fs::remove_dir_all(..).await`),
+        // so a concurrent `stop_node`→`start_node` could recreate
+        // `communities/<id>` DURING that await and have the fresh dir destroyed
+        // — the generation re-check above is a necessary fence but not a
+        // sufficient one across the yield. Close it by synchronously renaming
+        // the dir OUT of the canonical path (an atomic metadata op, with no
+        // `.await` between the gen_check and the rename) before the awaited
+        // delete: any `communities/<id>` a racing start_node then creates is an
+        // INDEPENDENT directory this delete never targets. We remove the
+        // detached snapshot instead. The recursive unlink stays async (no
+        // worker parked on `std::fs::remove_dir_all`).
+        let communities = self.cfg.identity_dir.join("communities");
+        let dir = communities.join(hex::encode(community_id.0));
         if dir.exists() {
-            tokio::fs::remove_dir_all(&dir)
-                .await
-                .map_err(|e| CommunitySyncError::Persist(format!("remove_dir_all {dir:?}: {e}")))?;
+            let detached = communities.join(format!(
+                "{}.deleting.{}",
+                hex::encode(community_id.0),
+                unique_detach_suffix()
+            ));
+            std::fs::rename(&dir, &detached)
+                .map_err(|e| CommunitySyncError::Persist(format!("detach {dir:?}: {e}")))?;
+            tokio::fs::remove_dir_all(&detached).await.map_err(|e| {
+                CommunitySyncError::Persist(format!("remove_dir_all {detached:?}: {e}"))
+            })?;
         }
         Ok(())
     }
@@ -6555,9 +6630,67 @@ mod tests {
 
         // Cleanup for test isolation: tear down explicitly via the registry.
         fix.registry
-            .shutdown_engine_and_cleanup_persistence(&community_id)
+            .shutdown_engine_and_cleanup_persistence(&community_id, || Ok(()))
             .await
             .expect("explicit cleanup for test isolation");
+    }
+
+    /// ZEB-732: `shutdown_engine_and_cleanup_persistence` must ABORT the
+    /// `remove_dir_all` when `gen_check` reports a changed node generation —
+    /// the persistence dir must survive (a concurrent stop/start installed a
+    /// fresh live community for this id during `stop_engine().await`). The
+    /// same call with a passing `gen_check` then deletes the dir, proving the
+    /// guard is the only thing holding the delete back.
+    #[tokio::test]
+    async fn shutdown_cleanup_aborts_delete_on_gen_check_mismatch() {
+        let fix = build_test_fixture().await;
+        let community_id = SpaceId([0x73; 16]);
+        // No engine is registered for this id → `stop_engine` is a no-op, so
+        // the test isolates the `gen_check` gate in front of `remove_dir_all`.
+        let dir = fix
+            .identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0));
+        std::fs::create_dir_all(&dir).expect("create community dir");
+        std::fs::write(dir.join("crdt.cbor"), b"x").expect("seed dir");
+
+        // gen_check reports a mismatch → CleanupAborted, dir preserved.
+        let aborted = fix
+            .registry
+            .shutdown_engine_and_cleanup_persistence(&community_id, || {
+                Err("node generation changed".to_string())
+            })
+            .await;
+        assert!(
+            matches!(aborted, Err(CommunitySyncError::CleanupAborted(_))),
+            "a failed gen_check must surface as CleanupAborted, got {aborted:?}"
+        );
+        assert!(
+            dir.exists(),
+            "aborted cleanup must NOT delete the community dir"
+        );
+
+        // gen_check passes → the dir IS deleted (proves the guard was the only
+        // thing preventing the delete).
+        fix.registry
+            .shutdown_engine_and_cleanup_persistence(&community_id, || Ok(()))
+            .await
+            .expect("cleanup with passing gen_check succeeds");
+        assert!(
+            !dir.exists(),
+            "passing gen_check must delete the community dir"
+        );
+        // ZEB-732: detach-then-delete must not leave a `.deleting` temp behind.
+        let leftover: Vec<String> = std::fs::read_dir(fix.identity_dir.join("communities"))
+            .expect("read communities dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".deleting"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "detach-then-delete must remove its temp dir, found: {leftover:?}"
+        );
     }
 
     /// CodeRabbit round 2: regression test for the adapter-dispatch-failure
