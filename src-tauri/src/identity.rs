@@ -2996,6 +2996,40 @@ pub fn write_seed_to_disk(
     write_seed_to_disk_with_keychain(identity_path, seed, force, KeychainStore::new().ok())
 }
 
+/// Process-wide mutex serializing **all writers of the at-rest encrypted-file
+/// identity material** — [`write_seed_to_disk_with_keychain`],
+/// [`rotate_passphrase`], and the secret-writing body of
+/// `owner_state::save_owner_state_atomic`.
+///
+/// Sibling of `owner_commands::OWNER_STATE_WRITE_LOCK` (ZEB-199), which guards
+/// `owner_state.cbor`. The two protect distinct invariants — that lock: "one
+/// writer of OwnerState at a time"; this: "one writer of the encrypted-file
+/// fallback at a time". Rotate/restore write the encrypted key file but NOT
+/// OwnerState, so folding them into the former would over-serialize unrelated
+/// work (ZEB-201).
+///
+/// Why it's needed (ZEB-201): in `HARMONY_PASSPHRASE`-only mode (no OS
+/// keychain), [`rotate_passphrase`] does a load→re-encrypt→atomic-write
+/// read-modify-write on `identity.enc`, and a concurrent `write_seed_*`
+/// (recovery-file / mnemonic restore) writes the same file. `EncryptedFileStore`
+/// uses atomic rename so the file never tears, but without serialization one
+/// writer's update is silently lost — the "loser" overwrites the "winner"
+/// mid-RMW. Holding this across each writer's whole critical section closes
+/// that window. (This is the intra-process serialization; the cross-process
+/// file+keychain TOCTOU on the `!force` probe remains tracked under ZEB-179.)
+///
+/// **Lock ordering (deadlock-free by construction):** whenever both locks are
+/// held, `OWNER_STATE_WRITE_LOCK` is the OUTER lock and this is the INNER.
+/// `save_owner_state_atomic` (called under `OWNER_STATE_WRITE_LOCK` by mint /
+/// pairing-persist / mnemonic-restore) acquires this internally; whereas
+/// [`rotate_passphrase`] / [`write_seed_to_disk_with_keychain`] acquire ONLY
+/// this. No path acquires `OWNER_STATE_WRITE_LOCK` while holding this, so the
+/// order can never invert. None of the three writers calls another, so this
+/// non-reentrant `Mutex` is never re-acquired on one thread. Recover from
+/// poisoning so a panic in one writer doesn't brick future ones (mirrors
+/// `OWNER_STATE_WRITE_LOCK`).
+pub(crate) static IDENTITY_FILE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Documented TOCTOU note (`!force` path): the existence probes (keychain
 /// `load()`, `enc_path.exists()`, `EncryptedFileStore::from_env`) happen
 /// before `save_with_fallback`, so two concurrent processes that both pass
@@ -3027,6 +3061,13 @@ pub fn write_seed_to_disk_with_keychain(
     force: bool,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
+    // ZEB-201: serialize against every other encrypted-file writer
+    // (`rotate_passphrase`, `save_owner_state_atomic`) for this writer's whole
+    // probe-and-write critical section. INNER lock — see
+    // `IDENTITY_FILE_WRITE_LOCK` ordering docs.
+    let _identity_file_guard = IDENTITY_FILE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let enc_path = identity_path.with_file_name("identity.enc");
     let mut keychain_healthy = false;
 
@@ -3145,6 +3186,13 @@ pub(crate) fn rotate_passphrase(
     old: &EncryptedFileStore,
     new_passphrase: SecretString,
 ) -> Result<(), String> {
+    // ZEB-201: INNER encrypted-file-write lock — serialize the
+    // load→re-encrypt→atomic-write RMW against concurrent `write_seed_*` /
+    // `save_owner_state_atomic` writers so neither silently overwrites the
+    // other mid-RMW. See `IDENTITY_FILE_WRITE_LOCK` ordering docs.
+    let _identity_file_guard = IDENTITY_FILE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // ZEB-363: rotate the WHOLE vault (preserving app-local keys), not just the
     // seed. The new store has a different passphrase, so a seed-level RMW save
     // would try to read the old-passphrase file with the new passphrase and fail
@@ -3529,6 +3577,73 @@ mod tests {
             *reloaded, new_seed,
             "after force-overwrite, the new seed must be present"
         );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn identity_file_write_lock_serializes_writers() {
+        // ZEB-201: holding IDENTITY_FILE_WRITE_LOCK must block a concurrent
+        // encrypted-file writer until released. Deterministic: while we hold the
+        // lock the spawned writer blocks on lock-acquire and can NEVER complete,
+        // so "not finished within 200 ms" holds regardless of machine speed; a
+        // broken lock would let the tiny write finish in ~ms and fail the
+        // negative assertion. (nextest runs each test in its own process, so
+        // this process-global lock is uncontended by other tests.)
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        std::env::set_var("HARMONY_PASSPHRASE", "zeb201-mutex-test");
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.key");
+
+        let guard = IDENTITY_FILE_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let (tx_started, rx_started) = mpsc::channel::<()>();
+        let (tx_done, rx_done) = mpsc::channel::<Result<(), String>>();
+        let ipath = identity_path.clone();
+        let handle = std::thread::spawn(move || {
+            // Signal we're about to attempt the write (and thus the lock).
+            tx_started.send(()).unwrap();
+            let r =
+                write_seed_to_disk_with_keychain(&ipath, &[0x55u8; 32], /*force=*/ true, None);
+            let _ = tx_done.send(r);
+        });
+
+        // The writer thread is alive and (about to be) blocked on lock-acquire.
+        rx_started
+            .recv_timeout(Duration::from_secs(30))
+            .expect("writer thread must start");
+        // It MUST NOT complete while we hold the lock. The window has to clear
+        // the real work-time of an *unblocked* writer so a silently-dropped lock
+        // is actually caught: this write runs a real Argon2id KDF (m=64MiB, t=3)
+        // that is ~100-300ms, so a 200ms window could let a broken lock's write
+        // still miss the deadline and pass by coincidence (CodeRabbit). 1s sits
+        // well above the KDF cost yet far under the completion budget below; a
+        // correctly-held lock keeps the writer blocked the whole window
+        // regardless of machine load, so this stays robust in both directions.
+        assert!(
+            rx_done.recv_timeout(Duration::from_millis(1000)).is_err(),
+            "a concurrent encrypted-file writer must block while IDENTITY_FILE_WRITE_LOCK is held"
+        );
+
+        // Release the lock; the writer now proceeds and completes. Generous
+        // budget: this only converts a true (infinite) hang into a clean
+        // failure, and the write does a real Argon2id KDF that is seconds-slow
+        // and highly variable under loaded CI — so the bound must be >> that
+        // legit work-time, not a tight perf assertion.
+        drop(guard);
+        let result = rx_done
+            .recv_timeout(Duration::from_secs(60))
+            .expect("writer must finish once the lock is released");
+        assert!(
+            result.is_ok(),
+            "unblocked writer must succeed; got {result:?}"
+        );
+        handle.join().unwrap();
 
         std::env::remove_var("HARMONY_PASSPHRASE");
     }

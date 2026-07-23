@@ -631,6 +631,9 @@ describe('DevicesPanel — closeBackup wipes sensitive state', () => {
       canBackUp: true,
     });
     mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-1' });
+    // ZEB-196: cancelling with a live (un-exported) token now fires a
+    // fire-and-forget revoke_owner_recovery_token before the reopen re-issues.
+    mockedInvoke.mockResolvedValueOnce(undefined);
     mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'tok-2' });
 
     render(DevicesPanel);
@@ -657,6 +660,102 @@ describe('DevicesPanel — closeBackup wipes sensitive state', () => {
     expect((passInput2 as HTMLInputElement).value).toBe('');
     expect((confirmInput2 as HTMLInputElement).value).toBe('');
     expect((commentInput2 as HTMLInputElement).value).toBe('');
+  });
+});
+
+describe('DevicesPanel — ZEB-196 revoke unconsumed token on cancel', () => {
+  const populatedOwner = {
+    ownerId: 'x',
+    ownerDisplayName: 'me',
+    devices: [{
+      deviceId: 'd',
+      displayName: 'this',
+      isThisDevice: true,
+      trustDecision: { kind: 'full', reason: null },
+      enrolledAt: 1_700_000_000,
+      fingerprint: 'd·x',
+    }],
+    canBackUp: true,
+  };
+
+  it('revokes the server-side token when the backup modal is cancelled without exporting', async () => {
+    // An issued-but-unconsumed token must be dropped server-side on cancel so
+    // it can't linger for its 5-minute TTL and LRU-evict a legitimate live
+    // token. closeBackup fires revoke_owner_recovery_token(token).
+    mockedInvoke.mockResolvedValueOnce(populatedOwner); // mount refresh
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'live-tok' }); // openBackup issue
+    mockedInvoke.mockResolvedValueOnce(undefined); // revoke_owner_recovery_token
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    // Modal open with a live token; cancel WITHOUT exporting.
+    const cancelBtn = await screen.findByRole('button', { name: /cancel/i });
+    await fireEvent.click(cancelBtn);
+
+    const revokeCalls = mockedInvoke.mock.calls.filter(
+      (c) => c[0] === 'revoke_owner_recovery_token',
+    );
+    expect(revokeCalls.length).toBe(1);
+    expect(revokeCalls[0][1]).toEqual({ recoveryToken: 'live-tok' });
+  });
+
+  it('does NOT revoke on the happy export path (token already consumed)', async () => {
+    // After a successful export, commitBackup nulls the token in its finally
+    // block, so closeBackup sees null and issues no wasted revoke.
+    mockedInvoke.mockResolvedValueOnce(populatedOwner); // mount refresh
+    mockedInvoke.mockResolvedValueOnce({ recoveryToken: 'exp-tok' }); // openBackup issue
+    mockedInvoke.mockResolvedValueOnce('path-token-uuid'); // request_export_save_path
+    mockedInvoke.mockResolvedValueOnce({ identityHash: 'h', byteLen: 0, path: '/tmp/x.bin' }); // export
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn);
+    const passInput = await screen.findByLabelText('Passphrase');
+    const confirmInput = screen.getByLabelText('Confirm passphrase');
+    await fireEvent.input(passInput, { target: { value: 'a-strong-passphrase' } });
+    await fireEvent.input(confirmInput, { target: { value: 'a-strong-passphrase' } });
+    await fireEvent.click(screen.getByRole('button', { name: /save backup/i }));
+    // Wait for the export to complete (saved-path confirmation renders "Done").
+    const doneBtn = await screen.findByRole('button', { name: /done/i });
+    await fireEvent.click(doneBtn);
+
+    const revokeCalls = mockedInvoke.mock.calls.filter(
+      (c) => c[0] === 'revoke_owner_recovery_token',
+    );
+    expect(revokeCalls.length).toBe(0);
+  });
+
+  it('revokes a token that resolves AFTER the modal was cancelled (in-flight guard)', async () => {
+    // ZEB-196 (Qodo): if the user cancels while issueRecoveryToken() is still
+    // pending, closeBackup can't revoke a token it doesn't hold yet. The
+    // generation guard must revoke the token when it finally arrives, and must
+    // not populate recoveryToken while the modal is closed.
+    mockedInvoke.mockResolvedValueOnce(populatedOwner); // mount refresh
+    // openBackup's issue: a promise we resolve only AFTER cancel.
+    let resolveIssue!: (v: { recoveryToken: string }) => void;
+    const issuePromise = new Promise<{ recoveryToken: string }>((r) => {
+      resolveIssue = r;
+    });
+    mockedInvoke.mockReturnValueOnce(issuePromise); // issue_owner_recovery_token (pending)
+    mockedInvoke.mockResolvedValueOnce(undefined); // revoke_owner_recovery_token
+
+    render(DevicesPanel);
+    const backupBtn = await screen.findByRole('button', { name: /back up owner identity/i });
+    await fireEvent.click(backupBtn); // openBackup → issue starts, stays pending
+    // Cancel BEFORE the token resolves — closeBackup bumps the generation.
+    const cancelBtn = await screen.findByRole('button', { name: /cancel/i });
+    await fireEvent.click(cancelBtn);
+
+    // The token now arrives: it must be revoked (stale generation), not stored.
+    resolveIssue({ recoveryToken: 'late-tok' });
+    await waitFor(() => {
+      const revokeCalls = mockedInvoke.mock.calls.filter(
+        (c) => c[0] === 'revoke_owner_recovery_token',
+      );
+      expect(revokeCalls.length).toBe(1);
+      expect(revokeCalls[0][1]).toEqual({ recoveryToken: 'late-tok' });
+    });
   });
 });
 

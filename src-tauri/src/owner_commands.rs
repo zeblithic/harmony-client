@@ -37,10 +37,13 @@ use zeroize::Zeroizing;
 /// in one handler doesn't brick future writes (mirrors PR-61's
 /// preview_cache_lock policy).
 ///
-/// Note: this lock does NOT cover `rotate_passphrase` /
-/// `restore_recovery_from_preview_token`, which write the encrypted-file
-/// fallback (`identity.key.enc`) but not `owner_state.cbor`. See ZEB-201
-/// for the parallel race on those paths.
+/// Note: this lock does NOT cover the encrypted-file writers `rotate_passphrase`
+/// / `write_seed_to_disk_with_keychain`, which write `identity.enc` but not
+/// `owner_state.cbor`. Those are serialized by the sibling
+/// `identity::IDENTITY_FILE_WRITE_LOCK` (ZEB-201). `save_owner_state_atomic`
+/// acquires BOTH — this lock (held by its callers) as the OUTER and
+/// `IDENTITY_FILE_WRITE_LOCK` as the INNER; the acquisition order never inverts,
+/// so the two locks are deadlock-free together.
 pub(crate) static OWNER_STATE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, serde::Serialize)]
@@ -1677,6 +1680,34 @@ pub async fn issue_owner_recovery_token(
     .await
 }
 
+/// ZEB-196: drop an issued-but-unconsumed recovery token from the server-side
+/// cache.
+///
+/// `closeBackup` in the Devices panel calls this (fire-and-forget) when the
+/// user cancels the backup modal. Without it, a token that was issued but never
+/// consumed lingers in `TOKEN_CACHE` for its full 5-minute TTL and can
+/// LRU-evict a *legitimate* live token once the 8-slot cache fills — e.g. a
+/// token freshly minted for the mint→backup happy path that the user has not
+/// yet consumed (the eviction concern from PR #62 round-5 review).
+///
+/// Idempotent: revoking an already-consumed, expired, or never-existed token is
+/// a no-op success. `take_token` removes the entry if present and returns
+/// `None` otherwise, so a double-revoke (or a revoke racing the export that
+/// consumed the same token) is inherently safe. The client fires this
+/// best-effort and never blocks the modal close on the result. A malformed
+/// (non-UUID) token string is the one error case — it can only arise from a
+/// caller bug, never from normal token aging.
+#[tauri::command]
+pub async fn revoke_owner_recovery_token(recovery_token: String) -> Result<(), String> {
+    let recovery_uuid: Uuid = recovery_token
+        .parse()
+        .map_err(|e| format!("invalid recovery token: {e}"))?;
+    // Consume-and-discard. No disk I/O (in-memory cache mutex only), so this
+    // needs neither `run_blocking` nor `AppHandle`.
+    let _ = take_token(&recovery_uuid);
+    Ok(())
+}
+
 /// Wire DTO for the owner recovery-phrase reveal (ZEB-650 slice 2).
 ///
 /// `owner_id` exists ONLY so the webview can cross-check the words against
@@ -2011,6 +2042,101 @@ mod tests {
         // ExportInfo.path must echo the chosen path.
         let info = result.unwrap();
         assert_eq!(info.path, out.display().to_string());
+    }
+
+    // ── ZEB-196: revoke_owner_recovery_token ─────────────────────────────
+
+    #[test]
+    #[serial]
+    fn revoke_consumes_live_token() {
+        clear_token_cache();
+        let recovery_uuid = insert_token(Zeroizing::new([0x11u8; 32]));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(revoke_owner_recovery_token(recovery_uuid.to_string()));
+        assert!(
+            result.is_ok(),
+            "revoke of a live token must succeed; got: {result:?}"
+        );
+        // Token is gone: a subsequent take finds nothing.
+        assert!(
+            take_token(&recovery_uuid).is_none(),
+            "revoke must consume the token so it can no longer be redeemed"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn revoke_is_idempotent() {
+        clear_token_cache();
+        let recovery_uuid = insert_token(Zeroizing::new([0x22u8; 32]));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // First revoke consumes it; a second revoke of the same UUID must ALSO
+        // be Ok (a no-op), not an error — closeBackup can fire more than once.
+        assert!(rt
+            .block_on(revoke_owner_recovery_token(recovery_uuid.to_string()))
+            .is_ok());
+        assert!(
+            rt.block_on(revoke_owner_recovery_token(recovery_uuid.to_string()))
+                .is_ok(),
+            "second revoke of an already-consumed token must be a no-op success"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn revoke_absent_token_is_ok() {
+        clear_token_cache();
+        let never_issued = Uuid::new_v4();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(
+            rt.block_on(revoke_owner_recovery_token(never_issued.to_string()))
+                .is_ok(),
+            "revoking a token that was never issued must succeed (idempotent)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn revoke_rejects_malformed_token() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(revoke_owner_recovery_token("not-a-uuid".to_string()));
+        assert!(result.is_err(), "a non-UUID token string must be rejected");
+        assert!(
+            result.unwrap_err().contains("invalid recovery token"),
+            "error must name the malformed token"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn export_after_revoke_fails() {
+        // Acceptance criterion (PR #62 round 5): once closeBackup revokes, the
+        // previously-issued token cannot be redeemed by a later export.
+        clear_token_cache();
+        clear_path_token_cache();
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "owner-cmd-test-pp");
+        let recovery_uuid = insert_token(Zeroizing::new([0x33u8; 32]));
+        let path_uuid = insert_path_token(PathBuf::from("/tmp/should-not-write-zeb196.bin"));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // Revoke first (simulates modal cancel).
+        assert!(rt
+            .block_on(revoke_owner_recovery_token(recovery_uuid.to_string()))
+            .is_ok());
+        // A later export with the same recovery token must now fail. The path
+        // token is consumed first (ZEB-194 ordering) and succeeds, so the error
+        // originates from the now-absent recovery token — nothing is written.
+        let result = rt.block_on(export_owner_recovery_file_to_path(
+            recovery_uuid.to_string(),
+            path_uuid.to_string(),
+            "passphrase-12+".into(),
+            None,
+        ));
+        assert!(result.is_err(), "export with a revoked token must fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("expired") || err.contains("invalid"),
+            "revoked-token export must report expired/invalid; got: {err}"
+        );
     }
 
     /// ZEB-418 P2 round-2 (Greptile P1): cross-layer contract test pinning the

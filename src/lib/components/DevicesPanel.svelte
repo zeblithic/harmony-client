@@ -43,6 +43,13 @@
   let mintInFlight = $state(false);
   let mintError = $state<string | null>(null);
   let recoveryToken = $state<string | null>(null);
+  // ZEB-196: generation guard for in-flight token issuance. Bumped on every new
+  // issue and on closeBackup, so a token whose async issuance resolves *after*
+  // the modal was cancelled (or after a newer issue started) is revoked rather
+  // than stored — otherwise it would linger in the bounded backend TOKEN_CACHE
+  // and still LRU-evict a legitimate token. Plain (non-$state) counter: read/
+  // written imperatively, never drives the UI.
+  let backupTokenGen = 0;
 
   // ZEB-650 meta facts. communitiesCount/lastBackedUpMs are plain $state (not
   // $derived) because localStorage and the IPC aren't reactive — they're keyed
@@ -634,19 +641,33 @@
     // post-mint token will surface as "expired or invalid" on commit, which is
     // recoverable via the inline Retry button.
     if (recoveryToken !== null) return;
-    try {
-      recoveryToken = await svc.issueRecoveryToken();
-    } catch (e) {
-      backupError = extractError(e);
-    }
+    await issueTokenGuarded();
   }
 
   async function retryIssueToken() {
     backupError = null;
+    await issueTokenGuarded();
+  }
+
+  // ZEB-196: issue a recovery token, guarding against the modal being cancelled
+  // (or a newer issue starting) while the async issuance is in flight. If the
+  // generation has moved on by the time the token arrives — closeBackup bumps
+  // it, as does a subsequent issue — the modal is no longer waiting for this
+  // token: store nothing and revoke the orphan (fire-and-forget) so it can't
+  // linger in the backend cache and LRU-evict a legitimate token.
+  async function issueTokenGuarded() {
+    const myGen = ++backupTokenGen;
     try {
-      recoveryToken = await svc.issueRecoveryToken();
+      const token = await svc.issueRecoveryToken();
+      if (myGen !== backupTokenGen || !backupOpen) {
+        void svc.revokeRecoveryToken(token).catch(() => {});
+        return;
+      }
+      recoveryToken = token;
     } catch (e) {
-      backupError = extractError(e);
+      // Only surface the error if this issuance is still the current one; a
+      // failure from an abandoned (cancelled) issue must not stamp the UI.
+      if (myGen === backupTokenGen) backupError = extractError(e);
     }
   }
 
@@ -756,6 +777,21 @@
 
   function closeBackup() {
     backupOpen = false;
+    // ZEB-196: invalidate any in-flight token issuance so a token that resolves
+    // after this close is revoked (not stored) by issueTokenGuarded.
+    backupTokenGen++;
+    // ZEB-196: proactively revoke the server-side token on cancel so an
+    // issued-but-unconsumed token can't linger for its 5-minute TTL and
+    // LRU-evict a legitimate live token (e.g. a freshly minted one). Capture
+    // the reference BEFORE nulling; fire-and-forget (don't block the modal
+    // close on the round-trip) and swallow errors — the token TTL-expires
+    // anyway, so there is nothing the user could act on. On the happy export
+    // path commitBackup has already nulled the token, so this is skipped and no
+    // wasted revoke is issued.
+    const tokenToRevoke = recoveryToken;
+    if (tokenToRevoke !== null) {
+      void svc.revokeRecoveryToken(tokenToRevoke).catch(() => {});
+    }
     // Tokens are single-use server-side; don't carry across opens.
     recoveryToken = null;
     // Wipe sensitive passphrase material from component state instead of
