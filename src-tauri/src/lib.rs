@@ -41977,10 +41977,14 @@ async fn cleanup_community_data_if_durable(
 /// re-invite (`apply_space` rejects tombstoned ids), so a failed unlink only
 /// leaves bytes the tombstone makes unreachable (warn, don't err).
 fn delete_community_dir(id_hex: &str, gen_check: impl FnOnce() -> Result<(), String>) {
-    // ZEB-732: guard the no-registry delete too. Its window is smaller (no
-    // `stop_engine().await` precedes it), but a concurrent `start_node`
-    // between the caller's generation snapshot and here could still install a
-    // fresh dir for this id — abort rather than delete it.
+    // ZEB-732: guard the no-registry delete too. There's no `stop_engine().await`
+    // before it, but on a multi-threaded runtime a concurrent `start_node` on
+    // another thread can still bump `generation` and recreate this dir between
+    // the `gen_check` (which releases the NodeState lock) and the delete below
+    // (CodeRabbit). So mirror the registry path: gen_check, then DETACH-then-
+    // delete — synchronously rename the dir out of the canonical path before
+    // removing it, so a freshly-recreated `communities/<id>` is an independent
+    // dir this delete never targets.
     if let Err(reason) = gen_check() {
         tracing::warn!(
             space_id = %id_hex, reason = %reason,
@@ -41988,8 +41992,8 @@ fn delete_community_dir(id_hex: &str, gen_check: impl FnOnce() -> Result<(), Str
         );
         return;
     }
-    let dir = match crate::owner_commands::resolve_identity_dir() {
-        Ok(d) => d.join("communities").join(id_hex),
+    let communities = match crate::owner_commands::resolve_identity_dir() {
+        Ok(d) => d.join("communities"),
         Err(e) => {
             tracing::warn!(
                 space_id = %id_hex, error = %e,
@@ -41998,15 +42002,29 @@ fn delete_community_dir(id_hex: &str, gen_check: impl FnOnce() -> Result<(), Str
             return;
         }
     };
+    let dir = communities.join(id_hex);
     if !dir.exists() {
         return;
     }
-    match std::fs::remove_dir_all(&dir) {
+    // Detach out of the canonical path (atomic rename) before the delete.
+    let detached = communities.join(format!(
+        "{id_hex}.deleting.{}",
+        crate::community_state_sync::unique_detach_suffix()
+    ));
+    if let Err(e) = std::fs::rename(&dir, &detached) {
+        tracing::warn!(
+            space_id = %id_hex, path = %dir.display(), error = %e,
+            "remove_space: failed to detach community dir for delete (the tombstone \
+             still blocks resurrection; the dir is now orphaned dead bytes)"
+        );
+        return;
+    }
+    match std::fs::remove_dir_all(&detached) {
         Ok(()) => tracing::info!(space_id = %id_hex, "remove_space: deleted community dir"),
         Err(e) => tracing::warn!(
-            space_id = %id_hex, path = %dir.display(), error = %e,
-            "remove_space: failed to delete community dir (the tombstone still blocks \
-             resurrection; the dir is now orphaned dead bytes)"
+            space_id = %id_hex, path = %detached.display(), error = %e,
+            "remove_space: failed to delete detached community dir (orphaned dead bytes; \
+             the tombstone still blocks resurrection)"
         ),
     }
 }
@@ -42721,6 +42739,18 @@ mod remove_space_tests {
         > = None;
         cleanup_community_data(&no_registry, &SpaceId(id), &id_hex, || Ok(())).await;
         assert!(!dir.exists(), "community dir deleted via fs fallback");
+        // ZEB-732: detach-then-delete must not leave a `.deleting` temp behind.
+        let communities = tmp.path().join(".harmony").join("communities");
+        let leftover: Vec<String> = std::fs::read_dir(&communities)
+            .expect("read communities dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".deleting"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "fs-fallback detach must remove its temp dir, found: {leftover:?}"
+        );
     }
 
     // ZEB-732: the no-registry fs-fallback delete must ALSO honor the

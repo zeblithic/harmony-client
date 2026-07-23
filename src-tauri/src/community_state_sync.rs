@@ -4261,13 +4261,14 @@ fn community_root_resync_dir(identity_dir: &std::path::Path, id: &SpaceId) -> st
     identity_dir.join("communities").join(hex::encode(id.0))
 }
 
-/// ZEB-732: a process-unique suffix for the detach-then-delete temp name in
-/// [`CommunitySyncRegistry::shutdown_engine_and_cleanup_persistence`]. The
+/// ZEB-732: a process-unique suffix for the detach-then-delete temp name.
+/// Used by both [`CommunitySyncRegistry::shutdown_engine_and_cleanup_persistence`]
+/// (registry path) and `lib.rs::delete_community_dir` (no-registry path). The
 /// monotonic `SEQ` guarantees uniqueness within a run; the wall-clock nanos
 /// disambiguate across process restarts, so a temp dir orphaned by a crash
 /// mid-delete cannot collide with a fresh detach (a collision would make the
 /// `rename` fail and leave the community dir un-deleted).
-fn unique_detach_suffix() -> String {
+pub(crate) fn unique_detach_suffix() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
