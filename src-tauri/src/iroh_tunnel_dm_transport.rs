@@ -96,7 +96,10 @@ pub(crate) fn resolve_owner_tunnel_targets(
             match crate::tunnel_manager::tunnel_peer_from_contact(contact) {
                 Ok(peer) => Some((node_id, peer)),
                 Err(reason) => {
-                    tracing::trace!(
+                    // Restore the pre-delegation visibility of this error path: the
+                    // old tunnel_task driver logged a device-contact reconstruction
+                    // failure at debug!, so keep it at debug! (not trace!) here.
+                    tracing::debug!(
                         %reason,
                         "ZEB-739: skip tunnel target with unmappable device contact"
                     );
