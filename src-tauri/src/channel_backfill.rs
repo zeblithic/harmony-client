@@ -1,5 +1,9 @@
-//! ZEB-418 SP2 P3a: channel-history backfill latch — paging + retry
-//! state machine.
+//! ZEB-418 SP2 P3a: channel-history backfill — the async drivers over the
+//! paging + retry latch. The pure latch state machines were extracted to the
+//! reusable `harmony_crdt_sync` core crate (ZEB-737 / ZEB-571 item 3); this
+//! module keeps the async interpreters (`run_backfill_driver` /
+//! `run_root_fetch_driver`), the epoch/resync helpers, and the `Hlc`
+//! watermark binding, and re-exports the latch primitives (see below).
 //!
 //! When a device joins a channel (or reconnects after downtime) it asks
 //! online holders for the channel history it missed. The serving side
@@ -45,12 +49,23 @@
 
 use crate::owner_state_types::Hlc;
 
-/// First retry delay after an unanswered backfill request (30 s).
-pub const BACKFILL_RETRY_BASE_MS: u64 = 30_000;
+// ZEB-737 (ZEB-571 item 3): the paging/backoff latch primitives were extracted
+// to the reusable `harmony_crdt_sync` core crate. This module keeps the async
+// drivers (`run_backfill_driver` / `run_root_fetch_driver`), the epoch/resync
+// helpers, and the app-specific `Hlc` watermark binding. It re-exports the
+// core primitives — and binds the generic ones to `Hlc` via type aliases — so
+// the drivers, the consumer sites, and the behavior tests below are unchanged.
+pub use harmony_crdt_sync::{
+    RootFetchAction, RootFetchLatch, BACKFILL_RETRY_BASE_MS, BACKFILL_RETRY_CAP_MS,
+};
 
-/// Maximum delay between retry attempts (600 s). Doubling stops here;
-/// the latch retries forever at this cadence until answered.
-pub const BACKFILL_RETRY_CAP_MS: u64 = 600_000;
+/// This app's paging-backfill latch: [`harmony_crdt_sync::BackfillLatch`]
+/// bound to the community [`Hlc`] watermark.
+pub type BackfillLatch = harmony_crdt_sync::BackfillLatch<Hlc>;
+/// The next-action a [`BackfillLatch`] emits (bound to [`Hlc`]).
+pub type BackfillAction = harmony_crdt_sync::BackfillAction<Hlc>;
+/// A completed backfill reply page fed to a [`BackfillLatch`] (bound to [`Hlc`]).
+pub type PageOutcome = harmony_crdt_sync::PageOutcome<Hlc>;
 
 /// ZEB-592: which catch-up strategy the backfill driver follows after probing
 /// for an RBSR responder. The driver tries RBSR first; an old peer (no
@@ -117,185 +132,6 @@ mod reconcile_mode_tests {
             reconcile_mode_after_round(3, false),
             ReconcileMode::RbsrContinue
         );
-    }
-}
-
-/// What the driver should do next, as decided by [`BackfillLatch`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BackfillAction {
-    /// Send a backfill request for events strictly after `since`
-    /// (`None` = from the beginning of channel history).
-    Request { since: Option<Hlc> },
-    /// Nothing to do until the given wall-clock instant (ms); re-poll
-    /// `next_action` at or after that time.
-    WaitUntil(u64),
-    /// The latch is satisfied — no further requests needed until
-    /// [`BackfillLatch::reset`].
-    Idle,
-}
-
-/// Result of a *completed* backfill reply page (a holder answered).
-///
-/// An unanswered query is NOT a `PageOutcome` — report that via
-/// [`BackfillLatch::on_no_reply`] instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageOutcome {
-    /// Number of events the page carried.
-    pub events: usize,
-    /// Maximum HLC among the page's events (`None` for an empty page).
-    pub max_hlc_seen: Option<Hlc>,
-    /// The per-request limit the serving side was asked for (page cap).
-    pub limit: usize,
-}
-
-/// Retry latch + paging state machine for one channel's backfill.
-///
-/// Drive it by polling [`next_action`](Self::next_action) with the
-/// current wall clock and feeding outcomes back via
-/// [`on_page_complete`](Self::on_page_complete) /
-/// [`on_no_reply`](Self::on_no_reply). At most one request is
-/// outstanding at a time (in-flight guard).
-#[derive(Debug, Clone)]
-pub struct BackfillLatch {
-    /// Request events strictly after this HLC (`None` = from start).
-    since: Option<Hlc>,
-    /// Set by a completed short/empty page; cleared by `reset`.
-    satisfied: bool,
-    /// A `Request` has been handed out and neither `on_page_complete`
-    /// nor `on_no_reply` has been called yet.
-    in_flight: bool,
-    /// Earliest wall-clock ms at which the next request may be sent.
-    next_retry_at: u64,
-    /// Current backoff delay (ms); 0 = no consecutive no-reply yet.
-    retry_delay_ms: u64,
-    /// First-retry delay after an unanswered request (ms). Production
-    /// = [`BACKFILL_RETRY_BASE_MS`]; tests inject smaller values via
-    /// [`Self::new_with_backoff`] (threaded from
-    /// `ChannelLogEngineConfig.backfill_retry_base_ms`).
-    retry_base_ms: u64,
-    /// Backoff ceiling (ms). Production = [`BACKFILL_RETRY_CAP_MS`].
-    retry_cap_ms: u64,
-}
-
-impl BackfillLatch {
-    /// New, unsatisfied latch requesting history after `watermark`,
-    /// with the production (spec D24) backoff schedule.
-    pub fn new(watermark: Option<Hlc>) -> Self {
-        Self::new_with_backoff(watermark, BACKFILL_RETRY_BASE_MS, BACKFILL_RETRY_CAP_MS)
-    }
-
-    /// New latch with an explicit backoff schedule (ZEB-418 P3a Task 6:
-    /// test-injectable; spec D24 base/cap are the production values —
-    /// see [`Self::new`]).
-    pub fn new_with_backoff(watermark: Option<Hlc>, base_ms: u64, cap_ms: u64) -> Self {
-        Self {
-            since: watermark,
-            satisfied: false,
-            in_flight: false,
-            next_retry_at: 0,
-            retry_delay_ms: 0,
-            retry_base_ms: base_ms,
-            retry_cap_ms: cap_ms,
-        }
-    }
-
-    /// True once a completed short/empty page has answered the query.
-    pub fn is_satisfied(&self) -> bool {
-        self.satisfied
-    }
-
-    /// Decide the next driver action at wall-clock `now_ms`.
-    pub fn next_action(&mut self, now_ms: u64) -> BackfillAction {
-        if self.satisfied {
-            return BackfillAction::Idle;
-        }
-        if self.in_flight {
-            // A request is already outstanding; nothing new until an
-            // outcome lands. `next_retry_at` may sit in the past here
-            // (it is only re-armed by `on_no_reply`), so clamp to `now`.
-            return BackfillAction::WaitUntil(self.next_retry_at.max(now_ms));
-        }
-        if now_ms < self.next_retry_at {
-            return BackfillAction::WaitUntil(self.next_retry_at);
-        }
-        self.in_flight = true;
-        BackfillAction::Request {
-            since: self.since.clone(),
-        }
-    }
-
-    /// Record a completed reply page (clears in-flight).
-    ///
-    /// Short or empty page satisfies the latch (spec D24: a served
-    /// "nothing" is an answer) and resets backoff. Full page (`events
-    /// >= limit`, `limit > 0`) means more history may remain:
-    ///
-    /// - **Progress** (`max_hlc_seen` is `Some` and differs from the
-    ///   current `since`): advance `since`, reset backoff, and leave
-    ///   the latch unsatisfied so the next `next_action(now)`
-    ///   re-requests immediately — the paging loop.
-    /// - **No progress** (`max_hlc_seen` is `None` or equals the
-    ///   current `since`): see the no-progress branch below.
-    pub fn on_page_complete(&mut self, outcome: PageOutcome, now_ms: u64) {
-        self.in_flight = false;
-
-        let full_page = outcome.limit > 0 && outcome.events >= outcome.limit;
-        if !full_page {
-            // Spec D24: a served "nothing more" is an answer.
-            self.satisfied = true;
-            self.retry_delay_ms = 0;
-            self.next_retry_at = now_ms;
-            return;
-        }
-        let progressed = outcome.max_hlc_seen.is_some() && outcome.max_hlc_seen != self.since;
-        if progressed {
-            // Paging loop: more history may remain behind the cap and
-            // the verified watermark moved — re-request immediately
-            // from the new window, resetting the no-reply backoff.
-            self.since = outcome.max_hlc_seen;
-            self.retry_delay_ms = 0;
-            self.next_retry_at = now_ms;
-        } else {
-            // No-progress full page: the verified watermark did not
-            // move past the window we asked for, so an immediate
-            // re-request would replay the exact same window — a
-            // hostile holder serving garbage that fails verification
-            // (or one that keeps serving already-held duplicates)
-            // would otherwise drive a tight zero-backoff request loop
-            // until shutdown. Arm the same escalating backoff as
-            // [`Self::on_no_reply`] WITHOUT satisfying the latch:
-            // history may genuinely remain, and the holder set can
-            // change, so backing off (rather than declaring done)
-            // keeps liveness.
-            self.arm_backoff(now_ms);
-        }
-    }
-
-    /// Record an unanswered request (clears in-flight, arms backoff).
-    ///
-    /// Delay schedule: `retry_base_ms` (production 30 s), doubling per
-    /// consecutive no-reply, capped at `retry_cap_ms` (production
-    /// 600 s); retries forever (driver enforces shutdown).
-    pub fn on_no_reply(&mut self, now_ms: u64) {
-        self.in_flight = false;
-        self.arm_backoff(now_ms);
-    }
-
-    /// Escalate the retry backoff and arm `next_retry_at`. Shared by
-    /// [`Self::on_no_reply`] and the no-progress full-page branch of
-    /// [`Self::on_page_complete`]. Delegates the step computation to
-    /// [`arm_backoff_step`].
-    fn arm_backoff(&mut self, now_ms: u64) {
-        self.retry_delay_ms =
-            arm_backoff_step(self.retry_delay_ms, self.retry_base_ms, self.retry_cap_ms);
-        self.next_retry_at = now_ms + self.retry_delay_ms;
-    }
-
-    /// Re-arm a satisfied latch with a new watermark (transport-recovery
-    /// hook); clears in-flight and backoff state. Preserves the
-    /// configured backoff schedule.
-    pub fn reset(&mut self, watermark: Option<Hlc>) {
-        *self = Self::new_with_backoff(watermark, self.retry_base_ms, self.retry_cap_ms);
     }
 }
 
@@ -818,32 +654,7 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     }
 }
 
-// ── Shared backoff helper ────────────────────────────────────────────────────
-
-/// One escalation step of the shared retry-backoff schedule: first
-/// retry waits `base` clamped to `cap` (a misconfigured base > cap
-/// must not violate the cap), then doubles per consecutive miss up to
-/// the cap. Shared by [`BackfillLatch`] and [`RootFetchLatch`].
-fn arm_backoff_step(current_delay_ms: u64, base_ms: u64, cap_ms: u64) -> u64 {
-    if current_delay_ms == 0 {
-        base_ms.min(cap_ms)
-    } else {
-        (current_delay_ms * 2).min(cap_ms)
-    }
-}
-
 // ── ZEB-434: community state-root fetch latch ────────────────────────────────
-
-/// What the root-fetch driver should do next.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RootFetchAction {
-    /// Send one state-root query (full-state exchange — no `since`).
-    Request,
-    /// Re-poll `next_action` at or after this wall-clock ms.
-    WaitUntil(u64),
-    /// Satisfied — park until `reset()` (transport-recovery re-arm).
-    Idle,
-}
 
 /// Outcome of one root-fetch attempt, as seen by the driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -855,90 +666,6 @@ pub enum RootFetch {
     NoReply,
     /// Engine/adapter permanently gone — stop the driver.
     EngineGone,
-}
-
-/// Retry latch for one community's state-root pull (ZEB-434 D3).
-///
-/// Page-less sibling of [`BackfillLatch`]: a responder always has a
-/// root, so ≥1 reply satisfies and zero replies means no responder.
-/// Shares the spec backoff schedule (30 s base doubling to a 600 s
-/// cap, retrying forever — the driver enforces shutdown).
-#[derive(Debug, Clone)]
-pub struct RootFetchLatch {
-    satisfied: bool,
-    in_flight: bool,
-    next_retry_at: u64,
-    retry_delay_ms: u64,
-    retry_base_ms: u64,
-    retry_cap_ms: u64,
-}
-
-impl RootFetchLatch {
-    /// New, unsatisfied latch with the production (spec D3) backoff schedule.
-    pub fn new() -> Self {
-        Self::new_with_backoff(BACKFILL_RETRY_BASE_MS, BACKFILL_RETRY_CAP_MS)
-    }
-
-    /// New latch with an explicit backoff schedule (test-injectable; mirrors
-    /// [`BackfillLatch::new_with_backoff`]).
-    pub fn new_with_backoff(base_ms: u64, cap_ms: u64) -> Self {
-        Self {
-            satisfied: false,
-            in_flight: false,
-            next_retry_at: 0,
-            retry_delay_ms: 0,
-            retry_base_ms: base_ms,
-            retry_cap_ms: cap_ms,
-        }
-    }
-
-    /// True once at least one responder has replied.
-    pub fn is_satisfied(&self) -> bool {
-        self.satisfied
-    }
-
-    /// Decide the next driver action at wall-clock `now_ms`.
-    pub fn next_action(&mut self, now_ms: u64) -> RootFetchAction {
-        if self.satisfied {
-            return RootFetchAction::Idle;
-        }
-        if self.in_flight {
-            return RootFetchAction::WaitUntil(self.next_retry_at.max(now_ms));
-        }
-        if now_ms < self.next_retry_at {
-            return RootFetchAction::WaitUntil(self.next_retry_at);
-        }
-        self.in_flight = true;
-        RootFetchAction::Request
-    }
-
-    /// ≥1 responder replied: satisfied, backoff cleared.
-    pub fn on_reply(&mut self, now_ms: u64) {
-        self.in_flight = false;
-        self.satisfied = true;
-        self.retry_delay_ms = 0;
-        self.next_retry_at = now_ms;
-    }
-
-    /// Zero responders: arm the escalating backoff (same schedule and
-    /// clamp semantics as `BackfillLatch::arm_backoff`).
-    pub fn on_no_reply(&mut self, now_ms: u64) {
-        self.in_flight = false;
-        self.retry_delay_ms =
-            arm_backoff_step(self.retry_delay_ms, self.retry_base_ms, self.retry_cap_ms);
-        self.next_retry_at = now_ms + self.retry_delay_ms;
-    }
-
-    /// Transport-recovery re-arm: unsatisfy, clear in-flight + backoff.
-    pub fn reset(&mut self) {
-        *self = Self::new_with_backoff(self.retry_base_ms, self.retry_cap_ms);
-    }
-}
-
-impl Default for RootFetchLatch {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Drive one community's [`RootFetchLatch`]: query at spawn, back off
