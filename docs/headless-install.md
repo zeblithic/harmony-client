@@ -230,20 +230,20 @@ a real identity you want to keep.
 
 ### Concurrent identity writes
 
-The `restore mnemonic` and `restore recovery-file` commands take an OS
-advisory lock on `~/.harmony/identity.enc.lock` spanning their whole
-check-and-write, so two `restore` invocations racing the same `~/.harmony`
-cannot silently clobber each other: the loser fails fast with `another
-harmony-app process is writing the identity store; retry once it finishes`
-rather than overwriting the winner. The lock is released automatically if
-the holder process dies, so a crash never strands it — no manual lockfile
-cleanup is needed.
+Every writer of the at-rest identity material — `restore mnemonic`,
+`restore recovery-file`, `rotate-passphrase`, and first-boot identity
+**generation** (when no identity exists yet) — takes the same OS advisory
+lock on `~/.harmony/identity.enc.lock` spanning its whole check-and-write.
+So any two of them racing the same `~/.harmony` cannot silently clobber
+each other: the loser fails fast with `another harmony-app process is
+writing the identity store; retry once it finishes` rather than overwriting
+the winner. A first-boot generate that loses the race re-checks under the
+lock and adopts the identity the winner just wrote, instead of generating a
+throwaway one. The lock is released automatically if the holder process
+dies, so a crash never strands it — no manual lockfile cleanup is needed.
 
-First-boot identity **generation** (when no identity exists yet) is a
-separate code path that does not take this lock; concurrent `serve` / GUI
-boots are instead mutually excluded by the per-profile `serve.lock`.
-Fully serializing a first-boot generate against a concurrent standalone
-`restore` in another process is tracked as ZEB-735.
+Concurrent `serve` / GUI boots of the *same profile* are additionally
+excluded earlier, by the per-profile `serve.lock`.
 
 ### Why two formats?
 
