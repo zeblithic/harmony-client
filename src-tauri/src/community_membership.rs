@@ -5627,6 +5627,17 @@ pub enum AutoExecOutcome {
     /// log sync. This is the intentional "wrong replica" path, not a
     /// failure.
     SkippedNotAdmin,
+    /// ZEB-734: this replica clears the (possibly lowered) `set_power`
+    /// threshold but does NOT hold admin power (`max`), and the finalized
+    /// outcome is admin-affecting (grants/removes admin). A direct SetPower
+    /// would self-reject at `verify_event`
+    /// (`SetPowerAdminAffectingRequiresAdmin`), and routing via `AdminProposal`
+    /// is equally unavailable (AP2 requires proposer power == `max`). Skip and
+    /// defer to an admin replica — behaviorally the same "wrong replica"
+    /// deferral as `SkippedNotAdmin`, but tracked as a distinct outcome so
+    /// telemetry doesn't conflate "below the set_power floor" with "moderator
+    /// clears set_power yet lacks the admin tier."
+    SkippedAdminAffectingRequiresAdmin,
     /// ZEB-300: community has `admin_quorum > 1` and the SetPower outcome
     /// is admin-affecting (`new_power == 100` OR target currently holds
     /// power 100), so it routes through `AdminProposal` instead of a
@@ -6071,7 +6082,7 @@ pub async fn apply_auto_exec_set_power(
             new_power,
             "auto_exec_set_power: skipping — admin-affecting change requires admin power (local actor is a sub-admin moderator; deferring to admin race)"
         );
-        return Ok(AutoExecOutcome::SkippedNotAdmin);
+        return Ok(AutoExecOutcome::SkippedAdminAffectingRequiresAdmin);
     }
     if blocked_by_quorum {
         // ZEB-300: admin_quorum > 1 + admin-affecting → route through
