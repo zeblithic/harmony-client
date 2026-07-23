@@ -3030,31 +3030,44 @@ pub fn write_seed_to_disk(
 /// `OWNER_STATE_WRITE_LOCK`).
 pub(crate) static IDENTITY_FILE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Documented TOCTOU note (`!force` path): the existence probes (keychain
-/// `load()`, `enc_path.exists()`, `EncryptedFileStore::from_env`) happen
-/// before `save_with_fallback`, so two concurrent processes that both pass
-/// the probe could both proceed to save, with the second silently winning.
+/// **Cross-process write serialization (ZEB-179).** The probe-and-write
+/// critical section below is a check-then-act: the `!force` existence probes
+/// (keychain `load()`, `enc_path.exists()`) run before `save_with_fallback`,
+/// so without coordination two concurrent processes could both pass the probe
+/// and both write, the second silently clobbering the first. The in-process
+/// `IDENTITY_FILE_WRITE_LOCK` above closes this only *within* one process; to
+/// close it *across* processes — the realistic case being an operator
+/// accidentally running two `harmony-app restore` / `mint` invocations against
+/// the same `~/.harmony` — this function also takes an `fd_lock` OS advisory
+/// write lock on `identity.enc.lock` spanning the whole probe-and-write.
+/// Mirrors `api::lock` (ZEB-445); `fd_lock` releases the lock on process
+/// death, so a crashed peer never strands it (no PID-liveness / stale-lock
+/// reclaim logic needed — the reason this was deferrable in April, before
+/// fd-lock landed).
 ///
-/// We accept this race because:
-///   1. The threat model is a single-user CLI tool; the only realistic
-///      scenario is the same operator invoking `harmony-app restore` twice
-///      in parallel (e.g. by accident). There is no adversarial concurrent
-///      writer.
-///   2. The integrity guarantee that matters most — AEAD authentication of
-///      the encrypted file — is unaffected. A `restore` race ends with one
-///      operator-supplied identity winning; neither half-state nor a
-///      forged identity is reachable.
-///   3. A correct lockfile fix is non-trivial: stdlib has no portable
-///      file-lock primitive (would require `fs2` / `fd-lock`), stale
-///      lockfiles after process crashes need recovery UX, NFS-mounted
-///      `~/.harmony` directories have known fcntl-lock quirks, and the
-///      keychain side of the resolution chain has no atomic
-///      "add-if-absent" primitive exposed by the `keyring` crate — so
-///      locking would only close the file-path race, leaving the keychain
-///      race documented but unfixed.
+/// Layered INSIDE the in-process mutex on purpose: `flock` / `LockFileEx` are
+/// per-open-file-description and self-conflict between two handles in one
+/// process, so the mutex (always acquired first) guarantees a single thread
+/// per process ever reaches the fd-lock — no intra-process self-deadlock. The
+/// acquire is non-blocking (`try_write`): a loser fails fast with a clear
+/// "another process is writing" error rather than hanging, and on retry simply
+/// observes the now-existing file (the ordinary "already exists" refusal).
 ///
-/// Tracked as a follow-up; not blocking ZEB-176. If you hit this in
-/// practice, that's a signal we should revisit — please file a bug.
+/// Residual, documented and accepted: the keychain side has no atomic
+/// add-if-absent (`keyring::set_password` is an unconditional overwrite), so
+/// two *force* writes to the keychain remain last-writer-wins. The fd-lock
+/// still serializes them (both take it before touching the keychain), so the
+/// outcome is a clean last-writer-wins of an operator-supplied identity —
+/// never an interleaved half-state, and AEAD authentication of the file is
+/// unaffected. Closing the keychain race outright needs an upstream `keyring`
+/// change; out of scope per ZEB-179.
+///
+/// Scope note: this cross-process guard lives only in this function.
+/// [`rotate_passphrase`] and first-boot generation
+/// ([`load_or_generate_with_stores_post_probe`]) take only the in-process
+/// `IDENTITY_FILE_WRITE_LOCK`, so a cross-process `rotate` or boot-generate
+/// racing a `restore` is not yet serialized — tracked as ZEB-735. Do not
+/// over-generalize "cross-process serialized" to those paths.
 pub fn write_seed_to_disk_with_keychain(
     identity_path: &Path,
     seed: &[u8; BLOB_LEN],
@@ -3068,6 +3081,39 @@ pub fn write_seed_to_disk_with_keychain(
     let _identity_file_guard = IDENTITY_FILE_WRITE_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
+
+    // ZEB-179: cross-process guard spanning the probe-and-write below. See the
+    // fn rustdoc for why this layers inside IDENTITY_FILE_WRITE_LOCK and why the
+    // acquire is non-blocking. Held (via `_cross_process_guard`) to fn return.
+    let lock_path = identity_path.with_file_name("identity.enc.lock");
+    // Filter empty parents (a bare relative `identity_path` yields `Some("")`,
+    // and `create_dir_all("")` errors) — same guard as `write_atomic_0600`.
+    if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("open identity write-lock {}: {e}", lock_path.display()))?;
+    let mut cross_process_lock = fd_lock::RwLock::new(lock_file);
+    // Only genuine contention (`WouldBlock`) means "another writer holds it";
+    // other I/O errors (e.g. `Interrupted` from a signal) must surface as real
+    // failures, not be masked as a retryable contention message.
+    let _cross_process_guard = cross_process_lock.try_write().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            "another harmony-app process is writing the identity store; retry once it finishes"
+                .to_string()
+        } else {
+            format!(
+                "could not acquire identity write-lock {}: {e}",
+                lock_path.display()
+            )
+        }
+    })?;
+
     let enc_path = identity_path.with_file_name("identity.enc");
     let mut keychain_healthy = false;
 
@@ -3644,6 +3690,70 @@ mod tests {
             "unblocked writer must succeed; got {result:?}"
         );
         handle.join().unwrap();
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn write_seed_refuses_while_another_process_holds_the_write_lock() {
+        // ZEB-179: the cross-process fd-lock must make a second writer fail fast
+        // rather than race the probe-and-write. We simulate a "concurrent
+        // process" by holding an fd-lock write guard on the same
+        // `identity.enc.lock`: flock is per-open-file-description, so a second
+        // handle in THIS process conflicts exactly as another process would
+        // (this is precisely what `api::lock`'s own test relies on). Fully
+        // deterministic — no spawned binaries.
+        std::env::set_var("HARMONY_PASSPHRASE", "zeb179-fdlock-test");
+        let dir = tempfile::tempdir().unwrap();
+        let identity_path = dir.path().join("identity.key");
+        let enc_path = identity_path.with_file_name("identity.enc");
+        let lock_path = identity_path.with_file_name("identity.enc.lock");
+
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        let mut external = fd_lock::RwLock::new(lock_file);
+        let held = external
+            .try_write()
+            .expect("external holder acquires the write lock");
+
+        // While the peer holds the lock, write_seed must refuse fast (non-blocking).
+        let err = write_seed_to_disk_with_keychain(
+            &identity_path,
+            &[0x99u8; 32],
+            /*force=*/ false,
+            None,
+        )
+        .expect_err("must refuse while another writer holds the cross-process lock");
+        assert!(
+            err.contains("another harmony-app process is writing"),
+            "actual: {err}"
+        );
+        // The probe-and-write never ran, so nothing was written.
+        assert!(
+            !enc_path.exists(),
+            "no identity.enc may be created while the write is blocked"
+        );
+
+        // Release the simulated peer; the write now succeeds and round-trips.
+        drop(held);
+        write_seed_to_disk_with_keychain(
+            &identity_path,
+            &[0x99u8; 32],
+            /*force=*/ false,
+            None,
+        )
+        .expect("write must succeed once the cross-process lock is free");
+        let reloaded = read_seed_from_disk_with_keychain(&identity_path, None).expect("reload");
+        assert_eq!(
+            *reloaded, [0x99u8; 32],
+            "the seed must round-trip after the lock frees"
+        );
 
         std::env::remove_var("HARMONY_PASSPHRASE");
     }

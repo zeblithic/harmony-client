@@ -702,7 +702,7 @@
     // the Rust backend's `passphrase.chars().count()` for multibyte input
     // (emoji, CJK). Spreading a string yields one element per codepoint.
     if ([...backupPassphrase].length < MIN_RECOVERY_PASSPHRASE_LEN) {
-      backupError = `Passphrase must be at least ${MIN_RECOVERY_PASSPHRASE_LEN} characters.`;
+      backupError = `Recovery passphrase must be at least ${MIN_RECOVERY_PASSPHRASE_LEN} characters.`;
       return;
     }
     // Comment cap is BYTES (matches harmony-owner's hard 256-byte limit on

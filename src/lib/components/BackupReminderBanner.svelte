@@ -104,7 +104,7 @@
     // the identity the user actually backed up.
     const backupOwnerId = ownerId;
     if ([...passphrase].length < MIN_RECOVERY_PASSPHRASE_LEN) {
-      error = `Passphrase must be at least ${MIN_RECOVERY_PASSPHRASE_LEN} characters.`;
+      error = `Recovery passphrase must be at least ${MIN_RECOVERY_PASSPHRASE_LEN} characters.`;
       return;
     }
     if (inFlight) return;

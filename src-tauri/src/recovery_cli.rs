@@ -343,7 +343,9 @@ pub fn export_recovery_file_with_keychain(
     let seed = identity::read_seed_from_disk_with_keychain(identity_path, keychain)?;
     let artifact = RecoveryArtifact::from_seed(*seed);
     let metadata = RecoveryMetadata {
-        mint_at: None,
+        // ZEB-180: stamp the export time so restore can surface it (spot a
+        // stale backup vs. the live identity).
+        mint_at: Some(mint_timestamp_secs()),
         comment: comment.map(str::to_string),
     };
     let bytes = artifact
@@ -374,6 +376,37 @@ pub fn owner_state_path(harmony_dir: &Path) -> PathBuf {
 
 pub fn last_backup_path(harmony_dir: &Path) -> PathBuf {
     harmony_dir.join("last_backup.json")
+}
+
+/// Wall-clock seconds since the Unix epoch, stamped into a recovery file's
+/// `mint_at` at export time so a later restore can surface *when* the backup
+/// was made (ZEB-180). Uses the same `SystemTime::now()` idiom as the
+/// owner-state export path below; saturates to 0 if the clock predates the
+/// epoch (unreachable in practice — keeps stamping infallible).
+///
+/// `pub(crate)` so the GUI export command (`owner_commands::
+/// export_owner_recovery_file_to_path`) stamps identically to the two CLI
+/// exporters — one source of truth for the timestamp.
+pub(crate) fn mint_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Format a recovery file's `mint_at` (Unix seconds) as an RFC 3339 UTC
+/// timestamp for operator display on restore (ZEB-180). Falls back to raw
+/// seconds if the value is outside chrono's representable range (unreachable
+/// for real timestamps).
+fn format_mint_at(secs: u64) -> String {
+    // `i64::try_from` before chrono: a raw `secs as i64` would wrap values above
+    // `i64::MAX` into negative (pre-1970) timestamps that chrono formats as a
+    // plausible date, defeating the raw-seconds fallback the doc promises.
+    i64::try_from(secs)
+        .ok()
+        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| format!("{secs} (unix seconds)"))
 }
 
 /// Compose the sidecar HRSS path next to `out`. Matches the spec
@@ -530,7 +563,9 @@ pub fn export_recovery_file_pair_with_keychain(
     };
     let artifact = RecoveryArtifact::from_seed(*seed);
     let metadata = RecoveryMetadata {
-        mint_at: None,
+        // ZEB-180: stamp the export time so restore can surface it (spot a
+        // stale backup vs. the live identity).
+        mint_at: Some(mint_timestamp_secs()),
         comment: comment.map(str::to_string),
     };
     let bytes = match artifact.to_encrypted_file(&passphrase, &metadata) {
@@ -723,6 +758,12 @@ pub fn restore_recovery_file_pair_with_keychain(
     };
     let restored =
         RecoveryArtifact::from_encrypted_file(&bytes, &passphrase).map_err(|e| e.to_string())?;
+    // ZEB-180: capture the recovery-file metadata before into_artifact()
+    // discards it, so we can surface it to the operator (stderr + the returned
+    // RestoreResult). mint_at is None for files exported before stamping
+    // landed; comment is None unless --comment was passed at export.
+    let mint_at = restored.metadata.mint_at;
+    let comment = restored.metadata.comment.clone();
     let artifact = restored.into_artifact();
     let seed_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(*artifact.as_bytes());
     let id_hash = artifact.master_pubkey_bundle().identity_hash();
@@ -798,6 +839,19 @@ pub fn restore_recovery_file_pair_with_keychain(
         0
     };
 
+    // ZEB-180: surface the recovery-file metadata so the operator can confirm
+    // WHICH backup this is (comment) and WHEN it was minted (spot a stale
+    // backup vs. the live identity), alongside the existing identity-hash line.
+    if let Some(secs) = mint_at {
+        eprintln!("recovery-file minted-at: {}", format_mint_at(secs));
+    }
+    if let Some(ref c) = comment {
+        // The comment is decrypted from the (portable, possibly shared) recovery
+        // file, so escape it before writing to the terminal — a crafted comment
+        // could otherwise inject ANSI/OSC/CR sequences into the operator's
+        // console. `escape_default` renders control chars visibly.
+        eprintln!("recovery-file comment: {}", c.escape_default());
+    }
     eprintln!("restored identity-hash: {}", hex::encode(id_hash));
     if let Some(ref hlc) = snap_at {
         eprintln!(
@@ -818,6 +872,8 @@ pub fn restore_recovery_file_pair_with_keychain(
         spaces_restored,
         sidecar_present: want_sidecar,
         snapshot_at: snap_at,
+        mint_at,
+        comment,
     })
 }
 
@@ -831,6 +887,14 @@ pub struct RestoreResult {
     /// `wall_ms` so callers (Task 9 GUI) can surface "exported from
     /// device X at time T". CLI stderr surfaces only `wall_ms`.
     pub snapshot_at: Option<Hlc>,
+    /// ZEB-180: recovery-file metadata parsed from the HRMR envelope.
+    /// `mint_at` is Unix seconds stamped at export (None for files exported
+    /// before stamping landed); `comment` is the operator's `--comment` at
+    /// export time (None if omitted). Surfaced on restore for a GUI caller
+    /// (the eventual Settings → Identity wizard) and asserted by tests; the
+    /// CLI additionally prints both to stderr.
+    pub mint_at: Option<u64>,
+    pub comment: Option<String>,
 }
 
 /// Derive the 16-byte owner address from a 32-byte seed.
@@ -1308,6 +1372,81 @@ mod tests {
 
         std::env::remove_var("HARMONY_PASSPHRASE");
         std::env::remove_var("HARMONY_RECOVERY_PASSPHRASE");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_surfaces_mint_at_and_comment() {
+        // ZEB-180: export stamps mint_at + carries --comment, and restore
+        // surfaces BOTH in the returned RestoreResult (the CLI additionally
+        // prints them to stderr). Hermetic: injected keychain=None and the
+        // recovery passphrase passed directly, so no env resolution is needed.
+        use secrecy::SecretString;
+        let dir = tempfile::tempdir().unwrap();
+        let src_identity = dir.path().join("identity.key");
+        let recovery_out = dir.path().join("recovery.bin");
+        let restore_dir = dir.path().join("restore");
+        std::fs::create_dir_all(&restore_dir).unwrap();
+        let dst_identity = restore_dir.join("identity.key");
+
+        std::env::set_var("HARMONY_PASSPHRASE", "at-rest-pass");
+        identity::write_seed_to_disk_with_keychain(
+            &src_identity,
+            &[0xB1u8; 32],
+            /*force=*/ true,
+            None,
+        )
+        .unwrap();
+
+        let recovery_pass = SecretString::from("recovery-pass".to_string());
+        let before = mint_timestamp_secs();
+        export_recovery_file_with_keychain(
+            &src_identity,
+            &recovery_out,
+            Some("laptop-backup"),
+            Some(&recovery_pass),
+            /*keychain=*/ None,
+        )
+        .expect("export");
+
+        let result = restore_recovery_file_pair_with_keychain(
+            &dst_identity,
+            &restore_dir,
+            &recovery_out,
+            Some(&recovery_pass),
+            /*force=*/ false,
+            /*ignore_state=*/ false,
+            /*keychain=*/ None,
+        )
+        .expect("restore");
+
+        assert_eq!(
+            result.comment.as_deref(),
+            Some("laptop-backup"),
+            "restore must surface the export --comment"
+        );
+        let minted = result
+            .mint_at
+            .expect("restore must surface a mint_at stamped at export");
+        assert!(
+            minted >= before,
+            "mint_at ({minted}) must be >= the pre-export timestamp ({before})"
+        );
+
+        std::env::remove_var("HARMONY_PASSPHRASE");
+    }
+
+    #[test]
+    fn format_mint_at_falls_back_for_out_of_range_seconds() {
+        // A normal timestamp formats as RFC 3339 UTC.
+        assert_eq!(format_mint_at(0), "1970-01-01T00:00:00Z");
+        // A u64 value above i64::MAX must fall back to raw seconds rather than
+        // wrapping into a bogus pre-1970 date (review hardening).
+        let out = format_mint_at(u64::MAX);
+        assert!(
+            out.contains("unix seconds"),
+            "out-of-range mint_at must use the raw-seconds fallback, got: {out}"
+        );
     }
 
     #[test]
