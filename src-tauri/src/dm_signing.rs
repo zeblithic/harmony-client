@@ -90,7 +90,7 @@ pub fn seal_to_owner_with_info(
         info,
         &mut rand::rngs::OsRng,
     )
-    .map_err(map_sealed_box_err)
+    .map_err(|e| map_sealed_box_err(e, DmSignError::EncryptionFailed))
 }
 
 /// Open a sealed envelope using the recipient's X25519 private key.
@@ -112,7 +112,7 @@ pub fn open_from_owner_with_info(
     info: &[u8],
 ) -> Result<Vec<u8>, DmSignError> {
     harmony_crypto::sealed_box::open(recipient_x25519_priv, sealed, info)
-        .map_err(map_sealed_box_err)
+        .map_err(|e| map_sealed_box_err(e, DmSignError::DecryptionFailed))
 }
 
 /// Convert an Ed25519 public key to an X25519 public key via the
@@ -145,17 +145,19 @@ pub fn ed25519_priv_to_x25519(
 const ZEB_249_EPOCH_KEY_SEAL_INFO: &[u8] = b"harmony-zeb-249-epoch-key-seal";
 
 /// Map a `harmony_crypto` sealed-box error onto this module's `DmSignError`
-/// taxonomy. `sealed_box::seal`/`open` only ever produce the four variants
-/// matched below; the catch-all is defensive — the fixed 32-byte HKDF output
-/// length can never trip `HkdfLengthExceeded`.
-fn map_sealed_box_err(e: harmony_crypto::CryptoError) -> DmSignError {
+/// taxonomy. The explicit arms are operation-agnostic (`sealed_box::seal`/`open`
+/// only ever produce these four today); `fallback` is the operation-appropriate
+/// default for any future `CryptoError` variant, so a seal error never surfaces
+/// as a decryption failure (or vice versa). The fixed 32-byte HKDF output length
+/// can never trip `HkdfLengthExceeded`, so the fallback is currently unreachable.
+fn map_sealed_box_err(e: harmony_crypto::CryptoError, fallback: DmSignError) -> DmSignError {
     use harmony_crypto::CryptoError;
     match e {
         CryptoError::AeadEncryptFailed => DmSignError::EncryptionFailed,
         CryptoError::AeadDecryptFailed => DmSignError::DecryptionFailed,
         CryptoError::CiphertextTooShort => DmSignError::MalformedSealedEnvelope,
         CryptoError::InvalidPublicKey => DmSignError::InvalidPublicKey,
-        _ => DmSignError::DecryptionFailed,
+        _ => fallback,
     }
 }
 
