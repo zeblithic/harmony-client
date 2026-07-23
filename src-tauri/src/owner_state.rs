@@ -593,6 +593,24 @@ pub fn save_owner_state_atomic(
     master_seed: Option<&[u8; 32]>,
     keychain: Option<KeychainStore>,
 ) -> Result<(), String> {
+    // ZEB-201: serialize the encrypted-file-fallback secret writes
+    // (`device_sk.enc` / `master_seed.enc`) against `rotate_passphrase` /
+    // `write_seed_to_disk_with_keychain`. Held across the prev-secret snapshot +
+    // write + rollback so the whole sequence is atomic w.r.t. those writers.
+    // This is the INNER lock: callers (mint / pairing-persist / mnemonic-restore)
+    // already hold the OUTER `OWNER_STATE_WRITE_LOCK`, so the fixed
+    // OWNER→IDENTITY acquisition order is deadlock-free (see
+    // `identity::IDENTITY_FILE_WRITE_LOCK`). Taken unconditionally (both keychain
+    // and file modes) for simplicity and defense-in-depth: if the two backends
+    // ever share a file, the guard already covers it. The deliberate tradeoff is
+    // mild over-serialization in pure-keychain mode — the lock is briefly held
+    // across keychain I/O (which has its own serialization), so a concurrent
+    // rotate/write_seed waits behind e.g. a first-access macOS permission
+    // prompt. Never a deadlock (order stays consistent), and identity writes are
+    // rare, so the coarser blocking is acceptable.
+    let _identity_file_guard = crate::identity::IDENTITY_FILE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // Snapshot the prior secrets so a mid-sequence failure on an OVERWRITE
     // (ZEB-439 forced re-adoption) can be rolled back: a fresh device key must
     // never be left orphaned against the previous, still-on-disk
@@ -1648,6 +1666,73 @@ mod persistence_tests {
             loaded.master_seed.as_deref(),
             Some(&a_seed),
             "master seed must roll back to A's after the failed overwrite"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_owner_state_atomic_and_write_seed_do_not_deadlock() {
+        // ZEB-201: save_owner_state_atomic acquires IDENTITY_FILE_WRITE_LOCK as
+        // the INNER lock while its callers hold the OUTER OWNER_STATE_WRITE_LOCK;
+        // write_seed_to_disk_with_keychain acquires only IDENTITY_FILE_WRITE_LOCK.
+        // Running both concurrently must NOT deadlock and both must succeed —
+        // this pins the fixed OWNER→IDENTITY acquisition order (a future
+        // IDENTITY-then-OWNER path would risk inverting it). If a deadlock is
+        // introduced, the recv_timeout below fires and the test fails instead of
+        // hanging until nextest's slow-test timeout.
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "zeb201-deadlock-test-pp");
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let dir_a_path = dir_a.path().to_path_buf();
+        let seed_path_b = dir_b.path().join("identity.key");
+
+        let a = mint_owner(1_700_000_000).unwrap();
+
+        let (tx_a, rx_a) = mpsc::channel::<Result<(), String>>();
+        let (tx_b, rx_b) = mpsc::channel::<Result<(), String>>();
+
+        // Thread A: hold OWNER_STATE_WRITE_LOCK (outer), then save_owner_state_atomic
+        // (which takes IDENTITY inner) — the real mint/pairing caller ordering.
+        std::thread::spawn(move || {
+            let a_seed = *a.recovery_artifact.as_bytes();
+            let _owner_guard = crate::owner_commands::OWNER_STATE_WRITE_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let r = save_owner_state_atomic(
+                &dir_a_path,
+                &a.state,
+                &a.device_signing_key,
+                Some(&a_seed),
+                None,
+            );
+            let _ = tx_a.send(r);
+        });
+
+        // Thread B: write_seed (IDENTITY only) to a different dir — contends on
+        // IDENTITY_FILE_WRITE_LOCK with thread A.
+        std::thread::spawn(move || {
+            let r = crate::identity::write_seed_to_disk_with_keychain(
+                &seed_path_b,
+                &[0x66u8; 32],
+                /*force=*/ true,
+                None,
+            );
+            let _ = tx_b.send(r);
+        });
+
+        let ra = rx_a
+            .recv_timeout(Duration::from_secs(10))
+            .expect("thread A (OWNER⊃IDENTITY) must complete — no deadlock");
+        let rb = rx_b
+            .recv_timeout(Duration::from_secs(10))
+            .expect("thread B (IDENTITY) must complete — no deadlock");
+        assert!(ra.is_ok(), "save_owner_state_atomic must succeed: {ra:?}");
+        assert!(
+            rb.is_ok(),
+            "write_seed_to_disk_with_keychain must succeed: {rb:?}"
         );
     }
 

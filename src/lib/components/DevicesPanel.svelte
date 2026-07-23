@@ -756,6 +756,18 @@
 
   function closeBackup() {
     backupOpen = false;
+    // ZEB-196: proactively revoke the server-side token on cancel so an
+    // issued-but-unconsumed token can't linger for its 5-minute TTL and
+    // LRU-evict a legitimate live token (e.g. a freshly minted one). Capture
+    // the reference BEFORE nulling; fire-and-forget (don't block the modal
+    // close on the round-trip) and swallow errors — the token TTL-expires
+    // anyway, so there is nothing the user could act on. On the happy export
+    // path commitBackup has already nulled the token, so this is skipped and no
+    // wasted revoke is issued.
+    const tokenToRevoke = recoveryToken;
+    if (tokenToRevoke !== null) {
+      void svc.revokeRecoveryToken(tokenToRevoke).catch(() => {});
+    }
     // Tokens are single-use server-side; don't carry across opens.
     recoveryToken = null;
     // Wipe sensitive passphrase material from component state instead of

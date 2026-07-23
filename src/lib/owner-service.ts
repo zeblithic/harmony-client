@@ -212,6 +212,16 @@ export class OwnerService {
     return result.recoveryToken;
   }
 
+  /**
+   * ZEB-196: proactively drop an issued-but-unconsumed recovery token from the
+   * server-side cache (e.g. when the user cancels the backup modal), so it
+   * can't linger for its 5-minute TTL and LRU-evict a legitimate live token.
+   * Idempotent server-side; callers fire it best-effort and needn't await.
+   */
+  async revokeRecoveryToken(recoveryToken: string): Promise<void> {
+    await invoke('revoke_owner_recovery_token', { recoveryToken });
+  }
+
   async exportRecoveryFile(
     recoveryToken: string,
     pathToken: string,
