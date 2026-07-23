@@ -57,7 +57,7 @@ pub fn derive_friendship_secret(
 /// own owner_id (so their friends — who know it — can resolve them); resolving
 /// uses the FRIEND's owner_id. Direction-specific so each side is the sole
 /// writer of its own DHT slot.
-fn case_d_info(epoch: u64, owner_id: &[u8; 16]) -> Vec<u8> {
+pub(crate) fn case_d_info(epoch: u64, owner_id: &[u8; 16]) -> Vec<u8> {
     let mut info = Vec::with_capacity(8 + 16);
     info.extend_from_slice(&epoch.to_be_bytes());
     info.extend_from_slice(owner_id);
