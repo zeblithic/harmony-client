@@ -628,8 +628,18 @@ pub enum CommunitySyncError {
     /// opens a window in which a concurrent `stop_node`/`start_node` can bump
     /// `NodeState.generation` and install a fresh live community for this id;
     /// deleting its dir would be data loss. Distinct from `Persist` because
-    /// nothing failed on disk — the cleanup was intentionally skipped and the
-    /// caller should retry on the current node. Carries the reason.
+    /// nothing failed on disk — the cleanup was intentionally skipped.
+    ///
+    /// The caller path (`cleanup_community_data`) treats this like any other
+    /// cleanup miss: warn-and-continue, best-effort — identical to how a failed
+    /// unlink is handled (the owner-state tombstone still blocks resurrection,
+    /// and an explicit later `remove_space` retries the on-disk cleanup via the
+    /// idempotent already-tombstoned path). The EARLY generation check in
+    /// `cleanup_community_data_if_durable` / `clear_space_local_cache_impl`
+    /// still surfaces a *pre*-cleanup generation change to the caller as `Err`;
+    /// only the deep in-flight abort is swallowed here (Qodo #2: intentional,
+    /// consistent with the established best-effort cleanup semantics). Carries
+    /// the reason.
     #[error("cleanup aborted: {0}")]
     CleanupAborted(String),
     /// Decoded blob's `community_id` doesn't match the engine's
@@ -4251,6 +4261,23 @@ fn community_root_resync_dir(identity_dir: &std::path::Path, id: &SpaceId) -> st
     identity_dir.join("communities").join(hex::encode(id.0))
 }
 
+/// ZEB-732: a process-unique suffix for the detach-then-delete temp name in
+/// [`CommunitySyncRegistry::shutdown_engine_and_cleanup_persistence`]. The
+/// monotonic `SEQ` guarantees uniqueness within a run; the wall-clock nanos
+/// disambiguate across process restarts, so a temp dir orphaned by a crash
+/// mid-delete cannot collide with a fresh detach (a collision would make the
+/// `rename` fail and leave the community dir un-deleted).
+fn unique_detach_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos}.{seq}")
+}
+
 /// Test-only re-export of `classify_incoming_error`. Lets the unit
 /// test pin the reason_tag → variant mapping without exposing the
 /// internal function as part of the public API.
@@ -4916,18 +4943,33 @@ impl CommunitySyncRegistry {
         // destructive delete below. Abort — do NOT delete — on a mismatch.
         gen_check().map_err(CommunitySyncError::CleanupAborted)?;
 
-        // Phase 2: remove the per-community persistence directory.
-        // `tokio::fs::remove_dir_all` so we don't park a worker thread
-        // on the synchronous `std::fs::remove_dir_all`.
-        let dir = self
-            .cfg
-            .identity_dir
-            .join("communities")
-            .join(hex::encode(community_id.0));
+        // Phase 2: remove the per-community persistence directory via
+        // DETACH-THEN-DELETE (Qodo #1 / CodeRabbit).
+        //
+        // The recursive delete is async (`tokio::fs::remove_dir_all(..).await`),
+        // so a concurrent `stop_node`→`start_node` could recreate
+        // `communities/<id>` DURING that await and have the fresh dir destroyed
+        // — the generation re-check above is a necessary fence but not a
+        // sufficient one across the yield. Close it by synchronously renaming
+        // the dir OUT of the canonical path (an atomic metadata op, with no
+        // `.await` between the gen_check and the rename) before the awaited
+        // delete: any `communities/<id>` a racing start_node then creates is an
+        // INDEPENDENT directory this delete never targets. We remove the
+        // detached snapshot instead. The recursive unlink stays async (no
+        // worker parked on `std::fs::remove_dir_all`).
+        let communities = self.cfg.identity_dir.join("communities");
+        let dir = communities.join(hex::encode(community_id.0));
         if dir.exists() {
-            tokio::fs::remove_dir_all(&dir)
-                .await
-                .map_err(|e| CommunitySyncError::Persist(format!("remove_dir_all {dir:?}: {e}")))?;
+            let detached = communities.join(format!(
+                "{}.deleting.{}",
+                hex::encode(community_id.0),
+                unique_detach_suffix()
+            ));
+            std::fs::rename(&dir, &detached)
+                .map_err(|e| CommunitySyncError::Persist(format!("detach {dir:?}: {e}")))?;
+            tokio::fs::remove_dir_all(&detached).await.map_err(|e| {
+                CommunitySyncError::Persist(format!("remove_dir_all {detached:?}: {e}"))
+            })?;
         }
         Ok(())
     }
@@ -6636,6 +6678,17 @@ mod tests {
         assert!(
             !dir.exists(),
             "passing gen_check must delete the community dir"
+        );
+        // ZEB-732: detach-then-delete must not leave a `.deleting` temp behind.
+        let leftover: Vec<String> = std::fs::read_dir(fix.identity_dir.join("communities"))
+            .expect("read communities dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".deleting"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "detach-then-delete must remove its temp dir, found: {leftover:?}"
         );
     }
 
