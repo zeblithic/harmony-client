@@ -329,7 +329,7 @@ impl OpenJoinSetup {
             .expect("alice state");
         let events: Vec<_> = {
             let g = alice_state.lock().await;
-            g.events.values().cloned().collect()
+            g.events().cloned().collect()
         };
         assert!(
             materialize(&events, self.alice_addr)
@@ -735,7 +735,7 @@ async fn assert_alice_materializes_bob_joined(setup: &OpenJoinSetup) {
     for _ in 0..50 {
         let events: Vec<_> = {
             let g = alice_state.lock().await;
-            g.events.values().cloned().collect()
+            g.events().cloned().collect()
         };
         let mat = materialize(&events, setup.alice_addr);
         if mat.members.get(&setup.bob_addr).map(|m| m.status) == Some(MemberStatus::Joined) {
@@ -745,7 +745,7 @@ async fn assert_alice_materializes_bob_joined(setup: &OpenJoinSetup) {
     }
     let events: Vec<_> = {
         let g = alice_state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
     let mat = materialize(&events, setup.alice_addr);
     panic!(
@@ -773,7 +773,7 @@ async fn assert_bob_materializes_channel(setup: &OpenJoinSetup, channel_id: Chan
     for _ in 0..50 {
         let events: Vec<_> = {
             let g = bob_state.lock().await;
-            g.events.values().cloned().collect()
+            g.events().cloned().collect()
         };
         if materialize(&events, setup.alice_addr)
             .channels
@@ -785,7 +785,7 @@ async fn assert_bob_materializes_channel(setup: &OpenJoinSetup, channel_id: Chan
     }
     let events: Vec<_> = {
         let g = bob_state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
     let mat = materialize(&events, setup.alice_addr);
     panic!(
@@ -977,7 +977,7 @@ async fn open_join_cold_start_is_retryable_then_succeeds() {
                 .expect("alice state");
             let events: Vec<_> = {
                 let g = alice_state.lock().await;
-                g.events.values().cloned().collect()
+                g.events().cloned().collect()
             };
             let mat = materialize(&events, s.alice_addr);
             assert!(
@@ -1128,7 +1128,7 @@ async fn build_open_invite_url_for_alice(s: &OpenJoinSetup) -> String {
         .expect("alice state");
     let events: Vec<_> = {
         let g = alice_state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
     let mat = materialize(&events, s.alice_addr);
 

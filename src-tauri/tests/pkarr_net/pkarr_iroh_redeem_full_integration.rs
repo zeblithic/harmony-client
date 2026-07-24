@@ -959,7 +959,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             .expect("bob state must exist after redeem");
         let bob_events: Vec<_> = {
             let g = bob_state.lock().await;
-            g.events.values().cloned().collect()
+            g.events().cloned().collect()
         };
         assert!(
             bob_events.len() >= 3,
@@ -996,7 +996,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             .expect("alice state");
         let alice_events: Vec<_> = {
             let g = alice_state.lock().await;
-            g.events.values().cloned().collect()
+            g.events().cloned().collect()
         };
         let alice_has_pending = alice_events.iter().any(|e| {
             matches!(
@@ -1182,7 +1182,7 @@ async fn targeted_invite_only_generate_then_redeem_roundtrip() {
             .expect("bob state must exist after redeem");
         let bob_events: Vec<_> = {
             let g = bob_state.lock().await;
-            g.events.values().cloned().collect()
+            g.events().cloned().collect()
         };
         let bob_materialized = materialize(&bob_events, s.alice_addr);
         assert_eq!(
@@ -1348,7 +1348,7 @@ async fn targeted_invite_only_multi_device_redeem_opens_correct_envelope() {
             .expect("bob state must exist after redeem");
         let bob_events: Vec<_> = {
             let g = bob_state.lock().await;
-            g.events.values().cloned().collect()
+            g.events().cloned().collect()
         };
         let bob_materialized = materialize(&bob_events, s.alice_addr);
         assert_eq!(
@@ -1551,7 +1551,7 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
             .expect("bob state must exist after redeem");
         let bob_events: Vec<_> = {
             let g = bob_state.lock().await;
-            g.events.values().cloned().collect()
+            g.events().cloned().collect()
         };
         let has_countersign = bob_events.iter().any(|e| {
             matches!(
