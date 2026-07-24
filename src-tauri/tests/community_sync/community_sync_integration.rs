@@ -376,7 +376,7 @@ async fn two_members_dag_sync_full_event_log() {
             .await
             .clone();
         assert_eq!(
-            sb.events.len(),
+            sb.event_count(),
             1,
             "B should hold the (pre-seeded) Join — A's publish carries \
              the same event id, so the merge is a no-op on the CRDT"
@@ -522,7 +522,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
     // is the whole point: we're crafting state that B will see only
     // after AEAD-decryption succeeds and the per-event verify fires.
     event.sig[0] ^= 0xFF;
-    bad_state.events.insert(event.id, event);
+    bad_state.insert_verified_for_test(event);
 
     // Encrypt + publish via the same primitives the engine uses.
     let blob_cleartext = canonical_cbor_encode(&bad_state).expect("encode state");
@@ -581,7 +581,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
     {
         let sb = state_b.lock().await;
         assert_eq!(
-            sb.events.len(),
+            sb.event_count(),
             1,
             "B should hold only the pre-seeded admin Join; \
              the forged-sig event must not have inserted"
@@ -1059,7 +1059,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         Duration::from_millis(10),
         move || {
             let s = Arc::clone(&state_b_for_poll);
-            async move { s.lock().await.events.len() == 2 }
+            async move { s.lock().await.event_count() == 2 }
         },
     )
     .await;
@@ -1069,7 +1069,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
     {
         let sb = state_b.lock().await;
         assert_eq!(
-            sb.events.len(),
+            sb.event_count(),
             2,
             "B's CRDT should hold exactly two events after replay \
              (pre-seeded Join + the new SetPower); a third would mean \
@@ -1859,7 +1859,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
                     .expect("state b");
                 let events_len = {
                     let g = s.lock().await;
-                    g.events.len()
+                    g.event_count()
                 };
                 if events_len != 2 {
                     return false;
@@ -1939,7 +1939,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
     // any future code path (Phase 4 re-Join via admin invite) that
     // bypasses the gate.
     let s = registry_b.state_for(&community_id).await.expect("state b");
-    let events: Vec<_> = s.lock().await.events.values().cloned().collect();
+    let events: Vec<_> = s.lock().await.events().cloned().collect();
     let materialized = harmony_app::community_membership::materialize(&events, alice_addr);
     let alice_state = materialized
         .members
@@ -2386,7 +2386,7 @@ mod task3_kick_setpower_round_trip {
             .expect("B insert A's bootstrap Join (pre-seed)");
         assert!(
             wait_until(
-                || async { state_b.lock().await.events.len() == 1 },
+                || async { state_b.lock().await.event_count() == 1 },
                 Duration::from_secs(10),
             )
             .await,
@@ -2443,7 +2443,7 @@ mod task3_kick_setpower_round_trip {
             .expect("A insert B's redemption Join");
         assert!(
             wait_until(
-                || async { state_a.lock().await.events.len() == 2 },
+                || async { state_a.lock().await.event_count() == 2 },
                 Duration::from_secs(10),
             )
             .await,
@@ -2506,7 +2506,7 @@ mod task3_kick_setpower_round_trip {
         // Wait for B to converge on 3 events (admin Join + B Join + Kick).
         assert!(
             wait_until(
-                || async { f.state_b.lock().await.events.len() == 3 },
+                || async { f.state_b.lock().await.event_count() == 3 },
                 Duration::from_secs(10),
             )
             .await,
@@ -2516,7 +2516,7 @@ mod task3_kick_setpower_round_trip {
         // Both peers' materialized state should show B as Banned.
         let events_b: Vec<_> = {
             let s = f.state_b.lock().await;
-            s.events.values().cloned().collect()
+            s.events().cloned().collect()
         };
         let mat_b: MaterializedMembership = materialize(&events_b, f.owner_a);
         assert_eq!(
@@ -2564,7 +2564,7 @@ mod task3_kick_setpower_round_trip {
 
         assert!(
             wait_until(
-                || async { f.state_b.lock().await.events.len() == 3 },
+                || async { f.state_b.lock().await.event_count() == 3 },
                 Duration::from_secs(10),
             )
             .await,
@@ -2573,7 +2573,7 @@ mod task3_kick_setpower_round_trip {
 
         let events_b: Vec<_> = {
             let s = f.state_b.lock().await;
-            s.events.values().cloned().collect()
+            s.events().cloned().collect()
         };
         let mat_b: MaterializedMembership = materialize(&events_b, f.owner_a);
         assert_eq!(

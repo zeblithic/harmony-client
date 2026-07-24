@@ -425,7 +425,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
 
     let sb = state_b.lock().await;
     assert_eq!(
-        sb.events.len(),
+        sb.event_count(),
         1,
         "B should still hold exactly one event (the pre-seeded Join, also present in A's blob)"
     );

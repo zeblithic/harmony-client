@@ -6244,7 +6244,7 @@ mod tests {
 
         let event = seed_membership_event(community_id, fix.admin_addr);
         let eid = event.id;
-        engine.state().lock().await.events.insert(eid, event);
+        engine.state().lock().await.insert_verified_for_test(event);
 
         // Publish-independent durable fence (the join-commit path). No publish
         // has run, yet the CRDT must be on disk after this returns.
@@ -6252,7 +6252,7 @@ mod tests {
 
         let loaded = load_crdt(&crdt_path, community_id).expect("load_crdt after persist_now");
         assert!(
-            loaded.events.contains_key(&eid),
+            loaded.contains_event(&eid),
             "persist_now must durably write the in-memory membership event"
         );
         // CRDT-ONLY regression (Cursor / CodeRabbit PR #253): persist_now must
@@ -6319,7 +6319,7 @@ mod tests {
 
         let event = seed_membership_event(community_id, fix.admin_addr);
         let eid = event.id;
-        engine.state().lock().await.events.insert(eid, event);
+        engine.state().lock().await.insert_verified_for_test(event);
 
         // flush_now publishes (FAILS — no CAS / no receiver) then, with the
         // fix, still persists the CRDT. The Result surfaces the publish error.
@@ -6332,7 +6332,7 @@ mod tests {
         let loaded =
             load_crdt(&crdt_path, community_id).expect("load_crdt after failed-publish flush");
         assert!(
-            loaded.events.contains_key(&eid),
+            loaded.contains_event(&eid),
             "ZEB-462 B: CRDT must persist even when the publish failed"
         );
 
@@ -7611,7 +7611,10 @@ mod tests {
             first_hlc.expect("B's replay tracker must record A's packet HLC after first ingest");
         let (events_before, channels_before) = {
             let g = b_state.lock().await;
-            (g.events.len(), g.materialize_now(alice_addr).channels.len())
+            (
+                g.event_count(),
+                g.materialize_now(alice_addr).channels.len(),
+            )
         };
         assert_eq!(
             events_before, 2,
@@ -7650,7 +7653,10 @@ mod tests {
 
         let (events_after, channels_after) = {
             let g = b_state.lock().await;
-            (g.events.len(), g.materialize_now(alice_addr).channels.len())
+            (
+                g.event_count(),
+                g.materialize_now(alice_addr).channels.len(),
+            )
         };
         assert_eq!(
             events_before, events_after,
@@ -7890,7 +7896,7 @@ mod tests {
 
         let loaded = load_crdt(&crdt_path, community_id).expect("load persisted crdt");
         assert!(
-            loaded.events.contains_key(&join_id),
+            loaded.contains_event(&join_id),
             "pre-shutdown insert must reach disk via the shutdown arm's final flush"
         );
     }
@@ -7951,8 +7957,8 @@ mod tests {
         let state = engine.state();
         {
             let mut g = state.lock().await;
-            g.events.insert(alice_join.id, alice_join);
-            g.events.insert(bob_pending.id, bob_pending.clone());
+            g.insert_verified_for_test(alice_join);
+            g.insert_verified_for_test(bob_pending.clone());
         }
 
         engine.shutdown().await.expect("shutdown");
@@ -7965,7 +7971,7 @@ mod tests {
         }
 
         let g = state.lock().await;
-        let countersigned = g.events.values().any(|e| {
+        let countersigned = g.events().any(|e| {
             matches!(
                 &e.kind,
                 MembershipEventKind::JoinCountersign { target_event_id }
