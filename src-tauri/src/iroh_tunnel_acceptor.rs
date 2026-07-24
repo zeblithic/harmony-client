@@ -20,7 +20,9 @@
 //! plus best-effort tunnel), so the sender's copy still lands via the deposit
 //! rung and a later attempt succeeds once a slot frees.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use harmony_identity::PqPrivateIdentity;
@@ -41,21 +43,47 @@ use crate::tunnel_manager::{InboundDm, TunnelManager};
 /// deposit rung rather than dropping DMs.
 const MAX_INBOUND_TUNNEL_SESSIONS: usize = 64;
 
+/// ZEB-757: emit at most one inbound-saturation warning per this many ms.
+/// Rejecting is the CHEAP path an inbound flood drives, so a warning per
+/// rejected connection would hand that flood an unbounded log-write amplifier —
+/// exactly the cost the cap exists to shed. Throttling keeps the operator signal
+/// (saturation started, and how heavily) while bounding log volume.
+const REJECT_WARN_INTERVAL_MS: u64 = 30_000;
+
+/// Sentinel for [`InboundAdmission::last_warn_ms`] meaning "no saturation
+/// warning emitted yet", so the FIRST rejection always logs immediately rather
+/// than waiting out a window.
+const WARN_NEVER: u64 = u64::MAX;
+
 /// ZEB-757: admission control for the live inbound tunnel population. Wraps a
 /// [`Semaphore`] sized to the population cap; each admitted inbound tunnel keeps
 /// one owned permit for its whole lifetime, so a `None` from [`try_admit`] means
 /// the population is saturated and the connection must be rejected. Split out as
 /// its own type so the bound is unit-testable without a real iroh endpoint.
 ///
+/// Also owns the saturation-log throttle (see [`REJECT_WARN_INTERVAL_MS`]).
+///
 /// [`try_admit`]: InboundAdmission::try_admit
 struct InboundAdmission {
     sem: Arc<Semaphore>,
+    /// Monotonic base for [`now_ms`](InboundAdmission::now_ms). The throttle
+    /// runs on this limiter's OWN monotonic clock, never wall time — a wall-clock
+    /// step would distort the window (same convention as the ZEB-711 shields).
+    started: Instant,
+    /// Monotonic ms at which the last saturation warning was emitted, or
+    /// [`WARN_NEVER`] if none has been.
+    last_warn_ms: AtomicU64,
+    /// Rejections accumulated since the last emitted warning.
+    rejected_since_warn: AtomicU64,
 }
 
 impl InboundAdmission {
     fn new(cap: usize) -> Self {
         Self {
             sem: Arc::new(Semaphore::new(cap)),
+            started: Instant::now(),
+            last_warn_ms: AtomicU64::new(WARN_NEVER),
+            rejected_since_warn: AtomicU64::new(0),
         }
     }
 
@@ -65,6 +93,38 @@ impl InboundAdmission {
     /// `None` means the live inbound population is at the cap.
     fn try_admit(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.sem).try_acquire_owned().ok()
+    }
+
+    /// Milliseconds since this admission control was built (monotonic).
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Record one rejected inbound connection and decide whether it should log.
+    ///
+    /// Returns `Some(n)` when the caller should emit ONE warning covering `n`
+    /// rejections — the first rejection always logs (so operators see saturation
+    /// begin), and afterwards at most one per [`REJECT_WARN_INTERVAL_MS`].
+    /// Returns `None` when this rejection is instead folded into the count the
+    /// next warning will carry. `now_ms` is a parameter so the window is testable
+    /// without sleeping.
+    fn note_rejection(&self, now_ms: u64) -> Option<u64> {
+        self.rejected_since_warn.fetch_add(1, Ordering::Relaxed);
+        let last = self.last_warn_ms.load(Ordering::Acquire);
+        let due = last == WARN_NEVER || now_ms.saturating_sub(last) >= REJECT_WARN_INTERVAL_MS;
+        if !due {
+            return None;
+        }
+        // Concurrent rejections can all see the window as due; only the one that
+        // installs its timestamp logs, the rest fold into the next window.
+        if self
+            .last_warn_ms
+            .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        Some(self.rejected_since_warn.swap(0, Ordering::Relaxed))
     }
 }
 
@@ -107,11 +167,18 @@ impl IrohHandshakeDispatcher for IrohTunnelAcceptor {
         let permit = match self.admission.try_admit() {
             Some(permit) => permit,
             None => {
-                tracing::warn!(
-                    cap = MAX_INBOUND_TUNNEL_SESSIONS,
-                    "inbound tunnel population cap reached — rejecting connection \
-                     (DM still delivers via the deposit rung)"
-                );
+                // Throttled: a flood drives this path, so it must not become a
+                // log-write amplifier (the warning carries how many rejections
+                // it covers, so nothing is silently lost).
+                if let Some(rejected) = self.admission.note_rejection(self.admission.now_ms()) {
+                    tracing::warn!(
+                        cap = MAX_INBOUND_TUNNEL_SESSIONS,
+                        rejected,
+                        window_ms = REJECT_WARN_INTERVAL_MS,
+                        "inbound tunnel population cap reached — rejecting connections \
+                         (DMs still deliver via the deposit rung)"
+                    );
+                }
                 conn.close(0u32.into(), b"tunnel-population-cap");
                 return;
             }
@@ -165,5 +232,41 @@ mod tests {
 
         drop(p2);
         drop(p3);
+    }
+
+    // ZEB-757 (Qodo): the saturation warning is throttled so an inbound flood
+    // cannot turn the cheap reject path into an unbounded log-write amplifier.
+    // The first rejection logs immediately (operators see saturation begin);
+    // afterwards at most one warning per window, carrying the count it covers so
+    // suppressed rejections are reported, never silently dropped.
+    #[test]
+    fn reject_warning_is_throttled_and_reports_suppressed_count() {
+        let admission = InboundAdmission::new(1);
+
+        assert_eq!(
+            admission.note_rejection(0),
+            Some(1),
+            "first rejection logs immediately"
+        );
+        assert_eq!(
+            admission.note_rejection(1_000),
+            None,
+            "inside the window — folded into the next warning"
+        );
+        assert_eq!(
+            admission.note_rejection(REJECT_WARN_INTERVAL_MS - 1),
+            None,
+            "still inside the window"
+        );
+        assert_eq!(
+            admission.note_rejection(REJECT_WARN_INTERVAL_MS),
+            Some(3),
+            "window elapsed — one warning covering the 3 rejections since the last"
+        );
+        assert_eq!(
+            admission.note_rejection(REJECT_WARN_INTERVAL_MS + 1),
+            None,
+            "the new window starts closed again"
+        );
     }
 }
