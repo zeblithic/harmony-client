@@ -38,9 +38,9 @@ pub trait LogPolicy {
     type Error;                       // e.g. VerifyError
 
     fn event_id(e: &Self::Event) -> Self::EventId;
-    fn sort_key(e: &Self::Event) -> impl Ord;     // total order; membership's 5-tuple (wall_ms, logical, device_id, id, sig)
+    fn cmp(a: &Self::Event, b: &Self::Event) -> core::cmp::Ordering; // total order; membership's 5-tuple (wall_ms, logical, device_id, id, sig)
     fn verify(e: &Self::Event, prior: &Self::State, ctx: &Self::Context) -> Result<(), Self::Error>;
-    fn materialize(events: &[Self::Event], ctx: &Self::Context) -> Self::State;
+    fn materialize(events: &[&Self::Event], ctx: &Self::Context) -> Self::State; // borrowed refs — no Event: Clone bound
 }
 
 pub enum InsertOutcome<E> { Inserted, AlreadyKnown, Rejected(E) }
