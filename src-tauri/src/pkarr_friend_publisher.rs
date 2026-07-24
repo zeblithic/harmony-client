@@ -4,14 +4,23 @@
 //! handle per active friend; mirrors `PkarrIdentityPublisher`.
 
 use crate::friend_rendezvous::{
-    case_d_publish_key, case_d_resolve_key, open_case_d_payload, seal_case_d_payload,
+    case_d_info, case_d_publish_key, open_case_d_payload, seal_case_d_payload,
 };
 use harmony_pkarr::{
-    current_epoch_id, epoch_tolerance_window, EphemeralKeyBuilder, PkarrPublisher, PkarrResolver,
-    PkarrRoutingRecord, RecordBuilder,
+    current_epoch_id, epoch_tolerance_window, resolve_rendezvous_with, EphemeralKeyBuilder,
+    PkarrCase, PkarrPublisher, PkarrResolver, PkarrRoutingRecord, PkarrSlotResolver, RecordBuilder,
+    RendezvousResolveConfig,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use zeroize::Zeroizing;
+
+/// Per-batch resolve deadline for friend Case-D (ZEB-743). Friend's old
+/// `resolve_window` had no explicit deadline (it bounded on the pkarr resolver's
+/// own per-query timeout); the kernel driver takes one, so set it >= the
+/// community resolve deadline (2500 ms) so it never cuts a slow-but-valid
+/// resolve before the resolver's own timeout in the common case.
+const FRIEND_RESOLVE_DEADLINE: Duration = Duration::from_millis(3000);
 
 pub struct PkarrFriendPublisher {
     publisher: Arc<PkarrPublisher>,
@@ -131,12 +140,27 @@ pub async fn sync_case_d_handles(
 }
 
 /// Resolve `friend_owner`'s current Case-D routing blob (UNSEALED) using the
-/// shared `secret`. Queries the ±1 epoch tolerance window in parallel; on a hit,
-/// tries each window epoch to unseal (the record could be from any of the three).
-/// Returns `Ok(None)` if no record is found OR a record is found but cannot be
-/// unsealed (wrong secret/epoch — treated as a miss, not an error).
+/// shared `secret`, via the core `harmony_pkarr::rendezvous` driver (ZEB-743).
+///
+/// Friend Case-D is the degenerate N=1 rendezvous shape: one slot per
+/// friendship, keyed by `case_d_info(epoch, friend_owner)`. We drive it through
+/// the shared kernel (`resolve_rendezvous_with` with a `[1]` batch curve) so
+/// friend and community resolve through one code path. The `PkarrSlotResolver`
+/// derives the exact same per-epoch slot key `case_d_resolve_key` does
+/// (case = `PkarrCase::Friend`, ikm = `secret`, info = `case_d_info`), so nothing
+/// on the wire changes.
+///
+/// The kernel's decode closure is epoch-blind (`Fn(&[u8]) -> Option<P>`) but the
+/// payload is AEAD-sealed with the epoch in the AAD, so the closure tries every
+/// epoch in the tolerance window — a wrong-epoch attempt fails instantly on the
+/// AAD mismatch, and N=1 keeps it to at most three trivial unseal attempts.
+///
+/// Returns `Ok(None)` when no live record is found OR a record is found but
+/// cannot be unsealed. Per the driver's best-effort, first-responder-wins
+/// contract a transient pkarr failure surfaces as `Ok(None)` (a miss this
+/// round), not `Err` — matching the community resolve path.
 pub async fn resolve_friend_case_d(
-    resolver: &PkarrResolver,
+    resolver: &Arc<PkarrResolver>,
     secret: &[u8; 32],
     friend_owner: &[u8; 16],
 ) -> Result<Option<Vec<u8>>, String> {
@@ -144,24 +168,37 @@ pub async fn resolve_friend_case_d(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    // The decode closure unseals across the same epoch window the driver probes
+    // (both derive it from `now_ms`), since the epoch-blind decode seam can't
+    // tell which window epoch a given blob was sealed under.
     let window = epoch_tolerance_window(now_ms);
-    let keys: Vec<_> = window
-        .iter()
-        .map(|&e| case_d_resolve_key(secret, e, friend_owner).verifying_key())
-        .collect();
-    let Some(rec) = resolver
-        .resolve_window(&keys)
-        .await
-        .map_err(|e| e.to_string())?
-    else {
-        return Ok(None);
-    };
-    for &e in &window {
-        if let Ok(blob) = open_case_d_payload(secret, e, &rec.routing_blob) {
-            return Ok(Some(blob));
-        }
-    }
-    Ok(None)
+    // Keep the closure-captured secret in `Zeroizing` (module invariant: friendship
+    // key material never lives in a plain `[u8; 32]` that escapes zeroization).
+    // `&decode_secret` deref-coerces to `&[u8; 32]` at the `open_case_d_payload`
+    // call, so the closure body is unchanged.
+    let decode_secret = Zeroizing::new(*secret);
+    let info_owner = *friend_owner;
+    let slot_resolver = PkarrSlotResolver::new(
+        Arc::clone(resolver),
+        PkarrCase::Friend,
+        secret.to_vec(),
+        Arc::new(move |_slot: u16, epoch: u64| case_d_info(epoch, &info_owner)),
+        move |blob: &[u8]| {
+            window
+                .iter()
+                .find_map(|&e| open_case_d_payload(&decode_secret, e, blob).ok())
+        },
+    );
+    let outcome = resolve_rendezvous_with(
+        &slot_resolver,
+        now_ms,
+        &RendezvousResolveConfig {
+            batch_curve: vec![1],
+            per_batch_deadline: FRIEND_RESOLVE_DEADLINE,
+        },
+    )
+    .await;
+    Ok(outcome.payload)
 }
 
 #[cfg(test)]
@@ -179,7 +216,7 @@ mod tests {
         let client = Arc::new(RelayClient::new(pool));
         let publisher = Arc::new(PkarrPublisher::new(Arc::clone(&client)));
         let _ph = Arc::clone(&publisher).spawn();
-        let resolver = PkarrResolver::new(Arc::clone(&client));
+        let resolver = Arc::new(PkarrResolver::new(Arc::clone(&client)));
 
         let secret = [9u8; 32];
         let a_owner = [0xAA; 16]; // the publisher's own owner_id
@@ -207,6 +244,21 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_friend_case_d_cold_start_returns_none() {
+        // No record published for this friendship → the driver's cold-start path
+        // yields an empty outcome, and the resolve reports Ok(None) (a miss for
+        // this round), never Err — the best-effort first-responder-wins contract.
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let resolver = Arc::new(PkarrResolver::new(client));
+        let out = resolve_friend_case_d(&resolver, &[7u8; 32], &[0xCC; 16])
+            .await
+            .expect("resolve must not error on a cold start");
+        assert!(out.is_none(), "cold start must resolve to None");
     }
 
     #[tokio::test]

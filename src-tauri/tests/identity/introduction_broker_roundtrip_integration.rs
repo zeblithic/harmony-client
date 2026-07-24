@@ -617,7 +617,7 @@ async fn setup(policy: PeerIntroPolicy, settings_dir: &std::path::Path) -> Harne
         let pkarr_client = Arc::clone(&pkarr_client);
         let x_owner = x.owner.0;
         async move {
-            let probe = harmony_pkarr::PkarrResolver::new(pkarr_client);
+            let probe = Arc::new(harmony_pkarr::PkarrResolver::new(pkarr_client));
             resolve_friend_case_d(&probe, &SECRET_FX, &x_owner)
                 .await
                 .ok()
