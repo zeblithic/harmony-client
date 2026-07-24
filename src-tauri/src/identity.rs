@@ -275,8 +275,8 @@ pub fn encrypt_with_params(
 /// passphrases gains no signal from the error message).
 ///
 /// Returns `Zeroizing<[u8; BLOB_LEN]>` so the caller's stack-resident copy of
-/// the plaintext seed bytes is wiped on drop. The intermediate `Vec<u8>` from
-/// `cipher.decrypt(...)` is also wrapped in `Zeroizing` before any further use.
+/// the plaintext seed bytes is wiped on drop. The intermediate `Vec<u8>` is
+/// returned by `password_envelope::open(...)` already wrapped in `Zeroizing`.
 #[doc(hidden)]
 pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
     if bytes.len() != ENC_FILE_LEN {
@@ -323,8 +323,8 @@ pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LE
 
     // Strict v1 KDF param check: refuse to allocate Argon2 memory on
     // attacker-controlled values. The AAD binding via the Poly1305 tag would
-    // reject mismatched params eventually, but only AFTER hash_password_into
-    // attempts the m_kib allocation — which is a DoS vector if m_kib is
+    // reject mismatched params eventually, but only AFTER `password_envelope::open`
+    // performs the Argon2 m_kib allocation — which is a DoS vector if m_kib is
     // 16 GiB. v1 hardcodes all three params, so any other value is either a
     // future format (handled by the format_version check above) or tampering.
     // Return the indistinguishable error to leak nothing about which it is.
