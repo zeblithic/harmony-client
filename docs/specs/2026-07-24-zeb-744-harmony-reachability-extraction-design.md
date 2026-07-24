@@ -20,14 +20,16 @@ ZEB-571's seam audit flagged the client's iroh-reachability primitive as net-new
 
 ## 2. Goals / non-goals
 
+**Resolver depth (decided 2026-07-24 after reading the full ~900-line resolver).** The resolver is ~80% Harmony-specific policy — the three-source `DurableCrdt`/`PkarrLive`/`FleetSibling` model is structural (woven through `ResolverSlots`, `freshest`, `durable_preferred`, `source_rank`, `freshest_across_owners`, `update_with_source`), and three client subsystems are integrated inside it (reconnect-supervisor kicks, peer-liveness telemetry, the `event_loop` generation counter), plus a full pkarr-refresh policy (`maybe_refresh_stale`: staleness gate, per-owner cooldowns, global semaphore, fleet-exclusion). All of it is concurrency-correct code with documented ZEB-620/621/622/627/643/704 fixes. Only ~150 lines are genuinely generic. **So we extract the record (full) + the clean kernel, and the Harmony resolver stays client-side as a consumer of the kernel** — real substrate lands in core, the hard-won policy code stays put (no rewrite, no regression risk).
+
 **Goals**
-- New core crate `harmony-reachability` housing the reachability record (byte-identical wire format) and a generic multi-device LWW resolver + fallback trait.
-- Client rewired onto the core types; local `reachability_record.rs` / `reachability_resolver.rs` deleted; ~17 consumers repointed.
+- New core crate `harmony-reachability` housing (a) the reachability record (byte-identical wire format) and (b) a generic reachability kernel: the `lww_newer` LWW comparator, a `MultiDeviceMap<Owner, V>` newtype (the `(owner, node_id)` keying with owner-prefix range + reverse-by-node lookup), and the `ReachabilityFallback` async trait.
+- Client rewired: the record's ~consumers repointed onto the core record; `ReachabilityResolver` (kept client-side) rebuilt on top of the core kernel; local `reachability_record.rs` deleted, `reachability_resolver.rs` slimmed to the Harmony policy.
 - Zero wire-format change: the five golden-hex vectors migrate into core as the acceptance gate and stay green client-side.
 
 **Non-goals**
 - Converging onto `harmony-discovery::AnnounceRecord` (wire-incompatible; a separate, network-migration-scale effort if ever wanted).
-- Moving the inner-signature scheme, the butler-deposit protocol, the pkarr resolver adapter, the three-source arbitration policy, or the fleet/community bindings into core.
+- Moving into core: the inner-signature scheme, the butler-deposit protocol, the pkarr resolver adapter, the three-source arbitration policy (`ResolverSlots`/`freshest`/`durable_preferred`/`source_rank`), the supervisor/liveness/generation integration, the `maybe_refresh_stale` pkarr-refresh policy, or the fleet/community bindings. All stay client-side.
 - Any change to the outer `PkarrRoutingRecord` (already in core `harmony-pkarr`).
 
 ## 3. Architecture overview
@@ -35,18 +37,24 @@ ZEB-571's seam audit flagged the client's iroh-reachability primitive as net-new
 ```
 harmony-reachability (new core crate)
 ├── record        ReachabilityAnnouncePayload (byte-preserving move) + DelegateEndpoint
-├── store         ReachabilityStore<Owner, Clock, Src>  — generic multi-device LWW map
-│                 + async cache-then-fallback resolve, cooldowns, bounded refresh,
-│                   injectable clock, stale-refresh, reverse-lookup, list queries
-├── fallback      ReachabilityFallback async trait (pkarr inverted behind it)
-└── hooks         SourcePolicy trait (rank / dial-vs-durable set) + optional
-                  RefreshHook / LivenessHook trait seams (supervisor+liveness inverted)
+│                 + is_zero_u64, serde byte-string helpers, canonical CBOR encode
+├── kernel        lww_newer<Clock, Rec>  — the LWW comparator (clock tuple →
+│                   announced_at → node_id tie-breaks, generic over a clock + a
+│                   ReachabilityRecord trait exposing node_id()/announced_at_ms())
+│                 MultiDeviceMap<Owner, V>  — (owner, node_id) keying newtype:
+│                   owner-prefix range query + reverse-by-node-id lookup
+└── fallback      ReachabilityFallback async trait (pkarr inverted behind it)
 
-harmony-client (rewired)
-├── keeps         inner sign/verify, PkarrResolverAdapter (impl ReachabilityFallback),
-│                 ReachabilitySource enum + SourcePolicy impl, butler-deposit protocol,
-│                 community-CRDT binding, fleet/SAS paths, supervisor+liveness impls
-└── ReachabilityResolver becomes a thin client wrapper over ReachabilityStore<OwnerAddr, HlcOrd, ReachabilitySource>
+harmony-client (rewired; ReachabilityResolver STAYS here)
+├── record users  ~consumers repointed onto harmony_reachability::ReachabilityAnnouncePayload
+├── keeps         inner sign/verify, butler accessors (fresh/durable_butler_set),
+│                 reachability_freshness_check, PkarrResolverAdapter (impl the core
+│                 ReachabilityFallback), ReachabilitySource + the 3-source arbitration
+│                 (ResolverSlots/freshest/durable_preferred/source_rank), supervisor +
+│                 liveness + generation, maybe_refresh_stale, community/fleet bindings
+└── ReachabilityResolver  rebuilt on the core kernel: its BTreeMap becomes a
+                  MultiDeviceMap<OwnerAddr, ResolverSlots>; same-source slot LWW calls
+                  the core lww_newer; all policy above stays byte-for-byte as today
 ```
 
 ## 4. The record — pure byte-preserving move
@@ -74,36 +82,34 @@ Rejected alternatives: a generic `Ext` type-parameter on the record (over-engine
 
 `inner_signed_bytes` / `build_signed_payload` / `build_signed_payload_with_key` / `verify_inner_signature` remain in the client. Rationale: the preimage is the 8-field tuple `(nd, rl, da, ts, ac, hl, bs, ba)` where `ac` (actor `OwnerAddr`) and `hl` (`Hlc`) come from the membership envelope — both are client-only types with a byte-identity constraint, and core has no `Hlc`/`OwnerAddr`. The client's preimage builder reads the (now core-typed) record's fields; byte-identity is preserved because the field values and their encoding are unchanged. The inner sig is zero-filled on the pkarr path and only meaningful on the durable-CRDT membership path (fully client-side).
 
-## 5. The resolver — generic skeleton, policy injected
+## 5. The resolver — extract the kernel, keep the policy client-side
 
-Core `ReachabilityStore<Owner, Clock, Src>`:
+Reading the full resolver (see §2, resolver depth) showed it is ~80% Harmony-specific policy. We extract only the genuinely-generic kernel; the `ReachabilityResolver` itself stays in the client and is rebuilt on top of the kernel.
 
-- `Owner: Ord + Clone` — the owner key (client: `OwnerAddr`).
-- `Clock: Ord + Clone` — the LWW ordering key. The client wraps `Hlc` in a newtype `HlcOrd(Hlc)` whose `Ord` matches `Hlc::is_strictly_newer_than` (tuple `(wall_ms, logical, device_id)`), since `Hlc` deliberately does not derive `Ord`.
-- `Src` — the source discriminant (client: `ReachabilitySource { DurableCrdt, PkarrLive, FleetSibling }`), used to key the per-source cells.
+**Kernel that moves to core (`harmony_reachability::kernel`):**
 
-**What the store owns (generic):**
-- The `BTreeMap<(Owner, node_id), PerSourceCells<Src, Clock, Record>>` — the multi-device dimension (different devices of one owner coexist; only same `(owner, node_id, src)` updates compete via LWW).
-- The `lww_newer` comparator: primary `Clock` order → tie-break greater `announced_at_ms` → tie-break lexicographically greater `node_id`; full equality is a no-op (byte-identical replay). **The ZEB-621 future-skew clamp** (`effective_announced_at_ms = min(announced_at_ms, now + FUTURE_SKEW_TOLERANCE_MS)`) is part of merge behavior and moves with the comparator.
-- Cache-then-fallback async resolve (`ReachabilityFallback` on miss), per-owner refresh cooldowns, a bounded (`Semaphore`) background refresh fan-out, an injectable now-ms clock, stale-refresh, reverse `resolve_by_node_id`, and the `list_*` queries.
+- `trait ReachabilityRecord { fn node_id(&self) -> [u8; 32]; fn announced_at_ms(&self) -> u64; }` — implemented by the core record (and by anything else that wants the kernel). Lets the comparator and map stay record-agnostic.
+- `fn lww_newer<C: Ord, R: ReachabilityRecord>(prev_clock: &C, prev_rec: &R, next_clock: &C, next_rec: &R) -> bool` — the same-source LWW comparator: primary `C` order → tie-break greater `announced_at_ms()` → tie-break lexicographically greater `node_id()`; full equality is a no-op (byte-identical replay is not a change). Generic over the clock so the client passes its `Hlc` comparison tuple `(wall_ms, logical, device_id)` (via a thin `Ord` wrapper, since `Hlc` deliberately does not derive `Ord`).
+- `struct MultiDeviceMap<Owner: Ord + Copy, V>` — a newtype over `BTreeMap<(Owner, [u8; 32]), V>` capturing the multi-device keying: `entry`/`get`/`remove` plus the two non-trivial helpers the resolver relies on — `range_owner(&self, owner) -> impl Iterator` (the `(owner, [0u8;32])..=(owner, [0xFF;32])` prefix scan) and `find_by_node_id(&self, &[u8;32]) -> impl Iterator` (the reverse scan). This is the reusable essence of "keyed by (owner, device) so a peer's devices coexist."
+- `trait ReachabilityFallback` — moves verbatim (async, `resolve(&self, &Owner) -> Vec<Record>`); the concrete `PkarrResolverAdapter` stays client-side and is injected as today.
 
-**What the client injects (policy — Decision 2):**
-- `SourcePolicy`: `rank(&Src) -> u8` (durable > pkarr > fleet) and the dial-vs-durable set (`freshest` counts all sources; `durable_preferred` = durable-then-pkarr, excludes fleet). The `freshest` / `durable_preferred` selection logic is generic over this policy; the concrete ranks and the three variants are client-side.
-- `ReachabilityFallback` concrete impl: `PkarrResolverAdapter` (queries pkarr relays, verifies the outer `PkarrRoutingRecord`, decodes the blob back to a record) — stays client-side, injected at boot.
-- Refresh/liveness/supervisor hooks: `SupervisorHandle` (reconnect kicks) and `LivenessHandle` (telemetry) become trait seams (`RefreshHook`/`LivenessHook`) implemented client-side and injected, mirroring how `ReachabilityFallback` is already inverted.
+**What stays client-side (unchanged Harmony policy, on top of the kernel):**
 
-The client's `ReachabilityResolver` becomes a thin wrapper: it holds a `ReachabilityStore<OwnerAddr, HlcOrd, ReachabilitySource>`, wires the injected policy + fallback + hooks, and exposes the same public methods the ~17 consumers already call (so consumer call sites change only their import path, not their call shape, wherever possible).
+- `ReachabilityResolver` and everything in it: the three-source `ResolverSlots{durable, pkarr, fleet}`, `ReachabilitySource`, `freshest`/`durable_preferred`/`source_rank`/`freshest_across_owners`, the future-skew clamp + `effective_announced_at_ms`, the supervisor kicks (`addr_key` before/after, `NewPeer`/`RecordChanged`), the liveness handle, the generation counter, `maybe_refresh_stale` (cooldowns + semaphore + fleet-exclusion), `seed_from_pkarr`, `resolve_async*`, and every `list_*`/`resolve*` method.
+- The only mechanical change to `ReachabilityResolver`: its `inner: Arc<RwLock<BTreeMap<ResolverKey, ResolverSlots>>>` becomes `Arc<RwLock<MultiDeviceMap<OwnerAddr, ResolverSlots>>>`, its owner-range and reverse-lookup scans call the `MultiDeviceMap` helpers, and its per-slot `lww_newer` call delegates to the core `lww_newer`. All behavior — and all the ZEB-620/621/622/627/643/704 correctness invariants — stays byte-for-byte as today, so the existing resolver test suite is the regression gate.
+
+This keeps the concurrency-correct policy code exactly where it is (no generic rewrite of code with documented TOCTOU/cooldown/generation/skew fixes) while still landing the reusable record + LWW/multi-device kernel + fallback trait in core.
 
 ## 6. Dependency edges / crate manifest
 
-`harmony-reachability/Cargo.toml` dependencies: `serde` (derive, alloc), `ciborium`, `serde_bytes`, `async-trait`, `tokio` (rt/sync/time — for `Semaphore`, `Instant`, `RwLock`), and `futures` if the fallback returns streams. **No `iroh`, no `pkarr`, no `harmony-owner`, no `harmony-identity`, no `harmony-crypto` concrete-type deps.** (If a generic `verify` helper over a caller-supplied verifying key lands, it pulls `ed25519-dalek`; default is to leave all signing client-side and keep the crate crypto-free.)
+`harmony-reachability/Cargo.toml` dependencies: `serde` (derive, alloc), `ciborium`, `serde_bytes`, `async-trait` (for the `ReachabilityFallback` trait). **No `tokio`** (the `Semaphore`/`Instant`/`RwLock` machinery stays with the resolver, which stays client-side). **No `iroh`, no `pkarr`, no `harmony-owner`, no `harmony-identity`, no `harmony-crypto` concrete-type deps** (all signing stays client-side, keeping the crate crypto-free).
 
 Because the crate takes no pkarr/iroh dep and no client-only concrete types, it rides the lockstep rev with zero pin-trap exposure. Added to the core workspace members + the client's lockstep pin block on the rewire PR.
 
 ## 7. Sequencing (two PRs, same as items 2–5)
 
-1. **Core PR (harmony):** add the `harmony-reachability` crate — record (byte-preserving) + `DelegateEndpoint` + the generic `ReachabilityStore` + `ReachabilityFallback` + `SourcePolicy`/hook traits. Migrate the wire-format golden vectors as in-crate tests (the acceptance gate). Merge.
-2. **Client PR (harmony-client):** bump the lockstep rev to the new core head; delete `reachability_record.rs` + `reachability_resolver.rs`; re-export/rewire the ~17 consumers onto the core record + the thin `ReachabilityResolver` wrapper; keep inner-sign/verify, `PkarrResolverAdapter`, the `ReachabilitySource`/`SourcePolicy`, the butler-deposit protocol, fleet/community bindings, and supervisor/liveness impls client-side; keep the client-side wire-format fixture tests green.
+1. **Core PR (harmony):** add the `harmony-reachability` crate — record (byte-preserving) + `DelegateEndpoint` + serde helpers + canonical encode; the kernel (`ReachabilityRecord` trait, `lww_newer`, `MultiDeviceMap`, `ReachabilityFallback`). Migrate the wire-format golden vectors + add kernel unit tests (comparator + map range/reverse). Merge.
+2. **Client PR (harmony-client):** bump the lockstep rev to the new core head; **delete** `reachability_record.rs` and re-export/rewire its consumers onto `harmony_reachability::ReachabilityAnnouncePayload` (keeping the client-only helpers — inner-sign/verify, butler accessors, `reachability_freshness_check` — in a thin client module that re-exports the core record); **slim** `reachability_resolver.rs` — swap its `BTreeMap<ResolverKey, ResolverSlots>` for `MultiDeviceMap<OwnerAddr, ResolverSlots>`, delegate same-source LWW to the core `lww_newer`, keep all three-source/supervisor/liveness/generation/refresh policy; keep every client-side wire-format fixture test and the full resolver test suite green (the regression gate).
 
 ## 8. Byte-preservation invariants (acceptance gate)
 
@@ -123,12 +129,13 @@ Plus the behavioral LWW anchors (must be preserved identically): higher-HLC-wins
 | --- | --- |
 | Wire drift on the move (field reorder, rename, bstr→array flip, dropped skip predicate) | Golden vectors are the gate; they move first and must be green in the new crate before consumers rewire. HIGH→LOW iff pure move. |
 | Inner-sig preimage drift (record fields now core-typed, `ac`/`hl` client-side) | Keep the preimage builder client-side reading core fields; add a preimage golden vector (§8 hardening). |
-| Generic bloat / over-abstraction (YAGNI) | Two params + `Src` + one `SourcePolicy` trait + `ReachabilityFallback` — no speculative generality; concrete ranks/sources/fallback stay client-side. |
-| ~17 consumer rewire churn | Keep the thin `ReachabilityResolver` wrapper's public method shapes identical so call sites change imports, not logic; subagent-driven task-per-cluster. |
+| Concurrency-correctness regression in the resolver | The resolver policy code is NOT rewritten — it stays client-side; only the backing map type + the `lww_newer` call site change. The full existing resolver test suite (LWW, dual-slot, TOCTOU, cooldown, generation, skew) stays as the regression gate. |
+| Consumer rewire churn | Far smaller than a full extract: the resolver stays client-side so its ~8 dial/reconnect/telemetry consumers are UNTOUCHED. Only the record-type imports repoint (re-export shim keeps most call sites stable) + the resolver's internal map/comparator swap. |
 | `serialize_bytes_as_bstr` helper duplication into core | Small self-contained serde helpers; copy into the crate (no client-crypto dep) — confirmed at plan time. |
+| Kernel too thin to be worth a crate | Accepted trade (Jake, 2026-07-24): the record is the substantial reusable piece; the kernel (comparator + multi-device map + fallback trait) is modest but is the honest generic line. The alternative (heavy generic resolver) was rejected for correctness risk. |
 
 ## 10. Test strategy
 
-- **Core:** the migrated wire-format golden vectors (record + butler variant + pkarr-blob equivalence), the LWW behavioral suite (generic over the test's chosen `Owner`/`Clock`/`Src`), fallback-on-miss, cooldown, reverse-lookup, stale-refresh — ported from `reachability_resolver.rs` tests. `no_std`-not-required (tokio dep); crate builds clean under `clippy --all-targets -D warnings`.
-- **Client:** the existing wire-format fixture tests stay in place and green post-rewire (the strongest cross-repo byte-identity proof); the inner-sign/verify + butler-deposit + three-source policy tests stay client-side and green; the integration round-trips (`pkarr_community_fallback`, `iroh_zenoh_registration`, `two_engines_exchange_via_iroh_zenoh`) exercise the wrapper end-to-end.
+- **Core:** the migrated wire-format golden vectors (record + butler variant + pkarr-blob equivalence) as the byte-identity acceptance gate; new kernel unit tests — `lww_newer` (clock order + `announced_at`/`node_id` tie-breaks + equality-no-op) over a tiny test record, and `MultiDeviceMap` (owner-prefix range returns only that owner's devices; reverse-by-node-id finds across owners; multi-device coexistence). Crate builds clean under `clippy --all-targets -D warnings`.
+- **Client:** the existing wire-format fixture tests stay in place and green post-rewire (the strongest cross-repo byte-identity proof); **the full `reachability_resolver.rs` test suite stays client-side and green** — it is the regression gate proving the map/comparator swap preserved every LWW / dual-slot / TOCTOU / cooldown / generation / future-skew invariant; the inner-sign/verify + butler-deposit tests stay client-side; the integration round-trips (`pkarr_community_fallback`, `iroh_zenoh_registration`, `two_engines_exchange_via_iroh_zenoh`) exercise the whole path end-to-end.
 - Both repos: fmt, `clippy --all-targets -D warnings`, scoped nextest per the harmony-app relink guidance (avoid the full ~97-binary relink per iteration).
