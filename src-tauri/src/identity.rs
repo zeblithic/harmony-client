@@ -1439,17 +1439,39 @@ fn item_bytes_to_vault(bytes: &[u8]) -> Result<SecretVault, String> {
 /// m=64MiB/t=3/p=1 → XChaCha20-Poly1305, 13-byte header bound as AAD) except the
 /// version byte is `0x02` and the protected plaintext is variable-length.
 fn encrypt_vault(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    use rand::RngCore;
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    encrypt_vault_inner(passphrase, plaintext, &salt, &nonce)
+}
+
+/// Deterministic variant for byte-pinning fixtures. Gated so production
+/// cannot link a caller-supplied-nonce path (nonce reuse on XChaCha20 is
+/// catastrophic — mirrors `encode_snapshot_with_params`, Qodo C4).
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub fn encrypt_vault_with_params(
+    passphrase: &[u8],
+    plaintext: &[u8],
+    salt: &[u8; SALT_LEN],
+    nonce: &[u8; NONCE_LEN],
+) -> Vec<u8> {
+    encrypt_vault_inner(passphrase, plaintext, salt, nonce)
+}
+
+fn encrypt_vault_inner(
+    passphrase: &[u8],
+    plaintext: &[u8],
+    salt: &[u8; SALT_LEN],
+    nonce: &[u8; NONCE_LEN],
+) -> Vec<u8> {
     use argon2::{Algorithm, Argon2, Params, Version};
     use chacha20poly1305::{
         aead::{Aead, KeyInit, Payload},
         XChaCha20Poly1305, XNonce,
     };
-    use rand::RngCore;
-
-    let mut salt = [0u8; SALT_LEN];
-    let mut nonce = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
 
     let mut out = Vec::with_capacity(HEADER_LEN + SALT_LEN + NONCE_LEN + plaintext.len() + TAG_LEN);
     out.extend_from_slice(ENC_MAGIC);
@@ -1459,15 +1481,15 @@ fn encrypt_vault(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&KDF_T.to_be_bytes());
     out.push(KDF_P);
     debug_assert_eq!(out.len(), HEADER_LEN);
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&nonce);
+    out.extend_from_slice(salt);
+    out.extend_from_slice(nonce);
 
     let params = Params::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32, Some(KDF_OUT_LEN))
         .expect("Argon2 params hardcoded valid");
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
     argon
-        .hash_password_into(passphrase, &salt, key.as_mut_slice())
+        .hash_password_into(passphrase, salt, key.as_mut_slice())
         .expect("Argon2 derivation cannot fail with hardcoded params");
 
     let cipher =
@@ -1477,7 +1499,7 @@ fn encrypt_vault(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8> {
         aad: &out[..HEADER_LEN],
     };
     let ciphertext_with_tag = cipher
-        .encrypt(XNonce::from_slice(&nonce), payload)
+        .encrypt(XNonce::from_slice(nonce), payload)
         .expect("AEAD encrypt cannot fail with valid inputs");
     out.extend_from_slice(&ciphertext_with_tag);
     out
@@ -3507,6 +3529,22 @@ fn warn_permissions(path: &Path) {
 pub mod test_only {
     pub use super::decrypt as decrypt_for_test;
     pub use super::encrypt_with_params as encrypt_with_params_for_test;
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub use super::encrypt_vault_with_params as encrypt_vault_with_params_for_test;
+
+    // `decrypt_vault_bytes` is `pub(crate)`, so integration tests can't reach it
+    // directly and a `pub use` of it fails E0364 (a re-export can't be more
+    // public than the item). Expose it through a gated wrapper for the v0x02
+    // round-trip assertion — this leaves `decrypt_vault_bytes`'s own
+    // `pub(crate)` visibility unchanged in production builds.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn decrypt_vault_bytes_for_test(
+        passphrase: &[u8],
+        bytes: &[u8],
+    ) -> Result<super::Zeroizing<Vec<u8>>, String> {
+        super::decrypt_vault_bytes(passphrase, bytes)
+    }
 }
 
 #[cfg(test)]
