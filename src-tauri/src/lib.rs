@@ -44991,16 +44991,12 @@ pub fn compute_pending_admin_proposals(
 /// AdminProposal (proposer + all AdminCountersign actors targeting it).
 /// Returns 0 if the proposal_id is not found (no proposal event and no
 /// countersigns).
-pub fn count_signers(
-    events: &std::collections::BTreeMap<
-        crate::community_membership::EventId,
-        crate::community_membership::SignedMembershipEvent,
-    >,
+pub fn count_signers<'a>(
+    events: impl Iterator<Item = &'a crate::community_membership::SignedMembershipEvent>,
     proposal_id: [u8; 16],
 ) -> u8 {
     use crate::community_membership::MembershipEventKind;
     events
-        .values()
         .filter_map(|e| match &e.kind {
             MembershipEventKind::AdminProposal { .. } if e.id == proposal_id => Some(e.actor),
             MembershipEventKind::AdminCountersign { target_event_id }
@@ -45176,7 +45172,7 @@ pub(crate) async fn countersign_admin_proposal_impl(
         // Idempotent — report current state without minting.
         let state = engine_arc.state();
         let g = state.lock().await;
-        let signers_after = count_signers(&g.events, proposal_id_bytes);
+        let signers_after = count_signers(g.events(), proposal_id_bytes);
         return Ok(CountersignResult {
             signers_after,
             quorum_required: admin_quorum,
@@ -45215,7 +45211,7 @@ pub(crate) async fn countersign_admin_proposal_impl(
     // Recompute signer count after insert.
     let state = engine_arc.state();
     let g = state.lock().await;
-    let signers_after = count_signers(&g.events, proposal_id_bytes);
+    let signers_after = count_signers(g.events(), proposal_id_bytes);
     let post_materialized = g.materialize_now(admin_addr);
     let quorum_required = post_materialized.admin_quorum;
     Ok(CountersignResult {
@@ -74073,7 +74069,7 @@ mod countersign_admin_proposal_tests {
             setup_quorum2_community(community_id);
 
         // Proposer (admin) already signed via AdminProposal.
-        let signers_before = count_signers(&state.events, proposal_id);
+        let signers_before = count_signers(state.events(), proposal_id);
         assert_eq!(signers_before, 1, "only proposer signed so far");
 
         // admin_quorum is 2 — quorum not yet reached.
@@ -74106,7 +74102,7 @@ mod countersign_admin_proposal_tests {
             "second countersign must insert; got {cs_outcome:?}"
         );
 
-        let signers_after = count_signers(&state.events, proposal_id);
+        let signers_after = count_signers(state.events(), proposal_id);
         assert_eq!(signers_after, 2, "proposer + second = 2 signers");
 
         // Idempotency: second admin already signed — a new AdminCountersign
@@ -74136,7 +74132,7 @@ mod countersign_admin_proposal_tests {
         );
 
         // count_signers must still be 2 (idempotent, no new signer added).
-        let signers_idempotent = count_signers(&state.events, proposal_id);
+        let signers_idempotent = count_signers(state.events(), proposal_id);
         assert_eq!(
             signers_idempotent, 2,
             "count must remain 2 after duplicate attempt"
@@ -74169,7 +74165,7 @@ mod countersign_admin_proposal_tests {
         );
 
         // Also verify count_signers is unaffected (still 1 — only proposer).
-        let signers = count_signers(&state.events, proposal_id);
+        let signers = count_signers(state.events(), proposal_id);
         assert_eq!(signers, 1, "only proposer; non-admin cannot sign");
     }
 
@@ -74213,7 +74209,7 @@ mod countersign_admin_proposal_tests {
         assert_eq!(m.admin_quorum, 2, "quorum must be 2");
 
         // Before countersign: signers=1, quorum=2, not reached.
-        let signers_before = count_signers(&state.events, proposal_id);
+        let signers_before = count_signers(state.events(), proposal_id);
         assert_eq!(signers_before, 1);
         assert!(signers_before < 2, "quorum not yet reached");
 
@@ -74242,7 +74238,7 @@ mod countersign_admin_proposal_tests {
             "countersign must insert; got {cs_outcome:?}"
         );
 
-        let signers_after = count_signers(&state.events, proposal_id);
+        let signers_after = count_signers(state.events(), proposal_id);
         let quorum_required = state.materialize_now(admin).admin_quorum;
         let reached_quorum = signers_after >= quorum_required;
 

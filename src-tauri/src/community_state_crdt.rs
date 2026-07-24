@@ -450,6 +450,64 @@ impl CommunityState {
         let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
         materialize_with_now(&log, admin_addr, Some(now_ms))
     }
+
+    // ── ZEB-748 phase 6a: event-log accessors ──────────────────────────
+    //
+    // Read accessors + trusted-write seams that mediate ALL access to the
+    // event log. Today they delegate to the `events` `BTreeMap` field; when
+    // Task 7 flips that field to a `VerifiedLog`, only these method BODIES
+    // change and the ~138 migrated call sites (Tasks 4–6) stay untouched.
+    // Their SIGNATURES are the migration contract — do not alter them.
+
+    /// Iterate the event log in canonical (EventId-ascending) order.
+    pub fn events(&self) -> impl Iterator<Item = &SignedMembershipEvent> {
+        self.events.values()
+    }
+
+    /// Look up a single event by id.
+    pub fn get_event(&self, id: &EventId) -> Option<&SignedMembershipEvent> {
+        self.events.get(id)
+    }
+
+    /// Whether an event with this id is already in the log.
+    pub fn contains_event(&self, id: &EventId) -> bool {
+        self.events.contains_key(id)
+    }
+
+    /// Number of events in the log.
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Whether the log holds no events yet.
+    pub fn events_is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Consume the state, yielding its events (canonical order).
+    pub fn into_events(self) -> Vec<SignedMembershipEvent> {
+        self.events.into_values().collect()
+    }
+
+    /// Trusted-write seam: insert a pre-verified event WITHOUT re-running
+    /// `verify_event`. Test/bootstrap only — never a production merge path.
+    /// Bumps the cache version so the next `materialized()` re-materializes
+    /// (mirrors what direct `events.insert` callers relied on; harmless for
+    /// the pre-flip field, required after Task 7 flips to a `VerifiedLog`).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn insert_verified_for_test(&mut self, e: SignedMembershipEvent) {
+        self.events.insert(e.id, e);
+        self.cache.lock().expect("cache mutex poisoned").version += 1;
+    }
+
+    /// Trusted-write seam: replace the entire event log in one shot.
+    /// Test/bootstrap only. Bumps the cache version (see
+    /// `insert_verified_for_test`).
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn set_event_log_for_test(&mut self, events: BTreeMap<EventId, SignedMembershipEvent>) {
+        self.events = events;
+        self.cache.lock().expect("cache mutex poisoned").version += 1;
+    }
 }
 
 #[cfg(test)]
