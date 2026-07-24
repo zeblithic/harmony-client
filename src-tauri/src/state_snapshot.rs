@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use ciborium::{from_reader, into_writer};
+use harmony_crypto::password_envelope::{self, Argon2idParams};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -27,7 +28,6 @@ const HRSS_KDF_ID_ARGON2ID: u8 = 0x01;
 const KDF_M_KIB: u32 = 65536; // 64 MiB
 const KDF_T: u16 = 3;
 const KDF_P: u8 = 1;
-const KDF_OUT_LEN: usize = 32;
 
 // Header layout (same shape as HRMI): magic(4) + version(1) + kdf_id(1)
 // + m_kib(4 BE) + t(2 BE) + p(1) = 13 bytes.
@@ -158,12 +158,6 @@ fn encode_snapshot_inner(
     salt: &[u8; SALT_LEN],
     nonce: &[u8; NONCE_LEN],
 ) -> Result<Vec<u8>, SnapshotError> {
-    use argon2::{Algorithm, Argon2, Params, Version};
-    use chacha20poly1305::{
-        aead::{Aead, KeyInit, Payload},
-        XChaCha20Poly1305, XNonce,
-    };
-
     let tree =
         canonicalize(state).map_err(|e| SnapshotError::CborEncode(format!("canonicalize: {e}")))?;
     let snapshot = OwnerStateSnapshot {
@@ -190,23 +184,11 @@ fn encode_snapshot_inner(
     out.extend_from_slice(salt);
     out.extend_from_slice(nonce);
 
-    let params = Params::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32, Some(KDF_OUT_LEN))
-        .expect("Argon2 params hardcoded valid");
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
-    argon
-        .hash_password_into(passphrase, salt, key.as_mut_slice())
+    let params = Argon2idParams::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32)
         .map_err(|e| SnapshotError::Argon2Fail(e.to_string()))?;
-
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(key.as_slice()).expect("32-byte key always valid");
-    let payload = Payload {
-        msg: cbor.as_slice(),
-        aad: HRSS_AAD,
-    };
-    let ciphertext_with_tag = cipher
-        .encrypt(XNonce::from_slice(nonce), payload)
-        .map_err(|_| SnapshotError::WrongPassphraseOrCorrupt)?;
+    let ciphertext_with_tag =
+        password_envelope::seal(passphrase, &params, salt, nonce, HRSS_AAD, cbor.as_slice())
+            .map_err(|_| SnapshotError::WrongPassphraseOrCorrupt)?;
     out.extend_from_slice(&ciphertext_with_tag);
     Ok(out)
 }
@@ -221,12 +203,6 @@ pub fn decode_snapshot(
     passphrase: &[u8],
     bytes: &[u8],
 ) -> Result<OwnerStateSnapshot, SnapshotError> {
-    use argon2::{Algorithm, Argon2, Params, Version};
-    use chacha20poly1305::{
-        aead::{Aead, KeyInit, Payload},
-        XChaCha20Poly1305, XNonce,
-    };
-
     if bytes.len() < HEADER_LEN + SALT_LEN + NONCE_LEN + TAG_LEN {
         return Err(SnapshotError::TooShort(bytes.len()));
     }
@@ -259,23 +235,17 @@ pub fn decode_snapshot(
     let nonce: &[u8; NONCE_LEN] = bytes[NONCE_OFF..CIPHER_OFF].try_into().unwrap();
     let ciphertext_with_tag = &bytes[CIPHER_OFF..];
 
-    let params = Params::new(m_kib, t, p, Some(KDF_OUT_LEN)).expect("KDF params hardcoded valid");
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
-    argon
-        .hash_password_into(passphrase, salt, key.as_mut_slice())
-        .map_err(|e| SnapshotError::Argon2Fail(e.to_string()))?;
-
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(key.as_slice()).expect("32-byte key always valid");
-    let payload = Payload {
-        msg: ciphertext_with_tag,
-        aad: HRSS_AAD,
-    };
-    let cleartext = cipher
-        .decrypt(XNonce::from_slice(nonce), payload)
-        .map_err(|_| SnapshotError::WrongPassphraseOrCorrupt)?;
-    let cleartext = Zeroizing::new(cleartext);
+    let params =
+        Argon2idParams::new(m_kib, t, p).map_err(|e| SnapshotError::Argon2Fail(e.to_string()))?;
+    let cleartext = password_envelope::open(
+        passphrase,
+        &params,
+        salt,
+        nonce,
+        HRSS_AAD,
+        ciphertext_with_tag,
+    )
+    .map_err(|_| SnapshotError::WrongPassphraseOrCorrupt)?;
 
     let snapshot: OwnerStateSnapshot =
         from_reader(cleartext.as_slice()).map_err(|e| SnapshotError::CborDecode(e.to_string()))?;
@@ -417,13 +387,8 @@ mod tests {
         let mut cbor = Vec::new();
         into_writer(&snapshot, &mut cbor).unwrap();
 
-        // Build a fresh envelope where the inner CBOR carries v=99. We
-        // do this by re-running the AEAD over the v=99 cbor manually.
-        use argon2::{Algorithm, Argon2, Params, Version};
-        use chacha20poly1305::{
-            aead::{Aead, KeyInit, Payload},
-            XChaCha20Poly1305, XNonce,
-        };
+        // Build a fresh envelope where the inner CBOR carries v=99. We do this by
+        // re-running the AEAD over the v=99 cbor via the shared primitive.
         let salt = [0u8; SALT_LEN];
         let nonce = [0u8; NONCE_LEN];
         let mut out = Vec::new();
@@ -435,18 +400,10 @@ mod tests {
         out.push(KDF_P);
         out.extend_from_slice(&salt);
         out.extend_from_slice(&nonce);
-        let params = Params::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32, Some(KDF_OUT_LEN)).unwrap();
-        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
-        argon
-            .hash_password_into(b"pp", &salt, key.as_mut_slice())
-            .unwrap();
-        let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice()).unwrap();
-        let payload = Payload {
-            msg: cbor.as_slice(),
-            aad: HRSS_AAD,
-        };
-        let ciphertext_with_tag = cipher.encrypt(XNonce::from_slice(&nonce), payload).unwrap();
+        let params = Argon2idParams::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32).unwrap();
+        let ciphertext_with_tag =
+            password_envelope::seal(b"pp", &params, &salt, &nonce, HRSS_AAD, cbor.as_slice())
+                .unwrap();
         out.extend_from_slice(&ciphertext_with_tag);
 
         let err = decode_snapshot(b"pp", &out).expect_err("must reject future version");
