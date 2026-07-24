@@ -2194,7 +2194,7 @@ pub async fn handle_unicast<H: AppHandleEmit>(
     //    (= 0 in v1 — structural no-op + stable hook for ZEB-251).
     let (self_status, self_power) = {
         let s = state_arc.lock().await;
-        let events: Vec<_> = s.events.values().cloned().collect();
+        let events: Vec<_> = s.events().cloned().collect();
         drop(s);
         // R4-6: pass wall_now_ms so an idle-community PendingJoin is
         // surfaced as expired (status == None) rather than as

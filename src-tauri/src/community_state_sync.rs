@@ -1797,7 +1797,7 @@ impl CommunitySyncEngine {
 
             // Pre-validate first: compute prior state from current log.
             let first_log: Vec<crate::community_membership::SignedMembershipEvent> =
-                state_g.events.values().cloned().collect();
+                state_g.events().cloned().collect();
             let first_prior = crate::community_membership::prior_state_at_event(
                 &first_log,
                 &first,
@@ -2069,7 +2069,7 @@ async fn spawn_auto_counter_sign_task(
         // escapes the block.
         let power_ok = crate::community_membership::actor_power_meets_invite_tier(&mat, self_owner);
 
-        let signed_already = state_g.events.values().any(|e| {
+        let signed_already = state_g.events().any(|e| {
             e.actor == self_owner
                 && matches!(
                     &e.kind,
@@ -2156,7 +2156,7 @@ async fn spawn_auto_counter_sign_task(
         // Re-check idempotency inside the lock so a race between two
         // concurrent triggers (e.g. two PendingJoin deliveries) doesn't
         // produce a duplicate JoinCountersign.
-        let already = state_g.events.values().any(|e| {
+        let already = state_g.events().any(|e| {
             e.actor == self_owner
                 && matches!(
                     &e.kind,
@@ -2318,7 +2318,7 @@ fn maybe_spawn_pending_join_clear(
         // (symmetric to R4-5 which fixed the boot-heal case).
         let target_pending_at = {
             let state_g = community_state.lock().await;
-            let target = match state_g.events.get(&target_event_id) {
+            let target = match state_g.get_event(&target_event_id) {
                 Some(t) => t,
                 None => {
                     // Out-of-order: target not yet in CRDT.
@@ -2485,8 +2485,8 @@ fn maybe_spawn_pending_clear_rescan_for_pending_join(
         // target_event_id matches our just-inserted PendingJoin.
         let matched_countersign: Option<crate::community_membership::SignedMembershipEvent> = {
             let g = state_for_scan.lock().await;
-            g.events
-                .values()
+            let matched = g
+                .events()
                 .find(|e| {
                     matches!(
                         &e.kind,
@@ -2494,7 +2494,9 @@ fn maybe_spawn_pending_clear_rescan_for_pending_join(
                             if *target_event_id == pending_id
                     )
                 })
-                .cloned()
+                .cloned();
+            drop(g);
+            matched
         };
 
         let cs = match matched_countersign {
@@ -3540,7 +3542,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         bool,
     ) = {
         let state = ctx.state.lock().await;
-        let events: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
+        let events: Vec<SignedMembershipEvent> = state.events().cloned().collect();
         drop(state);
         let materialized =
             crate::community_membership::prior_state_at_hlc(&events, &payload.at, ctx.admin_addr);
@@ -3702,7 +3704,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     // prior_state, and a valid event can land as `Rejected`. Sort
     // explicitly by `event_sort_key` so we merge in the same order
     // `materialize` would replay.
-    let mut resolved: Vec<SignedMembershipEvent> = remote.events.into_values().collect();
+    let mut resolved: Vec<SignedMembershipEvent> = remote.into_events();
     resolved.sort_by(|a, b| {
         crate::community_membership::event_sort_key(a)
             .cmp(&crate::community_membership::event_sort_key(b))
@@ -3817,7 +3819,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         //     prior-state for the deferred path to include `None` (the expected
         //     unknown-publisher case) alongside `Joined`.
         {
-            let events_now: Vec<SignedMembershipEvent> = state.events.values().cloned().collect();
+            let events_now: Vec<SignedMembershipEvent> = state.events().cloned().collect();
             let mat_now = crate::community_membership::prior_state_at_hlc(
                 &events_now,
                 &payload.at,
@@ -3861,7 +3863,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         }
 
         for event in resolved {
-            if state.events.contains_key(&event.id) {
+            if state.contains_event(&event.id) {
                 // C1 restart-recovery: even though we've already seen this
                 // event, check whether a self-authored JoinCountersign for
                 // it needs to be emitted. This handles the case where the
@@ -5644,7 +5646,7 @@ impl crate::community_channel_log::CommunityStateAtHlc for CommunityStateAtHlcAd
         // admit a post on a state that never coexisted at one HLC.
         let state = self.state.lock().await;
         let events: Vec<crate::community_membership::SignedMembershipEvent> =
-            state.events.values().cloned().collect();
+            state.events().cloned().collect();
         drop(state);
         let materialized =
             crate::community_membership::prior_state_at_hlc(&events, at, self.admin_addr);
