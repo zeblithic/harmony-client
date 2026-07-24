@@ -20,7 +20,7 @@ fn save_and_load_crdt_round_trips() {
     save_crdt(&path, &original).expect("save");
     let loaded = load_crdt(&path, community_id).expect("load");
     assert_eq!(loaded.community_id, community_id);
-    assert!(loaded.events.is_empty());
+    assert!(loaded.events_is_empty());
 }
 
 #[test]
@@ -30,7 +30,7 @@ fn load_crdt_missing_file_returns_empty_state() {
     let community_id = SpaceId([1u8; 16]);
     let loaded = load_crdt(&path, community_id).expect("load missing");
     assert_eq!(loaded.community_id, community_id);
-    assert!(loaded.events.is_empty());
+    assert!(loaded.events_is_empty());
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn load_crdt_truncated_file_self_heals_to_default() {
     let community_id = SpaceId([1u8; 16]);
     let recovered = load_crdt(&path, community_id).expect("self-heal returns default");
     assert_eq!(recovered.community_id, community_id);
-    assert!(recovered.events.is_empty());
+    assert!(recovered.events_is_empty());
 
     // The corrupted file should have been quarantined under a
     // `.corrupt.<ts>` suffix so the next save_crdt lands cleanly.

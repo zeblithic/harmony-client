@@ -257,7 +257,7 @@ async fn run_fork_inner(
             .expect("original engine arc");
         let state_arc = original_engine.state();
         let state_g = state_arc.lock().await;
-        state_g.events.values().cloned().collect()
+        state_g.events().cloned().collect()
     };
 
     let mut identity_pubs: BTreeMap<OwnerAddr, [u8; 64]> = BTreeMap::new();
@@ -567,7 +567,7 @@ async fn visible_fork_announces_in_original_log() {
     // Engine A should have the Fork event in the original community's log.
     let engine_a = engines.registry_a.engine_arc(&community_id).await.unwrap();
     let state_a = engine_a.state().lock().await.clone();
-    let has_fork = state_a.events.values().any(|e| {
+    let has_fork = state_a.events().any(|e| {
         matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid, .. } if *fid == fork_space_id)
     });
     assert!(
@@ -578,8 +578,7 @@ async fn visible_fork_announces_in_original_log() {
     // Now propagate the Fork event to engine B by inserting it directly
     // (mirrors what the sync transport would do).
     let fork_event = state_a
-        .events
-        .values()
+        .events()
         .find(|e| matches!(&e.kind, MembershipEventKind::Fork { .. }))
         .cloned()
         .expect("Fork event");
@@ -599,7 +598,7 @@ async fn visible_fork_announces_in_original_log() {
     );
 
     let state_b = engine_b.state().lock().await.clone();
-    let b_has_fork = state_b.events.values().any(|e| {
+    let b_has_fork = state_b.events().any(|e| {
         matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid, .. } if *fid == fork_space_id)
     });
     assert!(
@@ -623,7 +622,7 @@ async fn silent_fork_leaves_original_untouched() {
     // Record event count before the fork.
     let event_count_before = {
         let engine_b = engines.registry_b.engine_arc(&community_id).await.unwrap();
-        engine_b.state().lock().await.events.len()
+        engine_b.state().lock().await.event_count()
     };
 
     // Run a SILENT fork.
@@ -650,8 +649,7 @@ async fn silent_fork_leaves_original_untouched() {
         .state()
         .lock()
         .await
-        .events
-        .values()
+        .events()
         .any(|e| matches!(&e.kind, MembershipEventKind::Fork { .. }));
     assert!(
         !has_fork_in_original,
@@ -661,7 +659,7 @@ async fn silent_fork_leaves_original_untouched() {
     // B's event count must be unchanged (no new events delivered).
     let event_count_after = {
         let engine_b = engines.registry_b.engine_arc(&community_id).await.unwrap();
-        engine_b.state().lock().await.events.len()
+        engine_b.state().lock().await.event_count()
     };
     assert_eq!(
         event_count_before, event_count_after,
@@ -902,13 +900,12 @@ async fn also_leave_emits_fork_and_leave_events() {
     let engine_a = engines.registry_a.engine_arc(&community_id).await.unwrap();
     let state = engine_a.state().lock().await.clone();
 
-    let has_fork = state.events.values().any(|e| {
+    let has_fork = state.events().any(|e| {
         matches!(&e.kind, MembershipEventKind::Fork { fork_space_id: fid, .. }
             if *fid == result.fork_space_id)
     });
     let has_leave = state
-        .events
-        .values()
+        .events()
         .any(|e| matches!(&e.kind, MembershipEventKind::Leave) && e.actor == a_addr);
 
     assert!(
@@ -934,14 +931,12 @@ async fn also_leave_emits_fork_and_leave_events() {
 
     // Propagate Fork + Leave to B and verify B sees them.
     let fork_event = state
-        .events
-        .values()
+        .events()
         .find(|e| matches!(&e.kind, MembershipEventKind::Fork { .. }))
         .cloned()
         .unwrap();
     let leave_event = state
-        .events
-        .values()
+        .events()
         .find(|e| matches!(&e.kind, MembershipEventKind::Leave) && e.actor == a_addr)
         .cloned()
         .unwrap();
@@ -959,15 +954,13 @@ async fn also_leave_emits_fork_and_leave_events() {
     let b_state = engine_b.state().lock().await.clone();
     assert!(
         b_state
-            .events
-            .values()
+            .events()
             .any(|e| matches!(&e.kind, MembershipEventKind::Fork { .. })),
         "B must see Fork event"
     );
     assert!(
         b_state
-            .events
-            .values()
+            .events()
             .any(|e| matches!(&e.kind, MembershipEventKind::Leave) && e.actor == a_addr),
         "B must see Leave event"
     );

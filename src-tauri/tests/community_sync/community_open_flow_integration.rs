@@ -266,7 +266,7 @@ async fn open_community_create_redeem_leave_round_trip() {
     // stable).
     assert!(
         wait_until(
-            || async { state_b.lock().await.events.len() == 1 },
+            || async { state_b.lock().await.event_count() == 1 },
             Duration::from_secs(10),
         )
         .await,
@@ -337,7 +337,7 @@ async fn open_community_create_redeem_leave_round_trip() {
     // A should now hold both events (admin Join + B's redemption Join).
     assert!(
         wait_until(
-            || async { state_a.lock().await.events.len() == 2 },
+            || async { state_a.lock().await.event_count() == 2 },
             Duration::from_secs(10),
         )
         .await,
@@ -389,7 +389,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         wait_until(
             || async {
                 let s = state_a.lock().await;
-                s.events.len() == 3
+                s.event_count() == 3
             },
             Duration::from_secs(10),
         )
@@ -604,7 +604,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
 
     assert!(
         wait_until(
-            || async { state_b.lock().await.events.len() == 1 },
+            || async { state_b.lock().await.event_count() == 1 },
             Duration::from_secs(10),
         )
         .await,
@@ -670,7 +670,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
 
     assert!(
         wait_until(
-            || async { state_a.lock().await.events.len() == 2 },
+            || async { state_a.lock().await.event_count() == 2 },
             Duration::from_secs(10),
         )
         .await,
@@ -718,7 +718,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
     {
         let s = state_b.lock().await;
         assert_eq!(
-            s.events.len(),
+            s.event_count(),
             3,
             "event log should have A's bootstrap + B's two redemption Joins"
         );
@@ -750,7 +750,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
     // even though it's a materialization no-op.
     assert!(
         wait_until(
-            || async { state_a.lock().await.events.len() == 3 },
+            || async { state_a.lock().await.event_count() == 3 },
             Duration::from_secs(10),
         )
         .await,
@@ -1130,12 +1130,12 @@ async fn open_community_two_node_wire_convergence_no_preseed() {
     // bypassing an exact-equality condition. The roster-equality assertion below
     // does the real semantic check.
     let a_has_both = wait_until(
-        || async { state_a.lock().await.events.len() >= 2 },
+        || async { state_a.lock().await.event_count() >= 2 },
         Duration::from_secs(10),
     )
     .await;
     let b_has_both = wait_until(
-        || async { state_b.lock().await.events.len() >= 2 },
+        || async { state_b.lock().await.event_count() >= 2 },
         Duration::from_secs(10),
     )
     .await;
@@ -1474,7 +1474,7 @@ async fn invite_only_admin_admits_joiner_pending_join_over_wire() {
         || async {
             let s = state_a.lock().await;
             let mat = harmony_app::community_membership::materialize(
-                &s.events.values().cloned().collect::<Vec<_>>(),
+                &s.events().cloned().collect::<Vec<_>>(),
                 owner_a,
             );
             matches!(
@@ -1497,7 +1497,7 @@ async fn invite_only_admin_admits_joiner_pending_join_over_wire() {
         || async {
             let s = state_a.lock().await;
             let mat = harmony_app::community_membership::materialize(
-                &s.events.values().cloned().collect::<Vec<_>>(),
+                &s.events().cloned().collect::<Vec<_>>(),
                 owner_a,
             );
             matches!(

@@ -43,7 +43,7 @@ fn empty_community_state_round_trips() {
     let bytes = canonical_cbor_encode(&s).expect("encode");
     let decoded: CommunityState = canonical_cbor_decode(&bytes).expect("decode");
     assert_eq!(decoded.community_id, s.community_id);
-    assert!(decoded.events.is_empty());
+    assert!(decoded.events_is_empty());
 }
 
 fn hlc(wall_ms: u64) -> Hlc {
@@ -84,7 +84,7 @@ fn insert_rejects_event_with_wrong_community() {
         InsertOutcome::Rejected(VerifyError::WrongCommunity)
     ));
     assert!(
-        state.events.is_empty(),
+        state.events_is_empty(),
         "rejected event must not land in log"
     );
 }
@@ -115,8 +115,8 @@ fn insert_accepts_admin_self_join_in_open_community() {
     );
 
     assert_eq!(outcome, InsertOutcome::Inserted);
-    assert_eq!(state.events.len(), 1);
-    assert!(state.events.contains_key(&event_id));
+    assert_eq!(state.event_count(), 1);
+    assert!(state.contains_event(&event_id));
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn insert_is_idempotent_on_duplicate_event_id() {
         InsertOutcome::Inserted
     );
     assert_eq!(state.insert_event(event, &ctx), InsertOutcome::AlreadyKnown);
-    assert_eq!(state.events.len(), 1);
+    assert_eq!(state.event_count(), 1);
 }
 
 /// Build a `CommunityState` containing one verified admin self-Join.

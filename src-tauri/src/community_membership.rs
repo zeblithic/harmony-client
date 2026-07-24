@@ -3927,6 +3927,12 @@ pub fn prior_state_at_hlc(
 /// materialized `enrolled_device_keys` (steady-state events). Countersig
 /// and InviteToken signers are likewise resolved from materialized
 /// membership. The context now carries only policy/binding scalars.
+///
+/// `Clone`/`Copy` (ZEB-748 phase 6a): all three fields are `Copy`
+/// scalars (`SpaceId`, `OwnerAddr`, `bool`), so the derive is free. The
+/// `MembershipPolicy` adopter (`community_state_crdt.rs`) threads a
+/// `VerifyContext` by value inside its per-insert `MembershipInsertCtx`.
+#[derive(Clone, Copy)]
 pub struct VerifyContext {
     pub expected_community_id: SpaceId,
     pub admin_addr: OwnerAddr,
@@ -5857,9 +5863,9 @@ pub(crate) enum AdminProposalPlan {
 ///
 /// Idempotency: each admin signs a given proposal at most once (as proposer
 /// OR as one countersign) — enforced by the already-signed scan.
-pub(crate) fn plan_admin_proposal_auto_exec(
+pub(crate) fn plan_admin_proposal_auto_exec<'a>(
     mat: &MaterializedMembership,
-    events: &BTreeMap<EventId, SignedMembershipEvent>,
+    events: impl Iterator<Item = &'a SignedMembershipEvent>,
     target: OwnerAddr,
     level: u8,
     self_owner: OwnerAddr,
@@ -5871,10 +5877,15 @@ pub(crate) fn plan_admin_proposal_auto_exec(
     if mat.power_levels.get(&target).copied() == Some(level) {
         return AdminProposalPlan::AlreadyApplied;
     }
+    // Collect once: the planner scans the log twice (canonical selection
+    // below + the already-signed check further down) and an iterator param
+    // can only be consumed once.
+    let events: Vec<&SignedMembershipEvent> = events.collect();
     // 2. Live proposals for this exact (target, level); pick the canonical
     //    (smallest EventId) among those still within the expiry window.
     let canonical = events
-        .values()
+        .iter()
+        .copied()
         .filter(|e| match &e.kind {
             MembershipEventKind::AdminProposal { proposal_kind } => matches!(
                 proposal_kind,
@@ -5892,7 +5903,7 @@ pub(crate) fn plan_admin_proposal_auto_exec(
 
     // 4/5. Already signed the canonical (proposer or countersign) → nothing
     //      to do; otherwise countersign it.
-    let already_signed = events.values().any(|e| match &e.kind {
+    let already_signed = events.iter().copied().any(|e| match &e.kind {
         MembershipEventKind::AdminProposal { .. } => e.id == canonical.id && e.actor == self_owner,
         MembershipEventKind::AdminCountersign { target_event_id } => {
             *target_event_id == canonical.id && e.actor == self_owner
@@ -6236,7 +6247,7 @@ pub async fn apply_auto_exec_admin_proposal_set_power(
         let mat = state_g.materialized(engine_arc.admin_addr());
         plan_admin_proposal_auto_exec(
             &mat,
-            &state_g.events,
+            state_g.events(),
             target_pubkey,
             level,
             self_owner,
@@ -6966,9 +6977,9 @@ mod plan_admin_proposal_tests {
         let me = OwnerAddr([2; 16]);
         let mut mat = MaterializedMembership::default();
         mat.power_levels.insert(target, 100);
-        let events = BTreeMap::new();
+        let events: BTreeMap<EventId, SignedMembershipEvent> = BTreeMap::new();
         assert!(matches!(
-            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_000),
+            plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, 1_000),
             AdminProposalPlan::AlreadyApplied
         ));
     }
@@ -6979,9 +6990,9 @@ mod plan_admin_proposal_tests {
         let target = OwnerAddr([1; 16]);
         let me = OwnerAddr([2; 16]);
         let mat = MaterializedMembership::default();
-        let events = BTreeMap::new();
+        let events: BTreeMap<EventId, SignedMembershipEvent> = BTreeMap::new();
         assert!(matches!(
-            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_000),
+            plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, 1_000),
             AdminProposalPlan::MintProposal
         ));
     }
@@ -6996,7 +7007,7 @@ mod plan_admin_proposal_tests {
         let mat = MaterializedMembership::default();
         let mut events = BTreeMap::new();
         events.insert(pid, mk_proposal(pid, proposer, target, 100, 1_000));
-        match plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500) {
+        match plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, 1_500) {
             AdminProposalPlan::Countersign(got) => assert_eq!(got, pid),
             other => panic!("expected Countersign, got {other:?}"),
         }
@@ -7012,7 +7023,7 @@ mod plan_admin_proposal_tests {
         let mut events = BTreeMap::new();
         events.insert(pid, mk_proposal(pid, me, target, 100, 1_000));
         assert!(matches!(
-            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500),
+            plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, 1_500),
             AdminProposalPlan::Pending
         ));
     }
@@ -7030,7 +7041,7 @@ mod plan_admin_proposal_tests {
         events.insert(pid, mk_proposal(pid, proposer, target, 100, 1_000));
         events.insert(cid, mk_countersign(cid, me, pid, 1_100));
         assert!(matches!(
-            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500),
+            plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, 1_500),
             AdminProposalPlan::Pending
         ));
     }
@@ -7048,7 +7059,7 @@ mod plan_admin_proposal_tests {
         let mut events = BTreeMap::new();
         events.insert(high, mk_proposal(high, a, target, 100, 1_000));
         events.insert(low, mk_proposal(low, b, target, 100, 1_000));
-        match plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500) {
+        match plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, 1_500) {
             AdminProposalPlan::Countersign(got) => assert_eq!(got, low),
             other => panic!("expected canonical Countersign(low), got {other:?}"),
         }
@@ -7066,7 +7077,7 @@ mod plan_admin_proposal_tests {
         events.insert(pid, mk_proposal(pid, proposer, target, 100, 1_000));
         let now = 1_000 + ADMIN_PROPOSAL_EXPIRY_MS + 1;
         assert!(matches!(
-            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, now),
+            plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, now),
             AdminProposalPlan::MintProposal
         ));
     }
@@ -7083,7 +7094,7 @@ mod plan_admin_proposal_tests {
         let mut events = BTreeMap::new();
         events.insert(pid, mk_proposal(pid, proposer, other, 100, 1_000)); // different target
         assert!(matches!(
-            plan_admin_proposal_auto_exec(&mat, &events, target, 100, me, 1_500),
+            plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, 1_500),
             AdminProposalPlan::MintProposal
         ));
     }

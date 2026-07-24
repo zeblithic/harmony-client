@@ -1020,7 +1020,7 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
     let events: Vec<_> = {
         let state = engine.state();
         let g = state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
     let catchup_event = events
         .iter()
@@ -1463,8 +1463,8 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
     let catchup_event = {
         let state = engine.state();
         let g = state.lock().await;
-        g.events
-            .values()
+        let ev = g
+            .events()
             .find(|e| {
                 matches!(
                     &e.kind,
@@ -1472,7 +1472,8 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
                         if recipient_ciphertexts.iter().any(|rc| rc.recipient == dave_addr)
                 )
             })
-            .cloned()
+            .cloned();
+        ev
     }
     .expect(
         "observer must synthesize an EpochCatchup for the invite-only (countersigned PendingJoin) joiner",

@@ -396,8 +396,8 @@ where
         let countersign = loop {
             let found: Option<SignedMembershipEvent> = {
                 let g = state_arc.lock().await;
-                g.events
-                    .values()
+                let matched = g
+                    .events()
                     .find(|e| {
                         e.actor == self_owner
                             && matches!(
@@ -406,7 +406,9 @@ where
                                 if *target_event_id == bootstrap_join_id
                             )
                     })
-                    .cloned()
+                    .cloned();
+                drop(g);
+                matched
             };
             if let Some(cs) = found {
                 break cs;
@@ -553,7 +555,7 @@ where
         let current_events = {
             let g = engine.state();
             let g = g.lock().await;
-            g.events.values().cloned().collect::<Vec<_>>()
+            g.events().cloned().collect::<Vec<_>>()
         };
 
         let now_ms = std::time::SystemTime::now()

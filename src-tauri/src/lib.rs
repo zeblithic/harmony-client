@@ -8010,8 +8010,7 @@ pub async fn start_node_inner(
                                 // triple; the `Space.pending_join_at` field is exactly
                                 // the `event.at` stored at mint time.
                                 let target_event_id: Option<crate::community_membership::EventId> = g
-                                    .events
-                                    .values()
+                                    .events()
                                     .find(|e| {
                                         e.actor == self_owner
                                             && matches!(
@@ -8023,7 +8022,7 @@ pub async fn start_node_inner(
                                     .map(|e| e.id);
                                 match target_event_id {
                                     None => false, // no matching PendingJoin on disk
-                                    Some(target_id) => g.events.values().any(|e| matches!(
+                                    Some(target_id) => g.events().any(|e| matches!(
                                         &e.kind,
                                         crate::community_membership::MembershipEventKind::JoinCountersign {
                                             target_event_id,
@@ -8201,7 +8200,7 @@ pub async fn start_node_inner(
                                         })
                                         .unwrap_or(false)
                                 };
-                                for ev in st.events.values() {
+                                for ev in st.events() {
                                     match &ev.kind {
                                         crate::community_membership::MembershipEventKind::ReachabilityAnnounce { payload } => {
                                             if is_joined(&ev.actor) {
@@ -27569,7 +27568,10 @@ async fn list_community_forks(
         let events_clone: std::collections::BTreeMap<
             crate::community_membership::EventId,
             crate::community_membership::SignedMembershipEvent,
-        > = g.events.clone();
+        > = g
+            .events()
+            .map(|e| (e.id, e.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
         (events_clone, materialized)
     };
 
@@ -31099,7 +31101,7 @@ pub(crate) async fn generate_invite_impl(
     let events: Vec<crate::community_membership::SignedMembershipEvent> =
         if let Some(state_arc) = &engine_state {
             let state = state_arc.lock().await;
-            state.events.values().cloned().collect()
+            state.events().cloned().collect()
         } else {
             Vec::new()
         };
@@ -31215,7 +31217,7 @@ pub(crate) async fn generate_invite_impl(
                     for (sid, c_admin) in community_space_ids {
                         let evs = if let Some(arc) = community_registry.state_for(&sid).await {
                             let g = arc.lock().await;
-                            g.events.values().cloned().collect()
+                            g.events().cloned().collect()
                         } else {
                             Vec::new()
                         };
@@ -34483,8 +34485,8 @@ mod zeb_315_membership_at_event_hlc_tests {
                 },
                 hlc(3_000),
             );
-            st.events.insert(join.id, join);
-            st.events.insert(kick.id, kick);
+            st.insert_verified_for_test(join);
+            st.insert_verified_for_test(kick);
         }
 
         // Owner-state Community Space row so the snapshot builders can
@@ -35557,7 +35559,7 @@ fn orphan_dir_adoption_eligible(
     self_owner: crate::owner_state_types::OwnerAddr,
     now_wall_ms: u64,
 ) -> bool {
-    if dir_state.events.is_empty() {
+    if dir_state.events_is_empty() {
         return false;
     }
     let materialized = dir_state.materialized(payload.admin_addr);
@@ -36418,12 +36420,16 @@ where
                         let countersigned_now = {
                             let state = engine_arc.state();
                             let g = state.lock().await;
-                            g.events.values().any(|e| matches!(
+                            // `events()` yields an opaque `impl Iterator` whose
+                            // temporary would outlive the guard in tail position
+                            // (E0597); bind the bool so the iterator drops first.
+                            let found = g.events().any(|e| matches!(
                                 &e.kind,
                                 crate::community_membership::MembershipEventKind::JoinCountersign {
                                     target_event_id,
                                 } if *target_event_id == minted.bootstrap_join.id
-                            ))
+                            ));
+                            found
                         };
                         if countersigned_now {
                             tracing::debug!(
@@ -36472,14 +36478,18 @@ where
         let already_countersigned = {
             let state = engine_arc.state();
             let g = state.lock().await;
-            g.events.values().any(|e| {
+            // `events()` yields an opaque `impl Iterator` whose temporary would
+            // outlive the guard in tail position (E0597); bind the bool so the
+            // iterator drops before the guard.
+            let found = g.events().any(|e| {
                 matches!(
                     &e.kind,
                     crate::community_membership::MembershipEventKind::JoinCountersign {
                         target_event_id,
                     } if *target_event_id == minted.bootstrap_join.id
                 )
-            })
+            });
+            found
         };
         if already_countersigned {
             tracing::debug!(
@@ -38523,7 +38533,9 @@ mod zeb436_orphan_adoption_tests {
                 .await
                 .expect("baseline join must have spawned an engine");
             let g = state_arc.lock().await;
-            g.events.clone()
+            g.events()
+                .map(|e| (e.id, e.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>()
         };
         assert!(
             !events.is_empty(),
@@ -38545,7 +38557,7 @@ mod zeb436_orphan_adoption_tests {
             .expect("create community dir");
         let mut on_disk = crate::community_state_crdt::CommunityState::new(community_id);
         let event_count = events.len();
-        on_disk.events = events;
+        on_disk.set_event_log_for_test(events);
         crate::community_state_persist::save_crdt(&crdt_path, &on_disk)
             .expect("persist orphaned community CRDT");
 
@@ -38619,7 +38631,7 @@ mod zeb436_orphan_adoption_tests {
             .expect("repair redeem must (re)spawn the community engine");
         let events_after = {
             let g = state_arc.lock().await;
-            g.events.len()
+            g.event_count()
         };
         assert_eq!(
             events_after, events_before,
@@ -38686,7 +38698,7 @@ mod zeb436_orphan_adoption_tests {
         let survived = crate::community_state_persist::load_crdt(&crdt_path, community_id)
             .expect("orphaned CRDT must remain loadable after the failed attempt");
         assert_eq!(
-            survived.events.len(),
+            survived.event_count(),
             events_before,
             "membership history must be intact after the failed repair attempt"
         );
@@ -38903,10 +38915,8 @@ mod zeb436_orphan_adoption_tests {
             ev
         };
         let mut orphaned = crate::community_state_crdt::CommunityState::new(community_id);
-        orphaned
-            .events
-            .insert(admin_bootstrap.id, admin_bootstrap.clone());
-        orphaned.events.insert(self_join.id, self_join);
+        orphaned.insert_verified_for_test(admin_bootstrap.clone());
+        orphaned.insert_verified_for_test(self_join);
         let crdt_path = tmp
             .path()
             .join("communities")
@@ -39076,7 +39086,7 @@ mod zeb436_orphan_adoption_tests {
             .expect("repair redeem must (re)spawn the community engine");
         let events_after = {
             let g = state_arc.lock().await;
-            g.events.len()
+            g.event_count()
         };
         assert_eq!(
             events_after, 2,
@@ -44065,7 +44075,7 @@ pub(crate) async fn list_recent_moderation_events_impl(
     // Collect raw events, filter to moderation kinds, map to DTO.
     let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
         let g = engine_state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
 
     let mut dtos: Vec<ModerationEventDto> = raw_events
@@ -44223,7 +44233,7 @@ pub(crate) async fn list_pending_joins_impl(
     let engine_state = engine_arc.state();
     let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
         let g = engine_state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
 
     // F7: use wall-clock now for expiry threshold so a lone PendingJoin
@@ -44398,7 +44408,7 @@ pub(crate) async fn list_recent_counter_signs_impl(
     let engine_state = engine_arc.state();
     let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
         let g = engine_state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
 
     Ok(filter_recent_counter_signs(&raw_events, self_owner, cap))
@@ -44699,7 +44709,7 @@ async fn list_pending_admin_proposals(
     let raw_events: Vec<crate::community_membership::SignedMembershipEvent> = {
         let state = engine_arc.state();
         let g = state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
 
     let now_ms = std::time::SystemTime::now()
@@ -44991,16 +45001,12 @@ pub fn compute_pending_admin_proposals(
 /// AdminProposal (proposer + all AdminCountersign actors targeting it).
 /// Returns 0 if the proposal_id is not found (no proposal event and no
 /// countersigns).
-pub fn count_signers(
-    events: &std::collections::BTreeMap<
-        crate::community_membership::EventId,
-        crate::community_membership::SignedMembershipEvent,
-    >,
+pub fn count_signers<'a>(
+    events: impl Iterator<Item = &'a crate::community_membership::SignedMembershipEvent>,
     proposal_id: [u8; 16],
 ) -> u8 {
     use crate::community_membership::MembershipEventKind;
     events
-        .values()
         .filter_map(|e| match &e.kind {
             MembershipEventKind::AdminProposal { .. } if e.id == proposal_id => Some(e.actor),
             MembershipEventKind::AdminCountersign { target_event_id }
@@ -45121,7 +45127,7 @@ pub(crate) async fn countersign_admin_proposal_impl(
         }
 
         // Lookup + validate target event.
-        let target = g.events.get(&proposal_id_bytes);
+        let target = g.get_event(&proposal_id_bytes);
         let proposal_found = matches!(
             target.map(|e| &e.kind),
             Some(crate::community_membership::MembershipEventKind::AdminProposal { .. })
@@ -45145,7 +45151,7 @@ pub(crate) async fn countersign_admin_proposal_impl(
 
         // Idempotency: already signed as proposer or via AdminCountersign?
         use crate::community_membership::MembershipEventKind;
-        let already_signed = g.events.values().any(|e| match &e.kind {
+        let already_signed = g.events().any(|e| match &e.kind {
             MembershipEventKind::AdminProposal { .. } => {
                 e.id == proposal_id_bytes && e.actor == self_owner
             }
@@ -45176,7 +45182,7 @@ pub(crate) async fn countersign_admin_proposal_impl(
         // Idempotent — report current state without minting.
         let state = engine_arc.state();
         let g = state.lock().await;
-        let signers_after = count_signers(&g.events, proposal_id_bytes);
+        let signers_after = count_signers(g.events(), proposal_id_bytes);
         return Ok(CountersignResult {
             signers_after,
             quorum_required: admin_quorum,
@@ -45215,7 +45221,7 @@ pub(crate) async fn countersign_admin_proposal_impl(
     // Recompute signer count after insert.
     let state = engine_arc.state();
     let g = state.lock().await;
-    let signers_after = count_signers(&g.events, proposal_id_bytes);
+    let signers_after = count_signers(g.events(), proposal_id_bytes);
     let post_materialized = g.materialize_now(admin_addr);
     let quorum_required = post_materialized.admin_quorum;
     Ok(CountersignResult {
@@ -47184,7 +47190,7 @@ pub async fn self_heal_community_observer(
         let events: Vec<crate::community_membership::SignedMembershipEvent> = {
             let state_g = engine_arc.state();
             let state_g = state_g.lock().await;
-            state_g.events.values().cloned().collect()
+            state_g.events().cloned().collect()
         };
         // Select the NEWEST matching Kick or Leave so that a rejoin+re-kick
         // sequence picks the most-recent removal rather than the stale one,
@@ -47347,7 +47353,7 @@ pub async fn self_heal_community_observer(
         let events: Vec<crate::community_membership::SignedMembershipEvent> = {
             let state_g = engine_arc.state();
             let state_g = state_g.lock().await;
-            state_g.events.values().cloned().collect()
+            state_g.events().cloned().collect()
         };
         // ZEB-578: accept a `Join` OR a countersigned `PendingJoin` as the
         // catchup trigger (most recent wins, for rejoin). An invite-only joiner
@@ -47851,7 +47857,7 @@ async fn voting_build_snapshot_for_community_at_hlc(
     // O(events) walk.
     let events: Vec<crate::community_membership::SignedMembershipEvent> = {
         let g = engine_state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
     let materialized = crate::community_membership::prior_state_at_hlc(&events, at, admin_addr);
     Ok(voting_membership_snapshot_from_materialized(&materialized))
@@ -70205,8 +70211,7 @@ mod unban_from_community_tests {
 
         // Inspect the raw event log for the Kick event's reason.
         let kick_in_log = state
-            .events
-            .values()
+            .events()
             .find(|ev| matches!(&ev.kind, MembershipEventKind::Kick { .. }))
             .expect("Kick event must be in the event log");
 
@@ -70334,7 +70339,7 @@ mod unban_from_community_tests {
         // Apply the list_recent_moderation_events filter logic directly on
         // the raw event log (mirrors what the IPC does).
         let raw: Vec<crate::community_membership::SignedMembershipEvent> =
-            state.events.values().cloned().collect();
+            state.events().cloned().collect();
 
         let mut dtos: Vec<ModerationEventDto> = raw
             .into_iter()
@@ -70485,7 +70490,7 @@ mod unban_from_community_tests {
 
         // Apply filter + sort + truncate (limit = 3).
         let raw: Vec<crate::community_membership::SignedMembershipEvent> =
-            state.events.values().cloned().collect();
+            state.events().cloned().collect();
         let mut dtos: Vec<ModerationEventDto> = raw
             .into_iter()
             .filter_map(|ev| {
@@ -73111,7 +73116,7 @@ mod admin_action_result_routing_tests {
         // Confirm the proposal is in the event log (mirrors what the IPC Pending
         // branch returns via hex::encode(proposal.id)).
         assert!(
-            state.events.contains_key(&proposal_id),
+            state.contains_event(&proposal_id),
             "proposal must be in the CRDT event log"
         );
     }
@@ -73764,7 +73769,7 @@ mod zeb_714_recovery_state_tests {
             },
         ));
         for e in all {
-            state.events.insert(e.id, e);
+            state.insert_verified_for_test(e);
         }
         state
     }
@@ -73839,7 +73844,7 @@ mod zeb_714_recovery_state_tests {
                 target_event_id: P1,
             },
         );
-        state.events.insert(veto.id, veto);
+        state.insert_verified_for_test(veto);
         let m = state.materialized_with_now(admin1(), DEADLINE + 1);
         let dto = compute_recovery_state(&m, m2());
         let p = &dto.proposals[0];
@@ -74073,7 +74078,7 @@ mod countersign_admin_proposal_tests {
             setup_quorum2_community(community_id);
 
         // Proposer (admin) already signed via AdminProposal.
-        let signers_before = count_signers(&state.events, proposal_id);
+        let signers_before = count_signers(state.events(), proposal_id);
         assert_eq!(signers_before, 1, "only proposer signed so far");
 
         // admin_quorum is 2 — quorum not yet reached.
@@ -74106,7 +74111,7 @@ mod countersign_admin_proposal_tests {
             "second countersign must insert; got {cs_outcome:?}"
         );
 
-        let signers_after = count_signers(&state.events, proposal_id);
+        let signers_after = count_signers(state.events(), proposal_id);
         assert_eq!(signers_after, 2, "proposer + second = 2 signers");
 
         // Idempotency: second admin already signed — a new AdminCountersign
@@ -74136,7 +74141,7 @@ mod countersign_admin_proposal_tests {
         );
 
         // count_signers must still be 2 (idempotent, no new signer added).
-        let signers_idempotent = count_signers(&state.events, proposal_id);
+        let signers_idempotent = count_signers(state.events(), proposal_id);
         assert_eq!(
             signers_idempotent, 2,
             "count must remain 2 after duplicate attempt"
@@ -74169,7 +74174,7 @@ mod countersign_admin_proposal_tests {
         );
 
         // Also verify count_signers is unaffected (still 1 — only proposer).
-        let signers = count_signers(&state.events, proposal_id);
+        let signers = count_signers(state.events(), proposal_id);
         assert_eq!(signers, 1, "only proposer; non-admin cannot sign");
     }
 
@@ -74213,7 +74218,7 @@ mod countersign_admin_proposal_tests {
         assert_eq!(m.admin_quorum, 2, "quorum must be 2");
 
         // Before countersign: signers=1, quorum=2, not reached.
-        let signers_before = count_signers(&state.events, proposal_id);
+        let signers_before = count_signers(state.events(), proposal_id);
         assert_eq!(signers_before, 1);
         assert!(signers_before < 2, "quorum not yet reached");
 
@@ -74242,7 +74247,7 @@ mod countersign_admin_proposal_tests {
             "countersign must insert; got {cs_outcome:?}"
         );
 
-        let signers_after = count_signers(&state.events, proposal_id);
+        let signers_after = count_signers(state.events(), proposal_id);
         let quorum_required = state.materialize_now(admin).admin_quorum;
         let reached_quorum = signers_after >= quorum_required;
 

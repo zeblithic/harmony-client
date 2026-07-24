@@ -402,7 +402,7 @@ async fn admin_engine_auto_counter_signs_on_pending_join_insert() {
         loop {
             {
                 let g = state_arc.lock().await;
-                let found = g.events.values().any(|e| {
+                let found = g.events().any(|e| {
                     e.actor == admin_addr
                         && matches!(
                             &e.kind,
@@ -530,8 +530,7 @@ async fn admin_engine_idempotent_no_duplicate_counter_sign() {
             {
                 let g = state_arc.lock().await;
                 let count = g
-                    .events
-                    .values()
+                    .events()
                     .filter(|e| {
                         e.actor == admin_addr
                             && matches!(
@@ -556,8 +555,7 @@ async fn admin_engine_idempotent_no_duplicate_counter_sign() {
 
     let g = state_arc.lock().await;
     let count = g
-        .events
-        .values()
+        .events()
         .filter(|e| {
             e.actor == admin_addr
                 && matches!(
@@ -818,7 +816,7 @@ async fn sync_one_way(
 ) {
     let events: Vec<SignedMembershipEvent> = {
         let g = from_state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
     for ev in events {
         let Some(actor_pub) = actor_pubs.get(&ev.actor).copied() else {
@@ -1262,8 +1260,7 @@ async fn pending_join_resolves_under_two_admin_race() {
     // Both JoinCountersigns must be present in the joiner's event log.
     let cs_count = {
         let g = joiner_state_arc.lock().await;
-        g.events
-            .values()
+        g.events()
             .filter(|e| {
                 matches!(
                     &e.kind,
@@ -1402,13 +1399,14 @@ async fn pending_join_resolves_when_admin_comes_online() {
         loop {
             let done = {
                 let g = admin_state.lock().await;
-                g.events.values().any(|e| {
+                let found = g.events().any(|e| {
                     matches!(
                         &e.kind,
                         MembershipEventKind::JoinCountersign { target_event_id }
                         if *target_event_id == pending_id
                     )
-                })
+                });
+                found
             };
             if done {
                 return;
@@ -1555,7 +1553,7 @@ async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind(
         loop {
             {
                 let g = state_arc.lock().await;
-                let found = g.events.values().any(|e| {
+                let found = g.events().any(|e| {
                     e.actor == admin_addr
                         && matches!(
                             &e.kind,
@@ -1698,7 +1696,7 @@ async fn boot_reconcile_engine_accepts_pending_join_via_state_root_late_bind() {
         loop {
             {
                 let g = dst_state.lock().await;
-                if g.events.values().any(|e| {
+                if g.events().any(|e| {
                     e.actor == admin_addr
                         && matches!(
                             &e.kind,
@@ -1850,7 +1848,7 @@ async fn restart_recovery_already_known_pending_join_triggers_counter_sign() {
         loop {
             {
                 let g = state_arc.lock().await;
-                if g.events.values().any(|e| {
+                if g.events().any(|e| {
                     e.actor == admin_addr
                         && matches!(
                             &e.kind,
@@ -1872,8 +1870,7 @@ async fn restart_recovery_already_known_pending_join_triggers_counter_sign() {
 
     let g = state_arc.lock().await;
     let count = g
-        .events
-        .values()
+        .events()
         .filter(|e| {
             e.actor == admin_addr
                 && matches!(

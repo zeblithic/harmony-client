@@ -548,7 +548,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         .expect("alice state");
     let alice_events: Vec<_> = {
         let g = alice_state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
     assert_eq!(
         alice_events.len(),
@@ -575,7 +575,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         .expect("bob state");
     let bob_events: Vec<_> = {
         let g = bob_state.lock().await;
-        g.events.values().cloned().collect()
+        g.events().cloned().collect()
     };
     assert_eq!(
         bob_events.len(),

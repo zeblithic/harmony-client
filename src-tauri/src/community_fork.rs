@@ -348,7 +348,7 @@ pub async fn fork_community(
         }
         // Collect membership events for the snapshot.
         let events: Vec<crate::community_membership::SignedMembershipEvent> =
-            state_g.events.values().cloned().collect();
+            state_g.events().cloned().collect();
         // ZEB-287 Task 4: capture forker's lineage + forked_at_wall_ms so we
         // can extend the chain into the new fork's PreForkSnapshot.
         let forker_parent_lineage = state_g.parent_lineage.clone();
