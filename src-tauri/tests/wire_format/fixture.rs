@@ -177,15 +177,26 @@ fn space_shared_in_profile_true_emits_sp_key() {
     assert_eq!(sp_value, ciborium::value::Value::Bool(true));
 }
 
+// The v0x02 pin uses the `test-fixtures`-gated deterministic seam
+// (`encrypt_vault_with_params_for_test` / `decrypt_vault_bytes_for_test`), so
+// the whole v2 block is gated on that feature — mirroring `zeb213_fixtures.rs`.
+// (`wire_format_v1_pinned` above stays ungated: its `encrypt_with_params_for_test`
+// seam is not feature-gated.)
+#[cfg(feature = "test-fixtures")]
 use harmony_app::identity::test_only::encrypt_vault_with_params_for_test;
 
+#[cfg(feature = "test-fixtures")]
 const V2_PASSPHRASE: &[u8] = b"correct horse battery staple";
+#[cfg(feature = "test-fixtures")]
 const V2_SALT: [u8; 16] = [0x1A; 16];
+#[cfg(feature = "test-fixtures")]
 const V2_NONCE: [u8; 24] = [0x2B; 24];
 // Fixed arbitrary plaintext — the v0x02 envelope protects opaque bytes, so
 // the pin is independent of SecretVault CBOR shape.
+#[cfg(feature = "test-fixtures")]
 const V2_PLAINTEXT: [u8; 48] = [0x5C; 48];
 
+#[cfg(feature = "test-fixtures")]
 fn fixture_v2_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -193,6 +204,7 @@ fn fixture_v2_path() -> std::path::PathBuf {
         .join("encrypted_v2.bin")
 }
 
+#[cfg(feature = "test-fixtures")]
 #[test]
 fn wire_format_v2_pinned() {
     let bytes =

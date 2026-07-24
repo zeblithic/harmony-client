@@ -404,7 +404,11 @@ pub fn open(password: &[u8], params: &Argon2idParams, salt: &[u8], nonce: &[u8],
   ```bash
   cargo fmt --all
   cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings 2>&1 | tail -5
-  scripts/test-select --context task 2>&1 | tail -20
+  # Task 1 changed Cargo.toml's dependency graph this session, so the module-mapped
+  # iterative selector is unreliable here (it will bail with that warning). Use an
+  # explicit scoped selection instead:
+  cargo nextest run --locked --all-targets --features test-fixtures \
+    -E 'test(identity) or test(state_snapshot) or test(vault) or test(wire_format) or test(owner_state)' 2>&1 | tail -20
   git -C .. add src-tauri/src/identity.rs src-tauri/src/state_snapshot.rs
   git -C .. commit -m "identity+state_snapshot: converge HRMI v1/v2 + HRSS onto password_envelope (byte-identical)"
   ```
