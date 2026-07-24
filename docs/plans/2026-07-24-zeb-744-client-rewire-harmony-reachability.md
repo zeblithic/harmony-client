@@ -21,7 +21,7 @@
   - `harmony_reachability::MultiDeviceMap<Owner: Ord+Copy, V>` — `new()`, `insert(key:(Owner,[u8;32]), v)->Option<V>`, `get(&(Owner,[u8;32]))`, `get_mut(&…)`, `entry((Owner,[u8;32]))->btree_map::Entry`, `remove(&(Owner,[u8;32]))`, `iter()`, `is_empty()`, `len()`, `range_owner(&Owner)->impl Iterator<Item=(&(Owner,[u8;32]),&V)>`, `owner_keys(&Owner)->Vec<(Owner,[u8;32])>`, `find_by_node_id(&[u8;32])->impl Iterator`. Derives `Debug, Clone, Default`.
   - `harmony_reachability::ReachabilityFallback<Owner>: Send+Sync` — `#[async_trait] async fn resolve(&self, owner:&Owner)->Vec<ReachabilityAnnouncePayload>;`.
   - Also re-exported at crate root: `canonical_cbor_encode`, `canonical_cbor_decode`, `CborError`. NOT at root: `canonical_payload_bytes` (→ `::record::`), serde helpers (→ `::canonical::`).
-- **Test cost:** any lib change relinks ~97 integration binaries (~50 min full). Per-task gates use `scripts/test-select --context task` + the targeted binaries named in each task; the CI-parity `--full` sweep runs ONCE in Task 4. All test commands run from `src-tauri/` with `--locked --features test-fixtures`.
+- **Test cost:** any lib change relinks ~97 integration binaries (~50 min full). Per-task gates use `scripts/test-select` + the targeted binaries named in each task. **Because Task 1 changes `Cargo.toml`/`Cargo.lock` (a dependency-graph change), `test-select`'s module-mapping guard trips** — the per-task gates therefore run `scripts/test-select --context task --force` (the guard's sanctioned proceed-anyway), and the **authoritative dependency-change coverage is the full CI-parity sweep in Task 4** (`cargo nextest run --locked --workspace --all-targets`), which must be green before merge. All test commands run from `src-tauri/` with `--locked --features test-fixtures`.
 - **Gates (CI parity):** `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run --locked --workspace --all-targets --features test-fixtures`.
 
 ---
@@ -58,7 +58,7 @@ harmony-reachability = { git = "https://github.com/zeblithic/harmony.git", rev =
 
 - [ ] **Step 4: Regenerate the lockfile + verify it resolves and compiles.**
 
-Run (from `src-tauri/`): `cargo check --locked=false -p harmony-app --features test-fixtures 2>&1 | tail -20`
+Run (from `src-tauri/`) plain `cargo check` with **no** `--locked` flag — cargo has no `--locked=false` form (it rejects the argument before resolution); omitting `--locked` is what lets cargo re-resolve and rewrite `Cargo.lock` for the new rev: `cargo check -p harmony-app --features test-fixtures 2>&1 | tail -20`
 Expected: resolves the new git rev, updates `Cargo.lock`, compiles clean (the 12-crate bump is a no-op — `3745744` only *added* the new crate on top of `cb05de9`, touching none of their sources). `harmony-reachability` is added-but-not-yet-used; if (and only if) the build errors with `unused_crate_dependencies` for `harmony-reachability`, add `use harmony_reachability as _;` near the top of `src-tauri/src/lib.rs` and note it — Task 2 replaces it with real use. (Default lints do not enable that check; expect no such error.)
 
 - [ ] **Step 5: Confirm `--locked` is now satisfied.**
@@ -155,7 +155,7 @@ Generate the constant ONCE: run the test, read the `left:` value from the assert
 
 Run:
 ```bash
-scripts/test-select --context task
+scripts/test-select --context task --force   # --force: Task 1's manifest change trips the dep-graph guard; Task 4's full --workspace sweep is the authoritative dep-change coverage
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings 2>&1 | tail -15
 ```
@@ -253,7 +253,7 @@ Run: `cargo nextest run --locked --features test-fixtures -p harmony-app -E 'bin
 
 Run:
 ```bash
-scripts/test-select --context task
+scripts/test-select --context task --force   # --force: Task 1's manifest change trips the dep-graph guard; Task 4's full --workspace sweep is the authoritative dep-change coverage
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings 2>&1 | tail -15
 ```
