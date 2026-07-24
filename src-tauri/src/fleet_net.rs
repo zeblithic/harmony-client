@@ -1379,7 +1379,6 @@ mod tests {
         use crate::fleet_net_persist::FleetNetPersist;
         use crate::fleet_sync::{FleetSyncConfig, FleetSyncEngine, Merger, DEFAULT_DEBOUNCE_MS};
         use crate::owner_state_crypto::KeyTree;
-        use std::collections::BTreeMap;
         use std::sync::Arc;
         use std::time::Duration;
         use tokio::sync::{mpsc, Mutex};
@@ -1387,7 +1386,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let kt = Arc::new(KeyTree::derive(&[0x66u8; 32]).expect("derive kt"));
         let doc = Arc::new(Mutex::new(FleetNetDoc::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".to_string(),
+        )));
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
         let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
         let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
@@ -1410,7 +1411,7 @@ mod tests {
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             publish_seen: true,
             on_applied: None,
-            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+            sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
         });
 
         // A local self-row upsert (what start_node's post-bind upsert

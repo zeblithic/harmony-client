@@ -201,7 +201,7 @@ pub struct ProdCommunityDeviceRetireDepositCtx {
     /// Shared per-device HLC replay tracker (same one the intro deposit
     /// uses, so retire HLCs are monotonic with every other event this
     /// device stamps).
-    pub hlc_tracker: Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, Hlc>>>,
+    pub hlc_tracker: Arc<tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
 }
 
 #[async_trait]

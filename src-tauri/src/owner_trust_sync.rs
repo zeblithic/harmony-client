@@ -606,7 +606,9 @@ mod tests {
                 device_id: name.to_string(),
                 state: Arc::clone(doc),
                 merger: trust_merger(),
-                replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+                replay_tracker: Arc::new(tokio::sync::Mutex::new(
+                    harmony_crdt_sync::ReplayTracker::new(name.to_string()),
+                )),
                 content_store: Arc::clone(&store),
                 publisher_tx: pub_tx,
                 subscriber_rx: sub_rx,
@@ -618,7 +620,9 @@ mod tests {
                 debounce_ms: 50,
                 publish_seen: true,
                 on_applied: None,
-                sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+                sibling_acks: Arc::new(tokio::sync::Mutex::new(
+                    harmony_crdt_sync::MonotoneMap::new(),
+                )),
             }))
         };
         // Per-engine persist dirs must exist (save_owner_state_cbor_only

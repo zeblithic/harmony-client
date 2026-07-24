@@ -170,7 +170,7 @@ impl FleetPersist<RelayHoldDoc> for NoopRelayPersist {
 struct Built {
     engine: Arc<FleetSyncEngine<RelayHoldDoc>>,
     doc: Arc<Mutex<RelayHoldDoc>>,
-    tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     /// Keep the outbound receiver alive so the `publisher_tx` channel
     /// remains open — dropping it would close the publish channel and cause
     /// `flush_now` to return `TransportClosed`.
@@ -181,7 +181,9 @@ fn build_relay_engine(device_id: &str, persist: Arc<dyn FleetPersist<RelayHoldDo
     let (out_tx, out_rx) = mpsc::channel(64);
     let (_in_tx, in_rx) = mpsc::channel(64);
     let doc = Arc::new(Mutex::new(RelayHoldDoc::default()));
-    let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+    let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.to_string(),
+    )));
     let kt = Arc::new(KeyTree::derive(&[0xAA; 32]).expect("kt"));
     let merger: Merger<RelayHoldDoc> = Arc::new(|l: &mut RelayHoldDoc, r| l.merge_from(r));
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
@@ -198,7 +200,7 @@ fn build_relay_engine(device_id: &str, persist: Arc<dyn FleetPersist<RelayHoldDo
         debounce_ms: 50,
         publish_seen: false,
         on_applied: None,
-        sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+        sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
     }));
     Built {
         engine,
@@ -218,7 +220,9 @@ fn build_relay_engine_from_doc(
     let (out_tx, out_rx) = mpsc::channel(64);
     let (_in_tx, in_rx) = mpsc::channel(64);
     let doc = Arc::new(Mutex::new(persisted_doc));
-    let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+    let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.to_string(),
+    )));
     let kt = Arc::new(KeyTree::derive(&[0xAA; 32]).expect("kt"));
     let merger: Merger<RelayHoldDoc> = Arc::new(|l: &mut RelayHoldDoc, r| l.merge_from(r));
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
@@ -235,7 +239,7 @@ fn build_relay_engine_from_doc(
         debounce_ms: 50,
         publish_seen: false,
         on_applied: None,
-        sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+        sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
     }));
     Built {
         engine,
@@ -273,7 +277,7 @@ struct TestRelayCtx {
     /// The relay's hold doc (under engine lock).
     doc: Arc<Mutex<RelayHoldDoc>>,
     /// HLC tracker.
-    tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     /// Engine handle for notify_dirty + flush_now.
     engine: Arc<FleetSyncEngine<RelayHoldDoc>>,
 }

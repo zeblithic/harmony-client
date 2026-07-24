@@ -408,7 +408,7 @@ impl ProfileBroadcastPublisher {
 /// CRDT + uses the existing HLC tracker. Wired in start_node (Task 5).
 pub struct OwnerStateBroadcastSource {
     pub crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
-    pub hlc_tracker: Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, Hlc>>>,
+    pub hlc_tracker: Arc<tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     pub device_id: String,
 }
 
@@ -452,18 +452,22 @@ impl ProfileBroadcastSource for OwnerStateBroadcastSource {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let mut tracker = self.hlc_tracker.lock().await;
-        let entry = tracker.entry(self.device_id.clone()).or_insert(Hlc {
-            wall_ms: 0,
-            logical: 0,
+        // Was a fourth open-coded copy of the same tick rule (bump logical
+        // unless the wall reading advanced). It now delegates to the core
+        // kernel like every other minting path (ZEB-759).
+        let tick = harmony_crdt_sync::HlcTick::next(
+            tracker
+                .accepted_from(&self.device_id)
+                .map(harmony_crdt_sync::HlcTick::from),
+            now_ms,
+        );
+        let next = Hlc {
+            wall_ms: tick.wall_ms,
+            logical: tick.logical,
             device_id: self.device_id.clone(),
-        });
-        if now_ms > entry.wall_ms {
-            entry.wall_ms = now_ms;
-            entry.logical = 0;
-        } else {
-            entry.logical = entry.logical.saturating_add(1);
-        }
-        entry.clone()
+        };
+        tracker.observe_local(next.clone());
+        next
     }
 }
 
@@ -911,7 +915,9 @@ mod tests {
         state.spaces.insert(channel.id, channel.clone());
 
         let crdt_state = StdArc::new(TokioMutex::new(state));
-        let hlc_tracker = StdArc::new(TokioMutex::new(std::collections::BTreeMap::new()));
+        let hlc_tracker = StdArc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "test".to_string(),
+        )));
         let src = OwnerStateBroadcastSource {
             crdt_state,
             hlc_tracker,
@@ -1010,7 +1016,9 @@ mod tests {
             .insert(left_but_still_flagged.id, left_but_still_flagged.clone());
 
         let crdt_state = StdArc::new(TokioMutex::new(state));
-        let hlc_tracker = StdArc::new(TokioMutex::new(std::collections::BTreeMap::new()));
+        let hlc_tracker = StdArc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "test".to_string(),
+        )));
         let src = OwnerStateBroadcastSource {
             crdt_state,
             hlc_tracker,

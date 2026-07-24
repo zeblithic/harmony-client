@@ -29,7 +29,6 @@
 //! timeout. Never weaken an assertion to paper over a timing flake — bump the
 //! timeout instead.
 
-use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -269,7 +268,9 @@ async fn referral_catalog_roundtrip_serves_referrable_friends_over_iroh() {
         // invite + friend slots (only the friend-PEX ALPN is dialed here).
         let pex_acceptor: Arc<dyn IrohHandshakeDispatcher> = Arc::new(IrohFriendPexAcceptor::new(
             Arc::new(TokioMutex::new(a_owner_state)),
-            Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new())),
+            Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "a-dev".to_string(),
+            ))),
             "a-dev".to_string(),
             a.owner,
             a.cert.clone(),

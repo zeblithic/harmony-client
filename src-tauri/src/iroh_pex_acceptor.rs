@@ -79,7 +79,7 @@ pub struct IrohFriendPexAcceptor {
     crdt_state: Arc<TokioMutex<OwnerState>>,
     /// Shared HLC tracker (`device_id → last Hlc`), bumped per served catalog to
     /// stamp `ReferralCatalog.at`. Same map the handshake acceptor uses.
-    hlc_tracker: Arc<TokioMutex<std::collections::BTreeMap<String, Hlc>>>,
+    hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     device_id: String,
     self_owner: OwnerAddr,
     self_enrollment: EnrollmentCert,
@@ -162,7 +162,7 @@ impl IrohFriendPexAcceptor {
     /// Build a PEX acceptor with the default timeouts.
     pub fn new(
         crdt_state: Arc<TokioMutex<OwnerState>>,
-        hlc_tracker: Arc<TokioMutex<std::collections::BTreeMap<String, Hlc>>>,
+        hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
         device_id: String,
         self_owner: OwnerAddr,
         self_enrollment: EnrollmentCert,
@@ -183,7 +183,7 @@ impl IrohFriendPexAcceptor {
     /// deadlines; production passes the handshake acceptor's `config`).
     pub fn with_config(
         crdt_state: Arc<TokioMutex<OwnerState>>,
-        hlc_tracker: Arc<TokioMutex<std::collections::BTreeMap<String, Hlc>>>,
+        hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
         device_id: String,
         self_owner: OwnerAddr,
         self_enrollment: EnrollmentCert,
@@ -344,18 +344,21 @@ impl IrohFriendPexAcceptor {
     async fn next_hlc(&self) -> Hlc {
         let now_ms = wall_now_ms();
         let mut tracker = self.hlc_tracker.lock().await;
-        let entry = tracker.entry(self.device_id.clone()).or_insert(Hlc {
-            wall_ms: 0,
-            logical: 0,
+        // Delegates to the core tick kernel like every other minting path
+        // (ZEB-759); this was an open-coded copy of the same rule.
+        let tick = harmony_crdt_sync::HlcTick::next(
+            tracker
+                .accepted_from(&self.device_id)
+                .map(harmony_crdt_sync::HlcTick::from),
+            now_ms,
+        );
+        let next = Hlc {
+            wall_ms: tick.wall_ms,
+            logical: tick.logical,
             device_id: self.device_id.clone(),
-        });
-        if now_ms > entry.wall_ms {
-            entry.wall_ms = now_ms;
-            entry.logical = 0;
-        } else {
-            entry.logical = entry.logical.saturating_add(1);
-        }
-        entry.clone()
+        };
+        tracker.observe_local(next.clone());
+        next
     }
 
     /// ZEB-376 Task 10: X's `Introduction`-arm `Proceed` action — gather the

@@ -2140,12 +2140,13 @@ mod tests {
         use crate::dm_inbox_persist::DmInboxPersist;
         use crate::fleet_sync::{FleetSyncConfig, FleetSyncEngine, Merger, DEFAULT_DEBOUNCE_MS};
         use crate::owner_state_crypto::KeyTree;
-        use std::collections::BTreeMap;
 
         let dir = tempfile::tempdir().unwrap();
         let kt = Arc::new(KeyTree::derive(&[0x44u8; 32]).expect("derive kt"));
         let doc = Arc::new(Mutex::new(DmInboxDoc::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".to_string(),
+        )));
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
         let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
         let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
@@ -2172,7 +2173,7 @@ mod tests {
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             publish_seen: true,
             on_applied: Some(ingest_nudge_on_applied(nudge_tx)),
-            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+            sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
         });
 
         // A local deposit write (what the production butler persist path

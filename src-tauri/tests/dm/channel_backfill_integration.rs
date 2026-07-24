@@ -35,7 +35,7 @@
 //! (`channel_backfill::tests::driver_retries_until_holder_appears_then_satisfies`
 //! + the backoff-schedule tests).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -198,7 +198,7 @@ struct RegistryHandle {
     registry: Arc<ChannelLogRegistry>,
     owner: OwnerAddr,
     signing: Arc<SigningKey>,
-    tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     _dir: TempDir,
     _drainer: tokio::task::JoinHandle<()>,
 }
@@ -233,7 +233,9 @@ fn build_registry(session: &Arc<zenoh::Session>, seed: u8, device_id: &str) -> R
         registry,
         owner,
         signing,
-        tracker: Arc::new(Mutex::new(BTreeMap::new())),
+        tracker: Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            device_id.to_string(),
+        ))),
         _dir: dir,
         _drainer: drainer,
     }

@@ -47,7 +47,7 @@ use harmony_app::event_loop::CommunityAdapterRequest;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr, OwnerDeviceEntry};
 use harmony_identity::PrivateIdentity;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
@@ -264,8 +264,9 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         },
     );
     let crdt_b = Arc::new(TokioMutex::new(bob_owner_state));
-    let tracker_b: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
-        Arc::new(TokioMutex::new(BTreeMap::new()));
+    let tracker_b: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
+        TokioMutex::new(harmony_crdt_sync::ReplayTracker::new("bob-dev".into())),
+    );
     // Alice still needs a CRDT handle for handle_unicast's signature
     // (it takes &Arc<Mutex<OwnerState>>). Empty default state suffices —
     // handle_unicast doesn't read owner-state on the receive side; the

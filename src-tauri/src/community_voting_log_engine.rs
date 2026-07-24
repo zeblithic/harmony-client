@@ -294,7 +294,7 @@ pub struct VotingLogEngineParams<R: tauri::Runtime = tauri::Wry> {
     /// (kd=sf / Task 9, kd=cl / Task 10, kd=rs / Task 11) get HLCs
     /// monotone with the IPC layer's mints on the same lane.
     /// Optional so tests that never trigger engine-auto can pass `None`.
-    pub hlc_tracker: Option<Arc<Mutex<BTreeMap<String, Hlc>>>>,
+    pub hlc_tracker: Option<Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>>,
     /// Local device_id string, paired with `hlc_tracker` above.
     /// Optional for the same reason as `hlc_tracker`.
     pub device_id: Option<String>,
@@ -358,7 +358,7 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
     /// hook skips when `None`. Same shape + reuse semantics as the
     /// IPC layer's tracker so engine-auto HLCs are monotone with IPC
     /// mints on the local device's lane.
-    hlc_tracker: Option<Arc<Mutex<BTreeMap<String, Hlc>>>>,
+    hlc_tracker: Option<Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>>,
     /// ZEB-310 Task 9: local device_id paired with `hlc_tracker`.
     /// `None` follows the same gating as `hlc_tracker`.
     device_id: Option<String>,
@@ -6130,7 +6130,9 @@ mod tests {
             voting_log: Arc::new(Mutex::new(VotingLog::new())),
             publisher_tx,
             subscriber_rx,
-            hlc_tracker: Some(Arc::new(Mutex::new(BTreeMap::new()))),
+            hlc_tracker: Some(Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                device_id.to_string(),
+            )))),
             device_id: Some(device_id.to_string()),
             app_handle: Some(app.handle().clone()),
             identity_resolver: None,

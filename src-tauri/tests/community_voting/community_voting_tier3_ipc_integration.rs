@@ -194,8 +194,8 @@ pub struct TwoVotingEngines {
     /// Exposed so tests can assert that engine-auto kd=rs mints do NOT bump
     /// the device lane (the poll-derived-lane fix keeps a future-walled poll
     /// watermark out of the device's global outbound lane).
-    pub a_hlc_tracker: Arc<Mutex<std::collections::BTreeMap<String, Hlc>>>,
-    pub b_hlc_tracker: Arc<Mutex<std::collections::BTreeMap<String, Hlc>>>,
+    pub a_hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
+    pub b_hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
 }
 
 async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingEngines {
@@ -224,8 +224,12 @@ async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingEngin
     let log_a = Arc::new(Mutex::new(VotingLog::new()));
     let log_b = Arc::new(Mutex::new(VotingLog::new()));
 
-    let a_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
-    let b_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let a_hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "engine-a".into(),
+    )));
+    let b_hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "engine-b".into(),
+    )));
 
     let resolvers = BridgeTestResolvers::new();
     let id_resolver_a: Arc<dyn VotingIdentityResolver> =
@@ -1254,7 +1258,10 @@ async fn ipc_tier3_engine_auto_kd_rs_future_walled_no_device_lane_leak() {
     let (engine_a_lane_wall, engine_b_lane_wall) = {
         let ta = engines.a_hlc_tracker.lock().await;
         let tb = engines.b_hlc_tracker.lock().await;
-        (lane_wall(&ta, "engine-a"), lane_wall(&tb, "engine-b"))
+        (
+            lane_wall(ta.accepted(), "engine-a"),
+            lane_wall(tb.accepted(), "engine-b"),
+        )
     };
     assert!(
         engine_a_lane_wall < FUTURE_WALL,

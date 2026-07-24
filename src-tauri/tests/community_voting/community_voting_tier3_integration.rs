@@ -230,8 +230,12 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
     // orchestration on its side — so we wire one for it too (cheap;
     // empty tracker behaves identically to None for non-orchestrating
     // engines).
-    let a_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
-    let b_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let a_hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "engine-a".into(),
+    )));
+    let b_hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "engine-a".into(),
+    )));
 
     // ZEB-298+ZEB-312 PR 1: shared mutable resolver for bridge tests.
     // Tests must call `engines.resolvers.add_identity(&id)` for each
@@ -346,8 +350,12 @@ pub async fn setup_two_voting_engine_bridge_with_signing_and_app(
     let log_a = Arc::new(Mutex::new(VotingLog::new()));
     let log_b = Arc::new(Mutex::new(VotingLog::new()));
 
-    let a_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
-    let b_hlc_tracker = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let a_hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "engine-a".into(),
+    )));
+    let b_hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "engine-a".into(),
+    )));
 
     // ZEB-298+ZEB-312 PR 1: shared mutable resolver for bridge tests.
     let resolvers = BridgeTestResolvers::new();

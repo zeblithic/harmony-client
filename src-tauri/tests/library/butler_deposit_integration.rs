@@ -171,7 +171,7 @@ fn fixture() -> Fixture {
 struct Built {
     engine: Arc<FleetSyncEngine<DmInboxDoc>>,
     doc: Arc<Mutex<DmInboxDoc>>,
-    tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     out_rx: mpsc::Receiver<Vec<u8>>,
     in_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -185,7 +185,9 @@ fn build_engine(
     let (out_tx, out_rx) = mpsc::channel(64);
     let (in_tx, in_rx) = mpsc::channel(64);
     let doc = Arc::new(Mutex::new(DmInboxDoc::default()));
-    let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+    let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.to_string(),
+    )));
     let merger: Merger<DmInboxDoc> = Arc::new(|local, remote| local.merge_from(remote));
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
         keys: harmony_app::owner_state_crypto::FleetKeySet::new(kt),
@@ -201,7 +203,7 @@ fn build_engine(
         debounce_ms: 50,
         publish_seen: true,
         on_applied: None, // sweeps are driven explicitly in this test
-        sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+        sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
     }));
     Built {
         engine,
@@ -283,7 +285,7 @@ struct TestButlerCtx {
     device_owners: BTreeMap<DeviceIdentityHash, ([u8; 16], [u8; 64])>,
     butler_sk: SigningKey,
     doc: Arc<Mutex<DmInboxDoc>>,
-    tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     engine: Arc<FleetSyncEngine<DmInboxDoc>>,
 }
 

@@ -12,7 +12,6 @@
 //! here — they get a phrasing-only sweep in the same PR (Task 5). Existing
 //! IPCs adopt this helper incrementally as they're touched for other reasons.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
@@ -30,7 +29,7 @@ use crate::owner_state_types::{Hlc, OwnerAddr};
 /// drop the `dm_` prefix for readability at call sites.
 pub struct OwnerLoadedHandles {
     pub crdt_state: Arc<TokioMutex<OwnerState>>,
-    pub hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>>,
+    pub hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     pub device_id: String,
     pub self_owner: OwnerAddr,
     pub community_registry: Arc<CommunitySyncRegistry>,

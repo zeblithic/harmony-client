@@ -6,7 +6,7 @@
 //!
 //! See `docs/specs/2026-05-09-zeb-270-channel-log-zenoh-transport-design.md`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -112,7 +112,7 @@ struct DeferredSpawn {
     channel_id: ChannelId,
     channel_key: ChannelKey,
     state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
-    hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
 }
 
 /// One open community transaction. `tx_id` tags every guard so a stale
@@ -445,7 +445,7 @@ pub struct ChannelLogEngineParams {
     pub self_owner: OwnerAddr,
     pub self_device_id: String,
     pub signing_key: Arc<SigningKey>,
-    pub hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    pub hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     pub sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
     pub config: ChannelLogEngineConfig,
 
@@ -480,7 +480,7 @@ pub struct ChannelLogEngine {
     self_owner: OwnerAddr,
     self_device_id: String,
     signing_key: Arc<SigningKey>,
-    hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
     config: ChannelLogEngineConfig,
 
@@ -2438,7 +2438,7 @@ impl ChannelLogRegistry {
         channel_id: ChannelId,
         channel_key: ChannelKey,
         state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
-        hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+        hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     ) -> Result<SpawnOutcome, ChannelLogEngineError> {
         // ZEB-271: queue iff an open transaction targets this community.
         // Sync lock — critical section is just a HashMap mutation.
@@ -3035,7 +3035,7 @@ impl ChannelLogRegistry {
         materialized: &MaterializedMembership,
         membership_key: &EpochKey,
         state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
-        hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+        hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     ) -> Result<(), ChannelLogEngineError> {
         // Continue on error, accumulate the LAST error, return it after
         // attempting all channels. Mirrors `shutdown_all` — bailing on
@@ -3230,7 +3230,10 @@ mod tests {
             enrolled_key: signing_key.verifying_key().to_bytes(),
         });
 
-        let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".to_string(),
+            )));
 
         let (publisher_tx, publisher_rx) = mpsc::channel(64);
         let (subscriber_tx, subscriber_rx) = mpsc::channel(64);
@@ -5163,7 +5166,10 @@ mod tests {
             owner: self_owner,
             enrolled_key: signing_key.verifying_key().to_bytes(),
         });
-        let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".to_string(),
+            )));
         let (publisher_tx, _publisher_rx) = mpsc::channel(64);
         let (subscriber_tx, subscriber_rx) = mpsc::channel(64);
         let (query_request_tx, _query_request_rx) = mpsc::channel(8);
@@ -5456,7 +5462,7 @@ mod tests {
     struct RegistryFixture {
         registry: Arc<ChannelLogRegistry>,
         state: Arc<AlwaysJoinedState>,
-        hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+        hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
         membership_key: EpochKey,
         self_owner: OwnerAddr,
         // Held to keep the temp dir alive for the duration of the test.
@@ -5503,7 +5509,10 @@ mod tests {
             enrolled_key: signing_key.verifying_key().to_bytes(),
         });
 
-        let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "registry-test-device".to_string(),
+            )));
 
         let (_rec_sink, sink) = recording_sink_pair();
 
@@ -5629,7 +5638,7 @@ mod tests {
     struct BackfillRegistryFixture {
         registry: Arc<ChannelLogRegistry>,
         state: Arc<AlwaysJoinedState>,
-        hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+        hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
         membership_key: EpochKey,
         adapter_request_rx: mpsc::UnboundedReceiver<crate::event_loop::ChannelLogAdapterRequest>,
         _tmp: TempDir,
@@ -5648,7 +5657,10 @@ mod tests {
             enrolled_key: signing_key.verifying_key().to_bytes(),
         });
 
-        let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "backfill-test-device".to_string(),
+            )));
 
         let (_rec_sink, sink) = recording_sink_pair();
 
@@ -7285,8 +7297,10 @@ mod tests {
             owner: fix_a.self_owner,
             enrolled_key: fix_a.signing_key.verifying_key().to_bytes(),
         });
-        let hlc_tracker_b: Arc<Mutex<BTreeMap<String, Hlc>>> =
-            Arc::new(Mutex::new(BTreeMap::new()));
+        let hlc_tracker_b: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "device-b".to_string(),
+            )));
         let (publisher_tx_b, _publisher_rx_b) = mpsc::channel(64);
         let (subscriber_tx_b, subscriber_rx_b) = mpsc::channel(64);
         let (query_tx_b, _query_rx_b) = mpsc::channel(8);
@@ -7543,8 +7557,10 @@ mod tests {
             owner: fix_a.self_owner,
             enrolled_key: fix_a.signing_key.verifying_key().to_bytes(),
         });
-        let hlc_tracker_b: Arc<Mutex<BTreeMap<String, Hlc>>> =
-            Arc::new(Mutex::new(BTreeMap::new()));
+        let hlc_tracker_b: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "device-b".to_string(),
+            )));
         let (publisher_tx_b, _publisher_rx_b) = mpsc::channel(64);
         let (subscriber_tx_b, subscriber_rx_b) = mpsc::channel(64);
         let (query_tx_b, _query_rx_b) = mpsc::channel(8);

@@ -2245,7 +2245,9 @@ mod tests {
                 device_id: name.to_string(),
                 state: Arc::clone(&trust_doc),
                 merger: crate::owner_trust_sync::trust_merger(),
-                replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+                replay_tracker: Arc::new(tokio::sync::Mutex::new(
+                    harmony_crdt_sync::ReplayTracker::new(name.to_string()),
+                )),
                 content_store: Arc::clone(&store),
                 publisher_tx: t_pub,
                 subscriber_rx: t_sub,
@@ -2257,7 +2259,9 @@ mod tests {
                 debounce_ms: 50,
                 publish_seen: true,
                 on_applied: None,
-                sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+                sibling_acks: Arc::new(tokio::sync::Mutex::new(
+                    harmony_crdt_sync::MonotoneMap::new(),
+                )),
             }));
             let quorum_doc = Arc::new(tokio::sync::Mutex::new(QuorumReqDoc::default()));
             let quorum_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
@@ -2265,7 +2269,9 @@ mod tests {
                 device_id: name.to_string(),
                 state: Arc::clone(&quorum_doc),
                 merger: quorum_merger(),
-                replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+                replay_tracker: Arc::new(tokio::sync::Mutex::new(
+                    harmony_crdt_sync::ReplayTracker::new(name.to_string()),
+                )),
                 content_store: Arc::clone(&store),
                 publisher_tx: q_pub,
                 subscriber_rx: q_sub,
@@ -2277,7 +2283,9 @@ mod tests {
                 debounce_ms: 50,
                 publish_seen: true,
                 on_applied: None,
-                sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+                sibling_acks: Arc::new(tokio::sync::Mutex::new(
+                    harmony_crdt_sync::MonotoneMap::new(),
+                )),
             }));
             DevRig {
                 quorum_doc,
@@ -2830,7 +2838,9 @@ mod tests {
             device_id: "dev-a".to_string(),
             state: Arc::clone(&trust_doc),
             merger: crate::owner_trust_sync::trust_merger(),
-            replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            replay_tracker: Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("dev-a".to_string()),
+            )),
             content_store: Arc::clone(&store),
             publisher_tx: t_out,
             subscriber_rx: t_in,
@@ -2842,7 +2852,9 @@ mod tests {
             debounce_ms: 25,
             publish_seen: true,
             on_applied: None,
-            sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            sibling_acks: Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::MonotoneMap::new(),
+            )),
         }));
 
         let (q_out, mut q_drain) = mpsc::channel::<Vec<u8>>(64);
@@ -2853,7 +2865,9 @@ mod tests {
             device_id: "dev-a".to_string(),
             state: Arc::clone(&quorum_doc),
             merger: quorum_merger(),
-            replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            replay_tracker: Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("dev-a".to_string()),
+            )),
             content_store: store,
             publisher_tx: q_out,
             subscriber_rx: q_in,
@@ -2865,7 +2879,9 @@ mod tests {
             debounce_ms: 25,
             publish_seen: true,
             on_applied: None,
-            sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            sibling_acks: Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::MonotoneMap::new(),
+            )),
         }));
 
         SweepRig {
@@ -2972,7 +2988,9 @@ mod tests {
             merger: Arc::new(|_l: &mut crate::fleet_key_epoch::FleetKeyEpochDoc, _r| {
                 MergeOutcome { changed: false }
             }),
-            replay_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            replay_tracker: Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("dev-a".to_string()),
+            )),
             content_store: store,
             publisher_tx: c_out,
             subscriber_rx: c_in,
@@ -2984,7 +3002,9 @@ mod tests {
             debounce_ms: 25,
             publish_seen: false,
             on_applied: None,
-            sibling_acks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            sibling_acks: Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::MonotoneMap::new(),
+            )),
         }));
         CarrierRig {
             carrier: super::QuorumSweepCarrier {

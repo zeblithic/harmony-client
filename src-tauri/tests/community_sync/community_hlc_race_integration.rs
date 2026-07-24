@@ -40,7 +40,7 @@ use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::dm_outbox::reserve_next_hlc_for_device;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 use harmony_app::{mint_community_creation, mint_kick_event, mint_redemption};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Barrier, Mutex};
@@ -128,9 +128,11 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
     let (delta_tx, _delta_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
 
     // The IPC-level HLC tracker (per-device monotone HLCs). This is
-    // the SAME shape the real IPC uses — `Arc<Mutex<BTreeMap<String, Hlc>>>`.
+    // the SAME shape the real IPC uses — `Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>`.
     let device_id = "alice-dev".to_string();
-    let hlc_tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
+        Mutex::new(harmony_crdt_sync::ReplayTracker::new(device_id.clone())),
+    );
 
     // Mint Alice's community + bootstrap Join. Reserve via the helper
     // so the tracker has a valid starting state.
@@ -231,8 +233,15 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         // Full owner bytes (not just the 4-byte prefix) so the
         // per-target tracker key is collision-free (CodeRabbit review).
         let target_dev_id = format!("{}-dev", hex::encode(target_addr.0));
+        // The target is a DIFFERENT device, so it mints from its OWN tracker —
+        // which is also what keeps Alice's lane untouched (the point of the
+        // comment above). Reserving a foreign lane inside Alice's tracker was
+        // the old way to express that; a real device never shares one.
+        let target_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            target_dev_id.clone(),
+        )));
         let target_join_hlc =
-            reserve_next_hlc_for_device(&hlc_tracker, &target_dev_id, 100_000).await;
+            reserve_next_hlc_for_device(&target_tracker, &target_dev_id, 100_000).await;
         let minted_join = mint_redemption(
             &invite_payload,
             target_addr,
@@ -363,6 +372,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
     let stored = hlc_tracker
         .lock()
         .await
+        .accepted()
         .get(&device_id)
         .cloned()
         .expect("tracker entry");

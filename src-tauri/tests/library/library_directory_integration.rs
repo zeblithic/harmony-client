@@ -645,7 +645,6 @@ async fn click_to_join_redeem_invite_smoke() {
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::owner_state_types::{DeviceIdentityHash, EpochKey, SpaceKind};
     use harmony_identity::PrivateIdentity;
-    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{mpsc, Mutex};
@@ -872,7 +871,9 @@ async fn click_to_join_redeem_invite_smoke() {
     }));
 
     let crdt_state = Arc::new(Mutex::new(OwnerState::default()));
-    let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "joiner-dev".to_string(),
+    )));
 
     // Pre-call snapshot: joiner has no Spaces.
     {

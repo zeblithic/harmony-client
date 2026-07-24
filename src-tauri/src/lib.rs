@@ -921,7 +921,9 @@ pub struct NodeState {
     /// monotone with state-root publishes).
     hlc_tracker: Option<
         std::sync::Arc<
-            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
         >,
     >,
     /// Local device_id string + self OwnerAddr — captured at start_node
@@ -1236,7 +1238,9 @@ pub struct NodeState {
     pub notes_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::notes_crdt::NotesDoc>>>,
     pub notes_tracker: Option<
         std::sync::Arc<
-            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
         >,
     >,
     pub notes_sync:
@@ -1253,7 +1257,9 @@ pub struct NodeState {
     pub dm_inbox_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_inbox_crdt::DmInboxDoc>>>,
     pub dm_inbox_tracker: Option<
         std::sync::Arc<
-            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
         >,
     >,
     pub dm_inbox_sync: Option<
@@ -1276,7 +1282,9 @@ pub struct NodeState {
     >,
     pub community_device_intro_tracker: Option<
         std::sync::Arc<
-            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
         >,
     >,
     pub community_device_intro_sync: Option<
@@ -1310,7 +1318,9 @@ pub struct NodeState {
         Option<std::sync::Arc<tokio::sync::Mutex<crate::community_relay_hold_crdt::RelayHoldDoc>>>,
     pub relay_hold_tracker: Option<
         std::sync::Arc<
-            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
         >,
     >,
     pub relay_hold_sync: Option<
@@ -1329,7 +1339,9 @@ pub struct NodeState {
         Option<std::sync::Arc<tokio::sync::Mutex<crate::community_relay_optin::RelayOptInDoc>>>,
     pub relay_optin_tracker: Option<
         std::sync::Arc<
-            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
         >,
     >,
     pub relay_optin_sync: Option<
@@ -1372,7 +1384,9 @@ pub struct NodeState {
     pub dm_outhold_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::dm_outhold::DmOutholdDoc>>>,
     pub dm_outhold_tracker: Option<
         std::sync::Arc<
-            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
         >,
     >,
     pub dm_outhold_sync:
@@ -1388,7 +1402,9 @@ pub struct NodeState {
     pub fleet_net_doc: Option<std::sync::Arc<tokio::sync::Mutex<crate::fleet_net::FleetNetDoc>>>,
     pub fleet_net_tracker: Option<
         std::sync::Arc<
-            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
         >,
     >,
     pub fleet_net_sync:
@@ -3900,7 +3916,7 @@ pub async fn start_node_inner(
         let mut notes_tracker_opt: Option<
             std::sync::Arc<
                 tokio::sync::Mutex<
-                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                    harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
                 >,
             >,
         > = None;
@@ -3920,7 +3936,7 @@ pub async fn start_node_inner(
         let mut dm_inbox_tracker_opt: Option<
             std::sync::Arc<
                 tokio::sync::Mutex<
-                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                    harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
                 >,
             >,
         > = None;
@@ -3942,7 +3958,7 @@ pub async fn start_node_inner(
         let mut relay_hold_tracker_opt: Option<
             std::sync::Arc<
                 tokio::sync::Mutex<
-                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                    harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
                 >,
             >,
         > = None;
@@ -3957,7 +3973,7 @@ pub async fn start_node_inner(
         let mut relay_optin_tracker_opt: Option<
             std::sync::Arc<
                 tokio::sync::Mutex<
-                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                    harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
                 >,
             >,
         > = None;
@@ -3992,7 +4008,7 @@ pub async fn start_node_inner(
         let mut dm_outhold_tracker_opt: Option<
             std::sync::Arc<
                 tokio::sync::Mutex<
-                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                    harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
                 >,
             >,
         > = None;
@@ -4006,7 +4022,7 @@ pub async fn start_node_inner(
         let mut fleet_net_tracker_opt: Option<
             std::sync::Arc<
                 tokio::sync::Mutex<
-                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                    harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
                 >,
             >,
         > = None;
@@ -4079,7 +4095,7 @@ pub async fn start_node_inner(
         let mut community_device_intro_tracker_opt: Option<
             std::sync::Arc<
                 tokio::sync::Mutex<
-                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                    harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
                 >,
             >,
         > = None;
@@ -4135,7 +4151,7 @@ pub async fn start_node_inner(
         let mut tracker_for_state: Option<
             std::sync::Arc<
                 tokio::sync::Mutex<
-                    std::collections::BTreeMap<String, crate::owner_state_types::Hlc>,
+                    harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
                 >,
             >,
         > = None;
@@ -4809,7 +4825,12 @@ pub async fn start_node_inner(
                     feed_revoked_from_dm_store(&revoked_device_projection, &initial_crdt);
 
                     let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(initial_crdt));
-                    let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(initial_replay));
+                    let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                        harmony_crdt_sync::ReplayTracker::from_accepted(
+                            device_id.clone(),
+                            initial_replay,
+                        ),
+                    ));
                     // Phase 3b: real harmony-content CAS via RuntimeContentStore.
                     // Sends CasOp messages over cas_op_tx into the harmony-
                     // runtime event loop, which admits/queries through the
@@ -5136,8 +5157,11 @@ pub async fn start_node_inner(
                             .map_err(|e| format!("load notes doc: {e}"))?,
                     ));
                     let notes_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::notes_persist::load_replay_or_recover(&notes_replay_path)
-                            .map_err(|e| format!("load notes replay: {e}"))?,
+                        harmony_crdt_sync::ReplayTracker::from_accepted(
+                            device_id.clone(),
+                            crate::notes_persist::load_replay_or_recover(&notes_replay_path)
+                                .map_err(|e| format!("load notes replay: {e}"))?,
+                        ),
                     ));
                     let (notes_out_tx, notes_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
                     let (notes_in_tx, notes_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -5165,7 +5189,7 @@ pub async fn start_node_inner(
                                 notes_app.emit("notes-changed", serde_json::Value::Null);
                             })),
                             sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                std::collections::BTreeMap::new(),
+                                harmony_crdt_sync::MonotoneMap::new(),
                             )),
                         },
                     ));
@@ -5200,8 +5224,11 @@ pub async fn start_node_inner(
                             .map_err(|e| format!("load dm-inbox doc: {e}"))?,
                     ));
                     let dm_inbox_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::dm_inbox_persist::load_replay_or_recover(&dm_inbox_replay_path)
-                            .map_err(|e| format!("load dm-inbox replay: {e}"))?,
+                        harmony_crdt_sync::ReplayTracker::from_accepted(
+                            device_id.clone(),
+                            crate::dm_inbox_persist::load_replay_or_recover(&dm_inbox_replay_path)
+                                .map_err(|e| format!("load dm-inbox replay: {e}"))?,
+                        ),
                     ));
                     let (dm_inbox_out_tx, dm_inbox_out_rx) =
                         tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -5244,7 +5271,7 @@ pub async fn start_node_inner(
                                     dm_inbox_nudge_tx,
                                 )),
                                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    std::collections::BTreeMap::new(),
+                                    harmony_crdt_sync::MonotoneMap::new(),
                                 )),
                             },
                         ));
@@ -5352,13 +5379,15 @@ pub async fn start_node_inner(
                         )
                         .map_err(|e| format!("load community-device-intro doc: {e}"))?,
                     ));
-                    let community_device_intro_tracker =
-                        std::sync::Arc::new(tokio::sync::Mutex::new(
+                    let community_device_intro_tracker = std::sync::Arc::new(
+                        tokio::sync::Mutex::new(harmony_crdt_sync::ReplayTracker::from_accepted(
+                            device_id.clone(),
                             crate::community_device_intro_persist::load_replay_or_recover(
                                 &community_device_intro_replay_path,
                             )
                             .map_err(|e| format!("load community-device-intro replay: {e}"))?,
-                        ));
+                        )),
+                    );
                     let (community_device_intro_out_tx, community_device_intro_out_rx) =
                         tokio::sync::mpsc::channel::<Vec<u8>>(64);
                     let (community_device_intro_in_tx, community_device_intro_in_rx) =
@@ -5399,7 +5428,7 @@ pub async fn start_node_inner(
                                     ),
                                 ),
                                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    std::collections::BTreeMap::new(),
+                                    harmony_crdt_sync::MonotoneMap::new(),
                                 )),
                             },
                         ),
@@ -5453,8 +5482,13 @@ pub async fn start_node_inner(
                             .map_err(|e| format!("load relay-hold doc: {e}"))?,
                     ));
                     let relay_hold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::relay_hold_persist::load_replay_or_recover(&relay_hold_replay_path)
+                        harmony_crdt_sync::ReplayTracker::from_accepted(
+                            device_id.clone(),
+                            crate::relay_hold_persist::load_replay_or_recover(
+                                &relay_hold_replay_path,
+                            )
                             .map_err(|e| format!("load relay-hold replay: {e}"))?,
+                        ),
                     ));
                     let (relay_hold_out_tx, relay_hold_out_rx) =
                         tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -5485,7 +5519,7 @@ pub async fn start_node_inner(
                                 publish_seen: true,
                                 on_applied: None,
                                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    std::collections::BTreeMap::new(),
+                                    harmony_crdt_sync::MonotoneMap::new(),
                                 )),
                             },
                         ));
@@ -5498,10 +5532,13 @@ pub async fn start_node_inner(
                             .map_err(|e| format!("load relay-optin doc: {e}"))?,
                     ));
                     let relay_optin_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::relay_optin_persist::load_replay_or_recover(
-                            &relay_optin_replay_path,
-                        )
-                        .map_err(|e| format!("load relay-optin replay: {e}"))?,
+                        harmony_crdt_sync::ReplayTracker::from_accepted(
+                            device_id.clone(),
+                            crate::relay_optin_persist::load_replay_or_recover(
+                                &relay_optin_replay_path,
+                            )
+                            .map_err(|e| format!("load relay-optin replay: {e}"))?,
+                        ),
                     ));
                     let (relay_optin_out_tx, relay_optin_out_rx) =
                         tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -5532,7 +5569,7 @@ pub async fn start_node_inner(
                                 publish_seen: true,
                                 on_applied: None,
                                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    std::collections::BTreeMap::new(),
+                                    harmony_crdt_sync::MonotoneMap::new(),
                                 )),
                             },
                         ));
@@ -5584,8 +5621,13 @@ pub async fn start_node_inner(
                             .map_err(|e| format!("load dm-outhold doc: {e}"))?,
                     ));
                     let dm_outhold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::dm_outhold_persist::load_replay_or_recover(&dm_outhold_replay_path)
+                        harmony_crdt_sync::ReplayTracker::from_accepted(
+                            device_id.clone(),
+                            crate::dm_outhold_persist::load_replay_or_recover(
+                                &dm_outhold_replay_path,
+                            )
                             .map_err(|e| format!("load dm-outhold replay: {e}"))?,
+                        ),
                     ));
                     let (dm_outhold_out_tx, dm_outhold_out_rx) =
                         tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -5622,7 +5664,7 @@ pub async fn start_node_inner(
                                     ),
                                 ),
                                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    std::collections::BTreeMap::new(),
+                                    harmony_crdt_sync::MonotoneMap::new(),
                                 )),
                             },
                         ));
@@ -5682,8 +5724,13 @@ pub async fn start_node_inner(
                     let fleet_net_doc =
                         std::sync::Arc::new(tokio::sync::Mutex::new(initial_fleet_net_doc));
                     let fleet_net_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::fleet_net_persist::load_replay_or_recover(&fleet_net_replay_path)
+                        harmony_crdt_sync::ReplayTracker::from_accepted(
+                            device_id.clone(),
+                            crate::fleet_net_persist::load_replay_or_recover(
+                                &fleet_net_replay_path,
+                            )
                             .map_err(|e| format!("load fleet-net replay: {e}"))?,
+                        ),
                     ));
                     let (fleet_net_out_tx, fleet_net_out_rx) =
                         tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -5731,7 +5778,7 @@ pub async fn start_node_inner(
                                     fleet_net_snap_nudge_tx,
                                 )),
                                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    std::collections::BTreeMap::new(),
+                                    harmony_crdt_sync::MonotoneMap::new(),
                                 )),
                             },
                         ));
@@ -5924,7 +5971,12 @@ pub async fn start_node_inner(
                     let owner_trust_doc =
                         std::sync::Arc::new(tokio::sync::Mutex::new(loaded.state.clone()));
                     let owner_trust_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::owner_trust_sync::load_trust_replay_or_recover(&trust_replay_path),
+                        harmony_crdt_sync::ReplayTracker::from_accepted(
+                            device_id.clone(),
+                            crate::owner_trust_sync::load_trust_replay_or_recover(
+                                &trust_replay_path,
+                            ),
+                        ),
                     ));
                     let (trust_out_tx, trust_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
                     let (trust_in_tx, trust_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
@@ -5975,7 +6027,7 @@ pub async fn start_node_inner(
                                     })
                                 }),
                                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    std::collections::BTreeMap::new(),
+                                    harmony_crdt_sync::MonotoneMap::new(),
                                 )),
                             },
                         ),
@@ -6007,8 +6059,11 @@ pub async fn start_node_inner(
                         crate::owner_quorum_sync::load_quorum_doc_or_recover(&quorum_doc_path),
                     ));
                     let owner_quorum_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::owner_quorum_sync::load_quorum_replay_or_recover(
-                            &quorum_replay_path,
+                        harmony_crdt_sync::ReplayTracker::from_accepted(
+                            device_id.clone(),
+                            crate::owner_quorum_sync::load_quorum_replay_or_recover(
+                                &quorum_replay_path,
+                            ),
                         ),
                     ));
                     let (quorum_out_tx, quorum_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
@@ -6038,7 +6093,7 @@ pub async fn start_node_inner(
                                     quorum_nudge_tx.clone(),
                                 )),
                                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    std::collections::BTreeMap::new(),
+                                    harmony_crdt_sync::MonotoneMap::new(),
                                 )),
                             },
                         ));
@@ -6154,7 +6209,10 @@ pub async fn start_node_inner(
                         ),
                     ));
                     let fleet_keys_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::fleet_key_epoch::load_replay_or_recover(&fleet_keys_replay_path),
+                        harmony_crdt_sync::ReplayTracker::from_accepted(
+                            device_id.clone(),
+                            crate::fleet_key_epoch::load_replay_or_recover(&fleet_keys_replay_path),
+                        ),
                     ));
                     let (fkeys_out_tx, fkeys_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
                     let (fkeys_in_tx, fkeys_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -6199,7 +6257,7 @@ pub async fn start_node_inner(
                                     fkeys_nudge_tx,
                                 )),
                                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    std::collections::BTreeMap::new(),
+                                    harmony_crdt_sync::MonotoneMap::new(),
                                 )),
                             },
                         ));
@@ -6728,7 +6786,7 @@ pub async fn start_node_inner(
                             //     membership_key + state-at-HLC + identity
                             //     resolver via engine_arc())
                             //   - per-device hlc_tracker (the SAME
-                            //     `Arc<Mutex<BTreeMap<String, Hlc>>>`
+                            //     `Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>`
                             //     dm_outbox::reserve_next_hlc_for_device
                             //     uses; channel-log mints share this
                             //     monotonicity lane).
@@ -13032,7 +13090,9 @@ async fn publish_owner_card(
     dm_device_id: Option<String>,
     hlc_tracker: Option<
         std::sync::Arc<
-            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
         >,
     >,
     profile_card_publisher: Option<
@@ -13458,7 +13518,7 @@ pub(crate) async fn send_dm_impl(
     let mut outbox_g = dm_outbox.lock().await;
     let mut state_g = crdt_state.lock().await;
     let mut tracker_g = hlc_tracker.lock().await;
-    let prev_hlc = tracker_g.get(&device_id).cloned();
+    let prev_hlc = tracker_g.accepted_from(&device_id).cloned();
 
     let (msg_id, msg_cid) = outbox_g
         .send_dm(
@@ -13483,7 +13543,7 @@ pub(crate) async fn send_dm_impl(
         .get(&msg_id)
         .map(|e| e.created_at.clone())
         .ok_or("send_dm minted entry not in outbox (apply_outbox rejected?)")?;
-    tracker_g.insert(device_id, next_hlc);
+    tracker_g.observe_local(next_hlc);
 
     // Drop the per-handle locks. No post-check needed: _fence_permit guarantees
     // stop_inner cannot complete SyncEngine::shutdown while this permit is held,
@@ -14173,12 +14233,12 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
         //     written by a prior call, not the one just executed).
         if let Some(tomb_hlc) = state_g.outbox_tombstones.get(&outbox_entry_id).cloned() {
             if tomb_hlc.device_id == device_id {
-                let should_update = match tracker_g.get(&device_id) {
+                let should_update = match tracker_g.accepted_from(&device_id) {
                     Some(curr) => tomb_hlc.is_strictly_newer_than(curr),
                     None => true,
                 };
                 if should_update {
-                    tracker_g.insert(device_id.clone(), tomb_hlc);
+                    tracker_g.observe_local(tomb_hlc);
                 }
             }
         }
@@ -14690,7 +14750,7 @@ pub(crate) async fn add_space_impl(
         let outbox_g = dm_outbox.lock().await;
         let mut state_g = crdt_state.lock().await;
         let mut tracker_g = hlc_tracker.lock().await;
-        let prev_hlc = tracker_g.get(&device_id).cloned();
+        let prev_hlc = tracker_g.accepted_from(&device_id).cloned();
 
         // ZEB-580 S1 Task 6: source the DM-invite signing identity from the outbox
         // via the SHARED `dm_invite_material` selector — the enrolled #2 identity
@@ -14748,7 +14808,7 @@ pub(crate) async fn add_space_impl(
             Some(prev) => stamped.is_strictly_newer_than(prev),
         };
         if should_advance_tracker {
-            tracker_g.insert(device_id.clone(), stamped.clone());
+            tracker_g.observe_local(stamped.clone());
         }
 
         (canonical_id, fanout, stamped)
@@ -14845,7 +14905,6 @@ mod add_space_tunnel_routing_tests {
         DeviceIdentityHash, DeviceTunnelContact, Hlc, OwnerAddr, OwnerDeviceEntry,
     };
     use crate::tunnel_manager::{node_id_from_dsa_pubkey, TunnelManager};
-    use std::collections::BTreeMap;
     use std::sync::Arc as StdArc;
 
     /// A `TunnelManager` over a real loopback iroh endpoint (cheap; never dials).
@@ -14936,7 +14995,9 @@ mod add_space_tunnel_routing_tests {
             },
         );
         let crdt_state = StdArc::new(tokio::sync::Mutex::new(owner_state));
-        let hlc_tracker = StdArc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let hlc_tracker = StdArc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("alice-dev".to_string()),
+        ));
 
         let node = NodeState {
             dm_outbox: Some(dm_outbox),
@@ -28488,7 +28549,7 @@ pub(crate) async fn register_channel_log_engine(
     community_id: crate::owner_state_types::SpaceId,
     channel_id: crate::community_membership::ChannelId,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
 ) -> Result<
     crate::community_channel_log_engine::SpawnOutcome,
@@ -28541,7 +28602,7 @@ pub(crate) async fn reconcile_community_channel_logs(
     community_engine: &std::sync::Arc<crate::community_state_sync::CommunitySyncEngine>,
     community_id: crate::owner_state_types::SpaceId,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
 ) {
     // Materialise the channels map under the engine's CRDT lock (cheap —
@@ -28584,7 +28645,7 @@ pub async fn reconcile_community_channel_logs_for_test(
     community_engine: &std::sync::Arc<crate::community_state_sync::CommunitySyncEngine>,
     community_id: crate::owner_state_types::SpaceId,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
 ) {
     reconcile_community_channel_logs(
@@ -31714,7 +31775,7 @@ pub async fn create_community_inner(
     is_invite_only: bool,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -32286,14 +32347,14 @@ mod create_community_inner_tests {
     use crate::content_store::{ContentStore, RuntimeContentStore};
     use crate::owner_state_crdt::OwnerState;
     use crate::owner_state_types::{Hlc, OwnerAddr};
-    use std::collections::BTreeMap;
     use tokio::sync::mpsc;
 
     // ── Fixture helper ────────────────────────────────────────────────────────
 
     struct CreateCommunityTestFixture {
         crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
-        hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>>,
+        hlc_tracker:
+            std::sync::Arc<tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
         device_id: String,
         self_owner: OwnerAddr,
         signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
@@ -32441,7 +32502,9 @@ mod create_community_inner_tests {
         });
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
-        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("test-dev".to_string()),
+        ));
 
         // Fence-check node state — generation starts at 0 (matches
         // snapshot_generation = 0 for the happy-path and apply_space
@@ -35620,7 +35683,7 @@ pub async fn redeem_invite_inner<F>(
     url: String,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -35673,7 +35736,7 @@ pub async fn redeem_invite_inner_with_overrides<F>(
     url: String,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -37023,7 +37086,7 @@ async fn join_open_community_inner<F>(
     snapshot: &[crate::library_directory::AggregatedEntry],
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -37239,7 +37302,6 @@ mod redeem_invite_inner_tests {
     use crate::owner_state_crdt::OwnerState;
     use crate::owner_state_types::{DeviceIdentityHash, EpochKey, Hlc, OwnerAddr, SpaceId};
     use harmony_identity::PrivateIdentity;
-    use std::collections::BTreeMap;
     use tokio::sync::mpsc;
 
     // ── Open-join DTO mapping (open-community-cross-wan) ───────────────────────
@@ -37312,7 +37374,8 @@ mod redeem_invite_inner_tests {
 
     pub(super) struct RedeemInviteTestFixture {
         pub(super) crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
-        pub(super) hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>>,
+        pub(super) hlc_tracker:
+            std::sync::Arc<tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
         pub(super) device_id: String,
         pub(super) self_owner: OwnerAddr,
         pub(super) signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
@@ -37462,7 +37525,9 @@ mod redeem_invite_inner_tests {
         });
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
-        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("joiner-dev".into()),
+        ));
 
         RedeemInviteTestFixture {
             crdt_state,
@@ -38739,7 +38804,9 @@ mod zeb436_orphan_adoption_tests {
         invite_url: String,
         crdt_state: std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
         hlc_tracker: std::sync::Arc<
-            tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+            tokio::sync::Mutex<
+                harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>,
+            >,
         >,
         // Held alive so channels don't report Closed.
         _community_adapter_rx:
@@ -39002,8 +39069,9 @@ mod zeb436_orphan_adoption_tests {
         // Owner-state that never learned the row (the lost-row half of
         // the ZEB-427 split-brain).
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
-        let hlc_tracker =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("joiner-dev".to_string()),
+        ));
 
         InviteOnlyOrphanRig {
             community_id,
@@ -41648,7 +41716,9 @@ mod zeb427_leave_left_at_tests {
             crate::owner_state_crypto::FleetKeySet::new(kt),
             "left-at-test-dev".into(),
             std::sync::Arc::clone(&state),
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("left-at-test-dev".into()),
+            )),
             std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -41695,7 +41765,6 @@ mod zeb268_leave_detach_fence_tests {
     };
     use crate::content_store::{ContentStore, RuntimeContentStore};
     use crate::owner_state_types::{DeviceIdentityHash, OwnerAddr};
-    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -41770,7 +41839,9 @@ mod zeb268_leave_detach_fence_tests {
             ),
         ));
 
-        let hlc_tracker = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let hlc_tracker = Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("leaver-dev".into()),
+        ));
         let node = Arc::new(std::sync::Mutex::new(NodeState {
             dm_outbox: Some(Arc::clone(&dm_outbox)),
             crdt_state: Some(Arc::new(tokio::sync::Mutex::new(
@@ -41802,7 +41873,12 @@ mod zeb268_leave_detach_fence_tests {
         let mut reserved = false;
         for _ in 0..10_000 {
             tokio::task::yield_now().await;
-            if hlc_tracker.lock().await.contains_key("leaver-dev") {
+            if hlc_tracker
+                .lock()
+                .await
+                .accepted()
+                .contains_key("leaver-dev")
+            {
                 reserved = true;
                 break;
             }
@@ -47130,7 +47206,7 @@ pub async fn self_heal_community_observer(
     registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     community_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -50497,7 +50573,7 @@ async fn ensure_voting_engine_for(
         crate::event_loop::VotingLogAdapterRequest,
     >,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     local_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
@@ -50725,7 +50801,7 @@ async fn ensure_voting_engine_for(
 /// between extraction and `ensure_engine`.
 struct VotingEngineNodeHandles {
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -55757,7 +55833,9 @@ mod zeb427_fence_tests {
             crate::owner_state_crypto::FleetKeySet::new(kt),
             "fence-test-dev".into(),
             std::sync::Arc::clone(&state),
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("fence-test-dev".into()),
+            )),
             std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -55957,7 +56035,7 @@ pub async fn connectivity_redeem_invite_iroh_inner<F>(
     iroh_endpoint: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
@@ -57055,7 +57133,7 @@ pub async fn connectivity_link_friend_iroh_inner(
     self_display: Option<String>,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
@@ -57511,7 +57589,6 @@ pub async fn connectivity_link_friend_iroh_inner(
 #[cfg(test)]
 mod friend_redeem_expiry_tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -57547,7 +57624,9 @@ mod friend_redeem_expiry_tests {
         let crdt_state = Arc::new(tokio::sync::Mutex::new(
             crate::owner_state_crdt::OwnerState::default(),
         ));
-        let hlc_tracker = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let hlc_tracker = Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("redeem-dev".to_string()),
+        ));
 
         let err = connectivity_link_friend_iroh_inner(
             url,
@@ -58634,7 +58713,7 @@ fn apply_set_referrable(
 pub async fn unfriend_inner(
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: &std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: &str,
     peer_addr: crate::owner_state_types::OwnerAddr,
@@ -61166,7 +61245,7 @@ pub async fn connectivity_add_friend_by_key_inner(
     self_display: Option<String>,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
@@ -61395,7 +61474,7 @@ pub(crate) async fn complete_introduction(
     keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     // ZEB-376 Task 10 (durability fix): the post-`Linked` handles this shared
@@ -61530,7 +61609,7 @@ pub(crate) async fn link_over_connection(
     keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     hlc_tracker: std::sync::Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>,
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
     device_id: String,
     peer_label: String,
@@ -62021,7 +62100,6 @@ mod friend_ipc_tests {
     };
     use crate::owner_state_crdt::OwnerState;
     use crate::owner_state_types::{Hlc, OwnerAddr};
-    use std::collections::BTreeMap;
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -62440,13 +62518,14 @@ mod friend_ipc_tests {
             crate::owner_state_crdt::ApplyOutcome::Inserted
         ));
         let crdt_state = Arc::new(TokioMutex::new(state));
-        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
-            Arc::new(TokioMutex::new(BTreeMap::new()));
+        let hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
+            TokioMutex::new(harmony_crdt_sync::ReplayTracker::new("d".to_string())),
+        );
 
         // Seed the tracker so the revoke HLC is strictly newer than learned_at=5.
         {
             let mut t = hlc_tracker.lock().await;
-            t.insert("d".to_string(), hlc(5));
+            t.observe_local(hlc(5));
         }
 
         let changed = unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
@@ -62476,8 +62555,9 @@ mod friend_ipc_tests {
     #[tokio::test]
     async fn unfriend_inner_errors_for_unknown_peer() {
         let crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
-        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
-            Arc::new(TokioMutex::new(BTreeMap::new()));
+        let hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
+            TokioMutex::new(harmony_crdt_sync::ReplayTracker::new("d".to_string())),
+        );
         let unknown = OwnerAddr([0xEE; 16]);
         let err = unfriend_inner(&crdt_state, &hlc_tracker, "d", unknown)
             .await
@@ -62497,15 +62577,16 @@ mod friend_ipc_tests {
             crate::owner_state_crdt::ApplyOutcome::Inserted
         ));
         let crdt_state = Arc::new(TokioMutex::new(state));
-        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
-            Arc::new(TokioMutex::new(BTreeMap::new()));
+        let hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
+            TokioMutex::new(harmony_crdt_sync::ReplayTracker::new("d".to_string())),
+        );
 
         // Seed the tracker so that, were a tombstone (wrongly) written, its HLC
         // would be strictly newer than learned_at=7 and thus detectably change
         // the stored entry.
         {
             let mut t = hlc_tracker.lock().await;
-            t.insert("d".to_string(), hlc(7));
+            t.observe_local(hlc(7));
         }
 
         let changed = unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
@@ -62545,8 +62626,9 @@ mod friend_ipc_tests {
             crate::owner_state_crdt::ApplyOutcome::Inserted
         ));
         let crdt_state = Arc::new(TokioMutex::new(state));
-        let hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
-            Arc::new(TokioMutex::new(BTreeMap::new()));
+        let hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
+            TokioMutex::new(harmony_crdt_sync::ReplayTracker::new("self".to_string())),
+        );
         let changed = unfriend_inner(&crdt_state, &hlc_tracker, "self", addr)
             .await
             .expect("unfriend ok");
@@ -62568,8 +62650,9 @@ mod friend_ipc_tests {
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(
             crate::owner_state_crdt::OwnerState::default(),
         ));
-        let hlc_tracker =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let hlc_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("d".to_string()),
+        ));
         {
             let mut s = crdt_state.lock().await;
             s.apply_friend_update(
@@ -71144,7 +71227,9 @@ mod zeb703_outbox_runtime_durability_tests {
 
         // Shared HLC tracker: production mirrors the SAME Arc between the
         // engine and NodeState.hlc_tracker (see the field's doc comment).
-        let tracker = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let tracker = Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("zeb703-dev".into()),
+        ));
         // Short debounce keeps the green path fast; the red path is bounded
         // by the poll deadline below, not the debounce.
         let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
@@ -71262,7 +71347,9 @@ mod zeb703_outbox_runtime_durability_tests {
         let crdt_state = Arc::new(tokio::sync::Mutex::new(
             crate::owner_state_crdt::OwnerState::default(),
         ));
-        let tracker = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let tracker = Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("zeb709-dev".into()),
+        ));
         let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
             crate::owner_state_crypto::FleetKeySet::new(kt),
             "zeb709-dev".into(),
@@ -71335,7 +71422,9 @@ mod zeb703_outbox_runtime_durability_tests {
         let crdt_state = Arc::new(tokio::sync::Mutex::new(
             crate::owner_state_crdt::OwnerState::default(),
         ));
-        let tracker = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let tracker = Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("zeb709-dev".into()),
+        ));
         let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
             crate::owner_state_crypto::FleetKeySet::new(kt),
             "zeb709-dev".into(),
@@ -71400,7 +71489,9 @@ mod zeb703_outbox_runtime_durability_tests {
         let crdt_state = Arc::new(tokio::sync::Mutex::new(
             crate::owner_state_crdt::OwnerState::default(),
         ));
-        let tracker = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let tracker = Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("zeb703-dev".into()),
+        ));
 
         // SyncEngine::new spawns its task — needs a runtime context; scope
         // the enter guard so `get_ipc_response` below (which block_ons on
@@ -71582,7 +71673,9 @@ mod zeb703_outbox_runtime_durability_tests {
             crate::owner_state_crypto::FleetKeySet::new(kt),
             "zeb703-dev".into(),
             Arc::clone(&crdt_state),
-            Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
+            Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("zeb703-dev".into()),
+            )),
             Arc::new(crate::content_store::InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -71666,7 +71759,9 @@ mod zeb703_outbox_runtime_durability_tests {
             crate::owner_state_crypto::FleetKeySet::new(kt),
             "zeb703-dev".into(),
             Arc::clone(&crdt_state),
-            Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
+            Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("zeb703-dev".into()),
+            )),
             Arc::new(crate::content_store::InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -71792,7 +71887,7 @@ mod zeb703_outbox_runtime_durability_tests {
             dm_transport: Some(Arc::new(crate::dm_outbox::StubTransport::new())),
             crdt_state: Some(Arc::clone(&crdt_state)),
             hlc_tracker: Some(Arc::new(tokio::sync::Mutex::new(
-                std::collections::BTreeMap::new(),
+                harmony_crdt_sync::ReplayTracker::new("zeb703-dev".into()),
             ))),
             dm_device_id: Some("zeb703-dev".into()),
             dm_self_owner: Some(alice),
@@ -71868,7 +71963,9 @@ mod zeb703_outbox_runtime_durability_tests {
             crate::owner_state_crypto::FleetKeySet::new(kt),
             "zeb703-dev".into(),
             Arc::clone(&crdt_state),
-            Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
+            Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("zeb703-dev".into()),
+            )),
             Arc::new(crate::content_store::InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -72064,7 +72161,9 @@ mod zeb708_gui_exit_flush_tests {
         let crdt_state = Arc::new(tokio::sync::Mutex::new(
             crate::owner_state_crdt::OwnerState::default(),
         ));
-        let tracker = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let tracker = Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("zeb708-dev".into()),
+        ));
 
         // SyncEngine::new spawns its select task — scope the enter guard so
         // `run_bounded_flush` below runs OUTSIDE any tokio context (as the
@@ -75208,7 +75307,6 @@ mod owner_loaded_tests {
     use crate::owner_state_crdt::OwnerState;
     use crate::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr};
     use harmony_identity::PrivateIdentity;
-    use std::collections::BTreeMap;
     use tokio::sync::mpsc;
 
     // ── Fixture helpers ──────────────────────────────────────────────────────
@@ -75300,8 +75398,11 @@ mod owner_loaded_tests {
         )));
 
         let crdt_state = std::sync::Arc::new(tokio::sync::Mutex::new(OwnerState::default()));
-        let hlc_tracker: std::sync::Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>> =
-            std::sync::Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let hlc_tracker: std::sync::Arc<
+            tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>,
+        > = std::sync::Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("owner-loaded-test".into()),
+        ));
 
         let ns = NodeState {
             crdt_state: Some(std::sync::Arc::clone(&crdt_state)),
