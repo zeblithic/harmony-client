@@ -910,7 +910,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ReachabilityFallback for CountingFallback {
+    impl ReachabilityFallback<OwnerAddr> for CountingFallback {
         async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.payloads.clone()
