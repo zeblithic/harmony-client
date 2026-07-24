@@ -2,15 +2,13 @@
 //!
 //! See `docs/specs/2026-05-22-zeb-321-cross-wan-connectivity-design.md` §5.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::net::SocketAddr;
 
 use crate::owner_state_crypto::{
     canonical_cbor_encode, sealed::CanonicalPayloadSealed, CanonicalPayload, CryptoError,
 };
-use crate::owner_state_types::{
-    deserialize_bytes_from_bstr, serialize_bytes_as_bstr, Hlc, OwnerAddr,
-};
+use crate::owner_state_types::{serialize_bytes_as_bstr, Hlc, OwnerAddr};
 
 /// Signed validity window applied to every reachability pkarr record
 /// (identity / community / friend / invite). One epoch (7 days): covers the
@@ -19,118 +17,11 @@ use crate::owner_state_types::{
 /// record while `now <= announced_at + this`.
 pub(crate) const REACHABILITY_RECORD_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
-/// One entry of the butler-set advertisement carried in the pkarr routing
-/// blob (ZEB-418 SP2 P1, spec §3): an online device of this owner that
-/// accepts sealed DM deposits on behalf of offline siblings.
-///
-/// Key lengths are mixed (1-char `d` among 2-char keys) — safe here because
-/// structs serialize in declaration order (not BTreeMap key order), so the
-/// encoding stays deterministic across devices; this map simply doesn't get
-/// the "coincidentally RFC 8949-sorted" property (an acknowledged,
-/// unenforced gap — see `canonical_cbor_encode`'s doc).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ButlerSetEntry {
-    /// 16-byte identity hash of the device (the `state.enrollments` key).
-    #[serde(
-        rename = "d",
-        serialize_with = "serialize_bytes_as_bstr",
-        deserialize_with = "deserialize_bytes_from_bstr"
-    )]
-    pub device_id: [u8; 16],
-
-    /// Iroh EndpointId / NodeId (32-byte transport key — NOT the identity
-    /// key).
-    #[serde(
-        rename = "ep",
-        serialize_with = "serialize_bytes_as_bstr",
-        deserialize_with = "deserialize_bytes_from_bstr"
-    )]
-    pub iroh_endpoint_id: [u8; 32],
-
-    /// The cert-bound device ed25519 verify key. Senders derive the deposit
-    /// seal target as `birational(vk)` (ZEB-372 / `dm_signing::
-    /// ed25519_pub_to_x25519`).
-    #[serde(
-        rename = "vk",
-        serialize_with = "serialize_bytes_as_bstr",
-        deserialize_with = "deserialize_bytes_from_bstr"
-    )]
-    pub device_ed25519_verify: [u8; 32],
-
-    /// Home DERP relay URL for dialing the device.
-    #[serde(rename = "hr")]
-    pub home_relay: String,
-
-    /// Pinned always-on device (pin UI lands in P2; the wire format carries
-    /// it from day one so P1 records stay forward-compatible).
-    #[serde(rename = "pn")]
-    pub pinned: bool,
-}
-
-/// `skip_serializing_if` predicate for `bs_at`: a zero stamp means "no
-/// butler set" and is elided so legacy blobs stay byte-identical.
-fn is_zero_u64(v: &u64) -> bool {
-    *v == 0
-}
-
-/// Payload of a `MembershipEventKind::ReachabilityAnnounce` variant.
-/// All 5 original field keys are 2 chars to satisfy the same-length-keys
-/// invariant at this nesting level (the ZEB-418 additions `bs`/`ba` keep
-/// it). Encoded inside the membership envelope's `vl` (variant value) slot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReachabilityAnnouncePayload {
-    /// Iroh NodeId (Ed25519 public key, 32 bytes). Distinct from
-    /// harmony identity key — bound to it via `identity_signature`.
-    #[serde(
-        rename = "nd",
-        serialize_with = "serialize_bytes_as_bstr",
-        deserialize_with = "deserialize_bytes_from_bstr"
-    )]
-    pub iroh_node_id: [u8; 32],
-
-    /// Home DERP relay URL (Phase 1: an n0-hosted relay).
-    #[serde(rename = "rl")]
-    pub home_relay_url: String,
-
-    /// Direct-traversal hint addresses (publicly routable if any; may
-    /// be empty Vec).
-    #[serde(rename = "da")]
-    pub direct_addresses: Vec<SocketAddr>,
-
-    /// Wall-clock milliseconds when this record was authored.
-    #[serde(rename = "ts")]
-    pub announced_at_ms: u64,
-
-    /// Inner Ed25519 signature by the device's HARMONY identity key
-    /// over canonical CBOR of (nd, rl, da, ts, actor, hlc, bs, ba) — the
-    /// 8-field preimage built by [`inner_signed_bytes`] (the butler set `bs`
-    /// and its stamp `ba` were folded in for ZEB-418 durable seal-targets, a
-    /// flag-day change). Binds the Iroh NodeId AND the seal-targets to the
-    /// harmony identity. 64 bytes.
-    #[serde(
-        rename = "sg",
-        serialize_with = "serialize_bytes_as_bstr",
-        deserialize_with = "deserialize_bytes_from_bstr"
-    )]
-    pub identity_signature: [u8; 64],
-
-    /// ZEB-418 SP2 P1: ordered priority list of butler devices (max
-    /// [`crate::butler_deposit::BUTLER_SET_MAX_ENTRIES`]). Elided when empty
-    /// so blobs without a butler set stay byte-identical to the legacy
-    /// encoding (pinned by `routing_blob_without_butler_set_is_wire_
-    /// identical_to_legacy`). Read through a source-appropriate accessor —
-    /// never directly: [`fresh_butler_set`] for pkarr-live records (applies the
-    /// freshness window) or [`durable_butler_set`] for durable CRDT records
-    /// (window-exempt, Decision 3). The caller picks by [`crate::reachability_
-    /// resolver::ReachabilitySource`].
-    #[serde(rename = "bs", default, skip_serializing_if = "Vec::is_empty")]
-    pub butler_set: Vec<ButlerSetEntry>,
-
-    /// ZEB-418 SP2 P1: wall-clock ms freshness stamp for the whole butler
-    /// set, written at blob-build time. Zero (elided) means "no butler set".
-    #[serde(rename = "ba", default, skip_serializing_if = "is_zero_u64")]
-    pub bs_at: u64,
-}
+// The record shape + delegate type + canonical CBOR now live in the core crate
+// (harmony-reachability, ZEB-744 PR 1). This module keeps only the client-side
+// inner-signature scheme, butler-set accessors, and freshness policy, operating
+// on the core-owned record through its public fields.
+pub use harmony_reachability::{DelegateEndpoint as ButlerSetEntry, ReachabilityAnnouncePayload};
 
 /// Reader-side accessor for the butler set (ZEB-418 SP2 P1): returns the
 /// advertised entries iff the `bs_at` stamp is present and within
@@ -443,6 +334,33 @@ mod tests {
             butler_set: Vec::new(),
             bs_at: 0,
         }
+    }
+
+    /// Byte-lock for the inner-signature preimage (`inner_signed_bytes`), which now
+    /// spans the repo boundary: record fields come from the core crate, `actor`/`hlc`
+    /// from the client. DO NOT REGENERATE — regenerating would mask a preimage drift.
+    #[test]
+    fn inner_signed_bytes_preimage_is_wire_pinned() {
+        let hlc = fixture_hlc();
+        let actor = OwnerAddr([0x11; 16]);
+        let p = fixture_payload();
+        let bytes = inner_signed_bytes(
+            &p.iroh_node_id,
+            &p.home_relay_url,
+            &p.direct_addresses,
+            p.announced_at_ms,
+            &actor,
+            &hlc,
+            &p.butler_set,
+            p.bs_at,
+        )
+        .expect("preimage");
+        const EXPECTED_PREIMAGE_HEX: &str = "a8626e645820abababababababababababababababababababababababababababababababab62726c7568747470733a2f2f646572702e6578616d706c652f626461806274731b0000018bcfe56800626163501111111111111111111111111111111162686ca361771b0000018bcfe56800616c006164636669786262738062626100";
+        assert_eq!(
+            hex::encode(&bytes),
+            EXPECTED_PREIMAGE_HEX,
+            "inner-sig preimage drifted"
+        );
     }
 
     /// THE wire-compat pin (ZEB-418 P1 Task 4): a routing blob WITHOUT a
