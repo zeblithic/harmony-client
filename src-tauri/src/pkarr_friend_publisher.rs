@@ -172,7 +172,11 @@ pub async fn resolve_friend_case_d(
     // (both derive it from `now_ms`), since the epoch-blind decode seam can't
     // tell which window epoch a given blob was sealed under.
     let window = epoch_tolerance_window(now_ms);
-    let decode_secret = *secret;
+    // Keep the closure-captured secret in `Zeroizing` (module invariant: friendship
+    // key material never lives in a plain `[u8; 32]` that escapes zeroization).
+    // `&decode_secret` deref-coerces to `&[u8; 32]` at the `open_case_d_payload`
+    // call, so the closure body is unchanged.
+    let decode_secret = Zeroizing::new(*secret);
     let info_owner = *friend_owner;
     let slot_resolver = PkarrSlotResolver::new(
         Arc::clone(resolver),
