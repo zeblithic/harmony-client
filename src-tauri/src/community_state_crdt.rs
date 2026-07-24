@@ -14,11 +14,13 @@
 //! at this nesting level — both field codes (`ci` for community_id,
 //! `ev` for events) are 2 chars.
 
+use core::cmp::Ordering;
+use harmony_crdt_sync::verified_log::LogPolicy;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::community_membership::{
-    materialize, materialize_with_now, prior_state_at_event, verify_event, EventId,
+    event_sort_key, materialize, materialize_with_now, prior_state_at_event, verify_event, EventId,
     MaterializedMembership, SignedMembershipEvent, VerifyContext, VerifyError,
 };
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
@@ -196,6 +198,85 @@ pub enum InsertOutcome {
     Inserted,
     AlreadyKnown,
     Rejected(VerifyError),
+}
+
+/// Per-insert policy context for [`MembershipPolicy`] (ZEB-748 phase 6a).
+///
+/// The core [`VerifiedLog`](harmony_crdt_sync::verified_log::VerifiedLog)
+/// threads one `Context` through both the prior-state `materialize` and the
+/// `verify` of a single insert. `now_floor_ms` is the candidate event's own
+/// `at.wall_ms`, carried here so the prior-state materialization ages out
+/// TIME-DRIVEN state (PendingJoin's 30-day expiry; the admin-recovery
+/// lifecycle) exactly as `prior_state_at_event` does today — the R4-6
+/// idle-community now-floor. Threading `None` instead would be a behavioral
+/// regression.
+///
+/// Produced now for Task 7's `CommunityState` adoption; the legacy
+/// `insert_event` path is untouched by this change.
+///
+// ZEB-748 phase 6a: this adopter glue is exercised by `policy_tests` but has
+// no non-test consumer until Task 7 threads it through `CommunityState`, so
+// the plain-lib compilation (cfg(test) off) would otherwise warn
+// `never constructed`. Remove this `allow` when Task 7 lands its consumer.
+#[allow(dead_code)]
+pub(crate) struct MembershipInsertCtx {
+    pub verify: VerifyContext,
+    pub now_floor_ms: u64,
+}
+
+/// The [`LogPolicy`] that adopts community-membership into the core
+/// verified-event-log engine (ZEB-748 phase 6a).
+///
+/// Pure glue: every method delegates to the unchanged `community_membership`
+/// free functions (`event_sort_key`, `verify_event`, `materialize_with_now`),
+/// so a `VerifiedLog<MembershipPolicy>` and the legacy
+/// [`CommunityState::insert_event`] path stay bit-for-bit equivalent. The type
+/// is zero-sized — all state lives in the log's events and the per-insert
+/// [`MembershipInsertCtx`].
+///
+// ZEB-748 phase 6a: only `policy_tests` names this type until Task 7 builds a
+// `VerifiedLog<MembershipPolicy>` inside `CommunityState`; the plain-lib
+// compilation would otherwise warn `never constructed`. Remove this `allow`
+// when Task 7 lands its consumer.
+#[allow(dead_code)]
+pub(crate) struct MembershipPolicy;
+
+impl LogPolicy for MembershipPolicy {
+    type Event = SignedMembershipEvent;
+    type EventId = EventId;
+    type State = MaterializedMembership;
+    type Context = MembershipInsertCtx;
+    type Error = VerifyError;
+
+    fn event_id(e: &SignedMembershipEvent) -> EventId {
+        e.id
+    }
+
+    fn cmp(a: &SignedMembershipEvent, b: &SignedMembershipEvent) -> Ordering {
+        // The single canonical total order, shared with `materialize`.
+        event_sort_key(a).cmp(&event_sort_key(b))
+    }
+
+    fn verify(
+        e: &SignedMembershipEvent,
+        prior: &MaterializedMembership,
+        ctx: &MembershipInsertCtx,
+    ) -> Result<(), VerifyError> {
+        verify_event(e, prior, &ctx.verify)
+    }
+
+    fn materialize(
+        events: &[&SignedMembershipEvent],
+        ctx: &MembershipInsertCtx,
+    ) -> MaterializedMembership {
+        // The core hands events in unspecified order; `materialize_with_now`
+        // sorts internally by `event_sort_key`, so input order is irrelevant.
+        // Passing `Some(now_floor_ms)` — the candidate's own wall_ms —
+        // reproduces `prior_state_at_event`'s R4-6 idle-community aging floor.
+        // Threading `None` here would be a behavioral regression.
+        let owned: Vec<SignedMembershipEvent> = events.iter().map(|e| (*e).clone()).collect();
+        materialize_with_now(&owned, ctx.verify.admin_addr, Some(ctx.now_floor_ms))
+    }
 }
 
 impl CommunityState {
@@ -420,5 +501,109 @@ mod tests {
                 .any(|(k, _): &(ciborium::Value, ciborium::Value)| k.as_text() == Some("ff")),
             "forked_from=Some should appear in CBOR encoding"
         );
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    //! ZEB-748 phase 6a: `MembershipPolicy` is the `LogPolicy` adopter that
+    //! lets a `VerifiedLog<MembershipPolicy>` reuse the unchanged
+    //! `community_membership` verify/materialize/sort functions. This proves
+    //! the adopter's insert/dedup/reject wiring against the core engine
+    //! WITHOUT touching `CommunityState` (that is a later task).
+    use super::*;
+    use crate::community_membership::{
+        mint_test_owner, sign_event, EventPayload, MembershipEventKind, TestOwner,
+    };
+    use crate::owner_state_types::Hlc;
+    // The core engine's `InsertOutcome<E>` is a distinct type from this
+    // crate's own `InsertOutcome`, so it is aliased to avoid the name clash.
+    use harmony_crdt_sync::verified_log::{InsertOutcome as CoreOutcome, VerifiedLog};
+
+    fn hlc(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "d".into(),
+        }
+    }
+
+    /// Sign a membership event with `owner`'s enrolled device key, attaching
+    /// the Master cert on identity-introducing Join events so materialize
+    /// populates `enrolled_device_keys` and `verify_event` can resolve the
+    /// signer. Mirrors `community_state_crdt_unit.rs::sign_event_with_identity`.
+    fn sign_join(payload: &EventPayload, owner: &TestOwner) -> SignedMembershipEvent {
+        let ev = sign_event(payload, &owner.device_key).expect("sign");
+        match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        }
+    }
+
+    #[test]
+    fn membership_policy_insert_dedup_reject() {
+        let owner = mint_test_owner(0xa1);
+        let addr = owner.owner;
+        let community_id = SpaceId([1u8; 16]);
+
+        // A valid admin self-Join in an open (not invite-only) community.
+        let bootstrap = sign_join(
+            &EventPayload {
+                id: [3u8; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: addr,
+                at: hlc(100),
+            },
+            &owner,
+        );
+
+        // now_floor_ms = the candidate's own wall_ms (the R4-6 floor), exactly
+        // as Task 7's per-insert ctx will thread it.
+        let ctx = MembershipInsertCtx {
+            verify: VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: addr,
+                is_invite_only: false,
+            },
+            now_floor_ms: bootstrap.at.wall_ms,
+        };
+
+        let mut log: VerifiedLog<MembershipPolicy> = VerifiedLog::new();
+
+        // New, verified event -> Inserted.
+        assert_eq!(log.insert(bootstrap.clone(), &ctx), CoreOutcome::Inserted);
+        assert_eq!(log.len(), 1);
+
+        // Same id again -> AlreadyKnown; verify is NOT re-run (dedup short-circuit).
+        assert_eq!(
+            log.insert(bootstrap.clone(), &ctx),
+            CoreOutcome::AlreadyKnown
+        );
+        assert_eq!(log.len(), 1);
+
+        // A NEW-id event for the WRONG community: verify_event rejects at its
+        // community-binding step 0, so the policy surfaces Rejected and the
+        // event does not land.
+        let wrong_community = sign_join(
+            &EventPayload {
+                id: [4u8; 16],
+                community_id: SpaceId([2u8; 16]),
+                kind: MembershipEventKind::Join,
+                actor: addr,
+                at: hlc(200),
+            },
+            &owner,
+        );
+        assert!(matches!(
+            log.insert(wrong_community, &ctx),
+            CoreOutcome::Rejected(VerifyError::WrongCommunity)
+        ));
+        assert_eq!(log.len(), 1);
     }
 }

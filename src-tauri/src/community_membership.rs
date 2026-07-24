@@ -3927,6 +3927,12 @@ pub fn prior_state_at_hlc(
 /// materialized `enrolled_device_keys` (steady-state events). Countersig
 /// and InviteToken signers are likewise resolved from materialized
 /// membership. The context now carries only policy/binding scalars.
+///
+/// `Clone`/`Copy` (ZEB-748 phase 6a): all three fields are `Copy`
+/// scalars (`SpaceId`, `OwnerAddr`, `bool`), so the derive is free. The
+/// `MembershipPolicy` adopter (`community_state_crdt.rs`) threads a
+/// `VerifyContext` by value inside its per-insert `MembershipInsertCtx`.
+#[derive(Clone, Copy)]
 pub struct VerifyContext {
     pub expected_community_id: SpaceId,
     pub admin_addr: OwnerAddr,
