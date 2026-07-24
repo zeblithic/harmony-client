@@ -34,14 +34,14 @@ use crate::owner_state_types::{OwnerAddr, SpaceId};
 /// **Byte-transparency is the hard requirement**: every persisted
 /// `CommunityState` blob and every wire fixture (`zeb285`, `zeb250`, the
 /// disk round-trip, the in-module `community_state_forked_from_*` tests) must
-/// stay valid with zero fixture edits. To guarantee that by construction,
-/// `serialize` rebuilds the OWNED `BTreeMap<EventId, SignedMembershipEvent>`
-/// and delegates to its `Serialize` impl — the *exact same* code path
-/// `#[derive(Serialize)]` invoked for the old field (`serialize_map(Some(len))`
-/// then one `serialize_entry` per BTreeMap pair in EventId order). The
-/// zero-copy borrowed-entry path would only match if it reproduced that
-/// sequence precisely; the owned rebuild is identical by definition, so we
-/// take it. Byte-identity beats zero-copy here.
+/// stay valid with zero fixture edits. `serialize` collects the log's events
+/// into a `BTreeMap<EventId, &SignedMembershipEvent>` (borrowed values —
+/// serde serializes `&T` byte-identically to `T`, so no per-event clone is
+/// needed) and delegates to `BTreeMap`'s own `Serialize` impl: the *exact
+/// same* code path `#[derive(Serialize)]` invoked for the old field
+/// (`serialize_map(Some(len))` then one `serialize_entry` per pair in EventId
+/// order). `deserialize` decodes the same legacy map shape and rejects any
+/// blob whose stored key disagrees with the event's own id (see below).
 mod membership_log_serde {
     use super::*;
     use serde::{Deserializer, Serializer};
@@ -51,12 +51,13 @@ mod membership_log_serde {
         log: &VerifiedLog<MembershipPolicy>,
         s: S,
     ) -> Result<S::Ok, S::Error> {
-        // Rebuild the exact owned BTreeMap<EventId, SignedMembershipEvent> the
-        // derive used to emit for `events` (keyed by e.id → EventId-ascending
-        // iteration) and delegate to BTreeMap's own Serialize impl. This is
-        // byte-for-byte what `#[derive(Serialize)]` did for the old field.
-        let map: BTreeMap<EventId, SignedMembershipEvent> =
-            log.events().map(|e| (e.id, e.clone())).collect();
+        // Collect the log's events into BTreeMap<EventId, &SignedMembershipEvent>
+        // (borrowed values — serde serializes `&T` byte-identically to `T`),
+        // keyed by e.id → EventId-ascending, and delegate to BTreeMap's own
+        // Serialize impl. Byte-for-byte what `#[derive(Serialize)]` emitted for
+        // the old owned field, with no per-event clone.
+        let map: BTreeMap<EventId, &SignedMembershipEvent> =
+            log.events().map(|e| (e.id, e)).collect();
         map.serialize(s)
     }
 
@@ -65,10 +66,24 @@ mod membership_log_serde {
     ) -> Result<VerifiedLog<MembershipPolicy>, D::Error> {
         // Decode the legacy map shape, then restore into the engine WITHOUT
         // re-verifying (these events were verified when they first arrived and
-        // were persisted). `into_values()` yields EventId order; the engine
-        // re-keys by `e.id`, so the internal ordering is preserved.
+        // were persisted). Reject any blob whose stored CBOR map key disagrees
+        // with the event's own id rather than silently re-keying it — a
+        // mismatch can only mean a corrupt or tampered blob, and silent
+        // re-keying could collapse a distinct event. Every valid blob upholds
+        // key == e.id (the invariant every writer maintains), so this is
+        // byte-transparent for all real state. `from_verified_events` re-keys
+        // by e.id, preserving EventId iteration order.
         let map = BTreeMap::<EventId, SignedMembershipEvent>::deserialize(d)?;
-        Ok(VerifiedLog::from_verified_events(map.into_values()))
+        let mut events = Vec::with_capacity(map.len());
+        for (id, event) in map {
+            if id != event.id {
+                return Err(<D::Error as serde::de::Error>::custom(
+                    "membership event map key does not match event id",
+                ));
+            }
+            events.push(event);
+        }
+        Ok(VerifiedLog::from_verified_events(events))
     }
 }
 
