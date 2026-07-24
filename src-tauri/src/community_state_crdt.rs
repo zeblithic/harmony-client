@@ -15,18 +15,64 @@
 //! `ev` for events) are 2 chars.
 
 use core::cmp::Ordering;
-use harmony_crdt_sync::verified_log::LogPolicy;
+use harmony_crdt_sync::verified_log::{LogPolicy, VerifiedLog};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::community_membership::{
-    event_sort_key, materialize, materialize_with_now, prior_state_at_event, verify_event, EventId,
+    event_sort_key, materialize, materialize_with_now, verify_event, EventId,
     MaterializedMembership, SignedMembershipEvent, VerifyContext, VerifyError,
 };
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::{OwnerAddr, SpaceId};
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Serde shim (ZEB-748 phase 6a Task 7) that keeps
+/// [`CommunityState::log`] — a [`VerifiedLog<MembershipPolicy>`] — encoding
+/// BYTE-IDENTICALLY to the legacy `events: BTreeMap<EventId,
+/// SignedMembershipEvent>` field it replaced (CBOR field "ev").
+///
+/// **Byte-transparency is the hard requirement**: every persisted
+/// `CommunityState` blob and every wire fixture (`zeb285`, `zeb250`, the
+/// disk round-trip, the in-module `community_state_forked_from_*` tests) must
+/// stay valid with zero fixture edits. To guarantee that by construction,
+/// `serialize` rebuilds the OWNED `BTreeMap<EventId, SignedMembershipEvent>`
+/// and delegates to its `Serialize` impl — the *exact same* code path
+/// `#[derive(Serialize)]` invoked for the old field (`serialize_map(Some(len))`
+/// then one `serialize_entry` per BTreeMap pair in EventId order). The
+/// zero-copy borrowed-entry path would only match if it reproduced that
+/// sequence precisely; the owned rebuild is identical by definition, so we
+/// take it. Byte-identity beats zero-copy here.
+mod membership_log_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(
+        log: &VerifiedLog<MembershipPolicy>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        // Rebuild the exact owned BTreeMap<EventId, SignedMembershipEvent> the
+        // derive used to emit for `events` (keyed by e.id → EventId-ascending
+        // iteration) and delegate to BTreeMap's own Serialize impl. This is
+        // byte-for-byte what `#[derive(Serialize)]` did for the old field.
+        let map: BTreeMap<EventId, SignedMembershipEvent> =
+            log.events().map(|e| (e.id, e.clone())).collect();
+        map.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<VerifiedLog<MembershipPolicy>, D::Error> {
+        // Decode the legacy map shape, then restore into the engine WITHOUT
+        // re-verifying (these events were verified when they first arrived and
+        // were persisted). `into_values()` yields EventId order; the engine
+        // re-keys by `e.id`, so the internal ordering is preserved.
+        let map = BTreeMap::<EventId, SignedMembershipEvent>::deserialize(d)?;
+        Ok(VerifiedLog::from_verified_events(map.into_values()))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct CommunityState {
     /// The community this state belongs to. Persisted in the wire form
     /// so that a misrouted blob (wrong file, wrong ContentStore key) is
@@ -100,11 +146,16 @@ pub struct CommunityState {
     )]
     pub admin_quorum: u8,
 
-    /// Append-only signed event log, keyed by EventId. BTreeMap (not
-    /// HashMap) so iteration order is deterministic across replicas —
-    /// canonical CBOR encoding requires a stable order.
-    #[serde(rename = "ev")]
-    pub events: BTreeMap<EventId, SignedMembershipEvent>,
+    /// Append-only signed event log, verified on insert (ZEB-748 phase 6a).
+    /// Backed by the core `VerifiedLog<MembershipPolicy>` engine. Serialized
+    /// byte-identically to the legacy
+    /// `events: BTreeMap<EventId, SignedMembershipEvent>` field it replaced —
+    /// CBOR field "ev", keyed by EventId in ascending order — via the
+    /// `membership_log_serde` shim below. Private: ALL access goes through the
+    /// accessors (`events`, `get_event`, `insert_event`, …) so a future
+    /// backing swap only touches this module.
+    #[serde(rename = "ev", with = "membership_log_serde")]
+    log: VerifiedLog<MembershipPolicy>,
 
     /// Materialized-view cache. Skipped from CBOR — derivable from
     /// `events` so persisting it would just inflate the wire form.
@@ -145,11 +196,30 @@ struct MaterializedCache {
     cached: Option<MaterializedMembership>,
 }
 
+// `VerifiedLog<MembershipPolicy>` (the core engine) does not derive `Debug`,
+// so `CommunityState` can't `#[derive(Debug)]`. Format it by hand, rendering
+// the event log as the list of events it holds (EventId order).
+impl std::fmt::Debug for CommunityState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommunityState")
+            .field("community_id", &self.community_id)
+            .field("forked_from", &self.forked_from)
+            .field("forked_at_wall_ms", &self.forked_at_wall_ms)
+            .field("parent_lineage", &self.parent_lineage)
+            .field("fork_reason", &self.fork_reason)
+            .field("admin_quorum", &self.admin_quorum)
+            .field("events", &self.log.events().collect::<Vec<_>>())
+            .field("cache", &self.cache)
+            .field("bootstrap_hint", &self.bootstrap_hint)
+            .finish()
+    }
+}
+
 // `Mutex<MaterializedCache>` is not `Clone` / `PartialEq`, so we can't
 // auto-derive these on `CommunityState`. The cache is purely a derived
-// view of `events`, so a clone fresh-initializes the cache (the clone
+// view of the event log, so a clone fresh-initializes the cache (the clone
 // will re-materialize on first read) and equality is well-defined as
-// `community_id` + `events`.
+// `community_id` + the event set.
 impl Clone for CommunityState {
     fn clone(&self) -> Self {
         Self {
@@ -159,7 +229,10 @@ impl Clone for CommunityState {
             parent_lineage: self.parent_lineage.clone(),
             fork_reason: self.fork_reason.clone(),
             admin_quorum: self.admin_quorum,
-            events: self.events.clone(),
+            // The events are already-verified; rebuild the engine from them
+            // without re-running `verify` (a clone must never reject events
+            // the original accepted).
+            log: VerifiedLog::from_verified_events(self.log.events().cloned()),
             cache: std::sync::Mutex::new(MaterializedCache::default()),
             bootstrap_hint: std::sync::Mutex::new(
                 self.bootstrap_hint.lock().ok().and_then(|g| g.clone()),
@@ -176,7 +249,10 @@ impl PartialEq for CommunityState {
             && self.parent_lineage == other.parent_lineage
             && self.fork_reason == other.fork_reason
             && self.admin_quorum == other.admin_quorum
-            && self.events == other.events
+            // Both logs iterate in EventId order, so `Iterator::eq` is exact
+            // event-set equality (SignedMembershipEvent: PartialEq).
+            && self.log.len() == other.log.len()
+            && self.log.events().eq(other.log.events())
     }
 }
 impl Eq for CommunityState {}
@@ -211,14 +287,8 @@ pub enum InsertOutcome {
 /// idle-community now-floor. Threading `None` instead would be a behavioral
 /// regression.
 ///
-/// Produced now for Task 7's `CommunityState` adoption; the legacy
-/// `insert_event` path is untouched by this change.
-///
-// ZEB-748 phase 6a: this adopter glue is exercised by `policy_tests` but has
-// no non-test consumer until Task 7 threads it through `CommunityState`, so
-// the plain-lib compilation (cfg(test) off) would otherwise warn
-// `never constructed`. Remove this `allow` when Task 7 lands its consumer.
-#[allow(dead_code)]
+/// Produced now for Task 7's `CommunityState` adoption, which threads this
+/// per-insert context through [`CommunityState::insert_event`].
 pub(crate) struct MembershipInsertCtx {
     pub verify: VerifyContext,
     pub now_floor_ms: u64,
@@ -232,13 +302,8 @@ pub(crate) struct MembershipInsertCtx {
 /// so a `VerifiedLog<MembershipPolicy>` and the legacy
 /// [`CommunityState::insert_event`] path stay bit-for-bit equivalent. The type
 /// is zero-sized — all state lives in the log's events and the per-insert
-/// [`MembershipInsertCtx`].
-///
-// ZEB-748 phase 6a: only `policy_tests` names this type until Task 7 builds a
-// `VerifiedLog<MembershipPolicy>` inside `CommunityState`; the plain-lib
-// compilation would otherwise warn `never constructed`. Remove this `allow`
-// when Task 7 lands its consumer.
-#[allow(dead_code)]
+/// [`MembershipInsertCtx`]. Task 7 makes [`CommunityState`] hold a
+/// `VerifiedLog<MembershipPolicy>`, so this type now has a real consumer.
 pub(crate) struct MembershipPolicy;
 
 impl LogPolicy for MembershipPolicy {
@@ -288,7 +353,7 @@ impl CommunityState {
             parent_lineage: Vec::new(),
             fork_reason: None,
             admin_quorum: 1,
-            events: BTreeMap::new(),
+            log: VerifiedLog::new(),
             cache: std::sync::Mutex::new(MaterializedCache::default()),
             bootstrap_hint: std::sync::Mutex::new(None),
         }
@@ -349,7 +414,7 @@ impl CommunityState {
         // (e.g., a replica that only received remote events, never inserted
         // a local one). The correct behavior: hint is only the authoritative
         // view when there are truly NO events yet.
-        if cache.version == 0 && self.events.is_empty() {
+        if cache.version == 0 && self.log.is_empty() {
             if let Ok(hint_g) = self.bootstrap_hint.lock() {
                 if let Some(hint) = hint_g.clone() {
                     return hint;
@@ -359,7 +424,7 @@ impl CommunityState {
         let cache_hit = cache.cached_version == Some(cache.version)
             && cache.cached_admin_addr == Some(admin_addr);
         if !cache_hit {
-            let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
+            let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
             let m = materialize(&log, admin_addr);
             cache.cached = Some(m.clone());
             cache.cached_version = Some(cache.version);
@@ -388,36 +453,37 @@ impl CommunityState {
         event: SignedMembershipEvent,
         ctx: &VerifyContext,
     ) -> InsertOutcome {
-        if self.events.contains_key(&event.id) {
-            return InsertOutcome::AlreadyKnown;
+        use harmony_crdt_sync::verified_log::InsertOutcome as CoreOutcome;
+
+        // Build a FRESH per-insert policy context. `now_floor_ms` is the
+        // candidate's own `at.wall_ms` — the R4-6 idle-community aging floor
+        // that `prior_state_at_event` applied — read into a local BEFORE
+        // `event` moves into `self.log.insert`. The engine dedups by id,
+        // materializes the strictly-prior set (matching the old
+        // `prior_state_at_event` filter), then runs `verify_event`.
+        let policy_ctx = MembershipInsertCtx {
+            verify: *ctx,
+            now_floor_ms: event.at.wall_ms,
+        };
+        match self.log.insert(event, &policy_ctx) {
+            CoreOutcome::AlreadyKnown => InsertOutcome::AlreadyKnown,
+            CoreOutcome::Rejected(e) => InsertOutcome::Rejected(e),
+            CoreOutcome::Inserted => {
+                // Invalidate cache by bumping version. Lazy re-mat happens on
+                // the next `materialized` call.
+                self.cache.lock().expect("cache mutex poisoned").version += 1;
+
+                // ZEB-250: synchronize CommunityState.admin_quorum with the
+                // freshly-recomputed materialized view. `materialize` is the
+                // source of truth (walks ChangeQuorum proposals in HLC order);
+                // we write the result back to the persistent field so
+                // fast-load doesn't need to re-materialize.
+                let derived = self.materialize_now(ctx.admin_addr).admin_quorum;
+                self.admin_quorum = derived;
+
+                InsertOutcome::Inserted
+            }
         }
-
-        // Build prior_state from the current event log. Note that we
-        // pass the candidate event so prior_state_at_event filters
-        // strictly less-than, not less-than-or-equal — without this
-        // the candidate would self-authorize against its own future
-        // state if it had already been inserted.
-        let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
-        let prior = prior_state_at_event(&log, &event, ctx.admin_addr);
-
-        if let Err(e) = verify_event(&event, &prior, ctx) {
-            return InsertOutcome::Rejected(e);
-        }
-
-        self.events.insert(event.id, event);
-        // Invalidate cache by bumping version. Lazy re-mat happens on
-        // the next `materialized` call.
-        self.cache.lock().expect("cache mutex poisoned").version += 1;
-
-        // ZEB-250: synchronize CommunityState.admin_quorum with the
-        // freshly-recomputed materialized view. `materialize` is the
-        // source of truth (walks ChangeQuorum proposals in HLC order);
-        // we write the result back to the persistent field so fast-load
-        // doesn't need to re-materialize.
-        let derived = self.materialize_now(ctx.admin_addr).admin_quorum;
-        self.admin_quorum = derived;
-
-        InsertOutcome::Inserted
     }
 
     /// Materialize the current event log without consulting the cache.
@@ -425,7 +491,7 @@ impl CommunityState {
     /// Kept as a separate helper for tests and one-shot reads where
     /// cache pollution would be undesirable.
     pub fn materialize_now(&self, admin_addr: OwnerAddr) -> MaterializedMembership {
-        let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
+        let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
         materialize(&log, admin_addr)
     }
 
@@ -447,7 +513,7 @@ impl CommunityState {
         admin_addr: OwnerAddr,
         now_ms: u64,
     ) -> MaterializedMembership {
-        let log: Vec<SignedMembershipEvent> = self.events.values().cloned().collect();
+        let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
         materialize_with_now(&log, admin_addr, Some(now_ms))
     }
 
@@ -461,32 +527,35 @@ impl CommunityState {
 
     /// Iterate the event log in canonical (EventId-ascending) order.
     pub fn events(&self) -> impl Iterator<Item = &SignedMembershipEvent> {
-        self.events.values()
+        // Core `VerifiedLog::events()` iterates its internal
+        // `BTreeMap<EventId, Event>` values → EventId-ascending, preserving
+        // the old `BTreeMap::values()` contract.
+        self.log.events()
     }
 
     /// Look up a single event by id.
     pub fn get_event(&self, id: &EventId) -> Option<&SignedMembershipEvent> {
-        self.events.get(id)
+        self.log.get(id)
     }
 
     /// Whether an event with this id is already in the log.
     pub fn contains_event(&self, id: &EventId) -> bool {
-        self.events.contains_key(id)
+        self.log.contains(id)
     }
 
     /// Number of events in the log.
     pub fn event_count(&self) -> usize {
-        self.events.len()
+        self.log.len()
     }
 
     /// Whether the log holds no events yet.
     pub fn events_is_empty(&self) -> bool {
-        self.events.is_empty()
+        self.log.is_empty()
     }
 
     /// Consume the state, yielding its events (canonical order).
     pub fn into_events(self) -> Vec<SignedMembershipEvent> {
-        self.events.into_values().collect()
+        self.log.events().cloned().collect()
     }
 
     /// Trusted-write seam: insert a pre-verified event WITHOUT re-running
@@ -496,7 +565,12 @@ impl CommunityState {
     /// the pre-flip field, required after Task 7 flips to a `VerifiedLog`).
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn insert_verified_for_test(&mut self, e: SignedMembershipEvent) {
-        self.events.insert(e.id, e);
+        // `VerifiedLog` has no unverified single-insert seam, so rebuild it
+        // from the existing events plus the new one via the trusted
+        // `from_verified_events` restore path (dedups by id).
+        let mut evs: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
+        evs.push(e);
+        self.log = VerifiedLog::from_verified_events(evs);
         self.cache.lock().expect("cache mutex poisoned").version += 1;
     }
 
@@ -505,7 +579,7 @@ impl CommunityState {
     /// `insert_verified_for_test`).
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn set_event_log_for_test(&mut self, events: BTreeMap<EventId, SignedMembershipEvent>) {
-        self.events = events;
+        self.log = VerifiedLog::from_verified_events(events.into_values());
         self.cache.lock().expect("cache mutex poisoned").version += 1;
     }
 }
