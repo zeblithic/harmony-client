@@ -13,9 +13,15 @@
 //! comparator runs per-key, so each (owner, device) pair maintains its
 //! own latest record independently.
 
+// `async_trait` is now used only by the `#[cfg(test)]` fallback stubs below
+// (the production `ReachabilityFallback` trait def moved to the core kernel in
+// ZEB-744), so gate the import to test builds to avoid an unused-import warning.
+#[cfg(test)]
 use async_trait::async_trait;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
+
+use harmony_reachability::{lww_newer as core_lww_newer, MultiDeviceMap};
 
 use crate::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr};
 use crate::peer_liveness::LivenessHandle;
@@ -66,10 +72,11 @@ fn default_clock() -> Arc<dyn Fn() -> u64 + Send + Sync> {
 /// no entry for a given owner. Implemented by `PkarrResolverAdapter` (case C)
 /// and by test stubs. The concrete impl is injected at boot via
 /// `set_fallback_source`.
-#[async_trait]
-pub trait ReachabilityFallback: Send + Sync {
-    async fn resolve(&self, addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload>;
-}
+///
+/// ZEB-744: sourced from the core `harmony-reachability` kernel (generic over
+/// the owner key); the client instantiates it at `Owner = OwnerAddr`. Re-exported
+/// so existing `crate::reachability_resolver::ReachabilityFallback` paths resolve.
+pub use harmony_reachability::ReachabilityFallback;
 
 /// Composite key: harmony owner + iroh endpoint. Same-owner-different-
 /// device entries coexist; same-owner-same-device updates are LWW.
@@ -215,11 +222,10 @@ fn source_rank(s: ReachabilitySource) -> u8 {
 /// only on strictly-greater), keeping the degenerate all-tie case
 /// deterministic and identical to the old behavior.
 fn freshest_across_owners<'a>(
-    map: &'a BTreeMap<ResolverKey, ResolverSlots>,
-    node_id_bytes: &[u8; 32],
+    map: &'a MultiDeviceMap<OwnerAddr, ResolverSlots>,
+    node_id_bytes: &'a [u8; 32],
 ) -> Option<(OwnerAddr, &'a ResolverEntry)> {
-    map.iter()
-        .filter(|((_, key_node_id), _)| key_node_id == node_id_bytes)
+    map.find_by_node_id(node_id_bytes)
         .filter_map(|((owner, _), v)| v.freshest().map(|e| (*owner, e)))
         .reduce(|best, cand| {
             let ord = cand
@@ -236,11 +242,11 @@ fn freshest_across_owners<'a>(
 }
 
 pub struct ReachabilityResolver {
-    inner: Arc<RwLock<BTreeMap<ResolverKey, ResolverSlots>>>,
+    inner: Arc<RwLock<MultiDeviceMap<OwnerAddr, ResolverSlots>>>,
     /// Wrapped in an outer `Arc` so that all clones share the same
     /// `RwLock` — wiring the fallback via `set_fallback_source` on any
     /// clone is immediately visible to all others (CodeRabbit PR #158 round 2).
-    fallback_source: Arc<RwLock<Option<Arc<dyn ReachabilityFallback>>>>,
+    fallback_source: Arc<RwLock<Option<Arc<dyn ReachabilityFallback<OwnerAddr>>>>>,
     // ZEB-620: optional reconnect-supervisor handle. None until boot installs it
     // via `set_supervisor`. Kicked `NewPeer` on first-learn and `RecordChanged`
     // on a material LWW record change — the sole successor to ZEB-373's retired
@@ -294,7 +300,7 @@ impl std::fmt::Debug for ReachabilityResolver {
 impl Default for ReachabilityResolver {
     fn default() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(BTreeMap::new())),
+            inner: Arc::new(RwLock::new(MultiDeviceMap::new())),
             fallback_source: Arc::new(RwLock::new(None)),
             supervisor: Arc::new(RwLock::new(None)),
             liveness: Arc::new(RwLock::new(None)),
@@ -492,7 +498,7 @@ impl ReachabilityResolver {
     /// based on heartbeat/liveness).
     pub fn resolve(&self, actor: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
         let map = self.inner.read().expect("resolver read lock");
-        map.range((*actor, [0u8; 32])..=(*actor, [0xFFu8; 32]))
+        map.range_owner(actor)
             .filter_map(|(_, v)| v.durable_preferred().map(|e| e.payload.clone()))
             .collect()
     }
@@ -699,10 +705,7 @@ impl ReachabilityResolver {
     /// slots from the returned set.
     pub fn remove_owner(&self, actor: &OwnerAddr) -> Vec<[u8; 32]> {
         let mut map = self.inner.write().expect("resolver write lock");
-        let to_remove: Vec<ResolverKey> = map
-            .range((*actor, [0u8; 32])..=(*actor, [0xFFu8; 32]))
-            .map(|(k, _)| *k)
-            .collect();
+        let to_remove: Vec<ResolverKey> = map.range_owner(actor).map(|(k, _)| *k).collect();
         for k in &to_remove {
             map.remove(k);
         }
@@ -725,7 +728,7 @@ impl ReachabilityResolver {
     /// Register a pkarr-backed fallback source. Called once at boot by
     /// lib.rs after wiring `PkarrResolverAdapter`. Thread-safe; may be
     /// called any number of times (latest wins).
-    pub fn set_fallback_source(&self, fb: Arc<dyn ReachabilityFallback>) {
+    pub fn set_fallback_source(&self, fb: Arc<dyn ReachabilityFallback<OwnerAddr>>) {
         *self
             .fallback_source
             .write()
@@ -834,7 +837,7 @@ impl ReachabilityResolver {
         actor: &OwnerAddr,
     ) -> Vec<(ReachabilityAnnouncePayload, ReachabilitySource)> {
         let map = self.inner.read().expect("resolver read lock");
-        map.range((*actor, [0u8; 32])..=(*actor, [0xFFu8; 32]))
+        map.range_owner(actor)
             .filter_map(|(_, v)| v.durable_preferred().map(|e| (e.payload.clone(), e.source)))
             .collect()
     }
@@ -902,44 +905,36 @@ fn addr_key(payload: &ReachabilityAnnouncePayload) -> (String, BTreeSet<std::net
     )
 }
 
-/// LWW comparator for SAME-SOURCE slot replacement. `Hlc` does not derive `Ord`
-/// (canonical-CBOR keying constraints — see `owner_state_types.rs::Hlc`), so we
-/// compare by the same lexicographic tuple `(wall_ms, logical, device_id)` used
-/// by `Hlc::is_strictly_newer_than`. Ties on HLC fall through to
-/// `announced_at_ms` then lex `iroh_node_id`, per spec §5.4.
+/// Same-source LWW: is `next` strictly newer than `prev`? ZEB-744 delegates the
+/// comparison to the core `harmony-reachability` kernel comparator
+/// ([`core_lww_newer`]), passing the HLC as its `(wall_ms, logical, device_id)`
+/// `Ord` tuple — harmony's `Hlc` deliberately does not derive `Ord`
+/// (canonical-CBOR keying constraint — see `owner_state_types.rs::Hlc`), so the
+/// tuple is the clock the kernel orders. The payload supplies the
+/// `announced_at_ms` then lex `iroh_node_id` tie-breaks via the core
+/// `ReachabilityRecord` impl (spec §5.4). Full equality → `false` (byte-identical
+/// replay is a no-op).
 ///
 /// ZEB-621 dual-slot split: durable-CRDT and live-pkarr records for the same
-/// `(owner, iroh_node_id)` now live in SEPARATE cells ([`ResolverSlots`]), and
-/// each source writes only its own slot — so this comparator only ever sees
+/// `(owner, iroh_node_id)` live in SEPARATE cells ([`ResolverSlots`]), and each
+/// source writes only its own slot — so this comparator only ever sees
 /// `prev`/`next` of the SAME source. The old cross-source source-priority guard
 /// (ZEB-488) is gone: its intent is now structural rather than a comparator
 /// special-case. The durable slot is the butler authority and stays
 /// window-EXEMPT (a pkarr write can never touch it); the freshest view across
 /// both slots is the dial authority.
 fn lww_newer(prev: &ResolverEntry, next: &ResolverEntry) -> bool {
-    let prev_key = (
+    let prev_clock = (
         prev.hlc.wall_ms,
         prev.hlc.logical,
         prev.hlc.device_id.as_str(),
     );
-    let next_key = (
+    let next_clock = (
         next.hlc.wall_ms,
         next.hlc.logical,
         next.hlc.device_id.as_str(),
     );
-    match next_key.cmp(&prev_key) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => match next
-            .payload
-            .announced_at_ms
-            .cmp(&prev.payload.announced_at_ms)
-        {
-            std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Less => false,
-            std::cmp::Ordering::Equal => next.payload.iroh_node_id > prev.payload.iroh_node_id,
-        },
-    }
+    core_lww_newer(&prev_clock, &prev.payload, &next_clock, &next.payload)
 }
 
 #[cfg(test)]
@@ -1800,7 +1795,7 @@ mod fallback_tests {
     }
 
     #[async_trait]
-    impl ReachabilityFallback for StubFallback {
+    impl ReachabilityFallback<OwnerAddr> for StubFallback {
         async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
             self.responses.lock().unwrap().clone()
         }
@@ -1911,7 +1906,7 @@ mod fallback_tests {
     }
 
     #[async_trait]
-    impl ReachabilityFallback for DurableInjectingFallback {
+    impl ReachabilityFallback<OwnerAddr> for DurableInjectingFallback {
         async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
             self.resolver.update_with_source(
                 self.owner,
@@ -2018,7 +2013,7 @@ mod fallback_tests {
     }
 
     #[async_trait]
-    impl ReachabilityFallback for CountingFallback {
+    impl ReachabilityFallback<OwnerAddr> for CountingFallback {
         async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.payloads.clone()
@@ -2197,7 +2192,7 @@ mod fallback_tests {
             done: Arc<AtomicUsize>,
         }
         #[async_trait]
-        impl ReachabilityFallback for InFlightFallback {
+        impl ReachabilityFallback<OwnerAddr> for InFlightFallback {
             async fn resolve(&self, _addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
                 let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak.fetch_max(cur, Ordering::SeqCst);

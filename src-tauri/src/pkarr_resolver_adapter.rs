@@ -69,7 +69,7 @@ impl PkarrResolverAdapter {
 }
 
 #[async_trait]
-impl ReachabilityFallback for PkarrResolverAdapter {
+impl ReachabilityFallback<OwnerAddr> for PkarrResolverAdapter {
     async fn resolve(&self, addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
         // ZEB-596: the contexts closure walks the community registry (async).
         // It gathers all contexts and returns BEFORE we issue any pkarr relay
