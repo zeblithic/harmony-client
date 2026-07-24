@@ -176,3 +176,66 @@ fn space_shared_in_profile_true_emits_sp_key() {
         .expect("Space with shared_in_profile: true must emit \"sp\" key");
     assert_eq!(sp_value, ciborium::value::Value::Bool(true));
 }
+
+// The v0x02 pin uses the `test-fixtures`-gated deterministic seam
+// (`encrypt_vault_with_params_for_test` / `decrypt_vault_bytes_for_test`), so
+// the whole v2 block is gated on that feature — mirroring `zeb213_fixtures.rs`.
+// (`wire_format_v1_pinned` above stays ungated: its `encrypt_with_params_for_test`
+// seam is not feature-gated.)
+#[cfg(feature = "test-fixtures")]
+use harmony_app::identity::test_only::encrypt_vault_with_params_for_test;
+
+#[cfg(feature = "test-fixtures")]
+const V2_PASSPHRASE: &[u8] = b"correct horse battery staple";
+#[cfg(feature = "test-fixtures")]
+const V2_SALT: [u8; 16] = [0x1A; 16];
+#[cfg(feature = "test-fixtures")]
+const V2_NONCE: [u8; 24] = [0x2B; 24];
+// Fixed arbitrary plaintext — the v0x02 envelope protects opaque bytes, so
+// the pin is independent of SecretVault CBOR shape.
+#[cfg(feature = "test-fixtures")]
+const V2_PLAINTEXT: [u8; 48] = [0x5C; 48];
+
+#[cfg(feature = "test-fixtures")]
+fn fixture_v2_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("encrypted_v2.bin")
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn wire_format_v2_pinned() {
+    let bytes =
+        encrypt_vault_with_params_for_test(V2_PASSPHRASE, &V2_PLAINTEXT, &V2_SALT, &V2_NONCE);
+    // header(13) + salt(16) + nonce(24) + plaintext(48) + tag(16) = 117
+    assert_eq!(bytes.len(), 117, "v0x02 envelope length");
+    assert_eq!(&bytes[..4], b"HRMI", "magic");
+    assert_eq!(bytes[4], 0x02, "v0x02 format version");
+
+    let path = fixture_v2_path();
+    if std::env::var("HARMONY_REGENERATE_WIRE_FIXTURE").is_ok() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).expect("write fixture");
+        eprintln!("Regenerated v2 fixture at {}", path.display());
+        return;
+    }
+    let expected = std::fs::read(&path).unwrap_or_else(|_| {
+        panic!(
+            "Fixture missing at {}.\nFirst-time setup: run with HARMONY_REGENERATE_WIRE_FIXTURE=1 to generate, then commit.",
+            path.display()
+        )
+    });
+    assert_eq!(
+        bytes, expected,
+        "v0x02 WIRE FORMAT CHANGED — this envelope must stay byte-identical across the password_envelope rewire"
+    );
+
+    // Round-trip through the live decoder confirms the pinned bytes decrypt.
+    // `decrypt_vault_bytes` is `pub(crate)`; use the gated test_only re-export.
+    let back =
+        harmony_app::identity::test_only::decrypt_vault_bytes_for_test(V2_PASSPHRASE, &bytes)
+            .expect("decrypt pinned v2 envelope");
+    assert_eq!(&back[..], &V2_PLAINTEXT[..], "round-trip plaintext");
+}

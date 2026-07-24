@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
+use harmony_crypto::password_envelope::{self, Argon2idParams};
 use harmony_identity::{PqPrivateIdentity, PrivateIdentity};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -38,7 +39,6 @@ const ENC_KDF_ID_ARGON2ID: u8 = 0x01;
 const KDF_M_KIB: u32 = 65536; // 64 MiB
 const KDF_T: u16 = 3; // iterations
 const KDF_P: u8 = 1; // parallelism
-const KDF_OUT_LEN: usize = 32; // XChaCha20-Poly1305 key length
 
 // Wire format offsets:
 const HEADER_LEN: usize = 13; // magic(4) + version(1) + kdf_id(1) + m(4) + t(2) + p(1)
@@ -242,12 +242,6 @@ pub fn encrypt_with_params(
     nonce: &[u8; NONCE_LEN],
     blob: &[u8; BLOB_LEN],
 ) -> Vec<u8> {
-    use argon2::{Algorithm, Argon2, Params, Version};
-    use chacha20poly1305::{
-        aead::{Aead, KeyInit, Payload},
-        XChaCha20Poly1305, XNonce,
-    };
-
     // Build header (13 bytes — also serves as AAD).
     let mut out = Vec::with_capacity(ENC_FILE_LEN);
     out.extend_from_slice(ENC_MAGIC);
@@ -263,27 +257,12 @@ pub fn encrypt_with_params(
     out.extend_from_slice(nonce);
     debug_assert_eq!(out.len(), HEADER_LEN + SALT_LEN + NONCE_LEN);
 
-    // KDF.
-    let params = Params::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32, Some(KDF_OUT_LEN))
+    let params = Argon2idParams::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32)
         .expect("Argon2 params hardcoded valid");
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
-    argon
-        .hash_password_into(passphrase, salt, key.as_mut_slice())
-        .expect("Argon2 derivation cannot fail with hardcoded params");
-
-    // AEAD encrypt with header (first 13 bytes) as AAD.
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(key.as_slice()).expect("32-byte key always valid");
-    let payload = Payload {
-        msg: blob,
-        aad: &out[..HEADER_LEN],
-    };
-    let ciphertext_with_tag = cipher
-        .encrypt(XNonce::from_slice(nonce), payload)
-        .expect("AEAD encrypt cannot fail with valid inputs");
+    let ciphertext_with_tag =
+        password_envelope::seal(passphrase, &params, salt, nonce, &out[..HEADER_LEN], blob)
+            .expect("seal cannot fail with valid inputs");
     debug_assert_eq!(ciphertext_with_tag.len(), BLOB_LEN + TAG_LEN);
-
     out.extend_from_slice(&ciphertext_with_tag);
     debug_assert_eq!(out.len(), ENC_FILE_LEN);
     out
@@ -296,16 +275,10 @@ pub fn encrypt_with_params(
 /// passphrases gains no signal from the error message).
 ///
 /// Returns `Zeroizing<[u8; BLOB_LEN]>` so the caller's stack-resident copy of
-/// the plaintext seed bytes is wiped on drop. The intermediate `Vec<u8>` from
-/// `cipher.decrypt(...)` is also wrapped in `Zeroizing` before any further use.
+/// the plaintext seed bytes is wiped on drop. The intermediate `Vec<u8>` is
+/// returned by `password_envelope::open(...)` already wrapped in `Zeroizing`.
 #[doc(hidden)]
 pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LEN]>, String> {
-    use argon2::{Algorithm, Argon2, Params, Version};
-    use chacha20poly1305::{
-        aead::{Aead, KeyInit, Payload},
-        XChaCha20Poly1305, XNonce,
-    };
-
     if bytes.len() != ENC_FILE_LEN {
         return Err(format!(
             "identity store is corrupt: expected {ENC_FILE_LEN} bytes, got {}",
@@ -350,8 +323,8 @@ pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LE
 
     // Strict v1 KDF param check: refuse to allocate Argon2 memory on
     // attacker-controlled values. The AAD binding via the Poly1305 tag would
-    // reject mismatched params eventually, but only AFTER hash_password_into
-    // attempts the m_kib allocation — which is a DoS vector if m_kib is
+    // reject mismatched params eventually, but only AFTER `password_envelope::open`
+    // performs the Argon2 m_kib allocation — which is a DoS vector if m_kib is
     // 16 GiB. v1 hardcodes all three params, so any other value is either a
     // future format (handled by the format_version check above) or tampering.
     // Return the indistinguishable error to leak nothing about which it is.
@@ -360,29 +333,20 @@ pub fn decrypt(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<[u8; BLOB_LE
             "identity store could not be decrypted: wrong passphrase or corrupted file".to_string(),
         );
     }
-    let params = Params::new(m_kib, t, p, Some(KDF_OUT_LEN)).map_err(|_| {
+    let params = Argon2idParams::new(m_kib, t, p).map_err(|_| {
         "identity store could not be decrypted: wrong passphrase or corrupted file".to_string()
     })?;
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
-    // hash_password_into can return SaltTooShort/SaltTooLong (ruled out: salt is
-    // a fixed 16-byte slice from the file) or PwdTooLong (requires a >4 GiB
-    // passphrase — practically unreachable). Surfacing the specific error here
-    // is safe: it cannot be triggered by an adversary tampering with the file.
-    argon
-        .hash_password_into(passphrase, salt, key.as_mut_slice())
-        .map_err(|e| format!("Argon2 derivation failed: {e}"))?;
-
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(key.as_slice()).expect("32-byte key always valid");
-    let payload = Payload {
-        msg: ciphertext_with_tag,
-        aad: &bytes[..HEADER_LEN],
-    };
-    // Wrap the AEAD output Vec in Zeroizing immediately so it is wiped on drop.
-    let plaintext = Zeroizing::new(cipher.decrypt(XNonce::from_slice(nonce), payload).map_err(
-        |_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string(),
-    )?);
+    let plaintext = password_envelope::open(
+        passphrase,
+        &params,
+        salt,
+        nonce,
+        &bytes[..HEADER_LEN],
+        ciphertext_with_tag,
+    )
+    .map_err(|_| {
+        "identity store could not be decrypted: wrong passphrase or corrupted file".to_string()
+    })?;
 
     // Validate length, then copy directly into a Zeroizing-protected buffer
     // (no intermediate unprotected stack array). The borrowed slice points
@@ -1439,18 +1403,34 @@ fn item_bytes_to_vault(bytes: &[u8]) -> Result<SecretVault, String> {
 /// m=64MiB/t=3/p=1 → XChaCha20-Poly1305, 13-byte header bound as AAD) except the
 /// version byte is `0x02` and the protected plaintext is variable-length.
 fn encrypt_vault(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    use argon2::{Algorithm, Argon2, Params, Version};
-    use chacha20poly1305::{
-        aead::{Aead, KeyInit, Payload},
-        XChaCha20Poly1305, XNonce,
-    };
     use rand::RngCore;
-
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut salt);
     rand::rngs::OsRng.fill_bytes(&mut nonce);
+    encrypt_vault_inner(passphrase, plaintext, &salt, &nonce)
+}
 
+/// Deterministic variant for byte-pinning fixtures. Gated so production
+/// cannot link a caller-supplied-nonce path (nonce reuse on XChaCha20 is
+/// catastrophic — mirrors `encode_snapshot_with_params`, Qodo C4).
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub fn encrypt_vault_with_params(
+    passphrase: &[u8],
+    plaintext: &[u8],
+    salt: &[u8; SALT_LEN],
+    nonce: &[u8; NONCE_LEN],
+) -> Vec<u8> {
+    encrypt_vault_inner(passphrase, plaintext, salt, nonce)
+}
+
+fn encrypt_vault_inner(
+    passphrase: &[u8],
+    plaintext: &[u8],
+    salt: &[u8; SALT_LEN],
+    nonce: &[u8; NONCE_LEN],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + SALT_LEN + NONCE_LEN + plaintext.len() + TAG_LEN);
     out.extend_from_slice(ENC_MAGIC);
     out.push(ENC_FORMAT_VERSION_V2);
@@ -1459,26 +1439,19 @@ fn encrypt_vault(passphrase: &[u8], plaintext: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&KDF_T.to_be_bytes());
     out.push(KDF_P);
     debug_assert_eq!(out.len(), HEADER_LEN);
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&nonce);
-
-    let params = Params::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32, Some(KDF_OUT_LEN))
+    out.extend_from_slice(salt);
+    out.extend_from_slice(nonce);
+    let params = Argon2idParams::new(KDF_M_KIB, KDF_T as u32, KDF_P as u32)
         .expect("Argon2 params hardcoded valid");
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
-    argon
-        .hash_password_into(passphrase, &salt, key.as_mut_slice())
-        .expect("Argon2 derivation cannot fail with hardcoded params");
-
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(key.as_slice()).expect("32-byte key always valid");
-    let payload = Payload {
-        msg: plaintext,
-        aad: &out[..HEADER_LEN],
-    };
-    let ciphertext_with_tag = cipher
-        .encrypt(XNonce::from_slice(&nonce), payload)
-        .expect("AEAD encrypt cannot fail with valid inputs");
+    let ciphertext_with_tag = password_envelope::seal(
+        passphrase,
+        &params,
+        salt,
+        nonce,
+        &out[..HEADER_LEN],
+        plaintext,
+    )
+    .expect("seal cannot fail with valid inputs");
     out.extend_from_slice(&ciphertext_with_tag);
     out
 }
@@ -1524,12 +1497,6 @@ fn decrypt_vault(passphrase: &[u8], bytes: &[u8]) -> Result<SecretVault, String>
 /// length is derived from the file length. Same KDF DoS guard (reject non-v1 KDF
 /// params before the Argon2 allocation) and indistinguishable error.
 fn decrypt_v2_plaintext(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
-    use argon2::{Algorithm, Argon2, Params, Version};
-    use chacha20poly1305::{
-        aead::{Aead, KeyInit, Payload},
-        XChaCha20Poly1305, XNonce,
-    };
-
     const M_KIB_OFF: usize = 6;
     const T_OFF: usize = M_KIB_OFF + 4;
     const P_OFF: usize = T_OFF + 2;
@@ -1556,24 +1523,20 @@ fn decrypt_v2_plaintext(passphrase: &[u8], bytes: &[u8]) -> Result<Zeroizing<Vec
             "identity store could not be decrypted: wrong passphrase or corrupted file".to_string(),
         );
     }
-    let params = Params::new(m_kib, t, p, Some(KDF_OUT_LEN)).map_err(|_| {
+    let params = Argon2idParams::new(m_kib, t, p).map_err(|_| {
         "identity store could not be decrypted: wrong passphrase or corrupted file".to_string()
     })?;
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = Zeroizing::new([0u8; KDF_OUT_LEN]);
-    argon
-        .hash_password_into(passphrase, salt, key.as_mut_slice())
-        .map_err(|e| format!("Argon2 derivation failed: {e}"))?;
-
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(key.as_slice()).expect("32-byte key always valid");
-    let payload = Payload {
-        msg: ciphertext_with_tag,
-        aad: &bytes[..HEADER_LEN],
-    };
-    let plaintext = Zeroizing::new(cipher.decrypt(XNonce::from_slice(nonce), payload).map_err(
-        |_| "identity store could not be decrypted: wrong passphrase or corrupted file".to_string(),
-    )?);
+    let plaintext = password_envelope::open(
+        passphrase,
+        &params,
+        salt,
+        nonce,
+        &bytes[..HEADER_LEN],
+        ciphertext_with_tag,
+    )
+    .map_err(|_| {
+        "identity store could not be decrypted: wrong passphrase or corrupted file".to_string()
+    })?;
     Ok(plaintext)
 }
 
@@ -3507,6 +3470,22 @@ fn warn_permissions(path: &Path) {
 pub mod test_only {
     pub use super::decrypt as decrypt_for_test;
     pub use super::encrypt_with_params as encrypt_with_params_for_test;
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub use super::encrypt_vault_with_params as encrypt_vault_with_params_for_test;
+
+    // `decrypt_vault_bytes` is `pub(crate)`, so integration tests can't reach it
+    // directly and a `pub use` of it fails E0364 (a re-export can't be more
+    // public than the item). Expose it through a gated wrapper for the v0x02
+    // round-trip assertion — this leaves `decrypt_vault_bytes`'s own
+    // `pub(crate)` visibility unchanged in production builds.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn decrypt_vault_bytes_for_test(
+        passphrase: &[u8],
+        bytes: &[u8],
+    ) -> Result<super::Zeroizing<Vec<u8>>, String> {
+        super::decrypt_vault_bytes(passphrase, bytes)
+    }
 }
 
 #[cfg(test)]
