@@ -13,11 +13,6 @@
 //! comparator runs per-key, so each (owner, device) pair maintains its
 //! own latest record independently.
 
-// `async_trait` is now used only by the `#[cfg(test)]` fallback stubs below
-// (the production `ReachabilityFallback` trait def moved to the core kernel in
-// ZEB-744), so gate the import to test builds to avoid an unused-import warning.
-#[cfg(test)]
-use async_trait::async_trait;
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
