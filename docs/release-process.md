@@ -203,11 +203,23 @@ Also run the full local gate — CI green is necessary, not sufficient, because 
 release build compiles bundles CI never produces:
 
 ```bash
-cd src-tauri && cargo fmt --all -- --check
-cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
-cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures
-npx tsc --noEmit && npx vitest run   # from repo root
+# Rust gates run from src-tauri/ (see CLAUDE.md — the inner .cargo/config.toml
+# is discovered from the cwd). The subshell keeps that cd from leaking into the
+# frontend commands below; without it a pasted block would cd twice and silently
+# skip clippy + nextest.
+(
+  cd src-tauri
+  cargo fmt --all -- --check
+  cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+  cargo nextest run --locked --workspace --all-targets --features test-fixtures
+)
+
+# from repo root
+npx tsc --noEmit && npx vitest run
 ```
+
+Each command must pass. Note that `&&`-chaining the Rust three would stop at the
+first failure — run them all so you see every problem in one pass.
 
 > Do **not** use `scripts/test-select` here. Its rotating-partition selection is for
 > iterative dev gates; release validation takes the full sweep (see `CLAUDE.md`).
