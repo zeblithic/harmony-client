@@ -19,7 +19,7 @@
 - Do not touch: `CommunitySyncRegistry`'s multi-instance design, the membership-gated verify pipeline and its TOCTOU re-check, `CommunityMembershipDelta` notifications, ZEB-761's retry policy.
 - Every cargo command runs from `src-tauri/`.
 - Full gate before PR: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`, `cargo nextest run --locked --workspace --all-targets --features test-fixtures`.
-- Iterative gates use `scripts/test-select --context task`; the full sweep is only for the final pre-PR run.
+- Iterative gates use `scripts/test-select --context task` (`--context round` for PR converge rounds); the full sweep is only for the final pre-PR run. **Paste the printed `round=… bucket=…` summary line into the task report** so the selection is auditable — a selective run whose bucket is not recorded cannot be distinguished after the fact from a full one. `scripts/test-select` exits and demands `--full` if the branch touched `Cargo.toml` / `Cargo.lock` / `.cargo/` / `vendor/`; this branch touches none of those, so selection stays valid throughout.
 - Each new test needs a **negative control** — revert the fix, confirm the test fails, restore. Record the observed failure message in the PR body.
 
 ## File Structure

@@ -3290,8 +3290,10 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
 /// and only flush `replay.cbor`.
 #[derive(Debug)]
 enum IncomingOutcome {
-    /// `would_accept` rejected the wire HLC at the early replay-check
-    /// (step 2). No state change. Don't persist.
+    /// `ReplayTracker::admit` refused the wire HLC at the early
+    /// replay-check (step 5) — either `Duplicate` (a replay or
+    /// re-delivery) or `Echo` (our own publish reflected back by the
+    /// transport). No state change. Don't persist.
     Duplicate,
     /// Tracker advanced AND ≥ 1 new event was Inserted into the CRDT.
     /// Persist both `crdt.cbor` and `replay.cbor`.
@@ -3378,8 +3380,11 @@ impl IncomingOutcome {
 ///    against the resolved identity_pub (Ed25519 half = bytes [32..64])
 ///    over `canonical_cbor(CommunityRootSignedPayload::from(&payload))`.
 ///    Failure → `PublisherSigInvalid`. Tracker NOT advanced.
-/// 6. Replay-check via `tracker.would_accept(&payload.publisher_addr,
-///    &payload.at)` — early-exit `Duplicate`.
+/// 6. Replay-check via `tracker.admit(&(payload.publisher_addr,
+///    payload.at.device_id), &payload.at)` — early-exit `Duplicate` on
+///    both `Admission::Duplicate` and `Admission::Echo`. On
+///    `Admission::Accept` the returned `CommitTicket` is held across the
+///    rest of the pipeline and consumed at step 14.
 /// 7. Fetch the encrypted blob from CAS (cache miss → `ErrPreMutation`).
 /// 8. Decrypt the blob (deterministic-nonce).
 /// 9. Decode `CommunityState`.
@@ -3413,11 +3418,14 @@ impl IncomingOutcome {
 /// can race with `insert_local_event()`.
 ///
 /// **Censorship-defense invariant.** None of the rejection gates
-/// advance the tracker — only the `record` at step 14, which runs
-/// only after the state merge succeeds. A kicked-but-still-keyed
-/// member trying to squat HLC slots fails either the cheap step-2
-/// gate or the authoritative step-12 re-check before tracker.record
-/// runs; per-publisher namespacing on the tracker key
+/// advance the tracker — only the `commit` at step 14, which runs
+/// only after the state merge succeeds. ZEB-750 made that structural
+/// rather than merely disciplined: `commit` consumes the
+/// `CommitTicket` minted at step 6, so a rejection path physically
+/// cannot advance the watermark — it returns without a ticket in hand.
+/// A kicked-but-still-keyed member trying to squat HLC slots fails
+/// either the cheap step-6 gate or the authoritative step-12 re-check
+/// before `commit` runs; per-publisher namespacing on the tracker key
 /// `(publisher_addr, device_id)` further isolates the per-addr
 /// HLC space so an attacker can't claim Alice's slot via shared
 /// `EpochKey`.

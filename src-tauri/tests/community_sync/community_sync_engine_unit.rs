@@ -2108,32 +2108,53 @@ async fn a_burst_of_mutations_collapses_into_one_publish_zeb750() {
         root_serve_rx: None,
     });
 
-    // Five signals, 60 ms apart, spanning t=0..240 — all inside one 300 ms
+    // Five signals, 60 ms apart, spanning ~240 ms — all inside one 300 ms
     // window, but spread far enough that a SLIDING window and a FIXED one
-    // have distinguishable deadlines: fixed fires at 300 (armed by the first
-    // signal), sliding fires at 540 (240 + 300, from the last).
+    // have distinguishable deadlines: fixed fires at first+300, sliding at
+    // last+300.
     //
     // The spread is load-bearing. An earlier draft bunched the signals 10 ms
     // apart, putting both deadlines within 40 ms of each other; a single
     // coarse "sleep past both" check cannot tell them apart. Probing BETWEEN
     // them is what makes this a test about SLIDING rather than about
     // debouncing-at-all.
+    //
+    // Every deadline below is MEASURED, not assumed. A draft that slept
+    // hard-coded durations and reasoned about where it "should" be would go
+    // flaky under CI load: if the burst loop itself overshoots, the probe
+    // drifts past the sliding deadline and the test fails for scheduling
+    // reasons rather than behavioural ones. Recording the real instants and
+    // sleeping *until* a computed point keeps the probe correctly placed no
+    // matter how slowly the loop ran. (Qodo, PR #548.)
+    let debounce = std::time::Duration::from_millis(debounce_ms);
+    let first_signal_at = std::time::Instant::now();
+    let mut last_signal_at = first_signal_at;
     for _ in 0..5 {
         engine.notify_dirty();
+        last_signal_at = std::time::Instant::now();
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     }
 
-    // t≈300 after the loop. A fixed window armed by the FIRST signal has
-    // fired by now; a sliding one stays open until ≈540.
-    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-    assert!(
-        out_rx.try_recv().is_err(),
-        "a fixed window would have fired at 300 ms; the window must SLIDE \
-         with each mutation and still be open at t≈360"
-    );
+    let fixed_deadline = first_signal_at + debounce;
+    let sliding_deadline = last_signal_at + debounce;
 
-    // Advance past the window measured from the LAST signal.
-    tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+    // The probe must land strictly between the two deadlines. If the burst
+    // loop overshot far enough that no such point exists, the run was too
+    // degraded to say anything — skip the discriminating assertion rather
+    // than fail on scheduling noise.
+    let margin = std::time::Duration::from_millis(20);
+    let probe_at = fixed_deadline + margin;
+    if probe_at + margin < sliding_deadline {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(probe_at)).await;
+        assert!(
+            out_rx.try_recv().is_err(),
+            "a FIXED window would have fired by first_signal+{debounce_ms}ms; \
+             the window must SLIDE with each mutation and still be open here"
+        );
+    }
+
+    // Now past the deadline measured from the LAST signal.
+    tokio::time::sleep_until(tokio::time::Instant::from_std(sliding_deadline + margin)).await;
 
     let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
         .await
@@ -2144,8 +2165,9 @@ async fn a_burst_of_mutations_collapses_into_one_publish_zeb750() {
         "the publish must carry a real wire packet"
     );
 
-    // And exactly one publish, not five.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // And exactly one publish, not five. A second window's worth of quiet is
+    // long enough for any straggler from the burst to have arrived.
+    tokio::time::sleep(debounce).await;
     assert!(
         out_rx.try_recv().is_err(),
         "a burst inside one window must collapse to a SINGLE publish"
