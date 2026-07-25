@@ -731,7 +731,7 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
     use harmony_app::content_store::{ContentStore, RuntimeContentStore};
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::self_heal_community_observer;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
@@ -989,8 +989,10 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
     // ── Step 6: Call the observer directly ───────────────────────────────────
     // The observer's catchup synthesis must use crdt_state's K(1), not the
     // engine's spawn-time K(0). This is the core assertion of this test.
-    let hlc_tracker: Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>> =
-        Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+    let hlc_tracker: Arc<tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+        Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("admin-dev".into()),
+        ));
     let synth_rotations: Arc<
         Mutex<
             BTreeSet<(
@@ -1137,7 +1139,7 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
     use harmony_app::content_store::{ContentStore, RuntimeContentStore};
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::self_heal_community_observer;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
@@ -1428,8 +1430,10 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
     owner_state.apply_space_with_canonicalization(admin_space_k1);
     let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
 
-    let hlc_tracker: Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>> =
-        Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+    let hlc_tracker: Arc<tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+        Arc::new(tokio::sync::Mutex::new(
+            harmony_crdt_sync::ReplayTracker::new("admin-dev".into()),
+        ));
     let synth_rotations: Arc<
         Mutex<
             BTreeSet<(

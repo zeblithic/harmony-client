@@ -6,8 +6,8 @@
 
 use crate::notes_crdt::{Note, NotesDoc};
 use crate::owner_state_types::Hlc;
+use harmony_crdt_sync::ReplayTracker;
 use serde::Serialize;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -49,7 +49,7 @@ pub(crate) async fn notes_list_core(doc: &Arc<Mutex<NotesDoc>>) -> Vec<NoteView>
 /// ULID-keyed note; `Some(id)` edits an existing one (LWW on the HLC).
 pub(crate) async fn notes_upsert_core(
     doc: &Arc<Mutex<NotesDoc>>,
-    tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>,
+    tracker: &Arc<Mutex<ReplayTracker<String, Hlc>>>,
     device_id: &str,
     id: Option<String>,
     text: String,
@@ -75,13 +75,13 @@ pub(crate) async fn notes_upsert_core(
     // the opposite order.
     let at = if let Some(existing) = d.notes.get(&id) {
         let mut t = tracker.lock().await;
-        let candidate = crate::fleet_sync::peek_next_hlc(&t, device_id);
+        let candidate = crate::fleet_sync::peek_next_hlc(t.accepted(), device_id);
         if !candidate.is_strictly_newer_than(&existing.updated_at) {
             return Err(
                 "note upsert was superseded (a newer edit or delete already won)".to_string(),
             );
         }
-        t.insert(device_id.to_string(), candidate.clone());
+        t.observe_local(candidate.clone());
         candidate
     } else {
         crate::fleet_sync::mint_next_hlc(tracker, device_id).await
@@ -104,7 +104,7 @@ pub(crate) async fn notes_upsert_core(
 /// would lose LWW to a concurrent newer edit (mirrors `notes_upsert_core`).
 pub(crate) async fn notes_delete_core(
     doc: &Arc<Mutex<NotesDoc>>,
-    tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>,
+    tracker: &Arc<Mutex<ReplayTracker<String, Hlc>>>,
     device_id: &str,
     id: String,
 ) -> Result<bool, String> {
@@ -132,11 +132,11 @@ pub(crate) async fn notes_delete_core(
     // `updated_at`; otherwise commit it under the same lock and apply.
     let at = {
         let mut t = tracker.lock().await;
-        let candidate = crate::fleet_sync::peek_next_hlc(&t, device_id);
+        let candidate = crate::fleet_sync::peek_next_hlc(t.accepted(), device_id);
         if !candidate.is_strictly_newer_than(&current_updated_at) {
             return Err("note delete was superseded (a newer edit already won)".to_string());
         }
-        t.insert(device_id.to_string(), candidate.clone());
+        t.observe_local(candidate.clone());
         candidate
     };
     d.delete(&id, at);
@@ -220,7 +220,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_lists_and_deletes() {
         let doc = Arc::new(Mutex::new(NotesDoc::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".into(),
+        )));
         let v = notes_upsert_core(&doc, &tracker, "dev-A", None, "  hi  ".into())
             .await
             .unwrap();
@@ -240,10 +242,12 @@ mod tests {
         // Ok(false) AND mint no HLC, so the Tauri wrapper skips notify_dirty
         // and we never publish unchanged state (Greptile P2).
         let doc = Arc::new(Mutex::new(NotesDoc::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".into(),
+        )));
 
         // Tracker has no entry for the device before the delete.
-        let before = tracker.lock().await.get("dev-A").cloned();
+        let before = tracker.lock().await.accepted().get("dev-A").cloned();
         assert!(before.is_none(), "no HLC minted yet");
 
         let changed = notes_delete_core(&doc, &tracker, "dev-A", "does-not-exist".into())
@@ -252,7 +256,7 @@ mod tests {
         assert!(!changed, "deleting an unknown id returns Ok(false)");
 
         // The tracker entry for the device is unchanged — no HLC was minted.
-        let after = tracker.lock().await.get("dev-A").cloned();
+        let after = tracker.lock().await.accepted().get("dev-A").cloned();
         assert_eq!(after, before, "no HLC minted for a no-op delete");
     }
 
@@ -266,7 +270,9 @@ mod tests {
         // skew) and returned `Ok(true)` (a spurious notify_dirty publish of
         // unchanged state). The fix peeks before minting and bails.
         let doc = Arc::new(Mutex::new(NotesDoc::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".into(),
+        )));
 
         // 1. Create the note locally (low HLC via the real mint path).
         let v = notes_upsert_core(&doc, &tracker, "dev-A", None, "keep".into())
@@ -293,7 +299,9 @@ mod tests {
 
         // 3. dev-B deletes via a FRESH tracker, minting wall_ms ≈ now — strictly
         //    OLDER than the u64::MAX edit — so the LWW delete would lose.
-        let fresh_tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let fresh_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".into(),
+        )));
         let result = notes_delete_core(&doc, &fresh_tracker, "dev-B", id.clone()).await;
         assert!(
             result.is_err(),
@@ -308,7 +316,7 @@ mod tests {
         // And no HLC was minted on the no-op delete (tracker stays unadvanced),
         // so the durability indicator is not skewed and nothing is published.
         assert!(
-            fresh_tracker.lock().await.get("dev-B").is_none(),
+            fresh_tracker.lock().await.accepted().get("dev-B").is_none(),
             "a superseded delete must not mint an HLC (tracker stays unadvanced)"
         );
     }
@@ -316,7 +324,9 @@ mod tests {
     #[tokio::test]
     async fn upsert_rejects_blank() {
         let doc = Arc::new(Mutex::new(NotesDoc::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".into(),
+        )));
         assert!(
             notes_upsert_core(&doc, &tracker, "dev-A", None, "   ".into())
                 .await
@@ -332,7 +342,9 @@ mod tests {
         // CRDT, so `get` returns None. The core must surface that as Err, never
         // panic (which would crash the backend).
         let doc = Arc::new(Mutex::new(NotesDoc::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".into(),
+        )));
 
         // 1. Create the note (low HLC via the real mint path).
         let v = notes_upsert_core(&doc, &tracker, "dev-A", None, "original".into())
@@ -359,7 +371,9 @@ mod tests {
         // 3. dev-B re-upserts the SAME id with its own fresh tracker, which
         //    mints a wall_ms ≈ now — strictly OLDER than the u64::MAX delete,
         //    so the CRDT upsert is a no-op and `get` returns None.
-        let stale_tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let stale_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".to_string(),
+        )));
         let result = notes_upsert_core(
             &doc,
             &stale_tracker,
@@ -379,7 +393,7 @@ mod tests {
         // no-op would push tracker[dev-B] above any published HLC with no
         // corresponding publish, undercounting the durability indicator.
         assert!(
-            stale_tracker.lock().await.get("dev-B").is_none(),
+            stale_tracker.lock().await.accepted().get("dev-B").is_none(),
             "a superseded upsert must not mint an HLC (tracker stays unadvanced)"
         );
     }
@@ -388,7 +402,9 @@ mod tests {
     async fn upsert_mints_monotone_hlcs() {
         // two upserts produce strictly increasing updated_at via the shared tracker
         let doc = Arc::new(Mutex::new(NotesDoc::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".to_string(),
+        )));
         let a = notes_upsert_core(&doc, &tracker, "dev-A", None, "one".into())
             .await
             .unwrap();
@@ -416,7 +432,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let kt = Arc::new(KeyTree::derive(&[0x33u8; 32]).expect("derive kt"));
         let doc = Arc::new(Mutex::new(NotesDoc::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".to_string(),
+        )));
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let (_in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
@@ -439,7 +457,7 @@ mod tests {
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             publish_seen: true,
             on_applied: None,
-            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+            sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
         });
 
         // A local note write through the production IPC core, then force the
@@ -508,10 +526,12 @@ mod tests {
 
         /// One device's engine plus the handles the harness shuttles between
         /// devices. `out_rx`/`in_tx` are moved into the forwarder at wiring time.
+        use harmony_crdt_sync::ReplayTracker;
+
         struct NotesEngine {
             engine: FleetSyncEngine<NotesDoc>,
             doc: Arc<Mutex<NotesDoc>>,
-            tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+            tracker: Arc<Mutex<ReplayTracker<String, Hlc>>>,
             out_rx: mpsc::Receiver<Vec<u8>>,
             in_tx: mpsc::Sender<Vec<u8>>,
         }
@@ -522,7 +542,9 @@ mod tests {
             let (out_tx, out_rx) = mpsc::channel(64);
             let (in_tx, in_rx) = mpsc::channel(64);
             let doc = Arc::new(Mutex::new(NotesDoc::default()));
-            let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+            let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                device_id.to_string(),
+            )));
             let merger: Merger<NotesDoc> = Arc::new(|local, remote| local.merge_from(remote));
             let engine = FleetSyncEngine::<NotesDoc>::new(FleetSyncConfig {
                 keys: crate::owner_state_crypto::FleetKeySet::new(kt),
@@ -538,7 +560,7 @@ mod tests {
                 debounce_ms: DEFAULT_DEBOUNCE_MS,
                 publish_seen: true,
                 on_applied: None,
-                sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+                sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
             });
             NotesEngine {
                 engine,

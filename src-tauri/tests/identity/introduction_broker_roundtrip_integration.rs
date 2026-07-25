@@ -73,7 +73,6 @@
 //! outer (90s) timeouts. Never weaken an assertion to mask a timing flake — bump
 //! the timeout.
 
-use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -432,7 +431,6 @@ struct Harness {
     /// task holds its own clone, but this is a defensive keep-alive). Not read.
     _x_ep: Arc<IrohEndpoint>,
     x_crdt: Arc<TokioMutex<OwnerState>>,
-    x_hlc: Arc<TokioMutex<BTreeMap<String, Hlc>>>,
     x_keytree: Arc<KeyTree>,
     x_pending: Arc<PendingFriendRequests>,
 
@@ -513,9 +511,15 @@ async fn setup(policy: PeerIntroPolicy, settings_dir: &std::path::Path) -> Harne
         s
     }));
 
-    let you_hlc = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
-    let f_hlc = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
-    let x_hlc = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+    let you_hlc = Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "you-dev".to_string(),
+    )));
+    let f_hlc = Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "f-dev".to_string(),
+    )));
+    let x_hlc = Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "x-dev".to_string(),
+    )));
 
     // ── Shared mock pkarr relay for the F→X Case-D leg. ────────────────────
     let relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
@@ -661,7 +665,6 @@ async fn setup(policy: PeerIntroPolicy, settings_dir: &std::path::Path) -> Harne
         f_seeded_friend_count,
         _x_ep: x_ep,
         x_crdt,
-        x_hlc,
         x_keytree,
         x_pending,
         client,
@@ -901,7 +904,11 @@ async fn introduction_broker_roundtrip_askme_policy_stages_then_links_on_accept(
         let x2_pex: Arc<dyn IrohHandshakeDispatcher> = Arc::new(
             IrohFriendPexAcceptor::new(
                 Arc::clone(&h.x_crdt),
-                Arc::clone(&h.x_hlc),
+                // X's SECOND device mints from its own tracker — one tracker
+                // per device, as in production.
+                Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+                    "x2-dev".to_string(),
+                ))),
                 "x2-dev".to_string(),
                 h.x.owner,
                 h.x.cert.clone(),

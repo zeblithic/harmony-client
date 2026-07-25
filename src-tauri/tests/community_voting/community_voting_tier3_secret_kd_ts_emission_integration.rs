@@ -208,8 +208,10 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
     let (publisher_tx, mut publisher_rx) = mpsc::channel::<Vec<u8>>(32);
     let (_sub_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(32);
 
-    let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
     let device_id = "dev-test-kd-ts".to_string();
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.clone(),
+    )));
 
     let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
         community_id,
@@ -516,8 +518,10 @@ async fn no_kd_ts_emission_when_not_committee_member() {
     let voting_log = Arc::new(Mutex::new(VotingLog::new()));
     let (publisher_tx, mut publisher_rx) = mpsc::channel::<Vec<u8>>(32);
     let (_sub_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(32);
-    let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
     let device_id = "dev-non-committee".to_string();
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.clone(),
+    )));
 
     let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
         community_id,

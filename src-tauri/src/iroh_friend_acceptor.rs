@@ -1595,7 +1595,7 @@ where
     crdt_state: Arc<TokioMutex<OwnerState>>,
     /// Shared HLC tracker (`device_id → last Hlc`), bumped per accepted request
     /// to stamp `FriendEntry.learned_at`. Same map the profile broadcaster uses.
-    hlc_tracker: Arc<TokioMutex<std::collections::BTreeMap<String, Hlc>>>,
+    hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     device_id: String,
     self_owner: OwnerAddr,
     self_display: Option<String>,
@@ -1685,7 +1685,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         crdt_state: Arc<TokioMutex<OwnerState>>,
-        hlc_tracker: Arc<TokioMutex<std::collections::BTreeMap<String, Hlc>>>,
+        hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
         device_id: String,
         self_owner: OwnerAddr,
         self_display: Option<String>,
@@ -1713,7 +1713,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         crdt_state: Arc<TokioMutex<OwnerState>>,
-        hlc_tracker: Arc<TokioMutex<std::collections::BTreeMap<String, Hlc>>>,
+        hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
         device_id: String,
         self_owner: OwnerAddr,
         self_display: Option<String>,
@@ -1976,18 +1976,21 @@ where
     async fn next_hlc(&self) -> Hlc {
         let now_ms = wall_now_ms();
         let mut tracker = self.hlc_tracker.lock().await;
-        let entry = tracker.entry(self.device_id.clone()).or_insert(Hlc {
-            wall_ms: 0,
-            logical: 0,
+        // Delegates to the core tick kernel like every other minting path
+        // (ZEB-759); this was an open-coded copy of the same rule.
+        let tick = harmony_crdt_sync::HlcTick::next(
+            tracker
+                .accepted_from(&self.device_id)
+                .map(harmony_crdt_sync::HlcTick::from),
+            now_ms,
+        );
+        let next = Hlc {
+            wall_ms: tick.wall_ms,
+            logical: tick.logical,
             device_id: self.device_id.clone(),
-        });
-        if now_ms > entry.wall_ms {
-            entry.wall_ms = now_ms;
-            entry.logical = 0;
-        } else {
-            entry.logical = entry.logical.saturating_add(1);
-        }
-        entry.clone()
+        };
+        tracker.observe_local(next.clone());
+        next
     }
 
     /// ZEB-370 consent gate (ATOMIC check-and-consume). Returns `Ok(())` iff
@@ -3922,7 +3925,9 @@ mod tests {
         let me = mint_test_owner(0x70);
         IrohFriendHandshakeAcceptor::<()>::new(
             Arc::new(TokioMutex::new(OwnerState::default())),
-            Arc::new(TokioMutex::new(std::collections::BTreeMap::new())),
+            Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "gate-test-dev".to_string(),
+            ))),
             "gate-test-dev".to_string(),
             me.owner,
             Some("me".to_string()),
@@ -4189,7 +4194,9 @@ mod tests {
             )),
             "acceptor-test-dev".into(),
             Arc::clone(&shared_state),
-            Arc::new(TokioMutex::new(std::collections::BTreeMap::new())),
+            Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "acceptor-test-dev".into(),
+            ))),
             Arc::new(InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -4203,7 +4210,9 @@ mod tests {
         let me = mint_test_owner(0x71);
         let acceptor = IrohFriendHandshakeAcceptor::<()>::new(
             Arc::clone(&shared_state),
-            Arc::new(TokioMutex::new(std::collections::BTreeMap::new())),
+            Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "acceptor-test-dev".into(),
+            ))),
             "acceptor-test-dev".to_string(),
             me.owner,
             None,
@@ -5193,9 +5202,9 @@ mod tests {
         projection: crate::revoked_device_projection::RevokedDeviceProjection,
     ) -> IrohFriendHandshakeAcceptor<()> {
         let me = mint_test_owner(self_seed);
-        let hlc_tracker = Arc::new(TokioMutex::new(
-            std::collections::BTreeMap::<String, Hlc>::new(),
-        ));
+        let hlc_tracker = Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+            format!("dev-{self_seed:02x}"),
+        )));
         let device2 = Arc::new(ed25519_dalek::SigningKey::from_bytes(
             &me.device_key.to_bytes(),
         ));

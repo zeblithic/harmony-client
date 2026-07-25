@@ -41,7 +41,7 @@
 //! 0 → slot 0; `[lower_dummy, alice]` (Alice the higher address) → Alice ranks 1
 //! → slot 1 while slot 0 stays empty (the dummy never publishes).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -223,7 +223,7 @@ struct OpenJoinSetup {
     /// Per-device HLC tracker for Bob — the same lane the production redeem /
     /// boot reconcile threads into `register_channel_log_engine` /
     /// `reconcile_from_state`.
-    bob_hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>>,
+    bob_hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
 
     // ── pkarr ───────────────────────────────────────────────────────────
     pkarr_resolver: Arc<harmony_pkarr::PkarrResolver>,
@@ -639,8 +639,9 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
             // ZEB-599 Direction 1: no presence watch in this integration harness.
             presence_resync_rx: None,
         });
-    let bob_hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>> =
-        Arc::new(TokioMutex::new(BTreeMap::new()));
+    let bob_hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
+        TokioMutex::new(harmony_crdt_sync::ReplayTracker::new("bob-dev".into())),
+    );
     OpenJoinSetup {
         bob_comm_sk,
         alice_comm_sk,

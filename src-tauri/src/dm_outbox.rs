@@ -3199,17 +3199,63 @@ fn derive_recipients(members: &[OwnerAddr], self_addr: &OwnerAddr) -> Vec<OwnerA
 // keep production HLCs monotone with state-root publishes. (A future
 // cleanup could promote this to a shared module — out of Phase 2 scope.)
 pub(crate) fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) -> Hlc {
-    let (logical, base_wall) = match prev {
-        Some(p) if p.wall_ms == wall_now_ms => (p.logical.saturating_add(1), p.wall_ms),
-        Some(p) if p.wall_ms > wall_now_ms => (p.logical.saturating_add(1), p.wall_ms),
-        Some(p) => (0, p.wall_ms),
-        None => (0, 0),
-    };
-    let effective_wall = std::cmp::max(wall_now_ms, base_wall);
+    // Same tick rule as `fleet_sync::compute_next_hlc` — this was a verbatim
+    // second copy of it. Both now delegate to the core kernel (ZEB-759), so
+    // the saturating-monotonicity rule has exactly one implementation.
+    let tick =
+        harmony_crdt_sync::HlcTick::next(prev.map(harmony_crdt_sync::HlcTick::from), wall_now_ms);
     Hlc {
-        wall_ms: effective_wall,
-        logical,
+        wall_ms: tick.wall_ms,
+        logical: tick.logical,
         device_id: device_id.to_string(),
+    }
+}
+
+/// The two tracker shapes a device can reserve an HLC against.
+///
+/// The channel-log family keeps a plain `BTreeMap<String, Hlc>`; the fleet
+/// family keeps a `ReplayTracker`, whose peer watermarks are reachable only
+/// through the apply-before-advance admit/commit pair, leaving
+/// `observe_local` as the minting write (ZEB-759). Both answer the same two
+/// questions, so `reserve_next_hlc_for_device` is generic over this rather
+/// than duplicated per shape — and every existing call site infers.
+pub trait DeviceHlcStore {
+    /// The last HLC recorded for `device_id`, if any.
+    fn last_for(&self, device_id: &str) -> Option<&Hlc>;
+    /// Record an HLC this device just minted for itself.
+    fn record_local(&mut self, device_id: &str, hlc: Hlc);
+}
+
+impl DeviceHlcStore for std::collections::BTreeMap<String, Hlc> {
+    fn last_for(&self, device_id: &str) -> Option<&Hlc> {
+        self.get(device_id)
+    }
+    fn record_local(&mut self, device_id: &str, hlc: Hlc) {
+        self.insert(device_id.to_string(), hlc);
+    }
+}
+
+impl DeviceHlcStore for harmony_crdt_sync::ReplayTracker<String, Hlc> {
+    fn last_for(&self, device_id: &str) -> Option<&Hlc> {
+        // Through `accepted()` rather than `accepted_from`: the latter takes
+        // `&K` (= `&String`) and would allocate on every lookup, under the
+        // tracker lock, on a path ~77 call sites reach. `BTreeMap<String, _>`
+        // borrows to `str`, so this lookup is allocation-free.
+        self.accepted().get(device_id)
+    }
+    fn record_local(&mut self, device_id: &str, hlc: Hlc) {
+        debug_assert_eq!(
+            device_id,
+            self.local().as_str(),
+            "reserve_next_hlc_for_device mints only for the local device; a peer's \
+             watermark must go through admit/commit so apply-before-advance holds"
+        );
+        // Monotone rather than unconditional, unlike the map impl. Equivalent
+        // here: `next_hlc` never returns something older than `prev`, and in
+        // the one case where it returns something EQUAL (logical saturated at
+        // u32::MAX) both an overwrite and a rejected observe leave the same
+        // stored value.
+        self.observe_local(hlc);
     }
 }
 
@@ -3231,15 +3277,15 @@ pub(crate) fn next_hlc(prev: Option<&Hlc>, wall_now_ms: u64, device_id: &str) ->
 /// ZEB-267 — replaces the snapshot-then-release pattern that had a
 /// race window between the `prev_hlc` read and the post-`Inserted`
 /// advance. See `docs/specs/2026-05-09-zeb-267-atomic-hlc-reservation-design.md`.
-pub async fn reserve_next_hlc_for_device(
-    tracker: &std::sync::Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, Hlc>>>,
+pub async fn reserve_next_hlc_for_device<T: DeviceHlcStore>(
+    tracker: &std::sync::Arc<tokio::sync::Mutex<T>>,
     device_id: &str,
     wall_now_ms: u64,
 ) -> Hlc {
     let mut t = tracker.lock().await;
-    let prev = t.get(device_id).cloned();
+    let prev = t.last_for(device_id).cloned();
     let next = next_hlc(prev.as_ref(), wall_now_ms, device_id);
-    t.insert(device_id.to_string(), next.clone());
+    t.record_local(device_id, next.clone());
     next
 }
 
@@ -8689,12 +8735,13 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_next_hlc_for_device_advances_tracker_atomically() {
-        use std::collections::BTreeMap;
         use std::sync::Arc;
         use tokio::sync::Mutex;
 
-        let tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let device_id = "test-dev-A";
+        let tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
+            Mutex::new(harmony_crdt_sync::ReplayTracker::new(device_id.to_string())),
+        );
         let wall_now_ms = 1_700_000_000_000u64;
 
         let first = reserve_next_hlc_for_device(&tracker, device_id, wall_now_ms).await;
@@ -8711,6 +8758,7 @@ mod tests {
         let stored = tracker
             .lock()
             .await
+            .accepted()
             .get(device_id)
             .cloned()
             .expect("tracker has entry");
@@ -8722,13 +8770,15 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_next_hlc_for_device_concurrent_reservations_distinct() {
-        use std::collections::{BTreeMap, BTreeSet};
+        use std::collections::BTreeSet;
         use std::sync::Arc;
         use tokio::sync::Mutex;
         use tokio::task::JoinSet;
 
-        let tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let device_id = "test-dev-conc";
+        let tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
+            Mutex::new(harmony_crdt_sync::ReplayTracker::new(device_id.to_string())),
+        );
         let wall_now_ms = 1_700_000_111_222u64;
 
         // Spawn 64 concurrent reservations. Without the atomic helper,
@@ -8772,6 +8822,7 @@ mod tests {
         let stored = tracker
             .lock()
             .await
+            .accepted()
             .get(device_id)
             .cloned()
             .expect("tracker has entry");
@@ -8807,24 +8858,22 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_next_hlc_for_device_handles_wall_regression() {
-        use std::collections::BTreeMap;
         use std::sync::Arc;
         use tokio::sync::Mutex;
 
-        let tracker: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let device_id = "test-dev-regress";
+        let tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
+            Mutex::new(harmony_crdt_sync::ReplayTracker::new(device_id.to_string())),
+        );
 
         // Pre-seed the tracker with an HLC at wall_ms=1000, logical=5.
         {
             let mut t = tracker.lock().await;
-            t.insert(
-                device_id.to_string(),
-                Hlc {
-                    wall_ms: 1000,
-                    logical: 5,
-                    device_id: device_id.to_string(),
-                },
-            );
+            t.observe_local(Hlc {
+                wall_ms: 1000,
+                logical: 5,
+                device_id: device_id.to_string(),
+            });
         }
 
         // Reserve with wall_now_ms=500 — strictly less than the prior
@@ -8841,6 +8890,7 @@ mod tests {
         let stored = tracker
             .lock()
             .await
+            .accepted()
             .get(device_id)
             .cloned()
             .expect("tracker has entry");

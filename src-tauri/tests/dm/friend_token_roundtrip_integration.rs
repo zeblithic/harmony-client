@@ -33,7 +33,6 @@
 //! (ZEB-165 / ZEB-383). The end-to-end handshake is still wrapped in a generous
 //! `tokio::time::timeout`.
 
-use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -189,7 +188,9 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
 
         // ── 3. Alice's owner-state + hlc tracker (acceptor dependencies). ─
         let alice_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
-        let alice_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+        let alice_hlc_tracker = Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "alice-dev".to_string(),
+        )));
         // ZEB-371: each node has its OWN owner KeyTree (per-owner master seed). A
         // seals friend secrets under hers, B under his; the SHARED thing is the
         // 32-byte plaintext secret each side derives via ECDH.
@@ -303,7 +304,9 @@ async fn friend_token_roundtrip_mutual_active_token_friends() {
 
         // ── 7. Bob redeems. ─────────────────────────────────────────────
         let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
-        let bob_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+        let bob_hlc_tracker = Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "bob-dev".to_string(),
+        )));
         let bob_keytree =
             Arc::new(harmony_app::owner_state_crypto::KeyTree::derive(&[0xB2; 32]).expect("kt"));
 

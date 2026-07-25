@@ -326,7 +326,9 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
 
         // ── 3. Alice acceptor dependencies. ──────────────────────────────
         let alice_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
-        let alice_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+        let alice_hlc_tracker = Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "alice-dev".to_string(),
+        )));
         let alice_keytree =
             Arc::new(harmony_app::owner_state_crypto::KeyTree::derive(&[0xA1; 32]).expect("kt"));
 
@@ -421,7 +423,9 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
 
         // ── 7. Bob redeems (real handshake over harmony/friend/v1). ───────
         let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
-        let bob_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+        let bob_hlc_tracker = Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "bob-dev".to_string(),
+        )));
         let bob_keytree =
             Arc::new(harmony_app::owner_state_crypto::KeyTree::derive(&[0xB2; 32]).expect("kt"));
 

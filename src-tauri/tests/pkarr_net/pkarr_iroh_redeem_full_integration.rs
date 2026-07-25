@@ -34,7 +34,7 @@
 //!    immediately.
 //! 6. Bob's IPC returns `outcome.status == "joined"`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -251,7 +251,7 @@ struct TwoPartySetup {
     // ── Bob redeem deps ─────────────────────────────────────────────────
     bob_reachability: ReachabilityResolver,
     bob_crdt_state: Arc<TokioMutex<OwnerState>>,
-    bob_hlc_tracker: Arc<TokioMutex<BTreeMap<String, Hlc>>>,
+    bob_hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     bob_dm_outbox: Arc<TokioMutex<DmOutbox>>,
     bob_channel_log_registry: Arc<ChannelLogRegistry>,
     bob_adapter_tx: mpsc::Sender<CommunityAdapterRequest>,
@@ -608,7 +608,9 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
     });
 
     let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
-    let bob_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+    let bob_hlc_tracker = Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "bob-dev".to_string(),
+    )));
 
     // ZEB-325 PR #159 R6 (Cursor HIGH): pre-populate bob's owner_device_cache
     // with a fabricated alice device so `resolve_destinations_for_owner`

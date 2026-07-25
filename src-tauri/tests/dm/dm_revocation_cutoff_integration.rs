@@ -412,7 +412,9 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
         let bob_accept = bob_link_mgr.spawn_accept_loop();
 
         let alice_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
-        let alice_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+        let alice_hlc_tracker = Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "alice-dev".to_string(),
+        )));
         let alice_keytree =
             Arc::new(harmony_app::owner_state_crypto::KeyTree::derive(&[0xA3; 32]).expect("kt"));
 
@@ -507,7 +509,9 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
         await_pkarr_record_visible(&pkarr_resolver, &token_sig).await;
 
         let bob_crdt_state = Arc::new(TokioMutex::new(OwnerState::default()));
-        let bob_hlc_tracker = Arc::new(TokioMutex::new(BTreeMap::<String, Hlc>::new()));
+        let bob_hlc_tracker = Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "bob-dev".to_string(),
+        )));
         let bob_keytree =
             Arc::new(harmony_app::owner_state_crypto::KeyTree::derive(&[0xB4; 32]).expect("kt"));
 

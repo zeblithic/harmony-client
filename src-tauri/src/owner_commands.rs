@@ -3200,7 +3200,9 @@ mod revoke_tests {
                         }
                     },
                 ),
-                replay_tracker: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+                replay_tracker: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    harmony_crdt_sync::ReplayTracker::new("dev-a".to_string()),
+                )),
                 content_store: std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
                 publisher_tx: out_tx,
                 subscriber_rx: in_rx,
@@ -3229,7 +3231,9 @@ mod revoke_tests {
                 device_id: "dev-a".to_string(),
                 state: std::sync::Arc::clone(&trust_doc_arc),
                 merger: crate::owner_trust_sync::trust_merger(),
-                replay_tracker: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+                replay_tracker: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    harmony_crdt_sync::ReplayTracker::new("dev-a".to_string()),
+                )),
                 content_store: std::sync::Arc::new(crate::content_store::InMemoryStub::default()),
                 publisher_tx: t_out_tx,
                 subscriber_rx: t_in_rx,

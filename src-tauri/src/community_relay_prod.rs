@@ -23,6 +23,7 @@
 //! `mark_pulled` unit-testable without constructing a real engine. Production
 //! wires [`EngineRelayHoldFlush`] at `start_node` (T11).
 
+use harmony_crdt_sync::ReplayTracker;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -145,7 +146,7 @@ pub struct ProdRelayDepositCtx {
     /// Runtime relay-hold CRDT (same Arc the engine owns).
     pub relay_hold_doc: Arc<tokio::sync::Mutex<RelayHoldDoc>>,
     /// HLC tracker for minting `held_at`.
-    pub relay_hold_tracker: Arc<tokio::sync::Mutex<BTreeMap<String, Hlc>>>,
+    pub relay_hold_tracker: Arc<tokio::sync::Mutex<ReplayTracker<String, Hlc>>>,
     /// Flush seam (notify_dirty + flush_now over the fleet-sync engine).
     pub flush: Arc<dyn RelayHoldFlush>,
     /// Runtime per-community relay opt-in doc.
@@ -1329,7 +1330,9 @@ mod tests {
             self_owner,
             relay_device_id: "relay-dev".into(),
             relay_hold_doc,
-            relay_hold_tracker: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            relay_hold_tracker: Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("relay-dev".into()),
+            )),
             flush: Arc::new(NoopFlush),
             optin,
             membership,

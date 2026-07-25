@@ -1986,7 +1986,6 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
     use harmony_app::content_store::{ContentStore, RuntimeContentStore};
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::owner_state_persist::canonicalize;
-    use std::collections::BTreeMap;
 
     struct NopResolver;
     #[async_trait::async_trait]
@@ -2058,7 +2057,9 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
     // CBOR encodes the spaces map, which Phase 1's `apply_space_with_
     // canonicalization` would non-trivially mutate).
     let crdt_state = Arc::new(Mutex::new(OwnerState::default()));
-    let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "test-dev".to_string(),
+    )));
     let pre_bytes: Vec<u8> = {
         let g = crdt_state.lock().await;
         canonicalize(&g).expect("encode pre-state")
@@ -2636,7 +2637,7 @@ impl IdentityResolver for UnreachableInviterResolver {
 struct UnreachableRedeemFixture {
     url: String,
     crdt_state: Arc<Mutex<harmony_app::owner_state_crdt::OwnerState>>,
-    hlc_tracker: Arc<Mutex<std::collections::BTreeMap<String, Hlc>>>,
+    hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     registry: Arc<CommunitySyncRegistry>,
     adapter_tx: mpsc::Sender<harmony_app::event_loop::CommunityAdapterRequest>,
     dm_outbox: Arc<Mutex<harmony_app::dm_outbox::DmOutbox>>,
@@ -2664,7 +2665,6 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
     use harmony_app::owner_state_crdt::OwnerState;
     use harmony_app::owner_state_persist::canonicalize;
     use harmony_app::owner_state_types::DeviceIdentityHash;
-    use std::collections::BTreeMap;
 
     // ZEB-501: the redeem oneshot now fires ONLY on a real JoinCountersign, so an
     // unreachable inviter (no countersign) genuinely reaches the step-7d timeout.
@@ -2868,7 +2868,9 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
     }));
 
     let crdt_state = Arc::new(Mutex::new(OwnerState::default()));
-    let hlc_tracker = Arc::new(Mutex::new(BTreeMap::<String, Hlc>::new()));
+    let hlc_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        "bob-dev".to_string(),
+    )));
 
     // ZEB-473 (Move 1a): the unicast send channel was removed from
     // `redeem_invite_inner` with the Reticulum carrier; redemption proceeds via

@@ -37,6 +37,9 @@ use crate::owner_state_crypto::{
 };
 use crate::owner_state_types::Hlc;
 use harmony_content::cid::ContentId;
+use harmony_crdt_sync::{
+    Admission, DebounceLatch, DirtySignal, HlcTick, MonotoneMap, PublishOutcome, ReplayTracker,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -171,8 +174,14 @@ pub struct FleetSyncConfig<S> {
     /// Merge a decoded remote snapshot into local state, reporting
     /// whether anything changed.
     pub merger: Merger<S>,
-    /// Per-publisher last-accepted HLC (replay protection).
-    pub replay_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    /// Per-publisher last-accepted HLC (replay protection), and this
+    /// device's own last-minted stamp under its own key. The two
+    /// key-spaces are disjoint: the inbound path only ever reads peers
+    /// (our own publishes are echo-suppressed first), and minting only
+    /// ever touches our key. The core kernel enforces
+    /// apply-before-advance on the peer half — see
+    /// [`handle_incoming_publish`].
+    pub replay_tracker: Arc<Mutex<ReplayTracker<String, Hlc>>>,
     /// Content-addressed store (root blobs live here).
     pub content_store: Arc<dyn ContentStore>,
     /// Outbound wire frames (the engine's publisher side).
@@ -194,7 +203,7 @@ pub struct FleetSyncConfig<S> {
     pub on_applied: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Per-sibling record of "their latest seen-of-me" HLC, populated
     /// from inbound `seen` digests when `publish_seen` is set.
-    pub sibling_acks: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    pub sibling_acks: Arc<Mutex<MonotoneMap<String, Hlc>>>,
 }
 
 /// Generic per-owner sync engine. Construction spawns the internal task;
@@ -267,8 +276,8 @@ pub struct FleetSyncEngine<S: Send + 'static> {
     persist_sink: Arc<tokio::sync::Mutex<()>>,
     /// ZEB-710: dirty-window tripwire bookkeeping (see [`PersistTripwire`]).
     tripwire: Arc<PersistTripwire>,
-    replay_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
-    sibling_acks: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    replay_tracker: Arc<Mutex<ReplayTracker<String, Hlc>>>,
+    sibling_acks: Arc<Mutex<MonotoneMap<String, Hlc>>>,
     device_id: String,
     task: Mutex<Option<JoinHandle<()>>>,
     /// ZEB-707: sender the query-side zenoh adapter clones (via `root_serve_tx()`)
@@ -561,6 +570,7 @@ where
         self.replay_tracker
             .lock()
             .await
+            .accepted()
             .keys()
             .filter(|d| *d != &self.device_id)
             .cloned()
@@ -573,13 +583,14 @@ where
     pub async fn synced_device_count(&self) -> usize {
         let my_latest = {
             let tracker = self.replay_tracker.lock().await;
-            match tracker.get(&self.device_id) {
+            match tracker.accepted_from(&self.device_id) {
                 Some(h) => h.clone(),
                 None => return 0,
             }
         };
         let acks = self.sibling_acks.lock().await;
-        acks.values()
+        acks.entries()
+            .values()
             .filter(|seen_of_me| !my_latest.is_strictly_newer_than(seen_of_me))
             .count()
     }
@@ -605,7 +616,7 @@ struct Ctx<S> {
     device_id: String,
     state: Arc<Mutex<S>>,
     merger: Merger<S>,
-    replay_tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    replay_tracker: Arc<Mutex<ReplayTracker<String, Hlc>>>,
     content_store: Arc<dyn ContentStore>,
     publisher_tx: mpsc::Sender<Vec<u8>>,
     subscriber_rx: mpsc::Receiver<Vec<u8>>,
@@ -614,7 +625,7 @@ struct Ctx<S> {
     debounce: Duration,
     publish_seen: bool,
     on_applied: Option<Arc<dyn Fn() + Send + Sync>>,
-    sibling_acks: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    sibling_acks: Arc<Mutex<MonotoneMap<String, Hlc>>>,
     notify_dirty: Arc<Notify>,
     has_pending_dirty: Arc<AtomicBool>,
     /// ZEB-710: shared with the handle — every persist (task-side or
@@ -650,11 +661,31 @@ struct Ctx<S> {
     root_serve_rx: mpsc::Receiver<RootServeReq>,
 }
 
+/// Map a publish result onto the latch's outcome vocabulary.
+fn outcome_of<T, E>(r: &Result<T, E>) -> PublishOutcome {
+    if r.is_ok() {
+        PublishOutcome::Succeeded
+    } else {
+        PublishOutcome::Failed
+    }
+}
+
 async fn internal_task<S>(mut ctx: Ctx<S>)
 where
     S: CanonicalPayload + serde::de::DeserializeOwned + Clone + Send + 'static,
 {
-    let mut next_wakeup: Option<Instant> = None;
+    // The sliding-debounce window is the core kernel's (ZEB-759). The dirty
+    // FLAG stays ours: `notify_dirty()` writes it from ~144 mutation sites on
+    // arbitrary tasks, so it is an AtomicBool the latch could not own — the
+    // latch takes what we claimed and tells us whether to put it back.
+    //
+    // Millis come from a monotonic `Instant` epoch, never the wall clock: an
+    // NTP step must not stretch or collapse the debounce window. (Under
+    // `tokio::time::pause()` this is the paused clock, so tests keep logical
+    // time.)
+    let clock_epoch = Instant::now();
+    let now_ms = move || clock_epoch.elapsed().as_millis() as u64;
+    let mut latch = DebounceLatch::new(ctx.debounce.as_millis() as u64);
     // Latched after we observe `None` on `subscriber_rx`. Without this,
     // select! polls a closed channel every iteration and the arm-pattern
     // `Some(bytes) = recv()` silently filters out None — inbound sync is
@@ -683,8 +714,9 @@ where
 
     loop {
         // Compute the sleep duration for the wakeup branch.
-        let sleep_dur = next_wakeup
-            .map(|t| t.saturating_duration_since(Instant::now()))
+        let sleep_dur = latch
+            .deadline()
+            .map(|d| Duration::from_millis(d.saturating_sub(now_ms())))
             .unwrap_or(Duration::from_secs(3600));
 
         tokio::select! {
@@ -694,29 +726,29 @@ where
                 // calls reset the timer, collapsing to one publish
                 // `debounce` after the last call in the burst.
                 if ctx.has_pending_dirty.load(Ordering::Relaxed) {
-                    next_wakeup = Some(Instant::now() + ctx.debounce);
+                    latch.mark_dirty(now_ms());
                 }
                 // Replace the pinned future with a fresh one so we wait
                 // for the next notification. Without this, subsequent
                 // polls of the Done future return Ready in a tight loop.
                 notified.set(notify.notified());
             }
-            _ = tokio::time::sleep(sleep_dur), if next_wakeup.is_some() => {
-                next_wakeup = None;
-                // Use `swap` rather than `store(false)` so we can restore
-                // the dirty bit if the publish itself fails. Otherwise a
-                // transient publish error silently consumes the dirty
-                // signal and the next `shutdown()`/wakeup misses the
-                // pending-state guard.
-                let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
+            _ = tokio::time::sleep(sleep_dur), if latch.is_armed() => {
+                // `swap` rather than `store(false)`: clearing up front is
+                // mandatory (a mutation arriving DURING the publish must
+                // re-arm rather than be swallowed by it), which is exactly
+                // why the claim must be settled — otherwise a transient
+                // publish error silently consumes the dirty signal and the
+                // next shutdown misses the pending-state guard.
+                let claim = latch.on_deadline(ctx.has_pending_dirty.swap(false, Ordering::AcqRel));
                 let pub_result = publish_root_now(&ctx).await;
                 if let Err(e) = &pub_result {
                     tracing::warn!(error = %e, "publish_root_now failed");
-                    if was_dirty {
-                        // Re-arm so the next debounce wakeup / shutdown
-                        // retries this publish instead of skipping it.
-                        ctx.has_pending_dirty.store(true, Ordering::Release);
-                    }
+                }
+                if claim.settle(outcome_of(&pub_result)) == DirtySignal::Restore {
+                    // Re-arm so the next debounce wakeup / shutdown retries
+                    // this publish instead of skipping it.
+                    ctx.has_pending_dirty.store(true, Ordering::Release);
                 }
                 if let Err(e) = persist_now(&ctx).await {
                     tracing::warn!(error = %e, "persist_now failed");
@@ -730,17 +762,16 @@ where
                 // + AEAD round-trip if the engine happens to be idle,
                 // which is acceptable for tests and explicit "force
                 // publish" callers.
-                next_wakeup = None;
-                // Same swap-and-restore pattern as the wakeup arm: if the
-                // publish fails, preserve the dirty latch so the engine
+                // Same claim/settle discipline as the wakeup arm: if the
+                // publish fails, preserve the dirty signal so the engine
                 // retries on its next signal instead of losing work.
-                let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
+                let claim = latch.on_flush(ctx.has_pending_dirty.swap(false, Ordering::AcqRel));
                 let pub_result = publish_root_now(&ctx).await;
                 if let Err(ref e) = pub_result {
                     tracing::warn!(error = %e, "flush_now publish_root_now failed");
-                    if was_dirty {
-                        ctx.has_pending_dirty.store(true, Ordering::Release);
-                    }
+                }
+                if claim.settle(outcome_of(&pub_result)) == DirtySignal::Restore {
+                    ctx.has_pending_dirty.store(true, Ordering::Release);
                 }
                 // ZEB-710: an EXPLICIT flush accounts the caller's mutation
                 // for the dirty-window tripwire — the state was just
@@ -792,11 +823,16 @@ where
             }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
                 // Flush only if there is genuinely unpublished dirty state.
-                let pub_result = if ctx.has_pending_dirty.load(Ordering::Relaxed) {
+                // `load`, not `swap`: this arm returns, so the flag has no
+                // future to protect — and the latch does not touch it, which
+                // is precisely why the caller owning it keeps this faithful.
+                let claim = latch.on_shutdown(ctx.has_pending_dirty.load(Ordering::Relaxed));
+                let pub_result = if claim.should_publish() {
                     publish_root_now(&ctx).await
                 } else {
                     Ok(())
                 };
+                let _ = claim.settle(outcome_of(&pub_result));
                 let persist_result = persist_now(&ctx).await;
                 // Surface either failure to the caller. Persist failure is
                 // the more critical of the two — losing the final disk
@@ -836,7 +872,7 @@ where
 /// on-disk image.
 async fn persist_direct<S>(
     state: &Arc<Mutex<S>>,
-    replay_tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>,
+    replay_tracker: &Arc<Mutex<ReplayTracker<String, Hlc>>>,
     persist: &Arc<dyn FleetPersist<S>>,
     persist_sink: &Arc<tokio::sync::Mutex<()>>,
     tripwire: &Arc<PersistTripwire>,
@@ -908,7 +944,7 @@ where
         // Hold the sink for the WHOLE write, immune to async-side
         // cancellation (see the guard comment above).
         let _sink_g = sink_g;
-        persist.persist(&state_snap, &tracker_snap)
+        persist.persist(&state_snap, tracker_snap.accepted())
     })
     .await
     .map_err(|e| SyncError::Persist(format!("spawn_blocking join: {e}")))?
@@ -999,6 +1035,7 @@ where
         // lexicographically-last devices.
         let tracker = ctx.replay_tracker.lock().await;
         let mut entries: Vec<(String, Hlc)> = tracker
+            .accepted()
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -1023,11 +1060,18 @@ where
 /// Extracted as a free function (reused by later tasks). Mirrors the
 /// donor `owner_state_sync::next_hlc` wall-ms / logical-saturation logic
 /// exactly.
-pub async fn mint_next_hlc(tracker: &Arc<Mutex<BTreeMap<String, Hlc>>>, device_id: &str) -> Hlc {
+pub async fn mint_next_hlc(
+    tracker: &Arc<Mutex<ReplayTracker<String, Hlc>>>,
+    device_id: &str,
+) -> Hlc {
     let wall_ms = now_wall_ms();
     let mut tracker = tracker.lock().await;
-    let now = compute_next_hlc(&tracker, device_id, wall_ms);
-    tracker.insert(device_id.to_string(), now.clone());
+    let now = compute_next_hlc(tracker.accepted(), device_id, wall_ms);
+    // `observe_local` rather than `commit`: the local entry is unreachable
+    // through admit/commit by construction (our own publish is an Echo, which
+    // yields no ticket). This is the minting write, and it is monotone, so a
+    // clock that failed to advance cannot regress the stamp either.
+    tracker.observe_local(now.clone());
     now
 }
 
@@ -1057,33 +1101,16 @@ fn now_wall_ms() -> u64 {
 /// Pure HLC computation shared by `mint_next_hlc` (which commits the result to
 /// the tracker) and `peek_next_hlc` (which does not). No side effects.
 fn compute_next_hlc(tracker: &BTreeMap<String, Hlc>, device_id: &str, wall_ms: u64) -> Hlc {
-    // Read once — both the logical-counter computation and the
-    // effective-wall pin need the same `prev`. Re-fetching from the map
-    // is cheap but invites future divergence; folding into one lookup
-    // keeps the read consistent.
-    //
-    // `saturating_add` on the logical counter: under sustained backward
-    // NTP correction or repeated clock-monotonicity faults we'd
-    // repeatedly bump `logical` without advancing `wall_ms`. An unchecked
-    // u32 add would eventually wrap and produce an HLC smaller than the
-    // previous one, breaking the strict-newer monotonicity that replay
-    // protection depends on. Saturation pins the value at u32::MAX
-    // instead — pathological but bounded; further publishes from the same
-    // device on the same wall_ms tick would be rejected by the receiver
-    // until the wall clock advances, which is preferable to silent
-    // replay.
-    let prev = tracker.get(device_id);
-    let (logical, prev_wall) = match prev {
-        Some(p) if p.wall_ms == wall_ms => (p.logical.saturating_add(1), p.wall_ms),
-        Some(p) if p.wall_ms > wall_ms => (p.logical.saturating_add(1), p.wall_ms),
-        Some(p) => (0, p.wall_ms),
-        None => (0, 0),
-    };
-    let effective_wall = std::cmp::max(wall_ms, prev_wall);
+    // The tick arithmetic — including the saturating-monotonicity rule
+    // under backward clock correction — lives in the core kernel
+    // (`harmony_crdt_sync::HlcTick`, ZEB-759). What stays here is what is
+    // ours: which entry to read, and stamping the writer identity that
+    // the locked `w`/`l`/`d` wire encoding carries.
+    let tick = HlcTick::next(tracker.get(device_id).map(HlcTick::from), wall_ms);
 
     Hlc {
-        wall_ms: effective_wall,
-        logical,
+        wall_ms: tick.wall_ms,
+        logical: tick.logical,
         device_id: device_id.to_string(),
     }
 }
@@ -1247,23 +1274,25 @@ where
         }
     };
 
-    // 3. Echo-suppress: ignore our own publishes reflected back.
-    if payload.at.device_id == ctx.device_id {
-        return Inbound::Echo;
-    }
-
-    // 4. Replay check — READ-ONLY. Accept iff no prior entry or strictly
-    //    newer. Do NOT mutate the tracker here (apply-before-advance).
-    {
+    // 3+4. Judge the publish: echo-suppress our own frames reflected back,
+    //      reject anything not strictly newer than this publisher's
+    //      watermark, and otherwise take a ticket.
+    //
+    //      Apply-before-advance is now enforced by the core kernel's types
+    //      rather than by this comment (ZEB-759): `admit` takes `&self` and
+    //      cannot advance anything, the only advance is `commit`, and the
+    //      only `CommitTicket` in existence is the one inside this `Accept`.
+    //      Every fallible step between here and step 9 therefore leaves the
+    //      watermark un-advanced simply by returning — the ticket drops with
+    //      the stack frame, which is exactly the retry-safe state.
+    let ticket = {
         let tracker = ctx.replay_tracker.lock().await;
-        let accept = match tracker.get(&payload.at.device_id) {
-            None => true,
-            Some(existing) => payload.at.is_strictly_newer_than(existing),
-        };
-        if !accept {
-            return Inbound::Duplicate;
+        match tracker.admit(&payload.at.device_id, &payload.at) {
+            Admission::Echo => return Inbound::Echo,
+            Admission::Duplicate => return Inbound::Duplicate,
+            Admission::Accept(ticket) => ticket,
         }
-    }
+    };
 
     // 5. Fetch the encrypted root blob from CAS. Failures here are the
     //    TRANSIENT class (ZEB-705): return the wire frame so the engine
@@ -1316,25 +1345,21 @@ where
         (ctx.merger)(&mut local, remote)
     };
 
-    // 9. NOW advance the tracker — only after a successful apply.
-    ctx.replay_tracker
-        .lock()
-        .await
-        .insert(payload.at.device_id.clone(), payload.at.clone());
+    // 9. NOW advance the watermark — only after a successful apply. The
+    //    ticket has ridden every fallible step above to get here.
+    ctx.replay_tracker.lock().await.commit(ticket);
 
     // 10. If running with `publish_seen`, record the sibling's
     //     acknowledgement of us: their `seen[our_device]`, if newer than
-    //     what we already have recorded for that sibling.
+    //     what we already have recorded for that sibling. That "replace iff
+    //     strictly newer" fold is the same monotone rule the watermarks use,
+    //     so it is the same core type.
     if ctx.publish_seen {
         if let Some(their_seen_of_me) = payload.seen.get(&ctx.device_id) {
-            let mut acks = ctx.sibling_acks.lock().await;
-            let newer = match acks.get(&payload.at.device_id) {
-                None => true,
-                Some(existing) => their_seen_of_me.is_strictly_newer_than(existing),
-            };
-            if newer {
-                acks.insert(payload.at.device_id.clone(), their_seen_of_me.clone());
-            }
+            ctx.sibling_acks
+                .lock()
+                .await
+                .observe(payload.at.device_id.clone(), their_seen_of_me.clone());
         }
     }
 
@@ -1477,7 +1502,7 @@ mod engine_tests {
     struct Built {
         engine: FleetSyncEngine<ToyDoc>,
         state: Arc<Mutex<ToyDoc>>,
-        tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+        tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
         out_rx: mpsc::Receiver<Vec<u8>>,
         in_tx: mpsc::Sender<Vec<u8>>,
     }
@@ -1495,7 +1520,9 @@ mod engine_tests {
         let (out_tx, out_rx) = mpsc::channel(64);
         let (in_tx, in_rx) = mpsc::channel(64);
         let state = Arc::new(Mutex::new(ToyDoc::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            device_id.to_string(),
+        )));
         let engine = FleetSyncEngine::new(FleetSyncConfig {
             keys,
             device_id: device_id.to_string(),
@@ -1510,7 +1537,7 @@ mod engine_tests {
             debounce_ms: 50,
             publish_seen,
             on_applied: None,
-            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+            sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
         });
         Built {
             engine,
@@ -1583,7 +1610,9 @@ mod engine_tests {
         // channel and log a spurious error during these persist-only tests.
         let (in_tx, in_rx) = mpsc::channel(64);
         let state = Arc::new(Mutex::new(ToyDoc::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            device_id.to_string(),
+        )));
         let persist = RecordingPersist::default();
         let engine = FleetSyncEngine::new(FleetSyncConfig {
             keys: FleetKeySet::new(make_kt()),
@@ -1599,7 +1628,7 @@ mod engine_tests {
             debounce_ms,
             publish_seen: false,
             on_applied: None,
-            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+            sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
         });
         BuiltInspectable {
             engine,
@@ -1890,7 +1919,9 @@ mod engine_tests {
             device_id: "dev-persist-cancel".to_string(),
             state: Arc::clone(&state),
             merger: Arc::new(|local: &mut ToyDoc, remote: ToyDoc| toy_merge(local, remote)),
-            replay_tracker: Arc::new(Mutex::new(BTreeMap::new())),
+            replay_tracker: Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "dev-persist-cancel".to_string(),
+            ))),
             content_store: cas,
             publisher_tx: out_tx,
             subscriber_rx: in_rx,
@@ -1902,7 +1933,7 @@ mod engine_tests {
             debounce_ms: 3_600_000,
             publish_seen: false,
             on_applied: None,
-            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+            sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
         });
 
         // V1: cancelled mid-write (the slow first write outlives the 50ms
@@ -2635,7 +2666,7 @@ mod engine_tests {
             "B's engine never reached the CAS fetch step within 5s"
         );
         assert!(
-            !b.tracker.lock().await.contains_key("dev-A"),
+            !b.tracker.lock().await.accepted().contains_key("dev-A"),
             "B's tracker advanced for dev-A despite a blob-fetch miss"
         );
         assert!(
@@ -2760,7 +2791,7 @@ mod engine_tests {
         // After the failing fetch, B's tracker must have NO key for dev-A
         // (proving advance happens only after a successful apply).
         assert!(
-            !b.tracker.lock().await.contains_key("dev-A"),
+            !b.tracker.lock().await.accepted().contains_key("dev-A"),
             "tracker advanced for dev-A despite the apply failing (get error)"
         );
         assert!(
@@ -2909,7 +2940,7 @@ mod engine_tests {
             "retry scheduling must stop at the bound"
         );
         assert!(
-            !b.tracker.lock().await.contains_key("dev-A"),
+            !b.tracker.lock().await.accepted().contains_key("dev-A"),
             "tracker advanced despite every fetch failing"
         );
         assert!(!b.state.lock().await.entries.contains_key("k1"));
@@ -2930,7 +2961,7 @@ mod engine_tests {
         .await;
         assert!(converged, "re-offered frame did not apply after recovery");
         assert!(
-            b.tracker.lock().await.contains_key("dev-A"),
+            b.tracker.lock().await.accepted().contains_key("dev-A"),
             "tracker must advance on the successful re-offer"
         );
 

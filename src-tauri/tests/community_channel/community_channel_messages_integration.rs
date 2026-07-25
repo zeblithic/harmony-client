@@ -4,7 +4,6 @@
 //!
 //! Per spec §14.2.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -276,8 +275,14 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         enrolled_b,
     });
 
-    let tracker_a: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
-    let tracker_b: Arc<Mutex<BTreeMap<String, Hlc>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let tracker_a: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+        Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "device-a".to_string(),
+        )));
+    let tracker_b: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+        Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "device-a".to_string(),
+        )));
 
     // ── Adapter-request bridges + drainers (mirrors registry test fixture) ──
     let (adapter_tx_a, adapter_rx_a) = mpsc::unbounded_channel();

@@ -240,7 +240,7 @@ fn install_space(state: &mut OwnerState, sp: Space) {
 struct Built<S: Send + 'static> {
     engine: Arc<FleetSyncEngine<S>>,
     doc: Arc<Mutex<S>>,
-    tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     out_rx: mpsc::Receiver<Vec<u8>>,
     in_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -259,7 +259,9 @@ fn build_outhold_engine(
     let (out_tx, out_rx) = mpsc::channel(64);
     let (in_tx, in_rx) = mpsc::channel(64);
     let doc = Arc::new(Mutex::new(DmOutholdDoc::default()));
-    let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+    let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.to_string(),
+    )));
     let merger: Merger<DmOutholdDoc> = Arc::new(|local, remote| local.merge_from(remote));
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
         keys: harmony_app::owner_state_crypto::FleetKeySet::new(kt),
@@ -278,7 +280,7 @@ fn build_outhold_engine(
         debounce_ms: 50,
         publish_seen: true,
         on_applied: None, // sweeps driven explicitly in this test
-        sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+        sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
     }));
     Built {
         engine,
@@ -300,7 +302,9 @@ fn build_inbox_engine(
     let (out_tx, out_rx) = mpsc::channel(64);
     let (in_tx, in_rx) = mpsc::channel(64);
     let doc = Arc::new(Mutex::new(DmInboxDoc::default()));
-    let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+    let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+        device_id.to_string(),
+    )));
     let merger: Merger<DmInboxDoc> = Arc::new(|local, remote| local.merge_from(remote));
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
         keys: harmony_app::owner_state_crypto::FleetKeySet::new(kt),
@@ -319,7 +323,7 @@ fn build_inbox_engine(
         debounce_ms: 50,
         publish_seen: true,
         on_applied: None,
-        sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+        sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
     }));
     Built {
         engine,
@@ -384,7 +388,7 @@ struct TestButlerCtx {
     device_owners: BTreeMap<DeviceIdentityHash, ([u8; 16], [u8; 64])>,
     butler_sk: SigningKey,
     doc: Arc<Mutex<DmInboxDoc>>,
-    tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+    tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     engine: Arc<FleetSyncEngine<DmInboxDoc>>,
 }
 

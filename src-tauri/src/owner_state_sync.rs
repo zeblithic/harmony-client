@@ -32,6 +32,7 @@ use crate::owner_state_crypto::FleetKeySet;
 #[cfg(test)]
 use crate::owner_state_crypto::KeyTree;
 use crate::owner_state_types::Hlc;
+use harmony_crdt_sync::{MonotoneMap, ReplayTracker};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -117,7 +118,7 @@ impl SyncEngine {
         keys: FleetKeySet,
         device_id: String,
         state: Arc<Mutex<OwnerState>>,
-        tracker: Arc<Mutex<BTreeMap<String, Hlc>>>,
+        tracker: Arc<Mutex<ReplayTracker<String, Hlc>>>,
         content_store: Arc<dyn ContentStore>,
         publisher_tx: mpsc::Sender<Vec<u8>>,
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
@@ -160,7 +161,7 @@ impl SyncEngine {
             on_applied: None,
             // Unused while `publish_seen == false`, but the config field is
             // mandatory; a fresh empty map keeps the engine self-contained.
-            sibling_acks: Arc::new(Mutex::new(BTreeMap::new())),
+            sibling_acks: Arc::new(Mutex::new(MonotoneMap::new())),
         });
 
         SyncEngine { inner }
@@ -611,7 +612,9 @@ mod debounce_tests {
             FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".into(),
+            ))),
             Arc::new(InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -640,7 +643,9 @@ mod debounce_tests {
             FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".into(),
+            ))),
             Arc::new(InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -673,7 +678,9 @@ mod debounce_tests {
             FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".into(),
+            ))),
             Arc::new(InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -711,7 +718,9 @@ mod debounce_tests {
             FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::clone(&state),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".into(),
+            ))),
             Arc::new(InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -774,7 +783,9 @@ mod debounce_tests {
             FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".into(),
+            ))),
             Arc::new(InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -805,7 +816,9 @@ mod debounce_tests {
             FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".into(),
+            ))),
             Arc::new(InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -829,7 +842,9 @@ mod debounce_tests {
             FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".into(),
+            ))),
             Arc::new(InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -865,7 +880,9 @@ mod skeleton_tests {
             FleetKeySet::new(make_kt()),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".into(),
+            ))),
             Arc::new(InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -956,7 +973,9 @@ mod wire_identity_tests {
             FleetKeySet::new(Arc::clone(&kt)),
             "owner-dev".into(),
             Arc::new(Mutex::new(state)),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "owner-dev".into(),
+            ))),
             Arc::new(InMemoryStub::default()),
             pub_tx,
             sub_rx,
@@ -1086,7 +1105,9 @@ mod subscriber_tests {
         let (_dir, paths) = paths();
         let kt = make_kt();
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "self-device".into(),
+        )));
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
             FleetKeySet::new(Arc::clone(&kt)),
@@ -1105,7 +1126,8 @@ mod subscriber_tests {
         let accepted = wait_until(
             || async {
                 let t = tracker.lock().await;
-                t.get("peer-bob")
+                t.accepted()
+                    .get("peer-bob")
                     .is_some_and(|s| s.wall_ms == 1000 && s.logical == 0)
             },
             Duration::from_secs(2),
@@ -1117,7 +1139,7 @@ mod subscriber_tests {
         );
 
         let t = tracker.lock().await;
-        let stored = t.get("peer-bob").expect("peer accepted");
+        let stored = t.accepted().get("peer-bob").expect("peer accepted");
         assert_eq!(stored.wall_ms, 1000);
         assert_eq!(stored.logical, 0);
         drop(t);
@@ -1132,7 +1154,9 @@ mod subscriber_tests {
         let (_dir, paths) = paths();
         let kt = make_kt();
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "self-device".into(),
+        )));
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
             FleetKeySet::new(Arc::clone(&kt)),
@@ -1154,7 +1178,9 @@ mod subscriber_tests {
         let recorded = wait_until(
             || async {
                 let t = tracker.lock().await;
-                t.get("peer-bob").is_some_and(|s| s.wall_ms == 2000)
+                t.accepted()
+                    .get("peer-bob")
+                    .is_some_and(|s| s.wall_ms == 2000)
             },
             Duration::from_secs(2),
         )
@@ -1180,7 +1206,7 @@ mod subscriber_tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let t = tracker.lock().await;
-        let stored = t.get("peer-bob").expect("still present");
+        let stored = t.accepted().get("peer-bob").expect("still present");
         assert_eq!(stored.wall_ms, 2000, "tracker must not regress");
         drop(t);
 
@@ -1238,7 +1264,9 @@ mod subscriber_tests {
             FleetKeySet::new(Arc::clone(&kt)),
             "self-device".into(),
             Arc::clone(&local_state),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "self-device".into(),
+            ))),
             Arc::clone(&store),
             pub_tx,
             sub_rx,
@@ -1285,7 +1313,9 @@ mod subscriber_tests {
             FleetKeySet::new(Arc::clone(&kt)),
             "self-device".into(),
             Arc::clone(&local_state),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "self-device".into(),
+            ))),
             Arc::clone(&store),
             pub_tx,
             sub_rx,
@@ -1363,7 +1393,9 @@ mod subscriber_tests {
             FleetKeySet::new(Arc::clone(&kt)),
             "self-device".into(),
             Arc::clone(&local_state),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "self-device".into(),
+            ))),
             Arc::clone(&store),
             pub_tx,
             sub_rx,
@@ -1448,7 +1480,9 @@ mod subscriber_tests {
         let store_publisher = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let store_subscriber = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let local_state = Arc::new(Mutex::new(OwnerState::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "self-device".into(),
+        )));
         let engine = SyncEngine::new(
             FleetKeySet::new(Arc::clone(&kt)),
             "self-device".into(),
@@ -1490,7 +1524,7 @@ mod subscriber_tests {
         // hopefully-present root_cid) is retried rather than rejected.
         let t = tracker.lock().await;
         assert!(
-            !t.contains_key("peer-bob"),
+            !t.accepted().contains_key("peer-bob"),
             "MINT ordering: tracker must NOT advance on a blob-fetch miss"
         );
         drop(t);
@@ -1512,7 +1546,9 @@ mod subscriber_tests {
 
         // Round 1: bring up engine, accept a publish, shut down.
         {
-            let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+            let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "self-device".into(),
+            )));
             let state = Arc::new(Mutex::new(OwnerState::default()));
             let engine = SyncEngine::new(
                 FleetKeySet::new(Arc::clone(&kt)),
@@ -1532,7 +1568,9 @@ mod subscriber_tests {
             let converged = wait_until(
                 || async {
                     let t = tracker.lock().await;
-                    t.get("peer-bob").is_some_and(|s| s.wall_ms == 5000)
+                    t.accepted()
+                        .get("peer-bob")
+                        .is_some_and(|s| s.wall_ms == 5000)
                 },
                 Duration::from_secs(2),
             )
@@ -1552,7 +1590,10 @@ mod subscriber_tests {
 
         let (_pub_tx2, _pub_rx2) = mpsc::channel(16);
         let (sub_tx2, sub_rx2) = mpsc::channel(16);
-        let tracker2 = Arc::new(Mutex::new(tracker_loaded));
+        let tracker2 = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::from_accepted(
+            "self-device".to_string(),
+            tracker_loaded,
+        )));
         let state2 = Arc::new(Mutex::new(OwnerState::default()));
         let engine2 = SyncEngine::new(
             FleetKeySet::new(Arc::clone(&kt)),
@@ -1582,7 +1623,7 @@ mod subscriber_tests {
 
         let t = tracker2.lock().await;
         assert_eq!(
-            t.get("peer-bob").unwrap().wall_ms,
+            t.accepted().get("peer-bob").unwrap().wall_ms,
             5000,
             "replay tracker must reject the older HLC across restart"
         );
@@ -1625,7 +1666,9 @@ mod publisher_tests {
             FleetKeySet::new(Arc::clone(&kt)),
             "alice-device".into(),
             Arc::clone(&state),
-            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "alice-device".into(),
+            ))),
             Arc::clone(&store) as Arc<dyn ContentStore>,
             pub_tx,
             sub_rx,
@@ -1748,8 +1791,12 @@ mod integration_tests {
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let a_state = Arc::new(Mutex::new(OwnerState::default()));
         let b_state = Arc::new(Mutex::new(OwnerState::default()));
-        let a_tracker = Arc::new(Mutex::new(BTreeMap::new()));
-        let b_tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        let a_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "device-a".into(),
+        )));
+        let b_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "device-b".into(),
+        )));
 
         // A publishes → forwards into B's subscriber.
         let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -3144,7 +3191,6 @@ mod cas_op_protocol_tests {
             canonical_cbor_encode, encrypt_entry, encrypt_root_publish, space_lookup_key, KeyTree,
         };
         use crate::owner_state_types::{Hlc, RootPublishPayload};
-        use std::collections::BTreeMap;
         use tokio::sync::mpsc;
 
         let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(8);
@@ -3190,7 +3236,14 @@ mod cas_op_protocol_tests {
         // Set up a SyncEngine subscriber wired through RuntimeContentStore.
         let kt = Arc::new(KeyTree::derive(&[42u8; 32]).unwrap());
         let state = Arc::new(Mutex::new(OwnerState::default()));
-        let tracker = Arc::new(Mutex::new(BTreeMap::new()));
+        // The tracker's local id is the ENGINE's ("device-sub"), not the
+        // forged publisher's. With "device-pub" here the inbound frame would
+        // be echo-suppressed and the assertion below would pass for the wrong
+        // reason, leaving the fetch-miss path this test exists for untested
+        // (CodeRabbit, PR #546).
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "device-sub".into(),
+        )));
         let content_store = Arc::new(RuntimeContentStore::new(
             cas_op_tx.clone(),
             std::time::Duration::from_millis(500),

@@ -12,6 +12,7 @@
 //! Phase 3 (Zenoh sync) and Phase 4 (IPC) consume these types; this
 //! module has no I/O of its own.
 
+use harmony_crdt_sync::HlcTick;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Helper: serialize byte array as CBOR bstr, not as array.
@@ -315,7 +316,11 @@ where
 /// `device_id` (9) would mix encoded lengths 8/8/10 and silently
 /// violate the canonical-CBOR precondition. See PR #72 round 3 for
 /// the rationale.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Field declaration order is **load-bearing twice over**: it fixes the
+/// locked wire order above, and the derived [`Ord`] is lexicographic in
+/// declaration order, which is exactly the ZEB-211 "strictly newer"
+/// relation. Reordering these fields would silently change both.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Hlc {
     #[serde(rename = "w")]
     pub wall_ms: u64,
@@ -328,9 +333,26 @@ pub struct Hlc {
 impl Hlc {
     /// Lexicographic ordering on `(wall_ms, logical, device_id)`. See
     /// ZEB-211 spec §"Definition of strictly newer".
+    ///
+    /// Delegates to the derived [`Ord`], which compares fields in
+    /// declaration order — the same tuple, one definition. The
+    /// `derived_order_matches_is_strictly_newer_than` test pins that
+    /// equivalence, since `harmony_crdt_sync::MonotoneMap` and
+    /// `ReplayTracker` reach for `Ord` directly rather than this method.
     pub fn is_strictly_newer_than(&self, other: &Hlc) -> bool {
-        (self.wall_ms, self.logical, self.device_id.as_str())
-            > (other.wall_ms, other.logical, other.device_id.as_str())
+        self > other
+    }
+}
+
+impl From<&Hlc> for HlcTick {
+    /// Drop the writer identity: [`HlcTick`] carries the tick arithmetic
+    /// only, and the ZEB-211 ordering agrees with it on `(wall_ms,
+    /// logical)` because `device_id` is the *last* tie-break.
+    fn from(h: &Hlc) -> Self {
+        HlcTick {
+            wall_ms: h.wall_ms,
+            logical: h.logical,
+        }
     }
 }
 

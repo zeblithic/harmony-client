@@ -280,8 +280,9 @@ pub struct ProdButlerDepositCtx {
     pub device_x25519_priv: zeroize::Zeroizing<[u8; 32]>,
     /// The dm-inbox dataset handles (same Arcs the engine owns).
     pub dm_inbox_doc: Arc<tokio::sync::Mutex<DmInboxDoc>>,
-    pub dm_inbox_tracker:
-        Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, crate::owner_state_types::Hlc>>>,
+    pub dm_inbox_tracker: Arc<
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
+    >,
     pub dm_inbox_engine: Arc<crate::fleet_sync::FleetSyncEngine<DmInboxDoc>>,
     /// Weak nudge sender into the dm-inbox ingest sweeper. Weak so the
     /// acceptor (whose lifetime is tied to the iroh link manager, not the
