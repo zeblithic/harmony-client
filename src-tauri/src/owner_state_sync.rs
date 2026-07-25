@@ -3236,8 +3236,13 @@ mod cas_op_protocol_tests {
         // Set up a SyncEngine subscriber wired through RuntimeContentStore.
         let kt = Arc::new(KeyTree::derive(&[42u8; 32]).unwrap());
         let state = Arc::new(Mutex::new(OwnerState::default()));
+        // The tracker's local id is the ENGINE's ("device-sub"), not the
+        // forged publisher's. With "device-pub" here the inbound frame would
+        // be echo-suppressed and the assertion below would pass for the wrong
+        // reason, leaving the fetch-miss path this test exists for untested
+        // (CodeRabbit, PR #546).
         let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
-            "device-pub".into(),
+            "device-sub".into(),
         )));
         let content_store = Arc::new(RuntimeContentStore::new(
             cas_op_tx.clone(),

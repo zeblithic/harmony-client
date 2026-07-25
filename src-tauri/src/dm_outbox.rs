@@ -3237,7 +3237,11 @@ impl DeviceHlcStore for std::collections::BTreeMap<String, Hlc> {
 
 impl DeviceHlcStore for harmony_crdt_sync::ReplayTracker<String, Hlc> {
     fn last_for(&self, device_id: &str) -> Option<&Hlc> {
-        self.accepted_from(&device_id.to_string())
+        // Through `accepted()` rather than `accepted_from`: the latter takes
+        // `&K` (= `&String`) and would allocate on every lookup, under the
+        // tracker lock, on a path ~77 call sites reach. `BTreeMap<String, _>`
+        // borrows to `str`, so this lookup is allocation-free.
+        self.accepted().get(device_id)
     }
     fn record_local(&mut self, device_id: &str, hlc: Hlc) {
         debug_assert_eq!(
