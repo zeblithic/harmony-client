@@ -35,7 +35,10 @@
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use harmony_content::cid::ContentId;
-use harmony_crdt_sync::{Admission, HlcTick, ReplayTracker, RetryBackoff};
+use harmony_crdt_sync::{
+    Admission, DebounceLatch, DirtySignal, HlcTick, PublishClaim, PublishOutcome, ReplayTracker,
+    RetryBackoff,
+};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -2536,22 +2539,33 @@ fn maybe_spawn_pending_clear_rescan_for_pending_join(
 /// with nothing to send. Any success clears the escalation, so an intermittent
 /// failure does not inherit the delay an earlier outage earned.
 ///
-/// `fleet_sync::settle_publish` is the same decision expressed against the
-/// core kernel's `PublishClaim`/`DirtySignal` pair; this engine is still
-/// pre-kernel, so it takes the raw `was_dirty` bool instead. Logging stays at
-/// the call sites, which have different context to report.
+/// ZEB-750: this is now the SAME function `fleet_sync::settle_publish` is,
+/// expressed against the same core kernel vocabulary. ZEB-761 introduced the
+/// helper in both engines but had to give this one a raw `was_dirty` bool
+/// because it was still pre-kernel — "same decision, two vocabularies". The
+/// claim carries whether this path actually took the caller's signal, and
+/// `settle` decides whether it must be restored. Logging stays at the call
+/// sites, which have different context to report.
 fn settle_publish(
     ctx: &InternalCtx,
-    was_dirty: bool,
+    claim: PublishClaim,
     pub_result: &Result<(), CommunitySyncError>,
     retry: &mut RetryBackoff,
     now_ms: u64,
 ) {
-    if pub_result.is_err() && was_dirty {
-        // Re-arm the signal AND schedule the wakeup that will act on it.
-        // Restoring the flag alone is the ZEB-761 bug.
-        ctx.has_pending_dirty.store(true, Ordering::Release);
-        retry.on_failure(now_ms);
+    let outcome = if pub_result.is_ok() {
+        PublishOutcome::Succeeded
+    } else {
+        PublishOutcome::Failed
+    };
+    match claim.settle(outcome) {
+        DirtySignal::Restore => {
+            // Re-arm the signal AND schedule the wakeup that will act on it.
+            // Restoring the flag alone is the ZEB-761 bug.
+            ctx.has_pending_dirty.store(true, Ordering::Release);
+            retry.on_failure(now_ms);
+        }
+        DirtySignal::Spent => {}
     }
     if pub_result.is_ok() {
         retry.clear(now_ms);
@@ -2571,7 +2585,12 @@ fn settle_publish(
 async fn internal_task(mut ctx: InternalCtx) {
     use std::time::Instant;
 
-    let mut next_wakeup: Option<Instant> = None;
+    // ZEB-750: the publish window is core's `DebounceLatch`. The dirty FLAG
+    // stays caller-owned (`ctx.has_pending_dirty`) — it is poked by every
+    // mutation site, so it is shared, concurrently-written caller state and
+    // the kernel deliberately does not own it. The latch owns only the
+    // window, which nothing outside this task writes.
+    let mut latch = DebounceLatch::new(ctx.debounce.as_millis() as u64);
     // ZEB-761: the debounce timer alone cannot retry. A failed publish
     // restored the dirty bit but cleared `next_wakeup`, so on a quiescent
     // community the membership state stayed persisted-but-unreplicated
@@ -2611,15 +2630,12 @@ async fn internal_task(mut ctx: InternalCtx) {
         // SOONER wins — a fresh mutation is a legitimate new reason to
         // publish, not a retry spin, so it must not be held behind a
         // backoff earned by an earlier failure (ZEB-761).
-        let retry_wakeup = retry
-            .pending_at()
-            .map(|at| retry_epoch + std::time::Duration::from_millis(at));
-        let wake_at = match (next_wakeup, retry_wakeup) {
+        let wake_at = match (latch.deadline(), retry.pending_at()) {
             (Some(debounce_at), Some(retry_at)) => Some(debounce_at.min(retry_at)),
             (debounce_at, retry_at) => debounce_at.or(retry_at),
         };
         let sleep_dur = wake_at
-            .map(|t| t.saturating_duration_since(Instant::now()))
+            .map(|d| std::time::Duration::from_millis(d.saturating_sub(retry_now_ms())))
             .unwrap_or(std::time::Duration::from_secs(3600));
 
         tokio::select! {
@@ -2628,20 +2644,21 @@ async fn internal_task(mut ctx: InternalCtx) {
                 // a burst of mutations collapses to one publish after
                 // `debounce` from the last call in the burst.
                 if ctx.has_pending_dirty.load(Ordering::Relaxed) {
-                    next_wakeup = Some(Instant::now() + ctx.debounce);
+                    latch.mark_dirty(retry_now_ms());
                 }
                 notified.set(notify.notified());
             }
             _ = tokio::time::sleep(sleep_dur), if wake_at.is_some() => {
-                // Reached either schedule's instant. Clearing `next_wakeup`
-                // is right for both: a due retry publishes the pending
-                // mutation too, since the publish snapshots current state.
-                next_wakeup = None;
+                // Reached either schedule's instant. `on_deadline` disarms the
+                // window, which is right for both: a due retry publishes the
+                // pending mutation too, since the publish snapshots current
+                // state.
+                //
                 // `swap` rather than `store(false)` so a publish
                 // failure restores the dirty bit; otherwise a
                 // transient Zenoh / CAS error silently consumes the
                 // signal and the next shutdown skips the retry.
-                let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
+                let claim = latch.on_deadline(ctx.has_pending_dirty.swap(false, Ordering::AcqRel));
                 let pub_result = publish_root_now(&ctx).await;
                 if let Err(e) = &pub_result {
                     tracing::warn!(
@@ -2650,7 +2667,7 @@ async fn internal_task(mut ctx: InternalCtx) {
                         "community publish_root_now failed"
                     );
                 }
-                settle_publish(&ctx, was_dirty, &pub_result, &mut retry, retry_now_ms());
+                settle_publish(&ctx, claim, &pub_result, &mut retry, retry_now_ms());
                 // ZEB-462 B: persist the CRDT (`crdt.cbor`) UNCONDITIONALLY —
                 // the membership events are validated, durable facts that must
                 // survive a crash even when this publish never landed. Persist
@@ -2682,10 +2699,9 @@ async fn internal_task(mut ctx: InternalCtx) {
                 }
             }
             Some(resp_tx) = ctx.flush_now_rx.recv() => {
-                next_wakeup = None;
-                let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
+                let claim = latch.on_flush(ctx.has_pending_dirty.swap(false, Ordering::AcqRel));
                 let pub_result = publish_root_now(&ctx).await;
-                settle_publish(&ctx, was_dirty, &pub_result, &mut retry, retry_now_ms());
+                settle_publish(&ctx, claim, &pub_result, &mut retry, retry_now_ms());
                 // Persist matches the public contract: flush_now() returns
                 // after both publish AND on-disk persist complete (mirrors
                 // owner_state_sync::SyncEngine). ZEB-462 B: persist the CRDT
@@ -2865,12 +2881,23 @@ async fn internal_task(mut ctx: InternalCtx) {
                 // point — we're in the shutdown branch. (Mutating IPC
                 // entry points are fenced by `closing` above; the
                 // flag-set is why "no concurrent mutator" now holds.)
-                let was_dirty = ctx.has_pending_dirty.load(Ordering::Relaxed);
-                let pub_result = if was_dirty {
+                //
+                // ZEB-750: `load`, not `swap` — this arm returns, so the flag
+                // has no future to protect, and the latch does not touch it.
+                // The claim is settled below purely to discharge the
+                // must-settle contract; nothing will act on a retry armed
+                // here, and `should_publish()` is false when nothing is owed.
+                let claim = latch.on_shutdown(ctx.has_pending_dirty.load(Ordering::Relaxed));
+                let pub_result = if claim.should_publish() {
                     publish_root_now(&ctx).await
                 } else {
                     Ok(())
                 };
+                let _ = claim.settle(if pub_result.is_ok() {
+                    PublishOutcome::Succeeded
+                } else {
+                    PublishOutcome::Failed
+                });
                 // ZEB-462 B: persist the CRDT (`crdt.cbor`) UNCONDITIONALLY —
                 // a SIGKILL never reaches this arm, but a GRACEFUL shutdown
                 // that cannot publish (transport already torn down, no live
@@ -3205,6 +3232,27 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
 /// seam. `observe_local` is monotone: a stamp that fails to advance is a
 /// no-op returning `false`, not a panic. That is what lets this function
 /// use core's tick rule unmodified (see the saturation note below).
+/// The pure tick arithmetic behind [`next_hlc`], split out so it is
+/// directly testable without an `InternalCtx`, a clock, or a lock.
+///
+/// ZEB-750: the split exists because a test that called
+/// `HlcTick::next` directly was **vacuous** — it pinned core's contract but
+/// would still pass if this engine stopped delegating to it. Reintroducing
+/// the old manufactured-wall-advance branch did not fail that test. It
+/// fails this one.
+fn community_hlc_tick(prev: Option<&Hlc>, wall_ms: u64, device_id: &str) -> Hlc {
+    let prev_tick = prev.map(|p| HlcTick {
+        wall_ms: p.wall_ms,
+        logical: p.logical,
+    });
+    let tick = HlcTick::next(prev_tick, wall_ms);
+    Hlc {
+        wall_ms: tick.wall_ms,
+        logical: tick.logical,
+        device_id: device_id.to_string(),
+    }
+}
+
 async fn next_hlc(ctx: &InternalCtx) -> Hlc {
     use std::time::{SystemTime, UNIX_EPOCH};
     let wall_ms = SystemTime::now()
@@ -3217,26 +3265,13 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
     let prev = tracker.accepted_from(&local).cloned();
     // ZEB-750: the tick rule is core's, shared with fleet_sync — one
     // audited implementation of a subtle monotonicity contract rather than
-    // two hand-rolled ones. `HlcTick` is identity-free (`wall_ms`,
-    // `logical` only); the `device_id` that makes this a domain `Hlc` is
-    // re-attached below, so the pinned wire field order is untouched.
-    //
-    // Under logical saturation core TIES `prev` instead of manufacturing a
-    // wall advance. Receivers then reject the tied stamp as a duplicate
-    // until the wall clock catches up — a stall, which is strictly
-    // preferable to admitting a replay. The old escape branch existed only
-    // to dodge `record()`'s debug_assert, and `observe_local` replaced that
-    // with a monotone no-op.
-    let prev_tick = prev.as_ref().map(|p| HlcTick {
-        wall_ms: p.wall_ms,
-        logical: p.logical,
-    });
-    let tick = HlcTick::next(prev_tick, wall_ms);
-    let now = Hlc {
-        wall_ms: tick.wall_ms,
-        logical: tick.logical,
-        device_id: ctx.device_id.clone(),
-    };
+    // two hand-rolled ones. Under logical saturation core TIES `prev`
+    // instead of manufacturing a wall advance; receivers then reject the
+    // tied stamp as a duplicate until the wall clock catches up — a stall,
+    // which is strictly preferable to admitting a replay. The old escape
+    // branch existed only to dodge `record()`'s debug_assert, and
+    // `observe_local` replaced that with a monotone no-op.
+    let now = community_hlc_tick(prev.as_ref(), wall_ms, &ctx.device_id);
     tracker.observe_local(now.clone());
     now
 }
@@ -5814,11 +5849,16 @@ mod tests {
     /// publishes inside one wall-millisecond.
     #[test]
     fn hlc_tick_ties_instead_of_manufacturing_a_wall_advance_at_saturation_zeb750() {
-        let prev = HlcTick {
+        // Drives THIS ENGINE's arithmetic (`community_hlc_tick`), not core's
+        // `HlcTick::next` directly. An earlier draft called the kernel
+        // directly and was vacuous: reintroducing the old branch left it
+        // green, because it never touched the production path.
+        let prev = Hlc {
             wall_ms: 5_000,
             logical: u32::MAX,
+            device_id: "sat-dev".to_string(),
         };
-        let next = HlcTick::next(Some(prev), 5_000);
+        let next = community_hlc_tick(Some(&prev), 5_000, "sat-dev");
 
         assert_eq!(next, prev, "a saturated tick must tie, not advance");
         assert_eq!(
@@ -5829,16 +5869,36 @@ mod tests {
         // And the tracker reports the non-advance instead of asserting.
         let local = (OwnerAddr([9u8; 16]), "sat-dev".to_string());
         let mut tracker = CommunityReplayTracker::new(local);
-        let as_hlc = |t: HlcTick| Hlc {
-            wall_ms: t.wall_ms,
-            logical: t.logical,
-            device_id: "sat-dev".to_string(),
-        };
-        assert!(tracker.observe_local(as_hlc(prev)));
+        assert!(tracker.observe_local(prev));
         assert!(
-            !tracker.observe_local(as_hlc(next)),
+            !tracker.observe_local(next),
             "a tied tick must not advance the local watermark"
         );
+    }
+
+    /// ZEB-750: the ordinary (non-pathological) tick behaviour this engine
+    /// now delegates to core, pinned against the production helper so a
+    /// future divergence is caught rather than assumed away.
+    #[test]
+    fn community_hlc_tick_advances_on_wall_tie_and_backward_step_zeb750() {
+        let t0 = community_hlc_tick(None, 1_000, "d");
+        assert_eq!((t0.wall_ms, t0.logical), (1_000, 0));
+
+        // Same millisecond: the logical counter breaks the tie.
+        let t1 = community_hlc_tick(Some(&t0), 1_000, "d");
+        assert_eq!((t1.wall_ms, t1.logical), (1_000, 1));
+        assert!(t1.is_strictly_newer_than(&t0));
+
+        // Wall steps BACKWARD (NTP correction): the tick still advances and
+        // the wall reading never regresses.
+        let t2 = community_hlc_tick(Some(&t1), 900, "d");
+        assert_eq!((t2.wall_ms, t2.logical), (1_000, 2));
+        assert!(t2.is_strictly_newer_than(&t1));
+
+        // A later millisecond resets the counter.
+        let t3 = community_hlc_tick(Some(&t2), 2_000, "d");
+        assert_eq!((t3.wall_ms, t3.logical), (2_000, 0));
+        assert!(t3.is_strictly_newer_than(&t2));
     }
 
     /// ZEB-750: a publish reflected back by the transport is classified

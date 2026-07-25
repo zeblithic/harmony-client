@@ -2012,3 +2012,144 @@ async fn a_persistently_failing_community_publish_paces_its_retries_zeb761() {
 
     engine.shutdown().await.ok();
 }
+
+/// ZEB-750: a burst of mutations inside one debounce window collapses into a
+/// single publish.
+///
+/// This is the sliding-window property `DebounceLatch` exists to provide, and
+/// before this test nothing pinned it for the community engine — the window
+/// was hand-rolled (`next_wakeup = Some(Instant::now() + ctx.debounce)`) and
+/// only exercised incidentally by tests that happened to mutate once. A
+/// regression to "re-arm only when idle" would publish once per mutation,
+/// which is correct-looking, passes every existing test, and multiplies
+/// state-root traffic by the size of every burst.
+///
+/// **This test must run on the REAL clock.** Under
+/// `#[tokio::test(start_paused = true)]` it cannot detect the regression at
+/// all, and an earlier draft that used paused time passed with the window
+/// deliberately broken. The reason is a harness subtlety worth recording:
+/// the latch is driven by `retry_now_ms()`, which reads
+/// `std::time::Instant` — and `tokio::time::pause()` virtualizes only
+/// `tokio::time::Instant`, not `std::time::Instant`. So under paused time
+/// the latch's clock is FROZEN near zero while tokio's sleeps advance
+/// normally. Every loop re-entry then recomputes
+/// `sleep_dur = deadline - ~0`, i.e. the full window measured from *now* —
+/// which slides the effective wakeup whether or not `mark_dirty` was
+/// called. The two behaviours become indistinguishable.
+///
+/// ZEB-761's retry tests are unaffected because they only assert "it
+/// eventually fires" and "gaps escalate", neither of which depends on the
+/// latch clock tracking tokio's. A sliding-window assertion does.
+///
+/// The window is kept small (300 ms) so the real-clock cost is well under a
+/// second.
+#[tokio::test]
+async fn a_burst_of_mutations_collapses_into_one_publish_zeb750() {
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel(16);
+
+    let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let puts_task = Arc::clone(&puts);
+    tokio::spawn(async move {
+        use harmony_app::content_store::CasOp;
+        while let Some(op) = cas_op_rx.recv().await {
+            if let CasOp::PutLocal {
+                reply: Some(reply), ..
+            } = op
+            {
+                puts_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = reply.send(Ok(()));
+            }
+        }
+    });
+
+    let community_id = SpaceId([11u8; 16]);
+    let mk = EpochKey::new([0x5c; 32]);
+    let admin = OwnerAddr([12u8; 16]);
+    let debounce_ms = 300u64;
+
+    let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "burst-device".to_string(),
+    ))));
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: mk,
+        admin_addr: admin,
+        is_invite_only: false,
+        device_id: "burst-device".into(),
+        self_owner: admin,
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x5c; 32])),
+        state: Arc::clone(&state),
+        tracker: Arc::clone(&tracker),
+        content_store: cs,
+        publisher_tx: out_tx,
+        subscriber_rx: in_rx,
+        paths: harmony_app::community_state_sync::PersistPaths {
+            crdt: tmp.path().join("crdt.cbor"),
+            replay: tmp.path().join("replay.cbor"),
+        },
+        debounce_ms,
+        identity_resolver: None,
+        error_tx: None,
+        delta_tx: None,
+        pending_redemptions: None,
+        crdt_state: None,
+        admin_identity_pub: None,
+        nav_emitter: None,
+        root_serve_rx: None,
+    });
+
+    // Five signals, 60 ms apart, spanning t=0..240 — all inside one 300 ms
+    // window, but spread far enough that a SLIDING window and a FIXED one
+    // have distinguishable deadlines: fixed fires at 300 (armed by the first
+    // signal), sliding fires at 540 (240 + 300, from the last).
+    //
+    // The spread is load-bearing. An earlier draft bunched the signals 10 ms
+    // apart, putting both deadlines within 40 ms of each other; a single
+    // coarse "sleep past both" check cannot tell them apart. Probing BETWEEN
+    // them is what makes this a test about SLIDING rather than about
+    // debouncing-at-all.
+    for _ in 0..5 {
+        engine.notify_dirty();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    }
+
+    // t≈300 after the loop. A fixed window armed by the FIRST signal has
+    // fired by now; a sliding one stays open until ≈540.
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    assert!(
+        out_rx.try_recv().is_err(),
+        "a fixed window would have fired at 300 ms; the window must SLIDE \
+         with each mutation and still be open at t≈360"
+    );
+
+    // Advance past the window measured from the LAST signal.
+    tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+        .await
+        .expect("the collapsed burst must publish once the window elapses")
+        .expect("publisher_tx dropped or never sent");
+    assert!(
+        !bytes.is_empty(),
+        "the publish must carry a real wire packet"
+    );
+
+    // And exactly one publish, not five.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        out_rx.try_recv().is_err(),
+        "a burst inside one window must collapse to a SINGLE publish"
+    );
+
+    engine.shutdown().await.ok();
+}
