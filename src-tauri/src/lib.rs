@@ -62218,11 +62218,70 @@ async fn add_friend_by_key(
     add_friend_by_key_impl(state.inner(), sink, identity_pub_hex).await
 }
 
-/// ZEB-445: shared IPC/RPC seam.
+/// ZEB-784: WHY a dial is happening, which decides what a `Pending` result does
+/// to the outbound-request store.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DialOrigin {
+    /// The user asked for this dial. A `Pending` result records the request so
+    /// the node retries it.
+    UserRequested,
+    /// The retry driver re-dialing an ALREADY-RECORDED request.
+    Retry,
+}
+
+/// What a dial outcome should do to the outbound-request store.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum OutboundAction {
+    Record,
+    Forget,
+    Leave,
+}
+
+/// Pure decision behind the store write, extracted so the one case that is easy
+/// to get wrong is directly testable.
+///
+/// The subtle arm is `(Retry, Pending)`. A retry dial takes seconds, during
+/// which the user may cancel. If the retry then recorded on `Pending`, it would
+/// RESURRECT the request the user just cancelled and keep dialing it for the
+/// rest of the TTL — and the write would be perfectly ordered, so the persist
+/// serialization does not help. Recording is also pointless on this path: the
+/// record already exists (`record` is first-write-wins, so it would be a no-op)
+/// unless it was deliberately removed, which is exactly the case we must not
+/// undo. So a retry NEVER records.
+///
+/// `Unreachable` leaves the store alone from either origin — an offline peer is
+/// precisely what a retry is for, and a first dial that cannot reach anyone has
+/// not established a request worth retrying.
+pub(crate) fn outbound_record_action(
+    origin: DialOrigin,
+    outcome: &AddFriendOutcome,
+) -> OutboundAction {
+    match (origin, outcome) {
+        // The link exists; retrying would be a pointless dial. Safe from either
+        // origin: forgetting an already-cancelled key is a no-op.
+        (_, AddFriendOutcome::Linked { .. }) => OutboundAction::Forget,
+        (DialOrigin::UserRequested, AddFriendOutcome::Pending) => OutboundAction::Record,
+        (DialOrigin::Retry, AddFriendOutcome::Pending) => OutboundAction::Leave,
+        (_, AddFriendOutcome::Unreachable) => OutboundAction::Leave,
+    }
+}
+
+/// ZEB-445: shared IPC/RPC seam. User-initiated: a `Pending` result records the
+/// request so the node retries it.
 pub(crate) async fn add_friend_by_key_impl(
     state: &std::sync::Mutex<NodeState>,
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     identity_pub_hex: String,
+) -> Result<AddFriendOutcome, String> {
+    add_friend_by_key_with_origin(state, sink, identity_pub_hex, DialOrigin::UserRequested).await
+}
+
+/// ZEB-784: the real body, parameterized by why the dial is happening.
+pub(crate) async fn add_friend_by_key_with_origin(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    identity_pub_hex: String,
+    origin: DialOrigin,
 ) -> Result<AddFriendOutcome, String> {
     // ZEB-784: kept for the outbound-request bookkeeping below, because
     // `identity_pub_hex` itself is moved into the dial.
@@ -62352,13 +62411,13 @@ pub(crate) async fn add_friend_by_key_impl(
                 .map_err(|e| format!("NodeState poisoned: {e}"))?;
             std::sync::Arc::clone(&g.pending_outbound_links)
         };
-        match outcome {
-            AddFriendOutcome::Pending => outbound_links.record(
+        match outbound_record_action(origin, &outcome) {
+            OutboundAction::Record => outbound_links.record(
                 &identity_pub_hex_for_record,
                 crate::iroh_friend_acceptor::wall_now_ms(),
             ),
-            AddFriendOutcome::Linked { .. } => outbound_links.forget(&identity_pub_hex_for_record),
-            AddFriendOutcome::Unreachable => {}
+            OutboundAction::Forget => outbound_links.forget(&identity_pub_hex_for_record),
+            OutboundAction::Leave => {}
         }
     }
 
@@ -62448,10 +62507,11 @@ pub(crate) async fn retry_pending_friend_links(
     // `Pending` — costs one short dial a minute until the 7-day TTL retires it.
     let mut linked = 0usize;
     for (identity_pub_hex, _recorded_at) in due {
-        match add_friend_by_key_impl(
+        match add_friend_by_key_with_origin(
             state,
             std::sync::Arc::clone(&sink),
             identity_pub_hex.clone(),
+            DialOrigin::Retry,
         )
         .await
         {
@@ -63252,6 +63312,85 @@ mod friend_ipc_tests {
         let publisher = test_publisher().await;
         super::friend_token_publish_guard(Some(&publisher))
             .expect("a present publisher must pass the guard");
+    }
+
+    // ── ZEB-784: the store write is decided by WHY the dial happened ───────
+
+    /// The arm that matters: a retry must never record on `Pending`.
+    ///
+    /// A retry dial takes seconds. If the user cancels during it, recording on
+    /// the reply resurrects the request they just cancelled and keeps dialing it
+    /// for the rest of the TTL. Note this is NOT the persist-ordering race — the
+    /// writes here are perfectly ordered (`forget` then `record`); the `record`
+    /// simply should not happen at all.
+    #[test]
+    fn retry_never_records_but_user_request_does() {
+        use super::{outbound_record_action, DialOrigin, OutboundAction};
+        let pending = AddFriendOutcome::Pending;
+
+        assert_eq!(
+            outbound_record_action(DialOrigin::UserRequested, &pending),
+            OutboundAction::Record,
+            "a user's own add must be recorded so it gets retried"
+        );
+        assert_eq!(
+            outbound_record_action(DialOrigin::Retry, &pending),
+            OutboundAction::Leave,
+            "a retry must NOT record — it would resurrect a cancel made mid-dial"
+        );
+    }
+
+    /// `Linked` clears from either origin; `Unreachable` clears from neither.
+    #[test]
+    fn linked_always_forgets_and_unreachable_never_touches() {
+        use super::{outbound_record_action, DialOrigin, OutboundAction};
+        let linked = AddFriendOutcome::Linked {
+            owner_id_hex: "ab".repeat(16),
+            display: None,
+        };
+        for origin in [DialOrigin::UserRequested, DialOrigin::Retry] {
+            assert_eq!(
+                outbound_record_action(origin, &linked),
+                OutboundAction::Forget,
+                "{origin:?}: a formed link makes the record pointless"
+            );
+            assert_eq!(
+                outbound_record_action(origin, &AddFriendOutcome::Unreachable),
+                OutboundAction::Leave,
+                "{origin:?}: an offline peer is exactly what a retry exists for"
+            );
+        }
+    }
+
+    /// Replays the cancel-during-retry interleaving against the real store, so
+    /// the guarantee is pinned at the level the user experiences it: cancel, and
+    /// it stays cancelled.
+    #[test]
+    fn cancel_during_an_in_flight_retry_is_not_resurrected() {
+        use super::{outbound_record_action, DialOrigin, OutboundAction};
+        let store = crate::friend_requests::PendingOutboundLinks::new();
+        let key = "cd".repeat(64);
+        store.record(&key, 1_000);
+
+        // The retry driver snapshots the live set, then dials (slow).
+        let snapshot = store.list(2_000);
+        assert_eq!(snapshot.len(), 1, "the retry sees the request");
+
+        // The user cancels while that dial is in flight.
+        store.forget(&key);
+        assert!(store.list(3_000).is_empty(), "cancel took effect");
+
+        // The dial finally returns `Pending`. Applying the decision must leave
+        // the store alone — the old unconditional `record` put the key back.
+        if let OutboundAction::Record =
+            outbound_record_action(DialOrigin::Retry, &AddFriendOutcome::Pending)
+        {
+            store.record(&key, 4_000);
+        }
+        assert!(
+            store.list(5_000).is_empty(),
+            "a cancelled request must not come back when the in-flight retry replies"
+        );
     }
 
     // ── ZEB-783: outbound-request projection ──────────────────────────────
