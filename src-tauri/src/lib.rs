@@ -1575,6 +1575,15 @@ pub struct NodeState {
     pub pending_outbound_introductions:
         std::sync::Arc<crate::friend_requests::PendingOutboundIntroductions>,
 
+    /// ZEB-784: outbound plain link requests this user sent that came back
+    /// `Pending`. Shared with the friend acceptor (which `take`s one to
+    /// auto-accept the target's reciprocal dial) so `add_friend_by_key` can
+    /// `record` into the SAME store. Built once (unconditional, non-`Option`)
+    /// and rehydrated from disk at owner-load — unlike the introduction store
+    /// this one MUST survive restart, because it is bounded by human accept
+    /// latency rather than a machine round trip.
+    pub pending_outbound_links: std::sync::Arc<crate::friend_requests::PendingOutboundLinks>,
+
     /// ZEB-236: process-local staged DM invites awaiting user accept/decline.
     /// Same lifecycle as `pending_friend_requests`.
     pub(crate) pending_dm_invites:
@@ -1747,6 +1756,13 @@ impl NodeState {
         // restart drops any stale pre-authorizations (process-local + ephemeral).
         self.pending_outbound_introductions =
             std::sync::Arc::new(crate::friend_requests::PendingOutboundIntroductions::new());
+        // ZEB-784: rebuild an EMPTY outbound-link store. This is not the same
+        // decision as the introduction store above — these records are durable
+        // and are rehydrated from disk by `start_node`. Clearing here only drops
+        // the in-memory copy on stop; the file is the source of truth and the
+        // next boot reloads it.
+        self.pending_outbound_links =
+            std::sync::Arc::new(crate::friend_requests::PendingOutboundLinks::new());
         // ZEB-236: drop the staged DM-invite store so a restart rebuilds a
         // fresh one (process-local + ephemeral — ZEB-483 re-stages pending
         // invites from the next inbound message after a restart).
@@ -2030,6 +2046,10 @@ impl Default for NodeState {
             pending_friend_requests: None,
             pending_outbound_introductions: std::sync::Arc::new(
                 crate::friend_requests::PendingOutboundIntroductions::new(),
+            ),
+            // ZEB-784: empty until `start_node` rehydrates it from disk.
+            pending_outbound_links: std::sync::Arc::new(
+                crate::friend_requests::PendingOutboundLinks::new(),
             ),
             pending_dm_invites: None,
             pkarr_resolver: None,
@@ -62885,8 +62905,8 @@ mod friend_ipc_tests {
     fn list_pending_friend_requests_inner_projects_to_dto() {
         use crate::friend_requests::PendingFriendRequests;
         let store = PendingFriendRequests::new();
-        store.record_inbound(OwnerAddr([0xA1; 16]), Some("alice".into()), 1_000);
-        store.record_inbound(OwnerAddr([0xB2; 16]), None, 2_000);
+        store.record_inbound(OwnerAddr([0xA1; 16]), Some("alice".into()), None, 1_000);
+        store.record_inbound(OwnerAddr([0xB2; 16]), None, None, 2_000);
 
         let mut dtos = list_pending_friend_requests_inner(&store, 0);
         // Map iteration order is unspecified — sort for a stable assert.
@@ -63086,7 +63106,7 @@ mod friend_ipc_tests {
         use crate::friend_requests::PendingFriendRequests;
         let store = PendingFriendRequests::new();
         let addr = OwnerAddr([0xC3; 16]);
-        store.record_inbound(addr, Some("carol".into()), 5_000);
+        store.record_inbound(addr, Some("carol".into()), None, 5_000);
         assert!(!store.is_approved(&addr), "not approved before accept");
         store.mark_approved(addr);
         assert!(
@@ -63100,7 +63120,7 @@ mod friend_ipc_tests {
         use crate::friend_requests::PendingFriendRequests;
         let store = PendingFriendRequests::new();
         let addr = OwnerAddr([0xD4; 16]);
-        store.record_inbound(addr, None, 6_000);
+        store.record_inbound(addr, None, None, 6_000);
         store.mark_approved(addr);
         store.decline(&addr);
         assert!(
@@ -72859,6 +72879,10 @@ mod start_node_race_tests {
             pending_friend_requests: None,
             pending_outbound_introductions: std::sync::Arc::new(
                 crate::friend_requests::PendingOutboundIntroductions::new(),
+            ),
+            // ZEB-784: empty until `start_node` rehydrates it from disk.
+            pending_outbound_links: std::sync::Arc::new(
+                crate::friend_requests::PendingOutboundLinks::new(),
             ),
             pending_dm_invites: None,
             pkarr_resolver: None,
