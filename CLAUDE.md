@@ -198,6 +198,48 @@ untouched by design; full runs are the scheme's backstop).
 tells you to use `--full` (or `--force` to proceed anyway). `git add` new test
 files before gating: untracked files are invisible to the always-run set.
 
+### Reclaiming build-tree disk (ZEB-765)
+
+`src-tauri/target/` grows without bound and nothing prunes it automatically. On
+AVALON it reached **94.7 GB / 99,793 files** before anyone looked, from a tree
+whose newest artifact was three weeks stale. Two mechanisms compound:
+
+- **`incremental/`** accumulates per-session directories (695 of them, 48 GB)
+  that Cargo's lazy GC never keeps up with — and that are worthless the moment
+  the source moves on.
+- **`deps/`** is effectively append-only: artifacts are keyed by
+  (package, version, feature-set, compiler) and superseded entries are never
+  evicted. After an `iroh 0.98.2 → 1.0.1` bump, *both* versions' artifacts sit
+  on disk permanently. Every dependency bump ratchets the floor upward.
+
+So the steady state is not "large", it is "monotonically increasing".
+
+```bash
+scripts/build-gc                  # report size + staleness; deletes NOTHING  [default]
+scripts/build-gc --incremental    # drop incremental/ only; keeps deps/ rebuild speed
+scripts/build-gc --all            # full cargo clean; next build is COLD
+scripts/build-gc --all --yes      # skip the confirmation prompt
+```
+
+The report prints per-profile sizes, the `incremental/` session-dir count, and
+**when each profile last produced a binary** — that staleness line, not the size,
+is what tells you whether you are looking at a live cache or a corpse. Pruning
+always requires an explicit tier flag, and refuses to run non-interactively
+without `--yes` (exit 3).
+
+**Which tier:** `--incremental` during active work on a branch (deps/ stay warm).
+`--all` when the tree has gone stale across a dependency bump — once `Cargo.lock`
+has moved, most of `deps/` is artifacts for versions the lockfile no longer
+references, and the next build is near-cold whether you keep them or not.
+
+`CARGO_TARGET_DIR` is honoured, so a machine that redirects its target tree is
+still collectable.
+
+> **Note:** this is *not* ZEB-440. That was **CI runner** disk exhaustion, fixed
+> with `CARGO_INCREMENTAL=0` + debuginfo trims in `ci.yml`. Those mitigations are
+> exactly why CI does not accumulate this and workstations do — they never
+> applied locally.
+
 ### sccache (optional, larger speedup)
 
 [`sccache`](https://github.com/mozilla/sccache) caches cargo's compile artifacts across `cargo` invocations and across projects that share dep trees. Worth installing if you switch between `harmony-client` and other Rust projects often:
