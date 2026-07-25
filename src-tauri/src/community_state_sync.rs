@@ -35,7 +35,7 @@
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use harmony_content::cid::ContentId;
-use harmony_crdt_sync::RetryBackoff;
+use harmony_crdt_sync::{Admission, ReplayTracker, RetryBackoff};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -807,12 +807,35 @@ impl LocalInsertPrecheck {
     }
 }
 
-/// Per-publisher-device latest-accepted HLC, namespaced by publisher
-/// `OwnerAddr`. ZEB-256: re-keyed from `BTreeMap<String, Hlc>` so a
-/// member cannot squat another member's HLC slot via shared
-/// `EpochKey`. Each publisher's address gets its own per-device
-/// namespace, so a malicious Alice cannot squat Bob's HLC slot even if
-/// she emits a publish carrying `at.device_id == bob_dev`.
+/// The runtime replay type: core's [`ReplayTracker`] keyed by
+/// `(publisher_addr, device_id)` and clocked by the domain [`Hlc`].
+///
+/// ZEB-750: this replaces `CommunityRootHlcTracker`'s own
+/// `would_accept` / `record` pair. That pair enforced apply-before-advance
+/// with a `debug_assert!` — compiled out of release builds — across the
+/// 354-line window between the admission check and the advance in
+/// `handle_incoming_publish`. Core enforces the same discipline with a
+/// `CommitTicket` that only `admit` can mint and `commit` consumes, so the
+/// ordering is unforgeable rather than merely documented.
+///
+/// The local mint's own watermark lives in the same map under
+/// `(self_owner, device_id)` and is reached through `observe_local` — the
+/// two key-spaces are disjoint, exactly as core's module docs describe.
+/// `local` is NOT part of the on-disk shape, so `replay.cbor` is
+/// byte-unchanged by this adoption.
+pub type CommunityReplayTracker = ReplayTracker<(OwnerAddr, String), Hlc>;
+
+/// Persistence DTO for the per-publisher-device latest-accepted HLC map,
+/// namespaced by publisher `OwnerAddr`. ZEB-256: re-keyed from
+/// `BTreeMap<String, Hlc>` so a member cannot squat another member's HLC
+/// slot via shared `EpochKey`. Each publisher's address gets its own
+/// per-device namespace, so a malicious Alice cannot squat Bob's HLC slot
+/// even if she emits a publish carrying `at.device_id == bob_dev`.
+///
+/// ZEB-750: this type is now **only** the on-disk shape — the admission
+/// logic that used to live here moved to [`CommunityReplayTracker`].
+/// Convert at the persistence boundary: `ReplayTracker::from_accepted` on
+/// load, `accepted().clone()` on save.
 ///
 /// `Serialize` / `Deserialize` are derived so
 /// `community_state_persist::save_replay` can canonical-CBOR-encode the
@@ -831,42 +854,18 @@ impl CanonicalPayloadSealed for CommunityRootHlcTracker {}
 impl CanonicalPayload for CommunityRootHlcTracker {}
 
 impl CommunityRootHlcTracker {
-    /// Test the candidate HLC against the per-(addr, device) latest.
-    /// Returns `true` if the candidate strictly dominates the recorded
-    /// entry (or there is none); `false` otherwise.
-    ///
-    /// Does NOT mutate — `record` is a separate step the caller invokes
-    /// after the rest of the receive pipeline succeeds. The split
-    /// implements the "advance-after-success" idiom that owner-state's
-    /// call sites apply manually to a bare BTreeMap.
-    pub fn would_accept(&self, publisher_addr: &OwnerAddr, candidate: &Hlc) -> bool {
-        let key = (*publisher_addr, candidate.device_id.clone());
-        match self.per_device.get(&key) {
-            None => true,
-            Some(prev) => candidate.is_strictly_newer_than(prev),
+    /// Snapshot a runtime tracker into the on-disk shape. `local` is
+    /// deliberately dropped — it is ctx-derived and never persisted.
+    pub fn from_runtime(tracker: &CommunityReplayTracker) -> Self {
+        Self {
+            per_device: tracker.accepted().clone(),
         }
     }
 
-    /// Record `candidate` as the latest-accepted HLC for
-    /// `(publisher_addr, candidate.device_id)`.
-    ///
-    /// Precondition: caller MUST have just verified `would_accept`
-    /// returned `true`. We `debug_assert!` the precondition so a
-    /// buggy call site surfaces in dev/test rather than silently
-    /// no-opping (which would mask the bug). In release builds the
-    /// insert is unconditional — at this point the caller has
-    /// committed to advancing and a backward-jump indicates upstream
-    /// state corruption that no amount of guarding here can repair.
-    pub fn record(&mut self, publisher_addr: OwnerAddr, candidate: Hlc) {
-        debug_assert!(
-            self.would_accept(&publisher_addr, &candidate),
-            "CommunityRootHlcTracker::record called without would_accept check; \
-             backward-jump for ({:?}, {})",
-            publisher_addr,
-            candidate.device_id
-        );
-        let key = (publisher_addr, candidate.device_id.clone());
-        self.per_device.insert(key, candidate);
+    /// Rebuild the runtime tracker, attaching the `local` source id the
+    /// on-disk shape does not carry.
+    pub fn into_runtime(self, local: (OwnerAddr, String)) -> CommunityReplayTracker {
+        CommunityReplayTracker::from_accepted(local, self.per_device)
     }
 }
 
@@ -1014,7 +1013,7 @@ pub struct CommunitySyncEngineConfig {
     /// internal task share the same key without copying the secret.
     pub signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     pub state: Arc<Mutex<CommunityState>>,
-    pub tracker: Arc<Mutex<CommunityRootHlcTracker>>,
+    pub tracker: Arc<Mutex<CommunityReplayTracker>>,
     pub content_store: Arc<dyn ContentStore>,
     pub publisher_tx: mpsc::Sender<Vec<u8>>,
     pub subscriber_rx: mpsc::Receiver<Vec<u8>>,
@@ -1133,7 +1132,7 @@ pub struct CommunitySyncEngine {
     /// the receiver's tracker for the real publisher is NOT clobbered
     /// by a forged publish. `#[doc(hidden)]` until production callers
     /// need a public surface.
-    tracker: Arc<Mutex<CommunityRootHlcTracker>>,
+    tracker: Arc<Mutex<CommunityReplayTracker>>,
     /// Per-community symmetric key. Retained on the engine so the
     /// ZEB-270 Phase 3 channel-log registry (which derives per-channel
     /// keys via `derive_channel_key(membership_key, cid, chid)`) can
@@ -1337,7 +1336,7 @@ impl CommunitySyncEngine {
     /// spoofed `publisher_addr`, so the real publisher's next legit
     /// publish at HLC `Y` (with `huge > Y`) is still admitted.
     #[doc(hidden)]
-    pub fn tracker_arc(&self) -> Arc<Mutex<CommunityRootHlcTracker>> {
+    pub fn tracker_arc(&self) -> Arc<Mutex<CommunityReplayTracker>> {
         Arc::clone(&self.tracker)
     }
 
@@ -1974,7 +1973,7 @@ struct InternalCtx {
     self_owner: OwnerAddr,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     state: Arc<Mutex<CommunityState>>,
-    tracker: Arc<Mutex<CommunityRootHlcTracker>>,
+    tracker: Arc<Mutex<CommunityReplayTracker>>,
     content_store: Arc<dyn ContentStore>,
     publisher_tx: mpsc::Sender<Vec<u8>>,
     subscriber_rx: mpsc::Receiver<Vec<u8>>,
@@ -3200,13 +3199,12 @@ async fn publish_root_now(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
 ///   clock drift), we pin `effective_wall = max(now, prev_wall)` and
 ///   `logical = prev.logical + 1`.
 ///
-/// We route through `tracker.record(...)` rather than direct
-/// `per_device.insert(...)` so a backward-jump (would_accept fails)
-/// trips the `debug_assert!` in dev/test. Direct insert would silently
-/// smooth over a system-clock anomaly that the receiver-side replay
-/// tracker would otherwise reject — surfacing the bug at the publisher
-/// is strictly cheaper than chasing a "why is my publish being
-/// dropped" report from a peer.
+/// ZEB-750: the local mint's watermark lives in the same tracker as the
+/// peer watermarks, under the disjoint `(self_owner, device_id)` key, and
+/// is written through `observe_local` — core's dedicated minting-path
+/// seam. `observe_local` is monotone: a stamp that fails to advance is a
+/// no-op returning `false`, not a panic. That is what lets this function
+/// use core's tick rule unmodified (see the saturation note below).
 async fn next_hlc(ctx: &InternalCtx) -> Hlc {
     use std::time::{SystemTime, UNIX_EPOCH};
     let wall_ms = SystemTime::now()
@@ -3215,8 +3213,8 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
         .unwrap_or(0);
 
     let mut tracker = ctx.tracker.lock().await;
-    let key = (ctx.self_owner, ctx.device_id.clone());
-    let prev = tracker.per_device.get(&key).cloned();
+    let local = (ctx.self_owner, ctx.device_id.clone());
+    let prev = tracker.accepted_from(&local).cloned();
     // Three branches:
     //   (a) No prev → first publish for this device.
     //   (b) Wall advanced past prev_wall → reset logical to 0.
@@ -3252,7 +3250,7 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
             device_id: ctx.device_id.clone(),
         },
     };
-    tracker.record(ctx.self_owner, now.clone());
+    tracker.observe_local(now.clone());
     now
 }
 
@@ -3696,12 +3694,23 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    the same step-12 rejection until either the publisher's
     //    membership re-Joins (out-of-band) or the publisher republishes
     //    at a strictly newer HLC.
-    {
+    //
+    //    ZEB-750: `admit` is read-only by construction — it cannot advance
+    //    a watermark. It hands back a `CommitTicket` that step 14 consumes;
+    //    every early return between here and there drops the ticket, which
+    //    is the correct, retry-safe outcome (the watermark stays put, so
+    //    the peer's next delivery of this frame is admitted again).
+    let replay_ticket = {
         let tracker = ctx.tracker.lock().await;
-        if !tracker.would_accept(&payload.publisher_addr, &payload.at) {
-            return IncomingOutcome::Duplicate;
+        let source = (payload.publisher_addr, payload.at.device_id.clone());
+        match tracker.admit(&source, &payload.at) {
+            Admission::Accept(ticket) => ticket,
+            // Our own publish, reflected back by the transport. Not a
+            // replay and not an error — there is simply nothing to apply.
+            Admission::Echo => return IncomingOutcome::Duplicate,
+            Admission::Duplicate => return IncomingOutcome::Duplicate,
         }
-    }
+    };
 
     // 6. Fetch the encrypted blob from CAS. Cache-miss is a pre-mutation
     //    failure — the publish carries a CID we couldn't resolve in
@@ -4050,9 +4059,14 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //     leaves the tracker untouched, preserving the
     //     "tracker NOT advanced on any rejection" invariant under
     //     concurrent IPC mutations.
+    //     ZEB-750: that invariant is now enforced by the type system —
+    //     `commit` consumes the `CommitTicket` minted at step 5, and it is
+    //     the only way to reach the watermark. A rejection path cannot
+    //     advance the tracker because it never reaches this line with a
+    //     ticket in hand.
     {
         let mut tracker = ctx.tracker.lock().await;
-        tracker.record(payload.publisher_addr, payload.at.clone());
+        tracker.commit(replay_ticket);
     }
 
     // ZEB-501: wake the joiner's redeem oneshot ONLY on a real
@@ -4185,7 +4199,9 @@ async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
     // signed events, tracker is a small per-device map), and far
     // cheaper than holding a lock across blocking I/O.
     let state_snap = ctx.state.lock().await.clone();
-    let tracker_snap = ctx.tracker.lock().await.clone();
+    // ZEB-750: snapshot into the persistence DTO under the lock. `local`
+    // is ctx-derived and deliberately absent from the on-disk shape.
+    let tracker_snap = CommunityRootHlcTracker::from_runtime(&*ctx.tracker.lock().await);
     let crdt_path = ctx.paths.crdt.clone();
     let replay_path = ctx.paths.replay.clone();
     tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
@@ -4210,7 +4226,9 @@ async fn persist_both(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
 /// the tracker lock, drop the guard, run the disk write in
 /// `spawn_blocking`.
 async fn persist_replay_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError> {
-    let tracker_snap = ctx.tracker.lock().await.clone();
+    // ZEB-750: snapshot into the persistence DTO under the lock. `local`
+    // is ctx-derived and deliberately absent from the on-disk shape.
+    let tracker_snap = CommunityRootHlcTracker::from_runtime(&*ctx.tracker.lock().await);
     let replay_path = ctx.paths.replay.clone();
     tokio::task::spawn_blocking(move || -> Result<(), CommunitySyncError> {
         save_replay(&replay_path, &tracker_snap).map_err(map_persist_err)
@@ -5163,6 +5181,12 @@ impl CommunitySyncRegistry {
             CommunitySyncError::Persist(format!("spawn_blocking join failed: {join_err}"))
         })??;
 
+        // ZEB-750: attach the `local` source id the on-disk shape does not
+        // carry. Both halves live on `CommunityRegistryConfig`, so this is a
+        // one-step build — the DTO stays the only thing that touches disk.
+        let initial_tracker =
+            initial_tracker.into_runtime((self.cfg.self_owner, self.cfg.device_id.clone()));
+
         // Phase 2: take the engines lock, re-check idempotency, build
         // and insert the engine. Lock is held across CommunitySyncEngine::new
         // (which spawns the internal task) so a concurrent spawn for
@@ -5486,7 +5510,7 @@ impl CommunitySyncRegistry {
     ) -> Option<CommunityRootHlcTracker> {
         let engine = self.engines.lock().await.get(community_id).cloned()?;
         let tracker = engine.tracker_arc();
-        let snap = tracker.lock().await.clone();
+        let snap = CommunityRootHlcTracker::from_runtime(&*tracker.lock().await);
         Some(snap)
     }
 
@@ -5756,6 +5780,79 @@ impl crate::community_channel_log::CommunityStateAtHlc for CommunityStateAtHlcAd
 mod tests {
     use super::*;
     use crate::content_store::{ContentStore, RuntimeContentStore};
+
+    /// ZEB-750: the runtime tracker converts to and from the persistence
+    /// DTO without disturbing the on-disk shape. `local` is deliberately
+    /// NOT persisted — it is supplied from ctx at load — so a round trip
+    /// must preserve exactly the accepted watermarks and nothing else.
+    /// This is what keeps `replay.cbor` and its byte-pin fixtures valid
+    /// across the adoption.
+    #[test]
+    fn replay_tracker_round_trips_through_the_persistence_dto_zeb750() {
+        let local = (OwnerAddr([1u8; 16]), "local-dev".to_string());
+        let peer = (OwnerAddr([2u8; 16]), "peer-dev".to_string());
+        let clock = Hlc {
+            wall_ms: 1_000,
+            logical: 3,
+            device_id: "peer-dev".to_string(),
+        };
+
+        let mut tracker = CommunityReplayTracker::new(local.clone());
+        match tracker.admit(&peer, &clock) {
+            Admission::Accept(ticket) => assert!(tracker.commit(ticket)),
+            other => panic!("expected Accept, got {other:?}"),
+        }
+
+        let dto = CommunityRootHlcTracker::from_runtime(&tracker);
+        assert_eq!(
+            dto.per_device.len(),
+            1,
+            "only the peer watermark is stored; `local` is not on-disk state"
+        );
+
+        let restored = dto.into_runtime(local.clone());
+        assert_eq!(restored.accepted(), tracker.accepted());
+        assert_eq!(restored.local(), &local);
+    }
+
+    /// ZEB-750: a publish reflected back by the transport is classified
+    /// `Echo`, not `Duplicate`. Both are ignored, but only one of them is
+    /// worth an operator's attention — a replay is, a loopback is not.
+    /// A publish from the SAME owner's OTHER device is a normal peer,
+    /// because the key namespaces by device_id.
+    #[test]
+    fn a_self_echo_is_distinguished_from_a_replay_zeb750() {
+        let me = OwnerAddr([7u8; 16]);
+        let local = (me, "my-dev".to_string());
+        let mut tracker = CommunityReplayTracker::new(local.clone());
+
+        let own = Hlc {
+            wall_ms: 500,
+            logical: 0,
+            device_id: "my-dev".to_string(),
+        };
+        assert!(matches!(tracker.admit(&local, &own), Admission::Echo));
+
+        // My other device is NOT an echo — it is a peer whose publishes
+        // must be applied.
+        let other_device = (me, "my-other-dev".to_string());
+        let from_other = Hlc {
+            wall_ms: 500,
+            logical: 0,
+            device_id: "my-other-dev".to_string(),
+        };
+        let ticket = match tracker.admit(&other_device, &from_other) {
+            Admission::Accept(t) => t,
+            other => panic!("same owner, different device must be a peer, got {other:?}"),
+        };
+        assert!(tracker.commit(ticket));
+
+        // Re-delivery of that same frame is now a genuine Duplicate.
+        assert!(matches!(
+            tracker.admit(&other_device, &from_other),
+            Admission::Duplicate
+        ));
+    }
 
     /// NopResolver: minimal `IdentityResolver` for fixture builds. None
     /// of the spawn-rollback-guard tests exercise verify-on-receive, so
@@ -7153,7 +7250,10 @@ mod tests {
             self_owner: alice_addr,
             signing_key: Arc::clone(&alice_sk),
             state: Arc::new(Mutex::new(CommunityState::new(community_id))),
-            tracker: Arc::new(Mutex::new(CommunityRootHlcTracker::default())),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice_addr,
+                "alice-dev".to_string(),
+            )))),
             content_store: cs_a,
             publisher_tx: a_pub_tx,
             subscriber_rx: a_sub_rx,
@@ -7188,7 +7288,10 @@ mod tests {
             self_owner: bob_addr,
             signing_key: Arc::clone(&bob_sk),
             state: Arc::clone(&b_state),
-            tracker: Arc::new(Mutex::new(CommunityRootHlcTracker::default())),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                bob_addr,
+                "bob-dev".to_string(),
+            )))),
             content_store: cs_b,
             publisher_tx: b_pub_tx,
             subscriber_rx: b_sub_rx,
@@ -7341,7 +7444,10 @@ mod tests {
             self_owner: alice_addr,
             signing_key: alice_sk,
             state: Arc::new(Mutex::new(CommunityState::new(community_id))),
-            tracker: Arc::new(Mutex::new(CommunityRootHlcTracker::default())),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice_addr,
+                "alice-dev".to_string(),
+            )))),
             content_store: cs,
             publisher_tx: pub_tx,
             subscriber_rx: sub_rx,
@@ -7457,7 +7563,10 @@ mod tests {
             self_owner: alice_addr,
             signing_key: Arc::clone(&alice_sk),
             state: Arc::new(Mutex::new(CommunityState::new(community_id))),
-            tracker: Arc::new(Mutex::new(CommunityRootHlcTracker::default())),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice_addr,
+                "alice-dev".to_string(),
+            )))),
             content_store: cs_a,
             publisher_tx: a_pub_tx,
             subscriber_rx: a_sub_rx,
@@ -7482,7 +7591,10 @@ mod tests {
         let (b_pub_tx, _b_pub_rx_held) = mpsc::channel::<Vec<u8>>(64);
         let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
         let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-        let b_tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+        let b_tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+            bob_addr,
+            "bob-dev".to_string(),
+        ))));
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
             community_id,
@@ -7664,7 +7776,7 @@ mod tests {
         for _ in 0..40 {
             let entry = {
                 let g = b_tracker.lock().await;
-                g.per_device.get(&tracker_key).cloned()
+                g.accepted_from(&tracker_key).cloned()
             };
             if let Some(h) = entry {
                 first_hlc = Some(h);
@@ -7701,7 +7813,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let entry = {
                 let g = b_tracker.lock().await;
-                g.per_device.get(&tracker_key).cloned()
+                g.accepted_from(&tracker_key).cloned()
             };
             if let Some(h) = entry {
                 if h.is_strictly_newer_than(&first_hlc) {
@@ -7785,7 +7897,10 @@ mod tests {
             self_owner: alice.owner,
             signing_key: Arc::new(alice.device_key.clone()),
             state: Arc::new(Mutex::new(CommunityState::new(community_id))),
-            tracker: Arc::new(Mutex::new(CommunityRootHlcTracker::default())),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice.owner,
+                "alice-dev".to_string(),
+            )))),
             content_store: cs,
             publisher_tx: pub_tx,
             subscriber_rx: sub_rx,

@@ -6,7 +6,7 @@
 
 use harmony_app::community_state_crdt::CommunityState;
 use harmony_app::community_state_sync::{
-    CommunityRootHlcTracker, CommunitySyncEngine, CommunitySyncEngineConfig, DEFAULT_DEBOUNCE_MS,
+    CommunityReplayTracker, CommunitySyncEngine, CommunitySyncEngineConfig, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{ContentStore, RuntimeContentStore};
 use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
@@ -69,7 +69,10 @@ async fn engine_constructs_and_shuts_down_cleanly() {
     let admin = OwnerAddr([2u8; 16]);
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "test-device".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),
@@ -136,7 +139,10 @@ async fn flush_now_publishes_one_root_publish() {
     let admin = OwnerAddr([2u8; 16]);
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "test-device".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),
@@ -254,8 +260,14 @@ async fn engine_receives_remote_publish_and_merges_event() {
 
     let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_a = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "a-dev".to_string(),
+    ))));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        OwnerAddr([0xb1; 16]),
+        "b-dev".to_string(),
+    ))));
 
     let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx.clone(),
@@ -413,7 +425,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let t = tracker_b.lock().await;
-            if t.per_device.contains_key(&(admin, "a-dev".to_string())) {
+            if t.accepted().contains_key(&(admin, "a-dev".to_string())) {
                 break;
             }
             drop(t);
@@ -515,8 +527,14 @@ async fn engine_emits_membership_delta_on_remote_insert() {
 
     let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_a = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "a-dev".to_string(),
+    ))));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        OwnerAddr([0xb1; 16]),
+        "b-dev".to_string(),
+    ))));
 
     let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx.clone(),
@@ -746,7 +764,10 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
     let identity_pub = [0u8; 64];
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "local-dev".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         Duration::from_millis(1000),
@@ -915,7 +936,10 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
     let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]));
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        self_owner,
+        "test-device".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),
@@ -956,9 +980,8 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
 async fn publish_carries_valid_publisher_sig() {
     use ed25519_dalek::Verifier;
     use harmony_app::community_state_sync::{
-        decrypt_root_publish, CommunityRootHlcTracker, CommunityRootPublishPayload,
-        CommunityRootSignedPayload, CommunitySyncEngine, CommunitySyncEngineConfig,
-        DEFAULT_DEBOUNCE_MS,
+        decrypt_root_publish, CommunityRootPublishPayload, CommunityRootSignedPayload,
+        CommunitySyncEngine, CommunitySyncEngineConfig, DEFAULT_DEBOUNCE_MS,
     };
     use harmony_app::content_store::{ContentStore, RuntimeContentStore};
     use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
@@ -992,7 +1015,10 @@ async fn publish_carries_valid_publisher_sig() {
     let state = std::sync::Arc::new(tokio::sync::Mutex::new(
         harmony_app::community_state_crdt::CommunityState::new(community_id),
     ));
-    let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(CommunityReplayTracker::new((
+        self_owner,
+        "pub-dev".to_string(),
+    ))));
     let cs: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),
@@ -1210,7 +1236,10 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
     // pre-seed it with the same Join event Alice's state holds. (The
     // gate runs BEFORE sig-verify per cheapest-first ordering.)
     let state_b = Arc::new(Mutex::new(alice_state.clone()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        bob_addr,
+        "b-dev".to_string(),
+    ))));
     let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(2000),
@@ -1257,7 +1286,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
     // Tracker NOT advanced for alice's slot.
     let t = tracker_b.lock().await;
     assert!(
-        !t.per_device
+        !t.accepted()
             .contains_key(&(alice_addr, "alice-dev".to_string())),
         "tracker MUST NOT have advanced on sig-invalid rejection"
     );
@@ -1441,7 +1470,10 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
         Arc::new(MapResolver { entries });
 
     let state_b = Arc::new(Mutex::new(state.clone()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin_addr,
+        "b-dev".to_string(),
+    ))));
     let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(2000),
@@ -1486,7 +1518,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
 
     let t = tracker_b.lock().await;
     assert!(
-        !t.per_device
+        !t.accepted()
             .contains_key(&(alice_addr, "alice-dev".to_string())),
         "tracker MUST NOT have advanced on PublisherNotJoined"
     );
@@ -1650,7 +1682,10 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
     // so she is not a materialized member and her publish is rejected with
     // PublisherNotJoined (the enrolled-device cold-cache shape).
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        alice_addr,
+        "b-dev".to_string(),
+    ))));
     let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(2000),
@@ -1696,7 +1731,7 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
     {
         let t = tracker_b.lock().await;
         assert!(
-            !t.per_device
+            !t.accepted()
                 .contains_key(&(alice_addr, "alice-dev".to_string())),
             "tracker MUST NOT have advanced on PublisherNotJoined"
         );
@@ -1732,7 +1767,7 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let t = tracker_b.lock().await;
-            if t.per_device
+            if t.accepted()
                 .contains_key(&(alice_addr, "alice-dev".to_string()))
             {
                 break;
@@ -1792,7 +1827,10 @@ async fn a_failed_community_publish_retries_itself_on_a_quiescent_community_zeb7
     let admin = OwnerAddr([8u8; 16]);
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "retry-device".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),
@@ -1894,7 +1932,10 @@ async fn a_persistently_failing_community_publish_paces_its_retries_zeb761() {
     let admin = OwnerAddr([7u8; 16]);
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "spin-device".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),

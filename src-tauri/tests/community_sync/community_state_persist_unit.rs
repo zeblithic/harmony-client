@@ -104,9 +104,12 @@ fn save_and_load_replay_round_trips() {
     let path = dir.path().join("replay.cbor");
 
     let alice = OwnerAddr([0xA1; 16]);
+    // ZEB-750: this is a DTO round-trip test, so it populates the on-disk
+    // shape directly. `record` moved to the runtime tracker (`admit`/`commit`
+    // on `CommunityReplayTracker`); the DTO is now pure data.
     let mut tracker = CommunityRootHlcTracker::default();
-    tracker.record(
-        alice,
+    tracker.per_device.insert(
+        (alice, "dev".to_string()),
         Hlc {
             wall_ms: 1000,
             logical: 5,
@@ -179,8 +182,8 @@ fn load_replay_quarantines_and_recovers_from_old_shape() {
     // After self-heal, save_replay writes the new shape cleanly.
     let mut t = CommunityRootHlcTracker::default();
     let alice = OwnerAddr([0xA1; 16]);
-    t.record(
-        alice,
+    t.per_device.insert(
+        (alice, "new-dev".to_string()),
         Hlc {
             wall_ms: 100,
             logical: 0,
