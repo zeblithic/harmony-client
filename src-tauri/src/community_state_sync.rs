@@ -35,7 +35,7 @@
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use harmony_content::cid::ContentId;
-use harmony_crdt_sync::{Admission, ReplayTracker, RetryBackoff};
+use harmony_crdt_sync::{Admission, HlcTick, ReplayTracker, RetryBackoff};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -3215,40 +3215,27 @@ async fn next_hlc(ctx: &InternalCtx) -> Hlc {
     let mut tracker = ctx.tracker.lock().await;
     let local = (ctx.self_owner, ctx.device_id.clone());
     let prev = tracker.accepted_from(&local).cloned();
-    // Three branches:
-    //   (a) No prev → first publish for this device.
-    //   (b) Wall advanced past prev_wall → reset logical to 0.
-    //   (c) Same or earlier wall → bump logical, but if logical
-    //       saturates at u32::MAX manufacture a wall_ms advance to
-    //       keep producing strictly-newer HLCs. Otherwise the
-    //       resulting HLC would equal prev exactly, and `record()`
-    //       would panic via debug_assert (we'd also be silently
-    //       republishing the same logical clock, which receivers
-    //       reject as replay).
-    let now = match prev.as_ref() {
-        None => Hlc {
-            wall_ms,
-            logical: 0,
-            device_id: ctx.device_id.clone(),
-        },
-        Some(p) if wall_ms > p.wall_ms => Hlc {
-            wall_ms,
-            logical: 0,
-            device_id: ctx.device_id.clone(),
-        },
-        Some(p) if p.logical == u32::MAX => Hlc {
-            // Saturation escape: bump wall (vanishingly unlikely in
-            // production — 4B publishes within one wall-millisecond —
-            // but the alternative is debug-mode panic).
-            wall_ms: p.wall_ms.saturating_add(1),
-            logical: 0,
-            device_id: ctx.device_id.clone(),
-        },
-        Some(p) => Hlc {
-            wall_ms: p.wall_ms,
-            logical: p.logical + 1,
-            device_id: ctx.device_id.clone(),
-        },
+    // ZEB-750: the tick rule is core's, shared with fleet_sync — one
+    // audited implementation of a subtle monotonicity contract rather than
+    // two hand-rolled ones. `HlcTick` is identity-free (`wall_ms`,
+    // `logical` only); the `device_id` that makes this a domain `Hlc` is
+    // re-attached below, so the pinned wire field order is untouched.
+    //
+    // Under logical saturation core TIES `prev` instead of manufacturing a
+    // wall advance. Receivers then reject the tied stamp as a duplicate
+    // until the wall clock catches up — a stall, which is strictly
+    // preferable to admitting a replay. The old escape branch existed only
+    // to dodge `record()`'s debug_assert, and `observe_local` replaced that
+    // with a monotone no-op.
+    let prev_tick = prev.as_ref().map(|p| HlcTick {
+        wall_ms: p.wall_ms,
+        logical: p.logical,
+    });
+    let tick = HlcTick::next(prev_tick, wall_ms);
+    let now = Hlc {
+        wall_ms: tick.wall_ms,
+        logical: tick.logical,
+        device_id: ctx.device_id.clone(),
     };
     tracker.observe_local(now.clone());
     now
@@ -5813,6 +5800,45 @@ mod tests {
         let restored = dto.into_runtime(local.clone());
         assert_eq!(restored.accepted(), tracker.accepted());
         assert_eq!(restored.local(), &local);
+    }
+
+    /// ZEB-750: at `logical == u32::MAX` the tick TIES its predecessor
+    /// rather than manufacturing a wall-clock advance. That is core's rule,
+    /// now shared with fleet_sync: "a stall, which is strictly preferable
+    /// to admitting a replay." The old escape branch existed only to dodge
+    /// the `debug_assert!` in the deleted `record()`; `observe_local`
+    /// replaced that with a monotone no-op, so the branch became both
+    /// unnecessary and divergent.
+    ///
+    /// This is a deliberate behaviour change, reachable only at ~4 billion
+    /// publishes inside one wall-millisecond.
+    #[test]
+    fn hlc_tick_ties_instead_of_manufacturing_a_wall_advance_at_saturation_zeb750() {
+        let prev = HlcTick {
+            wall_ms: 5_000,
+            logical: u32::MAX,
+        };
+        let next = HlcTick::next(Some(prev), 5_000);
+
+        assert_eq!(next, prev, "a saturated tick must tie, not advance");
+        assert_eq!(
+            next.wall_ms, 5_000,
+            "the wall reading must NOT be manufactured forward"
+        );
+
+        // And the tracker reports the non-advance instead of asserting.
+        let local = (OwnerAddr([9u8; 16]), "sat-dev".to_string());
+        let mut tracker = CommunityReplayTracker::new(local);
+        let as_hlc = |t: HlcTick| Hlc {
+            wall_ms: t.wall_ms,
+            logical: t.logical,
+            device_id: "sat-dev".to_string(),
+        };
+        assert!(tracker.observe_local(as_hlc(prev)));
+        assert!(
+            !tracker.observe_local(as_hlc(next)),
+            "a tied tick must not advance the local watermark"
+        );
     }
 
     /// ZEB-750: a publish reflected back by the transport is classified
