@@ -24,6 +24,7 @@
     FriendService,
     FriendDto,
     PendingFriendRequestDto,
+    OutboundFriendRequestDto,
     ReferralView,
     PeerIntroPolicy,
   } from '../friend-service';
@@ -129,19 +130,26 @@
   let addingByKey = $state(false);
   let addByKeyStatus = $state<string | null>(null);
 
-  // ── ZEB-415 #2: in-panel auto-retry of a pending outbound add ─────────────
+  // ── ZEB-784 / ZEB-783: outbound requests are owned by the NODE ────────────
   // The mutual-key handshake is synchronous with no server-push: after we send a
   // request the link only completes when WE dial again (once the peer accepts).
-  // Rather than make the user guess when to re-press Connect, we re-attempt on a
-  // bounded interval and surface "now connected" the instant it links.
-  const ADD_RETRY_INTERVAL_MS = 10_000;
-  const ADD_RETRY_MAX_ATTEMPTS = 30; // ~5-minute ceiling
-  let addRetryTimer: ReturnType<typeof setTimeout> | null = null;
-  // Bumped to invalidate an in-flight retry chain (supersede / cancel / destroy).
-  let addRetryGeneration = 0;
+  //
+  // ZEB-415 #2 originally solved that here, with a 10s/30-attempt timer chain
+  // inside this component. That chain is gone: it could only run while this
+  // panel was mounted, gave up after ~5 minutes, and did not exist at all for a
+  // headless node — which is exactly the configuration ZEB-783 was measured on.
+  // The node now performs the retry itself, durably and across restarts, so
+  // there is exactly ONE retry owner. This panel's job is to SHOW that state
+  // (rows below) and offer a manual "Retry now" for the user who is watching
+  // and doesn't want to wait for the next node-side pass.
+  let outboundRequests = $state<OutboundFriendRequestDto[]>([]);
+  let outboundError = $state<string | null>(null);
+  // Per-row in-flight guard for Retry now / Cancel, keyed by identityPubHex.
+  let outboundInFlight = $state<Set<string>>(new Set());
+
   // Set once in onDestroy. Any async path that resumes after teardown (the
-  // initial add awaiting `addByKey`, a retry tick awaiting `refresh`) checks
-  // this before touching state or scheduling new timers.
+  // initial add awaiting `addByKey`, a row action awaiting `refresh`) checks
+  // this before touching state.
   let destroyed = false;
 
   // ── ZEB-388: my own identity pub hex (share for add-by-key) ───────────────
@@ -333,6 +341,10 @@
     // Re-fetch pending requests on new inbound request or list mutation.
     unsubscribePendingChanged = service.onPendingRequestsChanged(() => {
       void refreshPending();
+      // ZEB-783: the same events that mutate the inbound list also mutate the
+      // outbound one — a node-side retry that links emits `friend-list-changed`
+      // and clears the record, so the row must disappear without a reload.
+      void refreshOutbound();
     });
     // ZEB-236 T7: re-fetch pending DM invites on new-invite / list-mutated
     // (accept/decline, possibly from another device). Only when injected.
@@ -344,6 +356,7 @@
     }
     void refresh();
     void refreshPending();
+    void refreshOutbound();
     void loadAutoAccept();
     void loadPeerIntroPolicy();
     void loadMyKey();
@@ -370,7 +383,6 @@
     // Cancel any in-flight `loadDiscoverable` read so its late resolve can't
     // write `identityDiscoverable` after we've unmounted (CodeRabbit).
     discoverableGen += 1;
-    stopAddRetry();
     // ZEB-419: stop card updates + drop all friend/request card subscriptions.
     if (cardService) {
       cardService.onUpdate = undefined;
@@ -627,104 +639,96 @@
     }
   }
 
-  // Cancel any in-flight pending-add retry chain (on supersede / destroy).
-  function stopAddRetry(): void {
-    addRetryGeneration += 1;
-    if (addRetryTimer) {
-      clearTimeout(addRetryTimer);
-      addRetryTimer = null;
+  // ZEB-783: re-fetch this user's own unanswered outbound requests. Guards
+  // post-teardown writes like refresh()/refreshPending().
+  async function refreshOutbound(): Promise<void> {
+    try {
+      const next = await service.listOutboundRequests();
+      if (destroyed) return; // see refresh(): no post-teardown state writes
+      outboundRequests = next;
+      outboundError = null;
+    } catch (e) {
+      outboundError = e instanceof Error ? e.message : String(e);
     }
   }
 
-  // Begin retrying `add_friend_by_key` for a key that returned `pending`. Each
-  // tick re-dials; a `linked` result reports success and stops, anything else
-  // (still pending, a transient `unreachable`, a transient dial error) keeps
-  // waiting until the bounded window elapses. The `generation` guard makes a
-  // superseded or post-unmount tick a no-op so we never mutate $state after
-  // teardown or run two chains at once.
-  function startAddRetry(key: string): void {
-    stopAddRetry();
-    const generation = addRetryGeneration;
-    let attempt = 0;
-    // Why the latest attempt didn't link, so the terminal (max-attempts) message
-    // reflects reality — "they haven't accepted" vs "couldn't reach them" vs a
-    // hard error — instead of always blaming a missing accept (Cursor).
-    let lastReason = 'they have not accepted yet';
-    const waitingCopy =
-      "Request sent — they'll need to accept. We'll connect automatically once they do.";
-    const tick = async (): Promise<void> => {
-      if (generation !== addRetryGeneration) return;
-      try {
-        const outcome = await service.addByKey(key);
-        if (generation !== addRetryGeneration) return; // superseded while awaiting
-        if (outcome.kind === 'linked') {
-          addByKeyStatus = `Now connected with ${outcome.display ?? shortId(outcome.ownerIdHex)}`;
-          addRetryTimer = null;
-          // Re-check teardown before the (async) refresh — the panel may have
-          // unmounted while we awaited the dial (Cursor).
-          if (!destroyed) await refresh();
-          return;
-        }
-        if (outcome.kind === 'unreachable') {
-          lastReason = 'we could not reach them on the last try';
-        } else {
-          // 'pending' → the expected wait; re-assert the calm copy in case a
-          // prior transient error had replaced it.
-          lastReason = 'they have not accepted yet';
-          addByKeyStatus = waitingCopy;
-        }
-      } catch (e) {
-        if (generation !== addRetryGeneration) return;
-        const msg = e instanceof Error ? e.message : String(e);
-        // Keep retrying (the throw is usually a transient dial blip while the
-        // peer is still offline), but surface the failure now rather than hide
-        // it behind the rosy "we'll connect automatically" copy.
-        console.debug(
-          `add-by-key auto-retry attempt ${attempt + 1} failed (still retrying):`,
-          msg,
-        );
-        lastReason = `the last attempt failed: ${msg}`;
-        addByKeyStatus = `Still trying to connect — ${lastReason}.`;
+  // ZEB-784: re-dial one outbound request NOW rather than waiting for the node's
+  // next pass. This is the ONLY dial this component initiates on a pending
+  // request — the node owns the recurring retry, so there is no timer here to
+  // supersede, cancel, or leak.
+  async function handleRetryOutbound(identityPubHex: string): Promise<void> {
+    if (outboundInFlight.has(identityPubHex)) return;
+    outboundInFlight = new Set(outboundInFlight).add(identityPubHex);
+    try {
+      const outcome = await service.addByKey(identityPubHex);
+      if (destroyed) return;
+      if (outcome.kind === 'linked') {
+        addByKeyStatus = `Now connected with ${outcome.display ?? shortId(outcome.ownerIdHex)}`;
+        await refresh();
+      } else if (outcome.kind === 'unreachable') {
+        addByKeyStatus = "Still couldn't reach them — we'll keep trying in the background.";
+      } else {
+        addByKeyStatus = "They haven't accepted yet — we'll keep trying in the background.";
       }
-      attempt += 1;
-      if (attempt >= ADD_RETRY_MAX_ATTEMPTS) {
-        // Terminal message names the actual last outcome, not a blanket "still
-        // waiting to accept" (Cursor) — and doesn't clobber a surfaced error.
-        addByKeyStatus = `Stopped trying to connect — ${lastReason}. Press Connect again to retry.`;
-        addRetryTimer = null;
-        return;
+    } catch (e) {
+      // Surface it rather than hide it behind the calm "we'll keep trying"
+      // copy, but don't drop the row: the node retries regardless of what one
+      // manual attempt did.
+      addByKeyStatus = `Retry failed: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      if (!destroyed) {
+        const next = new Set(outboundInFlight);
+        next.delete(identityPubHex);
+        outboundInFlight = next;
+        await refreshOutbound();
       }
-      addRetryTimer = setTimeout(() => void tick(), ADD_RETRY_INTERVAL_MS);
-    };
-    addRetryTimer = setTimeout(() => void tick(), ADD_RETRY_INTERVAL_MS);
+    }
+  }
+
+  // ZEB-783: stop retrying an outbound request and drop the row. Local only —
+  // nothing was ever stored on the target, so there is nothing to withdraw.
+  async function handleCancelOutbound(identityPubHex: string): Promise<void> {
+    if (outboundInFlight.has(identityPubHex)) return;
+    outboundInFlight = new Set(outboundInFlight).add(identityPubHex);
+    try {
+      await service.cancelOutboundRequest(identityPubHex);
+      if (destroyed) return;
+      await refreshOutbound();
+    } catch (e) {
+      outboundError = e instanceof Error ? e.message : String(e);
+    } finally {
+      if (!destroyed) {
+        const next = new Set(outboundInFlight);
+        next.delete(identityPubHex);
+        outboundInFlight = next;
+      }
+    }
   }
 
   async function handleAddByKey(): Promise<void> {
     const key = addByKeyInput.trim();
     if (addingByKey || key.length === 0) return;
-    // A fresh add supersedes any prior pending-add retry chain.
-    stopAddRetry();
     addingByKey = true;
     addByKeyStatus = null;
     try {
       const outcome = await service.addByKey(key);
       // The panel may have been torn down while the add was in flight — don't
-      // mutate state or start a retry chain after unmount (CodeAnt).
+      // mutate state after unmount (CodeAnt).
       if (destroyed) return;
       if (outcome.kind === 'linked') {
         addByKeyStatus = `Connected with ${outcome.display ?? shortId(outcome.ownerIdHex)}`;
         addByKeyInput = '';
-        if (!destroyed) await refresh();
+        await refresh();
       } else if (outcome.kind === 'pending') {
         addByKeyStatus =
-          "Request sent — they'll need to accept. We'll connect automatically once they do.";
+          "Request sent — they'll need to accept. We'll keep trying until they do.";
         addByKeyInput = '';
         await refreshPending();
-        // refreshPending awaited above — re-check teardown before scheduling a
-        // retry chain, or an unmount during that refresh leaves timers running
-        // on a dead component (Cursor).
+        // The node recorded this request; show it in the outbound list so the
+        // user has durable evidence the add happened (ZEB-783 — previously it
+        // vanished from every surface the moment this message faded).
         if (destroyed) return;
-        startAddRetry(key);
+        await refreshOutbound();
       } else {
         addByKeyStatus =
           "Couldn't reach them — they may need to enable discovery, or try again in a moment.";
@@ -1113,6 +1117,62 @@
       </ul>
     {/if}
   </div>
+
+  <!-- ── ZEB-783: outbound requests — the mirror of the inbox above ─────── -->
+  <!-- Rendered only when there is something waiting, so the panel doesn't grow
+       an empty section for the common case. Before this, an add that returned
+       `pending` left NO trace anywhere: the user saw a UI state indistinguishable
+       from having done nothing at all. -->
+  {#if outboundRequests.length > 0 || outboundError}
+    <div class="subsection" data-testid="outbound-requests-section">
+      <h5 class="subsection-title">Sent requests</h5>
+
+      {#if outboundError}
+        <p class="error-text" data-testid="outbound-error">{outboundError}</p>
+      {/if}
+
+      <ul class="friend-list" data-testid="outbound-list">
+        {#each outboundRequests as req (req.identityPubHex)}
+          <li class="friend-row">
+            <div class="friend-id">
+              <!-- No name and no avatar, deliberately: a peer who hasn't
+                   accepted has disclosed neither their owner id nor their
+                   display name, so the only honest thing to show is the key
+                   the user typed. -->
+              <span class="friend-name" data-testid="outbound-status-{req.identityPubHex}">
+                Waiting for them to accept
+              </span>
+              <span class="friend-addr" data-testid="outbound-key-{req.identityPubHex}">
+                {shortId(req.identityPubHex)} · sent {relativeTime(req.requestedAtMs)}
+              </span>
+            </div>
+            <div class="request-actions">
+              <button
+                type="button"
+                class="accept-btn"
+                disabled={outboundInFlight.has(req.identityPubHex)}
+                onclick={() => handleRetryOutbound(req.identityPubHex)}
+                data-testid="outbound-retry-btn"
+                title="Try again now — we're already retrying in the background"
+              >
+                {outboundInFlight.has(req.identityPubHex) ? '…' : 'Retry now'}
+              </button>
+              <button
+                type="button"
+                class="unfriend-btn"
+                disabled={outboundInFlight.has(req.identityPubHex)}
+                onclick={() => handleCancelOutbound(req.identityPubHex)}
+                data-testid="outbound-cancel-btn"
+                title="Stop trying to connect with this key"
+              >
+                {outboundInFlight.has(req.identityPubHex) ? '…' : 'Cancel'}
+              </button>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
 
   <!-- ── ZEB-236 T7: DM invites inbox ───────────────────────────────────── -->
   <!-- Rendered only when the service is injected AND there are pending invites.

@@ -20,6 +20,9 @@ function mockService(overrides: Partial<FriendService> = {}): FriendService {
   return {
     listFriends: vi.fn().mockResolvedValue([]),
     listPendingRequests: vi.fn().mockResolvedValue([]),
+    // ZEB-783: loaded unconditionally on mount, like listPendingRequests.
+    listOutboundRequests: vi.fn().mockResolvedValue([]),
+    cancelOutboundRequest: vi.fn().mockResolvedValue(undefined),
     getAutoAccept: vi.fn().mockResolvedValue(false),
     // ZEB-376 Phase 2b Task 14: mirrors getAutoAccept's default — loaded
     // unconditionally on mount, so every test needs a resolved value even
@@ -195,186 +198,170 @@ describe('FriendsPanel — discovery-off footgun (ZEB-415 #1)', () => {
   });
 });
 
-describe('FriendsPanel — add-by-key auto-retry (ZEB-415 #2)', () => {
+describe('FriendsPanel — outbound requests (ZEB-784 / ZEB-783)', () => {
   const PEER_KEY = 'cd'.repeat(64);
+  const OUTBOUND = {
+    identityPubHex: PEER_KEY,
+    requestedAtMs: 1_700_000_000_000,
+    expiresAtMs: 1_700_000_000_000 + 7 * 24 * 60 * 60 * 1000,
+  };
 
-  it('auto-retries a pending add and reports connection once the peer accepts', async () => {
-    vi.useFakeTimers();
-    // 1st (initial click) + 2nd (retry) stay pending; 3rd retry links.
-    const addByKey = vi
-      .fn()
-      .mockResolvedValueOnce({ kind: 'pending' })
-      .mockResolvedValueOnce({ kind: 'pending' })
-      .mockResolvedValue({ kind: 'linked', ownerIdHex: 'ab'.repeat(8), display: 'Koya' });
-    const service = mockService({ addByKey });
-    const { getByTestId } = render(FriendsPanel, { props: { service } });
-    await vi.advanceTimersByTimeAsync(0); // flush mount
+  // ZEB-415 #2 previously ran a 10s/30-attempt retry chain inside this
+  // component. It is gone: the NODE now owns the retry, durably and headlessly.
+  // These tests pin the replacement contract — the panel SHOWS the node's state
+  // and offers manual overrides, and initiates no recurring dialling of its own.
 
-    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
-    await fireEvent.click(getByTestId('add-by-key-btn'));
-    await vi.advanceTimersByTimeAsync(0); // resolve the initial 'pending'
-
-    expect(getByTestId('add-by-key-status').textContent).toContain('Request sent');
-    expect(addByKey).toHaveBeenCalledTimes(1);
-
-    await vi.advanceTimersByTimeAsync(10_000); // retry 1 → still pending
-    expect(addByKey).toHaveBeenCalledTimes(2);
-
-    await vi.advanceTimersByTimeAsync(10_000); // retry 2 → linked
-    expect(addByKey).toHaveBeenCalledTimes(3);
-    expect(getByTestId('add-by-key-status').textContent).toContain('Now connected');
-
-    // No further retries fire once linked.
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(addByKey).toHaveBeenCalledTimes(3);
-  });
-
-  it('stops auto-retrying when the panel is destroyed', async () => {
-    vi.useFakeTimers();
-    const addByKey = vi.fn().mockResolvedValue({ kind: 'pending' });
-    const service = mockService({ addByKey });
-    const { getByTestId, unmount } = render(FriendsPanel, { props: { service } });
-    await vi.advanceTimersByTimeAsync(0);
-
-    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
-    await fireEvent.click(getByTestId('add-by-key-btn'));
-    await vi.advanceTimersByTimeAsync(0);
-    expect(addByKey).toHaveBeenCalledTimes(1);
-
-    unmount();
-    await vi.advanceTimersByTimeAsync(60_000);
-    // No retry timer survives unmount (no $state mutation after teardown).
-    expect(addByKey).toHaveBeenCalledTimes(1);
-  });
-
-  it('gives an actionable message (discovery / try again) when unreachable', async () => {
-    const addByKey = vi.fn().mockResolvedValue({ kind: 'unreachable' });
-    const service = mockService({ addByKey });
+  it('renders a sent-request row so a pending add leaves visible evidence', async () => {
+    const service = mockService({
+      listOutboundRequests: vi.fn().mockResolvedValue([OUTBOUND]),
+    });
     const { getByTestId, findByTestId } = render(FriendsPanel, { props: { service } });
 
-    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
-    await fireEvent.click(getByTestId('add-by-key-btn'));
-
-    const status = await findByTestId('add-by-key-status');
-    expect(status.textContent).toMatch(/discovery|try again/i);
-    // An unreachable peer is NOT auto-retried (only a 'pending' outcome is).
-    expect(addByKey).toHaveBeenCalledTimes(1);
+    await findByTestId('outbound-requests-section');
+    expect(getByTestId(`outbound-status-${PEER_KEY}`).textContent).toContain(
+      'Waiting for them to accept',
+    );
+    // The row shows the KEY the user typed. It deliberately shows no owner id
+    // and no display name: a peer who hasn't accepted has disclosed neither.
+    expect(getByTestId(`outbound-key-${PEER_KEY}`).textContent).toContain('cdcdcdcd');
   });
 
-  it('surfaces a retry error instead of masking it as normal waiting', async () => {
+  it('hides the section entirely when nothing is waiting', async () => {
+    const service = mockService();
+    const { queryByTestId } = render(FriendsPanel, { props: { service } });
+    await vi.waitFor(() => expect(queryByTestId('pending-empty')).not.toBeNull());
+    expect(queryByTestId('outbound-requests-section')).toBeNull();
+  });
+
+  it('runs NO recurring dial of its own — the node owns the retry', async () => {
     vi.useFakeTimers();
-    const addByKey = vi
-      .fn()
-      .mockResolvedValueOnce({ kind: 'pending' }) // initial add
-      .mockRejectedValueOnce(new Error('iroh connect failed')); // retry throws
-    const service = mockService({ addByKey });
+    const addByKey = vi.fn().mockResolvedValue({ kind: 'pending' });
+    const service = mockService({
+      addByKey,
+      listOutboundRequests: vi.fn().mockResolvedValue([OUTBOUND]),
+    });
     const { getByTestId } = render(FriendsPanel, { props: { service } });
     await vi.advanceTimersByTimeAsync(0);
 
     await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
     await fireEvent.click(getByTestId('add-by-key-btn'));
     await vi.advanceTimersByTimeAsync(0);
-    expect(getByTestId('add-by-key-status').textContent).toContain('Request sent');
+    expect(addByKey).toHaveBeenCalledTimes(1);
 
-    await vi.advanceTimersByTimeAsync(10_000); // retry → throws a hard error
-    const status = getByTestId('add-by-key-status').textContent;
-    // The failure is surfaced immediately, not hidden behind the rosy
-    // "we'll connect automatically" copy until the window elapses.
-    expect(status).toContain('iroh connect failed');
-    expect(status).not.toContain('Request sent');
+    // The old chain would have fired ~30 more times across this window. A
+    // second dial now can only come from the user pressing "Retry now".
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(addByKey).toHaveBeenCalledTimes(1);
   });
 
-  it('does not start a retry chain if unmounted during the initial add', async () => {
-    vi.useFakeTimers();
-    let resolveAdd: (v: { kind: string }) => void = () => {};
-    const addByKey = vi.fn().mockReturnValue(
-      new Promise((r) => {
-        resolveAdd = r as (v: { kind: string }) => void;
-      }),
-    );
-    const service = mockService({ addByKey });
-    const { getByTestId, unmount } = render(FriendsPanel, { props: { service } });
-    await vi.advanceTimersByTimeAsync(0);
+  it('shows the sent request immediately after a pending add', async () => {
+    const listOutboundRequests = vi
+      .fn()
+      .mockResolvedValueOnce([]) // mount: nothing waiting yet
+      .mockResolvedValue([OUTBOUND]); // after the add: the node recorded it
+    const service = mockService({
+      addByKey: vi.fn().mockResolvedValue({ kind: 'pending' }),
+      listOutboundRequests,
+    });
+    const { getByTestId, findByTestId } = render(FriendsPanel, { props: { service } });
+    await vi.waitFor(() => expect(getByTestId('add-by-key-btn')).not.toBeNull());
 
     await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
     await fireEvent.click(getByTestId('add-by-key-btn'));
-    // addByKey is in-flight; tear the panel down, THEN let it resolve pending.
+
+    // ZEB-783's actual complaint: the add reported `pending` and then left no
+    // trace in any surface. The row appearing IS the fix.
+    await findByTestId('outbound-requests-section');
+    expect(getByTestId('add-by-key-status').textContent).toContain('Request sent');
+  });
+
+  it('Retry now dials once and reports the link when the peer has accepted', async () => {
+    const addByKey = vi
+      .fn()
+      .mockResolvedValue({ kind: 'linked', ownerIdHex: 'ab'.repeat(8), display: 'Koya' });
+    const service = mockService({
+      addByKey,
+      listOutboundRequests: vi
+        .fn()
+        .mockResolvedValueOnce([OUTBOUND])
+        .mockResolvedValue([]), // the node forgets the record once linked
+    });
+    const { getByTestId, findByTestId } = render(FriendsPanel, { props: { service } });
+    await findByTestId('outbound-requests-section');
+
+    await fireEvent.click(getByTestId('outbound-retry-btn'));
+
+    await vi.waitFor(() =>
+      expect(getByTestId('add-by-key-status').textContent).toContain('Now connected'),
+    );
+    expect(addByKey).toHaveBeenCalledTimes(1);
+    expect(addByKey).toHaveBeenCalledWith(PEER_KEY);
+  });
+
+  it('surfaces a Retry now failure instead of masking it as normal waiting', async () => {
+    const service = mockService({
+      addByKey: vi.fn().mockRejectedValue(new Error('iroh connect failed')),
+      listOutboundRequests: vi.fn().mockResolvedValue([OUTBOUND]),
+    });
+    const { getByTestId, findByTestId } = render(FriendsPanel, { props: { service } });
+    await findByTestId('outbound-requests-section');
+
+    await fireEvent.click(getByTestId('outbound-retry-btn'));
+
+    await vi.waitFor(() => {
+      const status = getByTestId('add-by-key-status').textContent ?? '';
+      expect(status).toContain('iroh connect failed');
+    });
+    // The row must SURVIVE a failed manual retry — the node keeps trying
+    // regardless of what one manual attempt did.
+    expect(getByTestId('outbound-requests-section')).not.toBeNull();
+  });
+
+  it('Cancel stops the retry and drops the row', async () => {
+    const cancelOutboundRequest = vi.fn().mockResolvedValue(undefined);
+    const service = mockService({
+      cancelOutboundRequest,
+      listOutboundRequests: vi
+        .fn()
+        .mockResolvedValueOnce([OUTBOUND])
+        .mockResolvedValue([]),
+    });
+    const { getByTestId, queryByTestId, findByTestId } = render(FriendsPanel, {
+      props: { service },
+    });
+    await findByTestId('outbound-requests-section');
+
+    await fireEvent.click(getByTestId('outbound-cancel-btn'));
+
+    expect(cancelOutboundRequest).toHaveBeenCalledWith(PEER_KEY);
+    await vi.waitFor(() => expect(queryByTestId('outbound-requests-section')).toBeNull());
+  });
+
+  it('does not write state after unmount when an add is still in flight', async () => {
+    vi.useFakeTimers();
+    let resolveAdd: (v: unknown) => void = () => {};
+    const addByKey = vi.fn().mockReturnValue(
+      new Promise((r) => {
+        resolveAdd = r as (v: unknown) => void;
+      }),
+    );
+    const listOutboundRequests = vi.fn().mockResolvedValue([]);
+    const service = mockService({ addByKey, listOutboundRequests });
+    const { getByTestId, unmount } = render(FriendsPanel, { props: { service } });
+    await vi.advanceTimersByTimeAsync(0);
+    const callsAtMount = listOutboundRequests.mock.calls.length;
+
+    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
+    await fireEvent.click(getByTestId('add-by-key-btn'));
+
+    // Tear down while the dial is in flight, THEN let it resolve.
     unmount();
     resolveAdd({ kind: 'pending' });
     await vi.advanceTimersByTimeAsync(60_000);
 
-    // No retry chain was created after teardown (only the initial in-flight call).
-    expect(addByKey).toHaveBeenCalledTimes(1);
-  });
-
-  it('terminal message reflects the last error, not a generic wait', async () => {
-    vi.useFakeTimers();
-    const addByKey = vi
-      .fn()
-      .mockResolvedValueOnce({ kind: 'pending' })
-      .mockRejectedValue(new Error('pkarr resolve: boom'));
-    const service = mockService({ addByKey });
-    const { getByTestId } = render(FriendsPanel, { props: { service } });
-    await vi.advanceTimersByTimeAsync(0);
-
-    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
-    await fireEvent.click(getByTestId('add-by-key-btn'));
-    await vi.advanceTimersByTimeAsync(0);
-
-    // Exhaust the whole retry window so the terminal message is shown.
-    await vi.advanceTimersByTimeAsync(10_000 * 31);
-    const status = getByTestId('add-by-key-status').textContent ?? '';
-    expect(status).toContain('pkarr resolve: boom'); // the real failure, not hidden
-    expect(status).not.toContain('have not accepted');
-  });
-
-  it('terminal message reflects repeated unreachable, not "waiting to accept"', async () => {
-    vi.useFakeTimers();
-    const addByKey = vi
-      .fn()
-      .mockResolvedValueOnce({ kind: 'pending' })
-      .mockResolvedValue({ kind: 'unreachable' });
-    const service = mockService({ addByKey });
-    const { getByTestId } = render(FriendsPanel, { props: { service } });
-    await vi.advanceTimersByTimeAsync(0);
-
-    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
-    await fireEvent.click(getByTestId('add-by-key-btn'));
-    await vi.advanceTimersByTimeAsync(0);
-
-    await vi.advanceTimersByTimeAsync(10_000 * 31);
-    const status = (getByTestId('add-by-key-status').textContent ?? '').toLowerCase();
-    expect(status).toContain('reach'); // "could not reach them on the last try"
-    expect(status).not.toContain('have not accepted');
-  });
-
-  it('does not start a retry chain if unmounted during refreshPending', async () => {
-    vi.useFakeTimers();
-    let resolvePending: (v: unknown[]) => void = () => {};
-    const addByKey = vi.fn().mockResolvedValue({ kind: 'pending' });
-    const listPendingRequests = vi
-      .fn()
-      .mockResolvedValueOnce([]) // initial mount refresh
-      .mockReturnValue(
-        new Promise((r) => {
-          resolvePending = r as (v: unknown[]) => void;
-        }),
-      ); // the post-add refresh hangs until we resolve it
-    const service = mockService({ addByKey, listPendingRequests });
-    const { getByTestId, unmount } = render(FriendsPanel, { props: { service } });
-    await vi.advanceTimersByTimeAsync(0);
-
-    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
-    await fireEvent.click(getByTestId('add-by-key-btn'));
-    await vi.advanceTimersByTimeAsync(0); // addByKey resolves pending; now awaiting refreshPending
-
-    // Tear down while refreshPending is in flight, THEN let it resolve.
-    unmount();
-    resolvePending([]);
-    await vi.advanceTimersByTimeAsync(60_000);
-
-    // The post-refresh `startAddRetry` must not run after teardown.
-    expect(addByKey).toHaveBeenCalledTimes(1);
+    // The post-add refresh must not run after teardown — it would assign
+    // $state on a destroyed component.
+    expect(listOutboundRequests.mock.calls.length).toBe(callsAtMount);
   });
 });
 
