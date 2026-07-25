@@ -46,10 +46,23 @@ while [ $# -gt 0 ]; do
 done
 
 repo_root="$(git rev-parse --show-toplevel)"
+cargo_cwd="$repo_root/src-tauri"
+
 # Honour CARGO_TARGET_DIR — a machine that redirects its target tree elsewhere
 # must still be collectable, and silently GCing the wrong path would be worse
 # than doing nothing.
-target_dir="${CARGO_TARGET_DIR:-$repo_root/src-tauri/target}"
+#
+# A *relative* CARGO_TARGET_DIR has two different bases: Cargo resolves it
+# against the directory cargo runs in ($cargo_cwd), while a naive read here
+# would resolve it against the caller's cwd. Left unnormalised, invoking from
+# the repo root reports one tree and cleans a different one. Normalise to
+# Cargo's base so the report, the --incremental prune, and `cargo clean` can
+# only ever address a single tree.
+case "${CARGO_TARGET_DIR:-}" in
+  "")                 target_dir="$cargo_cwd/target" ;;
+  /*|[A-Za-z]:[/\\]*) target_dir="$CARGO_TARGET_DIR" ;;
+  *)                  target_dir="$cargo_cwd/$CARGO_TARGET_DIR" ;;
+esac
 
 # GNU vs BSD split. Git Bash and Linux ship GNU coreutils; macOS ships BSD.
 # Probe once rather than assuming, so the fleet's mixed hosts behave alike.
@@ -151,7 +164,10 @@ case "$tier" in
     ;;
   all)
     confirm "full cargo clean of $target_dir (next build will be COLD)"
-    ( cd "$repo_root/src-tauri" && cargo clean )
+    # --target-dir is passed explicitly rather than inherited from the
+    # environment: it pins cargo to the same tree the report measured, instead
+    # of letting cargo re-resolve CARGO_TARGET_DIR against its own cwd.
+    ( cd "$cargo_cwd" && cargo clean --target-dir "$target_dir" )
     ;;
 esac
 
