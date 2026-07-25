@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# ZEB-765: garbage-collect the local Cargo build tree (src-tauri/target).
+#
+# Reports by default; pruning requires an explicit tier flag. Rationale: on
+# AVALON this tree reached 94.7 GB / 99,793 files before anyone looked, so the
+# reporting path has to be the one that costs nothing to run. Deleting is the
+# cheap half — an accidental prune costs a cold rebuild, so it is opt-in.
+#
+# Why the tree grows without bound (measured 2026-07-25, see ZEB-765):
+#   - incremental/ accumulates per-session dirs (695 of them, 48 GB) that Cargo's
+#     lazy GC never keeps up with, and that are worthless once source moves on.
+#   - deps/ is effectively append-only: artifacts are keyed by
+#     (package, version, features, compiler) and superseded entries are never
+#     evicted, so every dependency bump ratchets the floor upward.
+#
+# NOT related to ZEB-440 (CI runner disk). CI already sets CARGO_INCREMENTAL=0
+# and trims debuginfo; those mitigations are precisely why CI is fine and
+# workstations are not.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: scripts/build-gc [--incremental|--all] [--yes] [--quiet]
+  (no tier flag)   report the size + staleness breakdown, delete nothing  [default]
+  --incremental    delete <profile>/incremental only — always regenerable,
+                   costs a non-incremental rebuild of local crates, keeps deps/
+  --all            full `cargo clean` — reclaims everything, next build is cold
+  --yes            skip the confirmation prompt (required when non-interactive)
+  --quiet          suppress the post-prune report
+
+Exit codes: 0 ok | 2 usage error | 3 refused (no tty and no --yes)
+EOF
+}
+
+tier="" assume_yes=0 quiet=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --incremental|--all)
+      [ -z "$tier" ] || { echo "build-gc: pick one tier, not both" >&2; exit 2; }
+      tier="${1#--}"; shift ;;
+    --yes|-y) assume_yes=1; shift ;;
+    --quiet|-q) quiet=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "build-gc: unknown arg: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+repo_root="$(git rev-parse --show-toplevel)"
+# Honour CARGO_TARGET_DIR — a machine that redirects its target tree elsewhere
+# must still be collectable, and silently GCing the wrong path would be worse
+# than doing nothing.
+target_dir="${CARGO_TARGET_DIR:-$repo_root/src-tauri/target}"
+
+# GNU vs BSD split. Git Bash and Linux ship GNU coreutils; macOS ships BSD.
+# Probe once rather than assuming, so the fleet's mixed hosts behave alike.
+if stat -c %Y . >/dev/null 2>&1; then
+  stat_mtime() { stat -c %Y "$1"; }
+  fmt_epoch()  { date -d "@$1" '+%Y-%m-%d'; }
+else
+  stat_mtime() { stat -f %m "$1"; }
+  fmt_epoch()  { date -r "$1" '+%Y-%m-%d'; }
+fi
+
+# `du -sk` (KiB) is the portable spelling — `du -sb` is GNU-only.
+size_kb() { [ -d "$1" ] || { echo 0; return; }; du -sk "$1" 2>/dev/null | awk '{print $1}'; }
+human()   { awk -v k="$1" 'BEGIN{ if (k>=1048576) printf "%.2f GiB", k/1048576; else printf "%.1f MiB", k/1024 }'; }
+
+# Staleness proxy: mtime of the newest *top-level* file in a profile dir (the
+# linked binaries), not a recursive scan. A recursive stat over ~100k files
+# costs more than the whole report is worth, and the linked artifacts answer
+# the actual question — "when did this tree last produce a build?"
+newest_in() {
+  local d="$1" f
+  [ -d "$d" ] || return 1
+  f="$(ls -t "$d" 2>/dev/null | while read -r n; do [ -f "$d/$n" ] && { echo "$n"; break; }; done)"
+  [ -n "$f" ] || return 1
+  stat_mtime "$d/$f"
+}
+
+report() {
+  if [ ! -d "$target_dir" ]; then
+    echo "build-gc: $target_dir does not exist — nothing to collect."
+    return 0
+  fi
+  local total now
+  total="$(size_kb "$target_dir")"
+  now="$(date '+%s')"
+  echo "build-gc: $target_dir"
+  printf '  %-34s %12s\n' "TOTAL" "$(human "$total")"
+
+  local prof profdir sub subdir n age epoch
+  for prof in debug release; do
+    profdir="$target_dir/$prof"
+    [ -d "$profdir" ] || continue
+    printf '  %-34s %12s' "$prof/" "$(human "$(size_kb "$profdir")")"
+    if epoch="$(newest_in "$profdir")"; then
+      age=$(( (now - epoch) / 86400 ))
+      printf '   newest %s (%sd ago)' "$(fmt_epoch "$epoch")" "$age"
+    fi
+    printf '\n'
+    for sub in incremental deps build; do
+      subdir="$profdir/$sub"
+      [ -d "$subdir" ] || continue
+      printf '    %-32s %12s' "$sub/" "$(human "$(size_kb "$subdir")")"
+      if [ "$sub" = incremental ]; then
+        n="$(find "$subdir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+        printf '   %s session dirs' "$n"
+      fi
+      printf '\n'
+    done
+  done
+}
+
+confirm() {
+  [ "$assume_yes" -eq 1 ] && return 0
+  if [ ! -t 0 ]; then
+    echo "build-gc: refusing to prune non-interactively without --yes" >&2
+    exit 3
+  fi
+  printf 'build-gc: %s — proceed? [y/N] ' "$1"
+  local reply; read -r reply
+  case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) echo "build-gc: aborted."; exit 0 ;; esac
+}
+
+report
+
+[ -n "$tier" ] || exit 0
+
+if [ ! -d "$target_dir" ]; then
+  exit 0
+fi
+
+before="$(size_kb "$target_dir")"
+
+case "$tier" in
+  incremental)
+    # Deliberately per-profile rather than `rm -rf $target_dir/*/incremental`:
+    # the glob would also match any sibling directory a future toolchain adds.
+    found=0
+    for prof in debug release; do
+      d="$target_dir/$prof/incremental"
+      [ -d "$d" ] || continue
+      found=1
+    done
+    [ "$found" -eq 1 ] || { echo "build-gc: no incremental/ dirs present."; exit 0; }
+    confirm "delete incremental/ caches (regenerable; deps/ kept)"
+    for prof in debug release; do
+      d="$target_dir/$prof/incremental"
+      [ -d "$d" ] && rm -rf "$d"
+    done
+    ;;
+  all)
+    confirm "full cargo clean of $target_dir (next build will be COLD)"
+    ( cd "$repo_root/src-tauri" && cargo clean )
+    ;;
+esac
+
+after="$(size_kb "$target_dir")"
+echo "build-gc: reclaimed $(human "$(( before - after ))")"
+[ "$quiet" -eq 1 ] || { echo; report; }
