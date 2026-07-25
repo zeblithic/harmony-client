@@ -20272,6 +20272,24 @@ pub(crate) async fn ingest_content_encrypted_impl(
         .await
         .map_err(|e| format!("open failed: {e}"))?;
 
+    // ZEB-781: reject non-regular files. The GUI reached this seam through a
+    // native file picker, which implicitly guaranteed a real file; the RPC
+    // surface accepts an arbitrary `sourcePath`, so a FIFO or device node
+    // (`/dev/zero`) would stream forever — and this ingest path is deliberately
+    // uncapped (ZEB-724 removed the size cap). Re-stat the OPENED handle rather
+    // than the path so a swap between stat and open cannot bypass the check;
+    // same posture as `ingest_channel_artifact_impl` and the vine-video ingest.
+    //
+    // Deliberately NOT rejecting empty files here, unlike vine video: the GUI
+    // shares this seam, and a user picking a 0-byte file succeeds today.
+    let opened_meta = plaintext_reader
+        .metadata()
+        .await
+        .map_err(|e| format!("stat opened file: {e}"))?;
+    if !opened_meta.is_file() {
+        return Err("encrypted ingest source must be a regular file".to_string());
+    }
+
     ingest_content_encrypted_inner(
         &ingest_tx,
         &content_index,

@@ -368,8 +368,14 @@ struct CidArgs {
     cid: String,
 }
 
-/// ZEB-781: `grant_read` / `revoke_read`. `granteeAddress` is an OwnerAddr hex;
-/// neither verb gates on the friend graph, so any owner address is accepted.
+/// ZEB-781: `grant_read` / `revoke_read`. `granteeAddress` is an OwnerAddr hex.
+///
+/// `grant_read` DOES gate on the friend graph: grants deliver over the friend
+/// transport, so the grantee must be an **Active** friend or the share is
+/// rejected with `INELIGIBLE_NON_FRIEND` (`file_sharing.rs`, "Gate 2"). Sharing
+/// with a community member you have not friended will fail — being co-resident
+/// in a community is not sufficient. `revoke_read` has no such gate; it stamps a
+/// local tombstone and converges, so a grantee can always be revoked.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GrantReadArgs {
@@ -1779,6 +1785,62 @@ mod tests {
                     panic!("{method}: arg struct rejected the wrapper shape: {msg}")
                 }
                 Ok(_) | Err(RpcError::Command(_)) => {}
+            }
+        }
+    }
+
+    /// ZEB-781 (CodeRabbit, PR #551): the registration test above accepts any
+    /// `Command` error, so it would still pass if `cid` and `granteeAddress`
+    /// were wired to each other's parameters. These verbs parse their args
+    /// BEFORE touching NodeState, and each parser has a distinct message, so a
+    /// default state is enough to prove the binding: feed exactly one malformed
+    /// arg and require the error naming THAT arg's parser.
+    ///
+    /// Scope note: `ingest_content_encrypted`'s `sourcePath` binding is not
+    /// provable here — it snapshots NodeState (failing "not connected") before
+    /// it ever opens the path, so a default state cannot reach the file layer.
+    /// That one is covered by the live ZEB-770 exercise instead.
+    #[tokio::test]
+    async fn file_sharing_rpcs_bind_args_to_the_right_parameters() {
+        let reg = build_registry();
+        let cid = "cd".repeat(32);
+        let grantee = "ab".repeat(16);
+        // (method, args, substring the CORRECT parser must produce)
+        let cases = [
+            (
+                "grant_read",
+                serde_json::json!({ "cid": "zz", "granteeAddress": grantee }),
+                "cid",
+            ),
+            (
+                "grant_read",
+                serde_json::json!({ "cid": cid, "granteeAddress": "zz" }),
+                "owner address",
+            ),
+            (
+                "revoke_read",
+                serde_json::json!({ "cid": "zz", "granteeAddress": grantee }),
+                "cid",
+            ),
+            (
+                "revoke_read",
+                serde_json::json!({ "cid": cid, "granteeAddress": "zz" }),
+                "owner address",
+            ),
+            (
+                "burn_content",
+                serde_json::json!({ "sidecarId": "" }),
+                "sidecar_id",
+            ),
+        ];
+        for (method, args, expect) in cases {
+            match reg.dispatch(method, test_state(), test_sink(), args).await {
+                Err(RpcError::Command(msg)) => assert!(
+                    msg.contains(expect),
+                    "{method}: expected the {expect:?} parser to reject, got {msg:?} — \
+                     args may be bound to the wrong parameters"
+                ),
+                other => panic!("{method}: expected a Command parse error, got {other:?}"),
             }
         }
     }

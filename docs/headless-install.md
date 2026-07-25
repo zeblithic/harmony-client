@@ -446,6 +446,17 @@ Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
 > `list_channel_messages` requires an explicit `limit`; the GUI's adapter
 > defaults it, this surface does not.
 
+> **Sharing files: `grant_read` requires an Active friend.** Grants deliver
+> over the friend transport, so sharing with someone you merely share a
+> community with is rejected as `ineligible: non_friend`. Friend them first
+> (`generate_friend_token` / `redeem_friend_token`). `revoke_read` has no such
+> gate — a grantee can always be revoked.
+>
+> `ingest_content_encrypted` takes a `sourcePath` and **has no size cap** — it
+> streams whatever you point it at, frame-by-frame. Non-regular files (FIFOs,
+> device nodes) are rejected, but a very large regular file will simply be
+> ingested in full. Bound it on the caller's side if that matters to you.
+
 ### Error contract
 
 Every error response is JSON: `{"error": "<message>"}`.
