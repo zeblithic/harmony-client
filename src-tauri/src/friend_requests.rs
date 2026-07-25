@@ -506,13 +506,26 @@ impl PendingOutboundLinks {
         identity_pub_hex.trim().to_ascii_lowercase()
     }
 
-    /// Record (or refresh the deadline of) an outbound request to
-    /// `identity_pub_hex` at `now_ms`. Refreshing on a manual re-add is
-    /// deliberate: the user asking again restarts the retry window rather than
-    /// inheriting a nearly-expired one.
+    /// Record an outbound request to `identity_pub_hex` at `now_ms`, keeping the
+    /// original timestamp if a live record already exists.
+    ///
+    /// First-write-wins, not last: `add_friend_by_key_impl` records on EVERY
+    /// `Pending`, and the retry driver goes through that same function, so
+    /// refreshing here would push the deadline out on every pass and the record
+    /// could never expire. It also keeps the timestamp meaning "when the user
+    /// asked", which is what the ZEB-783 projection displays. A re-add after the
+    /// window lapses starts a fresh record, since the expired one no longer
+    /// counts as live.
+    ///
+    /// Persists only when the map actually changed — otherwise a pending request
+    /// would rewrite the file on every retry pass, forever.
     pub fn record(&self, identity_pub_hex: &str, now_ms: u64) {
-        self.inner.record(Self::norm(identity_pub_hex), now_ms);
-        self.persist();
+        if self
+            .inner
+            .record_if_absent(Self::norm(identity_pub_hex), now_ms, OUTBOUND_LINK_TTL_MS)
+        {
+            self.persist();
+        }
     }
 
     /// Non-consuming: is there a live (un-expired) outbound request to this key?
@@ -564,6 +577,29 @@ impl<K: std::hash::Hash + Eq + Clone> TtlPreAuth<K> {
             .lock()
             .expect("outbound pre-auth mutex poisoned")
             .insert(target, now_ms);
+    }
+
+    /// Record `target` only if it has no LIVE record already, preserving the
+    /// original timestamp when it does. Returns `true` iff the map changed.
+    ///
+    /// This is the variant a self-retrying store needs. With plain [`record`],
+    /// a caller that re-records on every retry pass refreshes the deadline
+    /// every pass, so the TTL is never reached and the record becomes
+    /// immortal — a TTL its own consumer keeps resetting is not a TTL. It also
+    /// keeps a "requested at" timestamp meaning when the USER asked, not when
+    /// the machine last retried, which is what any UI projecting it needs.
+    ///
+    /// An expired record is replaced (returns `true`), so a manual re-add after
+    /// the window lapses correctly starts a fresh one.
+    fn record_if_absent(&self, target: K, now_ms: u64, ttl_ms: u64) -> bool {
+        let mut m = self.inner.lock().expect("outbound pre-auth mutex poisoned");
+        match m.get(&target) {
+            Some(rec) if Self::is_live(*rec, now_ms, ttl_ms) => false,
+            _ => {
+                m.insert(target, now_ms);
+                true
+            }
+        }
     }
 
     /// `true` iff `rec` is a live record as of `now_ms`. Fails CLOSED on a
@@ -935,5 +971,161 @@ mod tests {
                 .any(|(a, p)| *a == link && matches!(p.kind, PendingKind::LinkRequest)),
             "the LinkRequest entry must survive the sweep"
         );
+    }
+
+    // ── ZEB-784 / ZEB-783: PendingOutboundLinks ──────────────────────────────
+
+    /// A key with an uppercase/whitespace spelling must address the SAME entry
+    /// as its canonical form, or a `forget` from the UI would silently miss the
+    /// record the dialer wrote and the request would keep retrying after cancel.
+    #[test]
+    fn outbound_links_normalise_hex_spelling() {
+        let store = PendingOutboundLinks::new();
+        store.record("  AB12CD  ", 1_000);
+        assert!(store.is_pending("ab12cd", 1_000));
+        store.forget("Ab12Cd");
+        assert!(!store.is_pending("ab12cd", 1_000));
+    }
+
+    /// The bug this store would have shipped with: the retry driver goes through
+    /// `add_friend_by_key_impl`, which records on every `Pending`. If `record`
+    /// refreshed the deadline, each pass would push expiry out by a full TTL and
+    /// the entry could never age out — an immortal record retried forever.
+    #[test]
+    fn outbound_link_record_is_first_write_wins() {
+        let store = PendingOutboundLinks::new();
+        store.record("aa", 1_000);
+        // Simulate many retry passes, each re-recording the same key.
+        for pass in 1..=5u64 {
+            store.record("aa", 1_000 + pass * 60_000);
+        }
+        let rows = store.list(1_000 + 5 * 60_000);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].1, 1_000,
+            "the timestamp must stay when the USER asked, not when the machine last retried"
+        );
+        // And the TTL is therefore actually reachable.
+        assert!(
+            store.list(1_000 + OUTBOUND_LINK_TTL_MS).is_empty(),
+            "a re-recorded entry must still expire on the ORIGINAL deadline"
+        );
+    }
+
+    /// An expired record is replaced rather than resurrected, so a manual re-add
+    /// after the window lapses gets a full fresh retry window.
+    #[test]
+    fn outbound_link_readd_after_expiry_starts_fresh() {
+        let store = PendingOutboundLinks::new();
+        store.record("bb", 1_000);
+        let after = 1_000 + OUTBOUND_LINK_TTL_MS;
+        assert!(store.list(after).is_empty(), "lapsed before the re-add");
+        store.record("bb", after);
+        let rows = store.list(after);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, after, "re-add after expiry restarts the window");
+    }
+
+    /// Boundary + backward-clock. `is_live` must fail CLOSED when the clock goes
+    /// backwards: a record stamped in the future must not read as live forever.
+    #[test]
+    fn outbound_link_ttl_boundary_and_backward_clock() {
+        let store = PendingOutboundLinks::new();
+        store.record("cc", 10_000);
+        assert!(store.is_pending("cc", 10_000), "same instant is live");
+        assert!(
+            store.is_pending("cc", 10_000 + OUTBOUND_LINK_TTL_MS - 1),
+            "one ms inside the window is live"
+        );
+        assert!(
+            !store.is_pending("cc", 10_000 + OUTBOUND_LINK_TTL_MS),
+            "exactly at the TTL is expired (half-open window)"
+        );
+        assert!(
+            !store.is_pending("cc", 9_999),
+            "a backward clock must fail closed, not treat the record as live"
+        );
+    }
+
+    /// Persistence round-trip: a request survives the restart it exists to
+    /// survive. Records are bounded by HUMAN accept latency, so dropping them on
+    /// boot would silently abandon a request the user is still waiting on.
+    #[test]
+    fn outbound_links_persist_and_rehydrate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
+
+        let store = PendingOutboundLinks::load_or_recover(path.clone(), 1_000);
+        store.record("dd", 1_000);
+        store.record("ee", 2_000);
+        store.forget("ee");
+        drop(store);
+
+        let rehydrated = PendingOutboundLinks::load_or_recover(path, 3_000);
+        let rows = rehydrated.list(3_000);
+        assert_eq!(rows.len(), 1, "exactly the un-forgotten record survives");
+        assert_eq!(rows[0], ("dd".to_string(), 1_000));
+    }
+
+    /// Records already past their TTL are pruned at load rather than carried
+    /// forward, so the file can't grow without bound across restarts.
+    #[test]
+    fn outbound_links_prune_expired_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
+
+        let store = PendingOutboundLinks::load_or_recover(path.clone(), 1_000);
+        store.record("old", 1_000);
+        store.record("new", 1_000 + OUTBOUND_LINK_TTL_MS);
+        drop(store);
+
+        // Boot far enough ahead that only the second record is still live.
+        let boot = 1_000 + OUTBOUND_LINK_TTL_MS + 1;
+        let rehydrated = PendingOutboundLinks::load_or_recover(path.clone(), boot);
+        let rows = rehydrated.list(boot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "new");
+        drop(rehydrated);
+
+        // The prune was written through, not just applied in memory.
+        let again = PendingOutboundLinks::load_or_recover(path, boot);
+        assert_eq!(again.list(boot).len(), 1, "prune persisted to disk");
+    }
+
+    /// A corrupt file must not brick the boot: it is quarantined aside (bytes
+    /// preserved for diagnosis) and the store comes up empty. Losing these
+    /// records costs the automatic retry, not correctness.
+    #[test]
+    fn outbound_links_quarantine_corrupt_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
+        std::fs::write(&path, b"this is not cbor").expect("seed corrupt file");
+
+        let store = PendingOutboundLinks::load_or_recover(path.clone(), 7_777);
+        assert!(store.list(7_777).is_empty(), "corrupt file → empty store");
+
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("corrupt-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the unreadable bytes must be preserved aside, not deleted: {quarantined:?}"
+        );
+    }
+
+    /// A store with no bound path degrades to pre-ZEB-784 behaviour (in-memory
+    /// only) instead of panicking — the path every test and any caller without an
+    /// identity dir takes.
+    #[test]
+    fn outbound_links_without_path_are_ephemeral_not_fatal() {
+        let store = PendingOutboundLinks::new();
+        store.record("ff", 1_000);
+        assert!(store.is_pending("ff", 1_000));
+        store.forget("ff");
+        assert!(!store.is_pending("ff", 1_000));
     }
 }

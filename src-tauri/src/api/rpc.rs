@@ -1258,6 +1258,21 @@ pub fn build_registry() -> RpcRegistry {
             crate::decline_friend_request_impl(state, sink, a.owner_id_hex).await
         }
     );
+    // ZEB-783: this user's own unanswered outbound requests + a cancel.
+    rpc!(
+        m,
+        "list_outbound_friend_requests",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::list_outbound_friend_requests_impl(state).await }
+    );
+    rpc!(
+        m,
+        "cancel_outbound_friend_request",
+        AddFriendByKeyArgs,
+        |state, _sink, a| async move {
+            crate::cancel_outbound_friend_request_impl(state, a.identity_pub_hex).await
+        }
+    );
 
     // DM invites (ZEB-236): the staged non-friend invite consent trio.
     rpc!(
@@ -2516,6 +2531,9 @@ mod tests {
             "list_pending_friend_requests",
             "accept_friend_request",
             "decline_friend_request",
+            // ZEB-783: outbound mirror of the inbound inbox.
+            "list_outbound_friend_requests",
+            "cancel_outbound_friend_request",
             // DM invites (ZEB-236)
             "list_pending_dm_invites",
             "accept_dm_invite",

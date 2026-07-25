@@ -1191,6 +1191,13 @@ pub struct NodeState {
     /// aborted in stop_inner). Slot type mirrors `voting_tick_handle`.
     pub liveness_heartbeat_handle:
         std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// ZEB-784: JoinHandle for the periodic outbound-friend-request retry task
+    /// (spawned in start_node_inner; aborted in stop_inner). Slot type mirrors
+    /// `voting_tick_handle`. Aborting on stop matters more here than for the
+    /// other periodic tasks: this one dials peers, so a survivor would keep
+    /// re-dialing against a node the user has explicitly stopped.
+    pub friend_link_retry_handle:
+        std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// ZEB-163 Task 2: per-job cancellation flags for in-flight folder-
     /// tree ingests. `ingest_folder_tree` inserts a fresh `AtomicBool`
     /// keyed by its minted `job_id` and removes it on settle;
@@ -1953,6 +1960,7 @@ impl Default for NodeState {
             )),
             voting_tick_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
             liveness_heartbeat_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            friend_link_retry_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
             folder_ingest_jobs: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -2573,6 +2581,18 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
             {
                 let mut slot = guard
                     .liveness_heartbeat_handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(handle) = slot.take() {
+                    handle.abort();
+                }
+            }
+            // ZEB-784: abort the outbound-friend-request retry under the same
+            // lock, for the same reason — and one more: this task dials peers.
+            // A survivor would keep re-dialing after the user stopped the node.
+            {
+                let mut slot = guard
+                    .friend_link_retry_handle
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 if let Some(handle) = slot.take() {
@@ -12891,6 +12911,41 @@ pub async fn start_node_inner(
                     };
                     if let Some(old) = prev {
                         old.abort();
+                    }
+                }
+            }
+            // ── ZEB-784 — periodic outbound-friend-request retry ────────
+            // Runs the beat `AddFriendOutcome::Pending` has always
+            // documented but nothing ever performed: re-invoke
+            // `add_friend_by_key` until the target accepts. Placed here,
+            // beside the voting tick, because it needs the same two things
+            // and solves them the same way — a `'static` task that reaches
+            // `NodeState` through `wry_handle` (GUI) or `owned_state`
+            // (headless serve/RPC).
+            {
+                let retry_slot = {
+                    let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                    if guard.generation != our_gen {
+                        None
+                    } else {
+                        Some(std::sync::Arc::clone(&guard.friend_link_retry_handle))
+                    }
+                };
+                if let Some(slot) = retry_slot {
+                    if let Some(handle) = spawn_friend_link_retry(
+                        wry_handle.clone(),
+                        owned_state.clone(),
+                        std::sync::Arc::clone(&app),
+                        FRIEND_LINK_RETRY_INTERVAL,
+                    ) {
+                        // Recover a poisoned slot so a failed lock can't
+                        // leave the just-spawned task untracked (leaked) —
+                        // an untracked dialer is exactly what stop_inner
+                        // exists to prevent here.
+                        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(old) = slot.replace(handle) {
+                            old.abort();
+                        }
                     }
                 }
             }
@@ -60348,6 +60403,115 @@ pub(crate) async fn list_pending_friend_requests_impl(
     ))
 }
 
+/// ZEB-783: one of THIS user's own outbound friend requests that has not been
+/// answered yet — the mirror image of [`PendingFriendRequestDto`].
+///
+/// The sender previously had no projection of their own request at all: after
+/// `add_friend_by_key` returned `Pending` the request vanished from every
+/// surface, so "did that go anywhere?" was unanswerable and the natural read of
+/// an empty friend list was that nothing had been sent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboundFriendRequestDto {
+    /// The target's transport-identity pub, hex — the string the user typed.
+    ///
+    /// There is deliberately no owner_id or display name here: on a `Pending`
+    /// reply the target discloses neither, which is the whole point of the
+    /// consent gate. The UI can only echo back what the user themselves
+    /// entered, and claiming more would be inventing an identity for an
+    /// unconsenting peer.
+    pub identity_pub_hex: String,
+    /// Epoch-ms the request was sent (refreshed if the user re-sends).
+    pub requested_at_ms: u64,
+    /// Epoch-ms this request stops being retried. Surfaced rather than left for
+    /// the UI to derive, so a change to [`OUTBOUND_LINK_TTL_MS`] can't silently
+    /// desynchronise a hardcoded frontend copy of the same arithmetic.
+    pub expires_at_ms: u64,
+}
+
+/// Project the outbound-link store into the frontend DTO list. Synchronous and
+/// pure, so it is unit-testable without a NodeState harness.
+pub fn list_outbound_friend_requests_inner(
+    store: &crate::friend_requests::PendingOutboundLinks,
+    now_ms: u64,
+) -> Vec<OutboundFriendRequestDto> {
+    let mut rows: Vec<OutboundFriendRequestDto> = store
+        .list(now_ms)
+        .into_iter()
+        .map(
+            |(identity_pub_hex, requested_at_ms)| OutboundFriendRequestDto {
+                identity_pub_hex,
+                requested_at_ms,
+                expires_at_ms: requested_at_ms
+                    .saturating_add(crate::friend_requests::OUTBOUND_LINK_TTL_MS),
+            },
+        )
+        .collect();
+    // The store is a HashMap, so its iteration order is not merely unspecified
+    // — it varies run to run. Sort newest-first for a stable list that also
+    // puts the request the user just sent at the top.
+    rows.sort_by(|a, b| {
+        b.requested_at_ms
+            .cmp(&a.requested_at_ms)
+            .then_with(|| a.identity_pub_hex.cmp(&b.identity_pub_hex))
+    });
+    rows
+}
+
+/// List this user's own unanswered outbound friend requests (ZEB-783).
+#[tauri::command]
+async fn list_outbound_friend_requests(
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<OutboundFriendRequestDto>, String> {
+    list_outbound_friend_requests_impl(state.inner()).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn list_outbound_friend_requests_impl(
+    state: &std::sync::Mutex<NodeState>,
+) -> Result<Vec<OutboundFriendRequestDto>, String> {
+    let store = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        std::sync::Arc::clone(&g.pending_outbound_links)
+    };
+    Ok(list_outbound_friend_requests_inner(
+        &store,
+        crate::iroh_friend_acceptor::wall_now_ms(),
+    ))
+}
+
+/// Cancel one of this user's own outbound friend requests (ZEB-783): stop
+/// retrying it and drop it from the list.
+///
+/// Idempotent — cancelling an unknown or already-expired key succeeds. This is
+/// purely local: nothing is sent to the target, because nothing was ever
+/// *stored* on the target either. The peer's own inbound row (if their node saw
+/// the dial) is theirs to decline; we cannot and should not reach into it.
+#[tauri::command]
+async fn cancel_outbound_friend_request(
+    identity_pub_hex: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<(), String> {
+    cancel_outbound_friend_request_impl(state.inner(), identity_pub_hex).await
+}
+
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn cancel_outbound_friend_request_impl(
+    state: &std::sync::Mutex<NodeState>,
+    identity_pub_hex: String,
+) -> Result<(), String> {
+    let store = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        std::sync::Arc::clone(&g.pending_outbound_links)
+    };
+    store.forget(&identity_pub_hex);
+    Ok(())
+}
+
 /// Accept a pending inbound friend request. Two shapes:
 ///   * Path-A `LinkRequest` — mark the requester APPROVED so their NEXT dial is
 ///     accepted inline by the acceptor's `prior_accept` consent gate. This does
@@ -62286,6 +62450,62 @@ pub(crate) async fn retry_pending_friend_links(
     linked
 }
 
+/// ZEB-784: spawn the periodic retry task, reaching `NodeState` through
+/// whichever of the two `'static` seams this node actually has.
+///
+/// Same shape and same reason as [`build_auto_exec_fn`] (ZEB-719): a `'static`
+/// spawned task cannot borrow the `&Mutex<NodeState>` that `start_node_inner`
+/// holds, and the two run modes reach that state differently — the GUI fetches
+/// Tauri's managed `Mutex<NodeState>` at call time, while the headless
+/// serve/RPC node owns an `Arc` to the same allocation. GUI takes precedence
+/// when both are present, matching that function's dispatch order.
+///
+/// Returns `None` when neither handle is available. That is not a defensive
+/// stub — with no way to reach `NodeState` the task could never do anything, so
+/// spawning one would produce nothing but a handle to abort later.
+pub(crate) fn spawn_friend_link_retry(
+    wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
+    owned_state: Option<std::sync::Arc<Mutex<NodeState>>>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    interval: std::time::Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if wry_handle.is_none() && owned_state.is_none() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        // Tokio's first tick completes immediately, which is what we want here:
+        // a node that just rehydrated records from disk retries them at boot
+        // instead of after a full interval of silence. Safe despite running
+        // during the tail of `start_node_inner` — this is a spawned task, so
+        // the inline-await hazard (a boot-time await reaching the event-loop
+        // channels and deadlocking) does not apply.
+        loop {
+            tick.tick().await;
+            if let Some(app) = wry_handle.as_ref() {
+                use tauri::Manager as _;
+                // `try_state`, not `state`: a panic in a detached task is
+                // silent and would stop every future retry, so an unmanaged
+                // state must degrade to "skip this pass", not abort the loop.
+                match app.try_state::<std::sync::Mutex<crate::NodeState>>() {
+                    Some(node_state) => {
+                        retry_pending_friend_links(
+                            node_state.inner(),
+                            std::sync::Arc::clone(&sink),
+                        )
+                        .await;
+                    }
+                    None => tracing::debug!(
+                        "ZEB-784: friend-link retry: NodeState not managed yet; skipping pass"
+                    ),
+                }
+            } else if let Some(arc) = owned_state.as_ref() {
+                retry_pending_friend_links(arc, std::sync::Arc::clone(&sink)).await;
+            }
+        }
+    }))
+}
+
 #[cfg(test)]
 mod friend_ipc_tests {
     use super::*;
@@ -63011,6 +63231,72 @@ mod friend_ipc_tests {
         let publisher = test_publisher().await;
         super::friend_token_publish_guard(Some(&publisher))
             .expect("a present publisher must pass the guard");
+    }
+
+    // ── ZEB-783: outbound-request projection ──────────────────────────────
+
+    #[test]
+    fn list_outbound_friend_requests_inner_projects_and_sorts() {
+        let store = crate::friend_requests::PendingOutboundLinks::new();
+        store.record("aa", 1_000);
+        store.record("bb", 3_000);
+        store.record("cc", 2_000);
+
+        let rows = list_outbound_friend_requests_inner(&store, 3_000);
+        // Newest-first. The store is a HashMap, so without an explicit sort the
+        // order would vary run to run — a list that reshuffles itself under the
+        // user's cursor on every refresh.
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.identity_pub_hex.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bb", "cc", "aa"]
+        );
+        assert_eq!(rows[0].requested_at_ms, 3_000);
+        assert_eq!(
+            rows[0].expires_at_ms,
+            3_000 + crate::friend_requests::OUTBOUND_LINK_TTL_MS,
+            "expiry is surfaced so the UI need not duplicate the TTL arithmetic"
+        );
+    }
+
+    #[test]
+    fn list_outbound_friend_requests_inner_hides_expired() {
+        let store = crate::friend_requests::PendingOutboundLinks::new();
+        store.record("aa", 1_000);
+        let after = 1_000 + crate::friend_requests::OUTBOUND_LINK_TTL_MS;
+        assert!(
+            list_outbound_friend_requests_inner(&store, after).is_empty(),
+            "a lapsed request must not still read as 'waiting for them to accept'"
+        );
+    }
+
+    /// The two-seam guard (ZEB-719 shape): with NEITHER handle there is no way
+    /// to reach `NodeState`, so no task is spawned — a spawned one could only
+    /// ever loop doing nothing while still needing an abort on stop.
+    #[tokio::test]
+    async fn friend_link_retry_needs_a_node_state_seam() {
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(crate::node_event_sink::RecordingSink::new());
+        assert!(
+            super::spawn_friend_link_retry(
+                None,
+                None,
+                std::sync::Arc::clone(&sink),
+                std::time::Duration::from_secs(60),
+            )
+            .is_none(),
+            "no seam → no task"
+        );
+        let arc = std::sync::Arc::new(std::sync::Mutex::new(crate::NodeState::default()));
+        let handle = super::spawn_friend_link_retry(
+            None,
+            Some(arc),
+            sink,
+            std::time::Duration::from_secs(60),
+        )
+        .expect("headless seam spawns a task");
+        handle.abort();
     }
 
     // ── ZEB-371 Task 13: Path A simple-IPC inners ────────────────────────
@@ -65869,6 +66155,9 @@ pub fn run() {
             list_pending_friend_requests,
             accept_friend_request,
             decline_friend_request,
+            // ZEB-783: the outbound mirror of the inbound inbox above.
+            list_outbound_friend_requests,
+            cancel_outbound_friend_request,
             // ZEB-236 Task 4: staged non-friend DM-invite consent trio.
             list_pending_dm_invites,
             accept_dm_invite,
@@ -72913,6 +73202,7 @@ mod start_node_race_tests {
             )),
             voting_tick_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
             liveness_heartbeat_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            friend_link_retry_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
             folder_ingest_jobs: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),

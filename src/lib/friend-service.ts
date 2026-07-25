@@ -85,6 +85,24 @@ export interface PendingFriendRequestDto {
 }
 
 /**
+ * One of THIS user's own outbound friend requests that hasn't been answered
+ * yet (mirrors `OutboundFriendRequestDto` in src-tauri). Delivered by
+ * `list_outbound_friend_requests` — ZEB-783.
+ *
+ * There is deliberately no owner id or display name: a peer who hasn't
+ * accepted has disclosed neither, so the only thing we can honestly show is
+ * the key the user typed.
+ */
+export interface OutboundFriendRequestDto {
+  /** The target's 64-byte transport identity pub, hex (what the user typed). */
+  identityPubHex: string;
+  /** Epoch-ms the request was sent. */
+  requestedAtMs: number;
+  /** Epoch-ms the node stops retrying this request. */
+  expiresAtMs: number;
+}
+
+/**
  * Outcome of `add_friend_by_key`. The backend returns an externally-tagged
  * enum:
  *   - `{ linked: { ownerIdHex, display } }` → the peer was immediately linked
@@ -261,6 +279,23 @@ export class FriendService {
   /** Decline an inbound friend request by the sender's owner_id hex. */
   async declineRequest(ownerIdHex: string): Promise<void> {
     await this.invoke<void>('decline_friend_request', { ownerIdHex });
+  }
+
+  /**
+   * ZEB-783: list this user's OWN unanswered outbound requests — the mirror of
+   * `listPendingRequests`. The node retries each one until the target accepts,
+   * so a row here means "sent, still waiting on them", not "stuck".
+   */
+  async listOutboundRequests(): Promise<OutboundFriendRequestDto[]> {
+    return this.invoke<OutboundFriendRequestDto[]>('list_outbound_friend_requests', {});
+  }
+
+  /**
+   * ZEB-783: stop retrying an outbound request and drop it from the list.
+   * Purely local — nothing is sent to the target. Idempotent.
+   */
+  async cancelOutboundRequest(identityPubHex: string): Promise<void> {
+    await this.invoke<void>('cancel_outbound_friend_request', { identityPubHex });
   }
 
   /**
