@@ -2143,7 +2143,7 @@ mod task3_kick_setpower_round_trip {
     use harmony_app::community_membership::{materialize, MaterializedMembership, MemberStatus};
     use harmony_app::community_state_crdt::InsertOutcome;
     use harmony_app::community_state_sync::{
-        CommunityMembershipDelta, CommunityRootHlcTracker, CommunitySyncEngine,
+        CommunityMembershipDelta, CommunityReplayTracker, CommunitySyncEngine,
         CommunitySyncEngineConfig, PersistPaths,
     };
     use harmony_app::dm_outbox::reserve_next_hlc_for_device;
@@ -2306,8 +2306,14 @@ mod task3_kick_setpower_round_trip {
 
         let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
         let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
-        let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
-        let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+        let tracker_a = Arc::new(Mutex::new(CommunityReplayTracker::new((
+            owner_a,
+            "a-dev".to_string(),
+        ))));
+        let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+            owner_b,
+            "b-dev".to_string(),
+        ))));
 
         let (delta_a_tx, mut delta_a_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
         let (delta_b_tx, mut delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);

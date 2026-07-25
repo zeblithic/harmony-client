@@ -16,7 +16,7 @@
 use harmony_app::community_membership::MaterializedMembership;
 use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::community_state_sync::{
-    CommunityMembershipDelta, CommunityRootHlcTracker, CommunitySyncEngine,
+    CommunityMembershipDelta, CommunityReplayTracker, CommunitySyncEngine,
     CommunitySyncEngineConfig, IdentityResolver, PersistPaths, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
@@ -166,8 +166,14 @@ async fn open_community_create_redeem_leave_round_trip() {
 
     let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_a = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        owner_a,
+        "a-dev".to_string(),
+    ))));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        owner_b,
+        "b-dev".to_string(),
+    ))));
 
     let (delta_a_tx, mut delta_a_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
     let (delta_b_tx, mut delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
@@ -519,8 +525,14 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
 
     let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_a = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        owner_a,
+        "a-dev".to_string(),
+    ))));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        owner_b,
+        "b-dev".to_string(),
+    ))));
 
     let (delta_a_tx, mut delta_a_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
     let (delta_b_tx, mut delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
@@ -1015,8 +1027,14 @@ async fn open_community_two_node_wire_convergence_no_preseed() {
 
     let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_a = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        owner_a,
+        "a-dev".to_string(),
+    ))));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        owner_b,
+        "b-dev".to_string(),
+    ))));
     let (delta_a_tx, mut _delta_a_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
     let (delta_b_tx, mut _delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
     let tmp_a = tempfile::tempdir().expect("tmp a");
@@ -1305,8 +1323,14 @@ async fn invite_only_admin_admits_joiner_pending_join_over_wire() {
 
     let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_a = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        owner_a,
+        "a-dev".to_string(),
+    ))));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        owner_b,
+        "b-dev".to_string(),
+    ))));
     let (delta_a_tx, mut _delta_a_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
     let (delta_b_tx, mut _delta_b_rx) = mpsc::channel::<CommunityMembershipDelta>(32);
     let tmp_a = tempfile::tempdir().expect("tmp a");

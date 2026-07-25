@@ -14,7 +14,7 @@ use harmony_app::community_membership::{
 };
 use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::community_state_sync::{
-    CommunityRootHlcTracker, CommunitySyncEngine, CommunitySyncEngineConfig, PersistPaths,
+    CommunityReplayTracker, CommunitySyncEngine, CommunitySyncEngineConfig, PersistPaths,
     DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
@@ -100,7 +100,10 @@ async fn pending_join_accepted_via_engine_insert_without_admin_pub_bind() {
     let mk = EpochKey::new([0x42; 32]);
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin_addr,
+        "admin-dev".to_string(),
+    ))));
 
     let (cas_op_tx, mut cas_op_rx) = mpsc::channel(8);
     tokio::spawn(async move {
@@ -254,7 +257,10 @@ fn build_engine_with_resolver(
     let mk = EpochKey::new([0x42; 32]);
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let tracker = Arc::new(Mutex::new(
-        harmony_app::community_state_sync::CommunityRootHlcTracker::default(),
+        harmony_app::community_state_sync::CommunityReplayTracker::new((
+            self_addr,
+            "test-dev".to_string(),
+        )),
     ));
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
         community_id,
@@ -598,7 +604,10 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
 
     // ── Community state (engine's local membership CRDT) ───────────────
     let community_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        joiner_addr,
+        "joiner-dev".to_string(),
+    ))));
 
     // ── Owner-state CRDT: seed a Space with pending_join_at = Some ─────
     // ZEB-254 R5-6: `pending_join_at` MUST equal the PendingJoin event's

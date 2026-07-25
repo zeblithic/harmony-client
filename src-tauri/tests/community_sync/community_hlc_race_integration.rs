@@ -33,7 +33,7 @@
 
 use harmony_app::community_state_crdt::{CommunityState, InsertOutcome};
 use harmony_app::community_state_sync::{
-    CommunityMembershipDelta, CommunityRootHlcTracker, CommunitySyncEngine,
+    CommunityMembershipDelta, CommunityReplayTracker, CommunitySyncEngine,
     CommunitySyncEngineConfig, IdentityResolver, PersistPaths, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
@@ -154,7 +154,10 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         Duration::from_secs(2),
     ));
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        alice_addr,
+        device_id.clone(),
+    ))));
     let tmp = tempfile::tempdir().expect("tmp");
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
         community_id,

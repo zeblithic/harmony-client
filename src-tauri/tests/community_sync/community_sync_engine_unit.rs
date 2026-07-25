@@ -6,7 +6,7 @@
 
 use harmony_app::community_state_crdt::CommunityState;
 use harmony_app::community_state_sync::{
-    CommunityRootHlcTracker, CommunitySyncEngine, CommunitySyncEngineConfig, DEFAULT_DEBOUNCE_MS,
+    CommunityReplayTracker, CommunitySyncEngine, CommunitySyncEngineConfig, DEFAULT_DEBOUNCE_MS,
 };
 use harmony_app::content_store::{ContentStore, RuntimeContentStore};
 use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
@@ -69,7 +69,10 @@ async fn engine_constructs_and_shuts_down_cleanly() {
     let admin = OwnerAddr([2u8; 16]);
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "test-device".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),
@@ -136,7 +139,10 @@ async fn flush_now_publishes_one_root_publish() {
     let admin = OwnerAddr([2u8; 16]);
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "test-device".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),
@@ -254,8 +260,14 @@ async fn engine_receives_remote_publish_and_merges_event() {
 
     let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_a = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "a-dev".to_string(),
+    ))));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        OwnerAddr([0xb1; 16]),
+        "b-dev".to_string(),
+    ))));
 
     let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx.clone(),
@@ -413,7 +425,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let t = tracker_b.lock().await;
-            if t.per_device.contains_key(&(admin, "a-dev".to_string())) {
+            if t.accepted().contains_key(&(admin, "a-dev".to_string())) {
                 break;
             }
             drop(t);
@@ -515,8 +527,14 @@ async fn engine_emits_membership_delta_on_remote_insert() {
 
     let state_a = Arc::new(Mutex::new(CommunityState::new(community_id)));
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker_a = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_a = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "a-dev".to_string(),
+    ))));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        OwnerAddr([0xb1; 16]),
+        "b-dev".to_string(),
+    ))));
 
     let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx.clone(),
@@ -746,7 +764,10 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
     let identity_pub = [0u8; 64];
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "local-dev".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         Duration::from_millis(1000),
@@ -915,7 +936,10 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
     let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]));
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        self_owner,
+        "test-device".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),
@@ -956,9 +980,8 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
 async fn publish_carries_valid_publisher_sig() {
     use ed25519_dalek::Verifier;
     use harmony_app::community_state_sync::{
-        decrypt_root_publish, CommunityRootHlcTracker, CommunityRootPublishPayload,
-        CommunityRootSignedPayload, CommunitySyncEngine, CommunitySyncEngineConfig,
-        DEFAULT_DEBOUNCE_MS,
+        decrypt_root_publish, CommunityRootPublishPayload, CommunityRootSignedPayload,
+        CommunitySyncEngine, CommunitySyncEngineConfig, DEFAULT_DEBOUNCE_MS,
     };
     use harmony_app::content_store::{ContentStore, RuntimeContentStore};
     use harmony_app::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
@@ -992,7 +1015,10 @@ async fn publish_carries_valid_publisher_sig() {
     let state = std::sync::Arc::new(tokio::sync::Mutex::new(
         harmony_app::community_state_crdt::CommunityState::new(community_id),
     ));
-    let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(CommunityReplayTracker::new((
+        self_owner,
+        "pub-dev".to_string(),
+    ))));
     let cs: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),
@@ -1210,7 +1236,10 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
     // pre-seed it with the same Join event Alice's state holds. (The
     // gate runs BEFORE sig-verify per cheapest-first ordering.)
     let state_b = Arc::new(Mutex::new(alice_state.clone()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        bob_addr,
+        "b-dev".to_string(),
+    ))));
     let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(2000),
@@ -1257,7 +1286,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
     // Tracker NOT advanced for alice's slot.
     let t = tracker_b.lock().await;
     assert!(
-        !t.per_device
+        !t.accepted()
             .contains_key(&(alice_addr, "alice-dev".to_string())),
         "tracker MUST NOT have advanced on sig-invalid rejection"
     );
@@ -1441,7 +1470,10 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
         Arc::new(MapResolver { entries });
 
     let state_b = Arc::new(Mutex::new(state.clone()));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin_addr,
+        "b-dev".to_string(),
+    ))));
     let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(2000),
@@ -1486,7 +1518,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
 
     let t = tracker_b.lock().await;
     assert!(
-        !t.per_device
+        !t.accepted()
             .contains_key(&(alice_addr, "alice-dev".to_string())),
         "tracker MUST NOT have advanced on PublisherNotJoined"
     );
@@ -1650,7 +1682,10 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
     // so she is not a materialized member and her publish is rejected with
     // PublisherNotJoined (the enrolled-device cold-cache shape).
     let state_b = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker_b = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker_b = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        alice_addr,
+        "b-dev".to_string(),
+    ))));
     let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(2000),
@@ -1696,7 +1731,7 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
     {
         let t = tracker_b.lock().await;
         assert!(
-            !t.per_device
+            !t.accepted()
                 .contains_key(&(alice_addr, "alice-dev".to_string())),
             "tracker MUST NOT have advanced on PublisherNotJoined"
         );
@@ -1732,7 +1767,7 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let t = tracker_b.lock().await;
-            if t.per_device
+            if t.accepted()
                 .contains_key(&(alice_addr, "alice-dev".to_string()))
             {
                 break;
@@ -1792,7 +1827,10 @@ async fn a_failed_community_publish_retries_itself_on_a_quiescent_community_zeb7
     let admin = OwnerAddr([8u8; 16]);
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "retry-device".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),
@@ -1894,7 +1932,10 @@ async fn a_persistently_failing_community_publish_paces_its_retries_zeb761() {
     let admin = OwnerAddr([7u8; 16]);
 
     let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
-    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "spin-device".to_string(),
+    ))));
     let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
         cas_op_tx,
         std::time::Duration::from_millis(1000),
@@ -1967,6 +2008,169 @@ async fn a_persistently_failing_community_publish_paces_its_retries_zeb761() {
     assert!(
         *gaps.last().expect("at least one gap") > gaps[0],
         "retry gaps must ESCALATE, not merely be non-zero: {gaps:?}"
+    );
+
+    engine.shutdown().await.ok();
+}
+
+/// ZEB-750: a burst of mutations inside one debounce window collapses into a
+/// single publish.
+///
+/// This is the sliding-window property `DebounceLatch` exists to provide, and
+/// before this test nothing pinned it for the community engine — the window
+/// was hand-rolled (`next_wakeup = Some(Instant::now() + ctx.debounce)`) and
+/// only exercised incidentally by tests that happened to mutate once. A
+/// regression to "re-arm only when idle" would publish once per mutation,
+/// which is correct-looking, passes every existing test, and multiplies
+/// state-root traffic by the size of every burst.
+///
+/// **This test must run on the REAL clock.** Under
+/// `#[tokio::test(start_paused = true)]` it cannot detect the regression at
+/// all, and an earlier draft that used paused time passed with the window
+/// deliberately broken. The reason is a harness subtlety worth recording:
+/// the latch is driven by `retry_now_ms()`, which reads
+/// `std::time::Instant` — and `tokio::time::pause()` virtualizes only
+/// `tokio::time::Instant`, not `std::time::Instant`. So under paused time
+/// the latch's clock is FROZEN near zero while tokio's sleeps advance
+/// normally. Every loop re-entry then recomputes
+/// `sleep_dur = deadline - ~0`, i.e. the full window measured from *now* —
+/// which slides the effective wakeup whether or not `mark_dirty` was
+/// called. The two behaviours become indistinguishable.
+///
+/// ZEB-761's retry tests are unaffected because they only assert "it
+/// eventually fires" and "gaps escalate", neither of which depends on the
+/// latch clock tracking tokio's. A sliding-window assertion does.
+///
+/// The window is kept small (300 ms) so the real-clock cost is well under a
+/// second.
+#[tokio::test]
+async fn a_burst_of_mutations_collapses_into_one_publish_zeb750() {
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel(16);
+
+    let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let puts_task = Arc::clone(&puts);
+    tokio::spawn(async move {
+        use harmony_app::content_store::CasOp;
+        while let Some(op) = cas_op_rx.recv().await {
+            if let CasOp::PutLocal {
+                reply: Some(reply), ..
+            } = op
+            {
+                puts_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = reply.send(Ok(()));
+            }
+        }
+    });
+
+    let community_id = SpaceId([11u8; 16]);
+    let mk = EpochKey::new([0x5c; 32]);
+    let admin = OwnerAddr([12u8; 16]);
+    let debounce_ms = 300u64;
+
+    let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+    let tracker = Arc::new(Mutex::new(CommunityReplayTracker::new((
+        admin,
+        "burst-device".to_string(),
+    ))));
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: mk,
+        admin_addr: admin,
+        is_invite_only: false,
+        device_id: "burst-device".into(),
+        self_owner: admin,
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x5c; 32])),
+        state: Arc::clone(&state),
+        tracker: Arc::clone(&tracker),
+        content_store: cs,
+        publisher_tx: out_tx,
+        subscriber_rx: in_rx,
+        paths: harmony_app::community_state_sync::PersistPaths {
+            crdt: tmp.path().join("crdt.cbor"),
+            replay: tmp.path().join("replay.cbor"),
+        },
+        debounce_ms,
+        identity_resolver: None,
+        error_tx: None,
+        delta_tx: None,
+        pending_redemptions: None,
+        crdt_state: None,
+        admin_identity_pub: None,
+        nav_emitter: None,
+        root_serve_rx: None,
+    });
+
+    // Five signals, 60 ms apart, spanning ~240 ms — all inside one 300 ms
+    // window, but spread far enough that a SLIDING window and a FIXED one
+    // have distinguishable deadlines: fixed fires at first+300, sliding at
+    // last+300.
+    //
+    // The spread is load-bearing. An earlier draft bunched the signals 10 ms
+    // apart, putting both deadlines within 40 ms of each other; a single
+    // coarse "sleep past both" check cannot tell them apart. Probing BETWEEN
+    // them is what makes this a test about SLIDING rather than about
+    // debouncing-at-all.
+    //
+    // Every deadline below is MEASURED, not assumed. A draft that slept
+    // hard-coded durations and reasoned about where it "should" be would go
+    // flaky under CI load: if the burst loop itself overshoots, the probe
+    // drifts past the sliding deadline and the test fails for scheduling
+    // reasons rather than behavioural ones. Recording the real instants and
+    // sleeping *until* a computed point keeps the probe correctly placed no
+    // matter how slowly the loop ran. (Qodo, PR #548.)
+    let debounce = std::time::Duration::from_millis(debounce_ms);
+    let first_signal_at = std::time::Instant::now();
+    let mut last_signal_at = first_signal_at;
+    for _ in 0..5 {
+        engine.notify_dirty();
+        last_signal_at = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    }
+
+    let fixed_deadline = first_signal_at + debounce;
+    let sliding_deadline = last_signal_at + debounce;
+
+    // The probe must land strictly between the two deadlines. If the burst
+    // loop overshot far enough that no such point exists, the run was too
+    // degraded to say anything — skip the discriminating assertion rather
+    // than fail on scheduling noise.
+    let margin = std::time::Duration::from_millis(20);
+    let probe_at = fixed_deadline + margin;
+    if probe_at + margin < sliding_deadline {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(probe_at)).await;
+        assert!(
+            out_rx.try_recv().is_err(),
+            "a FIXED window would have fired by first_signal+{debounce_ms}ms; \
+             the window must SLIDE with each mutation and still be open here"
+        );
+    }
+
+    // Now past the deadline measured from the LAST signal.
+    tokio::time::sleep_until(tokio::time::Instant::from_std(sliding_deadline + margin)).await;
+
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+        .await
+        .expect("the collapsed burst must publish once the window elapses")
+        .expect("publisher_tx dropped or never sent");
+    assert!(
+        !bytes.is_empty(),
+        "the publish must carry a real wire packet"
+    );
+
+    // And exactly one publish, not five. A second window's worth of quiet is
+    // long enough for any straggler from the burst to have arrived.
+    tokio::time::sleep(debounce).await;
+    assert!(
+        out_rx.try_recv().is_err(),
+        "a burst inside one window must collapse to a SINGLE publish"
     );
 
     engine.shutdown().await.ok();
