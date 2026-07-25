@@ -289,7 +289,7 @@ describe('FriendsPanel — outbound requests (ZEB-784 / ZEB-783)', () => {
     const { getByTestId, findByTestId } = render(FriendsPanel, { props: { service } });
     await findByTestId('outbound-requests-section');
 
-    await fireEvent.click(getByTestId('outbound-retry-btn'));
+    await fireEvent.click(getByTestId(`outbound-retry-${PEER_KEY}`));
 
     await vi.waitFor(() =>
       expect(getByTestId('add-by-key-status').textContent).toContain('Now connected'),
@@ -306,7 +306,7 @@ describe('FriendsPanel — outbound requests (ZEB-784 / ZEB-783)', () => {
     const { getByTestId, findByTestId } = render(FriendsPanel, { props: { service } });
     await findByTestId('outbound-requests-section');
 
-    await fireEvent.click(getByTestId('outbound-retry-btn'));
+    await fireEvent.click(getByTestId(`outbound-retry-${PEER_KEY}`));
 
     await vi.waitFor(() => {
       const status = getByTestId('add-by-key-status').textContent ?? '';
@@ -331,10 +331,59 @@ describe('FriendsPanel — outbound requests (ZEB-784 / ZEB-783)', () => {
     });
     await findByTestId('outbound-requests-section');
 
-    await fireEvent.click(getByTestId('outbound-cancel-btn'));
+    await fireEvent.click(getByTestId(`outbound-cancel-${PEER_KEY}`));
 
     expect(cancelOutboundRequest).toHaveBeenCalledWith(PEER_KEY);
     await vi.waitFor(() => expect(queryByTestId('outbound-requests-section')).toBeNull());
+  });
+
+  it('keys per-row action buttons so multiple rows stay addressable', async () => {
+    // Regression guard for the duplicate-test-id bug: with static ids, two rows
+    // render two `outbound-retry-btn`s and getByTestId throws on the ambiguity.
+    // A single-row fixture cannot catch it, which is why this one has two.
+    const OTHER = 'ef'.repeat(64);
+    const service = mockService({
+      listOutboundRequests: vi.fn().mockResolvedValue([
+        OUTBOUND,
+        { identityPubHex: OTHER, requestedAtMs: 1_700_000_100_000, expiresAtMs: 1_700_000_100_000 },
+      ]),
+    });
+    const { getByTestId, findByTestId } = render(FriendsPanel, { props: { service } });
+    await findByTestId('outbound-requests-section');
+
+    // Each row's controls resolve unambiguously to that row's key.
+    expect(getByTestId(`outbound-retry-${PEER_KEY}`)).not.toBeNull();
+    expect(getByTestId(`outbound-cancel-${PEER_KEY}`)).not.toBeNull();
+    expect(getByTestId(`outbound-retry-${OTHER}`)).not.toBeNull();
+    expect(getByTestId(`outbound-cancel-${OTHER}`)).not.toBeNull();
+  });
+
+  it('clears the waiting copy after a cancel so it cannot outlive the row', async () => {
+    // The status line is shared with handleAddByKey, which writes "we'll keep
+    // trying until they do". After a cancel that message describes a request
+    // that no longer exists and retries that will not happen.
+    const service = mockService({
+      addByKey: vi.fn().mockResolvedValue({ kind: 'pending' }),
+      listOutboundRequests: vi
+        .fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([OUTBOUND])
+        .mockResolvedValue([]),
+    });
+    const { getByTestId, queryByTestId, findByTestId } = render(FriendsPanel, {
+      props: { service },
+    });
+    await vi.waitFor(() => expect(getByTestId('add-by-key-btn')).not.toBeNull());
+
+    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER_KEY } });
+    await fireEvent.click(getByTestId('add-by-key-btn'));
+    await findByTestId('outbound-requests-section');
+    expect(getByTestId('add-by-key-status').textContent).toContain('keep trying');
+
+    await fireEvent.click(getByTestId(`outbound-cancel-${PEER_KEY}`));
+
+    await vi.waitFor(() => expect(queryByTestId('outbound-requests-section')).toBeNull());
+    expect(queryByTestId('add-by-key-status')).toBeNull();
   });
 
   it('does not write state after unmount when an add is still in flight', async () => {

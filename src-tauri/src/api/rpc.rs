@@ -1689,6 +1689,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_friend_request_rpcs_are_registered_and_wired() {
+        // ZEB-783 (PR #552 review): `registry_has_exactly_the_curated_v1_surface`
+        // pins NAMES only. It cannot catch the arg struct rejecting the Tauri
+        // wrapper's camelCase shape, nor a verb wired to the wrong seam. Same
+        // proof shape as the vine-follow parity test.
+        //
+        // Both of these reach their seam on a default NodeState rather than
+        // erroring: the store is process-local and present on a bare NodeState,
+        // so `list` returns an empty projection and `cancel` is idempotently
+        // Ok on an unknown key. So `Ok` here IS the wired signal — what would
+        // fail is `UnknownCommand` (unregistered) or `BadArgs` (arg mismatch).
+        let reg = build_registry();
+        let key = "cd".repeat(64); // valid 128-hex identity pub
+        let cases = [
+            ("list_outbound_friend_requests", serde_json::json!({})),
+            (
+                "cancel_outbound_friend_request",
+                serde_json::json!({ "identityPubHex": key }),
+            ),
+        ];
+        for (method, args) in cases {
+            let out = reg.dispatch(method, test_state(), test_sink(), args).await;
+            assert!(
+                out.is_ok(),
+                "{method}: expected the seam to answer on a default NodeState, got {:?}",
+                out.unwrap_err()
+            );
+        }
+
+        // And the arg struct must actually REJECT a wrong shape — otherwise the
+        // Ok above would also pass for a verb that ignores its arguments.
+        let bad = reg
+            .dispatch(
+                "cancel_outbound_friend_request",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "identity_pub_hex": "snake_case is wrong" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(bad, RpcError::BadArgs(_)),
+            "snake_case args must be rejected, got {bad:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn vine_follow_rpcs_are_registered_and_wired() {
         // ZEB-562: dispatching the three follow verbs with valid args on a
         // default (not-connected) NodeState must reach the `_impl` seam and

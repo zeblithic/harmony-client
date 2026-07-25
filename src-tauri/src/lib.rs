@@ -12923,15 +12923,18 @@ pub async fn start_node_inner(
             // `NodeState` through `wry_handle` (GUI) or `owned_state`
             // (headless serve/RPC).
             {
-                let retry_slot = {
-                    let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-                    if guard.generation != our_gen {
-                        None
-                    } else {
-                        Some(std::sync::Arc::clone(&guard.friend_link_retry_handle))
-                    }
-                };
-                if let Some(slot) = retry_slot {
+                // The NodeState guard is held ACROSS spawn + handle-install, and
+                // that is load-bearing rather than incidental. `stop_inner` takes
+                // this same lock before reaching the handle slots, so a `stop_node`
+                // racing us can only run before or after this block — never in the
+                // window between `tokio::spawn` and the slot write. Without it,
+                // a stop landing in that window aborts an empty slot and the task
+                // survives, dialing peers forever on a node the user stopped.
+                // `tokio::spawn` never awaits, so holding a std guard over it is
+                // safe. Lock ORDER matches stop_inner (state → slot), so the two
+                // cannot deadlock.
+                let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                if guard.generation == our_gen {
                     if let Some(handle) = spawn_friend_link_retry(
                         wry_handle.clone(),
                         owned_state.clone(),
@@ -12942,7 +12945,10 @@ pub async fn start_node_inner(
                         // leave the just-spawned task untracked (leaked) —
                         // an untracked dialer is exactly what stop_inner
                         // exists to prevent here.
-                        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut slot = guard
+                            .friend_link_retry_handle
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         if let Some(old) = slot.replace(handle) {
                             old.abort();
                         }
@@ -62407,12 +62413,27 @@ pub(crate) async fn retry_pending_friend_links(
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
 ) -> usize {
     let outbound_links = {
-        let Ok(g) = state.lock() else {
-            return 0;
-        };
+        // Recover a poisoned lock rather than bailing. `let Ok(g) = … else`
+        // would make EVERY subsequent pass a silent no-op once any unrelated
+        // panic poisoned this mutex — the retry owner would be permanently and
+        // invisibly dead. The rest of this file (stop_inner, the spawn block)
+        // deliberately recovers via `into_inner` for the same reason.
+        let g = state.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("ZEB-784: NodeState mutex poisoned; recovering to keep retries alive");
+            poisoned.into_inner()
+        });
         std::sync::Arc::clone(&g.pending_outbound_links)
     };
-    let due = outbound_links.list(crate::iroh_friend_acceptor::wall_now_ms());
+    let now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+    // Sweep before reading: `list` filters expired entries but does not remove
+    // them, so without this a long-lived node accumulates dead keys in memory
+    // and re-persists them on every write. This task already runs on a timer,
+    // which makes it the natural sweeper.
+    let pruned = outbound_links.prune_expired(now_ms);
+    if pruned > 0 {
+        tracing::debug!(pruned, "ZEB-784: dropped expired outbound friend requests");
+    }
+    let due = outbound_links.list(now_ms);
     if due.is_empty() {
         return 0;
     }

@@ -648,6 +648,10 @@
       outboundRequests = next;
       outboundError = null;
     } catch (e) {
+      // Guard the FAILURE path too: `listOutboundRequests` can reject after the
+      // panel unmounts, and assigning here would mutate $state on a destroyed
+      // component exactly as the success path above is careful not to.
+      if (destroyed) return;
       outboundError = e instanceof Error ? e.message : String(e);
     }
   }
@@ -693,6 +697,11 @@
     try {
       await service.cancelOutboundRequest(identityPubHex);
       if (destroyed) return;
+      // Clear the shared status line. handleAddByKey / handleRetryOutbound both
+      // write "we'll keep trying…" into it, and after a cancel that message
+      // outlives the row it described — telling the user retries continue for a
+      // request they just stopped.
+      addByKeyStatus = null;
       await refreshOutbound();
     } catch (e) {
       outboundError = e instanceof Error ? e.message : String(e);
@@ -1152,7 +1161,7 @@
                 class="accept-btn"
                 disabled={outboundInFlight.has(req.identityPubHex)}
                 onclick={() => handleRetryOutbound(req.identityPubHex)}
-                data-testid="outbound-retry-btn"
+                data-testid="outbound-retry-{req.identityPubHex}"
                 title="Try again now — we're already retrying in the background"
               >
                 {outboundInFlight.has(req.identityPubHex) ? '…' : 'Retry now'}
@@ -1162,7 +1171,7 @@
                 class="unfriend-btn"
                 disabled={outboundInFlight.has(req.identityPubHex)}
                 onclick={() => handleCancelOutbound(req.identityPubHex)}
-                data-testid="outbound-cancel-btn"
+                data-testid="outbound-cancel-{req.identityPubHex}"
                 title="Stop trying to connect with this key"
               >
                 {outboundInFlight.has(req.identityPubHex) ? '…' : 'Cancel'}

@@ -391,6 +391,10 @@ impl PendingOutboundIntroductions {
 #[derive(Default)]
 pub struct PendingOutboundLinks {
     inner: TtlPreAuth<String>,
+    /// Serializes snapshot+encode+write in [`persist`](Self::persist) so two
+    /// concurrent mutators cannot write in non-chronological order. Separate
+    /// from the map lock precisely so the map is never held across I/O.
+    persist_lock: Mutex<()>,
     /// Where this store persists. `None` = ephemeral (tests, and any caller with
     /// no identity dir), which degrades to pre-ZEB-784 behaviour: the retry
     /// simply does not survive a restart.
@@ -438,9 +442,26 @@ impl PendingOutboundLinks {
                 Ok(m) => m,
                 Err(e) => {
                     let aside = path.with_extension(format!("corrupt-{now_ms}"));
-                    let _ = std::fs::rename(&path, &aside);
-                    tracing::warn!(error = %e, quarantined = %aside.display(),
-                        "ZEB-784: outbound-link store corrupt; quarantined, continuing empty");
+                    match std::fs::rename(&path, &aside) {
+                        Ok(()) => {
+                            tracing::warn!(error = %e, quarantined = %aside.display(),
+                                "ZEB-784: outbound-link store corrupt; quarantined, continuing empty");
+                        }
+                        Err(rename_err) => {
+                            // The rewrite below would overwrite `path` with the
+                            // empty map and destroy the very bytes the
+                            // quarantine exists to preserve. Bail out to an
+                            // ephemeral store instead: this session degrades to
+                            // pre-ZEB-784 behaviour (no durable retry), which is
+                            // strictly better than silently shredding the
+                            // evidence of whatever corrupted the file.
+                            tracing::error!(error = %e, rename_error = %rename_err,
+                                path = %path.display(),
+                                "ZEB-784: outbound-link store corrupt AND quarantine failed; \
+                                 running WITHOUT persistence so the bad bytes survive for diagnosis");
+                            return Self::default();
+                        }
+                    }
                     HashMap::new()
                 }
             },
@@ -456,6 +477,7 @@ impl PendingOutboundLinks {
             inner: TtlPreAuth {
                 inner: Mutex::new(live),
             },
+            persist_lock: Mutex::new(()),
             path: Some(path),
         };
         // Rewrite immediately so a pruned or quarantined file is reflected on
@@ -472,12 +494,30 @@ impl PendingOutboundLinks {
         Ok(rows.into_iter().collect())
     }
 
-    /// Snapshot under the lock, then write OUTSIDE it — never hold a mutex
-    /// across filesystem I/O.
+    /// Snapshot and write, serialized against other persists — but never holding
+    /// the MAP lock across filesystem I/O.
+    ///
+    /// The persist lock is taken BEFORE the snapshot, and that ordering is the
+    /// whole point. Serializing only the write would still allow two mutators to
+    /// snapshot in one order and write in the other, so an older snapshot could
+    /// land last. Concretely, that loses cancels: the retry driver calls `record`
+    /// on a timer (snapshot contains `k`), the user cancels (snapshot omits `k`),
+    /// the cancel's write lands first, and the stale snapshot puts `k` back. The
+    /// request then rehydrates on the next boot and is retried for the remaining
+    /// TTL — a cancelled request coming back from the dead.
+    ///
+    /// Taking the persist lock first makes snapshot→encode→write one atomic unit,
+    /// so the last writer's bytes always reflect the latest state.
     fn persist(&self) {
         let Some(path) = self.path.as_ref() else {
             return;
         };
+        // Recover a poisoned persist lock: a panic in a prior persist must not
+        // permanently disable durability for the rest of the session.
+        let _serialize = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let rows: Vec<(String, u64)> = {
             let m = self
                 .inner
@@ -539,6 +579,33 @@ impl PendingOutboundLinks {
     /// Backs both the retry driver and the sender-side UI projection.
     pub fn list(&self, now_ms: u64) -> Vec<(String, u64)> {
         self.inner.list(now_ms, OUTBOUND_LINK_TTL_MS)
+    }
+
+    /// Remove every expired record, returning how many were dropped.
+    ///
+    /// `list`/`is_pending` FILTER expired entries but do not remove them, because
+    /// a read should not mutate. Without an explicit sweep a long-lived node
+    /// accumulates dead keys in memory and re-persists them on every write, so
+    /// the file only ever shrinks at boot. The retry driver calls this on each
+    /// pass, which is the natural place: it already runs on a timer and already
+    /// walks the live set. Mirrors `sweep_expired_offers` on the inbound store.
+    ///
+    /// Persists only when something was actually dropped.
+    pub fn prune_expired(&self, now_ms: u64) -> usize {
+        let dropped = {
+            let mut m = self
+                .inner
+                .inner
+                .lock()
+                .expect("outbound pre-auth mutex poisoned");
+            let before = m.len();
+            m.retain(|_, rec| TtlPreAuth::<String>::is_live(*rec, now_ms, OUTBOUND_LINK_TTL_MS));
+            before - m.len()
+        };
+        if dropped > 0 {
+            self.persist();
+        }
+        dropped
     }
 
     /// Drop the record — the link completed, or the user cancelled. Idempotent.
@@ -1114,6 +1181,114 @@ mod tests {
             quarantined.len(),
             1,
             "the unreadable bytes must be preserved aside, not deleted: {quarantined:?}"
+        );
+    }
+
+    /// Runtime pruning: `list` only FILTERS expired entries, so without an
+    /// explicit sweep a long-lived node keeps dead keys in memory and
+    /// re-persists them on every write. The retry driver calls this each pass.
+    #[test]
+    fn outbound_links_prune_expired_at_runtime() {
+        let store = PendingOutboundLinks::new();
+        store.record("old", 1_000);
+        store.record("new", 1_000 + OUTBOUND_LINK_TTL_MS);
+
+        let now = 1_000 + OUTBOUND_LINK_TTL_MS + 1;
+        // Before the sweep the expired key is filtered from reads but still held.
+        assert_eq!(store.list(now).len(), 1, "reads already filter it");
+        assert_eq!(store.prune_expired(now), 1, "one expired record dropped");
+        assert_eq!(store.prune_expired(now), 0, "sweep is idempotent");
+        assert_eq!(store.list(now).len(), 1);
+    }
+
+    /// The persisted file must always match the final in-memory state, however
+    /// the mutations interleave.
+    ///
+    /// `persist` takes its lock BEFORE snapshotting for exactly this reason. If
+    /// it serialized only the write, two mutators could snapshot in one order
+    /// and write in the other — and the case that costs a user something real is
+    /// a `record` (from the retry driver's timer) overwriting a concurrent
+    /// `forget` (the user's cancel), resurrecting a cancelled request on reboot.
+    #[test]
+    fn outbound_links_persist_matches_memory_under_concurrency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
+        let store = Arc::new(PendingOutboundLinks::load_or_recover(path.clone(), 1_000));
+
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let s = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..40u64 {
+                    let key = format!("k{}", (t * 40 + i) % 10);
+                    if i % 2 == 0 {
+                        s.record(&key, 1_000 + i);
+                    } else {
+                        s.forget(&key);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        // One final mutation so the last write is unambiguously ours, then the
+        // file must agree with memory. A torn ordering shows up as a key on disk
+        // that memory no longer has (the resurrection case) or vice versa.
+        store.forget("k0");
+        store.record("sentinel", 2_000);
+
+        let mut in_memory: Vec<String> = store.list(2_000).into_iter().map(|(k, _)| k).collect();
+        let on_disk_map =
+            PendingOutboundLinks::decode(&std::fs::read(&path).expect("read")).expect("decode");
+        let mut on_disk: Vec<String> = on_disk_map.into_keys().collect();
+        in_memory.sort();
+        on_disk.sort();
+        assert_eq!(
+            on_disk, in_memory,
+            "the persisted file must reflect the final in-memory state"
+        );
+        assert!(
+            !on_disk.contains(&"k0".to_string()),
+            "a forgotten key must not be resurrected on disk by a racing record"
+        );
+    }
+
+    /// When the corrupt file cannot be moved aside, the store must NOT then
+    /// overwrite it with an empty map — that would destroy the exact bytes the
+    /// quarantine exists to preserve. It degrades to ephemeral instead.
+    ///
+    /// The rename is made to fail deterministically by pre-creating a DIRECTORY
+    /// at the quarantine path (rename of a file onto a directory fails), rather
+    /// than by permissions, which vary by platform and by whether tests run as
+    /// root.
+    #[test]
+    fn outbound_links_keep_corrupt_bytes_when_quarantine_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
+        let corrupt = b"this is not cbor";
+        std::fs::write(&path, corrupt).expect("seed corrupt file");
+
+        let now_ms = 4_242;
+        let blocked = path.with_extension(format!("corrupt-{now_ms}"));
+        std::fs::create_dir(&blocked).expect("occupy the quarantine path");
+
+        let store = PendingOutboundLinks::load_or_recover(path.clone(), now_ms);
+        assert!(store.list(now_ms).is_empty(), "comes up empty either way");
+
+        assert_eq!(
+            std::fs::read(&path).expect("original still readable"),
+            corrupt,
+            "the corrupt bytes must survive — losing them costs the diagnosis"
+        );
+
+        // And it must be ephemeral: a later write cannot clobber the evidence.
+        store.record("aa", now_ms);
+        assert_eq!(
+            std::fs::read(&path).expect("original still readable"),
+            corrupt,
+            "a store that failed to quarantine must not persist over the bad file"
         );
     }
 
