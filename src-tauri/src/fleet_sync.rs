@@ -38,7 +38,8 @@ use crate::owner_state_crypto::{
 use crate::owner_state_types::Hlc;
 use harmony_content::cid::ContentId;
 use harmony_crdt_sync::{
-    Admission, DebounceLatch, DirtySignal, HlcTick, MonotoneMap, PublishOutcome, ReplayTracker,
+    Admission, DebounceLatch, DirtySignal, HlcTick, MonotoneMap, PublishClaim, PublishOutcome,
+    ReplayTracker, RetryBackoff,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -670,6 +671,41 @@ fn outcome_of<T, E>(r: &Result<T, E>) -> PublishOutcome {
     }
 }
 
+/// Settle a publish claim and update the retry schedule in one place.
+///
+/// These are one decision, not two. [`DirtySignal::Restore`] means the
+/// publish failed **and** had taken a dirty signal — i.e. unreplicated
+/// local work exists — which is exactly the condition an autonomous retry
+/// should key off (ZEB-761). Keying off "the publish failed" alone would be
+/// wrong: a failed `flush_now` on a CLEAN engine settles `Spent`, and arming
+/// a retry for it would wake the task on an escalating schedule forever with
+/// nothing to send.
+///
+/// Any successful publish clears the escalation, so an intermittent failure
+/// does not inherit the delay an earlier outage earned.
+fn settle_publish<S, T>(
+    ctx: &Ctx<S>,
+    claim: PublishClaim,
+    pub_result: &Result<T, SyncError>,
+    retry: &mut RetryBackoff,
+    now_ms: u64,
+) {
+    match claim.settle(outcome_of(pub_result)) {
+        DirtySignal::Restore => {
+            // Re-arm the signal AND schedule the wakeup that will act on
+            // it. Restoring the flag alone is the ZEB-761 bug: the engine
+            // then holds unreplicated work with nothing scheduled to send
+            // it, and on a quiescent dataset nothing ever comes.
+            ctx.has_pending_dirty.store(true, Ordering::Release);
+            retry.on_failure(now_ms);
+        }
+        DirtySignal::Spent => {}
+    }
+    if pub_result.is_ok() {
+        retry.clear(now_ms);
+    }
+}
+
 async fn internal_task<S>(mut ctx: Ctx<S>)
 where
     S: CanonicalPayload + serde::de::DeserializeOwned + Clone + Send + 'static,
@@ -680,12 +716,32 @@ where
     // latch takes what we claimed and tells us whether to put it back.
     //
     // Millis come from a monotonic `Instant` epoch, never the wall clock: an
-    // NTP step must not stretch or collapse the debounce window. (Under
-    // `tokio::time::pause()` this is the paused clock, so tests keep logical
-    // time.)
+    // NTP step must not stretch or collapse the debounce window.
+    //
+    // This is `std::time::Instant`, which `tokio::time::pause()` does NOT
+    // freeze — only `tokio::time::Instant` is virtual. That is fine, and
+    // paused-clock tests still work, because every deadline is consumed as a
+    // DELTA (`target - now_ms()`) read from this same clock and then handed
+    // to a tokio sleep. Under pause the deltas are exact and the sleeps
+    // resolve in logical time; only the absolute millis stop tracking the
+    // virtual clock, which nothing here reads.
     let clock_epoch = Instant::now();
     let now_ms = move || clock_epoch.elapsed().as_millis() as u64;
     let mut latch = DebounceLatch::new(ctx.debounce.as_millis() as u64);
+    // ZEB-761: the debounce window alone cannot retry. `on_deadline`
+    // disarms, so a failed publish left the engine holding a restored dirty
+    // flag with NO wakeup scheduled — on a quiescent dataset (the write
+    // finished, the user stopped typing) the state stayed persisted-but-
+    // unreplicated until the next mutation, an explicit flush, or app exit.
+    // This is the second schedule: it arms only when a publish actually
+    // dropped work, and paces retries so an unhealthy transport is not
+    // hammered.
+    //
+    // Not configurable per engine: the production schedule is the only one
+    // production uses, and tests drive it in logical time (`tokio::time::
+    // pause()`) rather than by injecting a compressed one — which keeps 34
+    // `FleetSyncConfig` construction sites untouched.
+    let mut retry = RetryBackoff::default();
     // Latched after we observe `None` on `subscriber_rx`. Without this,
     // select! polls a closed channel every iteration and the arm-pattern
     // `Some(bytes) = recv()` silently filters out None — inbound sync is
@@ -713,9 +769,18 @@ where
     tokio::pin!(notified);
 
     loop {
-        // Compute the sleep duration for the wakeup branch.
-        let sleep_dur = latch
-            .deadline()
+        // Compute the sleep duration for the wakeup branch. Two schedules
+        // can want it: the debounce window (a mutation is waiting to be
+        // published) and the retry backoff (a previous publish failed with
+        // work still owed). Whichever is SOONER wins — a fresh mutation is
+        // a legitimate new reason to publish, not a retry spin, so it must
+        // not be held behind a 30 s-to-600 s backoff earned by an earlier
+        // failure. The backoff paces only the autonomous retry.
+        let wake_at = match (latch.deadline(), retry.pending_at()) {
+            (Some(debounce_at), Some(retry_at)) => Some(debounce_at.min(retry_at)),
+            (debounce_at, retry_at) => debounce_at.or(retry_at),
+        };
+        let sleep_dur = wake_at
             .map(|d| Duration::from_millis(d.saturating_sub(now_ms())))
             .unwrap_or(Duration::from_secs(3600));
 
@@ -733,7 +798,13 @@ where
                 // polls of the Done future return Ready in a tight loop.
                 notified.set(notify.notified());
             }
-            _ = tokio::time::sleep(sleep_dur), if latch.is_armed() => {
+            _ = tokio::time::sleep(sleep_dur), if wake_at.is_some() => {
+                // Reached either schedule's instant. `on_deadline` is right
+                // for both: it disarms the debounce window (whose pending
+                // mutation this publish carries anyway, since the publish
+                // snapshots current state) and always claims a publish,
+                // which is what a due retry owes.
+                //
                 // `swap` rather than `store(false)`: clearing up front is
                 // mandatory (a mutation arriving DURING the publish must
                 // re-arm rather than be swallowed by it), which is exactly
@@ -745,11 +816,7 @@ where
                 if let Err(e) = &pub_result {
                     tracing::warn!(error = %e, "publish_root_now failed");
                 }
-                if claim.settle(outcome_of(&pub_result)) == DirtySignal::Restore {
-                    // Re-arm so the next debounce wakeup / shutdown retries
-                    // this publish instead of skipping it.
-                    ctx.has_pending_dirty.store(true, Ordering::Release);
-                }
+                settle_publish(&ctx, claim, &pub_result, &mut retry, now_ms());
                 if let Err(e) = persist_now(&ctx).await {
                     tracing::warn!(error = %e, "persist_now failed");
                 }
@@ -770,9 +837,7 @@ where
                 if let Err(ref e) = pub_result {
                     tracing::warn!(error = %e, "flush_now publish_root_now failed");
                 }
-                if claim.settle(outcome_of(&pub_result)) == DirtySignal::Restore {
-                    ctx.has_pending_dirty.store(true, Ordering::Release);
-                }
+                settle_publish(&ctx, claim, &pub_result, &mut retry, now_ms());
                 // ZEB-710: an EXPLICIT flush accounts the caller's mutation
                 // for the dirty-window tripwire — the state was just
                 // published above, so the ZEB-703 harm (persisted but never
@@ -1844,6 +1909,167 @@ mod engine_tests {
         // Unwedge the task (closing the channel fails the pending send, which
         // the task handles as a publish error) so shutdown can run cleanly.
         drop(built.out_rx);
+        built.engine.shutdown().await.ok();
+    }
+
+    /// ZEB-761: a CAS whose `put` fails its first `remaining_failures`
+    /// attempts, then succeeds. `put_serveable` (what the publish path calls)
+    /// defaults to `put`, so this is the publish-failure injection point.
+    ///
+    /// Records the instant of every attempt so a test can assert the retry
+    /// CADENCE, not merely that a retry eventually happened.
+    struct FlakyPutCas {
+        inner: Arc<dyn ContentStore>,
+        remaining_failures: std::sync::Mutex<usize>,
+        attempts: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    }
+
+    #[async_trait]
+    impl ContentStore for FlakyPutCas {
+        async fn put(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {
+            self.attempts
+                .lock()
+                .expect("attempts mutex")
+                .push(tokio::time::Instant::now());
+            {
+                // Scoped so the std guard is dropped before the await below.
+                let mut left = self.remaining_failures.lock().expect("failures mutex");
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(ContentStoreError::Io(
+                        "forced publish failure (ZEB-761)".into(),
+                    ));
+                }
+            }
+            self.inner.put(cid, blob).await
+        }
+        async fn get(&self, cid: &ContentId) -> Result<Option<Vec<u8>>, ContentStoreError> {
+            self.inner.get(cid).await
+        }
+    }
+
+    /// ZEB-761: a failed publish on a QUIESCENT dataset must still reach the
+    /// transport, with no further mutation to carry it.
+    ///
+    /// Before the retry schedule the engine restored the dirty signal but
+    /// armed no wakeup — `on_deadline` disarms — so it sat on unreplicated
+    /// state until the next mutation, an explicit flush, or app exit. On a
+    /// continuously-written dataset the next keystroke papered over it; on a
+    /// quiescent one nothing ever came.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_publish_retries_itself_on_a_quiescent_dataset_zeb761() {
+        let inner: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cas: Arc<dyn ContentStore> = Arc::new(FlakyPutCas {
+            inner,
+            remaining_failures: std::sync::Mutex::new(1),
+            attempts: Arc::clone(&attempts),
+        });
+        let mut built = build_engine("dev-retry", cas, false);
+
+        // One mutation, then the writer goes quiet — no second notify_dirty
+        // to re-arm the debounce window. This is the whole point.
+        {
+            let mut doc = built.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "quiescent".into(),
+                },
+            );
+        }
+        built.engine.notify_dirty();
+
+        // The debounce publish fails; only the retry schedule can deliver
+        // this. The idle sleep is 3600 s, well beyond this budget, so the
+        // pre-fix behaviour fails the timeout rather than hanging forever.
+        let frame = tokio::time::timeout(Duration::from_secs(120), built.out_rx.recv())
+            .await
+            .expect("a failed publish on a quiescent dataset must retry itself (ZEB-761)")
+            .expect("publisher channel closed");
+        assert!(!frame.is_empty(), "retry must carry a real publish frame");
+
+        // And it genuinely took a retry: one failure, then one success.
+        assert_eq!(
+            attempts.lock().expect("attempts mutex").len(),
+            2,
+            "expected one failed publish followed by one successful retry"
+        );
+
+        built.engine.shutdown().await.ok();
+    }
+
+    /// ZEB-761: a persistently failing publish must PACE its retries.
+    ///
+    /// This pins the reason the naive fix was rejected: re-arming the
+    /// deadline that just fired targets an instant already in the PAST (its
+    /// firing is what put us here), so the driver's sleep is zero-length and
+    /// it re-fires immediately — `fire → fail → re-arm → fire → …`, hammering
+    /// the transport precisely while it is unhealthy. That is strictly worse
+    /// than the gap it was meant to close.
+    #[tokio::test(start_paused = true)]
+    async fn a_persistently_failing_publish_paces_its_retries_zeb761() {
+        let inner: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cas: Arc<dyn ContentStore> = Arc::new(FlakyPutCas {
+            inner,
+            // Never recovers: the transport stays down for the whole window.
+            remaining_failures: std::sync::Mutex::new(usize::MAX),
+            attempts: Arc::clone(&attempts),
+        });
+        let built = build_engine("dev-spin", cas, false);
+
+        {
+            let mut doc = built.state.lock().await;
+            doc.entries.insert(
+                "k1".into(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "never-lands".into(),
+                },
+            );
+        }
+        built.engine.notify_dirty();
+
+        // Eight minutes of LOGICAL time (the clock is paused, so this costs
+        // no wall-clock). The schedule is 30 s → 60 s → 120 s → 240 s, so
+        // this window admits roughly four retries after the first failure.
+        tokio::time::sleep(Duration::from_secs(480)).await;
+
+        let stamps = attempts.lock().expect("attempts mutex").clone();
+
+        // The anti-spin assertion. Unpaced, this window would have produced
+        // attempts without bound rather than a handful.
+        assert!(
+            stamps.len() <= 6,
+            "retries must be paced, not spun: {} attempts in 480 s",
+            stamps.len()
+        );
+        // ...but it must genuinely keep trying, not give up after one.
+        assert!(
+            stamps.len() >= 4,
+            "the schedule must keep retrying a persistent failure: only {} attempts",
+            stamps.len()
+        );
+
+        let gaps: Vec<u64> = stamps
+            .windows(2)
+            .map(|w| w[1].duration_since(w[0]).as_secs())
+            .collect();
+        assert!(
+            gaps[0] >= 29,
+            "first retry should wait ~30 s, waited {} s (gaps: {gaps:?})",
+            gaps[0]
+        );
+        for pair in gaps.windows(2) {
+            assert!(pair[1] >= pair[0], "retry gaps must never shrink: {gaps:?}");
+        }
+        assert!(
+            *gaps.last().expect("at least one gap") > gaps[0],
+            "retry gaps must ESCALATE, not merely be non-zero: {gaps:?}"
+        );
+
         built.engine.shutdown().await.ok();
     }
 

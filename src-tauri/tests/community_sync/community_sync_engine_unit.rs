@@ -1746,3 +1746,228 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
 
     engine_b.shutdown().await.expect("shutdown");
 }
+
+/// ZEB-761: a failed community state-root publish must retry itself.
+///
+/// The community engine had the identical gap `fleet_sync` did: a failed
+/// publish restored the dirty bit but cleared `next_wakeup`, arming nothing.
+/// Its own in-code comment conceded it — *"the next publish OPPORTUNITY
+/// retries it — a later mutation's debounce, flush_now, or shutdown"*. On a
+/// quiescent community that means an unreplicated membership mutation, so
+/// other members never see the roster change until the app is restarted.
+///
+/// Failure is injected at the CAS: the first `PutLocal` is answered with an
+/// error, every later one succeeds. Time is paused, so the 30 s backoff costs
+/// no wall-clock.
+#[tokio::test(start_paused = true)]
+async fn a_failed_community_publish_retries_itself_on_a_quiescent_community_zeb761() {
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel(8);
+
+    let put_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let put_attempts_task = Arc::clone(&put_attempts);
+    tokio::spawn(async move {
+        use harmony_app::content_store::CasOp;
+        while let Some(op) = cas_op_rx.recv().await {
+            if let CasOp::PutLocal {
+                reply: Some(reply), ..
+            } = op
+            {
+                let n = put_attempts_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Fail only the FIRST put; the retry must then succeed.
+                let _ = reply.send(if n == 0 {
+                    Err(harmony_app::content_store::ContentStoreError::Io(
+                        "forced publish failure (ZEB-761)".into(),
+                    ))
+                } else {
+                    Ok(())
+                });
+            }
+        }
+    });
+
+    let community_id = SpaceId([9u8; 16]);
+    let mk = EpochKey::new([0x77; 32]);
+    let admin = OwnerAddr([8u8; 16]);
+
+    let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: mk,
+        admin_addr: admin,
+        is_invite_only: false,
+        device_id: "retry-device".into(),
+        self_owner: admin,
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x77; 32])),
+        state: Arc::clone(&state),
+        tracker: Arc::clone(&tracker),
+        content_store: cs,
+        publisher_tx: out_tx,
+        subscriber_rx: in_rx,
+        paths: harmony_app::community_state_sync::PersistPaths {
+            crdt: tmp.path().join("crdt.cbor"),
+            replay: tmp.path().join("replay.cbor"),
+        },
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        identity_resolver: None,
+        error_tx: None,
+        delta_tx: None,
+        pending_redemptions: None,
+        crdt_state: None,
+        admin_identity_pub: None,
+        nav_emitter: None,
+        root_serve_rx: None,
+    });
+
+    // One dirty signal, then the community goes quiet — nothing else will
+    // ever re-arm the debounce window.
+    engine.notify_dirty();
+
+    // Only the retry schedule can deliver this. The idle sleep is 3600 s,
+    // far beyond this budget, so the pre-fix behaviour fails the timeout.
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(120), out_rx.recv())
+        .await
+        .expect("a failed community publish must retry itself on a quiescent community (ZEB-761)")
+        .expect("publisher_tx dropped or never sent");
+    assert!(!bytes.is_empty(), "retry must carry a real wire packet");
+
+    // It genuinely took a retry rather than succeeding first time.
+    assert!(
+        put_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "expected a failed publish followed by a retry"
+    );
+
+    engine.shutdown().await.ok();
+}
+
+/// ZEB-761: a persistently failing community publish must PACE its retries.
+///
+/// The community analog of `fleet_sync`'s
+/// `a_persistently_failing_publish_paces_its_retries_zeb761`. Recovery and
+/// pacing are two different properties, and pacing is the one that pins why
+/// the naive fix was rejected: re-arming the deadline that just fired targets
+/// an instant already in the PAST (its firing is what put us here), so the
+/// sleep is zero-length and it re-fires immediately — `fire → fail → re-arm →
+/// fire → …`, hammering the transport precisely while it is unhealthy. Both
+/// engines compose debounce + retry the same way, so both need the assertion.
+///
+/// Every `PutLocal` fails, and `encode_root_packet` propagates the first CAS
+/// error with `?`, so exactly one recorded attempt corresponds to one publish
+/// attempt — which is what makes the gaps below readable as the retry cadence.
+#[tokio::test(start_paused = true)]
+async fn a_persistently_failing_community_publish_paces_its_retries_zeb761() {
+    let (out_tx, _out_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (cas_op_tx, mut cas_op_rx) = mpsc::channel(8);
+
+    let attempts = Arc::new(std::sync::Mutex::new(Vec::<tokio::time::Instant>::new()));
+    let attempts_task = Arc::clone(&attempts);
+    tokio::spawn(async move {
+        use harmony_app::content_store::CasOp;
+        while let Some(op) = cas_op_rx.recv().await {
+            if let CasOp::PutLocal {
+                reply: Some(reply), ..
+            } = op
+            {
+                attempts_task
+                    .lock()
+                    .expect("attempts mutex")
+                    .push(tokio::time::Instant::now());
+                // Never recovers: the CAS stays down for the whole window.
+                let _ = reply.send(Err(harmony_app::content_store::ContentStoreError::Io(
+                    "forced persistent publish failure (ZEB-761)".into(),
+                )));
+            }
+        }
+    });
+
+    let community_id = SpaceId([10u8; 16]);
+    let mk = EpochKey::new([0x78; 32]);
+    let admin = OwnerAddr([7u8; 16]);
+
+    let state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+    let tracker = Arc::new(Mutex::new(CommunityRootHlcTracker::default()));
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_op_tx,
+        std::time::Duration::from_millis(1000),
+    ));
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        community_id,
+        membership_key: mk,
+        admin_addr: admin,
+        is_invite_only: false,
+        device_id: "spin-device".into(),
+        self_owner: admin,
+        signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x78; 32])),
+        state: Arc::clone(&state),
+        tracker: Arc::clone(&tracker),
+        content_store: cs,
+        publisher_tx: out_tx,
+        subscriber_rx: in_rx,
+        paths: harmony_app::community_state_sync::PersistPaths {
+            crdt: tmp.path().join("crdt.cbor"),
+            replay: tmp.path().join("replay.cbor"),
+        },
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        identity_resolver: None,
+        error_tx: None,
+        delta_tx: None,
+        pending_redemptions: None,
+        crdt_state: None,
+        admin_identity_pub: None,
+        nav_emitter: None,
+        root_serve_rx: None,
+    });
+
+    engine.notify_dirty();
+
+    // Eight minutes of LOGICAL time (the clock is paused, so this costs no
+    // wall-clock). The schedule is 30 s → 60 s → 120 s → 240 s, so this
+    // window admits roughly four retries after the first failure.
+    tokio::time::sleep(std::time::Duration::from_secs(480)).await;
+
+    let stamps = attempts.lock().expect("attempts mutex").clone();
+
+    // The anti-spin assertion. Unpaced, this window would have produced
+    // attempts without bound rather than a handful.
+    assert!(
+        stamps.len() <= 6,
+        "community retries must be paced, not spun: {} attempts in 480 s",
+        stamps.len()
+    );
+    // ...but it must genuinely keep trying, not give up after one.
+    assert!(
+        stamps.len() >= 4,
+        "the schedule must keep retrying a persistent failure: only {} attempts",
+        stamps.len()
+    );
+
+    let gaps: Vec<u64> = stamps
+        .windows(2)
+        .map(|w| w[1].duration_since(w[0]).as_secs())
+        .collect();
+    assert!(
+        gaps[0] >= 29,
+        "first retry should wait ~30 s, waited {} s (gaps: {gaps:?})",
+        gaps[0]
+    );
+    for pair in gaps.windows(2) {
+        assert!(pair[1] >= pair[0], "retry gaps must never shrink: {gaps:?}");
+    }
+    assert!(
+        *gaps.last().expect("at least one gap") > gaps[0],
+        "retry gaps must ESCALATE, not merely be non-zero: {gaps:?}"
+    );
+
+    engine.shutdown().await.ok();
+}
