@@ -361,6 +361,39 @@ struct IngestChannelArtifactArgs {
     encrypt: Option<bool>,
 }
 
+/// ZEB-781: `list_grants` / `dismiss_received_grant` — addressed by content id.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CidArgs {
+    cid: String,
+}
+
+/// ZEB-781: `grant_read` / `revoke_read`. `granteeAddress` is an OwnerAddr hex;
+/// neither verb gates on the friend graph, so any owner address is accepted.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GrantReadArgs {
+    cid: String,
+    grantee_address: String,
+}
+
+/// ZEB-781: `burn_content` addresses the *sidecar*, not the CID — a CID is only
+/// fully burned once its last sidecar reference is removed.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BurnContentArgs {
+    sidecar_id: String,
+}
+
+/// ZEB-781: headless encrypted ingest takes an explicit path. The GUI command
+/// owns the native file picker and delegates here with the chosen path, so the
+/// dialog stays out of the shared seam (same split as `ingest_channel_artifact`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestContentEncryptedArgs {
+    source_path: String,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetMessageReactionArgs {
@@ -989,6 +1022,54 @@ pub fn build_registry() -> RpcRegistry {
                 a.custom_emoji,
             )
             .await
+        }
+    );
+
+    // File sharing (ZEB-781). These are registrations, not a refactor: the
+    // `_impl` seams already take `&dyn NodeEventSink`, and the GUI commands
+    // in lib.rs reach them by passing `&app` (AppHandle implements the same
+    // trait). Without them a headless node can join, chat and vote but cannot
+    // answer "has a file been shared with me?" — which made ZEB-770's
+    // third-party exclusion assertion unavailable rather than merely weak.
+    rpc!(m, "list_received_grants", EmptyArgs, |state, _sink, _a| {
+        async move { crate::list_received_grants_impl(state).await }
+    });
+    rpc!(m, "list_grants", CidArgs, |state, _sink, a| async move {
+        crate::list_grants_impl(state, a.cid).await
+    });
+    rpc!(
+        m,
+        "grant_read",
+        GrantReadArgs,
+        |state, sink, a| async move {
+            crate::grant_read_impl(state, sink.as_ref(), a.cid, a.grantee_address).await
+        }
+    );
+    rpc!(
+        m,
+        "revoke_read",
+        GrantReadArgs,
+        |state, sink, a| async move {
+            crate::revoke_read_impl(state, sink.as_ref(), a.cid, a.grantee_address).await
+        }
+    );
+    rpc!(
+        m,
+        "dismiss_received_grant",
+        CidArgs,
+        |state, sink, a| async move {
+            crate::dismiss_received_grant_impl(state, sink.as_ref(), a.cid).await
+        }
+    );
+    rpc!(m, "burn_content", BurnContentArgs, |state, _sink, a| {
+        async move { crate::burn_content_impl(a.sidecar_id, state).await }
+    });
+    rpc!(
+        m,
+        "ingest_content_encrypted",
+        IngestContentEncryptedArgs,
+        |state, _sink, a| async move {
+            crate::ingest_content_encrypted_impl(state, std::path::Path::new(&a.source_path)).await
         }
     );
 
@@ -1660,6 +1741,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn file_sharing_rpcs_are_registered_and_wired() {
+        // ZEB-781: same proof shape as the storage-buddy parity test. These
+        // verbs existed as Tauri IPC only, so the risk this pins is an arg
+        // struct that does not match the wrapper's camelCase shape —
+        // `granteeAddress` / `sidecarId` / `sourcePath` are all easy to get
+        // wrong, and BadArgs is the failure a headless caller would hit.
+        let reg = build_registry();
+        let cid = "cd".repeat(32); // 32 bytes, the width parse_cid_hex requires
+        let grantee = "ab".repeat(16); // 16-byte OwnerAddr
+        let cases = [
+            ("list_received_grants", serde_json::json!({})),
+            ("list_grants", serde_json::json!({ "cid": cid })),
+            (
+                "grant_read",
+                serde_json::json!({ "cid": cid, "granteeAddress": grantee }),
+            ),
+            (
+                "revoke_read",
+                serde_json::json!({ "cid": cid, "granteeAddress": grantee }),
+            ),
+            ("dismiss_received_grant", serde_json::json!({ "cid": cid })),
+            (
+                "burn_content",
+                serde_json::json!({ "sidecarId": "00000000-0000-4000-8000-000000000000" }),
+            ),
+            (
+                "ingest_content_encrypted",
+                serde_json::json!({ "sourcePath": "/nonexistent/zeb781" }),
+            ),
+        ];
+        for (method, args) in cases {
+            match reg.dispatch(method, test_state(), test_sink(), args).await {
+                Err(RpcError::UnknownCommand) => panic!("{method} must be registered"),
+                Err(RpcError::BadArgs(msg)) => {
+                    panic!("{method}: arg struct rejected the wrapper shape: {msg}")
+                }
+                Ok(_) | Err(RpcError::Command(_)) => {}
+            }
+        }
+    }
+
     /// ZEB-668 S2 (PR #452 review): same proof shape as the storage-buddy
     /// parity test — camelCase args must parse and reach the `_impl` seam.
     /// `identity_dir` pins to an empty tempdir so the seam deterministically
@@ -2293,6 +2416,14 @@ mod tests {
             // channel artifacts (CAS)
             "ingest_channel_artifact",
             "download_channel_artifact",
+            // per-member file sharing (ZEB-781)
+            "ingest_content_encrypted",
+            "list_grants",
+            "list_received_grants",
+            "grant_read",
+            "revoke_read",
+            "dismiss_received_grant",
+            "burn_content",
             // community presence (ZEB-537)
             "subscribe_community_presence",
             "unsubscribe_community_presence",
