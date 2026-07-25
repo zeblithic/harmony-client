@@ -35,6 +35,7 @@
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use harmony_content::cid::ContentId;
+use harmony_crdt_sync::RetryBackoff;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -2534,6 +2535,19 @@ async fn internal_task(mut ctx: InternalCtx) {
     use std::time::Instant;
 
     let mut next_wakeup: Option<Instant> = None;
+    // ZEB-761: the debounce timer alone cannot retry. A failed publish
+    // restored the dirty bit but cleared `next_wakeup`, so on a quiescent
+    // community the membership state stayed persisted-but-unreplicated
+    // until the next mutation, an explicit flush, or app exit — meaning
+    // other members never saw the roster change. This second schedule arms
+    // only when a publish actually dropped work, and paces retries so an
+    // unhealthy transport is not hammered.
+    //
+    // Millis on a monotonic epoch, matching the core kernel's clock
+    // contract; converted back to an `Instant` for the sleep below.
+    let retry_epoch = Instant::now();
+    let retry_now_ms = move || retry_epoch.elapsed().as_millis() as u64;
+    let mut retry = RetryBackoff::default();
     // Latched after we observe `None` on `subscriber_rx` to prevent
     // tight-looping on a closed channel; engine remains alive in
     // publish-only mode. Mirrors owner_state_sync's same latch.
@@ -2554,7 +2568,20 @@ async fn internal_task(mut ctx: InternalCtx) {
     tokio::pin!(notified);
 
     loop {
-        let sleep_dur = next_wakeup
+        // Two schedules can want the wakeup: the debounce window (a
+        // mutation waiting to be published) and the retry backoff (a
+        // previous publish failed with work still owed). Whichever is
+        // SOONER wins — a fresh mutation is a legitimate new reason to
+        // publish, not a retry spin, so it must not be held behind a
+        // backoff earned by an earlier failure (ZEB-761).
+        let retry_wakeup = retry
+            .pending_at()
+            .map(|at| retry_epoch + std::time::Duration::from_millis(at));
+        let wake_at = match (next_wakeup, retry_wakeup) {
+            (Some(debounce_at), Some(retry_at)) => Some(debounce_at.min(retry_at)),
+            (debounce_at, retry_at) => debounce_at.or(retry_at),
+        };
+        let sleep_dur = wake_at
             .map(|t| t.saturating_duration_since(Instant::now()))
             .unwrap_or(std::time::Duration::from_secs(3600));
 
@@ -2568,7 +2595,10 @@ async fn internal_task(mut ctx: InternalCtx) {
                 }
                 notified.set(notify.notified());
             }
-            _ = tokio::time::sleep(sleep_dur), if next_wakeup.is_some() => {
+            _ = tokio::time::sleep(sleep_dur), if wake_at.is_some() => {
+                // Reached either schedule's instant. Clearing `next_wakeup`
+                // is right for both: a due retry publishes the pending
+                // mutation too, since the publish snapshots current state.
                 next_wakeup = None;
                 // `swap` rather than `store(false)` so a publish
                 // failure restores the dirty bit; otherwise a
@@ -2584,7 +2614,13 @@ async fn internal_task(mut ctx: InternalCtx) {
                     );
                     if was_dirty {
                         ctx.has_pending_dirty.store(true, Ordering::Release);
+                        // Schedule the wakeup that will act on the restored
+                        // bit. Restoring it alone is the ZEB-761 bug.
+                        retry.on_failure(retry_now_ms());
                     }
+                }
+                if pub_result.is_ok() {
+                    retry.clear(retry_now_ms());
                 }
                 // ZEB-462 B: persist the CRDT (`crdt.cbor`) UNCONDITIONALLY —
                 // the membership events are validated, durable facts that must
@@ -2621,6 +2657,10 @@ async fn internal_task(mut ctx: InternalCtx) {
                 let pub_result = publish_root_now(&ctx).await;
                 if pub_result.is_err() && was_dirty {
                     ctx.has_pending_dirty.store(true, Ordering::Release);
+                    retry.on_failure(retry_now_ms());
+                }
+                if pub_result.is_ok() {
+                    retry.clear(retry_now_ms());
                 }
                 // Persist matches the public contract: flush_now() returns
                 // after both publish AND on-disk persist complete (mirrors
