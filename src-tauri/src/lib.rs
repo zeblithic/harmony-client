@@ -20204,7 +20204,9 @@ async fn ingest_content_encrypted(
 ) -> Result<IngestResult, String> {
     use tauri_plugin_dialog::DialogExt;
 
-    // 1. Native file picker dialog.
+    // 1. Native file picker dialog — the GUI-only half. Everything downstream
+    //    of the chosen path lives in `ingest_content_encrypted_impl` so the
+    //    headless RPC surface can reach it (ZEB-781).
     let (path_tx, path_rx) = tokio::sync::oneshot::channel();
     app.dialog().file().pick_file(move |path| {
         let _ = path_tx.send(path);
@@ -20217,6 +20219,23 @@ async fn ingest_content_encrypted(
     let path = file_path
         .as_path()
         .ok_or_else(|| "unsupported file path".to_string())?;
+
+    ingest_content_encrypted_impl(state.inner(), path).await
+}
+
+/// ZEB-781: testable, transport-agnostic seam for [`ingest_content_encrypted`]
+/// (mirrors the `grant_read` → `grant_read_impl` split). Takes the source path
+/// the GUI's picker produced — or, headless, the caller's `sourcePath` — and
+/// runs the per-file-DEK encrypt + serveable-ingest path.
+///
+/// Deliberately takes `&Path` rather than `String`: the GUI already holds a
+/// `Path` from the dialog, and round-tripping it through `to_string_lossy`
+/// would silently mangle a non-UTF-8 filename that previously worked.
+pub(crate) async fn ingest_content_encrypted_impl(
+    state: &Mutex<NodeState>,
+    source_path: &std::path::Path,
+) -> Result<IngestResult, String> {
+    let path = source_path;
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -20252,6 +20271,24 @@ async fn ingest_content_encrypted(
     let plaintext_reader = tokio::fs::File::open(path)
         .await
         .map_err(|e| format!("open failed: {e}"))?;
+
+    // ZEB-781: reject non-regular files. The GUI reached this seam through a
+    // native file picker, which implicitly guaranteed a real file; the RPC
+    // surface accepts an arbitrary `sourcePath`, so a FIFO or device node
+    // (`/dev/zero`) would stream forever — and this ingest path is deliberately
+    // uncapped (ZEB-724 removed the size cap). Re-stat the OPENED handle rather
+    // than the path so a swap between stat and open cannot bypass the check;
+    // same posture as `ingest_channel_artifact_impl` and the vine-video ingest.
+    //
+    // Deliberately NOT rejecting empty files here, unlike vine video: the GUI
+    // shares this seam, and a user picking a 0-byte file succeeds today.
+    let opened_meta = plaintext_reader
+        .metadata()
+        .await
+        .map_err(|e| format!("stat opened file: {e}"))?;
+    if !opened_meta.is_file() {
+        return Err("encrypted ingest source must be a regular file".to_string());
+    }
 
     ingest_content_encrypted_inner(
         &ingest_tx,
@@ -55476,6 +55513,21 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
     // (inviter_unreachable / join_failed) committed no new community.
     if outcome.status == "joined" {
         force_reachability_republish(state);
+
+        // ZEB-778: engage presence for the freshly-joined community now.
+        // The startup auto-subscribe (ZEB-613) enumerates communities before
+        // mint on a fresh profile, so it fails there — and nothing re-runs it.
+        // Without this, a node that joins AFTER boot never subscribes and is
+        // invisible in both directions until the next restart. `redeem_invite`
+        // and `join_open_community` already do this; the iroh first-contact
+        // paths did not, which is exactly the cold-join case. The GUI also
+        // subscribes from the frontend; the event loop's dup-guard makes the
+        // double Subscribe a no-op.
+        if let Some(community_id) = outcome.community_id.clone() {
+            if let Err(e) = subscribe_community_presence_impl(state, community_id).await {
+                tracing::warn!(error = %e, "ZEB-778: post-join presence subscribe failed");
+            }
+        }
     }
 
     Ok(outcome)
@@ -55686,6 +55738,14 @@ pub(crate) async fn connectivity_open_join_iroh_impl(
     // `ReachabilityAnnounce` now (mirrors the iroh invite redeem).
     if dto.status.as_deref() == Some("joined") {
         force_reachability_republish(state);
+
+        // ZEB-778: engage presence for the freshly-joined community now — the
+        // same gap the iroh invite-redeem path had. See that call site for the
+        // full reasoning; in short, the ZEB-613 startup auto-subscribe cannot
+        // cover a community joined after boot.
+        if let Err(e) = subscribe_community_presence_impl(state, dto.community_id.clone()).await {
+            tracing::warn!(error = %e, "ZEB-778: post-join presence subscribe failed");
+        }
     }
 
     Ok(dto)

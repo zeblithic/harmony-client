@@ -416,8 +416,9 @@ list is the `registry_has_exactly_the_curated_v1_surface` pin test in
 |---|---|
 | Node lifecycle (2) | `start_node`, `stop_node` (serve auto-starts the node at boot) |
 | Identity (2) | `get_owner_state`, `mint_owner_identity` |
-| Communities (9) | `list_owner_communities`, `create_community`, `list_community_members`, `generate_invite`, `redeem_invite`, `join_open_community`, `leave_community`, `list_left_communities`, `remove_space` |
+| Communities (9) | `list_owner_communities`, `create_community`, `list_community_members`, `generate_invite`, **`connectivity_redeem_invite_iroh`**, **`connectivity_open_join_iroh`**, `leave_community`, `list_left_communities`, `remove_space` |
 | Channels (4) | `create_channel`, `list_channels`, `list_channel_messages`, `post_channel_message` |
+| Files / sharing (7) | `ingest_content_encrypted`, `grant_read`, `revoke_read`, `list_grants`, `list_received_grants`, `dismiss_received_grant`, `burn_content` |
 | Friends (7) | `list_friends`, `generate_friend_token`, `redeem_friend_token`, `add_friend_by_key`, `list_pending_friend_requests`, `accept_friend_request`, `decline_friend_request` |
 | Spaces / DMs (3) | `add_space`, `send_dm`, `read_dm_thread` |
 | Diagnostics (4) | `connectivity_get_my_reachability_record`, `connectivity_list_peer_reachability`, `network_health_snapshot`, `network_health_run_self_test` |
@@ -425,6 +426,36 @@ list is the `registry_has_exactly_the_curated_v1_surface` pin test in
 
 Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
 `POST /v1/shutdown` (graceful quit), `GET /v1/events` (WS firehose).
+
+> **Joining a community: use the `connectivity_*` verbs.** A `redeem_invite`
+> command is also registered, but it is the pre-iroh Reticulum path and
+> **cold-fails between two never-met nodes** — which is the normal case for
+> redeeming an invite. Since invite-only invites are single-use, calling it
+> can cost you the invite on a guaranteed failure. Reach for
+> `connectivity_redeem_invite_iroh` (invite-only) or
+> `connectivity_open_join_iroh` (open), which do the real first contact:
+> pkarr-resolve + iroh handshake.
+>
+> Both take **`url`**, not `inviteUrl` — the Tauri IPC uses the camelCase
+> name and the RPC surface does not. Passing the wrong key fails with
+> `400 missing field 'url'`, which is at least a loud failure.
+>
+> Two more things that bite scripted joins. Channel materialisation can lag
+> the join, so **poll `list_channels` rather than asserting once** — it may
+> briefly return `[]` or `no engine for <community>/<channel>`. And
+> `list_channel_messages` requires an explicit `limit`; the GUI's adapter
+> defaults it, this surface does not.
+
+> **Sharing files: `grant_read` requires an Active friend.** Grants deliver
+> over the friend transport, so sharing with someone you merely share a
+> community with is rejected as `ineligible: non_friend`. Friend them first
+> (`generate_friend_token` / `redeem_friend_token`). `revoke_read` has no such
+> gate — a grantee can always be revoked.
+>
+> `ingest_content_encrypted` takes a `sourcePath` and **has no size cap** — it
+> streams whatever you point it at, frame-by-frame. Non-regular files (FIFOs,
+> device nodes) are rejected, but a very large regular file will simply be
+> ingested in full. Bound it on the caller's side if that matters to you.
 
 ### Error contract
 
