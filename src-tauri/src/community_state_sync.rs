@@ -2521,6 +2521,44 @@ fn maybe_spawn_pending_clear_rescan_for_pending_join(
 
 // ── end ZEB-254 Task 11 helpers ───────────────────────────────────────────────
 
+/// Settle a publish's dirty-signal and retry-schedule consequences in one
+/// place (ZEB-761).
+///
+/// The debounce arm and the `flush_now` arm must make the SAME decision here.
+/// They were written with different conditional shapes (`if let Err` + a
+/// nested `if was_dirty` vs. a flat `is_err() && was_dirty`), which is exactly
+/// the shape drift that lets a future change to the retry-arming rule land in
+/// one arm and not the other.
+///
+/// The rule: arm a retry only when the publish failed **and** it had taken a
+/// dirty signal — i.e. unreplicated local work exists. `was_dirty == false`
+/// means a failed publish owed nothing (a `flush_now` on a clean community),
+/// and arming for it would wake the task on an escalating schedule forever
+/// with nothing to send. Any success clears the escalation, so an intermittent
+/// failure does not inherit the delay an earlier outage earned.
+///
+/// `fleet_sync::settle_publish` is the same decision expressed against the
+/// core kernel's `PublishClaim`/`DirtySignal` pair; this engine is still
+/// pre-kernel, so it takes the raw `was_dirty` bool instead. Logging stays at
+/// the call sites, which have different context to report.
+fn settle_publish(
+    ctx: &InternalCtx,
+    was_dirty: bool,
+    pub_result: &Result<(), CommunitySyncError>,
+    retry: &mut RetryBackoff,
+    now_ms: u64,
+) {
+    if pub_result.is_err() && was_dirty {
+        // Re-arm the signal AND schedule the wakeup that will act on it.
+        // Restoring the flag alone is the ZEB-761 bug.
+        ctx.has_pending_dirty.store(true, Ordering::Release);
+        retry.on_failure(now_ms);
+    }
+    if pub_result.is_ok() {
+        retry.clear(now_ms);
+    }
+}
+
 /// Internal task: `select!` loop multiplexing dirty signals, the
 /// debounce wakeup, forced flushes, inbound publishes, and shutdown.
 /// Mirrors `owner_state_sync::internal_task` exactly, minus the
@@ -2612,16 +2650,8 @@ async fn internal_task(mut ctx: InternalCtx) {
                         error = %e,
                         "community publish_root_now failed"
                     );
-                    if was_dirty {
-                        ctx.has_pending_dirty.store(true, Ordering::Release);
-                        // Schedule the wakeup that will act on the restored
-                        // bit. Restoring it alone is the ZEB-761 bug.
-                        retry.on_failure(retry_now_ms());
-                    }
                 }
-                if pub_result.is_ok() {
-                    retry.clear(retry_now_ms());
-                }
+                settle_publish(&ctx, was_dirty, &pub_result, &mut retry, retry_now_ms());
                 // ZEB-462 B: persist the CRDT (`crdt.cbor`) UNCONDITIONALLY —
                 // the membership events are validated, durable facts that must
                 // survive a crash even when this publish never landed. Persist
@@ -2630,12 +2660,13 @@ async fn internal_task(mut ctx: InternalCtx) {
                 // make a restart skip the retry and leave the community
                 // out-of-sync until clock-time passes the unpersisted HLC, so
                 // on failure we leave the on-disk tracker un-advanced. The
-                // dirty bit was restored above, so the next publish OPPORTUNITY
-                // retries it — a later mutation's debounce (mutations re-arm the
-                // timer via notify_dirty), flush_now, or shutdown — note that
-                // restoring the bit alone does NOT re-arm this debounce timer
-                // (next_wakeup was cleared), so the retry waits for one of those
-                // triggers. Errors are logged + swallowed (the debounce wakeup
+                // dirty bit was restored above AND the retry schedule was armed
+                // (ZEB-761), so this engine now retries the publish ON ITS OWN
+                // — it no longer waits on a later mutation's debounce, an
+                // explicit flush_now, or shutdown. That wait was the bug: on a
+                // quiescent community none of those ever come, and the roster
+                // change stayed persisted-but-unreplicated until app exit.
+                // Errors are logged + swallowed (the debounce wakeup
                 // has no caller to surface a Result to; dropping the loop on a
                 // transient disk error would silently disable sync).
                 let persist_result = if pub_result.is_ok() {
@@ -2655,13 +2686,7 @@ async fn internal_task(mut ctx: InternalCtx) {
                 next_wakeup = None;
                 let was_dirty = ctx.has_pending_dirty.swap(false, Ordering::AcqRel);
                 let pub_result = publish_root_now(&ctx).await;
-                if pub_result.is_err() && was_dirty {
-                    ctx.has_pending_dirty.store(true, Ordering::Release);
-                    retry.on_failure(retry_now_ms());
-                }
-                if pub_result.is_ok() {
-                    retry.clear(retry_now_ms());
-                }
+                settle_publish(&ctx, was_dirty, &pub_result, &mut retry, retry_now_ms());
                 // Persist matches the public contract: flush_now() returns
                 // after both publish AND on-disk persist complete (mirrors
                 // owner_state_sync::SyncEngine). ZEB-462 B: persist the CRDT
