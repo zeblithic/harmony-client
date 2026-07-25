@@ -63,29 +63,6 @@ pub fn is_offer_expired(received_at_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(received_at_ms) >= INTRODUCTION_OFFER_TTL_MS
 }
 
-/// ZEB-784: the requester's dial target, captured from the authenticated
-/// `FriendLinkRequest` that produced a `Pending` reply, so the user's later
-/// Accept can dial them back instead of waiting for a re-dial that nobody
-/// triggers.
-///
-/// Both fields are **signature-bound** into the request's `contact_digest`
-/// (ZEB-473 §6.3), and cert + signature verification always runs BEFORE the
-/// consent decision (see `decide_consent`'s contract) — so this is verified
-/// material, not attacker-steerable routing. That is what makes storing it
-/// safe: an active MITM cannot substitute its own node here without failing
-/// the upstream authentication that already ran.
-///
-/// This mirrors [`StoredIntroductionOffer::reachability`], which exists for
-/// exactly the same reason on the AskMe path: an accept that must dial needs
-/// somewhere to dial.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredLinkContact {
-    /// The requester's iroh `NodeId` — the dial target.
-    pub iroh_node_id: [u8; 32],
-    /// The requester's home-relay URL, if they advertised one.
-    pub home_relay_url: Option<String>,
-}
-
 /// One recorded inbound friend request awaiting the user's decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingInbound {
@@ -98,11 +75,6 @@ pub struct PendingInbound {
     /// AskMe-staged `IntroductionOffer` (which the accept path runs as a
     /// self-dial link rather than a `prior_accept` approval).
     pub kind: PendingKind,
-    /// ZEB-784: the signed dial target for a Path-A `LinkRequest`, so Accept can
-    /// complete the link itself. `None` for an `IntroductionOffer` (which
-    /// carries its own relayed `reachability`) and for pre-ZEB-784 peers whose
-    /// request predates the capture.
-    pub contact: Option<StoredLinkContact>,
 }
 
 #[derive(Default)]
@@ -137,21 +109,7 @@ impl PendingFriendRequests {
     /// `received_at_ms` and display — a re-dial does not reset the entry.
     /// If `addr` has already been approved, the call is a no-op (prevents
     /// a concurrent re-dial from resurrecting the inbox entry).
-    ///
-    /// ZEB-784: `contact` is the authenticated dial target from the request that
-    /// produced this entry, retained so Accept can dial back. Because the entry
-    /// is idempotent, a re-dial does NOT refresh the stored contact — the first
-    /// one wins, consistent with `received_at_ms`. That is deliberate: a peer
-    /// whose routing changed mid-wait is handled by the fallback (the approval
-    /// is still recorded, so their own next dial still links), not by letting a
-    /// later dial silently rewrite where we will call back to.
-    pub fn record_inbound(
-        &self,
-        addr: OwnerAddr,
-        display: Option<String>,
-        contact: Option<StoredLinkContact>,
-        now_ms: u64,
-    ) {
+    pub fn record_inbound(&self, addr: OwnerAddr, display: Option<String>, now_ms: u64) {
         let mut inner = self.inner.lock().expect("pending inner mutex poisoned");
         if inner.approved.contains(&addr) {
             return;
@@ -160,20 +118,7 @@ impl PendingFriendRequests {
             display,
             received_at_ms: now_ms,
             kind: PendingKind::LinkRequest,
-            contact,
         });
-    }
-
-    /// ZEB-784: non-consuming read of the stored dial target for `addr`.
-    ///
-    /// Read-only by design: the accept path reads this BEFORE it mutates
-    /// anything, so a dial that fails leaves the entry exactly as it was and the
-    /// user can Accept again. Returns `None` when `addr` is unknown, is an
-    /// `IntroductionOffer` (which dials via its own reachability), or was
-    /// recorded by a peer that predates the capture.
-    pub fn peek_contact(&self, addr: &OwnerAddr) -> Option<StoredLinkContact> {
-        let inner = self.inner.lock().expect("pending inner mutex poisoned");
-        inner.inbound.get(addr).and_then(|p| p.contact.clone())
     }
 
     /// ZEB-376 Task 11: stage an AskMe introduction OFFER for `subject` in the
@@ -198,9 +143,6 @@ impl PendingFriendRequests {
                 display,
                 received_at_ms: now_ms,
                 kind: PendingKind::IntroductionOffer(Box::new(offer)),
-                // ZEB-784: an offer dials via its own verified `reachability`;
-                // it never needs the Path-A callback contact.
-                contact: None,
             },
         );
     }
@@ -388,7 +330,7 @@ impl Drop for AcceptInFlightGuard {
 /// (ephemeral, like `PendingFriendRequests`).
 #[derive(Default)]
 pub struct PendingOutboundIntroductions {
-    inner: TtlPreAuth,
+    inner: TtlPreAuth<OwnerAddr>,
 }
 
 /// TTL bounding a recorded pre-authorization: a `record`ed target older than
@@ -415,33 +357,43 @@ impl PendingOutboundIntroductions {
     }
 }
 
-/// ZEB-784: the same one-shot, TTL-bounded pre-authorization for a **plain
-/// Path-A link request** the local user initiated.
+/// ZEB-784 / ZEB-783: the local record of plain Path-A friend requests this user
+/// sent that came back `Pending`, so they can be **retried automatically** and
+/// shown in the UI while they wait.
 ///
-/// When you `add_friend_by_key(X)` and X's node replies `Pending`, you record X
-/// here. X's later reciprocal dial — the one their Accept now performs — is then
-/// `take`-able and auto-accepts as [`ConsentDecision::AcceptInline`].
+/// ## Why this exists
 ///
-/// **Why this is required and not merely nice.** Before ZEB-784 the dialer's
-/// `Pending` branch wrote nothing at all, so the requester had no local record
-/// of their own outbound request (that gap is ZEB-783). `decide_consent` gates
-/// on `known` = "already an Active|Pending friend", which was therefore `false`
-/// — meaning a callback dial from the acceptor would have been treated as a
-/// brand-new request from a stranger and parked at `Pending`. The deadlock would
-/// have *mirrored* rather than resolved, with both sides now showing a pending
-/// request. ZEB-783 and ZEB-784 are one defect seen from two ends.
+/// `AddFriendOutcome::Pending`'s own documentation names the completing beat:
 ///
-/// **Why this is deliberately NOT routed through `known && auto_accept_known`.**
-/// That path is opt-out: a user who turns "auto-accept friends I already know"
-/// off would silently get the original deadlock back. "I dialed you first" is an
-/// explicit, per-target consent decision by this user, so it carries its own
-/// accept authority independent of that toggle.
+/// > The user re-invokes `add_friend_by_key` later to retry; once the target
+/// > accepts, the retry's response is `Accepted`.
+///
+/// That retry was never automated and never surfaced anywhere, so in practice
+/// nobody performed it. The natural mutual flow — A adds, B accepts, B adds,
+/// A accepts — ends with two stored approvals, zero friendships, and both users
+/// looking at "No friends yet", because each believes accepting was the last
+/// step. Recording the request here lets the node perform the documented retry
+/// on the user's behalf, and lets the UI answer "did my request go anywhere?"
+/// (ZEB-783 — the sender previously had no projection of their own outbound
+/// request at all).
+///
+/// ## Why the key is the identity pub hex, not an `OwnerAddr`
+///
+/// On a `Pending` reply the dialer receives **no cert and no owner id** — the
+/// target is not disclosed until they accept. So an `OwnerAddr` key is simply
+/// not available at record time. The identity pub hex *is*: it is the string the
+/// user typed. Keying on it also keeps the security story trivial — the only
+/// thing this store can ever cause is re-dialling a key the user themselves
+/// entered, which is precisely what they asked for. Nothing here grants any
+/// peer authority to be accepted; the acceptor's one-shot `approve` /
+/// `take_approved` gate is untouched and remains the only thing that can
+/// establish a friendship.
 #[derive(Default)]
 pub struct PendingOutboundLinks {
-    inner: TtlPreAuth,
-    /// Where this store persists. `None` = ephemeral (tests, and any caller that
-    /// has no identity dir yet), which behaves exactly like the pre-ZEB-784
-    /// in-memory store.
+    inner: TtlPreAuth<String>,
+    /// Where this store persists. `None` = ephemeral (tests, and any caller with
+    /// no identity dir), which degrades to pre-ZEB-784 behaviour: the retry
+    /// simply does not survive a restart.
     path: Option<std::path::PathBuf>,
 }
 
@@ -449,16 +401,15 @@ pub struct PendingOutboundLinks {
 /// per-identity state under `<identity_dir>/`.
 pub const OUTBOUND_LINKS_FILENAME: &str = "outbound_friend_links.cbor";
 
-/// TTL bounding a recorded outbound link request.
+/// How long an unanswered outbound request keeps being retried.
 ///
 /// Much longer than [`OUTBOUND_INTRO_TTL_MS`], and the difference is the whole
 /// point: an introduction pre-auth covers a machine-timescale round trip, but
 /// this one has to survive **human accept latency**. The recipient may not open
-/// the app until tomorrow. A 10-minute bound here would expire the pre-auth long
-/// before the user ever taps Accept and reintroduce the exact deadlock this
-/// change exists to remove. Matched to `INTRODUCTION_OFFER_TTL_MS` (7d), which
-/// is already this codebase's answer to "how long may a human sit on a pending
-/// friend decision".
+/// the app until tomorrow. A 10-minute bound would give up long before the user
+/// ever taps Accept, reintroducing the exact dead end this exists to remove.
+/// Matched to `INTRODUCTION_OFFER_TTL_MS` (7d), already this codebase's answer
+/// to "how long may a human sit on a pending friend decision".
 pub const OUTBOUND_LINK_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7d
 
 impl PendingOutboundLinks {
@@ -467,15 +418,14 @@ impl PendingOutboundLinks {
         Self::default()
     }
 
-    /// Load the store from `path`, binding it so every later mutation is
-    /// persisted.
+    /// Load from `path`, binding it so every later mutation is persisted.
     ///
     /// Self-heals rather than bricking the boot: a corrupt file is quarantined
     /// aside as `.corrupt-<ms>` (bytes preserved for diagnosis) and an empty
-    /// store returned, matching the `load_doc_or_recover` contract used by the
-    /// relay-opt-in and DM-inbox stores. Losing these records degrades to
-    /// pre-ZEB-784 behaviour — the peer's Accept parks at `Pending` — which is
-    /// strictly better than refusing to start.
+    /// store returned, matching the `load_doc_or_recover` contract the
+    /// relay-opt-in and DM-inbox stores use. Losing these records costs the
+    /// automatic retry, not correctness — the user can still re-add manually,
+    /// which is exactly the pre-ZEB-784 situation.
     pub fn load_or_recover(path: std::path::PathBuf, now_ms: u64) -> Self {
         let map = match std::fs::read(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
@@ -495,12 +445,12 @@ impl PendingOutboundLinks {
                 }
             },
         };
-        // Drop anything already past its TTL at load time rather than carrying
-        // dead records forward — `take` would reject them anyway, and pruning
-        // here keeps the file from growing without bound across restarts.
-        let live: HashMap<OwnerAddr, u64> = map
+        // Drop anything already past its TTL rather than carrying dead records
+        // forward — they would never be retried anyway, and pruning here keeps
+        // the file from growing without bound across restarts.
+        let live: HashMap<String, u64> = map
             .into_iter()
-            .filter(|(_, rec)| TtlPreAuth::is_live(*rec, now_ms, OUTBOUND_LINK_TTL_MS))
+            .filter(|(_, rec)| TtlPreAuth::<String>::is_live(*rec, now_ms, OUTBOUND_LINK_TTL_MS))
             .collect();
         let store = Self {
             inner: TtlPreAuth {
@@ -508,22 +458,18 @@ impl PendingOutboundLinks {
             },
             path: Some(path),
         };
-        // Rewrite immediately so a pruned/quarantined file is reflected on disk
-        // even if the user never sends another request.
+        // Rewrite immediately so a pruned or quarantined file is reflected on
+        // disk even if the user never sends another request.
         store.persist();
         store
     }
 
-    /// CBOR: `Vec<([u8; 16], u64)>`. A `Vec` of pairs rather than a map because
-    /// `OwnerAddr` is a byte array, and CBOR map keys of that shape round-trip
-    /// less predictably across serde versions than a plain sequence does.
-    fn decode(bytes: &[u8]) -> Result<HashMap<OwnerAddr, u64>, String> {
-        let rows: Vec<([u8; 16], u64)> =
+    /// CBOR `Vec<(String, u64)>` — a sequence of pairs rather than a map,
+    /// matching the encoding discipline used elsewhere in this crate.
+    fn decode(bytes: &[u8]) -> Result<HashMap<String, u64>, String> {
+        let rows: Vec<(String, u64)> =
             ciborium::from_reader(bytes).map_err(|e| format!("cbor decode: {e}"))?;
-        Ok(rows
-            .into_iter()
-            .map(|(a, rec)| (OwnerAddr(a), rec))
-            .collect())
+        Ok(rows.into_iter().collect())
     }
 
     /// Snapshot under the lock, then write OUTSIDE it — never hold a mutex
@@ -532,13 +478,13 @@ impl PendingOutboundLinks {
         let Some(path) = self.path.as_ref() else {
             return;
         };
-        let rows: Vec<([u8; 16], u64)> = {
+        let rows: Vec<(String, u64)> = {
             let m = self
                 .inner
                 .inner
                 .lock()
                 .expect("outbound pre-auth mutex poisoned");
-            m.iter().map(|(addr, rec)| (addr.0, *rec)).collect()
+            m.iter().map(|(k, rec)| (k.clone(), *rec)).collect()
         };
         let mut bytes = Vec::new();
         if let Err(e) = ciborium::into_writer(&rows, &mut bytes) {
@@ -548,65 +494,72 @@ impl PendingOutboundLinks {
         if let Err(e) = crate::owner_state_persist::save_atomically(path, &bytes) {
             // Best-effort: the in-memory store is still correct for this
             // session, so a write failure costs durability across restart, not
-            // the live handshake.
+            // the live retry.
             tracing::warn!(error = %e, path = %path.display(),
                 "ZEB-784: outbound-link persist failed");
         }
     }
 
-    /// Record (idempotent refresh of the deadline for) an outbound link request
-    /// to `target` at `now_ms`.
-    pub fn record(&self, target: OwnerAddr, now_ms: u64) {
-        self.inner.record(target, now_ms);
+    /// Hex is case-insensitive; normalise so a request recorded as `AB…` and a
+    /// later `forget`/lookup spelled `ab…` refer to the same entry.
+    fn norm(identity_pub_hex: &str) -> String {
+        identity_pub_hex.trim().to_ascii_lowercase()
+    }
+
+    /// Record (or refresh the deadline of) an outbound request to
+    /// `identity_pub_hex` at `now_ms`. Refreshing on a manual re-add is
+    /// deliberate: the user asking again restarts the retry window rather than
+    /// inheriting a nearly-expired one.
+    pub fn record(&self, identity_pub_hex: &str, now_ms: u64) {
+        self.inner.record(Self::norm(identity_pub_hex), now_ms);
         self.persist();
     }
 
-    /// Non-consuming test: is there a live (un-expired) outbound request to
-    /// `target`? Used by the sender-side projection (ZEB-783) so the UI can show
-    /// "waiting for them" without burning the one-shot pre-auth.
-    pub fn is_pending(&self, target: &OwnerAddr, now_ms: u64) -> bool {
-        self.inner.peek(target, now_ms, OUTBOUND_LINK_TTL_MS)
+    /// Non-consuming: is there a live (un-expired) outbound request to this key?
+    pub fn is_pending(&self, identity_pub_hex: &str, now_ms: u64) -> bool {
+        self.inner
+            .peek(&Self::norm(identity_pub_hex), now_ms, OUTBOUND_LINK_TTL_MS)
     }
 
-    /// Snapshot every live outbound request as `(target, recorded_at_ms)`.
+    /// Every live outbound request as `(identity_pub_hex, recorded_at_ms)`.
     /// Expired entries are filtered out but NOT removed (this is a read).
-    pub fn list(&self, now_ms: u64) -> Vec<(OwnerAddr, u64)> {
+    /// Backs both the retry driver and the sender-side UI projection.
+    pub fn list(&self, now_ms: u64) -> Vec<(String, u64)> {
         self.inner.list(now_ms, OUTBOUND_LINK_TTL_MS)
     }
 
-    /// Remove + return true iff `target` was recorded AND still within the TTL.
-    /// One-shot, same contract as [`PendingOutboundIntroductions::take`].
-    pub fn take(&self, target: &OwnerAddr, now_ms: u64) -> bool {
-        let hit = self.inner.take(target, now_ms, OUTBOUND_LINK_TTL_MS);
-        // Persist unconditionally: `take` removes the entry whether or not it
-        // was live, so the on-disk copy is stale either way. Skipping the write
-        // on a miss would let an expired record survive a restart and then be
-        // re-evaluated against a fresh clock.
-        self.persist();
-        hit
-    }
-
-    /// Drop any record for `target` without consuming it as an authorization —
-    /// used when the link completed by some other route, or the user cancelled.
-    pub fn forget(&self, target: &OwnerAddr) {
-        self.inner.forget(target);
+    /// Drop the record — the link completed, or the user cancelled. Idempotent.
+    pub fn forget(&self, identity_pub_hex: &str) {
+        self.inner.forget(&Self::norm(identity_pub_hex));
         self.persist();
     }
 }
 
-/// Shared one-shot, TTL-bounded pre-authorization map behind
-/// [`PendingOutboundIntroductions`] and [`PendingOutboundLinks`]. The TTL is a
-/// per-call parameter rather than a field because the two wrappers bound
-/// fundamentally different waits (machine round trip vs human decision), and
-/// keeping it at the call site puts each constant next to the contract that
-/// justifies it.
-#[derive(Default)]
-struct TtlPreAuth {
-    inner: Mutex<HashMap<OwnerAddr, u64>>,
+/// Shared TTL-bounded record map behind [`PendingOutboundIntroductions`] and
+/// [`PendingOutboundLinks`]. Generic over the key because the two wrappers
+/// address their targets differently: an introduction pre-auth keys on the
+/// authenticated `OwnerAddr` it will match an inbound request against, while an
+/// outbound link request keys on the identity pub hex the user typed (no
+/// `OwnerAddr` is available at record time — see `PendingOutboundLinks`).
+///
+/// The TTL is a per-call parameter rather than a field so each constant sits
+/// next to the contract that justifies it.
+struct TtlPreAuth<K: std::hash::Hash + Eq> {
+    inner: Mutex<HashMap<K, u64>>,
 }
 
-impl TtlPreAuth {
-    fn record(&self, target: OwnerAddr, now_ms: u64) {
+// Manual `Default` — deriving it would demand `K: Default`, which the key types
+// need not (and should not) implement.
+impl<K: std::hash::Hash + Eq> Default for TtlPreAuth<K> {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> TtlPreAuth<K> {
+    fn record(&self, target: K, now_ms: u64) {
         self.inner
             .lock()
             .expect("outbound pre-auth mutex poisoned")
@@ -615,7 +568,7 @@ impl TtlPreAuth {
 
     /// `true` iff `rec` is a live record as of `now_ms`. Fails CLOSED on a
     /// BACKWARD clock: `saturating_sub` would yield `0 < ttl` when
-    /// `now_ms < rec`, keeping a stale pre-auth valid indefinitely, so
+    /// `now_ms < rec`, keeping a stale record valid indefinitely, so
     /// `now_ms >= rec` is required explicitly.
     fn is_live(rec: u64, now_ms: u64, ttl_ms: u64) -> bool {
         now_ms >= rec && now_ms - rec < ttl_ms
@@ -623,7 +576,11 @@ impl TtlPreAuth {
 
     /// Consuming take. The entry is removed even when expired (and even on a
     /// backward clock), preserving the one-shot property.
-    fn take(&self, target: &OwnerAddr, now_ms: u64, ttl_ms: u64) -> bool {
+    fn take<Q>(&self, target: &Q, now_ms: u64, ttl_ms: u64) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
         let mut m = self.inner.lock().expect("outbound pre-auth mutex poisoned");
         match m.remove(target) {
             Some(rec) => Self::is_live(rec, now_ms, ttl_ms),
@@ -632,21 +589,29 @@ impl TtlPreAuth {
     }
 
     /// Non-consuming read.
-    fn peek(&self, target: &OwnerAddr, now_ms: u64, ttl_ms: u64) -> bool {
+    fn peek<Q>(&self, target: &Q, now_ms: u64, ttl_ms: u64) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
         let m = self.inner.lock().expect("outbound pre-auth mutex poisoned");
         m.get(target)
             .is_some_and(|rec| Self::is_live(*rec, now_ms, ttl_ms))
     }
 
-    fn list(&self, now_ms: u64, ttl_ms: u64) -> Vec<(OwnerAddr, u64)> {
+    fn list(&self, now_ms: u64, ttl_ms: u64) -> Vec<(K, u64)> {
         let m = self.inner.lock().expect("outbound pre-auth mutex poisoned");
         m.iter()
             .filter(|(_, rec)| Self::is_live(**rec, now_ms, ttl_ms))
-            .map(|(addr, rec)| (*addr, *rec))
+            .map(|(k, rec)| (k.clone(), *rec))
             .collect()
     }
 
-    fn forget(&self, target: &OwnerAddr) {
+    fn forget<Q>(&self, target: &Q)
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
         self.inner
             .lock()
             .expect("outbound pre-auth mutex poisoned")
@@ -705,7 +670,7 @@ mod tests {
         // fix, `take_offer(O)` returned None because the LinkRequest still occupied
         // the slot, stranding the user with an unacceptable-as-introduction row.
         let store = PendingFriendRequests::new();
-        store.record_inbound(addr(1), Some("link".into()), None, 1_000);
+        store.record_inbound(addr(1), Some("link".into()), 1_000);
         assert!(matches!(&store.list()[0].1.kind, PendingKind::LinkRequest));
         let offer = StoredIntroductionOffer {
             voucher: addr(2),
@@ -732,7 +697,7 @@ mod tests {
         // accept path — take_offer returns None and leaves the row so the accept
         // IPC falls through to the `approve` branch.
         let store = PendingFriendRequests::new();
-        store.record_inbound(addr(3), Some("bob".into()), None, 2_000);
+        store.record_inbound(addr(3), Some("bob".into()), 2_000);
         assert!(store.take_offer(&addr(3)).is_none());
         assert_eq!(store.list().len(), 1, "LinkRequest row must remain");
         assert!(matches!(&store.list()[0].1.kind, PendingKind::LinkRequest));
@@ -754,7 +719,7 @@ mod tests {
         assert!(store.has_offer(&subj), "peek did NOT consume the offer");
         // a plain LinkRequest yields None
         let other = OwnerAddr([9; 16]);
-        store.record_inbound(other, None, None, 1);
+        store.record_inbound(other, None, 1);
         assert!(
             store.peek_offer(&other).is_none(),
             "a LinkRequest is not an offer"
@@ -764,7 +729,7 @@ mod tests {
     #[test]
     fn record_then_list_returns_inbound() {
         let store = PendingFriendRequests::new();
-        store.record_inbound(addr(1), Some("alice".into()), None, 1_000);
+        store.record_inbound(addr(1), Some("alice".into()), 1_000);
         let list = store.list();
         assert_eq!(list.len(), 1);
         let (a, p) = &list[0];
@@ -776,9 +741,9 @@ mod tests {
     #[test]
     fn record_inbound_is_idempotent() {
         let store = PendingFriendRequests::new();
-        store.record_inbound(addr(2), Some("first".into()), None, 1_000);
+        store.record_inbound(addr(2), Some("first".into()), 1_000);
         // A re-dial must NOT overwrite the original entry (display + timestamp).
-        store.record_inbound(addr(2), Some("second".into()), None, 9_999);
+        store.record_inbound(addr(2), Some("second".into()), 9_999);
         let list = store.list();
         assert_eq!(
             list.len(),
@@ -806,7 +771,7 @@ mod tests {
     #[test]
     fn approve_clears_inbox_and_records_approval() {
         let store = PendingFriendRequests::new();
-        store.record_inbound(addr(8), Some("bob".into()), None, 1_000);
+        store.record_inbound(addr(8), Some("bob".into()), 1_000);
         store.approve(addr(8));
         assert!(
             store.list().is_empty(),
@@ -824,7 +789,7 @@ mod tests {
     #[test]
     fn decline_drops_inbound_and_approval() {
         let store = PendingFriendRequests::new();
-        store.record_inbound(addr(4), None, None, 5_000);
+        store.record_inbound(addr(4), None, 5_000);
         store.mark_approved(addr(4));
         store.decline(&addr(4));
         assert!(store.list().is_empty(), "decline drops the inbound request");
@@ -845,7 +810,7 @@ mod tests {
         // recorded as Pending who later becomes an active friend via another
         // path (e.g. token redeem) must NOT linger in the pending inbox.
         let store = PendingFriendRequests::new();
-        store.record_inbound(addr(7), Some("dora".into()), None, 1_000);
+        store.record_inbound(addr(7), Some("dora".into()), 1_000);
         assert_eq!(store.list().len(), 1, "precondition: recorded as pending");
         store.clear_completed(&addr(7));
         assert!(
@@ -874,7 +839,7 @@ mod tests {
         // entry — approve+record_inbound must be atomic via the single mutex.
         let store = PendingFriendRequests::new();
         store.approve(addr(6));
-        store.record_inbound(addr(6), Some("charlie".into()), None, 5_000);
+        store.record_inbound(addr(6), Some("charlie".into()), 5_000);
         assert!(
             store.list().is_empty(),
             "record_inbound must not add to inbox when addr is already approved"
@@ -951,7 +916,7 @@ mod tests {
         let now = 10 * INTRODUCTION_OFFER_TTL_MS;
         store.record_introduction_offer(fresh, None, now, mk(fresh)); // received now → fresh
         store.record_introduction_offer(stale, None, now - INTRODUCTION_OFFER_TTL_MS, mk(stale)); // exactly TTL old → expired
-        store.record_inbound(link, None, None, 0); // a LinkRequest, never swept
+        store.record_inbound(link, None, 0); // a LinkRequest, never swept
 
         assert!(is_offer_expired(now - INTRODUCTION_OFFER_TTL_MS, now));
         assert!(!is_offer_expired(now, now));

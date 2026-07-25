@@ -11753,6 +11753,18 @@ pub async fn start_node_inner(
                         // friend acceptor `take`s pre-authorizations from.
                         guard.pending_outbound_introductions =
                             std::sync::Arc::clone(&pending_outbound_introductions_for_state);
+                        // ZEB-784: rehydrate this user's own unanswered outbound
+                        // friend requests. Unlike the introduction pre-auths
+                        // above these MUST survive a restart — they are bounded
+                        // by human accept latency, so dropping them on boot
+                        // would silently abandon a request the user is still
+                        // waiting on and restore the ZEB-784 dead end.
+                        guard.pending_outbound_links = std::sync::Arc::new(
+                            crate::friend_requests::PendingOutboundLinks::load_or_recover(
+                                identity_dir.join(crate::friend_requests::OUTBOUND_LINKS_FILENAME),
+                                crate::iroh_friend_acceptor::wall_now_ms(),
+                            ),
+                        );
                         // ZEB-236: stash the staged DM-invite store so the
                         // accept/decline/list IPCs (later tasks) reach the SAME
                         // store the invite-ingest path will stage into.
@@ -62042,6 +62054,9 @@ pub(crate) async fn add_friend_by_key_impl(
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     identity_pub_hex: String,
 ) -> Result<AddFriendOutcome, String> {
+    // ZEB-784: kept for the outbound-request bookkeeping below, because
+    // `identity_pub_hex` itself is moved into the dial.
+    let identity_pub_hex_for_record = identity_pub_hex.clone();
     let (
         pkarr_resolver,
         iroh_endpoint,
@@ -62148,6 +62163,35 @@ pub(crate) async fn add_friend_by_key_impl(
     )
     .await?;
 
+    // ZEB-784 / ZEB-783: record or clear this user's own outbound request.
+    //
+    // `Pending` is the case the whole ticket is about. Before this, the dialer
+    // wrote NOTHING here — so the sender had no projection of their own request
+    // (ZEB-783) and, more importantly, nothing ever performed the retry that
+    // `AddFriendOutcome::Pending`'s own doc names as the completing beat. The
+    // record drives `retry_pending_friend_links`, which runs that documented
+    // retry on the user's behalf until the peer accepts.
+    //
+    // `Linked` clears it: the link exists, so retrying would be a pointless
+    // dial. `Unreachable` deliberately does NOT clear — the peer was simply
+    // offline, which is exactly the case a retry is for.
+    {
+        let outbound_links = {
+            let g = state
+                .lock()
+                .map_err(|e| format!("NodeState poisoned: {e}"))?;
+            std::sync::Arc::clone(&g.pending_outbound_links)
+        };
+        match outcome {
+            AddFriendOutcome::Pending => outbound_links.record(
+                &identity_pub_hex_for_record,
+                crate::iroh_friend_acceptor::wall_now_ms(),
+            ),
+            AddFriendOutcome::Linked { .. } => outbound_links.forget(&identity_pub_hex_for_record),
+            AddFriendOutcome::Unreachable => {}
+        }
+    }
+
     // Only a `Linked` outcome mutated owner-state → arm sync + reconcile Case-D +
     // refresh the UI. `Pending`/`Unreachable` wrote nothing.
     if matches!(outcome, AddFriendOutcome::Linked { .. }) {
@@ -62170,6 +62214,76 @@ pub(crate) async fn add_friend_by_key_impl(
     }
 
     Ok(outcome)
+}
+
+/// ZEB-784: how often the node re-attempts unanswered outbound friend requests.
+///
+/// Friend requests are rare and each retry is one pkarr resolve + one short
+/// iroh dial, so the cost is negligible; the interval is chosen for how long a
+/// user should stare at "waiting" after the other side taps Accept, not to
+/// conserve anything.
+pub(crate) const FRIEND_LINK_RETRY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// ZEB-784: run one pass of the documented `add_friend_by_key` retry over every
+/// live outbound request, returning how many newly linked.
+///
+/// This is the automation of the beat `AddFriendOutcome::Pending` already
+/// documents — *"the user re-invokes `add_friend_by_key` later to retry; once
+/// the target accepts, the retry's response is `Accepted`"*. Nothing about the
+/// consent model changes: the peer's one-shot `approve` / `take_approved` gate
+/// is still the only thing that can establish a friendship, and this only
+/// re-dials keys the user themselves entered.
+///
+/// Failures are logged and left in the store — an unreachable peer is precisely
+/// the case a retry exists for. Entries drop out on their own once
+/// `OUTBOUND_LINK_TTL_MS` elapses.
+pub(crate) async fn retry_pending_friend_links(
+    state: &std::sync::Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+) -> usize {
+    let outbound_links = {
+        let Ok(g) = state.lock() else {
+            return 0;
+        };
+        std::sync::Arc::clone(&g.pending_outbound_links)
+    };
+    let due = outbound_links.list(crate::iroh_friend_acceptor::wall_now_ms());
+    if due.is_empty() {
+        return 0;
+    }
+
+    // Deliberately NOT short-circuited against the current friend list.
+    // `FriendEntry` is keyed by `OwnerAddr`/`master_ed25519` and carries no
+    // device identity pub, so it cannot be matched against what this store holds
+    // without a lookup that does not exist. Retrying an already-linked peer is
+    // self-correcting rather than harmful: the dial returns `Linked` and
+    // `add_friend_by_key_impl` forgets the record on the spot. The residual case
+    // — already friends AND that peer has auto-accept off, so the dial returns
+    // `Pending` — costs one short dial a minute until the 7-day TTL retires it.
+    let mut linked = 0usize;
+    for (identity_pub_hex, _recorded_at) in due {
+        match add_friend_by_key_impl(
+            state,
+            std::sync::Arc::clone(&sink),
+            identity_pub_hex.clone(),
+        )
+        .await
+        {
+            // `add_friend_by_key_impl` already forgets the record and emits
+            // `friend-list-changed` on `Linked`; nothing to do but count it.
+            Ok(AddFriendOutcome::Linked { .. }) => {
+                linked += 1;
+                tracing::info!("ZEB-784: pending friend request completed on retry");
+            }
+            Ok(AddFriendOutcome::Pending) => {}
+            Ok(AddFriendOutcome::Unreachable) => tracing::debug!(
+                "ZEB-784: retry target unreachable; keeping the request for a later pass"
+            ),
+            Err(e) => tracing::debug!(error = %e, "ZEB-784: friend-link retry failed"),
+        }
+    }
+    linked
 }
 
 #[cfg(test)]
@@ -62905,8 +63019,8 @@ mod friend_ipc_tests {
     fn list_pending_friend_requests_inner_projects_to_dto() {
         use crate::friend_requests::PendingFriendRequests;
         let store = PendingFriendRequests::new();
-        store.record_inbound(OwnerAddr([0xA1; 16]), Some("alice".into()), None, 1_000);
-        store.record_inbound(OwnerAddr([0xB2; 16]), None, None, 2_000);
+        store.record_inbound(OwnerAddr([0xA1; 16]), Some("alice".into()), 1_000);
+        store.record_inbound(OwnerAddr([0xB2; 16]), None, 2_000);
 
         let mut dtos = list_pending_friend_requests_inner(&store, 0);
         // Map iteration order is unspecified — sort for a stable assert.
@@ -63106,7 +63220,7 @@ mod friend_ipc_tests {
         use crate::friend_requests::PendingFriendRequests;
         let store = PendingFriendRequests::new();
         let addr = OwnerAddr([0xC3; 16]);
-        store.record_inbound(addr, Some("carol".into()), None, 5_000);
+        store.record_inbound(addr, Some("carol".into()), 5_000);
         assert!(!store.is_approved(&addr), "not approved before accept");
         store.mark_approved(addr);
         assert!(
@@ -63120,7 +63234,7 @@ mod friend_ipc_tests {
         use crate::friend_requests::PendingFriendRequests;
         let store = PendingFriendRequests::new();
         let addr = OwnerAddr([0xD4; 16]);
-        store.record_inbound(addr, None, None, 6_000);
+        store.record_inbound(addr, None, 6_000);
         store.mark_approved(addr);
         store.decline(&addr);
         assert!(

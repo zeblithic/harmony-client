@@ -1149,7 +1149,6 @@ pub fn decide_consent(
 fn resolve_consent_consuming_approval(
     pending: Option<&crate::friend_requests::PendingFriendRequests>,
     pending_outbound: Option<&crate::friend_requests::PendingOutboundIntroductions>,
-    pending_outbound_links: Option<&crate::friend_requests::PendingOutboundLinks>,
     token_sig: Option<&[u8; 64]>,
     known: bool,
     auto_accept_known: bool,
@@ -1168,22 +1167,6 @@ fn resolve_consent_consuming_approval(
             return ConsentDecision::AcceptInlineIntroduced;
         }
         if pending.map(|p| p.take_approved(from)).unwrap_or(false) {
-            return ConsentDecision::AcceptInline;
-        }
-        // ZEB-784: this user already dialed `from` and got `Pending` back. That
-        // outbound request is itself an explicit consent decision, so `from`'s
-        // reciprocal dial — which is what their Accept now performs — links
-        // inline as MutualKey.
-        //
-        // Ordered LAST so it never shadows the two more specific
-        // authorizations above: an introduction must still stamp
-        // `Introduction`, and a live one-shot approval must still be the thing
-        // that gets consumed. Only a request that would otherwise have been
-        // parked at `Pending` reaches here.
-        if pending_outbound_links
-            .map(|p| p.take(from, now_ms))
-            .unwrap_or(false)
-        {
             return ConsentDecision::AcceptInline;
         }
     }
@@ -1651,12 +1634,6 @@ where
     /// `None` in tests / when the flow isn't wired — introductions then fall
     /// through to the normal Pending prompt.
     pending_outbound: Option<Arc<crate::friend_requests::PendingOutboundIntroductions>>,
-    /// ZEB-784: process-local record of plain Path-A link requests this user
-    /// sent that came back `Pending`. `Some` lets the target's reciprocal dial
-    /// — the one their Accept performs — auto-accept inline as MutualKey.
-    /// `None` in tests / when the flow isn't wired, which restores the
-    /// pre-ZEB-784 behaviour of parking that dial at `Pending`.
-    pending_outbound_links: Option<Arc<crate::friend_requests::PendingOutboundLinks>>,
     /// ZEB-371 Task 12: the per-user "auto-accept known requesters" toggle
     /// (spec §7.1; Jake's "Both" choice, default ON). Only gates whether to
     /// PROMPT a KNOWN requester — never relaxes authentication, and never
@@ -1763,8 +1740,6 @@ where
             pending_requests: None,
             // ZEB-376: default to no introduction pre-auth; production wires it.
             pending_outbound: None,
-            // ZEB-784: default to no outbound-link pre-auth; production wires it.
-            pending_outbound_links: None,
             // ZEB-371 spec §7.1 default: auto-accept KNOWN requesters is ON.
             auto_accept_known: true,
             // ZEB-461: default to the empty self bundle; production fills it.
@@ -1857,18 +1832,6 @@ where
         pending_outbound: Option<Arc<crate::friend_requests::PendingOutboundIntroductions>>,
     ) -> Self {
         self.pending_outbound = pending_outbound;
-        self
-    }
-
-    /// ZEB-784: wire in the process-local outbound-**link** pre-auth store, so a
-    /// reciprocal dial from someone this user already dialed auto-accepts inline
-    /// as MutualKey. Fluent setter (default `None`) so existing call sites —
-    /// including tests — keep compiling without an explicit `None`.
-    pub fn with_pending_outbound_links(
-        mut self,
-        pending_outbound_links: Option<Arc<crate::friend_requests::PendingOutboundLinks>>,
-    ) -> Self {
-        self.pending_outbound_links = pending_outbound_links;
         self
     }
 
@@ -2208,7 +2171,6 @@ where
         let (accepted, revocations_inserted) = match resolve_consent_consuming_approval(
             self.pending_requests.as_deref(),
             self.pending_outbound.as_deref(),
-            self.pending_outbound_links.as_deref(),
             req.token_sig.as_ref(),
             known,
             self.auto_accept_known,
@@ -2350,23 +2312,7 @@ where
                 // the requester's NEXT dial is accepted inline.
                 let now_ms = wall_now_ms();
                 if let Some(pending) = self.pending_requests.as_ref() {
-                    // ZEB-784: retain the requester's dial target alongside the
-                    // request. Both fields are signature-bound into
-                    // `contact_digest` (ZEB-473 §6.3) and authentication has
-                    // ALREADY run above, so this is verified routing, not
-                    // attacker-supplied. Without it the user's later Accept has
-                    // nothing to dial and can only record an approval nobody
-                    // ever consumes.
-                    let contact = crate::friend_requests::StoredLinkContact {
-                        iroh_node_id: req.iroh_node_id,
-                        home_relay_url: req.home_relay_url.clone(),
-                    };
-                    pending.record_inbound(
-                        req.from_addr,
-                        req.display.clone(),
-                        Some(contact),
-                        now_ms,
-                    );
+                    pending.record_inbound(req.from_addr, req.display.clone(), now_ms);
                 }
                 match self.app.as_ref() {
                     Some(app) => app.emit_friend_request_received(),
@@ -5159,26 +5105,10 @@ mod tests {
         // Two handshakes race on the single approval (no token, not known/auto).
         // EXACTLY one wins AcceptInline; the loser falls back to Pending so it
         // does NOT derive a second, mismatched friendship secret.
-        let first = resolve_consent_consuming_approval(
-            Some(&pending),
-            None,
-            None,
-            None,
-            false,
-            false,
-            &from,
-            0,
-        );
-        let second = resolve_consent_consuming_approval(
-            Some(&pending),
-            None,
-            None,
-            None,
-            false,
-            false,
-            &from,
-            0,
-        );
+        let first =
+            resolve_consent_consuming_approval(Some(&pending), None, None, false, false, &from, 0);
+        let second =
+            resolve_consent_consuming_approval(Some(&pending), None, None, false, false, &from, 0);
         assert_eq!(
             first,
             ConsentDecision::AcceptInline,
@@ -5205,7 +5135,6 @@ mod tests {
             resolve_consent_consuming_approval(
                 Some(&pending),
                 None,
-                None,
                 Some(&tok),
                 false,
                 false,
@@ -5222,16 +5151,7 @@ mod tests {
         // known + auto-accept → AcceptInline without needing/consuming an approval.
         let empty = PendingFriendRequests::new();
         assert_eq!(
-            resolve_consent_consuming_approval(
-                Some(&empty),
-                None,
-                None,
-                None,
-                true,
-                true,
-                &from,
-                0,
-            ),
+            resolve_consent_consuming_approval(Some(&empty), None, None, true, true, &from, 0),
             ConsentDecision::AcceptInline,
         );
     }
