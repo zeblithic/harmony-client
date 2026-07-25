@@ -188,7 +188,41 @@ git pull --ff-only
 git status   # must be clean
 ```
 
-Check: no draft PRs you meant to include. CI is disabled (`ci.yml.disabled`) — trust local test runs instead.
+Check: no draft PRs you meant to include.
+
+**Confirm CI is green on the release base.** `.github/workflows/ci.yml` is live (it was
+disabled when this playbook was first written; that changed in ZEB-676). It runs
+`rust-check` (fmt + clippy), three sharded `rust-test` jobs behind a
+`Rust — test (nextest)` roll-up, `msrv`, and `frontend` — ~12 min wall-clock warm.
+
+```bash
+gh run list --workflow=ci.yml --repo zeblithic/harmony-client --branch main --limit 1
+```
+
+Also run the full local gate — CI green is necessary, not sufficient, because the
+release build compiles bundles CI never produces:
+
+```bash
+# Rust gates run from src-tauri/ (see CLAUDE.md — the inner .cargo/config.toml
+# is discovered from the cwd). The subshell keeps that cd from leaking into the
+# frontend commands below; without it a pasted block would cd twice and silently
+# skip clippy + nextest.
+(
+  cd src-tauri
+  cargo fmt --all -- --check
+  cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+  cargo nextest run --locked --workspace --all-targets --features test-fixtures
+)
+
+# from repo root
+npx tsc --noEmit && npx vitest run
+```
+
+Each command must pass. Note that `&&`-chaining the Rust three would stop at the
+first failure — run them all so you see every problem in one pass.
+
+> Do **not** use `scripts/test-select` here. Its rotating-partition selection is for
+> iterative dev gates; release validation takes the full sweep (see `CLAUDE.md`).
 
 ---
 
@@ -242,7 +276,23 @@ See §3 below. Do this before publishing the draft release.
 
 ### Step 6: Edit draft release notes (still draft — do NOT un-draft yet)
 
-The workflow creates a draft release with auto-generated notes. Add narrative framing:
+The workflow creates a draft release with auto-generated notes. Add narrative framing.
+
+Notes are drafted **ahead of the release**, in the PR that bumps the version, and live at
+`docs/release-notes/vX.Y.Z.md` (see `docs/release-notes/v0.2.0.md` for the shape). Two reasons:
+they get reviewed like anything else, and a large release is far easier to summarize while the
+work is fresh than from a long generated list on release day. (v0.2.0 spanned 190 PRs; a
+`--generate-notes` wall that size is not something a tester reads.) Publish with:
+
+```bash
+gh release edit vX.Y.Z --repo zeblithic/harmony-client \
+  --notes-file docs/release-notes/vX.Y.Z.md
+```
+
+Search the file for `<!-- OPERATOR` first — that marks any line that could only be filled in
+from the smoke-test results, and it must be resolved before un-drafting.
+
+The template below is the original inline form, kept for reference:
 
 ```bash
 gh release edit v0.1.X+1 \
