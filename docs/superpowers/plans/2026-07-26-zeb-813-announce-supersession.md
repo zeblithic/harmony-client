@@ -28,8 +28,10 @@
 >    per-engine transition latch (`AtomicU8`), because `encode_root_packet`
 >    runs per query-serve request (harmony-client#560 round 1).
 >
-> The spec above reflects the shipped API; the checked-off steps below reflect
-> what was actually executed at the time, pre-redesign.
+> The spec above reflects the shipped API; the step bodies below are a
+> historical checklist — the plan as originally written, pre-redesign.
+> Execution happened inline (the checkbox states were never ticked), and the
+> as-shipped record is the two PRs' commit history, not these steps.
 
 ## Global Constraints
 
@@ -50,7 +52,7 @@
 
 **Interfaces:**
 - Consumes: existing `LogPolicy` (associated fns `event_id`, `cmp`, `verify`, `materialize`), `VerifiedLog { events: BTreeMap<P::EventId, P::Event> }`.
-- Produces: `LogPolicy::supersedes(newer: &Self::Event, older: &Self::Event) -> bool` (defaulted `false`); `InsertOutcome::Superseded` (unit variant, no payload); compaction behavior in `insert` + `from_verified_events`. Task 3 matches on `Superseded` and implements `supersedes`.
+- Produces (as shipped, post-redesign — see the banner above): `LogPolicy::SupersessionKey: Ord` (required associated type) + `LogPolicy::supersession_key(&Self::Event) -> Option<Self::SupersessionKey>` (defaulted `None`); `InsertOutcome::Superseded` (unit variant, no payload); same-key `cmp`-Greater short-circuit in `insert` + winners-map compaction in `from_verified_events`. Task 3 matches on `Superseded` and implements `supersession_key`. *(As originally planned this line declared the pairwise `supersedes(newer, older) -> bool` API that harmony#299 round 1 replaced.)*
 
 - [ ] **Step 1: branch + write failing tests** — `git checkout -b zeb-813-verified-log-supersession origin/main`. In the existing `mod tests`, add a supersession toy policy and five tests:
 
