@@ -34591,6 +34591,25 @@ mod create_community_inner_tests {
             ..NodeState::default()
         });
 
+        // ZEB-802: `create_community_inner` does NOT insert the #general
+        // engine synchronously — the wired delta consumer enqueues a
+        // DeferredSpawn while the transaction is open, and `commit()` drains
+        // it (see the module comment above `happy_path_spawns_default_channel_engine`).
+        // So the registry can still be empty here. Every sibling test in this
+        // module waits on that; this one did not, and CI caught it — the
+        // baseline scan reported the not-yet-registered #general in
+        // `unavailable_channels`, which is the verb working exactly as
+        // designed, against a test that had not earned its precondition.
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_secs(5)
+            )
+            .await,
+            "the #general channel-log engine must register before the baseline scan"
+        );
+
         // Baseline: one live, fully-readable community. If this is not
         // complete, every assertion below is meaningless.
         let base = list_mentions_impl(&node_state, None, None, 100)
