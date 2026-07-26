@@ -149,10 +149,18 @@
   // state to the flag made it announce success while nothing opened. Predicate
   // and transition both live in lib/settings-visibility.ts, where the
   // "aria-pressed never disagrees with what rendered" invariant is pinned.
-  let settingsVisible = $derived(isSettingsVisible(showSettings, appMode));
+  let settingsVisible = $derived(isSettingsVisible(showSettings, appMode, collapsed));
 
   function toggleSettings() {
-    ({ showSettings, appMode } = toggleSettingsState(showSettings, appMode));
+    const next = toggleSettingsState(showSettings, appMode);
+    // Route a mode change through `switchMode` rather than assigning `appMode`:
+    // it is the canonical transition and clears mode-local state (Files
+    // selection, filters, folder, cleanup view). Assigning directly left that
+    // state live after the gear navigated away from Files (Qodo, PR #553).
+    // `switchMode` also clears `showSettings`, so the intent is applied after it
+    // rather than before, or it would be immediately clobbered.
+    if (next.appMode !== appMode) switchMode(next.appMode);
+    showSettings = next.showSettings;
   }
 
   // ZEB-405 (WS-C): user-controlled reveal + width of the messages-mode media

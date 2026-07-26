@@ -33,9 +33,30 @@ export const SETTINGS_MODE: AppMode = 'messages';
 /**
  * Whether Settings is actually on screen — the value the gear's active and
  * `aria-pressed` states must be derived from.
+ *
+ * Mirrors `Layout.svelte`'s render condition, which is the only authority:
+ *
+ *   rightColumnVisible = isMessages && !collapsed && (wantSettings || …)
+ *   showingSettings    = rightColumnVisible && wantSettings
+ *
+ * The `collapsed` term is load-bearing and was missed in the first cut of this
+ * fix (Qodo, PR #553). Below the responsive breakpoint the whole right column
+ * is hidden, so Settings does not render *even in messages mode with the flag
+ * set* — and a predicate without `collapsed` reproduced the exact
+ * `aria-pressed="true"` with no panel that this module exists to eliminate,
+ * just on the width axis instead of the mode axis.
+ *
+ * `showSettings` remains the user's *intent* and deliberately survives a
+ * collapse, so Settings appears when the window widens again (the behaviour
+ * `handleExportRequested` already depends on). This function is the *actual*.
+ * Never bind ARIA to the intent.
  */
-export function isSettingsVisible(showSettings: boolean, appMode: AppMode): boolean {
-  return showSettings && appMode === SETTINGS_MODE;
+export function isSettingsVisible(
+  showSettings: boolean,
+  appMode: AppMode,
+  collapsed: boolean,
+): boolean {
+  return showSettings && appMode === SETTINGS_MODE && !collapsed;
 }
 
 /**
@@ -43,12 +64,22 @@ export function isSettingsVisible(showSettings: boolean, appMode: AppMode): bool
  * closing only applies when it is genuinely open, so a press in a non-messages
  * mode always *opens* (matching what the user sees) rather than silently
  * clearing a `showSettings` flag they were never shown.
+ *
+ * Deliberately keyed on mode alone, NOT on `isSettingsVisible`: while collapsed
+ * nothing renders at any flag value, so consulting visibility would make the
+ * gear unable to ever clear the intent. A press while collapsed therefore
+ * toggles the intent, which is the most useful thing available — the panel
+ * appears or not on the next widen.
+ *
+ * The caller must apply an `appMode` change through the app's canonical mode
+ * transition rather than assigning it directly; see `toggleSettings` in
+ * App.svelte.
  */
 export function toggleSettingsState(
   showSettings: boolean,
   appMode: AppMode,
 ): { showSettings: boolean; appMode: AppMode } {
-  if (isSettingsVisible(showSettings, appMode)) {
+  if (showSettings && appMode === SETTINGS_MODE) {
     return { showSettings: false, appMode };
   }
   return { showSettings: true, appMode: SETTINGS_MODE };

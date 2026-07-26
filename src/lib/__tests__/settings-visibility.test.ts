@@ -15,22 +15,35 @@ const NON_SETTINGS_MODES: AppMode[] = [
   'network',
 ];
 
+const EXPANDED = false;
+const COLLAPSED = true;
+
 describe('isSettingsVisible — ZEB-767', () => {
-  it('is true only in the mode Settings actually renders in', () => {
-    expect(isSettingsVisible(true, SETTINGS_MODE)).toBe(true);
+  it('is true only in the mode Settings renders in, on an expanded layout', () => {
+    expect(isSettingsVisible(true, SETTINGS_MODE, EXPANDED)).toBe(true);
   });
 
   it.each(NON_SETTINGS_MODES)(
     'is false in %s mode even when showSettings is set',
     (mode) => {
-      // The exact state the old gear reported as pressed: the flag is true,
-      // and Layout renders nothing.
-      expect(isSettingsVisible(true, mode)).toBe(false);
+      // The exact state the old gear reported as pressed: flag true, nothing rendered.
+      expect(isSettingsVisible(true, mode, EXPANDED)).toBe(false);
     },
   );
 
   it('is false when the flag is clear', () => {
-    expect(isSettingsVisible(false, SETTINGS_MODE)).toBe(false);
+    expect(isSettingsVisible(false, SETTINGS_MODE, EXPANDED)).toBe(false);
+  });
+
+  // The width axis. Missed by the first cut of this fix, which checked mode
+  // only — below the breakpoint Layout hides the entire right column, so the
+  // predicate reported visible while nothing rendered. Same lie, other axis.
+  it('is false on a collapsed layout even in the settings mode with the flag set', () => {
+    expect(isSettingsVisible(true, SETTINGS_MODE, COLLAPSED)).toBe(false);
+  });
+
+  it.each(NON_SETTINGS_MODES)('is false collapsed in %s mode', (mode) => {
+    expect(isSettingsVisible(true, mode, COLLAPSED)).toBe(false);
   });
 });
 
@@ -42,7 +55,7 @@ describe('toggleSettingsState — ZEB-767', () => {
     });
   });
 
-  it('closes only when Settings is genuinely visible', () => {
+  it('closes when Settings is genuinely open', () => {
     expect(toggleSettingsState(true, SETTINGS_MODE)).toEqual({
       showSettings: false,
       appMode: SETTINGS_MODE,
@@ -69,22 +82,22 @@ describe('toggleSettingsState — ZEB-767', () => {
       });
     },
   );
-});
 
-describe('the invariant the fix exists to hold — ZEB-767', () => {
-  const ALL_MODES: AppMode[] = [SETTINGS_MODE, ...NON_SETTINGS_MODES];
-
-  it('never reports pressed without Settings being visible, from any state', () => {
-    for (const mode of ALL_MODES) {
-      for (const flag of [false, true]) {
-        const next = toggleSettingsState(flag, mode);
-        // `aria-pressed` binds to isSettingsVisible, so post-press the two must
-        // agree by construction — there is no reachable state where the gear
-        // announces an open panel that Layout did not render.
-        const pressed = isSettingsVisible(next.showSettings, next.appMode);
-        const rendered = next.showSettings && next.appMode === SETTINGS_MODE;
-        expect(pressed).toBe(rendered);
-      }
-    }
+  it('still toggles the intent while collapsed, so the gear can clear it', () => {
+    // Keyed on mode, not on isSettingsVisible: while collapsed nothing renders
+    // at any flag value, so a visibility-keyed toggle could never turn the
+    // intent back off and the flag would latch on.
+    expect(toggleSettingsState(true, SETTINGS_MODE).showSettings).toBe(false);
+    expect(toggleSettingsState(false, SETTINGS_MODE).showSettings).toBe(true);
   });
 });
+
+/*
+ * The invariant "aria-pressed never disagrees with what rendered" is NOT
+ * asserted here. It was, and the assertion restated this module's own predicate
+ * as the definition of "rendered" — so when the predicate was wrong (missing
+ * `collapsed`) the test agreed with it and passed. A guard that re-derives the
+ * thing it is checking certifies the author's model, not the behaviour.
+ *
+ * It now lives in Layout.test.ts, where the oracle is the rendered DOM.
+ */
