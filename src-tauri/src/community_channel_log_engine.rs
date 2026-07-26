@@ -5517,7 +5517,9 @@ mod tests {
         let (_rec_sink, sink) = recording_sink_pair();
 
         // In-memory Zenoh session for the test-side adapter drainer.
-        let cfg = zenoh::Config::default();
+        // ZEB-799: single session, nothing to discover — keep it hermetic so a
+        // workstation running harmony nodes does not fail this test.
+        let cfg = crate::event_loop::hermetic_zenoh_config();
         let session = Arc::new(zenoh::open(cfg).await.expect("zenoh open"));
 
         // Adapter-request bridge for the test fixture. Unbounded to
