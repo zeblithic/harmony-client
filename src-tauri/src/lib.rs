@@ -4410,6 +4410,13 @@ pub async fn start_node_inner(
             tokio::sync::mpsc::channel::<crate::event_loop::AddressBookRequest>(64);
         let community_address_book =
             std::sync::Arc::new(crate::community_address_book::CommunityAddressBook::new());
+        // ZEB-815 Task 6: ingest → sidecar-persist wakeups, created HERE (not
+        // inside the event loop's pool) because the reachability + relay
+        // publisher closures below are producers too: they upsert our OWN rows
+        // into the book from outside the pool entirely. A pool-local `Notify`
+        // is unreachable from them, so a locally-published row would never be
+        // persisted until a peer echoed it back.
+        let addrbook_dirty_hub = crate::address_book_sync::AddrbookDirtyHub::new();
         // ZEB-622: network-health presence last-seen cache. Created here so it can
         // be (a) wired into the presence map below — every verified beacon's
         // `apply` feeds it — and (b) installed on the NetworkHealthService at the
@@ -8484,6 +8491,17 @@ pub async fn start_node_inner(
                         let butler_self_device_id_hash_for_pub = this_device_id_hash;
                         let butler_self_device_vk_for_pub =
                             loaded.device_signing_key.verifying_key().to_bytes();
+                        // ZEB-815 Task 6: an announce is an address-book row
+                        // now, not a community-CRDT event. These five handles
+                        // are what replaces `engine.insert_local_event`: the
+                        // node-wide book, both resolvers the ingest gate fans
+                        // out to, the per-community dirty hub that wakes the
+                        // sidecar, and the event loop's publish channel.
+                        let addrbook_book_for_pub = std::sync::Arc::clone(&community_address_book);
+                        let addrbook_rr_for_pub = reachability_resolver.clone();
+                        let addrbook_crr_for_pub = std::sync::Arc::clone(&community_relay_resolver);
+                        let addrbook_dirty_for_pub = addrbook_dirty_hub.clone();
+                        let addrbook_publish_tx_for_pub = publish_tx.clone();
                         let publish_fn: crate::reachability_publisher::PublishFn =
                             std::sync::Arc::new(move || {
                                 // Per-invocation clones — the closure is
@@ -8509,6 +8527,12 @@ pub async fn start_node_inner(
                                 let butler_self_device_vk = butler_self_device_vk_for_pub;
                                 // ZEB-621 per-invocation clone for the address delta.
                                 let addr_fanout = std::sync::Arc::clone(&addr_fanout_for_cb);
+                                // ZEB-815 Task 6 per-invocation address-book clones.
+                                let addrbook_book = std::sync::Arc::clone(&addrbook_book_for_pub);
+                                let addrbook_rr = addrbook_rr_for_pub.clone();
+                                let addrbook_crr = std::sync::Arc::clone(&addrbook_crr_for_pub);
+                                let addrbook_dirty = addrbook_dirty_for_pub.clone();
+                                let addrbook_publish_tx = addrbook_publish_tx_for_pub.clone();
                                 Box::pin(async move {
                                     // 1. Snapshot iroh state ONCE.
                                     let node_id_bytes: [u8; 32] = *ep.node_id().as_bytes();
@@ -8607,6 +8631,20 @@ pub async fn start_node_inner(
                                     // ZEB-371 friend reconcile below still runs
                                     // (friends can exist with zero communities) —
                                     // so this is NO LONGER an early `return`.
+                                    //
+                                    // ZEB-815: the loop MINTS; the single
+                                    // publish pass after it does all the I/O,
+                                    // so every community's row comes from the
+                                    // one address snapshot taken above before
+                                    // any of them goes on the wire.
+                                    let mut addrbook_rows: Vec<(
+                                        crate::owner_state_types::SpaceId,
+                                        crate::community_address_book::AddressBookRow,
+                                    )> = Vec::new();
+                                    let mut addrbook_keys: std::collections::HashMap<
+                                        crate::owner_state_types::SpaceId,
+                                        crate::community_channel_log::ChannelKey,
+                                    > = std::collections::HashMap::new();
                                     let community_ids = registry.known_ids().await;
                                     for community_id in community_ids {
                                         // 3a. Reserve an HLC for this
@@ -8650,49 +8688,15 @@ pub async fn start_node_inner(
                                                 }
                                             };
 
-                                        // 3c. Mint a fresh event_id +
-                                        //     wrap in EventPayload + sign
-                                        //     the outer envelope.
-                                        let event_id: [u8; 16] = {
-                                            use rand::RngCore;
-                                            let mut buf = [0u8; 16];
-                                            rand::thread_rng().fill_bytes(&mut buf);
-                                            buf
-                                        };
-                                        let envelope = crate::community_membership::EventPayload {
-                                            id: event_id,
-                                            community_id,
-                                            kind:
-                                                crate::community_membership::MembershipEventKind::ReachabilityAnnounce {
-                                                    payload,
-                                                },
-                                            actor,
-                                            at: hlc,
-                                        };
-                                        // ZEB-339: outer SignedMembershipEvent signed
-                                        // with the enrolled device key (#2). Steady-
-                                        // state event — no cert (verifier resolves the
-                                        // signer from materialized membership).
-                                        let signed = match crate::community_membership::sign_event(
-                                            &envelope,
-                                            community_signing_key.as_ref(),
-                                        ) {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    community_id = ?community_id,
-                                                    error = %e,
-                                                    "ReachabilityAnnounce sign_event failed; \
-                                                     skipping this community"
-                                                );
-                                                continue;
-                                            }
-                                        };
-
-                                        // 3d. Insert via the per-community
-                                        //     engine. If the engine isn't
-                                        //     spawned (race with leave?),
-                                        //     log + skip.
+                                        // 3c. Resolve this community's
+                                        //     address-book seal key. The
+                                        //     engine lookup that used to feed
+                                        //     `insert_local_event` now feeds
+                                        //     the key derivation: a race with
+                                        //     leave means we hold no
+                                        //     membership key for this
+                                        //     community, so there is nothing
+                                        //     we could seal a row under.
                                         let Some(engine) = registry.engine_arc(&community_id).await
                                         else {
                                             tracing::warn!(
@@ -8702,22 +8706,62 @@ pub async fn start_node_inner(
                                             );
                                             continue;
                                         };
-                                        match engine.insert_local_event(signed).await {
-                                            Ok(_) => {
-                                                tracing::debug!(
-                                                    community_id = ?community_id,
-                                                    "ReachabilityAnnounce inserted into community CRDT"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    community_id = ?community_id,
-                                                    error = %e,
-                                                    "ReachabilityAnnounce engine.insert_local_event \
-                                                     failed; continuing with next community"
-                                                );
-                                            }
-                                        }
+                                        addrbook_keys.insert(
+                                            community_id,
+                                            crate::address_book_sync::derive_addrbook_key(
+                                                &engine.membership_key(),
+                                                &community_id,
+                                            ),
+                                        );
+
+                                        // 3d. ZEB-815: the announce is an
+                                        //     address-book ROW now, not a
+                                        //     community-CRDT event — the
+                                        //     inner signed payload is
+                                        //     unchanged, only its carrier.
+                                        //     `device` is the enrolled key #2
+                                        //     the inner signature was made
+                                        //     with, which is what the ingest
+                                        //     gate verifies against.
+                                        addrbook_rows.push((
+                                            community_id,
+                                            crate::community_address_book::AddressBookRow {
+                                                entry:
+                                                    crate::community_address_book::AddressBookEntry::Reachability(
+                                                        payload,
+                                                    ),
+                                                actor,
+                                                device: community_signing_key
+                                                    .verifying_key()
+                                                    .to_bytes(),
+                                                at: hlc,
+                                                stamped_at_ms: announced_at_ms,
+                                            },
+                                        ));
+                                    }
+
+                                    // ZEB-815 Task 6: one publish pass for every
+                                    // community's row — local ingest through the
+                                    // SAME gate a peer's row takes (so `self`
+                                    // lands in our own book and resolvers, where
+                                    // the CRDT delta hook used to put it), then
+                                    // sealed onto each community's live record
+                                    // topic.
+                                    if !addrbook_rows.is_empty() {
+                                        let key_fn =
+                                            move |c: &crate::owner_state_types::SpaceId| {
+                                                addrbook_keys.get(c).cloned()
+                                            };
+                                        crate::address_book_sync::publish_own_rows(
+                                            &key_fn,
+                                            &addrbook_book,
+                                            &addrbook_rr,
+                                            &addrbook_crr,
+                                            &addrbook_publish_tx,
+                                            addrbook_rows,
+                                            &addrbook_dirty,
+                                        )
+                                        .await;
                                     }
 
                                     // ── ZEB-371: reconcile Case-D friend slots ──
@@ -10644,6 +10688,24 @@ pub async fn start_node_inner(
                                         let relay_device_ed25519_verify =
                                             community_signing_key_arc.verifying_key().to_bytes();
                                         let ep_for_relay = std::sync::Arc::clone(ep_arc);
+                                        // ZEB-815 Task 6: same swap as the
+                                        // reachability publisher — the relay ad
+                                        // becomes an address-book row instead of
+                                        // a community-CRDT event. `addrbook_crr`
+                                        // is the SAME resolver handle
+                                        // `rendezvous_resolver` ranks slots from;
+                                        // named separately because here it is an
+                                        // ingest fan-out target, not a ranking
+                                        // input.
+                                        let addrbook_book_for_relay =
+                                            std::sync::Arc::clone(&community_address_book);
+                                        let addrbook_rr_for_relay =
+                                            reachability_resolver.clone();
+                                        let addrbook_crr_for_relay =
+                                            std::sync::Arc::clone(&community_relay_resolver);
+                                        let addrbook_dirty_for_relay =
+                                            addrbook_dirty_hub.clone();
+                                        let addrbook_publish_tx_for_relay = publish_tx.clone();
                                         std::sync::Arc::new(move || {
                                             let registry = std::sync::Arc::clone(&registry);
                                             let signing_key = std::sync::Arc::clone(&signing_key);
@@ -10656,6 +10718,15 @@ pub async fn start_node_inner(
                                                 std::sync::Arc::clone(&rendezvous_publisher);
                                             let rendezvous_resolver =
                                                 std::sync::Arc::clone(&rendezvous_resolver);
+                                            let addrbook_book =
+                                                std::sync::Arc::clone(&addrbook_book_for_relay);
+                                            let addrbook_rr = addrbook_rr_for_relay.clone();
+                                            let addrbook_crr =
+                                                std::sync::Arc::clone(&addrbook_crr_for_relay);
+                                            let addrbook_dirty =
+                                                addrbook_dirty_for_relay.clone();
+                                            let addrbook_publish_tx =
+                                                addrbook_publish_tx_for_relay.clone();
                                             Box::pin(async move {
                                                 let now_ms = std::time::SystemTime::now()
                                                     .duration_since(std::time::UNIX_EPOCH)
@@ -10676,6 +10747,25 @@ pub async fn start_node_inner(
                                                 let opted = {
                                                     optin.lock().await.opted_in_communities()
                                                 };
+                                                // ZEB-815: mint in the loop,
+                                                // publish once after it — then
+                                                // refresh the rendezvous slots,
+                                                // which must see the freshly
+                                                // upserted self ad (see below).
+                                                let mut addrbook_rows: Vec<(
+                                                    crate::owner_state_types::SpaceId,
+                                                    crate::community_address_book::AddressBookRow,
+                                                )> = Vec::new();
+                                                let mut addrbook_keys: std::collections::HashMap<
+                                                    crate::owner_state_types::SpaceId,
+                                                    crate::community_channel_log::ChannelKey,
+                                                > = std::collections::HashMap::new();
+                                                let mut slot_refreshes: Vec<(
+                                                    crate::owner_state_types::SpaceId,
+                                                    std::sync::Arc<
+                                                        crate::community_state_sync::CommunitySyncEngine,
+                                                    >,
+                                                )> = Vec::new();
                                                 for c in opted {
                                                     if !membership.is_joined(&c, &actor.0).await {
                                                         continue;
@@ -10706,38 +10796,12 @@ pub async fn start_node_inner(
                                                             continue;
                                                         }
                                                     };
-                                                    let event_id: [u8; 16] = {
-                                                        use rand::RngCore;
-                                                        let mut buf = [0u8; 16];
-                                                        rand::thread_rng().fill_bytes(&mut buf);
-                                                        buf
-                                                    };
-                                                    let envelope =
-                                                        crate::community_membership::EventPayload {
-                                                            id: event_id,
-                                                            community_id: c,
-                                                            kind: crate::community_membership::MembershipEventKind::CommunityRelayAnnounce {
-                                                                payload,
-                                                            },
-                                                            actor,
-                                                            at: hlc,
-                                                        };
-                                                    let signed = match crate::community_membership::sign_event(
-                                                        &envelope,
-                                                        signing_key.as_ref(),
-                                                    ) {
-                                                        Ok(s) => s,
-                                                        Err(e) => {
-                                                            tracing::warn!(
-                                                                community_id = ?c,
-                                                                error = %e,
-                                                                "ZEB-458: CommunityRelayAnnounce \
-                                                                 sign_event failed; skipping this \
-                                                                 community"
-                                                            );
-                                                            continue;
-                                                        }
-                                                    };
+                                                    // The engine lookup that used
+                                                    // to feed `insert_local_event`
+                                                    // now feeds the address-book
+                                                    // seal key — and still feeds
+                                                    // `refresh_slot`'s membership
+                                                    // key below.
                                                     let Some(engine) =
                                                         registry.engine_arc(&c).await
                                                     else {
@@ -10749,28 +10813,73 @@ pub async fn start_node_inner(
                                                         );
                                                         continue;
                                                     };
-                                                    if let Err(e) =
-                                                        engine.insert_local_event(signed).await
-                                                    {
-                                                        tracing::warn!(
-                                                            community_id = ?c,
-                                                            error = %e,
-                                                            "ZEB-458: CommunityRelayAnnounce \
-                                                             insert_local_event failed; continuing"
-                                                        );
-                                                    }
+                                                    addrbook_keys.insert(
+                                                        c,
+                                                        crate::address_book_sync::derive_addrbook_key(
+                                                            &engine.membership_key(),
+                                                            &c,
+                                                        ),
+                                                    );
+                                                    addrbook_rows.push((
+                                                        c,
+                                                        crate::community_address_book::AddressBookRow {
+                                                            entry:
+                                                                crate::community_address_book::AddressBookEntry::Relay(
+                                                                    payload,
+                                                                ),
+                                                            actor,
+                                                            device: signing_key
+                                                                .verifying_key()
+                                                                .to_bytes(),
+                                                            at: hlc,
+                                                            stamped_at_ms: now_ms,
+                                                        },
+                                                    ));
+                                                    slot_refreshes.push((c, engine));
+                                                }
 
-                                                    // Beacon-side: (re)publish this
-                                                    // node's rendezvous slot for `c`.
-                                                    // Ranks into a slot by its position
-                                                    // in the FRESH advertiser set; if
-                                                    // this node is at rank i < N it
-                                                    // publishes its reachability under
-                                                    // the slot key, else it unregisters
-                                                    // any stale slot. Re-published on
-                                                    // the same triggers as the relay ad
-                                                    // (refresh cadence + membership-
-                                                    // change force-wake).
+                                                // ZEB-815 Task 6: publish BEFORE
+                                                // the slot refresh below. The
+                                                // refresh ranks this node against
+                                                // `advertiser_addrs_for_community`,
+                                                // which reads the relay resolver —
+                                                // and `publish_own_rows`' local
+                                                // ingest is what puts our OWN ad
+                                                // there, exactly as
+                                                // `insert_local_event`'s delta hook
+                                                // did before it. Refreshing first
+                                                // would rank us against a set that
+                                                // is missing us.
+                                                if !addrbook_rows.is_empty() {
+                                                    let key_fn =
+                                                        move |c: &crate::owner_state_types::SpaceId| {
+                                                            addrbook_keys.get(c).cloned()
+                                                        };
+                                                    crate::address_book_sync::publish_own_rows(
+                                                        &key_fn,
+                                                        &addrbook_book,
+                                                        &addrbook_rr,
+                                                        &addrbook_crr,
+                                                        &addrbook_publish_tx,
+                                                        addrbook_rows,
+                                                        &addrbook_dirty,
+                                                    )
+                                                    .await;
+                                                }
+
+                                                // Beacon-side: (re)publish this
+                                                // node's rendezvous slot per
+                                                // community. Ranks into a slot by
+                                                // its position in the FRESH
+                                                // advertiser set; if this node is
+                                                // at rank i < N it publishes its
+                                                // reachability under the slot key,
+                                                // else it unregisters any stale
+                                                // slot. Re-published on the same
+                                                // triggers as the relay ad
+                                                // (refresh cadence + membership-
+                                                // change force-wake).
+                                                for (c, engine) in slot_refreshes {
                                                     let advertisers = rendezvous_resolver
                                                         .advertiser_addrs_for_community(
                                                             &c, now_ms,
@@ -11241,6 +11350,7 @@ pub async fn start_node_inner(
                         reachability_resolver: std::sync::Arc::new(reachability_resolver.clone()),
                         community_relay_resolver: crr,
                         identity_dir: identity_dir.clone(),
+                        dirty_hub: addrbook_dirty_hub.clone(),
                     }
                 });
                 // Mint Phase 2 sync: thread handles into event_loop::run.

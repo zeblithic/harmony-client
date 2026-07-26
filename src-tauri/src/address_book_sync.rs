@@ -287,29 +287,47 @@ fn batch_changed_book(outcomes: &[IngestOutcome]) -> bool {
 // request channel closes (stop_node drops the sender), which is the same
 // terminal path the presence pool's `handles.drain()` uses.
 
-/// Per-community resync handles, shared between the producer (the community
-/// presence subscriber, which fires one on a roster device-set change) and the
-/// consumer (that community's snapshot requester).
+/// Per-community `Notify` registry shared by two sides that can reach a given
+/// community in EITHER order — the shared mechanics behind
+/// [`AddrbookResyncHub`] and [`AddrbookDirtyHub`].
 ///
-/// A hub rather than a plain `Arc<Notify>` per side because the two pools are
-/// independent tasks draining independent channels: either can process its
-/// `Subscribe` for a community first. `handle()` creates the `Notify` on first
-/// call and returns the same one to the second caller, so the wiring is
-/// order-independent. A fire with no requester yet (or ever — the pool is
-/// unwired in test callers that bypass `start_node`) is a no-op beyond leaving
-/// one permit, exactly like `send_modify` on a receiver-less watch.
+/// A hub rather than a plain `Arc<Notify>` per side because producer and
+/// consumer are independent tasks draining independent channels: either can
+/// process its `Subscribe` for a community first. `handle()` creates the
+/// `Notify` on first call and returns the same one to the second caller, so
+/// the wiring is order-independent. A fire with no listener yet (or ever — the
+/// pool is unwired in test callers that bypass `start_node`) is a no-op beyond
+/// leaving one permit, exactly like `send_modify` on a receiver-less watch.
 ///
 /// Entries are deliberately never removed. Dropping one on unsubscribe would
 /// reintroduce exactly the ordering bug the hub exists to prevent: across an
-/// unsubscribe→resubscribe the two pools can interleave such that the presence
-/// subscriber re-takes the OLD handle before the addrbook pool clears it, and
-/// the new requester then waits on a `Notify` nobody fires. The map is bounded
-/// by the number of communities the node has ever subscribed to, and a stale
-/// permit costs at most one extra snapshot query on resubscribe.
+/// unsubscribe→resubscribe the two sides can interleave such that the producer
+/// re-takes the OLD handle before the pool clears it, and the new consumer
+/// then waits on a `Notify` nobody fires. The map is bounded by the number of
+/// communities the node has ever subscribed to, and a stale permit costs at
+/// most one extra round of whatever the handle drives.
 #[derive(Clone, Default)]
-pub struct AddrbookResyncHub {
+struct NotifyHub {
     inner: Arc<std::sync::Mutex<HashMap<[u8; 16], Arc<Notify>>>>,
 }
+
+impl NotifyHub {
+    fn handle(&self, community_id: [u8; 16]) -> Arc<Notify> {
+        Arc::clone(
+            self.inner
+                .lock()
+                .expect("addrbook notify hub poisoned")
+                .entry(community_id)
+                .or_insert_with(|| Arc::new(Notify::new())),
+        )
+    }
+}
+
+/// Per-community resync handles, shared between the producer (the community
+/// presence subscriber, which fires one on a roster device-set change) and the
+/// consumer (that community's snapshot requester).
+#[derive(Clone, Default)]
+pub struct AddrbookResyncHub(NotifyHub);
 
 impl AddrbookResyncHub {
     pub fn new() -> Self {
@@ -319,13 +337,134 @@ impl AddrbookResyncHub {
     /// The resync handle for `community_id`, created on first call and stable
     /// for the process lifetime thereafter.
     pub fn handle(&self, community_id: [u8; 16]) -> Arc<Notify> {
-        Arc::clone(
-            self.inner
-                .lock()
-                .expect("addrbook resync hub poisoned")
-                .entry(community_id)
-                .or_insert_with(|| Arc::new(Notify::new())),
-        )
+        self.0.handle(community_id)
+    }
+}
+
+/// Per-community dirty handles, shared between the producers (every path that
+/// materially changes the book — the live subscriber, the snapshot requester,
+/// and [`publish_own_rows`] for our OWN rows) and the consumer (that
+/// community's sidecar persist task).
+///
+/// The pool's per-community `dirty` was originally minted locally inside the
+/// `Subscribe` arm, which made it unreachable from anywhere outside the pool:
+/// a LOCAL publish would upsert into the book and never wake the persist task,
+/// so our own reachability/relay rows would survive a restart only if a peer
+/// happened to echo them back. Routing `dirty` through a hub — created beside
+/// the resync hub and threaded to the pool AND the publisher closures — closes
+/// that seam with the same order-independence the resync hub already has.
+#[derive(Clone, Default)]
+pub struct AddrbookDirtyHub(NotifyHub);
+
+impl AddrbookDirtyHub {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The dirty handle for `community_id`, created on first call and stable
+    /// for the process lifetime thereafter.
+    pub fn handle(&self, community_id: [u8; 16]) -> Arc<Notify> {
+        self.0.handle(community_id)
+    }
+}
+
+/// Publish this node's OWN freshly-minted address-book rows.
+///
+/// Each row takes the SAME gate a peer's row takes ([`ingest_verified_row`]),
+/// so `self` lands in our own book and resolvers exactly where the CRDT
+/// membership-delta hook used to put it — one trust path, no self-shaped
+/// bypass — and is then sealed onto the community's live record topic for
+/// every other member.
+///
+/// `key_fn` resolves the per-community seal key synchronously: the callers
+/// already hold each community's engine inside their own publish loop and
+/// pre-collect `(community, key)` there, so an async lookup here would only
+/// re-take the registry lock mid-publish. `None` means we hold no key for that
+/// community — the row stays in our local book, but nothing goes on the wire
+/// (a member we cannot seal for could not read it anyway).
+///
+/// Every failure is per-row: one community's missing key, failed seal, or
+/// closed publish channel must not stop the other communities' rows — the same
+/// per-community `continue` discipline as the publish loops this replaces.
+pub async fn publish_own_rows(
+    key_fn: &(dyn Fn(&SpaceId) -> Option<ChannelKey> + Send + Sync),
+    book: &CommunityAddressBook,
+    rr: &ReachabilityResolver,
+    crr: &CommunityRelayResolver,
+    publish_tx: &tokio::sync::mpsc::Sender<crate::event_loop::PublishRequest>,
+    rows: Vec<(SpaceId, AddressBookRow)>,
+    dirty: &AddrbookDirtyHub,
+) {
+    for (community, row) in rows {
+        let community_hex = hex::encode(&community.0[..4]);
+        match ingest_verified_row(book, rr, crr, community, row.clone(), wall_now_ms()) {
+            IngestOutcome::Applied(UpsertOutcome::Inserted | UpsertOutcome::Replaced) => {
+                dirty.handle(community.0).notify_one();
+            }
+            // Nothing materially changed (a same-millisecond republish, or the
+            // community's row cap already full) — no sidecar rewrite is owed,
+            // but the row still goes out: peers keep their own books.
+            IngestOutcome::Applied(_) => {}
+            // Our own row failing the gate we hold every peer to is a bug in
+            // the minting path, and a row WE reject is one every member would
+            // reject too — so it is never put on the wire.
+            bad => {
+                tracing::warn!(
+                    community = %community_hex,
+                    outcome = ?bad,
+                    "own addrbook row failed the local ingest gate; not published"
+                );
+                continue;
+            }
+        }
+
+        let Some(key) = key_fn(&community) else {
+            tracing::warn!(
+                community = %community_hex,
+                "no addrbook key for community; own row stays local"
+            );
+            continue;
+        };
+        let payload = match seal_records(&key, &community, std::slice::from_ref(&row)) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    community = %community_hex,
+                    err = %e,
+                    "addrbook record seal failed; not published"
+                );
+                continue;
+            }
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if publish_tx
+            .send(crate::event_loop::PublishRequest {
+                key_expr: addrbook_records_topic(&community),
+                payload,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                community = %community_hex,
+                "event loop gone; addrbook record not published"
+            );
+            continue;
+        }
+        match reply_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                community = %community_hex,
+                err = %e,
+                "addrbook record publish failed"
+            ),
+            Err(_) => tracing::warn!(
+                community = %community_hex,
+                "event loop dropped the addrbook publish request"
+            ),
+        }
     }
 }
 
@@ -1150,6 +1289,175 @@ mod tests {
         assert!(
             open_records(&foreign, &community, &packet).is_none(),
             "a snapshot sealed under another epoch key never reaches the gate"
+        );
+    }
+
+    // ── Task 6: publisher swap ──────────────────────────────────────
+
+    /// Our OWN rows take the same path a peer's row takes — local gate → book
+    /// + resolvers — AND go out sealed on the live record topic, with the
+    /// per-community dirty handle fired so the sidecar picks the change up.
+    /// Two communities in one call so the per-community keying, topic, and
+    /// dirty handle are each exercised against a second value rather than a
+    /// single one that any constant would satisfy.
+    #[tokio::test]
+    async fn publish_own_rows_feeds_book_resolvers_and_wire() {
+        use futures::FutureExt;
+
+        let reach_community = SpaceId([0xD0; 16]);
+        let relay_community = SpaceId([0xD1; 16]);
+        let ts = 1_700_000_000_000u64;
+        let at = hlc(ts);
+
+        let reach_sk = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+        let reach_actor = OwnerAddr([0x0A; 16]);
+        let reach_payload = build_signed_payload_with_key(
+            [0xB1; 32],
+            "https://derp.example/".into(),
+            vec![],
+            ts,
+            &reach_actor,
+            &at,
+            Vec::new(),
+            0,
+            &reach_sk,
+        )
+        .expect("build signed reachability payload");
+        let reach_row = AddressBookRow {
+            entry: AddressBookEntry::Reachability(reach_payload),
+            actor: reach_actor,
+            device: reach_sk.verifying_key().to_bytes(),
+            at: at.clone(),
+            stamped_at_ms: ts,
+        };
+
+        let relay_sk = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
+        let relay_actor = OwnerAddr([0x0B; 16]);
+        let relay_payload = build_signed_community_relay_announce(
+            CommunityRelayEntry {
+                relay_device_id: [0x99; 16],
+                iroh_endpoint_id: [0xAA; 32],
+                relay_device_ed25519_verify: relay_sk.verifying_key().to_bytes(),
+                home_relay: "https://r.example/".into(),
+            },
+            ts,
+            &relay_actor,
+            &at,
+            &relay_sk,
+        )
+        .expect("build signed relay payload");
+        let relay_row = AddressBookRow {
+            entry: AddressBookEntry::Relay(relay_payload),
+            actor: relay_actor,
+            device: relay_sk.verifying_key().to_bytes(),
+            at,
+            stamped_at_ms: ts,
+        };
+
+        let book = CommunityAddressBook::new();
+        let rr = ReachabilityResolver::new();
+        let crr = CommunityRelayResolver::new();
+        let dirty = AddrbookDirtyHub::new();
+        let (publish_tx, mut publish_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::PublishRequest>(8);
+
+        // Stand in for the event loop's `publish_rx` arm: answer the oneshot
+        // (the publisher AWAITS it, so an undrained channel would hang) and
+        // keep what was sent. Drains until `publish_tx` is dropped below.
+        let drain = tokio::spawn(async move {
+            let mut seen: Vec<(String, Vec<u8>)> = Vec::new();
+            while let Some(req) = publish_rx.recv().await {
+                let _ = req.reply.send(Ok(()));
+                seen.push((req.key_expr, req.payload));
+            }
+            seen
+        });
+
+        let epoch = EpochKey::new([7u8; 32]);
+        let key_fn = |c: &SpaceId| Some(derive_addrbook_key(&epoch, c));
+        publish_own_rows(
+            &key_fn,
+            &book,
+            &rr,
+            &crr,
+            &publish_tx,
+            vec![
+                (reach_community, reach_row.clone()),
+                (relay_community, relay_row.clone()),
+            ],
+            &dirty,
+        )
+        .await;
+        drop(publish_tx);
+        let seen = drain.await.expect("publish drain task");
+
+        // (a) both rows are in OUR OWN book, under their own communities.
+        assert_eq!(
+            book.rows_for_community(&reach_community, ts),
+            vec![reach_row.clone()],
+            "our own reachability row lands in our own book"
+        );
+        assert_eq!(
+            book.rows_for_community(&relay_community, ts),
+            vec![relay_row.clone()],
+            "our own relay row lands in our own book"
+        );
+
+        // (b) both resolvers see them — the dial + deposit consumers read
+        //     these, and before Task 6 the CRDT delta hook is what fed them.
+        assert_eq!(
+            rr.resolve(&reach_actor).len(),
+            1,
+            "our own reachability row fanned out to the dial resolver"
+        );
+        assert_eq!(
+            crr.relays_for_community(&relay_community, ts).len(),
+            1,
+            "our own relay row fanned out to the community relay resolver"
+        );
+
+        // (c) both went out on the wire, on the RIGHT topic, and open back to
+        //     the exact row under that community's own derived key.
+        assert_eq!(seen.len(), 2, "one publish per row");
+        for (community, row) in [(reach_community, reach_row), (relay_community, relay_row)] {
+            let topic = addrbook_records_topic(&community);
+            let (_, packet) = seen
+                .iter()
+                .find(|(expr, _)| *expr == topic)
+                .unwrap_or_else(|| panic!("no publish on {topic}"));
+            let opened = open_records(&derive_addrbook_key(&epoch, &community), &community, packet)
+                .expect("own record opens under the community's addrbook key");
+            assert_eq!(
+                opened,
+                vec![row],
+                "the sealed record round-trips to the row"
+            );
+        }
+
+        // (d) the sidecar wakes for BOTH communities — a local publish that
+        //     never marked the book dirty would survive only if a peer echoed
+        //     it back. The unrelated community is the control: a hub that
+        //     handed out pre-notified handles would satisfy the first two
+        //     asserts for the wrong reason.
+        assert!(
+            dirty
+                .handle(reach_community.0)
+                .notified()
+                .now_or_never()
+                .is_some(),
+            "the reachability community's persist task was woken"
+        );
+        assert!(
+            dirty
+                .handle(relay_community.0)
+                .notified()
+                .now_or_never()
+                .is_some(),
+            "the relay community's persist task was woken"
+        );
+        assert!(
+            dirty.handle([0xEE; 16]).notified().now_or_never().is_none(),
+            "a community we published nothing for is NOT woken"
         );
     }
 

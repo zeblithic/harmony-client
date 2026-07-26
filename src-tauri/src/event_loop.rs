@@ -502,6 +502,12 @@ pub struct AddressBookRuntime {
     /// Sidecar root — the same `identity_dir` `CommunitySyncRegistry` derives
     /// `communities/{hex}/crdt.cbor` from, so `addrbook.cbor` lands beside it.
     pub identity_dir: std::path::PathBuf,
+    /// ingest → sidecar-persist wakeups. Threaded in (not minted per
+    /// `Subscribe`) because the publisher closures in `start_node` are the
+    /// THIRD producer: a locally-published row upserts into the book from
+    /// outside this pool entirely, and a pool-local `Notify` would leave that
+    /// change unpersisted until a peer echoed it back.
+    pub dirty_hub: crate::address_book_sync::AddrbookDirtyHub,
 }
 
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
@@ -4237,6 +4243,7 @@ pub async fn run(
             reachability_resolver,
             community_relay_resolver,
             identity_dir,
+            dirty_hub,
         } = addrbook;
         tokio::spawn(async move {
             use std::collections::HashMap;
@@ -4294,11 +4301,14 @@ pub async fn run(
                             continue;
                         }
                         let community = crate::owner_state_types::SpaceId(community_id);
-                        // `dirty`: ingest (subscriber + requester) → persist.
-                        // `resync`: presence roster change → requester. The
-                        // hub may already hold the resync handle if the
-                        // presence pool reached this community first.
-                        let dirty = std::sync::Arc::new(tokio::sync::Notify::new());
+                        // `dirty`: ingest (subscriber + requester + the
+                        // publisher closures' OWN rows) → persist.
+                        // `resync`: presence roster change → requester. Both
+                        // come from hubs whose other side may already hold the
+                        // handle — the presence pool for `resync`, the
+                        // publishers for `dirty` (they can publish a local row
+                        // before this Subscribe is drained).
+                        let dirty = dirty_hub.handle(community_id);
                         let resync = hub_for_addrbook.handle(community_id);
                         // Queryable FIRST, and awaited: a peer reacting to our
                         // arrival must not query us before we can serve.
