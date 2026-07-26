@@ -398,7 +398,13 @@ impl CommunityPresenceMap {
         let mut evicted = Vec::new();
         for (community, devices) in self.inner.iter_mut() {
             devices.retain(|device, e| {
-                let alive = now_ms.saturating_sub(e.last_seen_ms) < ttl_ms;
+                // ZEB-791: bound the forward direction too. `last_seen_ms` is
+                // stamped locally at receipt, so only a backward local clock
+                // step can put it ahead of `now_ms` — but while it is,
+                // `saturating_sub` reads age 0 and the entry is immortal.
+                // Fail closed: evict. A device that is genuinely still present
+                // is re-added by its next beacon.
+                let alive = now_ms >= e.last_seen_ms && now_ms - e.last_seen_ms < ttl_ms;
                 if !alive {
                     evicted.push((*community, e.owner, *device));
                 }
@@ -794,6 +800,24 @@ mod tests {
         m.apply(&c, &b(1, 1, 100, 0), 1_000);
         let ev = m.sweep(1_000 + 30_001, 30_000);
         assert_eq!(ev.len(), 1);
+        assert!(m.online_owners(&c).is_empty());
+    }
+
+    /// ZEB-791: a row stamped in the FUTURE must still be evictable.
+    ///
+    /// `last_seen_ms` is written locally at receipt, so the only way it exceeds
+    /// `now_ms` is a backward local clock step — which is not hypothetical: a
+    /// ~975ms backward step was performed on a fleet node as the ZEB-788
+    /// remediation. Before the forward bound, `saturating_sub` reported age 0
+    /// for the whole skew window and a departed device read as online.
+    #[test]
+    fn sweep_evicts_future_stamped_entry() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([1; 16]);
+        // Beacon recorded at 100_000, then the clock steps back to 10_000.
+        m.apply(&c, &b(1, 1, 100, 0), 100_000);
+        let ev = m.sweep(10_000, 30_000);
+        assert_eq!(ev.len(), 1, "a future-stamped entry must not be immortal");
         assert!(m.online_owners(&c).is_empty());
     }
 

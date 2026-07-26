@@ -424,7 +424,9 @@ impl VoicePresenceMap {
         let mut evicted = Vec::new();
         for (key, chan) in self.inner.iter_mut() {
             chan.retain(|device, e| {
-                let alive = now_ms.saturating_sub(e.last_seen_ms) < ttl_ms;
+                // ZEB-791: see `community_presence::sweep` — forward bound so a
+                // backward local clock step cannot make a row immortal.
+                let alive = now_ms >= e.last_seen_ms && now_ms - e.last_seen_ms < ttl_ms;
                 if !alive && !e.left {
                     // Only a VISIBLE row's eviction changes the roster; a
                     // gravestone is already hidden, so its GC is silent.
@@ -1325,6 +1327,21 @@ mod map_tests {
             m.sweep(21_000, TTL_MS),
             vec![((C, CH), [1u8; 16], [1u8; 32])],
             "12s after last → evict"
+        );
+        assert!(m.roster(&C, &CH).is_empty());
+    }
+
+    /// ZEB-791: mirrors `community_presence::sweep_evicts_future_stamped_entry`
+    /// — a row whose locally-written `last_seen_ms` sits ahead of `now_ms`
+    /// (backward clock step) must still age out rather than stay in the roster.
+    #[test]
+    fn sweep_evicts_future_stamped_entry() {
+        let mut m = VoicePresenceMap::new();
+        m.apply(&C, &CH, &b(1, 1, 0, true, false), 100_000);
+        assert_eq!(
+            m.sweep(10_000, TTL_MS),
+            vec![((C, CH), [1u8; 16], [1u8; 32])],
+            "a future-stamped entry must not be immortal"
         );
         assert!(m.roster(&C, &CH).is_empty());
     }

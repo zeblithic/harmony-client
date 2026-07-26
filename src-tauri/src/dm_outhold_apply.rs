@@ -250,7 +250,15 @@ pub async fn sweep_once(
                         orphan_first_seen.insert(key.clone(), now_ms);
                         stats.orphan_retains += 1;
                     }
-                    Some(&first) if now_ms.saturating_sub(first) < OUTHOLD_ORPHAN_GC_GRACE_MS => {
+                    // ZEB-791: `now_ms >= first` bounds the forward direction.
+                    // `first` is stamped locally on the arm above, so only a
+                    // backward clock step can exceed `now_ms` — but while it
+                    // does, `saturating_sub` holds the grace window open
+                    // forever and the orphan is never collected. Fail closed:
+                    // fall through to the GC arm.
+                    Some(&first)
+                        if now_ms >= first && now_ms - first < OUTHOLD_ORPHAN_GC_GRACE_MS =>
+                    {
                         stats.orphan_retains += 1;
                     }
                     Some(_) => {
@@ -631,6 +639,29 @@ mod tests {
         .await;
         assert_eq!(stats3.gc_removed, 0, "Pending row is never orphan-GC'd");
         assert!(doc.lock().await.entries.contains_key(&key));
+    }
+
+    /// ZEB-791: an orphan whose recorded `first_seen` sits AHEAD of `now_ms`
+    /// must still be GC-able.
+    ///
+    /// `first_seen` is written locally by a previous sweep, so the only way it
+    /// exceeds `now_ms` is a backward local clock step. While it does,
+    /// `saturating_sub` reported 0ms elapsed, `0 < GRACE` always held, and the
+    /// row was retained on every future sweep — the grace window never closed.
+    #[tokio::test]
+    async fn sweep_gcs_orphan_whose_first_seen_is_in_the_future() {
+        let (doc, key, _cid) = make_doc_with_one_entry();
+        let ctx = StubCtx::new([]); // status still unknown → orphan
+        let mut orphans = HashMap::new();
+        // A previous sweep stamped the orphan at a high clock value...
+        orphans.insert(key.clone(), 10 * OUTHOLD_ORPHAN_GC_GRACE_MS);
+        // ...and the clock has since stepped back well below it.
+        let stats = sweep_once(&doc, &ctx, noop_notify().as_ref(), &mut orphans, 1_000).await;
+        assert_eq!(
+            stats.gc_removed, 1,
+            "a future-stamped orphan must not hold the grace window open forever"
+        );
+        assert!(!doc.lock().await.entries.contains_key(&key));
     }
 
     /// Failing cas_put → row retained; a second sweep retries (counter == 2).
