@@ -419,7 +419,7 @@ list is the `registry_has_exactly_the_curated_v1_surface` pin test in
 | Communities (9) | `list_owner_communities`, `create_community`, `list_community_members`, `generate_invite`, **`connectivity_redeem_invite_iroh`**, **`connectivity_open_join_iroh`**, `leave_community`, `list_left_communities`, `remove_space` |
 | Channels (4) | `create_channel`, `list_channels`, `list_channel_messages`, `post_channel_message` |
 | Files / sharing (7) | `ingest_content_encrypted`, `grant_read`, `revoke_read`, `list_grants`, `list_received_grants`, `dismiss_received_grant`, `burn_content` |
-| Friends (7) | `list_friends`, `generate_friend_token`, `redeem_friend_token`, `add_friend_by_key`, `list_pending_friend_requests`, `accept_friend_request`, `decline_friend_request` |
+| Friends (9) | `list_friends`, `generate_friend_token`, `redeem_friend_token`, `add_friend_by_key`, `list_pending_friend_requests`, `accept_friend_request`, `decline_friend_request`, `list_outbound_friend_requests`, `cancel_outbound_friend_request` |
 | Spaces / DMs (3) | `add_space`, `send_dm`, `read_dm_thread` |
 | Diagnostics (4) | `connectivity_get_my_reachability_record`, `connectivity_list_peer_reachability`, `network_health_snapshot`, `network_health_run_self_test` |
 | Pairing (6) | `start_inviter_pairing` (`{"displayName": string}`), `start_joiner_pairing` (`{"displayName": string}`), `select_pairing_peer` (`{"peerSessionId": uuid}`), `confirm_pairing_sas`, `cancel_pairing`, `get_pairing_state` → `PairingState` JSON |

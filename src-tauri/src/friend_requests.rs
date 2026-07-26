@@ -330,7 +330,7 @@ impl Drop for AcceptInFlightGuard {
 /// (ephemeral, like `PendingFriendRequests`).
 #[derive(Default)]
 pub struct PendingOutboundIntroductions {
-    inner: Mutex<HashMap<OwnerAddr, u64>>,
+    inner: TtlPreAuth<OwnerAddr>,
 }
 
 /// TTL bounding a recorded pre-authorization: a `record`ed target older than
@@ -346,27 +346,379 @@ impl PendingOutboundIntroductions {
     /// Record (idempotent refresh of the deadline for) a pre-authorization for
     /// `target` at `now_ms`. A later `record` bumps the recorded instant.
     pub fn record(&self, target: OwnerAddr, now_ms: u64) {
-        self.inner
-            .lock()
-            .expect("outbound-intro mutex poisoned")
-            .insert(target, now_ms);
+        self.inner.record(target, now_ms);
     }
 
     /// Remove + return true iff `target` was recorded AND still within the TTL.
     /// A present-but-expired entry is removed and returns false. One-shot: even
     /// a fresh hit is consumed, so a single pre-auth accepts exactly one dial.
-    ///
-    /// #7 (security): fails CLOSED on a BACKWARD clock. `saturating_sub` returns
-    /// `0 < TTL` when `now_ms < rec` (the clock moved back after recording),
-    /// which would keep a stale pre-auth valid indefinitely. Require
-    /// `now_ms >= rec` explicitly so a backward-clock record is rejected — and it
-    /// is still consumed (the `remove` already ran), preserving one-shot.
     pub fn take(&self, target: &OwnerAddr, now_ms: u64) -> bool {
-        let mut m = self.inner.lock().expect("outbound-intro mutex poisoned");
+        self.inner.take(target, now_ms, OUTBOUND_INTRO_TTL_MS)
+    }
+}
+
+/// ZEB-784 / ZEB-783: the local record of plain Path-A friend requests this user
+/// sent that came back `Pending`, so they can be **retried automatically** and
+/// shown in the UI while they wait.
+///
+/// ## Why this exists
+///
+/// `AddFriendOutcome::Pending`'s own documentation names the completing beat:
+///
+/// > The user re-invokes `add_friend_by_key` later to retry; once the target
+/// > accepts, the retry's response is `Accepted`.
+///
+/// That retry was never automated and never surfaced anywhere, so in practice
+/// nobody performed it. The natural mutual flow — A adds, B accepts, B adds,
+/// A accepts — ends with two stored approvals, zero friendships, and both users
+/// looking at "No friends yet", because each believes accepting was the last
+/// step. Recording the request here lets the node perform the documented retry
+/// on the user's behalf, and lets the UI answer "did my request go anywhere?"
+/// (ZEB-783 — the sender previously had no projection of their own outbound
+/// request at all).
+///
+/// ## Why the key is the identity pub hex, not an `OwnerAddr`
+///
+/// On a `Pending` reply the dialer receives **no cert and no owner id** — the
+/// target is not disclosed until they accept. So an `OwnerAddr` key is simply
+/// not available at record time. The identity pub hex *is*: it is the string the
+/// user typed. Keying on it also keeps the security story trivial — the only
+/// thing this store can ever cause is re-dialling a key the user themselves
+/// entered, which is precisely what they asked for. Nothing here grants any
+/// peer authority to be accepted; the acceptor's one-shot `approve` /
+/// `take_approved` gate is untouched and remains the only thing that can
+/// establish a friendship.
+#[derive(Default)]
+pub struct PendingOutboundLinks {
+    inner: TtlPreAuth<String>,
+    /// Serializes snapshot+encode+write in [`persist`](Self::persist) so two
+    /// concurrent mutators cannot write in non-chronological order. Separate
+    /// from the map lock precisely so the map is never held across I/O.
+    persist_lock: Mutex<()>,
+    /// Where this store persists. `None` = ephemeral (tests, and any caller with
+    /// no identity dir), which degrades to pre-ZEB-784 behaviour: the retry
+    /// simply does not survive a restart.
+    path: Option<std::path::PathBuf>,
+}
+
+/// File name for the persisted outbound-link records, alongside the other
+/// per-identity state under `<identity_dir>/`.
+pub const OUTBOUND_LINKS_FILENAME: &str = "outbound_friend_links.cbor";
+
+/// How long an unanswered outbound request keeps being retried.
+///
+/// Much longer than [`OUTBOUND_INTRO_TTL_MS`], and the difference is the whole
+/// point: an introduction pre-auth covers a machine-timescale round trip, but
+/// this one has to survive **human accept latency**. The recipient may not open
+/// the app until tomorrow. A 10-minute bound would give up long before the user
+/// ever taps Accept, reintroducing the exact dead end this exists to remove.
+/// Matched to `INTRODUCTION_OFFER_TTL_MS` (7d), already this codebase's answer
+/// to "how long may a human sit on a pending friend decision".
+pub const OUTBOUND_LINK_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7d
+
+impl PendingOutboundLinks {
+    /// Empty, ephemeral store (no persistence).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Load from `path`, binding it so every later mutation is persisted.
+    ///
+    /// Self-heals rather than bricking the boot: a corrupt file is quarantined
+    /// aside as `.corrupt-<ms>` (bytes preserved for diagnosis) and an empty
+    /// store returned, matching the `load_doc_or_recover` contract the
+    /// relay-opt-in and DM-inbox stores use. Losing these records costs the
+    /// automatic retry, not correctness — the user can still re-add manually,
+    /// which is exactly the pre-ZEB-784 situation.
+    pub fn load_or_recover(path: std::path::PathBuf, now_ms: u64) -> Self {
+        let map = match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "ZEB-784: outbound-link store unreadable; continuing empty");
+                HashMap::new()
+            }
+            Ok(bytes) => match Self::decode(&bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    let aside = path.with_extension(format!("corrupt-{now_ms}"));
+                    match std::fs::rename(&path, &aside) {
+                        Ok(()) => {
+                            tracing::warn!(error = %e, quarantined = %aside.display(),
+                                "ZEB-784: outbound-link store corrupt; quarantined, continuing empty");
+                        }
+                        Err(rename_err) => {
+                            // The rewrite below would overwrite `path` with the
+                            // empty map and destroy the very bytes the
+                            // quarantine exists to preserve. Bail out to an
+                            // ephemeral store instead: this session degrades to
+                            // pre-ZEB-784 behaviour (no durable retry), which is
+                            // strictly better than silently shredding the
+                            // evidence of whatever corrupted the file.
+                            tracing::error!(error = %e, rename_error = %rename_err,
+                                path = %path.display(),
+                                "ZEB-784: outbound-link store corrupt AND quarantine failed; \
+                                 running WITHOUT persistence so the bad bytes survive for diagnosis");
+                            return Self::default();
+                        }
+                    }
+                    HashMap::new()
+                }
+            },
+        };
+        // Drop anything already past its TTL rather than carrying dead records
+        // forward — they would never be retried anyway, and pruning here keeps
+        // the file from growing without bound across restarts.
+        let live: HashMap<String, u64> = map
+            .into_iter()
+            .filter(|(_, rec)| TtlPreAuth::<String>::is_live(*rec, now_ms, OUTBOUND_LINK_TTL_MS))
+            .collect();
+        let store = Self {
+            inner: TtlPreAuth {
+                inner: Mutex::new(live),
+            },
+            persist_lock: Mutex::new(()),
+            path: Some(path),
+        };
+        // Rewrite immediately so a pruned or quarantined file is reflected on
+        // disk even if the user never sends another request.
+        store.persist();
+        store
+    }
+
+    /// CBOR `Vec<(String, u64)>` — a sequence of pairs rather than a map,
+    /// matching the encoding discipline used elsewhere in this crate.
+    fn decode(bytes: &[u8]) -> Result<HashMap<String, u64>, String> {
+        let rows: Vec<(String, u64)> =
+            ciborium::from_reader(bytes).map_err(|e| format!("cbor decode: {e}"))?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Snapshot and write, serialized against other persists — but never holding
+    /// the MAP lock across filesystem I/O.
+    ///
+    /// The persist lock is taken BEFORE the snapshot, and that ordering is the
+    /// whole point. Serializing only the write would still allow two mutators to
+    /// snapshot in one order and write in the other, so an older snapshot could
+    /// land last. Concretely, that loses cancels: the retry driver calls `record`
+    /// on a timer (snapshot contains `k`), the user cancels (snapshot omits `k`),
+    /// the cancel's write lands first, and the stale snapshot puts `k` back. The
+    /// request then rehydrates on the next boot and is retried for the remaining
+    /// TTL — a cancelled request coming back from the dead.
+    ///
+    /// Taking the persist lock first makes snapshot→encode→write one atomic unit,
+    /// so the last writer's bytes always reflect the latest state.
+    fn persist(&self) {
+        let Some(path) = self.path.as_ref() else {
+            return;
+        };
+        // Recover a poisoned persist lock: a panic in a prior persist must not
+        // permanently disable durability for the rest of the session.
+        let _serialize = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let rows: Vec<(String, u64)> = {
+            let m = self
+                .inner
+                .inner
+                .lock()
+                .expect("outbound pre-auth mutex poisoned");
+            m.iter().map(|(k, rec)| (k.clone(), *rec)).collect()
+        };
+        let mut bytes = Vec::new();
+        if let Err(e) = ciborium::into_writer(&rows, &mut bytes) {
+            tracing::warn!(error = %e, "ZEB-784: outbound-link encode failed; not persisted");
+            return;
+        }
+        if let Err(e) = crate::owner_state_persist::save_atomically(path, &bytes) {
+            // Best-effort: the in-memory store is still correct for this
+            // session, so a write failure costs durability across restart, not
+            // the live retry.
+            tracing::warn!(error = %e, path = %path.display(),
+                "ZEB-784: outbound-link persist failed");
+        }
+    }
+
+    /// Hex is case-insensitive; normalise so a request recorded as `AB…` and a
+    /// later `forget`/lookup spelled `ab…` refer to the same entry.
+    fn norm(identity_pub_hex: &str) -> String {
+        identity_pub_hex.trim().to_ascii_lowercase()
+    }
+
+    /// Record an outbound request to `identity_pub_hex` at `now_ms`, keeping the
+    /// original timestamp if a live record already exists.
+    ///
+    /// First-write-wins, not last: `add_friend_by_key_impl` records on EVERY
+    /// `Pending`, and the retry driver goes through that same function, so
+    /// refreshing here would push the deadline out on every pass and the record
+    /// could never expire. It also keeps the timestamp meaning "when the user
+    /// asked", which is what the ZEB-783 projection displays. A re-add after the
+    /// window lapses starts a fresh record, since the expired one no longer
+    /// counts as live.
+    ///
+    /// Persists only when the map actually changed — otherwise a pending request
+    /// would rewrite the file on every retry pass, forever.
+    pub fn record(&self, identity_pub_hex: &str, now_ms: u64) {
+        if self
+            .inner
+            .record_if_absent(Self::norm(identity_pub_hex), now_ms, OUTBOUND_LINK_TTL_MS)
+        {
+            self.persist();
+        }
+    }
+
+    /// Non-consuming: is there a live (un-expired) outbound request to this key?
+    pub fn is_pending(&self, identity_pub_hex: &str, now_ms: u64) -> bool {
+        self.inner
+            .peek(&Self::norm(identity_pub_hex), now_ms, OUTBOUND_LINK_TTL_MS)
+    }
+
+    /// Every live outbound request as `(identity_pub_hex, recorded_at_ms)`.
+    /// Expired entries are filtered out but NOT removed (this is a read).
+    /// Backs both the retry driver and the sender-side UI projection.
+    pub fn list(&self, now_ms: u64) -> Vec<(String, u64)> {
+        self.inner.list(now_ms, OUTBOUND_LINK_TTL_MS)
+    }
+
+    /// Remove every expired record, returning how many were dropped.
+    ///
+    /// `list`/`is_pending` FILTER expired entries but do not remove them, because
+    /// a read should not mutate. Without an explicit sweep a long-lived node
+    /// accumulates dead keys in memory and re-persists them on every write, so
+    /// the file only ever shrinks at boot. The retry driver calls this on each
+    /// pass, which is the natural place: it already runs on a timer and already
+    /// walks the live set. Mirrors `sweep_expired_offers` on the inbound store.
+    ///
+    /// Persists only when something was actually dropped.
+    pub fn prune_expired(&self, now_ms: u64) -> usize {
+        let dropped = {
+            let mut m = self
+                .inner
+                .inner
+                .lock()
+                .expect("outbound pre-auth mutex poisoned");
+            let before = m.len();
+            m.retain(|_, rec| TtlPreAuth::<String>::is_live(*rec, now_ms, OUTBOUND_LINK_TTL_MS));
+            before - m.len()
+        };
+        if dropped > 0 {
+            self.persist();
+        }
+        dropped
+    }
+
+    /// Drop the record — the link completed, or the user cancelled. Idempotent.
+    pub fn forget(&self, identity_pub_hex: &str) {
+        self.inner.forget(&Self::norm(identity_pub_hex));
+        self.persist();
+    }
+}
+
+/// Shared TTL-bounded record map behind [`PendingOutboundIntroductions`] and
+/// [`PendingOutboundLinks`]. Generic over the key because the two wrappers
+/// address their targets differently: an introduction pre-auth keys on the
+/// authenticated `OwnerAddr` it will match an inbound request against, while an
+/// outbound link request keys on the identity pub hex the user typed (no
+/// `OwnerAddr` is available at record time — see `PendingOutboundLinks`).
+///
+/// The TTL is a per-call parameter rather than a field so each constant sits
+/// next to the contract that justifies it.
+struct TtlPreAuth<K: std::hash::Hash + Eq> {
+    inner: Mutex<HashMap<K, u64>>,
+}
+
+// Manual `Default` — deriving it would demand `K: Default`, which the key types
+// need not (and should not) implement.
+impl<K: std::hash::Hash + Eq> Default for TtlPreAuth<K> {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> TtlPreAuth<K> {
+    fn record(&self, target: K, now_ms: u64) {
+        self.inner
+            .lock()
+            .expect("outbound pre-auth mutex poisoned")
+            .insert(target, now_ms);
+    }
+
+    /// Record `target` only if it has no LIVE record already, preserving the
+    /// original timestamp when it does. Returns `true` iff the map changed.
+    ///
+    /// This is the variant a self-retrying store needs. With plain [`record`],
+    /// a caller that re-records on every retry pass refreshes the deadline
+    /// every pass, so the TTL is never reached and the record becomes
+    /// immortal — a TTL its own consumer keeps resetting is not a TTL. It also
+    /// keeps a "requested at" timestamp meaning when the USER asked, not when
+    /// the machine last retried, which is what any UI projecting it needs.
+    ///
+    /// An expired record is replaced (returns `true`), so a manual re-add after
+    /// the window lapses correctly starts a fresh one.
+    fn record_if_absent(&self, target: K, now_ms: u64, ttl_ms: u64) -> bool {
+        let mut m = self.inner.lock().expect("outbound pre-auth mutex poisoned");
+        match m.get(&target) {
+            Some(rec) if Self::is_live(*rec, now_ms, ttl_ms) => false,
+            _ => {
+                m.insert(target, now_ms);
+                true
+            }
+        }
+    }
+
+    /// `true` iff `rec` is a live record as of `now_ms`. Fails CLOSED on a
+    /// BACKWARD clock: `saturating_sub` would yield `0 < ttl` when
+    /// `now_ms < rec`, keeping a stale record valid indefinitely, so
+    /// `now_ms >= rec` is required explicitly.
+    fn is_live(rec: u64, now_ms: u64, ttl_ms: u64) -> bool {
+        now_ms >= rec && now_ms - rec < ttl_ms
+    }
+
+    /// Consuming take. The entry is removed even when expired (and even on a
+    /// backward clock), preserving the one-shot property.
+    fn take<Q>(&self, target: &Q, now_ms: u64, ttl_ms: u64) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let mut m = self.inner.lock().expect("outbound pre-auth mutex poisoned");
         match m.remove(target) {
-            Some(rec) => now_ms >= rec && now_ms - rec < OUTBOUND_INTRO_TTL_MS,
+            Some(rec) => Self::is_live(rec, now_ms, ttl_ms),
             None => false,
         }
+    }
+
+    /// Non-consuming read.
+    fn peek<Q>(&self, target: &Q, now_ms: u64, ttl_ms: u64) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let m = self.inner.lock().expect("outbound pre-auth mutex poisoned");
+        m.get(target)
+            .is_some_and(|rec| Self::is_live(*rec, now_ms, ttl_ms))
+    }
+
+    fn list(&self, now_ms: u64, ttl_ms: u64) -> Vec<(K, u64)> {
+        let m = self.inner.lock().expect("outbound pre-auth mutex poisoned");
+        m.iter()
+            .filter(|(_, rec)| Self::is_live(**rec, now_ms, ttl_ms))
+            .map(|(k, rec)| (k.clone(), *rec))
+            .collect()
+    }
+
+    fn forget<Q>(&self, target: &Q)
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.inner
+            .lock()
+            .expect("outbound pre-auth mutex poisoned")
+            .remove(target);
     }
 }
 
@@ -686,5 +1038,269 @@ mod tests {
                 .any(|(a, p)| *a == link && matches!(p.kind, PendingKind::LinkRequest)),
             "the LinkRequest entry must survive the sweep"
         );
+    }
+
+    // ── ZEB-784 / ZEB-783: PendingOutboundLinks ──────────────────────────────
+
+    /// A key with an uppercase/whitespace spelling must address the SAME entry
+    /// as its canonical form, or a `forget` from the UI would silently miss the
+    /// record the dialer wrote and the request would keep retrying after cancel.
+    #[test]
+    fn outbound_links_normalise_hex_spelling() {
+        let store = PendingOutboundLinks::new();
+        store.record("  AB12CD  ", 1_000);
+        assert!(store.is_pending("ab12cd", 1_000));
+        store.forget("Ab12Cd");
+        assert!(!store.is_pending("ab12cd", 1_000));
+    }
+
+    /// The bug this store would have shipped with: the retry driver goes through
+    /// `add_friend_by_key_impl`, which records on every `Pending`. If `record`
+    /// refreshed the deadline, each pass would push expiry out by a full TTL and
+    /// the entry could never age out — an immortal record retried forever.
+    #[test]
+    fn outbound_link_record_is_first_write_wins() {
+        let store = PendingOutboundLinks::new();
+        store.record("aa", 1_000);
+        // Simulate many retry passes, each re-recording the same key.
+        for pass in 1..=5u64 {
+            store.record("aa", 1_000 + pass * 60_000);
+        }
+        let rows = store.list(1_000 + 5 * 60_000);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].1, 1_000,
+            "the timestamp must stay when the USER asked, not when the machine last retried"
+        );
+        // And the TTL is therefore actually reachable.
+        assert!(
+            store.list(1_000 + OUTBOUND_LINK_TTL_MS).is_empty(),
+            "a re-recorded entry must still expire on the ORIGINAL deadline"
+        );
+    }
+
+    /// An expired record is replaced rather than resurrected, so a manual re-add
+    /// after the window lapses gets a full fresh retry window.
+    #[test]
+    fn outbound_link_readd_after_expiry_starts_fresh() {
+        let store = PendingOutboundLinks::new();
+        store.record("bb", 1_000);
+        let after = 1_000 + OUTBOUND_LINK_TTL_MS;
+        assert!(store.list(after).is_empty(), "lapsed before the re-add");
+        store.record("bb", after);
+        let rows = store.list(after);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, after, "re-add after expiry restarts the window");
+    }
+
+    /// Boundary + backward-clock. `is_live` must fail CLOSED when the clock goes
+    /// backwards: a record stamped in the future must not read as live forever.
+    #[test]
+    fn outbound_link_ttl_boundary_and_backward_clock() {
+        let store = PendingOutboundLinks::new();
+        store.record("cc", 10_000);
+        assert!(store.is_pending("cc", 10_000), "same instant is live");
+        assert!(
+            store.is_pending("cc", 10_000 + OUTBOUND_LINK_TTL_MS - 1),
+            "one ms inside the window is live"
+        );
+        assert!(
+            !store.is_pending("cc", 10_000 + OUTBOUND_LINK_TTL_MS),
+            "exactly at the TTL is expired (half-open window)"
+        );
+        assert!(
+            !store.is_pending("cc", 9_999),
+            "a backward clock must fail closed, not treat the record as live"
+        );
+    }
+
+    /// Persistence round-trip: a request survives the restart it exists to
+    /// survive. Records are bounded by HUMAN accept latency, so dropping them on
+    /// boot would silently abandon a request the user is still waiting on.
+    #[test]
+    fn outbound_links_persist_and_rehydrate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
+
+        let store = PendingOutboundLinks::load_or_recover(path.clone(), 1_000);
+        store.record("dd", 1_000);
+        store.record("ee", 2_000);
+        store.forget("ee");
+        drop(store);
+
+        let rehydrated = PendingOutboundLinks::load_or_recover(path, 3_000);
+        let rows = rehydrated.list(3_000);
+        assert_eq!(rows.len(), 1, "exactly the un-forgotten record survives");
+        assert_eq!(rows[0], ("dd".to_string(), 1_000));
+    }
+
+    /// Records already past their TTL are pruned at load rather than carried
+    /// forward, so the file can't grow without bound across restarts.
+    #[test]
+    fn outbound_links_prune_expired_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
+
+        let store = PendingOutboundLinks::load_or_recover(path.clone(), 1_000);
+        store.record("old", 1_000);
+        store.record("new", 1_000 + OUTBOUND_LINK_TTL_MS);
+        drop(store);
+
+        // Boot far enough ahead that only the second record is still live.
+        let boot = 1_000 + OUTBOUND_LINK_TTL_MS + 1;
+        let rehydrated = PendingOutboundLinks::load_or_recover(path.clone(), boot);
+        let rows = rehydrated.list(boot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "new");
+        drop(rehydrated);
+
+        // The prune was written through, not just applied in memory.
+        let again = PendingOutboundLinks::load_or_recover(path, boot);
+        assert_eq!(again.list(boot).len(), 1, "prune persisted to disk");
+    }
+
+    /// A corrupt file must not brick the boot: it is quarantined aside (bytes
+    /// preserved for diagnosis) and the store comes up empty. Losing these
+    /// records costs the automatic retry, not correctness.
+    #[test]
+    fn outbound_links_quarantine_corrupt_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
+        std::fs::write(&path, b"this is not cbor").expect("seed corrupt file");
+
+        let store = PendingOutboundLinks::load_or_recover(path.clone(), 7_777);
+        assert!(store.list(7_777).is_empty(), "corrupt file → empty store");
+
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("corrupt-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the unreadable bytes must be preserved aside, not deleted: {quarantined:?}"
+        );
+    }
+
+    /// Runtime pruning: `list` only FILTERS expired entries, so without an
+    /// explicit sweep a long-lived node keeps dead keys in memory and
+    /// re-persists them on every write. The retry driver calls this each pass.
+    #[test]
+    fn outbound_links_prune_expired_at_runtime() {
+        let store = PendingOutboundLinks::new();
+        store.record("old", 1_000);
+        store.record("new", 1_000 + OUTBOUND_LINK_TTL_MS);
+
+        let now = 1_000 + OUTBOUND_LINK_TTL_MS + 1;
+        // Before the sweep the expired key is filtered from reads but still held.
+        assert_eq!(store.list(now).len(), 1, "reads already filter it");
+        assert_eq!(store.prune_expired(now), 1, "one expired record dropped");
+        assert_eq!(store.prune_expired(now), 0, "sweep is idempotent");
+        assert_eq!(store.list(now).len(), 1);
+    }
+
+    /// The persisted file must always match the final in-memory state, however
+    /// the mutations interleave.
+    ///
+    /// `persist` takes its lock BEFORE snapshotting for exactly this reason. If
+    /// it serialized only the write, two mutators could snapshot in one order
+    /// and write in the other — and the case that costs a user something real is
+    /// a `record` (from the retry driver's timer) overwriting a concurrent
+    /// `forget` (the user's cancel), resurrecting a cancelled request on reboot.
+    #[test]
+    fn outbound_links_persist_matches_memory_under_concurrency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
+        let store = Arc::new(PendingOutboundLinks::load_or_recover(path.clone(), 1_000));
+
+        let mut handles = Vec::new();
+        for t in 0..8u64 {
+            let s = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..40u64 {
+                    let key = format!("k{}", (t * 40 + i) % 10);
+                    if i % 2 == 0 {
+                        s.record(&key, 1_000 + i);
+                    } else {
+                        s.forget(&key);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        // One final mutation so the last write is unambiguously ours, then the
+        // file must agree with memory. A torn ordering shows up as a key on disk
+        // that memory no longer has (the resurrection case) or vice versa.
+        store.forget("k0");
+        store.record("sentinel", 2_000);
+
+        let mut in_memory: Vec<String> = store.list(2_000).into_iter().map(|(k, _)| k).collect();
+        let on_disk_map =
+            PendingOutboundLinks::decode(&std::fs::read(&path).expect("read")).expect("decode");
+        let mut on_disk: Vec<String> = on_disk_map.into_keys().collect();
+        in_memory.sort();
+        on_disk.sort();
+        assert_eq!(
+            on_disk, in_memory,
+            "the persisted file must reflect the final in-memory state"
+        );
+        assert!(
+            !on_disk.contains(&"k0".to_string()),
+            "a forgotten key must not be resurrected on disk by a racing record"
+        );
+    }
+
+    /// When the corrupt file cannot be moved aside, the store must NOT then
+    /// overwrite it with an empty map — that would destroy the exact bytes the
+    /// quarantine exists to preserve. It degrades to ephemeral instead.
+    ///
+    /// The rename is made to fail deterministically by pre-creating a DIRECTORY
+    /// at the quarantine path (rename of a file onto a directory fails), rather
+    /// than by permissions, which vary by platform and by whether tests run as
+    /// root.
+    #[test]
+    fn outbound_links_keep_corrupt_bytes_when_quarantine_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(OUTBOUND_LINKS_FILENAME);
+        let corrupt = b"this is not cbor";
+        std::fs::write(&path, corrupt).expect("seed corrupt file");
+
+        let now_ms = 4_242;
+        let blocked = path.with_extension(format!("corrupt-{now_ms}"));
+        std::fs::create_dir(&blocked).expect("occupy the quarantine path");
+
+        let store = PendingOutboundLinks::load_or_recover(path.clone(), now_ms);
+        assert!(store.list(now_ms).is_empty(), "comes up empty either way");
+
+        assert_eq!(
+            std::fs::read(&path).expect("original still readable"),
+            corrupt,
+            "the corrupt bytes must survive — losing them costs the diagnosis"
+        );
+
+        // And it must be ephemeral: a later write cannot clobber the evidence.
+        store.record("aa", now_ms);
+        assert_eq!(
+            std::fs::read(&path).expect("original still readable"),
+            corrupt,
+            "a store that failed to quarantine must not persist over the bad file"
+        );
+    }
+
+    /// A store with no bound path degrades to pre-ZEB-784 behaviour (in-memory
+    /// only) instead of panicking — the path every test and any caller without an
+    /// identity dir takes.
+    #[test]
+    fn outbound_links_without_path_are_ephemeral_not_fatal() {
+        let store = PendingOutboundLinks::new();
+        store.record("ff", 1_000);
+        assert!(store.is_pending("ff", 1_000));
+        store.forget("ff");
+        assert!(!store.is_pending("ff", 1_000));
     }
 }

@@ -1258,6 +1258,21 @@ pub fn build_registry() -> RpcRegistry {
             crate::decline_friend_request_impl(state, sink, a.owner_id_hex).await
         }
     );
+    // ZEB-783: this user's own unanswered outbound requests + a cancel.
+    rpc!(
+        m,
+        "list_outbound_friend_requests",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::list_outbound_friend_requests_impl(state).await }
+    );
+    rpc!(
+        m,
+        "cancel_outbound_friend_request",
+        AddFriendByKeyArgs,
+        |state, _sink, a| async move {
+            crate::cancel_outbound_friend_request_impl(state, a.identity_pub_hex).await
+        }
+    );
 
     // DM invites (ZEB-236): the staged non-friend invite consent trio.
     rpc!(
@@ -1671,6 +1686,53 @@ mod tests {
             }
             other => panic!("expected Command, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn outbound_friend_request_rpcs_are_registered_and_wired() {
+        // ZEB-783 (PR #552 review): `registry_has_exactly_the_curated_v1_surface`
+        // pins NAMES only. It cannot catch the arg struct rejecting the Tauri
+        // wrapper's camelCase shape, nor a verb wired to the wrong seam. Same
+        // proof shape as the vine-follow parity test.
+        //
+        // Both of these reach their seam on a default NodeState rather than
+        // erroring: the store is process-local and present on a bare NodeState,
+        // so `list` returns an empty projection and `cancel` is idempotently
+        // Ok on an unknown key. So `Ok` here IS the wired signal — what would
+        // fail is `UnknownCommand` (unregistered) or `BadArgs` (arg mismatch).
+        let reg = build_registry();
+        let key = "cd".repeat(64); // valid 128-hex identity pub
+        let cases = [
+            ("list_outbound_friend_requests", serde_json::json!({})),
+            (
+                "cancel_outbound_friend_request",
+                serde_json::json!({ "identityPubHex": key }),
+            ),
+        ];
+        for (method, args) in cases {
+            let out = reg.dispatch(method, test_state(), test_sink(), args).await;
+            assert!(
+                out.is_ok(),
+                "{method}: expected the seam to answer on a default NodeState, got {:?}",
+                out.unwrap_err()
+            );
+        }
+
+        // And the arg struct must actually REJECT a wrong shape — otherwise the
+        // Ok above would also pass for a verb that ignores its arguments.
+        let bad = reg
+            .dispatch(
+                "cancel_outbound_friend_request",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "identity_pub_hex": "snake_case is wrong" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(bad, RpcError::BadArgs(_)),
+            "snake_case args must be rejected, got {bad:?}"
+        );
     }
 
     #[tokio::test]
@@ -2516,6 +2578,9 @@ mod tests {
             "list_pending_friend_requests",
             "accept_friend_request",
             "decline_friend_request",
+            // ZEB-783: outbound mirror of the inbound inbox.
+            "list_outbound_friend_requests",
+            "cancel_outbound_friend_request",
             // DM invites (ZEB-236)
             "list_pending_dm_invites",
             "accept_dm_invite",

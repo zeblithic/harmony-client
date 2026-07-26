@@ -187,6 +187,28 @@ describe('FriendService', () => {
     });
   });
 
+  it('listOutboundRequests invokes list_outbound_friend_requests (ZEB-783)', async () => {
+    await service.connectAdapter(adapter);
+    const row = {
+      identityPubHex: 'cd'.repeat(64),
+      requestedAtMs: 1_700_000_000_000,
+      expiresAtMs: 1_700_000_000_000 + 7 * 24 * 60 * 60 * 1000,
+    };
+    (adapter.invoke as any).mockResolvedValue([row]);
+    const rows = await service.listOutboundRequests();
+    expect(adapter.invoke).toHaveBeenCalledWith('list_outbound_friend_requests', {});
+    expect(rows).toEqual([row]);
+  });
+
+  it('cancelOutboundRequest invokes cancel_outbound_friend_request with identityPubHex', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue(undefined);
+    await service.cancelOutboundRequest('cd'.repeat(64));
+    expect(adapter.invoke).toHaveBeenCalledWith('cancel_outbound_friend_request', {
+      identityPubHex: 'cd'.repeat(64),
+    });
+  });
+
   it('addByKey invokes add_friend_by_key with identityPubHex and returns a linked outcome', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue({
