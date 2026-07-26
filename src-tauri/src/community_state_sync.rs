@@ -3143,6 +3143,40 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
     //    the spawn-time `membership_key`.
     let blob_ciphertext = encrypt_blob(&current_key, &blob_cleartext)?;
 
+    // ZEB-813: surface the size trajectory long before the ContentId cap
+    // detonates. One site covers both consumers — publish and query-serve
+    // both route through encode_root_packet.
+    match classify_root_size(blob_ciphertext.len()) {
+        RootSizeWatermark::Ok => {}
+        RootSizeWatermark::NearHalf => {
+            tracing::warn!(
+                community_id = ?ctx.community_id,
+                blob_bytes = blob_ciphertext.len(),
+                cap_bytes = harmony_content::cid::MAX_PAYLOAD_SIZE,
+                "community state-root blob at >=50% of the ContentId cap"
+            );
+        }
+        RootSizeWatermark::NearCap => {
+            tracing::warn!(
+                community_id = ?ctx.community_id,
+                blob_bytes = blob_ciphertext.len(),
+                cap_bytes = harmony_content::cid::MAX_PAYLOAD_SIZE,
+                "community state-root blob at >=80% of the ContentId cap; \
+                 root publish/serve fails entirely at the cap"
+            );
+            report_degraded(
+                ctx.error_tx.as_ref(),
+                ctx.community_id,
+                "state_root_near_cap",
+                format!(
+                    "state-root blob {} bytes >= 80% of ContentId cap {}",
+                    blob_ciphertext.len(),
+                    harmony_content::cid::MAX_PAYLOAD_SIZE
+                ),
+            );
+        }
+    }
+
     // 3. Derive structured ContentId for the encrypted blob. Flagged
     //    `encrypted: true` so the eviction policy classifies it as
     //    EncryptedDurable (priority 0 — never auto-burns).
@@ -3154,6 +3188,14 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
         },
     )
     .map_err(|e| {
+        // ZEB-813: the over-cap failure was previously a silent
+        // warn-and-retry (publish) / withheld reply (serve). Surface it.
+        report_degraded(
+            ctx.error_tx.as_ref(),
+            ctx.community_id,
+            "state_root_over_cap",
+            format!("state-root blob exceeds ContentId cap: {e}"),
+        );
         CommunitySyncError::Crypto(CommunityCryptoError::ContentIdDerivation(e.to_string()))
     })?;
 
@@ -4310,6 +4352,32 @@ async fn persist_crdt_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError> 
 /// channel would compound the degradation. A dropped report is logged
 /// at debug level for diagnostics; the next degraded event from the
 /// same community will re-trigger the frontend banner.
+/// ZEB-813: size-watermark classification for the encoded community root
+/// blob against `harmony_content::cid::MAX_PAYLOAD_SIZE`. Crossing the cap
+/// kills BOTH root publish and query-serve for the community — silently,
+/// until the log shrinks — so the approach must be visible long before.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RootSizeWatermark {
+    /// Below every threshold — no surfacing.
+    Ok,
+    /// >= 50% of the ContentId payload cap: log a warning.
+    NearHalf,
+    /// >= 80% of the cap: warn + degraded report — the community is close
+    /// to losing root publish/serve entirely.
+    NearCap,
+}
+
+pub(crate) fn classify_root_size(len: usize) -> RootSizeWatermark {
+    let cap = harmony_content::cid::MAX_PAYLOAD_SIZE;
+    if len >= cap * 4 / 5 {
+        RootSizeWatermark::NearCap
+    } else if len >= cap / 2 {
+        RootSizeWatermark::NearHalf
+    } else {
+        RootSizeWatermark::Ok
+    }
+}
+
 fn report_degraded(
     error_tx: Option<&mpsc::Sender<CommunityDegradedReport>>,
     community_id: SpaceId,
@@ -5958,6 +6026,23 @@ mod tests {
         async fn resolve(&self, _: &OwnerAddr) -> Option<[u8; 64]> {
             None
         }
+    }
+
+    /// ZEB-813: the size-watermark classifier trips at exactly 50% and 80%
+    /// of the ContentId payload cap.
+    #[test]
+    fn zeb_813_root_size_watermarks_classify_at_boundaries() {
+        use harmony_content::cid::MAX_PAYLOAD_SIZE as CAP;
+        assert_eq!(classify_root_size(0), RootSizeWatermark::Ok);
+        assert_eq!(classify_root_size(CAP / 2 - 1), RootSizeWatermark::Ok);
+        assert_eq!(classify_root_size(CAP / 2), RootSizeWatermark::NearHalf);
+        assert_eq!(
+            classify_root_size(CAP * 4 / 5 - 1),
+            RootSizeWatermark::NearHalf
+        );
+        assert_eq!(classify_root_size(CAP * 4 / 5), RootSizeWatermark::NearCap);
+        assert_eq!(classify_root_size(CAP), RootSizeWatermark::NearCap);
+        assert_eq!(classify_root_size(CAP + 1), RootSizeWatermark::NearCap);
     }
 
     /// ZEB-618: the per-community resync sidecar path derives from

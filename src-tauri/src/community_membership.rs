@@ -18537,9 +18537,14 @@ mod zeb_813_supersession_tests {
             relay_device_ed25519_verify: [0xDD; 32],
             home_relay: "https://derp.example/".to_string(),
         };
-        let payload =
-            build_signed_community_relay_announce(relay, wall_ms, &owner.owner, &at, &owner.device_key)
-                .expect("build relay announce");
+        let payload = build_signed_community_relay_announce(
+            relay,
+            wall_ms,
+            &owner.owner,
+            &at,
+            &owner.device_key,
+        )
+        .expect("build relay announce");
         let event_payload = EventPayload {
             id: event_id,
             community_id,
@@ -18636,7 +18641,13 @@ mod zeb_813_supersession_tests {
         let join = join_event(CID, &a);
         let mut full = vec![join.clone()];
         for i in 0..8u8 {
-            full.push(announce(CID, &a, [0xAB; 32], [0x30 + i; 16], 1_000 + u64::from(i)));
+            full.push(announce(
+                CID,
+                &a,
+                [0xAB; 32],
+                [0x30 + i; 16],
+                1_000 + u64::from(i),
+            ));
         }
         let compacted = vec![join, full.last().expect("non-empty").clone()];
         assert_eq!(
@@ -18679,7 +18690,13 @@ mod zeb_813_supersession_tests {
         let join = join_event(CID, &a);
         let mut events = vec![join];
         for i in 0..10u8 {
-            events.push(announce(CID, &a, [0xAB; 32], [0x40 + i; 16], 1_000 + u64::from(i)));
+            events.push(announce(
+                CID,
+                &a,
+                [0xAB; 32],
+                [0x40 + i; 16],
+                1_000 + u64::from(i),
+            ));
         }
         let state = CommunityState::from_trusted_events_for_test(CID, events.clone());
         assert_eq!(

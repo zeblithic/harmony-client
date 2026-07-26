@@ -157,7 +157,11 @@ No behavior change below 50%.
   boot. The rewritten `crdt.cbor` persists on the next ordinary mutation
   (the next hourly announce at the latest); until then the compacted view lives in
   memory, which is where `encode_root_packet` reads from — publishing recovers
-  immediately after boot.
+  immediately after boot. This covers the **already-oversized-and-offline replica**
+  (AVALON's `971bd814`, 118.7% of cap, frozen since 07-15, never once published):
+  `crdt.cbor` deserialization rebuilds through `from_verified_events`
+  (`community_state_crdt.rs:86`), so compaction runs on any persisted state — healthy,
+  detonated, or long-offline — before the first publish is attempted.
 - **No chunking, no address-book move** — ZEB-814 and ZEB-815 respectively.
 
 ## Testing

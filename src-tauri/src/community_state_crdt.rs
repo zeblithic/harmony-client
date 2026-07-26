@@ -374,8 +374,7 @@ impl LogPolicy for MembershipPolicy {
                 newer.actor == older.actor && pn.iroh_node_id == po.iroh_node_id
             }
             (CommunityRelayAnnounce { payload: pn }, CommunityRelayAnnounce { payload: po }) => {
-                newer.actor == older.actor
-                    && pn.relay.relay_device_id == po.relay.relay_device_id
+                newer.actor == older.actor && pn.relay.relay_device_id == po.relay.relay_device_id
             }
             _ => false,
         };
