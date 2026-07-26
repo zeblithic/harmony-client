@@ -303,6 +303,25 @@ pub enum PageFetch {
     EngineGone,
 }
 
+/// ZEB-807 (Qodo, PR #557): which delta mechanisms a presence re-arm will
+/// actually put on the wire, for the `harmony_channel` debug line.
+///
+/// Not cosmetic. `wm = None` (empty log / fresh join) is a full-history request
+/// AND suppresses the per-author watermark vector, because the engine seals one
+/// only when `since.is_some()`. A line reading "incremental + ZEB-585 vector"
+/// on that path asserts a mechanism that is not on the wire — the same class of
+/// false claim ZEB-807 removed from this arm's own justification comment, and
+/// exactly what ZEB-803 spent a night proving costs real debugging time. The
+/// operator reading this line is trying to learn whether the vector is in play;
+/// it has to answer that honestly on both branches.
+fn presence_rearm_mode(wm: &Option<Hlc>) -> &'static str {
+    if wm.is_some() {
+        "incremental + ZEB-585 vector"
+    } else {
+        "full history (empty log — no vector to diff against)"
+    }
+}
+
 /// Floor for the driver's backoff sleeps (ms). Defensive: guards
 /// against a hot loop if the injected clock ever lags the latch's
 /// `next_retry_at` (the latch's in-flight `WaitUntil` clamp can hand
@@ -349,14 +368,42 @@ const BACKFILL_DRIVER_MIN_WAIT_MS: u64 = 250;
 ///   the driver degrades to the no-epoch contract (keeps any backoff
 ///   retries running; returns on Idle only if resync is also disabled)
 ///   instead of exiting mid-latch.
-/// - `full_resync_rx` (ZEB-599 Direction 1) is the presence-driven
-///   reachability watch. A bump re-arms with a FULL reconcile
-///   (`since = None`, like the periodic floor) rather than the epoch arm's
-///   incremental watermark, so a relay-mediated cross-WAN peer's
-///   below-watermark backlog heals within seconds of the peer appearing
-///   instead of waiting the ~1h floor. Same cooldown + sender-drop
-///   degradation as `epoch_rx`; `None` disables it (used by tests / callers
-///   with no presence signal).
+/// - `presence_rx` (ZEB-599 Direction 1) is the presence-driven
+///   reachability watch: a bump means a new device entered the roster, so a
+///   new potential holder just became reachable. A bump re-arms with the
+///   FRESH `current_watermark()` — incremental, like the epoch arm.
+///
+///   ZEB-807: this arm used to re-arm with a FULL reconcile
+///   (`since = None`). That was written against the SCALAR `since` model,
+///   where an incremental re-arm genuinely could not recover a returning
+///   peer's entry whose HLC sorts below our max (the ZEB-584 blind spot).
+///   It is no longer the model: ZEB-585 (three days earlier) made
+///   `send_backfill_request` attach a sealed PER-AUTHOR watermark vector on
+///   exactly the `since.is_some()` branch, and the responder's
+///   `collect_events_vector` scans every segment serving any lane it has
+///   never seen (`vector_serves` returns `true` for an absent lane). So the
+///   incremental path already recovers sub-max entries — including every
+///   event of a device we have never heard from, which is precisely what a
+///   presence kick fires on.
+///
+///   Re-arming with `None` therefore bought nothing and cost both delta
+///   mechanisms at once: it discards the scalar `since` AND suppresses the
+///   vector (`send_backfill_request` seals one only when `since.is_some()`),
+///   so every responder re-serves its whole log and the requester drops the
+///   duplicates. A `None` watermark (empty log / fresh join) still means
+///   "serve everything", so a fresh joiner is unaffected — it falls out of
+///   the same code path rather than needing a special case.
+///
+///   RESIDUAL GAP, stated rather than papered over: against a pre-ZEB-585
+///   responder — one that ignores the payload and honors only the key-expr
+///   scalar — an incremental re-arm IS blind to sub-max entries, where
+///   `None` was not. Same for a channel over `MAX_WATERMARK_VECTOR_ENTRIES`
+///   authoring devices, where the vector is dropped and the request degrades
+///   to the scalar. The ~1h periodic floor (below) still re-pulls from
+///   scratch and remains the backstop for both.
+///
+///   Same cooldown + sender-drop degradation as `epoch_rx`; `None` disables
+///   it (used by tests / callers with no presence signal).
 /// - `resync_interval_ms = Some(ms)` arms the ZEB-425 anti-entropy floor:
 ///   a satisfied latch re-arms every `ms` even with NO epoch bump. ZEB-584:
 ///   the floor re-arms with a FULL reconcile (`since = None`), NOT the
@@ -389,13 +436,17 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
     mut epoch_rx: Option<tokio::sync::watch::Receiver<u64>>,
     // ZEB-599 Direction 1: presence-driven reachability watch. Bumped by the
     // per-community presence subscriber when a new device enters the roster (a
-    // new potential holder became reachable). A bump re-arms the latch with a
-    // FULL reconcile (`since = None`) — the fast, relay-mediated analogue of the
-    // ~1h periodic floor — so a NAT'd cross-WAN peer's below-watermark backlog
-    // heals within seconds instead of waiting the hour. Same `Option<watch>`
-    // shape + sender-drop degradation as `epoch_rx`; `None` (tests, callers with
-    // no presence) preserves prior behaviour exactly.
-    mut full_resync_rx: Option<tokio::sync::watch::Receiver<u64>>,
+    // new potential holder became reachable), so a NAT'd cross-WAN peer's
+    // backlog heals within the cooldown instead of waiting the ~1h floor. Same
+    // `Option<watch>` shape + sender-drop degradation as `epoch_rx`; `None`
+    // (tests, callers with no presence) disables the arm.
+    //
+    // ZEB-807 renamed this from `full_resync_rx`: the bump no longer forces a
+    // full reconcile, and a parameter naming a POLICY outlives the policy —
+    // which is how the stale `since = None` rationale survived three days past
+    // the ZEB-585 vector that obsoleted it. The name now states the SOURCE,
+    // which is what actually holds still.
+    mut presence_rx: Option<tokio::sync::watch::Receiver<u64>>,
     resync_interval_ms: Option<u64>,
     now_ms: impl Fn() -> u64,
     // ZEB-599: `Some(..)` makes the periodic floor restart-aware — the
@@ -431,7 +482,7 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
         match latch.next_action(now_ms()) {
             BackfillAction::Idle => {
                 if epoch_rx.is_none()
-                    && full_resync_rx.is_none()
+                    && presence_rx.is_none()
                     && !matches!(resync_interval_ms, Some(ms) if ms > 0)
                 {
                     return;
@@ -472,32 +523,41 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         );
                         latch.reset(wm);
                     }
-                    kicked = epoch_bump(&mut full_resync_rx) => {
-                        // ZEB-599 Direction 1: a presence-driven reachability
-                        // kick re-arms with a FULL reconcile (`since = None`) —
-                        // the fast, relay-mediated analogue of the periodic floor
-                        // (`latch.reset(None)` below). Full, NOT the incremental
-                        // `current_watermark()` the epoch arm uses, because a
-                        // returning/relay peer may hold entries whose HLC sorts
-                        // below our max (the ZEB-584 blind spot). Cooldown-gated
-                        // like the epoch arm so presence churn can't storm; the
-                        // ~1h floor stays the ultimate backstop and its persisted
-                        // deadline is deliberately untouched here (a presence
-                        // reconcile is a bonus, not a floor fire).
+                    kicked = epoch_bump(&mut presence_rx) => {
+                        // ZEB-599 Direction 1 / ZEB-807: a presence-driven
+                        // reachability kick re-arms INCREMENTALLY, with the
+                        // fresh `current_watermark()` — same as the epoch arm.
+                        //
+                        // It re-armed with `since = None` until ZEB-807. The
+                        // completeness that bought (recovering a returning
+                        // peer's sub-max entry) is already delivered by the
+                        // ZEB-585 per-author vector, which rides along on
+                        // `since.is_some()` and serves every lane the requester
+                        // has never seen — see the `presence_rx` doc above for
+                        // why `None` cost both delta mechanisms to buy nothing.
+                        //
+                        // Cooldown-gated like the epoch arm so presence churn
+                        // can't storm; the ~1h floor stays the ultimate backstop
+                        // (and the backstop for the pre-ZEB-585-responder gap),
+                        // its persisted deadline deliberately untouched here — a
+                        // presence reconcile is a bonus, not a floor fire.
                         if !kicked {
                             // Presence sender dropped: degrade to no-presence
                             // mode (mirrors the epoch-sender-drop path above).
-                            full_resync_rx = None;
+                            presence_rx = None;
                             continue;
                         }
                         if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
                             return;
                         }
+                        let wm = current_watermark().await;
                         tracing::debug!(
                             target: "harmony_channel",
-                            "re-arm: presence kick (full reconcile, since=None)"
+                            since = ?wm,
+                            mode = presence_rearm_mode(&wm),
+                            "re-arm: presence kick"
                         );
-                        latch.reset(None);
+                        latch.reset(wm);
                     }
                     _ = resync_tick(resync_arg) => {
                         // ZEB-425 anti-entropy floor + ZEB-584 full reconcile:
@@ -575,23 +635,27 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         );
                         latch.reset(wm);
                     }
-                    kicked = epoch_bump(&mut full_resync_rx) => {
-                        // ZEB-599 Direction 1: a presence kick mid-backoff — a
-                        // new holder just became reachable, so restart from
-                        // scratch with a FULL reconcile (see the Idle arm).
+                    kicked = epoch_bump(&mut presence_rx) => {
+                        // ZEB-599 Direction 1 / ZEB-807: a presence kick
+                        // mid-backoff — a new holder just became reachable, so
+                        // re-arm with the fresh watermark (see the Idle arm for
+                        // why this is incremental rather than `since = None`).
                         // Cooldown-gated like the epoch arm.
                         if !kicked {
-                            full_resync_rx = None;
+                            presence_rx = None;
                             continue;
                         }
                         if !cooldown_wait(last_request_at, now_ms(), &mut shutdown_rx).await {
                             return;
                         }
+                        let wm = current_watermark().await;
                         tracing::debug!(
                             target: "harmony_channel",
-                            "re-arm: presence kick mid-backoff (full reconcile, since=None)"
+                            since = ?wm,
+                            mode = presence_rearm_mode(&wm),
+                            "re-arm: presence kick mid-backoff"
                         );
-                        latch.reset(None);
+                        latch.reset(wm);
                     }
                     changed = shutdown_rx.changed() => {
                         // Err = sender dropped (registry entry gone):
@@ -1477,15 +1541,22 @@ mod tests {
         driver.abort();
     }
 
-    /// ZEB-599 Direction 1: a presence-driven reachability kick re-arms a
-    /// satisfied (Idle-parked) latch with a FULL reconcile (`since = None`),
-    /// NOT the incremental watermark — so a relay-mediated cross-WAN peer's
-    /// below-watermark backlog is refetched within the cooldown instead of
-    /// waiting the ~1h floor. Contrast
-    /// `backfill_driver_rearms_on_epoch_bump_with_fresh_watermark`, whose
-    /// epoch (direct-peer) re-arm stays incremental.
+    /// ZEB-807: a presence-driven reachability kick re-arms a satisfied
+    /// (Idle-parked) latch with the FRESH watermark — incremental, not
+    /// `since = None`.
+    ///
+    /// This test previously asserted the opposite. The `None` was there to
+    /// recover a returning peer's sub-max entry, which the ZEB-585 per-author
+    /// vector already does (it rides along on `since.is_some()` and serves any
+    /// lane the requester has never seen), so `None` discarded BOTH delta
+    /// mechanisms to buy a property it was already getting — every responder
+    /// re-served its whole log on every roster flap.
+    ///
+    /// The `since` asserted here is load-bearing beyond the value itself: it is
+    /// what makes `send_backfill_request` seal the vector at all. Pinned
+    /// engine-side by `since_some_seals_vector_since_none_does_not`.
     #[tokio::test(start_paused = true)]
-    async fn backfill_driver_rearms_full_reconcile_on_presence_kick() {
+    async fn backfill_driver_rearms_incrementally_on_presence_kick() {
         let requests = Arc::new(AtomicUsize::new(0));
         let sinces: Arc<StdMutex<Vec<Option<Hlc>>>> = Arc::new(StdMutex::new(Vec::new()));
         let counter = Arc::clone(&requests);
@@ -1506,8 +1577,8 @@ mod tests {
         let driver = tokio::spawn(run_backfill_driver(
             BackfillLatch::new(Some(hlc(100))),
             request_page,
-            // Watermark has advanced to 200 — a FULL reconcile must IGNORE it
-            // and request `None`, unlike the incremental epoch re-arm.
+            // Watermark has advanced to 200 since the spawn-time 100. The
+            // re-arm must use this FRESH read, not the stale spawn value.
             || async { Some(hlc(200)) },
             shutdown_rx,
             None,              // no transport-epoch watch — isolate the presence path
@@ -1528,8 +1599,8 @@ mod tests {
             !driver.is_finished(),
             "must park on Idle with a presence watch (no epoch, no floor)"
         );
-        // A presence kick + cooldown elapse → a second request fires as a FULL
-        // reconcile (`since = None`), NOT the incremental watermark (200).
+        // A presence kick + cooldown elapse → a second request fires with the
+        // fresh watermark (200), which is what carries the ZEB-585 vector.
         presence_tx.send(1).expect("presence bump");
         tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
         for _ in 0..128 {
@@ -1540,22 +1611,116 @@ mod tests {
         }
         assert_eq!(
             sinces.lock().unwrap().clone(),
-            vec![Some(hlc(100)), None],
-            "presence kick must re-arm with a FULL reconcile (None), not the \
-             incremental watermark"
+            vec![Some(hlc(100)), Some(hlc(200))],
+            "presence kick must re-arm incrementally with the FRESH watermark \
+             (ZEB-807); `None` would suppress the ZEB-585 vector and make every \
+             responder re-serve its whole log"
         );
         driver.abort();
     }
 
-    /// ZEB-599 Direction 1 (PR #384 review, CodeRabbit): a presence kick that
-    /// arrives while the driver is mid-backoff (`WaitUntil`, latch unsatisfied)
-    /// must re-arm with a FULL reconcile (`since = None`) after the cooldown —
-    /// NOT the incremental watermark (which the epoch `WaitUntil` arm uses),
-    /// and NOT the backoff-retry's original `since`. Mirror of
-    /// `root_driver_epoch_bump_mid_backoff_requeries_after_cooldown`, but on the
-    /// presence path and asserting the full-vs-incremental `since`.
+    /// ZEB-807 (Qodo, PR #557): the presence re-arm's `mode` field must not
+    /// claim the ZEB-585 vector on the one branch that suppresses it.
+    ///
+    /// `since = None` makes the engine skip the seal entirely, so a line
+    /// reading "incremental + ZEB-585 vector" there would describe a mechanism
+    /// that is not on the wire. Cheap to pin, and the cost of getting it wrong
+    /// is an operator ruling out the vector path on false evidence.
+    #[test]
+    fn presence_rearm_mode_does_not_claim_a_vector_it_will_not_send() {
+        assert!(presence_rearm_mode(&Some(hlc(100))).contains("vector"));
+        let empty = presence_rearm_mode(&None);
+        assert!(
+            !empty.contains("incremental"),
+            "an empty-log re-arm is full history, not incremental: {empty}"
+        );
+        assert!(
+            empty.contains("no vector"),
+            "must say the vector is absent, not merely omit it: {empty}"
+        );
+    }
+
+    /// ZEB-807 boundary: an EMPTY log (fresh join — `current_watermark()`
+    /// yields `None`) must still request `None` on a presence kick.
+    ///
+    /// This is the one case where the old full-reconcile behaviour was right,
+    /// and it has to keep working without a special case: a fresh joiner has no
+    /// vector to send, so "serve everything" is the correct request. It falls
+    /// out of `latch.reset(wm)` because `wm` is already `None` — pinned here so
+    /// nobody later "fixes" the arm by forcing a non-`None` since.
     #[tokio::test(start_paused = true)]
-    async fn backfill_driver_presence_kick_mid_backoff_requeries_full_after_cooldown() {
+    async fn presence_kick_on_empty_log_still_requests_full_history() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let sinces: Arc<StdMutex<Vec<Option<Hlc>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let counter = Arc::clone(&requests);
+        let since_log = Arc::clone(&sinces);
+        let request_page = move |since: Option<Hlc>| {
+            let counter = Arc::clone(&counter);
+            let since_log = Arc::clone(&since_log);
+            async move {
+                since_log.lock().unwrap().push(since);
+                counter.fetch_add(1, Ordering::SeqCst);
+                PageFetch::Completed(0, 256)
+            }
+        };
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (presence_tx, presence_rx) = tokio::sync::watch::channel(0u64);
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(run_backfill_driver(
+            BackfillLatch::new(None), // fresh join: nothing held
+            request_page,
+            || async { None }, // log still empty at re-arm time
+            shutdown_rx,
+            None,
+            Some(presence_rx),
+            None,
+            move || start.elapsed().as_millis() as u64,
+            None,
+        ));
+        // Qodo (PR #557): bounded, not `while … { yield_now() }`. Under
+        // `start_paused` an unbounded spin never advances the timer, so a
+        // regression that suppresses the first request HANGS CI instead of
+        // failing it — turning a legible assertion failure into a 6h job
+        // timeout with no diagnosis.
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the driver must issue its first request without needing a timer"
+        );
+        presence_tx.send(1).expect("presence bump");
+        tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            sinces.lock().unwrap().clone(),
+            vec![None, None],
+            "an empty log must still ask for full history — `serve everything` \
+             is correct when there is no vector to diff against"
+        );
+        driver.abort();
+    }
+
+    /// ZEB-599 Direction 1 (PR #384 review, CodeRabbit) / ZEB-807: a presence
+    /// kick that arrives while the driver is mid-backoff (`WaitUntil`, latch
+    /// unsatisfied) must re-arm after the cooldown with the FRESH watermark —
+    /// and specifically NOT the backoff-retry's stale original `since`.
+    ///
+    /// The stale-`since` half of this assertion is the part that was always
+    /// load-bearing and is unchanged by ZEB-807; only the full-vs-incremental
+    /// half flipped. Mirror of
+    /// `root_driver_epoch_bump_mid_backoff_requeries_after_cooldown`.
+    #[tokio::test(start_paused = true)]
+    async fn backfill_driver_presence_kick_mid_backoff_requeries_after_cooldown() {
         let requests = Arc::new(AtomicUsize::new(0));
         let sinces: Arc<StdMutex<Vec<Option<Hlc>>>> = Arc::new(StdMutex::new(Vec::new()));
         let counter = Arc::clone(&requests);
@@ -1577,7 +1742,8 @@ mod tests {
         let driver = tokio::spawn(run_backfill_driver(
             BackfillLatch::new(Some(hlc(100))),
             request_page,
-            // Watermark advanced to 200 — a FULL re-arm must IGNORE it.
+            // Watermark advanced to 200 — the re-arm must read this fresh
+            // value, not reuse the backoff-retry's stale 100.
             || async { Some(hlc(200)) },
             shutdown_rx,
             None,              // no transport-epoch watch — isolate the presence path
@@ -1601,7 +1767,7 @@ mod tests {
         // presence arm (ready immediately) wins the select over the not-yet-
         // elapsed backoff sleep; the driver then parks inside `cooldown_wait`,
         // abandoning the sleep future. Advancing past the cooldown boundary
-        // fires the FULL reconcile deterministically.
+        // fires the re-arm deterministically.
         presence_tx.send(1).expect("presence bump");
         for _ in 0..16 {
             tokio::task::yield_now().await;
@@ -1615,9 +1781,9 @@ mod tests {
         }
         assert_eq!(
             sinces.lock().unwrap().clone(),
-            vec![Some(hlc(100)), None],
-            "presence kick mid-backoff must re-arm FULL (None), not the \
-             incremental watermark (200) nor the backoff-retry since (100)"
+            vec![Some(hlc(100)), Some(hlc(200))],
+            "presence kick mid-backoff must re-arm with the FRESH watermark \
+             (200), not the backoff-retry's stale since (100)"
         );
         driver.abort();
     }
@@ -1627,7 +1793,7 @@ mod tests {
     /// retries continue — not exit with the latch unsatisfied (which would
     /// strand the channel without backfill until engine restart). Mirror of
     /// `backfill_driver_epoch_sender_drop_degrades_to_backoff_retries` on the
-    /// presence path (exercises the `full_resync_rx = None; continue;` branch).
+    /// presence path (exercises the `presence_rx = None; continue;` branch).
     #[tokio::test(start_paused = true)]
     async fn backfill_driver_presence_sender_drop_degrades_to_backoff_retries() {
         let requests = Arc::new(AtomicUsize::new(0));
