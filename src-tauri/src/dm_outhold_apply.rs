@@ -244,20 +244,40 @@ pub async fn sweep_once(
                 // grace window on this replica, which is the safe
                 // direction; the fleet converges once every sibling has
                 // GC'd the row.
-                match orphan_first_seen.get(key.as_str()) {
+                match orphan_first_seen.get(key.as_str()).copied() {
                     None => {
                         // First sweep that sees this row as an orphan.
                         orphan_first_seen.insert(key.clone(), now_ms);
                         stats.orphan_retains += 1;
                     }
-                    Some(&first) if now_ms.saturating_sub(first) < OUTHOLD_ORPHAN_GC_GRACE_MS => {
-                        stats.orphan_retains += 1;
-                    }
-                    Some(_) => {
-                        // Grace expired with the status still unknown — GC.
-                        to_remove.push(key.clone());
-                        stats.gc_removed += 1;
-                    }
+                    Some(first) => match now_ms.checked_sub(first) {
+                        // ZEB-791, corrected in PR #555 review: the clock
+                        // stepped back past the recorded first-seen. NEITHER
+                        // fail direction is correct here. Saturating to age 0
+                        // (the original) holds the window open forever, so the
+                        // orphan is never collected. Failing closed (this fix's
+                        // first cut) GCs on the spot, dropping the held blob
+                        // before its OutboxEntry replicates — precisely the
+                        // loss the grace window exists to prevent, and the more
+                        // expensive of the two mistakes.
+                        //
+                        // REBASE instead: restart the window from `now_ms`.
+                        // Immortality is still impossible, because the window
+                        // closes as soon as the clock advances normally from the
+                        // new base; and nothing is deleted early.
+                        None => {
+                            orphan_first_seen.insert(key.clone(), now_ms);
+                            stats.orphan_retains += 1;
+                        }
+                        Some(elapsed) if elapsed < OUTHOLD_ORPHAN_GC_GRACE_MS => {
+                            stats.orphan_retains += 1;
+                        }
+                        Some(_) => {
+                            // Grace expired with the status still unknown — GC.
+                            to_remove.push(key.clone());
+                            stats.gc_removed += 1;
+                        }
+                    },
                 }
             }
         }
@@ -631,6 +651,56 @@ mod tests {
         .await;
         assert_eq!(stats3.gc_removed, 0, "Pending row is never orphan-GC'd");
         assert!(doc.lock().await.entries.contains_key(&key));
+    }
+
+    /// ZEB-791, corrected in the PR #555 review: an orphan whose recorded
+    /// `first_seen` sits AHEAD of `now_ms` (backward local clock step) must be
+    /// neither immortal nor deleted on the spot.
+    ///
+    /// Both single-direction policies are wrong here. The original
+    /// `saturating_sub` reported 0ms elapsed forever, so the grace window never
+    /// closed. This fix's first cut failed closed and GC'd immediately — which
+    /// drops the held blob before its `OutboxEntry` replicates, the exact loss
+    /// the grace window exists to prevent. The correct policy is to REBASE the
+    /// window to `now_ms`, which this test pins in both directions.
+    #[tokio::test]
+    async fn sweep_rebases_orphan_grace_when_clock_steps_backward() {
+        let (doc, key, _cid) = make_doc_with_one_entry();
+        let ctx = StubCtx::new([]); // status still unknown → orphan
+        let mut orphans = HashMap::new();
+        // A previous sweep stamped the orphan at a high clock value...
+        orphans.insert(key.clone(), 10 * OUTHOLD_ORPHAN_GC_GRACE_MS);
+
+        // ...and the clock has since stepped back well below it. Retain, and
+        // move the window's base to now rather than leaving it in the future.
+        let stats = sweep_once(&doc, &ctx, noop_notify().as_ref(), &mut orphans, 1_000).await;
+        assert_eq!(
+            stats.gc_removed, 0,
+            "a rolled-back clock must not delete the held blob early"
+        );
+        assert_eq!(stats.orphan_retains, 1);
+        assert_eq!(
+            orphans.get(&key).copied(),
+            Some(1_000),
+            "the grace window must be rebased to now, not left in the future"
+        );
+        assert!(doc.lock().await.entries.contains_key(&key));
+
+        // Still mortal: once the grace elapses from the NEW base the row is
+        // collected, so a rollback cannot confer immortality either.
+        let stats2 = sweep_once(
+            &doc,
+            &ctx,
+            noop_notify().as_ref(),
+            &mut orphans,
+            1_000 + OUTHOLD_ORPHAN_GC_GRACE_MS,
+        )
+        .await;
+        assert_eq!(
+            stats2.gc_removed, 1,
+            "the grace window must still close from the rebased base"
+        );
+        assert!(!doc.lock().await.entries.contains_key(&key));
     }
 
     /// Failing cas_put → row retained; a second sweep retries (counter == 2).

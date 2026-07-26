@@ -11171,7 +11171,9 @@ mod channel_log_adapter_tests {
     /// the default current-thread scheduler.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn channel_log_adapter_publish_subscribe_round_trip() {
-        let cfg = zenoh::Config::default();
+        // ZEB-799: publisher and subscriber are the SAME session (local
+        // routing), so peers are never wanted here.
+        let cfg = hermetic_zenoh_config();
         let session = Arc::new(zenoh::open(cfg).await.expect("zenoh open"));
 
         let (pub_tx, pub_rx) = mpsc::channel::<Vec<u8>>(8);
@@ -11277,7 +11279,9 @@ mod channel_log_adapter_tests {
     async fn channel_log_qr_driver_reports_page_completion_on_stream_close() {
         use crate::community_channel_log_engine::{BackfillPageReport, BackfillQueryRequest};
 
-        let cfg = zenoh::Config::default();
+        // ZEB-799: the adapter's own queryable answers the adapter's own GET,
+        // so this session has nothing to discover.
+        let cfg = hermetic_zenoh_config();
         let session = Arc::new(zenoh::open(cfg).await.expect("zenoh open"));
 
         // pub side unused; keep the sender alive so the publisher
@@ -12083,6 +12087,32 @@ pub async fn open_session_with_runtime(
     Ok((runtime, session))
 }
 
+/// ZEB-799: zenoh config for a test that opens a session it does not intend to
+/// share with anyone.
+///
+/// `zenoh::Config::default()` leaves multicast scouting and gossip ENABLED, so
+/// such a session peers with every other zenoh node reachable on the host —
+/// including a developer's standing `harmony-app serve` nodes. `session.close()`
+/// then has to tear those peer links down and hits its internal timeout, so the
+/// test fails **deterministically on a workstation and never in CI**, where the
+/// runner has no neighbours. Measured: `Config::default()` FAIL 3/3 at ~10.55s
+/// vs hermetic PASS at 0.124s.
+///
+/// Use this ONLY for single-session tests. Several multi-session integration
+/// tests deliberately rely on loopback scouting for their two sessions to
+/// discover each other (see `community_presence_two_engine_integration.rs`) —
+/// applying this there would break them. Naming the constraint here because the
+/// obvious sweep (`s/Config::default()/hermetic/`) is wrong.
+#[cfg(test)]
+pub(crate) fn hermetic_zenoh_config() -> zenoh::Config {
+    let mut cfg = zenoh::Config::default();
+    cfg.insert_json5("scouting/multicast/enabled", "false")
+        .expect("disable multicast scouting");
+    cfg.insert_json5("scouting/gossip/enabled", "false")
+        .expect("disable gossip scouting");
+    cfg
+}
+
 #[cfg(test)]
 mod zeb616_lease_config_tests {
     /// ZEB-616 Component C: pin that the keepalive/lease config key paths
@@ -12227,7 +12257,8 @@ mod dispatch_attachment_tests {
     /// `multi_thread` tokio flavor (`current_thread` panics on
     /// `zenoh::open` — see `community_channel_log_engine.rs` fixtures).
     async fn publish_and_observe_attachment(key_expr: &str) -> Option<String> {
-        let session = zenoh::open(zenoh::Config::default())
+        // ZEB-799: single in-process session, subscriber declared on itself.
+        let session = zenoh::open(hermetic_zenoh_config())
             .await
             .expect("zenoh open");
         let sub = session
@@ -12288,7 +12319,11 @@ mod dispatch_attachment_tests {
     /// value feeds `note_announce_sample` and counts.
     #[tokio::test(flavor = "multi_thread")]
     async fn subscription_arm_extracts_source_zid_and_feeds_holders() {
-        let session = zenoh::open(zenoh::Config::default())
+        // ZEB-799: this is the test that actually failed. It asserts on the
+        // Subscribe arm's zid extraction against its own session and wants no
+        // peers at all — but `Config::default()` gave it every harmony node on
+        // the host, and `session.close()` below then timed out waiting on them.
+        let session = zenoh::open(hermetic_zenoh_config())
             .await
             .expect("zenoh open");
         let (zenoh_tx, mut zenoh_rx) = mpsc::channel::<ZenohEvent>(8);

@@ -1413,6 +1413,16 @@ impl DmOutbox {
                     DeliveryStatus::Pending | DeliveryStatus::Partial
                 )
             })
+            // ZEB-791 swept this site and deliberately LEFT IT SATURATING.
+            // `created_at` is our own minted HLC (`next_hlc(prev, wall_now,
+            // device)`), which is monotonic per-device, while `wall_now_ms` is a
+            // raw clock read — so after a backward step the HLC high-water mark
+            // can sit ahead of the clock. Here `saturating_sub` then yields age
+            // 0, which KEEPS the entry in the retry set. That is the safe
+            // direction: bounding it forward would make us abandon delivery of
+            // our own freshly-created DM. Do not "harden" this to match the
+            // presence sites — their fail-open direction is immortality, this
+            // one's is persistence.
             .filter(|(_, e)| wall_now_ms.saturating_sub(e.created_at.wall_ms) < EXPIRATION_MS)
             .map(|(id, e)| {
                 let outstanding: Vec<OwnerAddr> = e
@@ -1654,6 +1664,11 @@ impl DmOutbox {
             ) {
                 continue;
             }
+            // ZEB-791: saturating on purpose, same reasoning as the retry-set
+            // filter above — a future `created_at` yields age 0, so the entry is
+            // NOT marked Expired and delivery keeps being attempted. Failing
+            // closed here would emit `dm-expired` for a message we had only just
+            // created.
             let age = expiration_now_ms.saturating_sub(entry.created_at.wall_ms);
             if age >= EXPIRATION_MS {
                 let recipient_set: BTreeSet<&OwnerAddr> = entry.recipient_owners.iter().collect();

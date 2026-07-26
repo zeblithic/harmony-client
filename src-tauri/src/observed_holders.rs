@@ -74,7 +74,10 @@ impl ObservedHolders {
     /// CIDs with no remaining holders (mirrors `CommunityPresenceMap::sweep`).
     pub fn sweep(&mut self, now_ms: u64, ttl_ms: u64) {
         for holders in self.inner.values_mut() {
-            holders.retain(|_, last| now_ms.saturating_sub(*last) <= ttl_ms);
+            // ZEB-791: forward bound as well — a future stamp would otherwise
+            // pin the holder permanently. Fail closed; `note()` re-adds any
+            // holder still announcing.
+            holders.retain(|_, last| now_ms >= *last && now_ms - *last <= ttl_ms);
         }
         self.inner.retain(|_, holders| !holders.is_empty());
     }
@@ -118,6 +121,20 @@ mod tests {
         h.note("aa", "zid-new", 900);
         h.sweep(1000, 200); // cutoff: last_seen >= 800
         assert_eq!(h.peer_count("aa"), 1);
+    }
+
+    /// ZEB-791: a holder stamped in the FUTURE must still be evictable —
+    /// `saturating_sub` previously read it as age 0 and pinned it permanently.
+    #[test]
+    fn sweep_evicts_future_stamped_holder() {
+        let mut h = ObservedHolders::new();
+        h.note("aa", "zid-future", 100_000);
+        h.sweep(1_000, 200);
+        assert_eq!(
+            h.peer_count("aa"),
+            0,
+            "a future-stamped holder must not be immortal"
+        );
     }
 
     #[test]
