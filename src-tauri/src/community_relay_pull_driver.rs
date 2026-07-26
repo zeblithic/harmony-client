@@ -208,6 +208,10 @@ pub struct CommunityRelayPullDriver {
     wake: Arc<Notify>,
     /// Idle backstop between passes.
     interval: Duration,
+    /// ZEB-803: pull-side health telemetry, shared with
+    /// `network_health_snapshot`. `None` when nothing installed a source (unit
+    /// tests, pre-boot); recording is then a no-op.
+    telemetry: Option<Arc<crate::network_health::CommunityRelayPullTelemetry>>,
 }
 
 impl CommunityRelayPullDriver {
@@ -231,7 +235,18 @@ impl CommunityRelayPullDriver {
             joined_communities,
             wake: Arc::new(Notify::new()),
             interval: Duration::from_millis(COMMUNITY_RELAY_PULL_INTERVAL_MS),
+            telemetry: None,
         }
+    }
+
+    /// ZEB-803: install the pull health telemetry sink. Builder-style so boot
+    /// wiring can attach it without growing `new`'s already-long arity.
+    pub fn with_telemetry(
+        mut self,
+        telemetry: Arc<crate::network_health::CommunityRelayPullTelemetry>,
+    ) -> Self {
+        self.telemetry = Some(telemetry);
+        self
     }
 
     /// Clone the wake handle so external callers (an event-loop hook on applied
@@ -244,9 +259,34 @@ impl CommunityRelayPullDriver {
     /// One pull pass: for every Joined community, pull from every fresh relay.
     /// Errors are logged and skipped — one bad relay never aborts the pass.
     pub async fn run_one_pass(&self, now_ms: u64) {
+        // ZEB-803: recorded FIRST and unconditionally — before the joined-set
+        // read, before any relay work. This counter's job is to prove the loop
+        // is alive, which it can only do if it advances on a pass that finds
+        // nothing to do. Moving it inside any branch below would reintroduce
+        // the blind spot: a driver whose task died and a driver with no joined
+        // communities would once again be indistinguishable.
+        if let Some(t) = self.telemetry.as_ref() {
+            t.record_pass_start();
+        }
         let communities = (self.joined_communities)();
         for community in communities {
             let relays = self.resolver.relays_for_community(&community, now_ms);
+            if relays.is_empty() {
+                // ZEB-803 silent path 3: a joined community with no fresh relay
+                // never entered the loop below and produced no log line at all —
+                // indistinguishable from a healthy quiet channel, and a leading
+                // candidate for the observed >=33-minute delivery lag. It is
+                // NOT a failure (nothing was tried), so it gets its own counter
+                // rather than inflating `sessionsFailed`.
+                if let Some(t) = self.telemetry.as_ref() {
+                    t.record_no_relay(&community.0);
+                }
+                tracing::debug!(
+                    community = ?community,
+                    "ZEB-458 pull: no fresh relay advertised; nothing to pull from"
+                );
+                continue;
+            }
             for relay in &relays {
                 let query = self.build_query(&community);
                 let ack_builder = self.make_ack_builder(community);
@@ -256,6 +296,18 @@ impl CommunityRelayPullDriver {
                     .await
                 {
                     Ok(n) => {
+                        // ZEB-803 silent path 2: `n == 0` is a healthy answer
+                        // (the relay held nothing for us) and previously logged
+                        // NOTHING. Recorded as a success either way; only the
+                        // log stays conditional, since an info line per idle
+                        // pass would drown the signal it exists to carry.
+                        if let Some(t) = self.telemetry.as_ref() {
+                            t.record_session_ok(
+                                &community.0,
+                                &relay.relay_device_id,
+                                u32::try_from(n).unwrap_or(u32::MAX),
+                            );
+                        }
                         if n > 0 {
                             tracing::info!(
                                 community = ?community,
@@ -266,6 +318,14 @@ impl CommunityRelayPullDriver {
                         }
                     }
                     Err(e) => {
+                        // ZEB-803 silent path 1: this was debug-only, so in a
+                        // production log level a failing pull path was
+                        // completely invisible. The counter is the durable
+                        // record; the log line stays at debug to avoid a
+                        // per-pass warn storm on a node with one dead relay.
+                        if let Some(t) = self.telemetry.as_ref() {
+                            t.record_session_failed(&community.0, &relay.relay_device_id);
+                        }
                         tracing::debug!(
                             community = ?community,
                             relay_device = %hex::encode(relay.relay_device_id),
@@ -500,6 +560,125 @@ mod tests {
             joined,
         ));
         (driver, signing_key)
+    }
+
+    // ── ZEB-803: pull-side observability at the call site ──
+    //
+    // The telemetry unit tests in `network_health` prove the counters count.
+    // These prove the DRIVER calls them at the right moments — which is the
+    // part that failed in production, where every counter would have been
+    // correct and simply never incremented.
+
+    /// Build a driver with telemetry attached, returning the shared handle.
+    fn make_driver_with_telemetry(
+        transport: Arc<dyn RelayPullTransport>,
+        communities: Vec<SpaceId>,
+        now: u64,
+        seed_relays: bool,
+    ) -> (
+        Arc<CommunityRelayPullDriver>,
+        Arc<crate::network_health::CommunityRelayPullTelemetry>,
+    ) {
+        let (driver, _key) = make_driver(transport, communities, now, seed_relays);
+        let telemetry = Arc::new(crate::network_health::CommunityRelayPullTelemetry::new());
+        // `make_driver` hands back an Arc; rebuild with the sink attached.
+        let driver = Arc::new(
+            Arc::try_unwrap(driver)
+                .unwrap_or_else(|_| panic!("sole owner"))
+                .with_telemetry(Arc::clone(&telemetry)),
+        );
+        (driver, telemetry)
+    }
+
+    #[tokio::test]
+    async fn pass_start_is_recorded_even_with_zero_joined_communities() {
+        // THE liveness guarantee. A driver whose task died and a driver with
+        // nothing to do are indistinguishable in every success counter; they
+        // must differ here. If someone later moves `record_pass_start` inside
+        // the community loop as a tidy-up, this fails — which is the point,
+        // because that edit silently restores the blind spot that let a
+        // >=33-minute delivery lag look like a quiet channel.
+        let transport = Arc::new(MockTransport::new(0));
+        let (driver, telemetry) =
+            make_driver_with_telemetry(transport, Vec::new(), 1_700_000_000_000, false);
+
+        driver.run_one_pass(1_700_000_000_000).await;
+        driver.run_one_pass(1_700_000_000_001).await;
+
+        let s = telemetry.summary();
+        assert_eq!(s.passes_run, 2, "the loop must prove liveness with no work");
+        assert!(s.last_pass_ms.is_some());
+        assert_eq!(s.sessions_ok, 0);
+        assert_eq!(s.sessions_failed, 0);
+        assert_eq!(s.passes_no_relay, 0, "no communities ⇒ no no-relay rows");
+    }
+
+    #[tokio::test]
+    async fn joined_community_with_no_fresh_relay_is_counted_not_silent() {
+        // ZEB-803 silent path 3, at the call site. Before this, the resolver
+        // returning nothing meant the inner loop was never entered and NOTHING
+        // was emitted — not even a debug line — so the state was
+        // indistinguishable from a healthy quiet channel.
+        let transport = Arc::new(MockTransport::new(0));
+        let community = SpaceId([0xAB; 16]);
+        let (driver, telemetry) = make_driver_with_telemetry(
+            transport.clone(),
+            vec![community],
+            1_700_000_000_000,
+            // NO relays seeded — this is the whole point.
+            false,
+        );
+
+        driver.run_one_pass(1_700_000_000_000).await;
+
+        let s = telemetry.summary();
+        assert_eq!(s.passes_run, 1);
+        assert_eq!(s.passes_no_relay, 1, "the silent path must leave a trace");
+        assert_eq!(
+            s.sessions_failed, 0,
+            "nothing was tried, so this is NOT a failure — conflating them \
+             would send an operator hunting a transport fault that isn't there"
+        );
+        assert_eq!(s.sessions_ok, 0);
+        assert_eq!(s.recent.len(), 1);
+        assert_eq!(s.recent[0].outcome, "noRelay");
+    }
+
+    #[tokio::test]
+    async fn successful_pull_records_session_and_ingest_counts() {
+        let now = 1_700_000_000_000u64;
+        let transport = Arc::new(MockTransport::new(0));
+        let community = SpaceId([0xCD; 16]);
+        let (driver, telemetry) =
+            make_driver_with_telemetry(transport.clone(), vec![community], now, true);
+
+        driver.run_one_pass(now).await;
+
+        let s = telemetry.summary();
+        assert_eq!(s.passes_run, 1);
+        assert_eq!(s.passes_no_relay, 0);
+        assert_eq!(s.sessions_ok, 1, "one relay seeded ⇒ one session");
+        assert_eq!(s.sessions_failed, 0);
+        assert_eq!(s.recent.len(), 1);
+        assert_eq!(s.recent[0].outcome, "ok");
+    }
+
+    #[tokio::test]
+    async fn driver_without_telemetry_behaves_identically() {
+        // The sink is optional so unit tests and pre-boot construction need no
+        // wiring. Recording must never be load-bearing for pull behaviour.
+        let now = 1_700_000_000_000u64;
+        let transport = Arc::new(MockTransport::new(0));
+        let community = SpaceId([0xEF; 16]);
+        let (driver, _key) = make_driver(transport.clone(), vec![community], now, true);
+
+        driver.run_one_pass(now).await;
+
+        assert_eq!(
+            transport.calls().len(),
+            1,
+            "an unwired driver must still run its pull session"
+        );
     }
 
     #[tokio::test]

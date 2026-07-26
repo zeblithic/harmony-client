@@ -667,12 +667,12 @@ impl CommunityRelayPullTelemetry {
     /// Silent path 3: a joined community with no fresh relay to pull from.
     pub fn record_no_relay(&self, community: &[u8; 16]) {
         self.passes_no_relay.fetch_add(1, Ordering::Relaxed);
-        self.push(community, &[0u8; 32], "noRelay", 0);
+        self.push(community, &[0u8; 16], "noRelay", 0);
     }
 
     /// A completed pull session. `ingested == 0` is a success, not a failure —
     /// it means the relay held nothing for us.
-    pub fn record_session_ok(&self, community: &[u8; 16], relay_device: &[u8; 32], ingested: u32) {
+    pub fn record_session_ok(&self, community: &[u8; 16], relay_device: &[u8; 16], ingested: u32) {
         self.sessions_ok.fetch_add(1, Ordering::Relaxed);
         if ingested > 0 {
             self.blobs_ingested
@@ -682,12 +682,12 @@ impl CommunityRelayPullTelemetry {
         self.push(community, relay_device, "ok", ingested);
     }
 
-    pub fn record_session_failed(&self, community: &[u8; 16], relay_device: &[u8; 32]) {
+    pub fn record_session_failed(&self, community: &[u8; 16], relay_device: &[u8; 16]) {
         self.sessions_failed.fetch_add(1, Ordering::Relaxed);
         self.push(community, relay_device, "failed", 0);
     }
 
-    fn push(&self, community: &[u8; 16], relay_device: &[u8; 32], outcome: &str, ingested: u32) {
+    fn push(&self, community: &[u8; 16], relay_device: &[u8; 16], outcome: &str, ingested: u32) {
         let hit = CommunityRelayPullHit {
             community_short: hex::encode(&community[..4]),
             relay_device_short: hex::encode(&relay_device[..4]),
@@ -5027,7 +5027,7 @@ mod tests {
         // failure would cry wolf on every idle pass; counting it as nothing at
         // all is silent path 2 from the module docs.
         let p = CommunityRelayPullTelemetry::new();
-        p.record_session_ok(&[7u8; 16], &[9u8; 32], 0);
+        p.record_session_ok(&[7u8; 16], &[9u8; 16], 0);
         let s = p.summary();
         assert_eq!(s.sessions_ok, 1);
         assert_eq!(s.sessions_failed, 0);
@@ -5048,7 +5048,7 @@ mod tests {
         // remedies differ (stale/absent announce vs transport fault).
         let p = CommunityRelayPullTelemetry::new();
         p.record_no_relay(&[3u8; 16]);
-        p.record_session_failed(&[3u8; 16], &[4u8; 32]);
+        p.record_session_failed(&[3u8; 16], &[4u8; 16]);
         let s = p.summary();
         assert_eq!(s.passes_no_relay, 1);
         assert_eq!(s.sessions_failed, 1);
@@ -5064,7 +5064,7 @@ mod tests {
     fn pull_ring_is_bounded() {
         let p = CommunityRelayPullTelemetry::new();
         for _ in 0..(COMMUNITY_RELAY_PULL_RING_CAP + 5) {
-            p.record_session_failed(&[1u8; 16], &[2u8; 32]);
+            p.record_session_failed(&[1u8; 16], &[2u8; 16]);
         }
         let s = p.summary();
         assert_eq!(s.recent.len(), COMMUNITY_RELAY_PULL_RING_CAP, "ring must be capped");
