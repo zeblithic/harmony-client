@@ -474,6 +474,16 @@ pub enum AddressBookRequest {
     Unsubscribe { community_id: [u8; 16] },
 }
 
+/// ZEB-815: names for the four per-community address-book tasks, in the order
+/// the pool spawns and stores them. Used only to say WHICH task died when a
+/// group is reaped — keep in step with the `vec![..]` at the insert site.
+const ADDRBOOK_TASK_LABELS: [&str; 4] = [
+    "snapshot-queryable",
+    "record-subscriber",
+    "snapshot-requester",
+    "sidecar-persist",
+];
+
 /// ZEB-815: everything the address-book pool needs that isn't already a
 /// parameter of [`run`]. Bundled (like [`IrohRuntimeHandles`]) rather than
 /// threaded as five more positional arguments, and `Option` at the call site
@@ -4240,14 +4250,41 @@ pub async fn run(
                         // alive. If any exited (e.g. a failed zenoh declare),
                         // abort the survivors and drop the entry so this
                         // Subscribe restarts all four cleanly.
-                        handles.retain(|_, hs| {
-                            let alive = hs.iter().all(|h| !h.is_finished());
-                            if !alive {
-                                for h in hs.iter() {
-                                    h.abort();
-                                }
+                        //
+                        // This sweeps EVERY community, not just the one being
+                        // subscribed, and only the subscribed one is respawned
+                        // below — so a reaped group is a community that stops
+                        // syncing until it is re-subscribed. Log which task
+                        // died; without it the reap is invisible.
+                        handles.retain(|cid, hs| {
+                            debug_assert_eq!(
+                                hs.len(),
+                                ADDRBOOK_TASK_LABELS.len(),
+                                "addrbook task labels must stay in step with the spawned group"
+                            );
+                            let finished: Vec<&str> = hs
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, h)| h.is_finished())
+                                // `get` not `[i]`: a panic here would take down
+                                // the whole pool, and a stale label is a strictly
+                                // better failure than that.
+                                .map(|(i, _)| ADDRBOOK_TASK_LABELS.get(i).copied().unwrap_or("?"))
+                                .collect();
+                            if finished.is_empty() {
+                                return true;
                             }
-                            alive
+                            tracing::warn!(
+                                community_id = %hex::encode(cid),
+                                finished = %finished.join(","),
+                                "addrbook task group reaped: a task exited, so its \
+                                 survivors are aborted — this community stops syncing \
+                                 its address book until it is re-subscribed"
+                            );
+                            for h in hs.iter() {
+                                h.abort();
+                            }
+                            false
                         });
                         if handles.contains_key(&community_id) {
                             tracing::warn!(

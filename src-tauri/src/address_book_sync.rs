@@ -61,6 +61,24 @@ pub const ADDRBOOK_SNAPSHOT_GET_TIMEOUT_MS: u64 = 10_000;
 /// Coalesces a snapshot's row burst into one file write.
 pub const ADDRBOOK_PERSIST_DEBOUNCE_MS: u64 = 2_000;
 
+/// Width of the random delay applied before a WOKEN snapshot query.
+///
+/// A roster change is a shared edge: every member's presence subscriber sees
+/// it at about the same instant and wakes its requester, so without a spread
+/// one edge produces N simultaneous queries, each answered by every other node
+/// sealing its ENTIRE book — up to N×(N−1) sealed replies landing at once.
+/// Same thundering-herd reasoning (and same fix) as
+/// `channel_backfill::PERIODIC_RESYNC_JITTER_MS`.
+pub const ADDRBOOK_SNAPSHOT_JITTER_MS: u64 = 5_000;
+
+/// Map a raw random value onto `[0, ADDRBOOK_SNAPSHOT_JITTER_MS)`. Pure, so
+/// the bound is unit-testable without a clock or an RNG; the caller draws
+/// `rng_val` from entropy per fire (never a fixed seed — a seeded draw would
+/// leave every node in a freshly-rebuilt fleet correlated again).
+pub fn jitter_ms(rng_val: u64) -> u64 {
+    rng_val % ADDRBOOK_SNAPSHOT_JITTER_MS
+}
+
 /// Live per-record topic for a community's address book.
 pub fn addrbook_records_topic(community: &SpaceId) -> String {
     format!("harmony/addrbook/{}/records", hex::encode(community.0))
@@ -566,6 +584,13 @@ async fn request_snapshot_once(
 /// change after a join typically lands seconds after the spawn-time query
 /// (which found nobody connected yet), and dropping it would leave the node
 /// waiting out the idle backstop with an empty book.
+///
+/// Every WOKEN fire is additionally jittered by `[0,
+/// ADDRBOOK_SNAPSHOT_JITTER_MS)` (after any cooldown deferral, so the two
+/// compose rather than cancel). The spawn-time fire is deliberately NOT
+/// jittered: it is triggered locally by this node's own subscribe, not by an
+/// edge every member observes at once, and it is the bootstrap-latency path a
+/// joiner's first dial waits on.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_addrbook_snapshot_requester(
     session: zenoh::Session,
@@ -602,6 +627,12 @@ pub fn spawn_addrbook_snapshot_requester(
                     ADDRBOOK_SNAPSHOT_COOLDOWN_MS.saturating_sub(now.saturating_sub(last_fire_ms));
                 tokio::time::sleep(Duration::from_millis(remaining)).await;
             }
+            // Decorrelate this fire from every other member woken by the same
+            // roster edge. Drawn fresh per fire from entropy, and applied AFTER
+            // the deferral so a herd that all defer to the same instant still
+            // spreads. `cooldown_elapsed` stays pure — the jitter is timing,
+            // not a rate-limit decision.
+            tokio::time::sleep(Duration::from_millis(jitter_ms(rand::random::<u64>()))).await;
             last_fire_ms = wall_now_ms();
             request_snapshot_once(
                 &session, &topic, &registry, &book, &rr, &crr, community, &dirty,
@@ -990,6 +1021,37 @@ mod tests {
         assert!(
             !cooldown_elapsed(first_fire, first_fire - 5_000),
             "a backwards clock step keeps the gate closed (saturating), not open"
+        );
+
+        // The woken-fire jitter that decorrelates a roster-edge herd is bounded
+        // by the window and never negative-equivalent (it is added to a delay,
+        // so a value at or over the window would stretch the fire past the
+        // cooldown it composes with). Extremes plus a spread check — no tokio
+        // time travel needed, the helper is pure.
+        assert_eq!(jitter_ms(0), 0, "the low extreme is a zero-delay fire");
+        assert_eq!(
+            jitter_ms(ADDRBOOK_SNAPSHOT_JITTER_MS - 1),
+            ADDRBOOK_SNAPSHOT_JITTER_MS - 1,
+            "the high extreme maps to the top of the window"
+        );
+        assert_eq!(
+            jitter_ms(ADDRBOOK_SNAPSHOT_JITTER_MS),
+            0,
+            "the window wraps rather than escaping it"
+        );
+        for raw in [1u64, 4_321, u64::MAX / 3, u64::MAX] {
+            assert!(
+                jitter_ms(raw) < ADDRBOOK_SNAPSHOT_JITTER_MS,
+                "raw {raw} must land inside the jitter window"
+            );
+        }
+        // Distinct raw draws must land on distinct delays — a helper that
+        // collapsed everything onto one value would compile, pass the bound
+        // checks above, and still leave the herd perfectly synchronized.
+        assert_ne!(
+            jitter_ms(7),
+            jitter_ms(1_234),
+            "the jitter must actually spread, not map every draw to one delay"
         );
     }
 
