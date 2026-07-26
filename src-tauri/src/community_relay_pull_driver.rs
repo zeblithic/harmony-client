@@ -397,35 +397,58 @@ impl CommunityRelayPullDriver {
     /// durably-ingested content ids) is preserved verbatim; the frame→handler
     /// argument mapping mirrors the iroh pull shell's ack read in
     /// `iroh_community_relay_acceptor`.
+    ///
+    /// Bounded by [`DEFAULT_RELAY_IO_DEADLINE_MS`] exactly like the remote
+    /// transport bounds its whole exchange (Qodo, PR #561): there is no dial
+    /// here, but `ingest_recovered` and `mark_pulled`'s durable flush are
+    /// real I/O — an unbounded stall would wedge `run_one_pass` and with it
+    /// every future pull on this node.
     async fn local_pull_session(
         &self,
         ctx: &dyn RelayPullCtx,
         query: &RelayPullQuery,
         ack_builder: &(dyn for<'a> Fn(&'a [[u8; 32]]) -> RelayPullAckFrame + Send + Sync),
     ) -> Result<usize, String> {
-        let resp = handle_relay_pull_query(query, ctx)
-            .await
-            .map_err(|e| format!("local pull query: {e}"))?;
-        let ids = open_and_ingest(&resp.entries, self.ingest.as_ref()).await;
-        let ingested_count = ids.len();
-        if !ids.is_empty() {
-            let frame = ack_builder(&ids);
-            let ack = RelayPullAck {
-                content_ids: frame.content_ids.clone(),
-            };
-            handle_relay_pull_ack(
-                &frame.recipient_owner,
-                &frame.community_id,
-                &ack,
-                &frame.requester_enrollment_cert,
-                &frame.signer_certs_cbor,
-                &frame.sig,
-                ctx,
-            )
-            .await
-            .map_err(|e| format!("local pull ack: {e}"))?;
-        }
-        Ok(ingested_count)
+        let exchange = async {
+            let resp = handle_relay_pull_query(query, ctx)
+                .await
+                .map_err(|e| format!("local pull query: {e}"))?;
+            let ids = open_and_ingest(&resp.entries, self.ingest.as_ref()).await;
+            let ingested_count = ids.len();
+            if !ids.is_empty() {
+                // Move the frame's owned fields instead of borrowing + cloning
+                // (Qodo, PR #561: `content_ids` was materialized twice).
+                let RelayPullAckFrame {
+                    recipient_owner,
+                    community_id,
+                    requester_enrollment_cert,
+                    content_ids,
+                    sig,
+                    signer_certs_cbor,
+                } = ack_builder(&ids);
+                let ack = RelayPullAck { content_ids };
+                handle_relay_pull_ack(
+                    &recipient_owner,
+                    &community_id,
+                    &ack,
+                    &requester_enrollment_cert,
+                    &signer_certs_cbor,
+                    &sig,
+                    ctx,
+                )
+                .await
+                .map_err(|e| format!("local pull ack: {e}"))?;
+            }
+            Ok::<usize, String>(ingested_count)
+        };
+        tokio::time::timeout(
+            Duration::from_millis(
+                crate::iroh_community_relay_acceptor::DEFAULT_RELAY_IO_DEADLINE_MS,
+            ),
+            exchange,
+        )
+        .await
+        .map_err(|_| "local pull IO timeout".to_string())?
     }
 
     /// Build a signed pull query for `community`. The signature binds
@@ -1203,6 +1226,64 @@ mod tests {
             "ZEB-803 telemetry: no permanent failure floor on a healthy volunteer"
         );
         assert_eq!(s.blobs_ingested, 1);
+    }
+
+    /// A [`RelayPullCtx`] whose `held_for` never resolves — drives the local
+    /// session's timeout arm. Auth passes first (the driver identity is a real
+    /// minted owner), so the stall sits exactly where production would stall:
+    /// in hold I/O.
+    struct StallingPullCtx;
+
+    #[async_trait]
+    impl RelayPullCtx for StallingPullCtx {
+        async fn serves_community(&self, _c: &SpaceId) -> bool {
+            true
+        }
+        async fn is_joined_member(&self, _c: &SpaceId, _o: &[u8; 16]) -> bool {
+            true
+        }
+        fn now_secs(&self) -> u64 {
+            1_700_000_100
+        }
+        async fn held_for(
+            &self,
+            _recipient_owner: &[u8; 16],
+            _requester_device: &str,
+        ) -> Vec<(String, RelayHeldBlob)> {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn mark_pulled(&self, _keys: &[String], _device: String) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_local_drain_times_out_and_is_recorded_failed() {
+        // Qodo (PR #561): the local session carries the same deadline the
+        // remote transport wraps its whole exchange in — an unbounded stall
+        // in hold I/O would wedge run_one_pass and every future pull on the
+        // node. Paused tokio time auto-advances past the deadline, so this
+        // test costs no real wall-clock.
+        let me = mint_test_owner(0x24);
+        let community = SpaceId([0xC8; 16]);
+        let now = 1_700_000_100_000u64;
+        let (driver, transport, _local, _ingest, telemetry, _resolver) =
+            self_relay_driver(&me, community, now, Vec::new(), false);
+        let driver = driver.with_local_pull_ctx(Arc::new(StallingPullCtx));
+
+        driver.run_one_pass(now).await;
+
+        assert!(
+            transport.calls().is_empty(),
+            "a stall must not fall back to dialing"
+        );
+        let s = telemetry.summary();
+        assert_eq!(
+            s.sessions_failed, 1,
+            "a stalled local drain must time out into the visible failed arm"
+        );
+        assert_eq!(s.sessions_ok, 0);
     }
 
     #[tokio::test]
