@@ -31182,6 +31182,29 @@ pub struct MentionDto {
     pub at: crate::community_channel_log_engine::HlcDto,
 }
 
+/// ZEB-780: the engine's `limit` sentinel, mirrored so `list_mentions`
+/// treats `0` the way `list_channel_messages` does.
+const DEFAULT_MENTION_SCAN_LIMIT: u32 = 256;
+
+/// ZEB-780: the reply, plus whether the answer is complete.
+///
+/// A bare `Vec<MentionDto>` cannot express "I found none in the window I
+/// looked at, and there may be more behind it" — the caller reads an empty
+/// array as "you were not mentioned". That is exactly the shape of ZEB-789
+/// (a successful call returning a plausible, frozen window), so the verb
+/// this PR adds must not reproduce it.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MentionScanDto {
+    /// Newest-first across every scanned channel, capped at `limit`.
+    pub mentions: Vec<MentionDto>,
+    /// Channel ids whose scan filled its window, so mentions may exist
+    /// beyond it. **Empty means the answer is complete** for the given
+    /// `since`; non-empty means widen `limit` or advance `since` before
+    /// concluding anything from a short `mentions` list.
+    pub truncated_channels: Vec<String>,
+}
+
 /// Tauri IPC: list messages that mention the local owner.
 ///
 /// ZEB-780. The delivery half of mentions already worked — a structured
@@ -31212,8 +31235,30 @@ pub struct MentionDto {
 /// makes the query resumable and idempotent — strictly better for an agent
 /// than server-held read state it cannot inspect or reset.
 ///
-/// Scans newest-first and stops at `limit` across all channels, so the cost
-/// is bounded by the reply size rather than by history.
+/// ## Cost, and the window the caller must know about
+///
+/// Each scanned channel is read newest-first for up to `limit` **messages**,
+/// and the mention filter runs after that read. So the real cost is one
+/// engine read per live channel, not "bounded by the reply size" — an
+/// earlier revision of this comment claimed the latter, which the code has
+/// never done (CodeRabbit + Qodo, PR #554). Peak memory is one channel's
+/// window at a time, since each channel's DTOs drop before the next is
+/// read and only the small [`MentionDto`] projections accumulate.
+///
+/// The window has a consequence that must never be silent: a channel whose
+/// newest `limit` messages contain no mention yields nothing, **even if
+/// mentions exist just past it.** That is ZEB-789's defect one layer up — a
+/// query that succeeds and returns a plausible, incomplete answer. So the
+/// reply names every channel whose scan filled its window
+/// ([`MentionScanDto::truncated_channels`]); a caller seeing its channel
+/// listed knows to widen `limit` or advance `since` rather than concluding
+/// it was not mentioned. An empty `truncated_channels` means the answer is
+/// complete for the given `since`.
+///
+/// `limit` matches `list_channel_messages`' boundary contract exactly,
+/// including `0` meaning "engine default", because a caller who learned the
+/// convention on one verb and got silence from the other would be hitting
+/// the same class of surprise this ticket exists to remove.
 ///
 /// Errors:
 /// - `Err("limit {N} exceeds max 1000")` — same cap as
@@ -31226,7 +31271,7 @@ async fn list_mentions(
     community_id: Option<String>,
     since: Option<crate::community_channel_log_engine::HlcDto>,
     limit: u32,
-) -> Result<Vec<MentionDto>, String> {
+) -> Result<MentionScanDto, String> {
     list_mentions_impl(state_lock.inner(), community_id, since, limit).await
 }
 
@@ -31236,10 +31281,19 @@ pub(crate) async fn list_mentions_impl(
     community_id: Option<String>,
     since: Option<crate::community_channel_log_engine::HlcDto>,
     limit: u32,
-) -> Result<Vec<MentionDto>, String> {
+) -> Result<MentionScanDto, String> {
     if limit > 1000 {
         return Err(format!("limit {limit} exceeds max 1000"));
     }
+    // Parity with `list_channel_messages`, where 0 is the "use the engine
+    // default" sentinel rather than "give me nothing". Left as a literal 0
+    // this returned an empty list and reported success — a silent wrong
+    // answer for a caller who learned the convention next door.
+    let limit = if limit == 0 {
+        DEFAULT_MENTION_SCAN_LIMIT
+    } else {
+        limit
+    };
 
     let (crdt_state, community_registry, channel_log_registry, self_owner) = {
         let g = state
@@ -31273,12 +31327,20 @@ pub(crate) async fn list_mentions_impl(
     // Communities to scan: live (non-left) Community spaces, narrowed by the
     // filter when present. Reading owner-state rather than the engine keeps
     // this consistent with `list_owner_communities`.
+    //
+    // `left_at.is_none()` is the "live" half and was missing in the first
+    // cut (Qodo, PR #554) — the comment claimed non-left and the predicate
+    // did not check it, so a community you had left could still raise
+    // mentions. `communities_for_nav` uses the same predicate for the same
+    // meaning; matching it is what keeps "which communities am I in" one
+    // answer instead of two.
     let communities: Vec<(crate::owner_state_types::SpaceId, [u8; 16])> = {
         let s = crdt_state.lock().await;
         s.spaces
             .iter()
             .filter(|(id, sp)| {
                 sp.kind == crate::owner_state_types::SpaceKind::Community
+                    && sp.left_at.is_none()
                     && filter.as_ref().is_none_or(|f| f == *id)
             })
             .filter_map(|(id, sp)| sp.admin_addr.map(|admin| (*id, admin.0)))
@@ -31292,6 +31354,7 @@ pub(crate) async fn list_mentions_impl(
     });
 
     let mut out: Vec<MentionDto> = Vec::new();
+    let mut truncated_channels: Vec<String> = Vec::new();
     for (space_id, admin_bytes) in communities {
         let admin_addr = crate::owner_state_types::OwnerAddr(admin_bytes);
         let Some(engine_state) = community_registry.state_for(&space_id).await else {
@@ -31317,6 +31380,13 @@ pub(crate) async fn list_mentions_impl(
                 .list_message_dtos_desc(since_hlc.clone(), limit as usize)
                 .await
                 .map_err(|e| e.to_string())?;
+            // A full window means the scan stopped at `limit` messages, not
+            // at the end of history, so mentions may sit just past it. Record
+            // it so an empty reply can be distinguished from an exhausted one
+            // — the caller must never have to guess which it got.
+            if dtos.len() >= limit as usize {
+                truncated_channels.push(hex::encode(channel_id.0));
+            }
             for d in dtos {
                 let mentions_me = d
                     .mentions
@@ -31351,8 +31421,24 @@ pub(crate) async fn list_mentions_impl(
             .then_with(|| b.at.logical.cmp(&a.at.logical))
             .then_with(|| b.message_id.cmp(&a.message_id))
     });
-    out.truncate(limit as usize);
-    Ok(out)
+    // A global truncation is itself an incomplete answer, so it counts as
+    // truncation for every channel that contributed — otherwise a caller
+    // reading an empty `truncatedChannels` would believe a capped reply was
+    // exhaustive.
+    if out.len() > limit as usize {
+        for m in &out[limit as usize..] {
+            if !truncated_channels.contains(&m.channel_id) {
+                truncated_channels.push(m.channel_id.clone());
+            }
+        }
+        out.truncate(limit as usize);
+    }
+    truncated_channels.sort();
+    truncated_channels.dedup();
+    Ok(MentionScanDto {
+        mentions: out,
+        truncated_channels,
+    })
 }
 
 /// Tauri IPC: fire a backfill request via the channel's Zenoh queryable.
@@ -34107,23 +34193,248 @@ mod create_community_inner_tests {
             .await
             .expect("list_mentions_impl must succeed");
         assert!(
-            found.is_empty(),
+            found.mentions.is_empty(),
             "none of these three should wake me: a self-authored self-mention, \
-             a mention of someone else, and an unaddressed post. Got: {found:?}"
+             a mention of someone else, and an unaddressed post. Got: {:?}",
+            found.mentions
         );
 
-        // The community filter must not be a silent no-op that returns
-        // everything — pin that it is actually applied.
-        let filtered = list_mentions_impl(&node_state, Some(community_id_hex), None, 100)
-            .await
-            .expect("filtered list_mentions_impl must succeed");
-        assert!(filtered.is_empty(), "filter path agrees: {filtered:?}");
+        // ── The positive path, reachable after all ──────────────────────
+        //
+        // The fixture mints one identity, so every message it can post is
+        // self-authored — which is why an earlier version of this test
+        // claimed the positive path was out of reach. It is not: `self` is
+        // read from `dm_self_owner`, and the scan is driven by the shared
+        // registries. A second NodeState over the *same* registries with a
+        // *different* `dm_self_owner` is exactly "somebody else's node
+        // reading a channel where a peer mentioned them".
+        let peer_owner = crate::owner_state_types::OwnerAddr([0x5c; 16]);
+        let peer_hex = hex::encode(peer_owner.0);
+        post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            b"hey you".to_vec(),
+            None,
+            Some(vec![peer_hex.clone()]),
+            None,
+        )
+        .await
+        .expect("peer-directed post must succeed");
 
-        // Boundary parity with list_channel_messages.
-        let err = list_mentions_impl(&node_state, None, None, 1001)
+        let peer_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(peer_owner),
+            crdt_state: Some(std::sync::Arc::clone(&fixture.crdt_state)),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            ..NodeState::default()
+        });
+
+        let seen = list_mentions_impl(&peer_state, None, None, 100)
+            .await
+            .expect("peer list_mentions_impl must succeed");
+        assert_eq!(
+            seen.mentions.len(),
+            1,
+            "the peer must see exactly the one message addressed to them: {:?}",
+            seen.mentions
+        );
+        assert_eq!(seen.mentions[0].channel_name, "mentions");
+        assert_eq!(seen.mentions[0].author, self_hex, "authored by the poster");
+        assert!(
+            seen.truncated_channels.is_empty(),
+            "a 4-message channel read with limit 100 is exhausted, so nothing \
+             may be reported as truncated: {:?}",
+            seen.truncated_channels
+        );
+
+        // ── The community filter, now falsifiable ───────────────────────
+        //
+        // With a non-empty result to compare against, these can fail. The
+        // earlier assertion (`filtered.is_empty()` when everything was
+        // empty) passed whether the filter was applied, ignored, or
+        // inverted — it could not fail for the reason it named
+        // (CodeRabbit, PR #554).
+        let same = list_mentions_impl(&peer_state, Some(community_id_hex.clone()), None, 100)
+            .await
+            .expect("filtered scan must succeed");
+        assert_eq!(
+            same.mentions.len(),
+            1,
+            "filtering to the community that holds the mention keeps it"
+        );
+
+        let elsewhere = list_mentions_impl(&peer_state, Some("ab".repeat(16)), None, 100)
+            .await
+            .expect("unknown-but-well-formed community must not error");
+        assert!(
+            elsewhere.mentions.is_empty(),
+            "filtering to a different community must exclude it — this is the \
+             assertion that fails if the filter is a no-op: {:?}",
+            elsewhere.mentions
+        );
+
+        let err = list_mentions_impl(&peer_state, Some("nothex".to_string()), None, 100)
+            .await
+            .expect_err("a malformed filter must be rejected at the boundary");
+        assert!(err.contains("invalid community_id hex"), "got: {err}");
+
+        // ── Truncation is reported, never silent (ZEB-789 one layer up) ──
+        //
+        // limit=1 makes the per-channel window smaller than the channel, so
+        // the scan stops at the window rather than at the end of history.
+        // Without this signal the caller cannot tell a short reply from an
+        // exhaustive one.
+        let capped = list_mentions_impl(&peer_state, None, None, 1)
+            .await
+            .expect("capped scan must succeed");
+        assert!(
+            !capped.truncated_channels.is_empty(),
+            "a window smaller than the channel must be reported as truncated"
+        );
+
+        // ── Boundary parity with list_channel_messages ──────────────────
+        let err = list_mentions_impl(&peer_state, None, None, 1001)
             .await
             .expect_err("over-cap limit must be rejected");
         assert!(err.contains("exceeds max 1000"), "got: {err}");
+
+        // `0` is the engine-default sentinel next door, so it must not mean
+        // "return nothing" here.
+        let zero = list_mentions_impl(&peer_state, None, None, 0)
+            .await
+            .expect("limit 0 must be the default sentinel, not an error");
+        assert_eq!(
+            zero.mentions.len(),
+            1,
+            "limit 0 must behave as the engine default, matching \
+             list_channel_messages — returning an empty list would be the \
+             silent-wrong-answer this verb exists to avoid"
+        );
+    }
+
+    /// ZEB-780 + Qodo (PR #554): a community you have left must not raise
+    /// mentions.
+    ///
+    /// The first cut's comment said it scanned "live (non-left) Community
+    /// spaces" while the predicate checked only `SpaceKind::Community` — the
+    /// comment described behaviour the code did not have. `left_at` is set
+    /// through the normal leave path, so this drives that rather than poking
+    /// the field, and asserts the same scan flips from 1 to 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_mentions_skips_communities_the_owner_has_left() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "zeb780-left-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned"
+        );
+
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            crdt_state: Some(std::sync::Arc::clone(&fixture.crdt_state)),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(synthetic_dm_outbox_for_test(&fixture, 0x58)),
+            ..NodeState::default()
+        });
+
+        let channel_id_hex = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "left-chan".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("create_channel_impl must succeed");
+
+        let peer_owner = crate::owner_state_types::OwnerAddr([0x5d; 16]);
+        post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex,
+            b"still here?".to_vec(),
+            None,
+            Some(vec![hex::encode(peer_owner.0)]),
+            None,
+        )
+        .await
+        .expect("peer-directed post must succeed");
+
+        let peer_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(peer_owner),
+            crdt_state: Some(std::sync::Arc::clone(&fixture.crdt_state)),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            ..NodeState::default()
+        });
+
+        // Precondition: visible while joined. Without this the test could
+        // pass on a scan that never worked at all.
+        let before = list_mentions_impl(&peer_state, None, None, 100)
+            .await
+            .expect("pre-leave scan must succeed");
+        assert_eq!(
+            before.mentions.len(),
+            1,
+            "precondition: the mention is visible while the space is live"
+        );
+
+        // Mark the space left, the same field the leave path sets.
+        {
+            let space_id = crate::owner_state_types::SpaceId(
+                <[u8; 16]>::try_from(hex::decode(&community_id_hex).expect("hex").as_slice())
+                    .expect("16 bytes"),
+            );
+            let mut s = fixture.crdt_state.lock().await;
+            let sp = s.spaces.get_mut(&space_id).expect("space exists");
+            sp.left_at = Some(crate::owner_state_types::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: fixture.device_id.clone(),
+            });
+        }
+
+        let after = list_mentions_impl(&peer_state, None, None, 100)
+            .await
+            .expect("post-leave scan must succeed");
+        assert!(
+            after.mentions.is_empty(),
+            "a community you have left must not raise mentions: {:?}",
+            after.mentions
+        );
     }
 
     /// ZEB-540: `preview_channel_artifact_impl` must REJECT an unauthorized CID

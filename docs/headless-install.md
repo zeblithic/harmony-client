@@ -417,7 +417,7 @@ list is the `registry_has_exactly_the_curated_v1_surface` pin test in
 | Node lifecycle (2) | `start_node`, `stop_node` (serve auto-starts the node at boot) |
 | Identity (2) | `get_owner_state`, `mint_owner_identity` |
 | Communities (9) | `list_owner_communities`, `create_community`, `list_community_members`, `generate_invite`, **`connectivity_redeem_invite_iroh`**, **`connectivity_open_join_iroh`**, `leave_community`, `list_left_communities`, `remove_space` |
-| Channels (4) | `create_channel`, `list_channels`, `list_channel_messages`, `post_channel_message` |
+| Channels (5) | `create_channel`, `list_channels`, `list_channel_messages`, **`list_mentions`**, `post_channel_message` |
 | Files / sharing (7) | `ingest_content_encrypted`, `grant_read`, `revoke_read`, `list_grants`, `list_received_grants`, `dismiss_received_grant`, `burn_content` |
 | Friends (9) | `list_friends`, `generate_friend_token`, `redeem_friend_token`, `add_friend_by_key`, `list_pending_friend_requests`, `accept_friend_request`, `decline_friend_request`, `list_outbound_friend_requests`, `cancel_outbound_friend_request` |
 | Spaces / DMs (3) | `add_space`, `send_dm`, `read_dm_thread` |
@@ -461,6 +461,30 @@ Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
 > the oldest window (ZEB-797). Unknown keys are now a `400` naming the field,
 > so "my node is too old for this argument" is a one-line diagnosis — but
 > that only helps against nodes new enough to reject.
+
+> **`list_mentions`: check `truncatedChannels` before believing an empty
+> reply.** The verb answers "which messages address me", so an agent can wake
+> on being addressed instead of on every message:
+>
+> ```bash
+> harmony-app api --profile <name> list_mentions '{"limit": 50}'
+> #   → { "mentions": [ { "communityId", "channelId", "channelName",
+> #                       "messageId", "author", "at" }, ... ],
+> #       "truncatedChannels": [] }
+> ```
+>
+> `communityId` is optional (omit to scan every joined community). `since` is
+> **your** cursor, not server-held read state — pass the `at` of the newest
+> mention you have handled and the query is resumable and idempotent. `limit`
+> follows the same contract as `list_channel_messages`, `0` included.
+>
+> Each channel is scanned newest-first for up to `limit` **messages**, and the
+> mention filter runs after that read. So a channel with `limit` recent
+> non-mention messages can hide older mentions behind the window. **That is
+> never silent:** any channel whose scan filled its window is listed in
+> `truncatedChannels`. Empty means the answer is complete for your `since`;
+> non-empty means widen `limit` or advance `since` before concluding you were
+> not mentioned.
 
 > **`add_friend_by_key` needs the TARGET to be discoverable, and that is off
 > by default.** Case-B — the public identity slot this verb resolves against

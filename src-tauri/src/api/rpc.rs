@@ -1860,6 +1860,73 @@ mod tests {
         );
     }
 
+    /// ZEB-775: the other two relay-rung verbs carry the same alias contract.
+    ///
+    /// Only `get_community_relay_status` had coverage in the first cut
+    /// (CodeRabbit, PR #554), so an accidental removal of the `alias` on
+    /// `SetCommunityRelayOptInArgs` or `GetRelayHeldArgs` would have gone
+    /// unnoticed — and under ZEB-797's strictness that removal is no longer
+    /// a silent degradation, it is a hard failure for those callers.
+    ///
+    /// `BadArgs` is the failure this discriminates: it means the key was not
+    /// accepted. Reaching `Command` means it deserialized and hit the impl.
+    #[tokio::test]
+    async fn all_relay_verbs_accept_both_community_id_spellings() {
+        let reg = build_registry();
+        let hex = "00".repeat(16);
+        let cases = [
+            (
+                "set_community_relay_opt_in",
+                serde_json::json!({ "communityId": hex, "optedIn": true }),
+            ),
+            (
+                "set_community_relay_opt_in",
+                serde_json::json!({ "communityIdHex": hex, "optedIn": true }),
+            ),
+            ("get_relay_held", serde_json::json!({ "communityId": hex })),
+            (
+                "get_relay_held",
+                serde_json::json!({ "communityIdHex": hex }),
+            ),
+        ];
+        for (cmd, args) in cases {
+            let outcome = reg
+                .dispatch(cmd, test_state(), test_sink(), args.clone())
+                .await;
+            match outcome {
+                // Either shape is fine: what must NOT happen is BadArgs,
+                // which would mean the key was rejected.
+                Ok(_) => {}
+                Err(RpcError::Command(_)) => {}
+                Err(other) => panic!("{cmd} rejected {args}: {other:?}"),
+            }
+        }
+    }
+
+    /// ZEB-797 + ZEB-775 together: strictness must not swallow the alias.
+    ///
+    /// A misspelling adjacent to both accepted spellings has to fail — the
+    /// alias widens the accepted set by exactly one name, not to anything
+    /// that looks close enough.
+    #[tokio::test]
+    async fn a_near_miss_community_id_spelling_is_still_rejected() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "get_community_relay_status",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityIDHex": "00".repeat(16) }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::BadArgs(_)),
+            "`communityIDHex` is neither the field nor the alias and must be \
+             rejected; got {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn command_error_passes_through_ipc_error_string() {
         let reg = build_registry();
