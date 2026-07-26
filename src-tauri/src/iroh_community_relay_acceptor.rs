@@ -900,6 +900,11 @@ enum RelayPullConnError {
 pub struct IrohCommunityRelayPullAcceptor {
     ctx: Arc<dyn RelayPullCtx>,
     config: RelayAcceptorConfig,
+    /// ZEB-803: per-peer served/rejected/failed telemetry, shared with
+    /// `network_health_snapshot`. `None` when nothing installed a source (unit
+    /// tests, pre-boot) — recording is then a no-op, so the shell's behaviour is
+    /// identical whether or not health is wired.
+    telemetry: Option<Arc<crate::network_health::CommunityRelayServingTelemetry>>,
 }
 
 impl IrohCommunityRelayPullAcceptor {
@@ -908,7 +913,21 @@ impl IrohCommunityRelayPullAcceptor {
     }
 
     pub fn with_config(ctx: Arc<dyn RelayPullCtx>, config: RelayAcceptorConfig) -> Self {
-        Self { ctx, config }
+        Self {
+            ctx,
+            config,
+            telemetry: None,
+        }
+    }
+
+    /// ZEB-803: install the health telemetry sink. Builder-style so the boot
+    /// wiring can attach it without a second constructor arity.
+    pub fn with_telemetry(
+        mut self,
+        telemetry: Arc<crate::network_health::CommunityRelayServingTelemetry>,
+    ) -> Self {
+        self.telemetry = Some(telemetry);
+        self
     }
 
     /// Handle one inbound relay-pull connection. On ANY failure the stream is
@@ -916,6 +935,11 @@ impl IrohCommunityRelayPullAcceptor {
     pub async fn handle_connection(&self, conn: Connection) {
         match self.handle_pull_inbound(&conn).await {
             Ok(()) => {
+                // ZEB-803: keyed on the iroh-authenticated `remote_id()`, so a
+                // peer cannot inflate or forge another peer's served-pull row.
+                if let Some(t) = self.telemetry.as_ref() {
+                    t.record_served(conn.remote_id().as_bytes());
+                }
                 tracing::info!(
                     remote_id = ?conn.remote_id(),
                     "ZEB-458: community relay pull served"
@@ -924,6 +948,13 @@ impl IrohCommunityRelayPullAcceptor {
             }
             Err(RelayPullConnError::QueryReject(reject))
             | Err(RelayPullConnError::AckReject(reject)) => {
+                // ZEB-803: a reject is not a serving fault — the connection
+                // ARRIVED, which is itself the evidence that inbound
+                // reachability was fine. Counted separately from `failed` so
+                // the two hypotheses stay distinguishable.
+                if let Some(t) = self.telemetry.as_ref() {
+                    t.record_rejected();
+                }
                 tracing::debug!(
                     reject = %reject,
                     remote_id = ?conn.remote_id(),
@@ -932,6 +963,9 @@ impl IrohCommunityRelayPullAcceptor {
                 conn.close(0u32.into(), b"");
             }
             Err(e) => {
+                if let Some(t) = self.telemetry.as_ref() {
+                    t.record_failed();
+                }
                 tracing::warn!(
                     error = %e,
                     remote_id = ?conn.remote_id(),

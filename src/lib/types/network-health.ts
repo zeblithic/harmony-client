@@ -146,6 +146,15 @@ export interface NetworkHealthSnapshot {
    * be told apart from transport failure without a debug-level log session.
    */
   butlerDeposits?: ButlerDepositHealth | null;
+  /**
+   * ZEB-803: ZEB-458 community-relay health, both directions.
+   *
+   * `null`/absent means this node runs no relay wiring at all — which is a
+   * DIFFERENT statement from "wired and serving nothing". The latter arrives as
+   * a present object with zeroed counters, and is exactly the incident state
+   * this field exists to surface, so the two must not be rendered alike.
+   */
+  communityRelay?: CommunityRelayHealth | null;
 }
 
 /** ZEB-702: process-lifetime butler-deposit decision counters (camelCase
@@ -154,6 +163,78 @@ export interface ButlerDepositHealth {
   accepted: number;
   rejectedUnauthorized: number;
   rejectedOther: number;
+}
+
+/**
+ * ZEB-803: community-relay health (camelCase mirror of Rust
+ * `CommunityRelayHealth`, network_health.rs).
+ *
+ * Both directions are carried because the two ends cannot see each other: a
+ * serving fault and a pulling fault present identically to the peer observing
+ * them, which is why the originating incident needed a third node to resolve.
+ */
+export interface CommunityRelayHealth {
+  serving: CommunityRelayServingHealth;
+  pulling: CommunityRelayPullingHealth;
+}
+
+/** ZEB-803: acceptor side — are we serving pulls to peers relaying through us? */
+export interface CommunityRelayServingHealth {
+  pullsServed: number;
+  pullsRejected: number;
+  pullsFailed: number;
+  /**
+   * Wall ms of the most recent successfully served pull, any peer. `null` until
+   * this node serves its first — deliberately not `0`, so "never served" cannot
+   * render as the epoch.
+   *
+   * Serving cadence is ~7m30s per peer, so a value older than ~3 cadences while
+   * peers are believed connected is the incident signature.
+   */
+  lastServedMs: number | null;
+  /** Per-peer, newest-served first. Bounded server-side. */
+  peers: CommunityRelayPeerServed[];
+}
+
+/** ZEB-803: one peer's served-pull record. `peerShort` is 8 hex chars —
+ * truncated at the writer per the ZEB-329 redaction invariant. */
+export interface CommunityRelayPeerServed {
+  peerShort: string;
+  lastServedMs: number;
+  servedCount: number;
+}
+
+/** ZEB-803: puller side — are we successfully pulling our held blobs? */
+export interface CommunityRelayPullingHealth {
+  /**
+   * Pull passes started. This is the LIVENESS PROOF: it climbs on the idle
+   * backstop even with zero joined communities, so a flat value means the loop
+   * is gone rather than merely idle. The success counters below cannot make
+   * that distinction, which is what let a silent stall look healthy.
+   */
+  passesRun: number;
+  lastPassMs: number | null;
+  sessionsOk: number;
+  sessionsFailed: number;
+  blobsIngested: number;
+  lastIngestMs: number | null;
+  /**
+   * A joined community examined with NO fresh relay advertised — nothing was
+   * tried, so it is not a failure, but it is also not health. Previously this
+   * path emitted nothing at all and was indistinguishable from a quiet channel.
+   */
+  passesNoRelay: number;
+  recent: CommunityRelayPullHit[];
+}
+
+/** ZEB-803: one pull-session outcome. Short-form ids only (ZEB-329). */
+export interface CommunityRelayPullHit {
+  communityShort: string;
+  relayDeviceShort: string;
+  outcome: 'ok' | 'failed' | 'noRelay';
+  /** Blobs ingested by this session; `0` for a failure or a no-op success. */
+  ingested: number;
+  capturedAtMs: number;
 }
 
 export type StepOutcome =
