@@ -44,7 +44,7 @@ pub enum AddressBookKey {
 /// The two entry kinds an address-book row can carry — the payloads
 /// previously routed through `ReachabilityResolver` and
 /// `CommunityRelayResolver` respectively.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AddressBookEntry {
     Reachability(ReachabilityAnnouncePayload),
     Relay(CommunityRelayAnnouncePayload),
@@ -53,7 +53,7 @@ pub enum AddressBookEntry {
 /// One address-book row: the entry payload plus the membership-envelope
 /// attribution (`actor`/`device`/`at`) and the store's own admission stamp
 /// (`stamped_at_ms`, clamped by `upsert` — see its doc comment).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddressBookRow {
     pub entry: AddressBookEntry,
     pub actor: OwnerAddr,

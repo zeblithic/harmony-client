@@ -107,6 +107,7 @@ mod zeb398_content_policy_tests {
     }
 }
 
+pub mod address_book_sync;
 pub mod api;
 mod app_tracing;
 pub mod backup_state;

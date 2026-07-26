@@ -49,6 +49,14 @@ impl ChannelKey {
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Wrap already-derived key bytes. `pub(crate)` so a sibling module's own
+    /// HKDF derivation (e.g. `address_book_sync::derive_addrbook_key`) can
+    /// produce a `ChannelKey` without this module needing to host every
+    /// derivation function.
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 impl std::fmt::Debug for ChannelKey {
