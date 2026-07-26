@@ -80,53 +80,75 @@ macro_rules! rpc {
 // One struct per distinct argument shape; field names/types mirror the
 // Tauri command wrappers exactly (snake_case params on the Rust side,
 // camelCase keys on the wire — same conversion Tauri's IPC layer does).
-// Deliberately NO deny_unknown_fields: Tauri tolerates extra fields, so
-// the RPC surface stays permissive for parity.
+//
+// ZEB-797: every struct carries `deny_unknown_fields`. This deliberately
+// breaks parity with the Tauri IPC surface, which tolerates extra fields
+// — the two surfaces differ on the axis that matters here:
+//
+//   Tauri IPC is called by the bundled frontend, compiled and shipped
+//   from this same tree. Caller and callee cannot be at different
+//   revisions, so a dropped field hides nothing.
+//
+//   This surface exists to be driven by out-of-band, independently
+//   versioned clients (fleet agent nodes, the `api` CLI, e2e harnesses).
+//   Skew is the normal condition, not an edge case.
+//
+// Permissiveness was therefore free on one surface and load-bearing on
+// the other. Measured cost of the old behaviour: `order` did not exist
+// before ZEB-602, so `{limit: 50, order: "desc"}` against an older node
+// silently returned the OLDEST 50 — the caller applied the documented
+// ZEB-789 workaround, got a full array of real messages, and came away
+// with more confidence and identical blindness. An unknown key is now a
+// named error instead.
+//
+// Cost accepted in exchange: a new optional argument fails loudly against
+// older servers rather than silently, so cross-version clients must
+// feature-detect rather than optimistically pass the new field.
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EmptyArgs {}
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetBuddyPledgeArgs {
     owner_address: String,
     bytes: u64,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RemoveStorageBuddyArgs {
     owner_address: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetSharedBudgetArgs {
     bytes: u64,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetBackupFlagArgs {
     sidecar_id: String,
     backup: bool,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StartNodeArgs {
     endpoint: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CommunityIdArgs {
     community_id: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct VineIdArgs {
     vine_id: String,
 }
@@ -134,7 +156,7 @@ struct VineIdArgs {
 /// ZEB-435: `remove_space` takes a generic space id (community / dm /
 /// group-dm), not specifically a community id.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SpaceIdArgs {
     space_id: String,
 }
@@ -142,7 +164,7 @@ struct SpaceIdArgs {
 /// ZEB-562: headless vine-follow verbs. `name` is the optional display label
 /// recorded alongside the followed address (mirrors the GUI command).
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FollowVineCreatorArgs {
     address: String,
     #[serde(default)]
@@ -150,7 +172,7 @@ struct FollowVineCreatorArgs {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UnfollowVineCreatorArgs {
     address: String,
 }
@@ -159,7 +181,7 @@ struct UnfollowVineCreatorArgs {
 /// moderation read verbs (`list_recent_counter_signs`,
 /// `list_recent_moderation_events`).
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CommunityLimitArgs {
     community_id: String,
     limit: u32,
@@ -169,7 +191,7 @@ struct CommunityLimitArgs {
 /// the two member-targeting moderation action verbs (`kick_from_community`,
 /// `unban_from_community`).
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ModerationTargetArgs {
     community_id: String,
     target_addr: String,
@@ -179,7 +201,7 @@ struct ModerationTargetArgs {
 /// ZEB-527: `community_id` + `proposal_event_id` for
 /// `countersign_admin_proposal`.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CountersignArgs {
     community_id: String,
     proposal_event_id: String,
@@ -189,7 +211,7 @@ struct CountersignArgs {
 /// read-side as-of override (recovery phases advance with wall clock;
 /// the 7-day RD4 floor makes execution unobservable on the real clock).
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GetRecoveryStateArgs {
     community_id: String,
     #[serde(default)]
@@ -198,7 +220,7 @@ struct GetRecoveryStateArgs {
 
 /// ZEB-714: `set_recovery_designates` (spec §3.1 config ceremony).
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetRecoveryDesignatesArgs {
     community_id: String,
     designate_addrs: Vec<String>,
@@ -208,7 +230,7 @@ struct SetRecoveryDesignatesArgs {
 
 /// ZEB-714: `initiate_admin_recovery` (spec §3.2).
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InitiateRecoveryArgs {
     community_id: String,
     lost_admin_addr: String,
@@ -218,14 +240,14 @@ struct InitiateRecoveryArgs {
 /// ZEB-714: `cosign_admin_recovery` / `veto_admin_recovery` — both take
 /// the target proposal's event id.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecoveryProposalTargetArgs {
     community_id: String,
     proposal_event_id: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateCommunityArgs {
     name: String,
     is_invite_only: bool,
@@ -233,7 +255,7 @@ struct CreateCommunityArgs {
 
 // ── Tier-2 conviction voting (ZEB-720) ───────────────────────────────
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct VotingCreateTier2Args {
     community_id: String,
     channel_id: String,
@@ -261,20 +283,20 @@ struct VotingCreateTier2Args {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct VotingSignalTier2Args {
     proposal_id: String,
     support: bool,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct VotingGetTier2Args {
     proposal_id: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GenerateInviteArgs {
     community_id: String,
     invitee_hint: Option<String>,
@@ -287,13 +309,13 @@ struct GenerateInviteArgs {
 /// Shared by `redeem_invite` and `redeem_friend_token` — both take one
 /// `url` parameter.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UrlArgs {
     url: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateChannelArgs {
     community_id: String,
     name: String,
@@ -302,18 +324,34 @@ struct CreateChannelArgs {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ListChannelMessagesArgs {
     community_id: String,
     channel_id: String,
     since: Option<crate::community_channel_log_engine::HlcDto>,
     limit: u32,
-    /// ZEB-602: `"asc"` (default) or `"desc"` for newest-first.
+    /// ZEB-602 / ZEB-789: `"desc"` (default) for newest-first, or
+    /// `"asc"` for oldest-first. Also selects which end `limit` cuts
+    /// from — `"asc"` with a `limit` is the *earliest* N, not the
+    /// latest.
     order: Option<String>,
 }
 
+/// ZEB-780: `communityId` optional — omit to scan every joined community.
+/// `since` is the caller's own cursor, which is what makes this resumable
+/// (see `list_mentions_impl` for why it is not server-held read state).
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListMentionsArgs {
+    #[serde(default)]
+    community_id: Option<String>,
+    #[serde(default)]
+    since: Option<crate::community_channel_log_engine::HlcDto>,
+    limit: u32,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PostChannelMessageArgs {
     community_id: String,
     channel_id: String,
@@ -324,25 +362,25 @@ struct PostChannelMessageArgs {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SubscribeCommunityPresenceArgs {
     community_id: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UnsubscribeCommunityPresenceArgs {
     community_id: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GetCommunityPresenceArgs {
     community_id: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DownloadChannelArtifactArgs {
     community_id: String,
     channel_id: String,
@@ -352,7 +390,7 @@ struct DownloadChannelArtifactArgs {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct IngestChannelArtifactArgs {
     community_id: String,
     source_path: String,
@@ -363,7 +401,7 @@ struct IngestChannelArtifactArgs {
 
 /// ZEB-781: `list_grants` / `dismiss_received_grant` — addressed by content id.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CidArgs {
     cid: String,
 }
@@ -377,7 +415,7 @@ struct CidArgs {
 /// in a community is not sufficient. `revoke_read` has no such gate; it stamps a
 /// local tombstone and converges, so a grantee can always be revoked.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GrantReadArgs {
     cid: String,
     grantee_address: String,
@@ -386,7 +424,7 @@ struct GrantReadArgs {
 /// ZEB-781: `burn_content` addresses the *sidecar*, not the CID — a CID is only
 /// fully burned once its last sidecar reference is removed.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BurnContentArgs {
     sidecar_id: String,
 }
@@ -395,13 +433,13 @@ struct BurnContentArgs {
 /// owns the native file picker and delegates here with the chosen path, so the
 /// dialog stays out of the shared seam (same split as `ingest_channel_artifact`).
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct IngestContentEncryptedArgs {
     source_path: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetMessageReactionArgs {
     community_id: String,
     channel_id: String,
@@ -414,7 +452,7 @@ struct SetMessageReactionArgs {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GenerateFriendTokenArgs {
     /// ZEB-507: TTL *duration* in milliseconds (not an absolute epoch). The
     /// server computes `expiresAt = now_ms + ttlMs`. Omitted/`null` → no expiry.
@@ -422,26 +460,26 @@ struct GenerateFriendTokenArgs {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AddFriendByKeyArgs {
     identity_pub_hex: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OwnerIdHexArgs {
     owner_id_hex: String,
 }
 
 /// ZEB-236: accept/decline a staged DM invite, keyed by hex `SpaceId`.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SpaceIdHexArgs {
     space_id: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AddSpaceArgs {
     kind: String,
     name: String,
@@ -449,7 +487,7 @@ struct AddSpaceArgs {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SendDmArgs {
     space_id: String,
     content: Vec<u8>,
@@ -457,7 +495,7 @@ struct SendDmArgs {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReadDmThreadArgs {
     space_id: String,
     limit: usize,
@@ -466,35 +504,50 @@ struct ReadDmThreadArgs {
     before_hlc: Option<String>,
 }
 
-/// ZEB-487: relay opt-in control. Note the existing `CommunityIdArgs` uses
-/// `community_id`; the relay-rung RPCs key on `community_id_hex`, so they take
-/// their own `…HexArgs` shapes.
+// ZEB-775: the three relay-rung RPCs below used to key on `communityIdHex`
+// while every sibling verb — `list_community_members`, `list_channels`,
+// `list_channel_messages`, `generate_invite` — keys on `communityId`, for
+// the same concept holding the same value. The rejection named the key it
+// wanted without hinting that the caller had almost certainly used the
+// spelling from the adjacent line, so it read as "do you have the id?"
+// (yes) rather than "did you spell it our way?" (no).
+//
+// They now take `communityId`, with `communityIdHex` kept as a serde
+// `alias`. An alias rather than a rename because ZEB-797 turns unknown
+// fields into hard errors in this same change: a straight rename would
+// promote every existing `communityIdHex` caller from silently-wrong to
+// broken in one commit. Strictness is meant to catch typos and version
+// skew, not to punish the callers who followed the old docs.
+
+/// ZEB-487 / ZEB-775: relay opt-in control.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetCommunityRelayOptInArgs {
-    community_id_hex: String,
+    #[serde(alias = "communityIdHex")]
+    community_id: String,
     opted_in: bool,
 }
 
-/// ZEB-487: `community_id_hex`-keyed arg shape for the relay-status read.
-/// Distinct from the existing `CommunityIdArgs` (which keys on `community_id`).
+/// ZEB-487 / ZEB-775: arg shape for the relay-status read.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CommunityIdHexArgs {
-    community_id_hex: String,
+    #[serde(alias = "communityIdHex")]
+    community_id: String,
 }
 
-/// ZEB-487: optional community filter for the relay-held observability read.
+/// ZEB-487 / ZEB-775: optional community filter for the relay-held
+/// observability read.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GetRelayHeldArgs {
-    #[serde(default)]
-    community_id_hex: Option<String>,
+    #[serde(default, alias = "communityIdHex")]
+    community_id: Option<String>,
 }
 
 /// ZEB-489: butler-pin control arg shape. `deviceId` omitted/null → clear.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetButlerPinArgs {
     #[serde(default)]
     device_id: Option<String>,
@@ -502,7 +555,7 @@ struct SetButlerPinArgs {
 
 /// ZEB-668 S2: device revocation. `reason` ∈ decommissioned|lost|compromised.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RevokeDeviceArgs {
     device_vk_hex: String,
     reason: String,
@@ -510,7 +563,7 @@ struct RevokeDeviceArgs {
 
 /// ZEB-668 S4: fleet-synced device petname. Empty `petname` clears.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetDevicePetnameArgs {
     device_vk_hex: String,
     petname: String,
@@ -518,19 +571,19 @@ struct SetDevicePetnameArgs {
 
 /// ZEB-677 S3: quorum ceremony verbs addressed by request id.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct QuorumRequestIdArgs {
     request_id: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DisplayNameArgs {
     display_name: String,
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PeerSessionIdArgs {
     peer_session_id: String,
 }
@@ -538,7 +591,7 @@ struct PeerSessionIdArgs {
 /// ZEB-464: shared by the card/profile `get_cached_*` + `unsubscribe_*`
 /// verbs — a single `subscriptionId` returned from a prior subscribe.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SubscriptionIdArgs {
     subscription_id: u64,
 }
@@ -546,14 +599,14 @@ struct SubscriptionIdArgs {
 /// ZEB-464: `subscribe_peer_profile` keys on the peer's owner address hex
 /// (`peerAddr`), distinct from the card verbs' `ownerIdHex`.
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PeerAddrArgs {
     peer_addr: String,
 }
 
 /// ZEB-464: `republish_owner_card` args (avatar/profile-page CIDs optional).
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RepublishOwnerCardArgs {
     display_name: String,
     status_text: String,
@@ -562,7 +615,7 @@ struct RepublishOwnerCardArgs {
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SetIdentityDiscoverableArgs {
     enabled: bool,
 }
@@ -964,6 +1017,16 @@ pub fn build_registry() -> RpcRegistry {
             .await
         }
     );
+    // ZEB-780: the receive half of mentions. Without this a headless agent
+    // could send a correct mention and never learn it had received one.
+    rpc!(
+        m,
+        "list_mentions",
+        ListMentionsArgs,
+        |state, _sink, a| async move {
+            crate::list_mentions_impl(state, a.community_id, a.since, a.limit).await
+        }
+    );
     rpc!(
         m,
         "post_channel_message",
@@ -1323,7 +1386,7 @@ pub fn build_registry() -> RpcRegistry {
         "set_community_relay_opt_in",
         SetCommunityRelayOptInArgs,
         |state, _sink, a| async move {
-            crate::set_community_relay_opt_in_impl(state, a.community_id_hex, a.opted_in).await
+            crate::set_community_relay_opt_in_impl(state, a.community_id, a.opted_in).await
         }
     );
     rpc!(
@@ -1331,14 +1394,14 @@ pub fn build_registry() -> RpcRegistry {
         "get_community_relay_status",
         CommunityIdHexArgs,
         |state, _sink, a| async move {
-            crate::get_community_relay_status_impl(state, a.community_id_hex).await
+            crate::get_community_relay_status_impl(state, a.community_id).await
         }
     );
     rpc!(
         m,
         "get_relay_held",
         GetRelayHeldArgs,
-        |state, _sink, a| async move { crate::get_relay_held_impl(state, a.community_id_hex).await }
+        |state, _sink, a| async move { crate::get_relay_held_impl(state, a.community_id).await }
     );
 
     // Butler rung (ZEB-489).
@@ -1479,6 +1542,17 @@ pub fn build_registry() -> RpcRegistry {
         EmptyArgs,
         |state, _sink, _a| {
             async move { crate::connectivity_get_identity_discoverable_impl(state).await }
+        }
+    );
+    // ZEB-794: was Tauri-only. `identityActive` here is the direct answer to
+    // "why does add_friend_by_key say `unreachable` against my node?" — and
+    // it was reachable only from a surface a `serve` node does not have.
+    rpc!(
+        m,
+        "connectivity_pkarr_publication_status",
+        EmptyArgs,
+        |state, _sink, _a| {
+            async move { crate::connectivity_pkarr_publication_status_impl(state).await }
         }
     );
 
@@ -1664,6 +1738,126 @@ mod tests {
             }
             other => panic!("expected BadArgs, got {other:?}"),
         }
+    }
+
+    /// ZEB-797: an unknown key must be a named error, not silently dropped.
+    ///
+    /// The oracle is a real dispatch of a real payload, not the presence of
+    /// the attribute — `deny_unknown_fields` is easy to delete and a test
+    /// that greps for it would keep passing on a struct that no longer
+    /// enforces anything.
+    ///
+    /// The field name must appear in the message. The whole value of failing
+    /// loudly is that an operator reads *which* key was not understood and
+    /// concludes "my node predates this argument" in one step; a bare
+    /// "invalid arguments" would restore the guessing this replaces.
+    #[tokio::test]
+    async fn unknown_arg_key_is_rejected_and_named() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_channel_messages",
+                test_state(),
+                test_sink(),
+                serde_json::json!({
+                    "communityId": "00".repeat(16),
+                    "channelId": "00".repeat(16),
+                    "limit": 5,
+                    "nonsenseArg": "xyz",
+                }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            RpcError::BadArgs(msg) => assert!(
+                msg.contains("nonsenseArg"),
+                "the rejection must name the offending key so version skew is \
+                 self-diagnosing; got: {msg}"
+            ),
+            other => panic!("expected BadArgs for an unknown key, got {other:?}"),
+        }
+    }
+
+    /// ZEB-797, the case that motivated it: `order` did not exist before
+    /// ZEB-602, so against an older node `{limit, order}` deserialized to
+    /// `{limit}` and returned a window the caller had explicitly asked not
+    /// to get. Nothing can make an *old* binary report that — but this pins
+    /// the property that makes the failure impossible going forward, by
+    /// proving an argument this surface does not know is never ignored.
+    #[tokio::test]
+    async fn a_future_argument_is_never_silently_dropped() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "list_channel_messages",
+                test_state(),
+                test_sink(),
+                serde_json::json!({
+                    "communityId": "00".repeat(16),
+                    "channelId": "00".repeat(16),
+                    "limit": 5,
+                    // Stand-in for whatever `order` was in July 2026: an
+                    // argument a later revision adds and this one has never
+                    // heard of.
+                    "cursorDirection": "desc",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::BadArgs(_)),
+            "an unrecognised argument must fail the call rather than change \
+             its meaning; got {err:?}"
+        );
+    }
+
+    /// ZEB-775: the relay verbs accept `communityId` like every sibling.
+    ///
+    /// Reaching the impl seam is the assertion — the default `NodeState`
+    /// has no owner, so a `Command` error proves deserialization succeeded
+    /// and the value arrived. `BadArgs` would mean the key was not accepted.
+    #[tokio::test]
+    async fn relay_status_accepts_community_id() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "get_community_relay_status",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityId": "00".repeat(16) }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::Command(_)),
+            "communityId must deserialize and reach the impl; got {err:?}"
+        );
+    }
+
+    /// ZEB-775 + ZEB-797: the old spelling still works.
+    ///
+    /// This is the half that makes the two tickets compatible. `alias` keeps
+    /// `communityIdHex` a *known* field, so strictness does not convert the
+    /// callers who followed the old docs from silently-wrong into broken.
+    /// Delete the alias and this fails while the test above still passes —
+    /// which is the point of asserting both spellings separately.
+    #[tokio::test]
+    async fn relay_status_still_accepts_the_deprecated_community_id_hex() {
+        let reg = build_registry();
+        let err = reg
+            .dispatch(
+                "get_community_relay_status",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "communityIdHex": "00".repeat(16) }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::Command(_)),
+            "the deprecated communityIdHex alias must still deserialize; \
+             got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -2535,6 +2729,7 @@ mod tests {
             "create_channel",
             "list_channels",
             "list_channel_messages",
+            "list_mentions",
             "post_channel_message",
             "set_message_reaction",
             // channel artifacts (CAS)
@@ -2618,6 +2813,7 @@ mod tests {
             "connectivity_list_peer_reachability",
             "connectivity_set_identity_discoverable",
             "connectivity_get_identity_discoverable",
+            "connectivity_pkarr_publication_status",
             "connectivity_redeem_invite_iroh",
             "connectivity_open_join_iroh",
             // network health

@@ -9130,6 +9130,31 @@ pub async fn start_node_inner(
                     // Restore case-B if enabled (connectivity_settings loaded above, hoisted by ZEB-380).
                     if connectivity_settings.identity_discoverable {
                         pkarr_identity_pub.enable().await;
+                        tracing::info!(
+                            "ZEB-794: identity discoverability ON — case-B published, \
+                             this node is resolvable by add_friend_by_key"
+                        );
+                    } else {
+                        // ZEB-794: log the OFF branch, at info, unconditionally.
+                        //
+                        // The default is off and the boot log said nothing either
+                        // way, so an operator reading a fresh `serve` log had no
+                        // way to learn the node was undiscoverable. Meanwhile
+                        // case-C and case-D publish automatically, so the node
+                        // looks like it is publishing — it is, just not the slot
+                        // first contact resolves against. The remote symptom is a
+                        // bare `unreachable`, indistinguishable from offline,
+                        // wrong key, or a broken DHT.
+                        //
+                        // Deliberately NOT a warning: off-by-default is a
+                        // considered privacy posture, not a misconfiguration.
+                        tracing::info!(
+                            "ZEB-794: identity discoverability OFF (default) — case-B not \
+                             published, so add_friend_by_key against this node returns \
+                             `unreachable`. Enable with \
+                             `connectivity_set_identity_discoverable {{\"enabled\": true}}`, \
+                             or use the friend-token path, which does not need it."
+                        );
                     }
                     // ZEB-371 Task 12: lift the persisted Path-A auto-accept
                     // toggle so the friend acceptor (constructed below) reads it.
@@ -27516,13 +27541,16 @@ pub(crate) async fn list_community_members_impl(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let (crdt_state, registry) = {
+    let (crdt_state, registry, profile_card_cache) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            // ZEB-777. Optional on purpose: an unnamed roster is strictly
+            // better than an error, since this is an enrichment.
+            g.profile_card_cache.clone(),
         )
     };
 
@@ -27565,7 +27593,41 @@ pub(crate) async fn list_community_members_impl(
         g.materialized(admin_addr)
     };
 
-    Ok(member_info_for(&materialized))
+    let mut rows = member_info_for(&materialized);
+
+    // ZEB-777: fill `displayName` from the profile-card cache — the same
+    // source the UI's MemberCardService reads, and the same enrichment
+    // ZEB-595 already applies to `network_health_snapshot`'s peers. The
+    // field existed on the DTO and was hardcoded `None`, so the roster was
+    // *structurally* unable to carry a name that the app was rendering
+    // correctly two components away.
+    //
+    // Scope, stated because it bounds what this fixes: the cache holds cards
+    // RECEIVED from peers. It is empty until cards propagate, and on a
+    // freshly-restarted headless node nothing re-publishes them (ZEB-774) —
+    // measured 2026-07-26, where this cache named 0 of 3 peers on a live
+    // node, via the ZEB-595 path. So this makes the DTO honest and gives the
+    // UI a fallback; it does not make names resolve. That is ZEB-774.
+    //
+    // Local-lookup only, no network, and cheap: one lock + scan into a map,
+    // then O(1) per row — same shape as ZEB-595, for the same reason
+    // (avoids O(members × slots) plus repeated locking).
+    if let Some(cache) = profile_card_cache.as_ref() {
+        let names = cache.display_names_by_owner().await;
+        if !names.is_empty() {
+            for row in &mut rows {
+                if let Ok(bytes) = hex::decode(&row.addr) {
+                    if let Ok(owner) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                        if let Some(name) = names.get(&owner) {
+                            row.display_name = Some(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(rows)
 }
 
 // ── ZEB-287 Phase 2: list_community_forks IPC ─────────────────────────
@@ -30974,11 +31036,25 @@ async fn list_emoji_names(
 /// `0` means "use the engine's default (256)"; the IPC enforces a hard
 /// cap of 1000 per spec §9.2 (rejected before reaching the engine).
 ///
-/// `order` (ZEB-602) selects the walk direction: `None`/`"asc"` returns
-/// DTOs in HLC order (segments first, then in-memory tail) with `limit`
-/// bounding from the OLDEST end — the original behavior; `"desc"`
-/// returns newest-first with `limit` bounding from the NEWEST end (the
-/// cheap "latest N" query).
+/// `order` (ZEB-602) selects the walk direction, and — this is the part
+/// that bites — it also decides **which end `limit` cuts from**, because
+/// the walk and the bound start at the same end:
+///
+/// - `None`/`"desc"` — newest-first, `limit` bounds from the NEWEST end.
+///   The "latest N" query, and the default (ZEB-789).
+/// - `"asc"` — HLC order (segments first, then in-memory tail), `limit`
+///   bounds from the OLDEST end. The "earliest N" query.
+///
+/// **ZEB-789: the default was `"asc"` and is now `"desc"`.** An
+/// unqualified `{ limit: N }` used to return the *oldest* N, so any
+/// caller watching a channel froze permanently once it passed N messages
+/// — the query kept succeeding and returning N real messages, and could
+/// never again include a newly-posted one. Two fleet watchers and the
+/// GUI's own channel feed were all written against the "latest N"
+/// reading; none of them noticed, because a stale full window is
+/// indistinguishable from a quiet channel. The default now matches what
+/// every caller already assumed. Callers that genuinely want the
+/// earliest N must say `"asc"` explicitly.
 ///
 /// Errors:
 /// - `Err("limit {N} exceeds max 1000")` — boundary cap.
@@ -31023,10 +31099,15 @@ pub(crate) async fn list_channel_messages_impl(
         return Err(format!("limit {limit} exceeds max 1000"));
     }
     // ZEB-602: validate at the boundary, like `limit` — an unknown order
-    // must fail loudly, not silently fall back to oldest-first.
+    // must fail loudly, not silently fall back to a direction the caller
+    // did not ask for.
+    //
+    // ZEB-789: `None` maps to newest-first. It used to map to oldest-first,
+    // which made an unqualified `limit` mean "the earliest N messages ever
+    // posted" — a window that freezes forever once the channel outgrows it.
     let newest_first = match order.as_deref() {
-        None | Some("asc") => false,
-        Some("desc") => true,
+        None | Some("desc") => true,
+        Some("asc") => false,
         Some(other) => {
             return Err(format!(
                 "invalid order \"{other}\": expected \"asc\" or \"desc\""
@@ -31082,6 +31163,196 @@ pub(crate) async fn list_channel_messages_impl(
     .map_err(|e| e.to_string())?;
 
     Ok(dtos)
+}
+
+/// ZEB-780: one message that addresses the local owner.
+///
+/// Deliberately the message's own identity plus where it lives — not a
+/// count and not a body. An agent that wants the text calls
+/// `list_channel_messages` with `since`; duplicating bodies here would
+/// mean two projections of the same event that can disagree.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MentionDto {
+    pub community_id: String,
+    pub channel_id: String,
+    pub channel_name: String,
+    pub message_id: String,
+    pub author: String,
+    pub at: crate::community_channel_log_engine::HlcDto,
+}
+
+/// Tauri IPC: list messages that mention the local owner.
+///
+/// ZEB-780. The delivery half of mentions already worked — a structured
+/// `mentions` array rides every message, so a receiver never parses text.
+/// The *query* half did not exist: `mentionCount` reached clients only
+/// through the `nav-updated` push event, so a headless agent could compose
+/// and send a correct multi-mention and had no way to discover it had
+/// received one. Send worked; receive was unobservable.
+///
+/// **This departs from the shape ZEB-780 proposed, and the reason matters.**
+/// That ticket asked for `list_unseen_mentions`, "reading the same state
+/// the nav DTO already computes, so there is one source of truth rather
+/// than a parallel derivation." Correct instinct, but there is no such
+/// state to read: `mentionCount` is derived in TypeScript by
+/// `NavService`/`MentionAlertService` and is a session-scoped **UI badge**,
+/// not a fact about the log. It only counts messages that arrived live
+/// while the app was running, only when the viewer was not looking at that
+/// channel, and only when the notification policy resolved above `silent`.
+/// Reproducing it in Rust would mean reimplementing window focus and
+/// notification policy on a node that has neither, and would produce
+/// exactly the second derivation the ticket warned against — one that
+/// drifts from the badge, leaving agent and human disagreeing about the
+/// same channel with neither obviously wrong.
+///
+/// So this reads the durable fact instead: which messages carry the local
+/// owner in `mentions`. "Unseen" becomes the caller's `since` cursor, which
+/// is how every other read on this surface already bounds itself, and which
+/// makes the query resumable and idempotent — strictly better for an agent
+/// than server-held read state it cannot inspect or reset.
+///
+/// Scans newest-first and stops at `limit` across all channels, so the cost
+/// is bounded by the reply size rather than by history.
+///
+/// Errors:
+/// - `Err("limit {N} exceeds max 1000")` — same cap as
+///   `list_channel_messages`.
+/// - `Err("invalid community_id hex: ...")` when the filter is malformed.
+/// - `Err(OWNER_NOT_LOADED_MSG)` / `Err("channel_log_registry missing …")`.
+#[tauri::command]
+async fn list_mentions(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    community_id: Option<String>,
+    since: Option<crate::community_channel_log_engine::HlcDto>,
+    limit: u32,
+) -> Result<Vec<MentionDto>, String> {
+    list_mentions_impl(state_lock.inner(), community_id, since, limit).await
+}
+
+/// ZEB-445 shared IPC/RPC seam for [`list_mentions`].
+pub(crate) async fn list_mentions_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: Option<String>,
+    since: Option<crate::community_channel_log_engine::HlcDto>,
+    limit: u32,
+) -> Result<Vec<MentionDto>, String> {
+    if limit > 1000 {
+        return Err(format!("limit {limit} exceeds max 1000"));
+    }
+
+    let (crdt_state, community_registry, channel_log_registry, self_owner) = {
+        let g = state
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.channel_log_registry
+                .clone()
+                .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?,
+            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+        )
+    };
+    let self_owner_hex = hex::encode(self_owner.0);
+
+    // Optional single-community filter, validated at the boundary like every
+    // other id on this surface.
+    let filter: Option<crate::owner_state_types::SpaceId> = match community_id.as_deref() {
+        None => None,
+        Some(h) => {
+            let bytes: [u8; 16] = hex::decode(h)
+                .map_err(|e| format!("invalid community_id hex: {e}"))?
+                .as_slice()
+                .try_into()
+                .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+            Some(crate::owner_state_types::SpaceId(bytes))
+        }
+    };
+
+    // Communities to scan: live (non-left) Community spaces, narrowed by the
+    // filter when present. Reading owner-state rather than the engine keeps
+    // this consistent with `list_owner_communities`.
+    let communities: Vec<(crate::owner_state_types::SpaceId, [u8; 16])> = {
+        let s = crdt_state.lock().await;
+        s.spaces
+            .iter()
+            .filter(|(id, sp)| {
+                sp.kind == crate::owner_state_types::SpaceKind::Community
+                    && filter.as_ref().is_none_or(|f| f == *id)
+            })
+            .filter_map(|(id, sp)| sp.admin_addr.map(|admin| (*id, admin.0)))
+            .collect()
+    };
+
+    let since_hlc = since.map(|h| crate::owner_state_types::Hlc {
+        wall_ms: h.wall_ms,
+        logical: h.logical,
+        device_id: h.device_id,
+    });
+
+    let mut out: Vec<MentionDto> = Vec::new();
+    for (space_id, admin_bytes) in communities {
+        let admin_addr = crate::owner_state_types::OwnerAddr(admin_bytes);
+        let Some(engine_state) = community_registry.state_for(&space_id).await else {
+            // Not started yet. A community whose engine is absent has no
+            // locally-readable log, so it contributes nothing — skipping is
+            // correct, and erroring would make one cold community break the
+            // whole query.
+            continue;
+        };
+        let materialized = {
+            let g = engine_state.lock().await;
+            g.materialized(admin_addr)
+        };
+
+        for (channel_id, info) in materialized.channels.iter() {
+            let Some(engine) = channel_log_registry.engine(&space_id, channel_id).await else {
+                continue;
+            };
+            // Newest-first, so the `limit` below keeps the most recent
+            // mentions rather than whichever channel happened to be scanned
+            // first — the ZEB-789 trap, one layer up.
+            let dtos = engine
+                .list_message_dtos_desc(since_hlc.clone(), limit as usize)
+                .await
+                .map_err(|e| e.to_string())?;
+            for d in dtos {
+                let mentions_me = d
+                    .mentions
+                    .as_ref()
+                    .is_some_and(|m| m.iter().any(|o| o == &self_owner_hex));
+                if !mentions_me {
+                    continue;
+                }
+                // Your own message that @-mentions you is not a notification,
+                // matching MentionAlertService's identical check.
+                if d.author == self_owner_hex {
+                    continue;
+                }
+                out.push(MentionDto {
+                    community_id: d.community_id,
+                    channel_id: d.channel_id,
+                    channel_name: info.name.clone(),
+                    message_id: d.message_id,
+                    author: d.author,
+                    at: d.at,
+                });
+            }
+        }
+    }
+
+    // Newest-first across every channel, then cap. Sorting before the cap is
+    // what makes the reply "the latest N mentions anywhere" rather than "the
+    // latest N from whichever channels sorted first".
+    out.sort_by(|a, b| {
+        b.at.wall_ms
+            .cmp(&a.at.wall_ms)
+            .then_with(|| b.at.logical.cmp(&a.at.logical))
+            .then_with(|| b.message_id.cmp(&a.message_id))
+    });
+    out.truncate(limit as usize);
+    Ok(out)
 }
 
 /// Tauri IPC: fire a backfill request via the channel's Zenoh queryable.
@@ -32527,6 +32798,32 @@ mod create_community_inner_tests {
         }
     }
 
+    /// A synthetic `DmOutbox` for tests that only need `create_channel_impl`
+    /// and `post_channel_message_impl` to clear their NodeState precondition.
+    /// `dm_outbox` is required by both, but nothing here exercises DM
+    /// delivery.
+    ///
+    /// `seed` distinguishes the derived Reticulum identity per test, so two
+    /// fixtures in the same run never share a device-address hash.
+    fn synthetic_dm_outbox_for_test(
+        fixture: &CreateCommunityTestFixture,
+        seed: u8,
+    ) -> std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>> {
+        let retic = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
+        let device_hash = crate::owner_state_types::DeviceIdentityHash(retic.identity.address_hash);
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::dm_outbox::DmOutbox::new_synthetic(
+                fixture.device_id.clone(),
+                fixture.self_owner,
+                device_hash,
+                std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[seed; 32])),
+                std::sync::Arc::new(retic),
+                std::sync::Arc::clone(&fixture.signing_key),
+                fixture.enrollment_cert.clone(),
+            ),
+        ))
+    }
+
     /// Build a minimal fixture for `create_community_inner` unit tests.
     ///
     /// Key design choices:
@@ -33558,6 +33855,275 @@ mod create_community_inner_tests {
             "the materialized DTO must surface the custom emoji CID"
         );
         assert_eq!(r.emoji_size, Some(1024));
+    }
+
+    /// ZEB-789: an unqualified `limit` must return the NEWEST N, not the
+    /// oldest N.
+    ///
+    /// The oracle here is the engine's actual contents, deliberately. A test
+    /// that asserted the `match` arm maps `None → newest_first` would restate
+    /// the line it is guarding and pass for either default. This posts more
+    /// messages than `limit` and names which bodies come back, so it can only
+    /// pass if the window really moved.
+    ///
+    /// Both directions are pinned. The default is the fix; `"asc"` is the
+    /// escape hatch for callers who genuinely want the earliest N, and a fix
+    /// that silently removed it would be its own regression.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_channel_messages_default_order_returns_newest_not_oldest() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "zeb789-window-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned"
+        );
+
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(synthetic_dm_outbox_for_test(&fixture, 0x56)),
+            ..NodeState::default()
+        });
+
+        let channel_id_hex = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "window".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("create_channel_impl must succeed");
+
+        // Six messages, posted oldest → newest. `limit: 2` is deliberately far
+        // below the count so the two ends are unambiguous.
+        for i in 0..6u8 {
+            post_channel_message_impl(
+                &node_state,
+                community_id_hex.clone(),
+                channel_id_hex.clone(),
+                format!("msg-{i}").into_bytes(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("post_channel_message_impl must succeed");
+        }
+
+        let body_of = |d: &crate::community_channel_log_engine::ChannelMessageDto| {
+            String::from_utf8(d.body.clone()).expect("test bodies are utf-8")
+        };
+
+        // No `order` — the shape every caller writes, and the one that used to
+        // freeze on the oldest window.
+        let defaulted = list_channel_messages_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            None,
+            2,
+            None,
+        )
+        .await
+        .expect("defaulted list must succeed");
+        let mut defaulted_bodies: Vec<String> = defaulted.iter().map(body_of).collect();
+        defaulted_bodies.sort();
+        assert_eq!(
+            defaulted_bodies,
+            vec!["msg-4".to_string(), "msg-5".to_string()],
+            "an unqualified limit must yield the NEWEST 2 (ZEB-789); \
+             getting msg-0/msg-1 means the default reverted to oldest-first, \
+             which freezes every watcher and the GUI feed past `limit` messages"
+        );
+
+        // The escape hatch still reaches the other end.
+        let ascending = list_channel_messages_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            None,
+            2,
+            Some("asc".to_string()),
+        )
+        .await
+        .expect("asc list must succeed");
+        let mut ascending_bodies: Vec<String> = ascending.iter().map(body_of).collect();
+        ascending_bodies.sort();
+        assert_eq!(
+            ascending_bodies,
+            vec!["msg-0".to_string(), "msg-1".to_string()],
+            "explicit asc must still yield the OLDEST 2"
+        );
+
+        // And the two really are different windows — a backend that ignored
+        // `order` entirely would satisfy neither assertion above, but this
+        // states the invariant the two share rather than leaving it implied.
+        assert_ne!(
+            defaulted_bodies, ascending_bodies,
+            "default and asc must select opposite ends, not the same page"
+        );
+    }
+
+    /// ZEB-780: `list_mentions` excludes your own posts, including one that
+    /// literally lists you in `mentions`.
+    ///
+    /// **Coverage is deliberately partial and the gap is named.** This
+    /// fixture mints one identity, so every message it can post is
+    /// self-authored — which reaches the two exclusion rules and cannot
+    /// reach the positive path. Writing a "positive" case here would mean
+    /// asserting against a message this fixture cannot produce.
+    ///
+    /// The positive path is verified live instead, against the 4-author
+    /// `#fleet-ops` board: ground truth computed from the raw log before
+    /// running the verb is 71 messages mentioning owner `03636c9a` authored
+    /// by someone else, 0 authored by self. See the PR description.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_mentions_excludes_self_authored_and_unaddressed() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "zeb780-mentions-community".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        assert!(
+            wait_until_engines_count(
+                &fixture.channel_log_registry,
+                1,
+                std::time::Duration::from_millis(500),
+            )
+            .await,
+            "precondition: #general channel-log engine must be spawned"
+        );
+
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            crdt_state: Some(std::sync::Arc::clone(&fixture.crdt_state)),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(synthetic_dm_outbox_for_test(&fixture, 0x57)),
+            ..NodeState::default()
+        });
+
+        let channel_id_hex = create_channel_impl(
+            &node_state,
+            community_id_hex.clone(),
+            "mentions".to_string(),
+            0,
+            None,
+        )
+        .await
+        .expect("create_channel_impl must succeed");
+
+        let self_hex = hex::encode(fixture.self_owner.0);
+        let other_hex = "ab".repeat(16);
+
+        // (a) mentions me, but I wrote it — the self-wake footgun.
+        post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            b"i am talking about myself".to_vec(),
+            None,
+            Some(vec![self_hex.clone()]),
+            None,
+        )
+        .await
+        .expect("self-mention post must succeed");
+
+        // (b) mentions somebody else entirely.
+        post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            b"addressed elsewhere".to_vec(),
+            None,
+            Some(vec![other_hex]),
+            None,
+        )
+        .await
+        .expect("other-mention post must succeed");
+
+        // (c) no mentions at all.
+        post_channel_message_impl(
+            &node_state,
+            community_id_hex.clone(),
+            channel_id_hex.clone(),
+            b"plain chatter".to_vec(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("plain post must succeed");
+
+        let found = list_mentions_impl(&node_state, None, None, 100)
+            .await
+            .expect("list_mentions_impl must succeed");
+        assert!(
+            found.is_empty(),
+            "none of these three should wake me: a self-authored self-mention, \
+             a mention of someone else, and an unaddressed post. Got: {found:?}"
+        );
+
+        // The community filter must not be a silent no-op that returns
+        // everything — pin that it is actually applied.
+        let filtered = list_mentions_impl(&node_state, Some(community_id_hex), None, 100)
+            .await
+            .expect("filtered list_mentions_impl must succeed");
+        assert!(filtered.is_empty(), "filter path agrees: {filtered:?}");
+
+        // Boundary parity with list_channel_messages.
+        let err = list_mentions_impl(&node_state, None, None, 1001)
+            .await
+            .expect_err("over-cap limit must be rejected");
+        assert!(err.contains("exceeds max 1000"), "got: {err}");
     }
 
     /// ZEB-540: `preview_channel_artifact_impl` must REJECT an unauthorized CID
@@ -58700,6 +59266,21 @@ async fn connectivity_discover_identity(
 async fn connectivity_pkarr_publication_status(
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<PkarrPublicationStatus, String> {
+    connectivity_pkarr_publication_status_impl(state.inner()).await
+}
+
+/// ZEB-445 shared IPC/RPC seam.
+///
+/// ZEB-794: this was Tauri-only, and that was the gap. Case-B (the public
+/// identity slot `add_friend_by_key` resolves against) is opt-in and
+/// defaults off, so a fresh `serve` node is unresolvable to first contact
+/// while still publishing Case-C and Case-D — it *looks* like it is
+/// publishing, because it is, just not the slot that matters. The one call
+/// that would have said so returned `404 unknown command` on the only
+/// surface a headless node has. Three nodes spent about two hours on that.
+pub(crate) async fn connectivity_pkarr_publication_status_impl(
+    state: &Mutex<NodeState>,
+) -> Result<PkarrPublicationStatus, String> {
     let publisher = {
         state
             .lock()
@@ -66200,6 +66781,7 @@ pub fn run() {
             delete_channel,
             list_channels,
             list_channel_messages,
+            list_mentions,
             post_channel_message,
             set_message_reaction,
             download_channel_artifact,

@@ -112,6 +112,55 @@ describe('ShareList', () => {
     expect(screen.queryByLabelText('Share with...')).toBeNull();
   });
 
+  // ── ZEB-782: why the picker is absent ────────────────────────────────
+  //
+  // Two states used to be indistinguishable: "you have no friends, so this
+  // feature cannot work yet" and "you have already shared with everyone".
+  // Both rendered as a bare "Not shared with anyone" with no picker, which
+  // reads as a broken feature in the first case and a finished job in the
+  // second. Each assertion below pins the *distinction*, not merely the
+  // presence of some text — checking only that a hint exists would pass
+  // with one hint reused for both states, which is the bug.
+  describe('empty-picker explanation — ZEB-782', () => {
+    it('tells a user with no friends that sharing is friend-gated', () => {
+      renderShareList({ grants: [], availableFriends: [] });
+      const hint = screen.getByTestId('share-picker-hint').textContent ?? '';
+      expect(hint).toMatch(/add a friend/i);
+      // The precondition must be stated, since the release notes previously
+      // implied community membership was enough.
+      expect(hint).toMatch(/community membership/i);
+      expect(screen.queryByLabelText('Share with...')).toBeNull();
+    });
+
+    it('tells a user who granted everyone that the job is done, not broken', () => {
+      renderShareList({
+        grants: [
+          { granteeAddress: 'addr-alice', displayName: 'Alice', grantedAt: 1 },
+          { granteeAddress: 'addr-bob', displayName: 'Bob', grantedAt: 2 },
+          { granteeAddress: 'addr-carol', displayName: 'Carol', grantedAt: 3 },
+        ],
+      });
+      const hint = screen.getByTestId('share-picker-hint').textContent ?? '';
+      expect(hint).toMatch(/already has access/i);
+      // Must NOT tell someone who has friends to go add one.
+      expect(hint).not.toMatch(/add a friend/i);
+    });
+
+    it('stays quiet when the picker is usable — a hint would be noise', () => {
+      renderShareList({ grants: [] });
+      expect(screen.queryByTestId('share-picker-hint')).toBeNull();
+      expect(screen.getByLabelText('Share with...')).toBeTruthy();
+    });
+
+    it('says nothing before grants resolve, so the hint cannot pre-empt the query', () => {
+      // `grants: null` means listGrants has not returned. Claiming "everyone
+      // already has access" here would be a guess, and claiming "add a
+      // friend" would be wrong for a user who has some.
+      renderShareList({ grants: null, availableFriends: [] });
+      expect(screen.queryByTestId('share-picker-hint')).toBeNull();
+    });
+  });
+
   // ── Gated off entirely on public (unencrypted) files ─────────────────
   it('renders nothing when isEncrypted is false, even with resolved grants', () => {
     renderShareList({ grants: [GRANT_A], isEncrypted: false });
