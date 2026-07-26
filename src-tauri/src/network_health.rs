@@ -72,6 +72,18 @@ pub struct NetworkHealthSnapshot {
     /// snapshot forward-compatible, matching `butler_deposits`).
     #[serde(default)]
     pub dm_fence: Option<DmFenceHealth>,
+    /// ZEB-803: ZEB-458 community-relay serving/pulling health. `None` when this
+    /// node runs no relay wiring at all (no owner identity, relay opt-in off),
+    /// which is a different statement from "wired but serving nothing" — the
+    /// latter is `Some` with zeroed counters, and is exactly the incident state.
+    /// Conflating the two would hide the bug this field exists to surface.
+    /// `#[serde(default)]` keeps a pre-field snapshot forward-compatible.
+    ///
+    /// Named `community_relay`, not `relay`, because `pkarr_status.relays`
+    /// already means the pkarr relay pool — an unqualified `relay` on the same
+    /// wire type would read as that.
+    #[serde(default)]
+    pub community_relay: Option<CommunityRelayHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -259,6 +271,125 @@ pub struct DmFenceHealth {
     pub stop_fence_skipped_contended: u64,
 }
 
+/// ZEB-803: the ZEB-458 community-relay path, both directions.
+///
+/// Motivated by a live incident: a relay acceptor served **zero pulls for 46
+/// minutes** while the process stayed alive and logged normally, and separately
+/// a channel message took **≥33 minutes** to reach a third node. Every existing
+/// surface read green throughout. The relay path is how channel history reaches
+/// a peer, so while it is down a node looks healthy from the inside and silent
+/// from the outside — indistinguishable from "nobody is talking".
+///
+/// Both directions are carried because the two ends cannot see each other:
+/// the incident needed a third node precisely because a serving fault and a
+/// pulling fault present identically to the peer observing them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityRelayHealth {
+    /// Outbound: are we serving pulls to peers who relay through us?
+    pub serving: CommunityRelayServingHealth,
+    /// Inbound: are we successfully pulling our own held blobs from relays?
+    pub pulling: CommunityRelayPullingHealth,
+}
+
+/// ZEB-803: acceptor side — the `harmony/community-relay-pull/v1` shell.
+///
+/// ## Reading this to tell a dead acceptor from an unreachable node
+///
+/// The incident left two hypotheses the logs could not separate: the acceptor
+/// task stopped accepting, or inbound reachability changed so peers could no
+/// longer reach a live acceptor. Both zero these counters, so this section
+/// alone does not decide it — but the snapshot already carries the tiebreak.
+///
+/// The iroh accept loop is **shared** across ALPNs (butler, friend, invite,
+/// pex, tunnel, relay). So compare against [`ButlerDepositHealth`]:
+///
+/// | relay counters | butler counters | reading |
+/// | -- | -- | -- |
+/// | flat | still moving | accept loop alive ⇒ **relay-specific fault** |
+/// | flat | flat | nothing is arriving ⇒ **reachability** |
+///
+/// `rejected` and `failed` are the other half: a connection that arrives and
+/// fails proves reachability was fine, which rules out hypothesis 2 outright.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityRelayServingHealth {
+    pub pulls_served: u64,
+    pub pulls_rejected: u64,
+    pub pulls_failed: u64,
+    /// Wall ms of the most recent successfully served pull, any peer. `None`
+    /// until this node serves its first. **This is the field the incident
+    /// wanted**: cadence is ~7m30s per peer, so a value older than ~3 cadences
+    /// while peers are believed connected is the signature.
+    pub last_served_ms: Option<u64>,
+    /// Per-peer, so one stuck peer is distinguishable from a dead acceptor.
+    /// Sorted by `last_served_ms` desc. Bounded — see `COMMUNITY_RELAY_PEER_CAP`.
+    pub peers: Vec<CommunityRelayPeerServed>,
+}
+
+/// ZEB-803: one peer's served-pull record. `peer_short` is 8 hex chars,
+/// truncated **at the writer** per the ZEB-329 redaction invariant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityRelayPeerServed {
+    pub peer_short: String,
+    pub last_served_ms: u64,
+    pub served_count: u64,
+}
+
+/// ZEB-803: puller side — [`crate::community_relay_pull_driver`].
+///
+/// ## Why `passes_run` matters more than the success counters
+///
+/// `passes_run` is a **liveness proof for the pull loop itself**, independent of
+/// whether any relay answered. A driver whose task died and a driver finding
+/// nothing to do are the same observation from the success counters alone; they
+/// differ here. That is the receiver-side mirror of the acceptor tiebreak above.
+///
+/// ## The silent paths this exists to expose
+///
+/// `run_one_pass` had three ways to do nothing and say nothing:
+///
+/// 1. a failed pull session — logged at `debug!`, filtered out in production;
+/// 2. a session that succeeded and ingested `0` blobs — logged nothing at all;
+/// 3. a joined community whose resolver returned **no fresh relay** — never
+///    entered the inner loop, so not even a debug line.
+///
+/// Path 3 is the dangerous one: it is indistinguishable from a healthy quiet
+/// channel, and it is a leading candidate for the ≥33-minute delivery lag.
+/// `passes_no_relay` counts it explicitly rather than leaving it inferable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityRelayPullingHealth {
+    /// Pull passes started. Climbs on the idle backstop even with zero joined
+    /// communities, so a flat value means the loop is gone, not merely idle.
+    pub passes_run: u64,
+    pub last_pass_ms: Option<u64>,
+    pub sessions_ok: u64,
+    pub sessions_failed: u64,
+    pub blobs_ingested: u64,
+    /// Wall ms of the last pass that actually ingested at least one blob.
+    pub last_ingest_ms: Option<u64>,
+    /// Silent path 3: a joined community examined with no fresh relay available.
+    /// Counted per (pass, community).
+    pub passes_no_relay: u64,
+    /// Bounded ring of recent per-relay session outcomes.
+    pub recent: Vec<CommunityRelayPullHit>,
+}
+
+/// ZEB-803: one pull-session outcome. Short-form ids only (ZEB-329).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityRelayPullHit {
+    pub community_short: String,
+    pub relay_device_short: String,
+    /// `"ok"` | `"failed"` | `"noRelay"`.
+    pub outcome: String,
+    /// Blobs ingested by this session (`0` for a failure or a no-op success).
+    pub ingested: u32,
+    pub captured_at_ms: u64,
+}
+
 /// ZEB-620: live per-peer-state tally derived from a supervisor
 /// [`states_snapshot`](crate::reconnect_supervisor::SupervisorHandle::states_snapshot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -416,6 +547,184 @@ impl PkarrFallbackTelemetry {
     }
 }
 
+const COMMUNITY_RELAY_PULL_RING_CAP: usize = 32;
+/// Peers retained in [`CommunityRelayServingHealth::peers`]. Bounded because a public
+/// relay serves an unbounded peer set; eviction is least-recently-served, so the
+/// entry that matters during an incident (the one that stopped) is the last to
+/// go, not the first.
+const COMMUNITY_RELAY_PEER_CAP: usize = 64;
+
+/// ZEB-803: process-lifetime relay-serving counters, shared (`Arc`) between
+/// [`crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor`]
+/// (writer) and `network_health_snapshot` (reader). Mirrors [`DialTelemetry`].
+#[derive(Debug, Default)]
+pub struct CommunityRelayServingTelemetry {
+    served: AtomicU64,
+    rejected: AtomicU64,
+    failed: AtomicU64,
+    last_served_ms: AtomicU64,
+    /// `peer_short → (last_served_ms, served_count)`.
+    peers: Mutex<std::collections::HashMap<String, (u64, u64)>>,
+}
+
+impl CommunityRelayServingTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one successfully served pull. `peer` is the remote iroh node id;
+    /// only the first 4 bytes (8 hex chars) are retained (ZEB-329).
+    pub fn record_served(&self, peer: &[u8; 32]) {
+        self.served.fetch_add(1, Ordering::Relaxed);
+        let now = now_ms();
+        self.last_served_ms.store(now, Ordering::Relaxed);
+        let key = hex::encode(&peer[..4]);
+        let mut peers = self.peers.lock().expect("relay serving peer map lock");
+        let entry = peers.entry(key).or_insert((0, 0));
+        entry.0 = now;
+        entry.1 += 1;
+        if peers.len() > COMMUNITY_RELAY_PEER_CAP {
+            // Evict least-recently-served. Cheap at this cap and only on growth.
+            if let Some(oldest) = peers
+                .iter()
+                .min_by_key(|(_, (last, _))| *last)
+                .map(|(k, _)| k.clone())
+            {
+                peers.remove(&oldest);
+            }
+        }
+    }
+
+    pub fn record_rejected(&self) {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_failed(&self) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn summary(&self) -> CommunityRelayServingHealth {
+        let mut peers: Vec<CommunityRelayPeerServed> = self
+            .peers
+            .lock()
+            .expect("relay serving peer map lock")
+            .iter()
+            .map(|(k, (last, count))| CommunityRelayPeerServed {
+                peer_short: k.clone(),
+                last_served_ms: *last,
+                served_count: *count,
+            })
+            .collect();
+        peers.sort_by(|a, b| {
+            b.last_served_ms
+                .cmp(&a.last_served_ms)
+                .then_with(|| a.peer_short.cmp(&b.peer_short))
+        });
+        let last = self.last_served_ms.load(Ordering::Relaxed);
+        CommunityRelayServingHealth {
+            pulls_served: self.served.load(Ordering::Relaxed),
+            pulls_rejected: self.rejected.load(Ordering::Relaxed),
+            pulls_failed: self.failed.load(Ordering::Relaxed),
+            // 0 is the "never served" sentinel: a real wall-clock stamp is never
+            // 0, and `Option<AtomicU64>` does not exist. Mapped back to `None`
+            // here so the wire type carries the honest absence rather than the
+            // epoch, which a UI would render as 1970.
+            last_served_ms: (last != 0).then_some(last),
+            peers,
+        }
+    }
+}
+
+/// ZEB-803: process-lifetime relay-pulling counters, shared (`Arc`) between
+/// [`crate::community_relay_pull_driver::CommunityRelayPullDriver`] (writer) and
+/// `network_health_snapshot` (reader).
+#[derive(Debug, Default)]
+pub struct CommunityRelayPullTelemetry {
+    passes_run: AtomicU64,
+    last_pass_ms: AtomicU64,
+    sessions_ok: AtomicU64,
+    sessions_failed: AtomicU64,
+    blobs_ingested: AtomicU64,
+    last_ingest_ms: AtomicU64,
+    passes_no_relay: AtomicU64,
+    recent: Mutex<VecDeque<CommunityRelayPullHit>>,
+}
+
+impl CommunityRelayPullTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the START of a pull pass. Deliberately recorded before any work,
+    /// and unconditionally — including when the node has joined no communities —
+    /// because this counter's job is to prove the loop is alive, not that it
+    /// found something to do.
+    pub fn record_pass_start(&self) {
+        self.passes_run.fetch_add(1, Ordering::Relaxed);
+        self.last_pass_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Silent path 3: a joined community with no fresh relay to pull from.
+    pub fn record_no_relay(&self, community: &[u8; 16]) {
+        self.passes_no_relay.fetch_add(1, Ordering::Relaxed);
+        self.push(community, &[0u8; 32], "noRelay", 0);
+    }
+
+    /// A completed pull session. `ingested == 0` is a success, not a failure —
+    /// it means the relay held nothing for us.
+    pub fn record_session_ok(&self, community: &[u8; 16], relay_device: &[u8; 32], ingested: u32) {
+        self.sessions_ok.fetch_add(1, Ordering::Relaxed);
+        if ingested > 0 {
+            self.blobs_ingested
+                .fetch_add(u64::from(ingested), Ordering::Relaxed);
+            self.last_ingest_ms.store(now_ms(), Ordering::Relaxed);
+        }
+        self.push(community, relay_device, "ok", ingested);
+    }
+
+    pub fn record_session_failed(&self, community: &[u8; 16], relay_device: &[u8; 32]) {
+        self.sessions_failed.fetch_add(1, Ordering::Relaxed);
+        self.push(community, relay_device, "failed", 0);
+    }
+
+    fn push(&self, community: &[u8; 16], relay_device: &[u8; 32], outcome: &str, ingested: u32) {
+        let hit = CommunityRelayPullHit {
+            community_short: hex::encode(&community[..4]),
+            relay_device_short: hex::encode(&relay_device[..4]),
+            outcome: outcome.to_string(),
+            ingested,
+            captured_at_ms: now_ms(),
+        };
+        let mut ring = self.recent.lock().expect("relay pull ring lock");
+        if ring.len() == COMMUNITY_RELAY_PULL_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(hit);
+    }
+
+    pub fn summary(&self) -> CommunityRelayPullingHealth {
+        let last_pass = self.last_pass_ms.load(Ordering::Relaxed);
+        let last_ingest = self.last_ingest_ms.load(Ordering::Relaxed);
+        CommunityRelayPullingHealth {
+            passes_run: self.passes_run.load(Ordering::Relaxed),
+            // Same 0-as-never sentinel as `CommunityRelayServingTelemetry::summary`.
+            last_pass_ms: (last_pass != 0).then_some(last_pass),
+            sessions_ok: self.sessions_ok.load(Ordering::Relaxed),
+            sessions_failed: self.sessions_failed.load(Ordering::Relaxed),
+            blobs_ingested: self.blobs_ingested.load(Ordering::Relaxed),
+            last_ingest_ms: (last_ingest != 0).then_some(last_ingest),
+            passes_no_relay: self.passes_no_relay.load(Ordering::Relaxed),
+            recent: self
+                .recent
+                .lock()
+                .expect("relay pull ring lock")
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ReachabilityStatus {
@@ -507,6 +816,8 @@ impl NetworkHealthSnapshot {
             butler_deposits: None,
             // ZEB-710: no service ⇒ no fence source installed.
             dm_fence: None,
+            // ZEB-803: no service ⇒ no relay telemetry source wired.
+            community_relay: None,
         }
     }
 }
@@ -926,6 +1237,17 @@ pub struct NetworkHealthService {
     /// [`set_dm_fence_source`](Self::set_dm_fence_source), additive like the
     /// other `set_*` sources.
     dm_fence: Option<std::sync::Arc<crate::dm_outbox::DmFenceStats>>,
+    /// ZEB-803: community-relay ACCEPTOR telemetry — the SAME `Arc` the pull
+    /// shell increments. `None` on nodes with no relay acceptor installed.
+    /// Installed at boot via
+    /// [`set_community_relay_serving_source`](Self::set_community_relay_serving_source).
+    community_relay_serving: Option<std::sync::Arc<CommunityRelayServingTelemetry>>,
+    /// ZEB-803: community-relay PULL-DRIVER telemetry — the SAME `Arc` the
+    /// driver loop increments. Held separately from the serving source because
+    /// a node can run one without the other, and the incident turned on being
+    /// able to say which side was dark. Installed at boot via
+    /// [`set_community_relay_pull_source`](Self::set_community_relay_pull_source).
+    community_relay_pulling: Option<std::sync::Arc<CommunityRelayPullTelemetry>>,
 }
 
 impl NetworkHealthService {
@@ -955,6 +1277,8 @@ impl NetworkHealthService {
             self_owner: None,
             butler_deposits: None,
             dm_fence: None,
+            community_relay_serving: None,
+            community_relay_pulling: None,
         }
     }
 
@@ -1019,6 +1343,24 @@ impl NetworkHealthService {
         src: std::sync::Arc<crate::dm_outbox::DmFenceStats>,
     ) {
         self.dm_fence = Some(src);
+    }
+
+    /// ZEB-803: install the community-relay ACCEPTOR telemetry source (the same
+    /// `Arc` the pull shell writes). Additive — when unset,
+    /// `snapshot().community_relay` reports `None` for a node with no acceptor.
+    pub(crate) fn set_community_relay_serving_source(
+        &mut self,
+        src: std::sync::Arc<CommunityRelayServingTelemetry>,
+    ) {
+        self.community_relay_serving = Some(src);
+    }
+
+    /// ZEB-803: install the community-relay PULL-DRIVER telemetry source.
+    pub(crate) fn set_community_relay_pull_source(
+        &mut self,
+        src: std::sync::Arc<CommunityRelayPullTelemetry>,
+    ) {
+        self.community_relay_pulling = Some(src);
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -1269,6 +1611,22 @@ impl NetworkHealthService {
                 phase_c_saturated_skips: s.phase_c_saturated_skips(),
                 stop_fence_skipped_contended: s.stop_fence_skipped_contended(),
             }),
+            // ZEB-803: `Some` when EITHER side is wired — a node can serve
+            // without pulling (relay-only) or pull without serving (opt-in off),
+            // and the whole point of the section is saying which side is dark.
+            // The unwired side reports its zeroed default rather than suppressing
+            // the section, so "not running" is never dressed up as "running and
+            // idle". Only a node with neither reports `None`.
+            community_relay: match (
+                self.community_relay_serving.as_ref(),
+                self.community_relay_pulling.as_ref(),
+            ) {
+                (None, None) => None,
+                (serving, pulling) => Some(CommunityRelayHealth {
+                    serving: serving.map(|s| s.summary()).unwrap_or_default(),
+                    pulling: pulling.map(|p| p.summary()).unwrap_or_default(),
+                }),
+            },
         }
     }
 
@@ -2909,6 +3267,7 @@ mod tests {
             transport_disabled_reason: None,
             butler_deposits: None,
             dm_fence: None,
+            community_relay: None,
         }
     }
 
@@ -4551,6 +4910,234 @@ mod tests {
         let snap = NetworkHealthSnapshot::empty();
         assert_eq!(snap.dial_status.attempts, 0);
         assert!(snap.dial_status.recent.is_empty());
+    }
+
+    // ── ZEB-803: community-relay serving / pulling telemetry ──
+
+    #[test]
+    fn never_served_relay_reports_none_not_epoch() {
+        // The 0-sentinel must surface as absence. If this regresses, the panel
+        // renders 1970 and "never served" reads as "served 56 years ago" —
+        // which during the incident would look like data rather than a gap.
+        let t = CommunityRelayServingTelemetry::new();
+        let s = t.summary();
+        assert_eq!(s.last_served_ms, None, "never-served must be None, not 0");
+        assert_eq!(s.pulls_served, 0);
+        assert!(s.peers.is_empty());
+
+        let p = CommunityRelayPullTelemetry::new();
+        let ps = p.summary();
+        assert_eq!(ps.last_pass_ms, None);
+        assert_eq!(ps.last_ingest_ms, None);
+    }
+
+    #[test]
+    fn serving_telemetry_tracks_per_peer_last_served() {
+        let t = CommunityRelayServingTelemetry::new();
+        let a = [0xAAu8; 32];
+        let b = [0xBBu8; 32];
+        t.record_served(&a);
+        t.record_served(&b);
+        t.record_served(&b);
+        t.record_rejected();
+        t.record_failed();
+
+        let s = t.summary();
+        assert_eq!(s.pulls_served, 3);
+        assert_eq!(s.pulls_rejected, 1);
+        assert_eq!(s.pulls_failed, 1);
+        assert!(s.last_served_ms.is_some());
+        assert_eq!(s.peers.len(), 2, "one row per peer");
+
+        let bb = s
+            .peers
+            .iter()
+            .find(|p| p.peer_short == "bbbbbbbb")
+            .expect("peer b present");
+        assert_eq!(bb.served_count, 2);
+        // Short-form only — the full 32-byte id must never reach the wire.
+        assert_eq!(bb.peer_short.len(), 8, "ZEB-329 redaction: 8 hex chars");
+        for p in &s.peers {
+            assert!(
+                !p.peer_short.contains("aaaaaaaaaa"),
+                "must not carry more than 4 bytes of the node id"
+            );
+        }
+    }
+
+    #[test]
+    fn serving_peer_map_is_bounded_and_evicts_least_recently_served() {
+        // A public relay serves an unbounded peer set; the map must not grow
+        // without bound. Eviction is least-recently-served so the peer that
+        // STOPPED being served is the last to be dropped — during an incident
+        // that row is the evidence.
+        let t = CommunityRelayServingTelemetry::new();
+        for i in 0..(COMMUNITY_RELAY_PEER_CAP + 10) {
+            let mut peer = [0u8; 32];
+            peer[0] = (i / 256) as u8;
+            peer[1] = (i % 256) as u8;
+            peer[2] = 0xCC;
+            peer[3] = 0xDD;
+            t.record_served(&peer);
+        }
+        let s = t.summary();
+        assert!(
+            s.peers.len() <= COMMUNITY_RELAY_PEER_CAP,
+            "peer map must stay bounded, got {}",
+            s.peers.len()
+        );
+        assert_eq!(
+            s.pulls_served,
+            (COMMUNITY_RELAY_PEER_CAP + 10) as u64,
+            "the counter is NOT capped even though the map is"
+        );
+    }
+
+    #[test]
+    fn serving_peers_sorted_newest_first() {
+        let t = CommunityRelayServingTelemetry::new();
+        t.record_served(&[0x11u8; 32]);
+        t.record_served(&[0x22u8; 32]);
+        let s = t.summary();
+        let stamps: Vec<u64> = s.peers.iter().map(|p| p.last_served_ms).collect();
+        let mut sorted = stamps.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(stamps, sorted, "peers must be newest-served first");
+    }
+
+    #[test]
+    fn pull_pass_counter_climbs_even_when_nothing_to_do() {
+        // This is the loop-liveness proof. A driver whose task died and a driver
+        // with no joined communities are identical in the success counters; they
+        // MUST differ here, or the receiver side keeps the blind spot that let a
+        // >=33-minute delivery lag look like a quiet channel.
+        let p = CommunityRelayPullTelemetry::new();
+        p.record_pass_start();
+        p.record_pass_start();
+        let s = p.summary();
+        assert_eq!(s.passes_run, 2);
+        assert!(s.last_pass_ms.is_some());
+        assert_eq!(s.sessions_ok, 0, "no session ran");
+        assert_eq!(s.blobs_ingested, 0);
+    }
+
+    #[test]
+    fn zero_ingest_session_is_success_not_failure() {
+        // A relay holding nothing for us is a healthy answer. Counting it as a
+        // failure would cry wolf on every idle pass; counting it as nothing at
+        // all is silent path 2 from the module docs.
+        let p = CommunityRelayPullTelemetry::new();
+        p.record_session_ok(&[7u8; 16], &[9u8; 32], 0);
+        let s = p.summary();
+        assert_eq!(s.sessions_ok, 1);
+        assert_eq!(s.sessions_failed, 0);
+        assert_eq!(s.blobs_ingested, 0);
+        assert_eq!(
+            s.last_ingest_ms, None,
+            "a 0-blob success must not stamp last_ingest_ms"
+        );
+        assert_eq!(s.recent.len(), 1);
+        assert_eq!(s.recent[0].outcome, "ok");
+    }
+
+    #[test]
+    fn no_relay_path_is_counted_distinctly_from_failure() {
+        // Silent path 3: a joined community with no fresh relay never entered
+        // the inner loop and produced no log line at all. It must be
+        // distinguishable from a relay that was tried and failed, because the
+        // remedies differ (stale/absent announce vs transport fault).
+        let p = CommunityRelayPullTelemetry::new();
+        p.record_no_relay(&[3u8; 16]);
+        p.record_session_failed(&[3u8; 16], &[4u8; 32]);
+        let s = p.summary();
+        assert_eq!(s.passes_no_relay, 1);
+        assert_eq!(s.sessions_failed, 1);
+        assert_eq!(
+            s.sessions_ok, 0,
+            "neither path may be mistaken for a success"
+        );
+        let outcomes: Vec<&str> = s.recent.iter().map(|h| h.outcome.as_str()).collect();
+        assert_eq!(outcomes, vec!["noRelay", "failed"]);
+    }
+
+    #[test]
+    fn pull_ring_is_bounded() {
+        let p = CommunityRelayPullTelemetry::new();
+        for _ in 0..(COMMUNITY_RELAY_PULL_RING_CAP + 5) {
+            p.record_session_failed(&[1u8; 16], &[2u8; 32]);
+        }
+        let s = p.summary();
+        assert_eq!(s.recent.len(), COMMUNITY_RELAY_PULL_RING_CAP, "ring must be capped");
+        assert_eq!(
+            s.sessions_failed,
+            (COMMUNITY_RELAY_PULL_RING_CAP + 5) as u64,
+            "counter is not capped"
+        );
+    }
+
+    #[test]
+    fn relay_health_wire_keys_are_camel_case() {
+        // NetworkHealthSnapshot is serde-wire and read by the TS adapter; the
+        // exact key spellings are the contract.
+        let t = CommunityRelayServingTelemetry::new();
+        t.record_served(&[0xEEu8; 32]);
+        let p = CommunityRelayPullTelemetry::new();
+        p.record_pass_start();
+        p.record_no_relay(&[5u8; 16]);
+        let health = CommunityRelayHealth {
+            serving: t.summary(),
+            pulling: p.summary(),
+        };
+        let v = serde_json::to_value(&health).expect("serialize");
+        let serving = &v["serving"];
+        for k in [
+            "pullsServed",
+            "pullsRejected",
+            "pullsFailed",
+            "lastServedMs",
+            "peers",
+        ] {
+            assert!(serving.get(k).is_some(), "missing serving key {k}");
+        }
+        assert!(serving["peers"][0].get("peerShort").is_some());
+        assert!(serving["peers"][0].get("lastServedMs").is_some());
+        assert!(serving["peers"][0].get("servedCount").is_some());
+        let pulling = &v["pulling"];
+        for k in [
+            "passesRun",
+            "lastPassMs",
+            "sessionsOk",
+            "sessionsFailed",
+            "blobsIngested",
+            "lastIngestMs",
+            "passesNoRelay",
+            "recent",
+        ] {
+            assert!(pulling.get(k).is_some(), "missing pulling key {k}");
+        }
+        assert!(pulling["recent"][0].get("communityShort").is_some());
+        assert!(pulling["recent"][0].get("relayDeviceShort").is_some());
+        assert!(pulling["recent"][0].get("capturedAtMs").is_some());
+    }
+
+    #[test]
+    fn snapshot_without_relay_field_still_deserializes() {
+        // Forward-compat: a cached/exported snapshot written before ZEB-803 must
+        // still load. Same guarantee butlerDeposits and dmFence carry.
+        let mut v = serde_json::to_value(NetworkHealthSnapshot::empty()).expect("serialize");
+        v.as_object_mut().expect("object").remove("communityRelay");
+        let back: NetworkHealthSnapshot =
+            serde_json::from_value(v).expect("pre-ZEB-803 snapshot must still deserialize");
+        assert_eq!(back.community_relay, None);
+    }
+
+    #[test]
+    fn empty_snapshot_relay_is_none_not_zeroed() {
+        // `None` means "no relay wiring on this node"; `Some` with zeroed
+        // counters means "wired and serving nothing" — the incident state.
+        // Collapsing them would hide exactly what this field is for.
+        let snap = NetworkHealthSnapshot::empty();
+        assert_eq!(snap.community_relay, None);
     }
 
     // ── ZEB-620 Task 6: supervisor-state telemetry + PeerHealth feeds ──
