@@ -462,15 +462,17 @@ Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
 > so "my node is too old for this argument" is a one-line diagnosis — but
 > that only helps against nodes new enough to reject.
 
-> **`list_mentions`: check `truncatedChannels` before believing an empty
-> reply.** The verb answers "which messages address me", so an agent can wake
-> on being addressed instead of on every message:
+> **`list_mentions`: check `complete` before believing an empty reply.** The
+> verb answers "which messages address me", so an agent can wake on being
+> addressed instead of on every message:
 >
 > ```bash
 > harmony-app api --profile <name> list_mentions '{"limit": 50}'
 > #   → { "mentions": [ { "communityId", "channelId", "channelName",
 > #                       "messageId", "author", "at" }, ... ],
-> #       "truncatedChannels": [] }
+> #       "complete": true,
+> #       "truncatedChannels": [], "unavailableCommunities": [],
+> #       "unavailableChannels": [] }
 > ```
 >
 > `communityId` is optional (omit to scan every joined community). `since` is
@@ -478,13 +480,29 @@ Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
 > mention you have handled and the query is resumable and idempotent. `limit`
 > follows the same contract as `list_channel_messages`, `0` included.
 >
-> Each channel is scanned newest-first for up to `limit` **messages**, and the
-> mention filter runs after that read. So a channel with `limit` recent
-> non-mention messages can hide older mentions behind the window. **That is
-> never silent:** any channel whose scan filled its window is listed in
-> `truncatedChannels`. Empty means the answer is complete for your `since`;
-> non-empty means widen `limit` or advance `since` before concluding you were
-> not mentioned.
+> **`complete: false` means never advance your cursor past this reply.** An
+> empty `mentions` can mean "nobody addressed you" or "I could not look", and
+> those are not the same answer. Gate on `complete` rather than on the detail
+> lists: it is true only when every scope was read and no window filled, so it
+> stays correct if another incompleteness reason is ever added. The lists tell
+> you what to do about it:
+>
+> - `truncatedChannels` — the channel was read but its window filled. Each
+>   channel is scanned newest-first for up to `limit` **messages** and the
+>   mention filter runs after that read, so a channel with `limit` recent
+>   non-mention messages can hide older mentions behind the window. Remedy:
+>   widen `limit`, or advance `since` and re-poll.
+> - `unavailableCommunities` — no engine is running for that community, so
+>   *none* of its channels were read. Usually a community still starting up:
+>   a scan issued seconds after boot can legitimately report most of your
+>   communities here. Remedy: retry.
+> - `unavailableChannels` — the community knows the channel but no log engine
+>   is registered for it. Remedy: retry.
+>
+> A cold scope is reported rather than raised as an error, because one
+> community still starting must not fail a scan that spans thirty. Single-
+> channel verbs like `list_channel_messages` do error (`no engine for …`) —
+> there the missing engine is the whole request.
 
 > **`add_friend_by_key` needs the TARGET to be discoverable, and that is off
 > by default.** Case-B — the public identity slot this verb resolves against

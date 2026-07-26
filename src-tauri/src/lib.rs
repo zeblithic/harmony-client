@@ -31193,16 +31193,41 @@ const DEFAULT_MENTION_SCAN_LIMIT: u32 = 256;
 /// array as "you were not mentioned". That is exactly the shape of ZEB-789
 /// (a successful call returning a plausible, frozen window), so the verb
 /// this PR adds must not reproduce it.
+///
+/// ## Read [`complete`](Self::complete), not the detail lists
+///
+/// `complete` is derivable from the three lists below and is serialized
+/// anyway, because deriving it is precisely the mistake this PR already
+/// made once. The first cut shipped a single incompleteness reason
+/// (`truncated_channels`) and review found two more the same day
+/// (Greptile, PR #554): a caller who had written
+/// `truncatedChannels.length === 0` became silently wrong the moment a
+/// second reason existed. Reading `complete` stays correct if a third is
+/// ever found. The lists say *what to do about it*; the flag says
+/// *whether `mentions` can be trusted at all*.
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MentionScanDto {
     /// Newest-first across every scanned channel, capped at `limit`.
     pub mentions: Vec<MentionDto>,
+    /// True when `mentions` is every mention at or after `since`. False
+    /// when any scope below went unread — **never advance a polling cursor
+    /// past a reply whose `complete` is false**, or the unread scope's
+    /// mentions are skipped permanently.
+    pub complete: bool,
     /// Channel ids whose scan filled its window, so mentions may exist
-    /// beyond it. **Empty means the answer is complete** for the given
-    /// `since`; non-empty means widen `limit` or advance `since` before
-    /// concluding anything from a short `mentions` list.
+    /// beyond it. Remedy: widen `limit`, or advance `since` and re-poll.
     pub truncated_channels: Vec<String>,
+    /// Community ids that could not be scanned at all — no engine is
+    /// running for them, so *none* of their channels were read. Usually a
+    /// community still starting up; a community whose Space carries no
+    /// `admin_addr` never gets an engine and stays listed. Remedy: retry.
+    /// Distinct from `truncated_channels` because widening `limit` does
+    /// nothing here — there was no read to widen.
+    pub unavailable_communities: Vec<String>,
+    /// Channel ids their community knows about but which have no log
+    /// engine registered, so they were not read. Remedy: retry.
+    pub unavailable_channels: Vec<String>,
 }
 
 /// Tauri IPC: list messages that mention the local owner.
@@ -31252,8 +31277,28 @@ pub struct MentionScanDto {
 /// reply names every channel whose scan filled its window
 /// ([`MentionScanDto::truncated_channels`]); a caller seeing its channel
 /// listed knows to widen `limit` or advance `since` rather than concluding
-/// it was not mentioned. An empty `truncated_channels` means the answer is
-/// complete for the given `since`.
+/// it was not mentioned.
+///
+/// ## Scopes that could not be read at all
+///
+/// A scan spans many channels, so a cold one must not fail the whole query
+/// the way it does on single-channel verbs — `list_channel_messages` and
+/// every other engine caller in this file return
+/// `Err("no engine for …")`, which is right when the missing engine *is*
+/// the entire request and wrong when it is one of thirty scopes. The first
+/// cut drew the wrong conclusion from that: it skipped silently, so a
+/// community still starting up, or a channel with no log engine, produced
+/// an empty scan that reported itself complete (Greptile, PR #554). A
+/// polling agent would advance its cursor straight past those mentions and
+/// never see them — ZEB-789's defect once more, now in the verb written to
+/// prevent it.
+///
+/// Not-an-error and not-reported are different things. Unreadable scopes
+/// are named instead: [`MentionScanDto::unavailable_communities`] and
+/// [`MentionScanDto::unavailable_channels`], with
+/// [`MentionScanDto::complete`] false whenever either is non-empty. The
+/// query still succeeds, and the caller can tell "no mentions" from "I
+/// could not look".
 ///
 /// `limit` matches `list_channel_messages`' boundary contract exactly,
 /// including `0` meaning "engine default", because a caller who learned the
@@ -31334,7 +31379,11 @@ pub(crate) async fn list_mentions_impl(
     // mentions. `communities_for_nav` uses the same predicate for the same
     // meaning; matching it is what keeps "which communities am I in" one
     // answer instead of two.
-    let communities: Vec<(crate::owner_state_types::SpaceId, [u8; 16])> = {
+    // `admin_addr` stays an Option through the collect so the loop can
+    // report the communities that lack one. Dropping them here with a
+    // `filter_map` — the first cut — made them vanish from the scan with no
+    // trace in the reply (Greptile, PR #554).
+    let communities: Vec<(crate::owner_state_types::SpaceId, Option<[u8; 16]>)> = {
         let s = crdt_state.lock().await;
         s.spaces
             .iter()
@@ -31343,7 +31392,7 @@ pub(crate) async fn list_mentions_impl(
                     && sp.left_at.is_none()
                     && filter.as_ref().is_none_or(|f| f == *id)
             })
-            .filter_map(|(id, sp)| sp.admin_addr.map(|admin| (*id, admin.0)))
+            .map(|(id, sp)| (*id, sp.admin_addr.map(|admin| admin.0)))
             .collect()
     };
 
@@ -31355,13 +31404,26 @@ pub(crate) async fn list_mentions_impl(
 
     let mut out: Vec<MentionDto> = Vec::new();
     let mut truncated_channels: Vec<String> = Vec::new();
+    let mut unavailable_communities: Vec<String> = Vec::new();
+    let mut unavailable_channels: Vec<String> = Vec::new();
     for (space_id, admin_bytes) in communities {
+        let community_hex = hex::encode(space_id.0);
+        // No `admin_addr` means boot logged "missing admin_addr — skipping
+        // engine spawn" and moved on, so this community has no engine now
+        // and will not grow one. Nothing to read is not the same as nothing
+        // to find.
+        let Some(admin_bytes) = admin_bytes else {
+            unavailable_communities.push(community_hex);
+            continue;
+        };
         let admin_addr = crate::owner_state_types::OwnerAddr(admin_bytes);
         let Some(engine_state) = community_registry.state_for(&space_id).await else {
-            // Not started yet. A community whose engine is absent has no
-            // locally-readable log, so it contributes nothing — skipping is
-            // correct, and erroring would make one cold community break the
-            // whole query.
+            // Not started yet — the condition this file elsewhere calls
+            // "not joined or not yet started". Erroring would let one cold
+            // community break the whole scan, so this stays a skip; but a
+            // skipped community is an unread scope, and the reply has to
+            // say so or the caller reads absence as proof.
+            unavailable_communities.push(community_hex);
             continue;
         };
         let materialized = {
@@ -31371,6 +31433,10 @@ pub(crate) async fn list_mentions_impl(
 
         for (channel_id, info) in materialized.channels.iter() {
             let Some(engine) = channel_log_registry.engine(&space_id, channel_id).await else {
+                // The community knows this channel but no log engine is
+                // registered for it, so it was not read. Same reasoning as
+                // the community arm: skip, but never silently.
+                unavailable_channels.push(hex::encode(channel_id.0));
                 continue;
             };
             // Newest-first, so the `limit` below keeps the most recent
@@ -31435,9 +31501,22 @@ pub(crate) async fn list_mentions_impl(
     }
     truncated_channels.sort();
     truncated_channels.dedup();
+    unavailable_communities.sort();
+    unavailable_communities.dedup();
+    unavailable_channels.sort();
+    unavailable_channels.dedup();
+    // Derived once, here, so a caller never has to know the full set of
+    // reasons a scan can come back short — that set grew twice during this
+    // PR's review alone.
+    let complete = truncated_channels.is_empty()
+        && unavailable_communities.is_empty()
+        && unavailable_channels.is_empty();
     Ok(MentionScanDto {
         mentions: out,
+        complete,
         truncated_channels,
+        unavailable_communities,
+        unavailable_channels,
     })
 }
 
@@ -34249,6 +34328,11 @@ mod create_community_inner_tests {
              may be reported as truncated: {:?}",
             seen.truncated_channels
         );
+        assert!(
+            seen.complete,
+            "every scope was read and no window filled, so the scan is \
+             complete: {seen:?}"
+        );
 
         // ── The community filter, now falsifiable ───────────────────────
         //
@@ -34293,6 +34377,12 @@ mod create_community_inner_tests {
         assert!(
             !capped.truncated_channels.is_empty(),
             "a window smaller than the channel must be reported as truncated"
+        );
+        assert!(
+            !capped.complete,
+            "a truncated scan is not a complete one — `complete` is the flag \
+             callers are told to gate their cursor on, so it must track every \
+             incompleteness reason, not just the ones added first"
         );
 
         // ── Boundary parity with list_channel_messages ──────────────────
@@ -34434,6 +34524,161 @@ mod create_community_inner_tests {
             after.mentions.is_empty(),
             "a community you have left must not raise mentions: {:?}",
             after.mentions
+        );
+    }
+
+    /// ZEB-780 + Greptile (PR #554): a scope that could not be read must be
+    /// named, never silently skipped.
+    ///
+    /// The scan spans many channels, so one cold community must not fail the
+    /// whole query — that is why these are skips and not `Err`. The first cut
+    /// concluded from that they could be *silent*, which is the ZEB-789 defect
+    /// this very verb exists to prevent: the reply looked like "you were not
+    /// mentioned" when it meant "I could not look". A polling agent would
+    /// advance its cursor past those mentions and never see them.
+    ///
+    /// Each arm drives a distinct real path: a community whose engine never
+    /// started (boot, or a join still settling), a Space carrying no
+    /// `admin_addr` (boot logs "skipping engine spawn" and it never gets one),
+    /// and a channel whose log engine has been stopped. All three previously
+    /// returned an empty scan reporting itself complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_mentions_reports_scopes_it_could_not_read() {
+        let fixture = build_create_community_test_fixture().await;
+        let snapshot_gen = fixture.snapshot_generation();
+
+        let community_id_hex = create_community_inner(
+            "zeb780-unreadable".to_string(),
+            false,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None,
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            snapshot_gen,
+            &fixture.node_state,
+        )
+        .await
+        .expect("create_community_inner must succeed");
+
+        let live_space = crate::owner_state_types::SpaceId(
+            <[u8; 16]>::try_from(hex::decode(&community_id_hex).expect("hex").as_slice())
+                .expect("16 bytes"),
+        );
+
+        // Same shape the sibling mention tests use: the fixture's own
+        // `node_state` carries only `community_registry`, which is not enough
+        // to drive a scan.
+        let node_state = std::sync::Mutex::new(NodeState {
+            hlc_tracker: Some(std::sync::Arc::clone(&fixture.hlc_tracker)),
+            dm_device_id: Some(fixture.device_id.clone()),
+            dm_self_owner: Some(fixture.self_owner),
+            crdt_state: Some(std::sync::Arc::clone(&fixture.crdt_state)),
+            community_registry: Some(std::sync::Arc::clone(&fixture.community_registry)),
+            channel_log_registry: Some(std::sync::Arc::clone(&fixture.channel_log_registry)),
+            dm_outbox: Some(synthetic_dm_outbox_for_test(&fixture, 0x7e)),
+            ..NodeState::default()
+        });
+
+        // Baseline: one live, fully-readable community. If this is not
+        // complete, every assertion below is meaningless.
+        let base = list_mentions_impl(&node_state, None, None, 100)
+            .await
+            .expect("baseline scan must succeed");
+        assert!(
+            base.complete,
+            "precondition: a single live community is fully readable: {base:?}"
+        );
+
+        // ── A community in owner-state whose engine never started ────────
+        //
+        // Exactly the boot window: the Space is replayed from owner-state
+        // before `spawn_engine_inner_now` has run for it, so `state_for`
+        // returns None. `admin_addr` is Some here, isolating the engine arm
+        // from the admin arm below.
+        let cold = crate::owner_state_types::SpaceId([0xc0; 16]);
+        let no_admin = crate::owner_state_types::SpaceId([0xda; 16]);
+        {
+            let mut s = fixture.crdt_state.lock().await;
+            let template = s.spaces.get(&live_space).expect("live space").clone();
+            s.spaces.insert(
+                cold,
+                crate::owner_state_types::Space {
+                    id: cold,
+                    name: "engine-not-started".into(),
+                    admin_addr: Some(fixture.self_owner),
+                    ..template.clone()
+                },
+            );
+            s.spaces.insert(
+                no_admin,
+                crate::owner_state_types::Space {
+                    id: no_admin,
+                    name: "no-admin-addr".into(),
+                    admin_addr: None,
+                    ..template
+                },
+            );
+        }
+
+        let scan = list_mentions_impl(&node_state, None, None, 100)
+            .await
+            .expect("a cold community must not fail the whole scan");
+        let cold_hex = hex::encode(cold.0);
+        let no_admin_hex = hex::encode(no_admin.0);
+        assert!(
+            scan.unavailable_communities.contains(&cold_hex),
+            "a community with no running engine was not read, so it must be \
+             named — silence here is indistinguishable from 'no mentions': \
+             {scan:?}"
+        );
+        assert!(
+            scan.unavailable_communities.contains(&no_admin_hex),
+            "a Space with no admin_addr never gets an engine, so it is \
+             unreadable too and must be named rather than dropped by the \
+             collect: {scan:?}"
+        );
+        assert!(
+            !scan.complete,
+            "`complete` must be false whenever any scope went unread — this \
+             is the single flag callers gate their cursor on: {scan:?}"
+        );
+
+        // ── A channel whose log engine is gone ───────────────────────────
+        //
+        // Driven through the registry's real `stop`, which removes the entry
+        // the same way shutdown does, so the community still lists the
+        // channel while `engine()` returns None.
+        let channels = list_channels_impl(&node_state, community_id_hex.clone())
+            .await
+            .expect("live community must list its channels");
+        let victim = channels.first().expect("community has a channel").clone();
+        let victim_id = crate::community_membership::ChannelId(
+            <[u8; 16]>::try_from(hex::decode(&victim.channel_id).expect("hex").as_slice())
+                .expect("16 bytes"),
+        );
+        fixture
+            .channel_log_registry
+            .stop(&live_space, &victim_id)
+            .await
+            .expect("stopping a channel log engine must succeed");
+
+        let after = list_mentions_impl(&node_state, Some(community_id_hex.clone()), None, 100)
+            .await
+            .expect("a stopped channel must not fail the scan");
+        assert!(
+            after.unavailable_channels.contains(&victim.channel_id),
+            "the community still knows this channel but it has no log engine, \
+             so it went unread and must be named: {after:?}"
+        );
+        assert!(
+            !after.complete,
+            "an unread channel makes the scan incomplete: {after:?}"
         );
     }
 
