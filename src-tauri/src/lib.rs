@@ -1120,6 +1120,12 @@ pub struct NodeState {
     /// an owner identity is running.
     community_presence_request_tx:
         Option<tokio::sync::mpsc::Sender<crate::event_loop::CommunityPresenceRequest>>,
+    /// ZEB-815: control channel into the event-loop's address-book task pool.
+    /// Sent from the SAME IPC sites as `community_presence_request_tx` — a
+    /// community's address book syncs for exactly as long as the node is
+    /// subscribed to that community. `None` until a node with an owner
+    /// identity is running.
+    addrbook_request_tx: Option<tokio::sync::mpsc::Sender<crate::event_loop::AddressBookRequest>>,
     /// ZEB-537: the live community-presence roster map, shared with the event
     /// loop's subscriber + sweeper tasks. IPC reads the roster from here.
     community_presence_map:
@@ -1944,6 +1950,7 @@ impl Default for NodeState {
                 std::sync::atomic::AtomicU64::new(1),
             ),
             community_presence_request_tx: None,
+            addrbook_request_tx: None,
             community_presence_map: None,
             // ZEB-290 Phase 1 Task 11 + ZEB-291 Task 19 migration: voting
             // log registry starts empty and survives stop_node (in-memory
@@ -2636,6 +2643,9 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.profile_card_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         guard.community_presence_request_tx = None;
+        // ZEB-815: dropping the sender closes the addrbook pool's request
+        // channel, whose terminal drain aborts every per-community task group.
+        guard.addrbook_request_tx = None;
         guard.community_presence_map = None;
         // Mint Phase 2 sync: take before releasing the lock so a concurrent
         // IPC doesn't race to call notify_dirty on a shutting-down engine.
@@ -3678,6 +3688,9 @@ pub async fn start_node_inner(
         guard.profile_card_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         guard.community_presence_request_tx = None;
+        // ZEB-815: dropping the sender closes the addrbook pool's request
+        // channel, whose terminal drain aborts every per-community task group.
+        guard.addrbook_request_tx = None;
         guard.community_presence_map = None;
         // Mint Phase 2 sync: take the prior identity's engine so it can be
         // shut down outside the lock below (same pattern as sync_engine).
@@ -4388,6 +4401,15 @@ pub async fn start_node_inner(
         // keeps `community_presence_map_for_state`.
         let (community_presence_request_tx, community_presence_request_rx) =
             tokio::sync::mpsc::channel::<crate::event_loop::CommunityPresenceRequest>(64);
+        // ZEB-815: address-book request channel + the node-wide store. Created
+        // beside the presence pair because the two are driven from the same IPC
+        // sites (subscribe/unsubscribe a community). The book holds every
+        // community's rows in one map; the event loop's pool spawns the
+        // per-community sync tasks against it.
+        let (addrbook_request_tx, addrbook_request_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::AddressBookRequest>(64);
+        let community_address_book =
+            std::sync::Arc::new(crate::community_address_book::CommunityAddressBook::new());
         // ZEB-622: network-health presence last-seen cache. Created here so it can
         // be (a) wired into the presence map below — every verified beacon's
         // `apply` feeds it — and (b) installed on the NetworkHealthService at the
@@ -11204,6 +11226,23 @@ pub async fn start_node_inner(
                 let community_presence_request_rx_for_loop = Some(community_presence_request_rx);
                 let community_presence_map_for_loop =
                     std::sync::Arc::clone(&community_presence_map);
+                // ZEB-815: bundle the address-book pool's inputs. The two
+                // resolvers are the SAME handles the CRDT membership-delta hook
+                // feeds today (spec §4) — ingest fans out to them so the dial
+                // supervisor and deposit ordering see no change. Both resolver
+                // types share their state across clones (`ReachabilityResolver`
+                // is Arc-internal; the relay resolver is already an Arc), so
+                // these are handles, not copies. `None` when the community
+                // relay resolver was never built (no owner identity).
+                let addrbook_runtime_for_loop = community_relay_resolver_opt.clone().map(|crr| {
+                    crate::event_loop::AddressBookRuntime {
+                        request_rx: addrbook_request_rx,
+                        book: std::sync::Arc::clone(&community_address_book),
+                        reachability_resolver: std::sync::Arc::new(reachability_resolver.clone()),
+                        community_relay_resolver: crr,
+                        identity_dir: identity_dir.clone(),
+                    }
+                });
                 // Mint Phase 2 sync: thread handles into event_loop::run.
                 let mint_sync_handles_for_loop = mint_sync_handles_opt;
                 // ZEB-417 SP1: thread the Notes adapter handles into
@@ -11396,6 +11435,9 @@ pub async fn start_node_inner(
                                 profile_card_request_rx_for_loop,
                                 community_presence_request_rx_for_loop,
                                 community_presence_map_for_loop,
+                                // ZEB-815: address-book pool inputs (request rx
+                                // + store + resolver fan-out + sidecar root).
+                                addrbook_runtime_for_loop,
                                 mint_sync_handles_for_loop,
                                 notes_sync_handles_for_loop,
                                 dm_inbox_sync_handles_for_loop,
@@ -11680,6 +11722,8 @@ pub async fn start_node_inner(
                         // shared roster map so presence IPC handlers can drive the
                         // pool and read the live roster.
                         guard.community_presence_request_tx = Some(community_presence_request_tx);
+                        // ZEB-815: the sibling sender the same IPC sites drive.
+                        guard.addrbook_request_tx = Some(addrbook_request_tx);
                         guard.community_presence_map = Some(community_presence_map_for_state);
                         // Mint Phase 2 sync: store the engine Arc so IPC handlers
                         // can call notify_dirty() after mutations.
@@ -41705,13 +41749,16 @@ pub(crate) async fn subscribe_community_presence_impl(
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .try_into()
         .map_err(|_| "community_id length wrong".to_string())?;
-    let request_tx = {
+    let (request_tx, addrbook_tx) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.community_presence_request_tx
-            .clone()
-            .ok_or(OWNER_NOT_LOADED_MSG)?
+        (
+            g.community_presence_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.addrbook_request_tx.clone(),
+        )
     };
     request_tx
         .send(crate::event_loop::CommunityPresenceRequest::Subscribe {
@@ -41719,6 +41766,20 @@ pub(crate) async fn subscribe_community_presence_impl(
         })
         .await
         .map_err(|e| format!("community_presence_request_tx send: {e}"))?;
+    // ZEB-815: the address book subscribes on the same edge. Best-effort — a
+    // failure here degrades routing catch-up (live records still arrive once
+    // any peer publishes) and must not fail the presence subscribe, which the
+    // caller already treats as the contract of this IPC.
+    if let Some(tx) = addrbook_tx {
+        if let Err(e) = tx
+            .send(crate::event_loop::AddressBookRequest::Subscribe {
+                community_id: cid_bytes,
+            })
+            .await
+        {
+            tracing::warn!(community = %community_id, error = %e, "addrbook subscribe send failed");
+        }
+    }
     Ok(())
 }
 
@@ -41745,13 +41806,16 @@ pub(crate) async fn unsubscribe_community_presence_impl(
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .try_into()
         .map_err(|_| "community_id length wrong".to_string())?;
-    let request_tx = {
+    let (request_tx, addrbook_tx) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.community_presence_request_tx
-            .clone()
-            .ok_or(OWNER_NOT_LOADED_MSG)?
+        (
+            g.community_presence_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.addrbook_request_tx.clone(),
+        )
     };
     request_tx
         .send(crate::event_loop::CommunityPresenceRequest::Unsubscribe {
@@ -41759,6 +41823,18 @@ pub(crate) async fn unsubscribe_community_presence_impl(
         })
         .await
         .map_err(|e| format!("community_presence_request_tx send: {e}"))?;
+    // ZEB-815: tear down this community's address-book sync tasks on the same
+    // edge. Best-effort for the same reason as the Subscribe sibling.
+    if let Some(tx) = addrbook_tx {
+        if let Err(e) = tx
+            .send(crate::event_loop::AddressBookRequest::Unsubscribe {
+                community_id: cid_bytes,
+            })
+            .await
+        {
+            tracing::warn!(community = %community_id, error = %e, "addrbook unsubscribe send failed");
+        }
+    }
     Ok(())
 }
 
@@ -74586,6 +74662,7 @@ mod start_node_race_tests {
                 std::sync::atomic::AtomicU64::new(1),
             ),
             community_presence_request_tx: None,
+            addrbook_request_tx: None,
             community_presence_map: None,
             voting_logs: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),

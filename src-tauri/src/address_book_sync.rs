@@ -9,18 +9,24 @@
 //! can never be confused with (or opened as) a presence beacon.
 
 use crate::community_address_book::{
-    AddressBookEntry, AddressBookRow, CommunityAddressBook, UpsertOutcome,
+    save_addrbook, AddressBookEntry, AddressBookRow, CommunityAddressBook, UpsertOutcome,
 };
 use crate::community_channel_log::ChannelKey;
 use crate::community_membership::ChannelId;
 use crate::community_relay_resolver::CommunityRelayResolver;
 use crate::community_state_sync::CommunitySyncRegistry;
+use crate::iroh_friend_acceptor::wall_now_ms;
 use crate::owner_state_types::{EpochKey, SpaceId};
 use crate::reachability_resolver::ReachabilityResolver;
 use crate::voice_crypto::{decrypt_voice_packet, encrypt_voice_packet};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 /// Domain separator for sealed address-book packets (records + snapshots
 /// alike — one codec, no second format).
@@ -39,6 +45,42 @@ pub const ADDRBOOK_SNAPSHOT_COOLDOWN_MS: u64 = 60_000;
 /// for decryption. Enforced before any AEAD open to bound allocation from a
 /// peer flooding the topic.
 pub const ADDRBOOK_SNAPSHOT_MAX_BYTES: usize = 1_048_576;
+
+/// Idle backstop between snapshot queries when nothing wakes the requester.
+/// The event-driven fires (spawn, presence roster change) are the real
+/// catch-up path; this only bounds how long a node that missed every edge
+/// stays behind.
+pub const ADDRBOOK_SNAPSHOT_IDLE_REQUERY_MS: u64 = 30 * 60_000;
+
+/// Budget for draining one snapshot query's replies. Generous relative to a
+/// KB-scale reply because a cross-WAN responder may be several hops out; the
+/// requester is off the critical path (live records keep filling the book).
+pub const ADDRBOOK_SNAPSHOT_GET_TIMEOUT_MS: u64 = 10_000;
+
+/// Debounce between an ingest marking the book dirty and the sidecar write.
+/// Coalesces a snapshot's row burst into one file write.
+pub const ADDRBOOK_PERSIST_DEBOUNCE_MS: u64 = 2_000;
+
+/// Live per-record topic for a community's address book.
+pub fn addrbook_records_topic(community: &SpaceId) -> String {
+    format!("harmony/addrbook/{}/records", hex::encode(community.0))
+}
+
+/// Full-snapshot queryable topic for a community's address book.
+pub fn addrbook_snapshot_topic(community: &SpaceId) -> String {
+    format!("harmony/addrbook/{}/snapshot", hex::encode(community.0))
+}
+
+/// Has the snapshot cooldown window closed since `last_fire_ms`?
+///
+/// Factored out of [`spawn_addrbook_snapshot_requester`] so the rate limiter
+/// is unit-testable without a zenoh session. `saturating_sub` matters in both
+/// directions: `last_fire_ms == 0` (never fired) always elapses, and a
+/// backwards clock step reads as "not elapsed" rather than underflowing into
+/// a permanently-open gate.
+pub fn cooldown_elapsed(last_fire_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(last_fire_ms) >= ADDRBOOK_SNAPSHOT_COOLDOWN_MS
+}
 
 /// HKDF-SHA256 derivation of the per-community address-book key from the
 /// community epoch (membership) key. Mirrors `derive_presence_key` — same
@@ -200,6 +242,413 @@ pub async fn ingest_sealed_packet(
         ));
     }
     outcomes
+}
+
+/// Did this batch of outcomes materially change the book? Only `Inserted` /
+/// `Replaced` did — an `IgnoredOlder`/`IgnoredCapped`/rejected row leaves the
+/// store byte-identical, so neither the sidecar nor a re-persist is warranted.
+fn batch_changed_book(outcomes: &[IngestOutcome]) -> bool {
+    outcomes.iter().any(|o| {
+        matches!(
+            o,
+            IngestOutcome::Applied(UpsertOutcome::Inserted | UpsertOutcome::Replaced)
+        )
+    })
+}
+
+// ── ZEB-815 Task 5: per-community sync tasks ────────────────────────
+//
+// Four tasks per subscribed community, spawned + owned by the event loop's
+// address-book pool (`event_loop.rs`, mirroring the ZEB-537 presence pool):
+// live subscriber, snapshot queryable (serve), snapshot requester (catch-up),
+// and the sidecar persist task. They coordinate through two `Notify`s:
+// `dirty` (ingest → persist) and `resync` (presence roster change → requester).
+//
+// None of the four takes a `closing` flag: shutdown is abort-driven. The pool
+// owns all four `JoinHandle`s and aborts them on `Unsubscribe` and when its
+// request channel closes (stop_node drops the sender), which is the same
+// terminal path the presence pool's `handles.drain()` uses.
+
+/// Per-community resync handles, shared between the producer (the community
+/// presence subscriber, which fires one on a roster device-set change) and the
+/// consumer (that community's snapshot requester).
+///
+/// A hub rather than a plain `Arc<Notify>` per side because the two pools are
+/// independent tasks draining independent channels: either can process its
+/// `Subscribe` for a community first. `handle()` creates the `Notify` on first
+/// call and returns the same one to the second caller, so the wiring is
+/// order-independent. A fire with no requester yet (or ever — the pool is
+/// unwired in test callers that bypass `start_node`) is a no-op beyond leaving
+/// one permit, exactly like `send_modify` on a receiver-less watch.
+///
+/// Entries are deliberately never removed. Dropping one on unsubscribe would
+/// reintroduce exactly the ordering bug the hub exists to prevent: across an
+/// unsubscribe→resubscribe the two pools can interleave such that the presence
+/// subscriber re-takes the OLD handle before the addrbook pool clears it, and
+/// the new requester then waits on a `Notify` nobody fires. The map is bounded
+/// by the number of communities the node has ever subscribed to, and a stale
+/// permit costs at most one extra snapshot query on resubscribe.
+#[derive(Clone, Default)]
+pub struct AddrbookResyncHub {
+    inner: Arc<std::sync::Mutex<HashMap<[u8; 16], Arc<Notify>>>>,
+}
+
+impl AddrbookResyncHub {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The resync handle for `community_id`, created on first call and stable
+    /// for the process lifetime thereafter.
+    pub fn handle(&self, community_id: [u8; 16]) -> Arc<Notify> {
+        Arc::clone(
+            self.inner
+                .lock()
+                .expect("addrbook resync hub poisoned")
+                .entry(community_id)
+                .or_insert_with(|| Arc::new(Notify::new())),
+        )
+    }
+}
+
+/// Live-record subscriber: every sealed packet on
+/// `harmony/addrbook/{hex}/records` goes through [`ingest_sealed_packet`]
+/// (unseal under the community's CURRENT membership key → per-row membership
+/// gate → signature → LWW upsert → resolver fan-out). A batch that materially
+/// changed the book marks it dirty so the sidecar is rewritten.
+///
+/// `session` is an owned, cheaply-cloned `zenoh::Session` (call sites pass
+/// `session.clone()`), matching
+/// [`crate::community_presence::spawn_community_presence_subscriber`], whose
+/// declare-inside-the-task shape this mirrors.
+pub fn spawn_addrbook_subscriber(
+    session: zenoh::Session,
+    registry: Arc<CommunitySyncRegistry>,
+    book: Arc<CommunityAddressBook>,
+    rr: Arc<ReachabilityResolver>,
+    crr: Arc<CommunityRelayResolver>,
+    community: SpaceId,
+    dirty: Arc<Notify>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let topic = addrbook_records_topic(&community);
+        let sub = match session.declare_subscriber(&topic).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(%topic, err = %e, "addrbook record subscribe failed");
+                return;
+            }
+        };
+        while let Ok(sample) = sub.recv_async().await {
+            // Bound the copy BEFORE materializing the payload — `open_records`
+            // re-checks, but only after `to_vec` has already allocated.
+            if sample.payload().len() > ADDRBOOK_SNAPSHOT_MAX_BYTES {
+                tracing::warn!(
+                    %topic,
+                    len = sample.payload().len(),
+                    max = ADDRBOOK_SNAPSHOT_MAX_BYTES,
+                    "oversized addrbook record dropped"
+                );
+                continue;
+            }
+            let bytes = sample.payload().to_bytes().to_vec();
+            let outcomes = ingest_sealed_packet(
+                &registry,
+                &book,
+                &rr,
+                &crr,
+                community,
+                &bytes,
+                wall_now_ms(),
+            )
+            .await;
+            if batch_changed_book(&outcomes) {
+                dirty.notify_one();
+            }
+        }
+    })
+}
+
+/// Seal `rows` for a snapshot reply, dropping the oldest half until the sealed
+/// packet fits `max_bytes`. A reply over the receiver's cap is rejected before
+/// decryption (see [`open_records`]), so serving one is pure waste — a partial
+/// newest-first snapshot is strictly better, and the omitted rows still arrive
+/// via live records or another responder. Terminates: each iteration halves
+/// the row count, and an empty row set always seals small.
+fn seal_snapshot_bounded(
+    key: &ChannelKey,
+    community: &SpaceId,
+    mut rows: Vec<AddressBookRow>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    rows.sort_by(|a, b| b.stamped_at_ms.cmp(&a.stamped_at_ms));
+    loop {
+        let packet = seal_records(key, community, &rows)?;
+        if packet.len() <= max_bytes || rows.is_empty() {
+            return Ok(packet);
+        }
+        let keep = rows.len() / 2;
+        tracing::warn!(
+            community = %hex::encode(&community.0[..4]),
+            len = packet.len(),
+            max = max_bytes,
+            rows = rows.len(),
+            keep,
+            "addrbook snapshot over cap; serving the newest rows only"
+        );
+        rows.truncate(keep);
+    }
+}
+
+/// Snapshot queryable (the serve side of catch-up): reply to a query on
+/// `harmony/addrbook/{hex}/snapshot` with this node's full TTL-filtered book
+/// for the community, sealed under the community's current address-book key.
+///
+/// `async` so the declare is AWAITED before the serve loop is spawned — a
+/// caller that sequences a subscribe against readiness must not race the
+/// declare (`event_loop.rs`'s `spawn_content_serve_queryable`). A declare
+/// failure returns an already-finished handle, which the pool's self-healing
+/// `retain` treats as a dead entry and restarts on the next `Subscribe`.
+pub async fn spawn_addrbook_snapshot_queryable(
+    session: zenoh::Session,
+    registry: Arc<CommunitySyncRegistry>,
+    book: Arc<CommunityAddressBook>,
+    community: SpaceId,
+) -> JoinHandle<()> {
+    let topic = addrbook_snapshot_topic(&community);
+    let qbl = match session.declare_queryable(&topic).await {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::error!(%topic, err = %e, "addrbook snapshot queryable declare failed");
+            return tokio::spawn(async {});
+        }
+    };
+    tokio::spawn(async move {
+        while let Ok(query) = qbl.recv_async().await {
+            // Re-derive per query so the reply follows epoch rotation; a
+            // missing engine means we hold no key for this community and
+            // simply do not answer (the querier logs a no-responder INFO).
+            let Some(engine) = registry.engine_arc(&community).await else {
+                continue;
+            };
+            let key = derive_addrbook_key(&engine.membership_key(), &community);
+            // An EMPTY book still replies: "I am here and hold nothing" is a
+            // real answer, and suppressing it would make an all-empty
+            // community look like a no-responder failure forever.
+            let rows = book.rows_for_community(&community, wall_now_ms());
+            let packet =
+                match seal_snapshot_bounded(&key, &community, rows, ADDRBOOK_SNAPSHOT_MAX_BYTES) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(%topic, err = %e, "addrbook snapshot seal failed");
+                        continue;
+                    }
+                };
+            if let Err(e) = query.reply(query.key_expr(), packet).await {
+                tracing::warn!(%topic, err = %e, "addrbook snapshot reply failed");
+            }
+        }
+    })
+}
+
+/// One snapshot query round: GET the community's snapshot topic, then run
+/// EVERY responder's reply through the same per-row ingest gate live records
+/// use — a hostile or stale responder can therefore only contribute rows that
+/// verify individually (spec §6).
+#[allow(clippy::too_many_arguments)]
+async fn request_snapshot_once(
+    session: &zenoh::Session,
+    topic: &str,
+    registry: &Arc<CommunitySyncRegistry>,
+    book: &CommunityAddressBook,
+    rr: &ReachabilityResolver,
+    crr: &CommunityRelayResolver,
+    community: SpaceId,
+    dirty: &Notify,
+) {
+    let community_hex = hex::encode(community.0);
+    // Mirrors the channel-log/voting backfill requester's get shape:
+    // - ConsolidationMode::None — every member's book is a legitimate partial
+    //   view, so we want ALL replies, not zenoh's newest-per-key pick.
+    // - Locality::Remote — exclude our OWN snapshot queryable. Ingesting our
+    //   own book back is pure work, and (worse) a self-reply would make the
+    //   `responders == 0` branch below unreachable, silently retiring the
+    //   spec §6 no-responder signal on exactly the solo node it is for.
+    // - `.timeout` — bound the query zenoh-side too, so the stream closes on
+    //   its own rather than relying only on our drain budget.
+    let replies = match session
+        .get(topic)
+        .consolidation(zenoh::query::ConsolidationMode::None)
+        .allowed_destination(zenoh::sample::Locality::Remote)
+        .timeout(Duration::from_millis(ADDRBOOK_SNAPSHOT_GET_TIMEOUT_MS))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(%topic, err = %e, "addrbook snapshot get failed");
+            return;
+        }
+    };
+
+    let mut responders = 0usize;
+    let mut changed = false;
+    let drain = async {
+        while let Ok(reply) = replies.recv_async().await {
+            match reply.result() {
+                Ok(sample) => {
+                    responders += 1;
+                    if sample.payload().len() > ADDRBOOK_SNAPSHOT_MAX_BYTES {
+                        tracing::warn!(
+                            %topic,
+                            len = sample.payload().len(),
+                            max = ADDRBOOK_SNAPSHOT_MAX_BYTES,
+                            "oversized addrbook snapshot reply dropped"
+                        );
+                        continue;
+                    }
+                    let bytes = sample.payload().to_bytes().to_vec();
+                    let outcomes = ingest_sealed_packet(
+                        registry,
+                        book,
+                        rr,
+                        crr,
+                        community,
+                        &bytes,
+                        wall_now_ms(),
+                    )
+                    .await;
+                    changed |= batch_changed_book(&outcomes);
+                }
+                Err(err) => {
+                    let msg = String::from_utf8_lossy(&err.payload().to_bytes()).into_owned();
+                    tracing::info!(%topic, err = %msg, "addrbook snapshot reply error");
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(
+        Duration::from_millis(ADDRBOOK_SNAPSHOT_GET_TIMEOUT_MS),
+        drain,
+    )
+    .await
+    .is_err()
+    {
+        tracing::info!(
+            community = %community_hex,
+            %topic,
+            responders,
+            "addrbook snapshot query budget elapsed; keeping what arrived"
+        );
+    }
+
+    if responders == 0 {
+        // Spec §6: INFO with community context, NOT a warn. A solo node — or
+        // the first of a fleet to rebuild — legitimately has nobody to ask;
+        // live records still fill the book. ZEB-813's lesson was that a WARN
+        // here trains operators to ignore the line that matters.
+        tracing::info!(
+            community = %community_hex,
+            %topic,
+            "addrbook snapshot: no responder (not an error — live records still fill the book)"
+        );
+    }
+    if changed {
+        dirty.notify_one();
+    }
+}
+
+/// Snapshot requester (the catch-up side): fire one query immediately on
+/// spawn (join / resubscribe / reconnect), then on every `resync` fire
+/// (presence roster change) and on a `ADDRBOOK_SNAPSHOT_IDLE_REQUERY_MS` idle
+/// backstop, rate-limited to one query per `ADDRBOOK_SNAPSHOT_COOLDOWN_MS`.
+///
+/// A wake inside the cooldown is DEFERRED, never dropped: the first roster
+/// change after a join typically lands seconds after the spawn-time query
+/// (which found nobody connected yet), and dropping it would leave the node
+/// waiting out the idle backstop with an empty book.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_addrbook_snapshot_requester(
+    session: zenoh::Session,
+    registry: Arc<CommunitySyncRegistry>,
+    book: Arc<CommunityAddressBook>,
+    rr: Arc<ReachabilityResolver>,
+    crr: Arc<CommunityRelayResolver>,
+    community: SpaceId,
+    resync: Arc<Notify>,
+    dirty: Arc<Notify>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let topic = addrbook_snapshot_topic(&community);
+        let mut idle =
+            tokio::time::interval(Duration::from_millis(ADDRBOOK_SNAPSHOT_IDLE_REQUERY_MS));
+        // `interval` fires its first tick immediately; the spawn-time query
+        // below IS that fire, so consume it rather than querying twice.
+        idle.tick().await;
+
+        let mut last_fire_ms = wall_now_ms();
+        request_snapshot_once(
+            &session, &topic, &registry, &book, &rr, &crr, community, &dirty,
+        )
+        .await;
+
+        loop {
+            tokio::select! {
+                _ = resync.notified() => {}
+                _ = idle.tick() => {}
+            }
+            let now = wall_now_ms();
+            if !cooldown_elapsed(last_fire_ms, now) {
+                let remaining =
+                    ADDRBOOK_SNAPSHOT_COOLDOWN_MS.saturating_sub(now.saturating_sub(last_fire_ms));
+                tokio::time::sleep(Duration::from_millis(remaining)).await;
+            }
+            last_fire_ms = wall_now_ms();
+            request_snapshot_once(
+                &session, &topic, &registry, &book, &rr, &crr, community, &dirty,
+            )
+            .await;
+        }
+    })
+}
+
+/// Sidecar persist task: on `dirty`, debounce
+/// `ADDRBOOK_PERSIST_DEBOUNCE_MS`, then snapshot the community's rows and
+/// write `addrbook.cbor` off the async runtime. Snapshot-then-`spawn_blocking`
+/// mirrors `community_state_sync::persist_crdt_only` — the (sync) store lock
+/// is never held across the file write.
+///
+/// A failed write is logged and dropped: the book is fully peer-recoverable
+/// (spec §2), so a persist failure must not take down the sync tasks.
+pub fn spawn_addrbook_persist_task(
+    book: Arc<CommunityAddressBook>,
+    path: PathBuf,
+    community: SpaceId,
+    dirty: Arc<Notify>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            dirty.notified().await;
+            tokio::time::sleep(Duration::from_millis(ADDRBOOK_PERSIST_DEBOUNCE_MS)).await;
+            let rows = book.rows_for_community(&community, wall_now_ms());
+            let path_for_write = path.clone();
+            let result =
+                tokio::task::spawn_blocking(move || save_addrbook(&path_for_write, &rows)).await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    community = %hex::encode(&community.0[..4]),
+                    path = %path.display(),
+                    err = %e,
+                    "addrbook sidecar write failed"
+                ),
+                Err(e) => tracing::warn!(
+                    community = %hex::encode(&community.0[..4]),
+                    err = %e,
+                    "addrbook sidecar write task join failed"
+                ),
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -506,5 +955,185 @@ mod tests {
         let resolved = reach_resolver.resolve(&actor);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].announced_at_ms, now_ms);
+    }
+
+    // ── Task 5: sync-task decision cores ────────────────────────────
+
+    /// The snapshot requester's rate limiter, exercised on BOTH sides of the
+    /// boundary: a rapid second notify inside the window must not fire a
+    /// second GET, and the instant the window closes it must.
+    #[test]
+    fn requester_cooldown_gates_rapid_notifies() {
+        let first_fire = 1_700_000_000_000u64;
+
+        assert!(
+            !cooldown_elapsed(first_fire, first_fire),
+            "a notify in the same millisecond as the last fire is gated"
+        );
+        assert!(
+            !cooldown_elapsed(first_fire, first_fire + ADDRBOOK_SNAPSHOT_COOLDOWN_MS - 1),
+            "one millisecond BEFORE the window closes is still gated"
+        );
+        assert!(
+            cooldown_elapsed(first_fire, first_fire + ADDRBOOK_SNAPSHOT_COOLDOWN_MS),
+            "exactly at the window boundary the next fire is allowed"
+        );
+        assert!(
+            cooldown_elapsed(first_fire, first_fire + ADDRBOOK_SNAPSHOT_COOLDOWN_MS + 1),
+            "past the window the next fire is allowed"
+        );
+
+        // A never-fired requester (last_fire_ms == 0) fires immediately, and a
+        // backwards clock step saturates to "not elapsed" rather than
+        // underflowing into a permanently-open gate.
+        assert!(cooldown_elapsed(0, first_fire), "first fire is never gated");
+        assert!(
+            !cooldown_elapsed(first_fire, first_fire - 5_000),
+            "a backwards clock step keeps the gate closed (saturating), not open"
+        );
+    }
+
+    /// The queryable↔requester contract minus the wire: the responder seals
+    /// its full row set under the community address-book key; the requester
+    /// opens it and runs every row through the SAME per-row ingest gate live
+    /// records use, landing them in the book and fanning out to both
+    /// resolvers.
+    #[test]
+    fn snapshot_reply_and_ingest_round_trip() {
+        let community = SpaceId([0xC5; 16]);
+        let ts = 1_700_000_000_000u64;
+        let at = hlc(ts);
+        let key = fixture_key(&community);
+
+        // Responder side: two members, one reachability row and one relay row.
+        let reach_sk = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let reach_actor = OwnerAddr([0x05; 16]);
+        let reach_payload = build_signed_payload_with_key(
+            [0xA5; 32],
+            "https://derp.example/".into(),
+            vec![],
+            ts,
+            &reach_actor,
+            &at,
+            Vec::new(),
+            0,
+            &reach_sk,
+        )
+        .expect("build signed reachability payload");
+
+        let relay_sk = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
+        let relay_actor = OwnerAddr([0x06; 16]);
+        let relay_payload = build_signed_community_relay_announce(
+            CommunityRelayEntry {
+                relay_device_id: [0x77; 16],
+                iroh_endpoint_id: [0x88; 32],
+                relay_device_ed25519_verify: relay_sk.verifying_key().to_bytes(),
+                home_relay: "https://r.example/".into(),
+            },
+            ts,
+            &relay_actor,
+            &at,
+            &relay_sk,
+        )
+        .expect("build signed relay payload");
+
+        let served = vec![
+            AddressBookRow {
+                entry: AddressBookEntry::Reachability(reach_payload),
+                actor: reach_actor,
+                device: reach_sk.verifying_key().to_bytes(),
+                at: at.clone(),
+                stamped_at_ms: ts,
+            },
+            AddressBookRow {
+                entry: AddressBookEntry::Relay(relay_payload),
+                actor: relay_actor,
+                device: relay_sk.verifying_key().to_bytes(),
+                at,
+                stamped_at_ms: ts,
+            },
+        ];
+        let packet = seal_records(&key, &community, &served).expect("seal snapshot");
+
+        // Requester side: open under the same community key, then per-row gate.
+        let opened = open_records(&key, &community, &packet).expect("open snapshot");
+        assert_eq!(opened.len(), 2, "both rows survive the snapshot round trip");
+
+        let book = CommunityAddressBook::new();
+        let reach_resolver = ReachabilityResolver::new();
+        let relay_resolver = CommunityRelayResolver::new();
+        for row in opened {
+            assert_eq!(
+                ingest_verified_row(&book, &reach_resolver, &relay_resolver, community, row, ts),
+                IngestOutcome::Applied(UpsertOutcome::Inserted),
+                "a snapshot row goes through the same gate as a live record"
+            );
+        }
+
+        assert_eq!(book.rows_for_community(&community, ts).len(), 2);
+        assert_eq!(
+            reach_resolver.resolve(&reach_actor).len(),
+            1,
+            "the reachability row fanned out to the dial resolver"
+        );
+        assert_eq!(
+            relay_resolver.relays_for_community(&community, ts).len(),
+            1,
+            "the relay row fanned out to the community relay resolver"
+        );
+
+        // A responder sealing under a DIFFERENT epoch key contributes nothing:
+        // the requester cannot open the packet at all.
+        let foreign = derive_addrbook_key(&EpochKey::new([0xEE; 32]), &community);
+        assert!(
+            open_records(&foreign, &community, &packet).is_none(),
+            "a snapshot sealed under another epoch key never reaches the gate"
+        );
+    }
+
+    /// A book too large to seal under the receiver's cap is served
+    /// newest-first and truncated, never as an over-cap packet the receiver
+    /// would reject before decrypting. `max_bytes` is a parameter (not the
+    /// constant) so the boundary is testable without building a megabyte.
+    #[test]
+    fn oversize_snapshot_truncates_to_newest_rows() {
+        let community = SpaceId([0xC6; 16]);
+        let key = fixture_key(&community);
+        let rows: Vec<AddressBookRow> = (1..=8u8).map(|i| row(i, 1_000 + i as u64)).collect();
+
+        let full = seal_snapshot_bounded(&key, &community, rows.clone(), usize::MAX)
+            .expect("seal under an unbounded cap");
+        assert_eq!(
+            open_records(&key, &community, &full)
+                .expect("open full")
+                .len(),
+            8,
+            "an unbounded cap serves every row"
+        );
+
+        // A cap under the full size forces truncation; whatever survives must
+        // still open, and must be the NEWEST rows.
+        let cap = full.len() / 2;
+        let trimmed = seal_snapshot_bounded(&key, &community, rows, cap).expect("seal under a cap");
+        assert!(
+            trimmed.len() <= cap,
+            "the served packet fits the receiver's cap ({} <= {cap})",
+            trimmed.len()
+        );
+        let served = open_records(&key, &community, &trimmed).expect("open trimmed");
+        assert!(
+            !served.is_empty() && served.len() < 8,
+            "a partial snapshot is served, not an empty or full one (got {})",
+            served.len()
+        );
+        let oldest_kept = served
+            .iter()
+            .map(|r| r.stamped_at_ms)
+            .min()
+            .expect("non-empty");
+        assert!(
+            oldest_kept > 1_000,
+            "truncation drops the OLDEST rows first (kept floor {oldest_kept})"
+        );
     }
 }

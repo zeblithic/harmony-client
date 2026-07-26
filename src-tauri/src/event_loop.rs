@@ -464,6 +464,36 @@ pub enum CommunityPresenceRequest {
     Unsubscribe { community_id: [u8; 16] },
 }
 
+/// ZEB-815 community address-book task-pool requests. Sibling of
+/// `CommunityPresenceRequest` — sent from the SAME IPC sites, keyed the same
+/// way — because the address book's lifetime is exactly a community
+/// subscription's: it syncs while the node is in the community and stops when
+/// it leaves.
+pub enum AddressBookRequest {
+    Subscribe { community_id: [u8; 16] },
+    Unsubscribe { community_id: [u8; 16] },
+}
+
+/// ZEB-815: everything the address-book pool needs that isn't already a
+/// parameter of [`run`]. Bundled (like [`IrohRuntimeHandles`]) rather than
+/// threaded as five more positional arguments, and `Option` at the call site
+/// for the same reason the presence pool is: test callers that bypass
+/// `start_node` leave the pool unwired, and the book simply never syncs.
+pub struct AddressBookRuntime {
+    /// Paired with NodeState's `addrbook_request_tx`.
+    pub request_rx: mpsc::Receiver<AddressBookRequest>,
+    /// The node-wide store, shared with the publisher (Task 6) and the IPC
+    /// readers (Task 7) — every community's rows live in this one book.
+    pub book: Arc<crate::community_address_book::CommunityAddressBook>,
+    /// Ingest fan-out targets — the exact resolvers the CRDT membership-delta
+    /// hook feeds today (spec §4), so dial + deposit consumers are unchanged.
+    pub reachability_resolver: Arc<crate::reachability_resolver::ReachabilityResolver>,
+    pub community_relay_resolver: Arc<crate::community_relay_resolver::CommunityRelayResolver>,
+    /// Sidecar root — the same `identity_dir` `CommunitySyncRegistry` derives
+    /// `communities/{hex}/crdt.cbor` from, so `addrbook.cbor` lands beside it.
+    pub identity_dir: std::path::PathBuf,
+}
+
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
 enum ZenohEvent {
     Query {
@@ -1054,6 +1084,11 @@ pub async fn run(
     community_presence_map: std::sync::Arc<
         tokio::sync::Mutex<crate::community_presence::CommunityPresenceMap>,
     >,
+    // ZEB-815: address-book pool inputs (request rx + store + the two resolver
+    // fan-out targets + the sidecar root). `None` in test callers that bypass
+    // `start_node`; the pool is then not spawned and the presence subscribers
+    // get a resync handle nobody consumes.
+    addrbook_runtime: Option<AddressBookRuntime>,
     // Mint Phase 2 sync: channel pair bridging MintSyncEngine to Zenoh.
     // `None` when no owner identity is loaded.
     mut mint_sync_handles: Option<MintSyncHandles>,
@@ -3931,6 +3966,15 @@ pub async fn run(
         u64,
     > = std::collections::HashMap::new();
 
+    // ZEB-815: per-community address-book resync handles. Created HERE, above
+    // both pools, because the producer (presence subscriber) and the consumer
+    // (addrbook snapshot requester) are spawned by two independent tasks
+    // draining two independent channels — either can reach a given community
+    // first. The hub hands both sides the same `Notify` whichever order they
+    // arrive in. Unconditional (it is a map behind an Arc): when the addrbook
+    // pool is unwired, a presence-side fire simply has no consumer.
+    let addrbook_resync_hub = crate::address_book_sync::AddrbookResyncHub::new();
+
     // ── ZEB-537: community-presence pool + global sweeper ─────────────
     // One (publisher, subscriber) task pair per subscribed community, keyed off
     // CommunityPresenceRequest::{Subscribe, Unsubscribe} from NodeState (mirrors
@@ -3975,6 +4019,10 @@ pub async fn run(
             // a roster device-set change also kicks a presence sweep (re-arm all
             // non-connected peers). `None` on iroh-disabled runs.
             let supervisor_for_presence = reconnect_supervisor.clone();
+            // ZEB-815: the per-community handle each subscriber fires on a
+            // roster device-set change, waking that community's snapshot
+            // requester (spec §2: snapshot on presence roster change).
+            let addrbook_hub_for_presence = addrbook_resync_hub.clone();
             tokio::spawn(async move {
                 use std::collections::HashMap;
                 let mut handles: HashMap<
@@ -4068,6 +4116,9 @@ pub async fn run(
                                     // ZEB-620 Task 5: same roster edge kicks the
                                     // reconnect supervisor into a presence sweep.
                                     supervisor_for_presence.clone(),
+                                    // ZEB-815: and wakes this community's
+                                    // address-book snapshot requester.
+                                    Some(addrbook_hub_for_presence.handle(community_id)),
                                 );
                             handles.insert(community_id, (pub_handle, sub_handle));
                             // Emit an INITIAL empty roster so the UI has a
@@ -4156,6 +4207,129 @@ pub async fn run(
                 }
             });
         }
+    }
+
+    // ── ZEB-815: community address-book task pool ─────────────────────
+    // Four tasks per subscribed community (live subscriber, snapshot
+    // queryable, snapshot requester, sidecar persist), keyed off
+    // AddressBookRequest::{Subscribe, Unsubscribe} — the sibling requests the
+    // presence IPC sites send. Mirrors the ZEB-537 presence pool above: one
+    // task owns the rx plus the per-community handles, with the same
+    // self-healing `retain` and the same abort-on-unsubscribe/abort-on-close
+    // shutdown. Gated on the registry (the seal key derives from the community
+    // membership key) exactly like presence.
+    if let (Some(addrbook), Some(registry)) = (addrbook_runtime, community_registry.clone()) {
+        let session_for_addrbook = Arc::clone(&session_arc);
+        let hub_for_addrbook = addrbook_resync_hub.clone();
+        let AddressBookRuntime {
+            mut request_rx,
+            book,
+            reachability_resolver,
+            community_relay_resolver,
+            identity_dir,
+        } = addrbook;
+        tokio::spawn(async move {
+            use std::collections::HashMap;
+            // Vec (not a tuple) because all four handles are interchangeable
+            // to the pool: it only ever aborts them together.
+            let mut handles: HashMap<[u8; 16], Vec<tokio::task::JoinHandle<()>>> = HashMap::new();
+            while let Some(req) = request_rx.recv().await {
+                match req {
+                    AddressBookRequest::Subscribe { community_id } => {
+                        // Self-heal: a group is healthy only if EVERY task is
+                        // alive. If any exited (e.g. a failed zenoh declare),
+                        // abort the survivors and drop the entry so this
+                        // Subscribe restarts all four cleanly.
+                        handles.retain(|_, hs| {
+                            let alive = hs.iter().all(|h| !h.is_finished());
+                            if !alive {
+                                for h in hs.iter() {
+                                    h.abort();
+                                }
+                            }
+                            alive
+                        });
+                        if handles.contains_key(&community_id) {
+                            tracing::warn!(
+                                community_id = %hex::encode(community_id),
+                                "AddressBookRequest::Subscribe duplicate — ignoring"
+                            );
+                            continue;
+                        }
+                        let community = crate::owner_state_types::SpaceId(community_id);
+                        // `dirty`: ingest (subscriber + requester) → persist.
+                        // `resync`: presence roster change → requester. The
+                        // hub may already hold the resync handle if the
+                        // presence pool reached this community first.
+                        let dirty = std::sync::Arc::new(tokio::sync::Notify::new());
+                        let resync = hub_for_addrbook.handle(community_id);
+                        // Queryable FIRST, and awaited: a peer reacting to our
+                        // arrival must not query us before we can serve.
+                        let queryable_handle =
+                            crate::address_book_sync::spawn_addrbook_snapshot_queryable(
+                                (*session_for_addrbook).clone(),
+                                Arc::clone(&registry),
+                                std::sync::Arc::clone(&book),
+                                community,
+                            )
+                            .await;
+                        let subscriber_handle = crate::address_book_sync::spawn_addrbook_subscriber(
+                            (*session_for_addrbook).clone(),
+                            Arc::clone(&registry),
+                            std::sync::Arc::clone(&book),
+                            std::sync::Arc::clone(&reachability_resolver),
+                            std::sync::Arc::clone(&community_relay_resolver),
+                            community,
+                            std::sync::Arc::clone(&dirty),
+                        );
+                        let requester_handle =
+                            crate::address_book_sync::spawn_addrbook_snapshot_requester(
+                                (*session_for_addrbook).clone(),
+                                Arc::clone(&registry),
+                                std::sync::Arc::clone(&book),
+                                std::sync::Arc::clone(&reachability_resolver),
+                                std::sync::Arc::clone(&community_relay_resolver),
+                                community,
+                                resync,
+                                std::sync::Arc::clone(&dirty),
+                            );
+                        let persist_handle = crate::address_book_sync::spawn_addrbook_persist_task(
+                            std::sync::Arc::clone(&book),
+                            crate::community_address_book::addrbook_path(&identity_dir, &community),
+                            community,
+                            dirty,
+                        );
+                        handles.insert(
+                            community_id,
+                            vec![
+                                queryable_handle,
+                                subscriber_handle,
+                                requester_handle,
+                                persist_handle,
+                            ],
+                        );
+                    }
+                    AddressBookRequest::Unsubscribe { community_id } => {
+                        if let Some(hs) = handles.remove(&community_id) {
+                            for h in hs {
+                                h.abort();
+                            }
+                        }
+                        // The resync handle stays in the hub (see its doc: a
+                        // resubscribe must not re-mint one half of the pair),
+                        // and so do the book's ROWS — leaving a community is a
+                        // distinct eviction path (spec §5, Task 7).
+                    }
+                }
+            }
+            // Request channel closed (stop_node dropped the sender): abort any
+            // still-running groups, same terminal drain as the presence pool.
+            for (_cid, hs) in handles.drain() {
+                for h in hs {
+                    h.abort();
+                }
+            }
+        });
     }
 
     tracing::info!("event loop running");

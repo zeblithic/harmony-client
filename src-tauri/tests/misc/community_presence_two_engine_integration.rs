@@ -253,6 +253,8 @@ async fn invisible_inner() {
         tokio::sync::watch::channel(0u64).0,
         // ZEB-620 Task 5: no reconnect supervisor in this link-layer test.
         None,
+        // ZEB-815: no address-book pool in this link-layer test.
+        None,
     );
 
     // Match A's session to B's REMOTE subscriber first, so a later "no beacon"
@@ -412,6 +414,8 @@ async fn run_inner() {
         // ZEB-599 Direction 1: throwaway resync sender (no receivers → no-op).
         tokio::sync::watch::channel(0u64).0,
         // ZEB-620 Task 5: no reconnect supervisor in this link-layer test.
+        None,
+        // ZEB-815: no address-book pool in this link-layer test.
         None,
     );
 
