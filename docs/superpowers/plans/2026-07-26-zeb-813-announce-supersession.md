@@ -344,8 +344,8 @@ Tests: boundary values (49%/50%/79%/80%/100% of `MAX_PAYLOAD_SIZE`) map to `Ok`/
 
 ### Task 5: Gates, PRs, convergence
 
-- [ ] **Step 1: client gates** — from `src-tauri/`: fmt check, clippy `--locked --all-targets --features test-fixtures --no-deps -- -D warnings`, then `scripts/test-select --context task`; fix anything red.
-- [ ] **Step 2: full sweep** — `cargo nextest run --locked --workspace --all-targets --features test-fixtures` (background, wall-clock net). Frontend untouched — no tsc/vitest needed unless CI disagrees.
+- [ ] **Step 1: client gates** — from `src-tauri/`: fmt check, clippy `--locked --all-targets --features test-fixtures --no-deps -- -D warnings`, then `scripts/test-select`; fix anything red. **This PR changes the dependency graph (Cargo.toml/Cargo.lock rev bump), so per the workspace rule test-select must run as `scripts/test-select --full`** — the script itself refuses `--context task` on dep-graph changes and execution confirmed that refusal; the full sweep of Step 2 is the gate. When a future round uses selective mode (docs/test-only fixes), paste the printed `round=… bucket=…` summary line into the task report so the selection is auditable.
+- [ ] **Step 2: full sweep** — `cargo nextest run --locked --workspace --all-targets --features test-fixtures` (background, wall-clock net). This satisfies Step 1's `--full` requirement. Frontend untouched — no tsc/vitest needed unless CI disagrees.
 - [ ] **Step 3: core PR merge gate** — the client PR cannot point at an unmerged branch SHA long-term. When the core PR merges (Jake's gate), re-pin all harmony revs to the MERGE SHA, `cargo update -p harmony-crdt-sync --precise` as needed / regenerate `Cargo.lock`, re-run Step 1 gates, push.
 - [ ] **Step 4: open client PR** — `gh pr create --repo zeblithic/harmony-client` from `zeb-813-announce-supersession`; body: mechanism, heal-on-load, watermark surfacing, spec + plan paths, `Fixes ZEB-813`; standard footer; ONE review-bot trigger.
 - [ ] **Step 5: convergence loop** — both PRs: scan all three comment buckets, bundle fixes, ONE push per round, wait CI green + bots clean. Never merge.

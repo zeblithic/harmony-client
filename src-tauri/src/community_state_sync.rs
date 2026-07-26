@@ -1284,6 +1284,7 @@ impl CommunitySyncEngine {
             shutdown_rx,
             identity_resolver: cfg.identity_resolver,
             error_tx: cfg.error_tx,
+            root_size_watermark_seen: std::sync::atomic::AtomicU8::new(0),
             delta_tx: cfg.delta_tx,
             pending_redemptions: cfg.pending_redemptions,
             crdt_state: crdt_state_for_task,
@@ -1993,6 +1994,11 @@ struct InternalCtx {
     shutdown_rx: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), CommunitySyncError>>>,
     identity_resolver: Option<Arc<dyn IdentityResolver>>,
     error_tx: Option<mpsc::Sender<CommunityDegradedReport>>,
+    /// ZEB-813 (PR #560 round 1): last emitted root-size watermark level —
+    /// see `watermark_transitioned`. Emission is per-transition, not
+    /// per-call, because `encode_root_packet` runs on every query-serve
+    /// request.
+    root_size_watermark_seen: std::sync::atomic::AtomicU8,
     delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
     /// ZEB-262 Phase 4: shared pending-redemption map. Used by
     /// `handle_incoming_publish` to fire any oneshot registered
@@ -3145,35 +3151,59 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
 
     // ZEB-813: surface the size trajectory long before the ContentId cap
     // detonates. One site covers both consumers — publish and query-serve
-    // both route through encode_root_packet.
-    match classify_root_size(blob_ciphertext.len()) {
-        RootSizeWatermark::Ok => {}
-        RootSizeWatermark::NearHalf => {
-            tracing::warn!(
-                community_id = ?ctx.community_id,
-                blob_bytes = blob_ciphertext.len(),
-                cap_bytes = harmony_content::cid::MAX_PAYLOAD_SIZE,
-                "community state-root blob at >=50% of the ContentId cap"
-            );
-        }
-        RootSizeWatermark::NearCap => {
-            tracing::warn!(
-                community_id = ?ctx.community_id,
-                blob_bytes = blob_ciphertext.len(),
-                cap_bytes = harmony_content::cid::MAX_PAYLOAD_SIZE,
-                "community state-root blob at >=80% of the ContentId cap; \
-                 root publish/serve fails entirely at the cap"
-            );
-            report_degraded(
-                ctx.error_tx.as_ref(),
-                ctx.community_id,
-                "state_root_near_cap",
-                format!(
-                    "state-root blob {} bytes >= 80% of ContentId cap {}",
-                    blob_ciphertext.len(),
-                    harmony_content::cid::MAX_PAYLOAD_SIZE
-                ),
-            );
+    // both route through encode_root_packet — and emission is latched to
+    // watermark TRANSITIONS (PR #560 round 1), because this function runs
+    // on every query-serve request, not just debounced publishes.
+    let watermark = classify_root_size(blob_ciphertext.len());
+    if watermark_transitioned(&ctx.root_size_watermark_seen, &watermark) {
+        match watermark {
+            RootSizeWatermark::Ok => {}
+            RootSizeWatermark::NearHalf => {
+                tracing::warn!(
+                    community_id = ?ctx.community_id,
+                    blob_bytes = blob_ciphertext.len(),
+                    cap_bytes = harmony_content::cid::MAX_PAYLOAD_SIZE,
+                    "community state-root blob at >=50% of the ContentId cap"
+                );
+            }
+            RootSizeWatermark::NearCap => {
+                tracing::warn!(
+                    community_id = ?ctx.community_id,
+                    blob_bytes = blob_ciphertext.len(),
+                    cap_bytes = harmony_content::cid::MAX_PAYLOAD_SIZE,
+                    "community state-root blob at >=80% of the ContentId cap; \
+                     root publish/serve fails entirely at the cap"
+                );
+                report_degraded(
+                    ctx.error_tx.as_ref(),
+                    ctx.community_id,
+                    "state_root_near_cap",
+                    format!(
+                        "state-root blob {} bytes >= 80% of ContentId cap {}",
+                        blob_ciphertext.len(),
+                        harmony_content::cid::MAX_PAYLOAD_SIZE
+                    ),
+                );
+            }
+            RootSizeWatermark::OverCap => {
+                tracing::warn!(
+                    community_id = ?ctx.community_id,
+                    blob_bytes = blob_ciphertext.len(),
+                    cap_bytes = harmony_content::cid::MAX_PAYLOAD_SIZE,
+                    "community state-root blob EXCEEDS the ContentId cap; \
+                     root publish/serve is down until the log shrinks"
+                );
+                report_degraded(
+                    ctx.error_tx.as_ref(),
+                    ctx.community_id,
+                    "state_root_over_cap",
+                    format!(
+                        "state-root blob {} bytes exceeds ContentId cap {}",
+                        blob_ciphertext.len(),
+                        harmony_content::cid::MAX_PAYLOAD_SIZE
+                    ),
+                );
+            }
         }
     }
 
@@ -3189,13 +3219,19 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
     )
     .map_err(|e| {
         // ZEB-813: the over-cap failure was previously a silent
-        // warn-and-retry (publish) / withheld reply (serve). Surface it.
-        report_degraded(
-            ctx.error_tx.as_ref(),
-            ctx.community_id,
-            "state_root_over_cap",
-            format!("state-root blob exceeds ContentId cap: {e}"),
-        );
+        // warn-and-retry (publish) / withheld reply (serve). The OverCap
+        // transition above normally reported already; this latched
+        // fallback covers a `for_book` rejection the classifier did not
+        // predict (defense in depth — the shared latch prevents a double
+        // report in the normal case).
+        if watermark_transitioned(&ctx.root_size_watermark_seen, &RootSizeWatermark::OverCap) {
+            report_degraded(
+                ctx.error_tx.as_ref(),
+                ctx.community_id,
+                "state_root_over_cap",
+                format!("state-root blob exceeds ContentId cap: {e}"),
+            );
+        }
         CommunitySyncError::Crypto(CommunityCryptoError::ContentIdDerivation(e.to_string()))
     })?;
 
@@ -4343,15 +4379,6 @@ async fn persist_crdt_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError> 
     Ok(())
 }
 
-/// Send a `CommunityDegradedReport` if `error_tx` is wired.
-///
-/// **Fire-and-forget semantics.** Uses `try_send` so a full degraded
-/// channel falls back to dropping the report rather than back-
-/// pressuring the engine's `select!` loop. The engine is already
-/// degraded by the time we emit — adding a tokio task stall on a full
-/// channel would compound the degradation. A dropped report is logged
-/// at debug level for diagnostics; the next degraded event from the
-/// same community will re-trigger the frontend banner.
 /// ZEB-813: size-watermark classification for the encoded community root
 /// blob against `harmony_content::cid::MAX_PAYLOAD_SIZE`. Crossing the cap
 /// kills BOTH root publish and query-serve for the community — silently,
@@ -4362,14 +4389,19 @@ pub(crate) enum RootSizeWatermark {
     Ok,
     /// At or above 50% of the ContentId payload cap: log a warning.
     NearHalf,
-    /// At or above 80% of the cap: warn + degraded report — the community
-    /// is close to losing root publish/serve entirely.
+    /// At or above 80% of the cap (but within it): warn + degraded report —
+    /// the community is close to losing root publish/serve entirely.
     NearCap,
+    /// Above the cap: `ContentId::for_book` rejects the blob, so root
+    /// publish/serve is down for this community until the log shrinks.
+    OverCap,
 }
 
 pub(crate) fn classify_root_size(len: usize) -> RootSizeWatermark {
     let cap = harmony_content::cid::MAX_PAYLOAD_SIZE;
-    if len >= cap * 4 / 5 {
+    if len > cap {
+        RootSizeWatermark::OverCap
+    } else if len >= cap * 4 / 5 {
         RootSizeWatermark::NearCap
     } else if len >= cap / 2 {
         RootSizeWatermark::NearHalf
@@ -4378,6 +4410,39 @@ pub(crate) fn classify_root_size(len: usize) -> RootSizeWatermark {
     }
 }
 
+/// Numeric latch level for [`watermark_transitioned`] (0=Ok … 3=OverCap).
+fn watermark_level(w: &RootSizeWatermark) -> u8 {
+    match w {
+        RootSizeWatermark::Ok => 0,
+        RootSizeWatermark::NearHalf => 1,
+        RootSizeWatermark::NearCap => 2,
+        RootSizeWatermark::OverCap => 3,
+    }
+}
+
+/// ZEB-813 (PR #560 round 1): record `next` in the latch and report
+/// whether it DIFFERS from the previously recorded level — i.e. whether
+/// the caller should emit surfacing. `encode_root_packet` runs on every
+/// query-serve request, not just debounced publishes, so per-call
+/// emission would spam warns and degraded reports for as long as a
+/// community sits above a threshold. Latching to transitions means:
+/// crossing a threshold emits once, steady state is silent, shrinking
+/// back re-arms, and a later re-cross emits again. `Relaxed` suffices —
+/// the latch only dedups log/report emission and guards no other state.
+fn watermark_transitioned(seen: &std::sync::atomic::AtomicU8, next: &RootSizeWatermark) -> bool {
+    let level = watermark_level(next);
+    seen.swap(level, std::sync::atomic::Ordering::Relaxed) != level
+}
+
+/// Send a `CommunityDegradedReport` if `error_tx` is wired.
+///
+/// **Fire-and-forget semantics.** Uses `try_send` so a full degraded
+/// channel falls back to dropping the report rather than back-
+/// pressuring the engine's `select!` loop. The engine is already
+/// degraded by the time we emit — adding a tokio task stall on a full
+/// channel would compound the degradation. A dropped report is logged
+/// at debug level for diagnostics; the next degraded event from the
+/// same community will re-trigger the frontend banner.
 fn report_degraded(
     error_tx: Option<&mpsc::Sender<CommunityDegradedReport>>,
     community_id: SpaceId,
@@ -6041,8 +6106,43 @@ mod tests {
             RootSizeWatermark::NearHalf
         );
         assert_eq!(classify_root_size(CAP * 4 / 5), RootSizeWatermark::NearCap);
+        // for_book accepts len == cap, so the cap itself is NearCap; only
+        // strictly above flips to OverCap.
         assert_eq!(classify_root_size(CAP), RootSizeWatermark::NearCap);
-        assert_eq!(classify_root_size(CAP + 1), RootSizeWatermark::NearCap);
+        assert_eq!(classify_root_size(CAP + 1), RootSizeWatermark::OverCap);
+    }
+
+    /// ZEB-813 (PR #560 round 1): the watermark latch emits once per
+    /// transition — steady state is silent (an over-cap community must not
+    /// warn on every query-serve request), shrinking re-arms, re-crossing
+    /// re-emits.
+    #[test]
+    fn zeb_813_watermark_latch_emits_once_per_transition() {
+        let seen = std::sync::atomic::AtomicU8::new(0);
+        assert!(
+            !watermark_transitioned(&seen, &RootSizeWatermark::Ok),
+            "initial Ok is not a transition"
+        );
+        assert!(watermark_transitioned(&seen, &RootSizeWatermark::NearHalf));
+        assert!(
+            !watermark_transitioned(&seen, &RootSizeWatermark::NearHalf),
+            "steady state must not re-emit"
+        );
+        assert!(watermark_transitioned(&seen, &RootSizeWatermark::NearCap));
+        assert!(!watermark_transitioned(&seen, &RootSizeWatermark::NearCap));
+        assert!(watermark_transitioned(&seen, &RootSizeWatermark::OverCap));
+        assert!(
+            !watermark_transitioned(&seen, &RootSizeWatermark::OverCap),
+            "an over-cap community must not spam per serve request"
+        );
+        assert!(
+            watermark_transitioned(&seen, &RootSizeWatermark::Ok),
+            "shrinking back re-arms the latch"
+        );
+        assert!(
+            watermark_transitioned(&seen, &RootSizeWatermark::NearCap),
+            "a re-cross after re-arm emits again"
+        );
     }
 
     /// ZEB-618: the per-community resync sidecar path derives from
