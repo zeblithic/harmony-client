@@ -5067,7 +5067,11 @@ mod tests {
             p.record_session_failed(&[1u8; 16], &[2u8; 16]);
         }
         let s = p.summary();
-        assert_eq!(s.recent.len(), COMMUNITY_RELAY_PULL_RING_CAP, "ring must be capped");
+        assert_eq!(
+            s.recent.len(),
+            COMMUNITY_RELAY_PULL_RING_CAP,
+            "ring must be capped"
+        );
         assert_eq!(
             s.sessions_failed,
             (COMMUNITY_RELAY_PULL_RING_CAP + 5) as u64,
