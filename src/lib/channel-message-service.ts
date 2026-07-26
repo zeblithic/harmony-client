@@ -324,7 +324,17 @@ export class ChannelMessageService {
 
   /** Page through locally-known messages. Caches results + notifies
    *  subscribers (so callers don't double-render — list-then-subscribe
-   *  is the standard pattern). */
+   *  is the standard pattern).
+   *
+   *  Returns the **newest** `limit` messages (ZEB-789 made that the
+   *  backend default). `order` is deliberately not passed: the default is
+   *  now what every caller here wants, and re-stating it at each call site
+   *  invites someone to "fix" one of them to `'asc'`.
+   *
+   *  Response sequence does not matter to callers — `ingest` places each
+   *  DTO by HLC-sorted insertion, so the rendered feed is chronological
+   *  regardless of which end the backend walked from. That independence is
+   *  why flipping the default was safe here. */
   async listMessages(
     communityId: string,
     channelId: string,

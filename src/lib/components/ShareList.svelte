@@ -31,6 +31,27 @@
     availableFriends.filter((f) => !grantedAddresses.has(f.address)),
   );
 
+  /**
+   * ZEB-782. With no friends, the picker was omitted and the section
+   * collapsed to a bare "Not shared with anyone" — no control, no
+   * explanation, no way to learn that sharing is friend-gated. A user who
+   * followed the v0.2.0 release notes (which said "community members")
+   * landed on a feature that appeared present and did nothing.
+   *
+   * Three states that used to render as one, now told apart. The
+   * distinction that matters is *why* there is nothing to pick: having no
+   * friends is a dead end with an action attached, whereas having already
+   * granted everyone is a finished job. Same empty picker, opposite
+   * meanings.
+   */
+  let pickerHint = $derived(
+    availableFriends.length === 0
+      ? 'You can share encrypted files with your friends. Add a friend to get started — sharing runs over the friend connection, so community membership on its own is not enough.'
+      : pickableFriends.length === 0
+        ? 'Everyone you can share with already has access to this file.'
+        : null,
+  );
+
   // Backend rejections carry a stable `ineligible:` machine prefix — strip it
   // for display exactly like the backup toggle does (FileDetailPanel.svelte).
   function displayError(err: unknown): string {
@@ -116,6 +137,10 @@
       <p class="share-error" role="alert">{revokeError}</p>
     {/if}
 
+    {#if pickerHint}
+      <p class="picker-hint" data-testid="share-picker-hint">{pickerHint}</p>
+    {/if}
+
     {#if pickableFriends.length > 0}
       <div class="picker-row">
         <label for="share-picker" class="visually-hidden">Share with...</label>
@@ -173,6 +198,16 @@
     color: var(--text-muted);
     margin: 4px 0;
     font-style: italic;
+  }
+
+  /* ZEB-782: explains why the picker is absent. Not italic — this is
+     guidance to act on, not a placeholder for missing content, and the
+     italic empty-state right above it already reads as "nothing here". */
+  .picker-hint {
+    font-size: 0.78rem;
+    line-height: 1.4;
+    color: var(--text-muted);
+    margin: 6px 0 0;
   }
 
   .share-peer-list {

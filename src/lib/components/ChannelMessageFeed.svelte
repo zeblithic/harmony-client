@@ -262,9 +262,15 @@
       });
     });
 
-    // Pull initial page (last 100 messages). Guard against the old promise
-    // overwriting the new channel's state if user switched mid-flight
-    // (Cursor Bugbot MEDIUM on PR #97 round 1).
+    // Pull initial page (last 100 messages — relies on the ZEB-789 default,
+    // do NOT pass order: 'asc' here). Before ZEB-789 this comment was
+    // accurate about the intent and wrong about the behaviour: the backend
+    // bounded `limit` from the OLDEST end, so a channel past 100 messages
+    // opened on its first 100 and never showed a recent one. It read as
+    // healthy because the .then() scrolls to the bottom of that stale window.
+    //
+    // Guard against the old promise overwriting the new channel's state if
+    // user switched mid-flight (Cursor Bugbot MEDIUM on PR #97 round 1).
     void channelMessageService.listMessages(cid, chid, undefined, 100)
       .then(() => {
         if (cancelled) return;

@@ -417,11 +417,11 @@ list is the `registry_has_exactly_the_curated_v1_surface` pin test in
 | Node lifecycle (2) | `start_node`, `stop_node` (serve auto-starts the node at boot) |
 | Identity (2) | `get_owner_state`, `mint_owner_identity` |
 | Communities (9) | `list_owner_communities`, `create_community`, `list_community_members`, `generate_invite`, **`connectivity_redeem_invite_iroh`**, **`connectivity_open_join_iroh`**, `leave_community`, `list_left_communities`, `remove_space` |
-| Channels (4) | `create_channel`, `list_channels`, `list_channel_messages`, `post_channel_message` |
+| Channels (5) | `create_channel`, `list_channels`, `list_channel_messages`, **`list_mentions`**, `post_channel_message` |
 | Files / sharing (7) | `ingest_content_encrypted`, `grant_read`, `revoke_read`, `list_grants`, `list_received_grants`, `dismiss_received_grant`, `burn_content` |
 | Friends (9) | `list_friends`, `generate_friend_token`, `redeem_friend_token`, `add_friend_by_key`, `list_pending_friend_requests`, `accept_friend_request`, `decline_friend_request`, `list_outbound_friend_requests`, `cancel_outbound_friend_request` |
 | Spaces / DMs (3) | `add_space`, `send_dm`, `read_dm_thread` |
-| Diagnostics (4) | `connectivity_get_my_reachability_record`, `connectivity_list_peer_reachability`, `network_health_snapshot`, `network_health_run_self_test` |
+| Diagnostics (5) | `connectivity_get_my_reachability_record`, `connectivity_list_peer_reachability`, **`connectivity_pkarr_publication_status`**, `network_health_snapshot`, `network_health_run_self_test` |
 | Pairing (6) | `start_inviter_pairing` (`{"displayName": string}`), `start_joiner_pairing` (`{"displayName": string}`), `select_pairing_peer` (`{"peerSessionId": uuid}`), `confirm_pairing_sas`, `cancel_pairing`, `get_pairing_state` → `PairingState` JSON |
 
 Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
@@ -445,6 +445,95 @@ Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
 > briefly return `[]` or `no engine for <community>/<channel>`. And
 > `list_channel_messages` requires an explicit `limit`; the GUI's adapter
 > defaults it, this surface does not.
+
+> **Watching a channel: `limit` means the LATEST N.** `order` defaults to
+> `"desc"`, and it decides which end `limit` cuts from as well as the
+> sequence you get back. Pass `"asc"` and `{limit: 50}` becomes *the fifty
+> oldest messages in the channel* — a window that stops changing the moment
+> the channel outgrows it, while every poll keeps succeeding and returning
+> fifty real messages. Two fleet watchers were blind for ~18 minutes each
+> that way (ZEB-789), because a frozen window is indistinguishable from a
+> quiet channel.
+>
+> `"desc"` was **not** the default before this release. If you are driving a
+> node built before it, passing `order` does nothing: this surface used to
+> ignore unknown keys, so an older node accepts `order` and silently returns
+> the oldest window (ZEB-797). Unknown keys are now a `400` naming the field,
+> so "my node is too old for this argument" is a one-line diagnosis — but
+> that only helps against nodes new enough to reject.
+
+> **`list_mentions`: check `complete` before believing an empty reply.** The
+> verb answers "which messages address me", so an agent can wake on being
+> addressed instead of on every message:
+>
+> ```bash
+> harmony-app api --profile <name> list_mentions '{"limit": 50}'
+> #   → { "mentions": [ { "communityId", "channelId", "channelName",
+> #                       "messageId", "author", "at" }, ... ],
+> #       "complete": true,
+> #       "truncatedChannels": [], "unavailableCommunities": [],
+> #       "unavailableChannels": [] }
+> ```
+>
+> `communityId` is optional (omit to scan every joined community). `since` is
+> **your** cursor, not server-held read state — pass the `at` of the newest
+> mention you have handled and the query is resumable and idempotent. `limit`
+> follows the same contract as `list_channel_messages`, `0` included.
+>
+> **`complete: false` means never advance your cursor past this reply.** An
+> empty `mentions` can mean "nobody addressed you" or "I could not look", and
+> those are not the same answer. Gate on `complete` rather than on the detail
+> lists: it is true only when every scope was read and no window filled, so it
+> stays correct if another incompleteness reason is ever added. The lists tell
+> you what to do about it:
+>
+> - `truncatedChannels` — the channel was read but its window filled. Each
+>   channel is scanned newest-first for up to `limit` **messages** and the
+>   mention filter runs after that read, so a channel with `limit` recent
+>   non-mention messages can hide older mentions behind the window. Remedy:
+>   widen `limit`, or advance `since` and re-poll.
+> - `unavailableCommunities` — no engine is running for that community, so
+>   *none* of its channels were read: a community still starting, one joined
+>   while the node was already running, or a Space carrying no `admin_addr`
+>   (which never gets an engine, so it stays listed). Remedy: retry.
+>
+>   On the node this was measured against the API did not begin answering
+>   until after every engine had spawned, so a scan right after boot came
+>   back complete rather than listing everything. Do not rely on that
+>   ordering — it was one node with a handful of communities, and nothing
+>   guarantees it.
+> - `unavailableChannels` — the community knows the channel but no log engine
+>   is registered for it. Remedy: retry.
+>
+> A cold scope is reported rather than raised as an error, because one
+> community still starting must not fail a scan that spans thirty. Single-
+> channel verbs like `list_channel_messages` do error (`no engine for …`) —
+> there the missing engine is the whole request.
+
+> **`add_friend_by_key` needs the TARGET to be discoverable, and that is off
+> by default.** Case-B — the public identity slot this verb resolves against
+> — is opt-in. A fresh node publishes case-C (community) and case-D
+> (friend-private) automatically, so it looks like it is publishing; it is,
+> just not the slot first contact reads. Dialling an opted-out node returns a
+> bare `unreachable`, which is the same answer you get for offline, wrong
+> key, or a broken DHT.
+>
+> On the **target** node:
+>
+> ```bash
+> harmony-app api --profile <name> connectivity_set_identity_discoverable '{"enabled": true}'
+> harmony-app api --profile <name> connectivity_pkarr_publication_status '{}'
+> #   → { "identityActive": true, ... }   ← the direct answer
+> ```
+>
+> `identityActive: false` means no dialler can find you, whatever they do.
+> The node also states this at boot now — grep the log for `ZEB-794`.
+>
+> **The friend-token path does not need any of this.** `generate_friend_token`
+> publishes case-A as part of minting the token, so
+> `generate_friend_token` → `redeem_friend_token` works against a node that
+> has never enabled discoverability. If you only need the two nodes to become
+> friends, that path has fewer preconditions.
 
 > **Sharing files: `grant_read` requires an Active friend.** Grants deliver
 > over the friend transport, so sharing with someone you merely share a
