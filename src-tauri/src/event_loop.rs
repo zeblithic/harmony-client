@@ -1735,6 +1735,14 @@ pub async fn run(
                                     }
                                 };
                                 let mut replies: usize = 0;
+                                // ZEB-812: never await subscriber_tx inside
+                                // the reply-drain arm — that holds zenoh's
+                                // reply channel hostage on engine
+                                // backpressure and can park zenoh's net
+                                // thread (see `reply_spill` module doc).
+                                let mut spill = crate::reply_spill::ReplySpill::new(
+                                    subscriber_tx_rf.clone(),
+                                );
                                 let drained_clean: bool = loop {
                                     tokio::select! {
                                         biased;
@@ -1759,7 +1767,7 @@ pub async fn run(
                                                 }
                                                 let bytes: Vec<u8> =
                                                     sample.payload().to_bytes().to_vec();
-                                                if subscriber_tx_rf.send(bytes).await.is_err() {
+                                                if !spill.accept(bytes) {
                                                     return; // engine teardown
                                                 }
                                                 replies = replies.saturating_add(1);
@@ -1770,7 +1778,19 @@ pub async fn run(
                                         }
                                     }
                                 };
-                                if drained_clean {
+                                // ZEB-812: post-drain delivery; report only
+                                // once the page has landed (or never, on
+                                // shutdown/teardown — matching the old
+                                // no-report semantics of those paths).
+                                let flushed_clean = drained_clean
+                                    && match spill.flush(&closing_rf).await {
+                                        crate::reply_spill::FlushOutcome::Flushed => true,
+                                        crate::reply_spill::FlushOutcome::ConsumerGone => return,
+                                        crate::reply_spill::FlushOutcome::ShutdownAbandoned => {
+                                            false
+                                        }
+                                    };
+                                if flushed_clean {
                                     let _ = req.report.send(replies);
                                 }
                             }
@@ -9449,7 +9469,14 @@ pub fn spawn_community_state_zenoh_adapter(
                         // Inner reply-drain loop with closing-poll arm
                         // (mirrors the channel-log query driver): a hung
                         // peer must not block teardown past ~500ms.
+                        // ZEB-812: never await subscriber_tx inside the
+                        // reply-drain arm — that holds zenoh's reply
+                        // channel hostage on engine backpressure and can
+                        // park zenoh's net thread (see `reply_spill`
+                        // module doc).
                         let mut replies: usize = 0;
+                        let mut spill =
+                            crate::reply_spill::ReplySpill::new(subscriber_tx_rf.clone());
                         let drained_clean: bool = loop {
                             tokio::select! {
                                 biased;
@@ -9458,7 +9485,7 @@ pub fn spawn_community_state_zenoh_adapter(
                                     if let Ok(sample) = reply.into_result() {
                                         let bytes: Vec<u8> =
                                             sample.payload().to_bytes().to_vec();
-                                        if subscriber_tx_rf.send(bytes).await.is_err() {
+                                        if !spill.accept(bytes) {
                                             return; // engine teardown
                                         }
                                         replies = replies.saturating_add(1);
@@ -9469,10 +9496,19 @@ pub fn spawn_community_state_zenoh_adapter(
                                 }
                             }
                         };
-                        if drained_clean {
+                        // ZEB-812: post-drain delivery; report only once
+                        // the page has landed (or never, on shutdown/
+                        // teardown — the old no-report semantics).
+                        let flushed_clean = drained_clean
+                            && match spill.flush(&closing_rf).await {
+                                crate::reply_spill::FlushOutcome::Flushed => true,
+                                crate::reply_spill::FlushOutcome::ConsumerGone => return,
+                                crate::reply_spill::FlushOutcome::ShutdownAbandoned => false,
+                            };
+                        if flushed_clean {
                             let _ = req.report.send(replies);
                         }
-                        // !drained_clean: report drops without a value →
+                        // !flushed_clean: report drops without a value →
                         // fetch driver sees NoReply (its shutdown watch
                         // ends it promptly during teardown anyway).
                     }
@@ -9854,6 +9890,14 @@ pub fn spawn_voting_log_zenoh_adapter(
                     .allowed_destination(zenoh::sample::Locality::Remote)
                     // Bound the query so a hung/never-completing round can't
                     // stall anti-entropy forever (mirrors the RBSR get path).
+                    // ZEB-812 audit note: this drain awaits `apply_backfilled`
+                    // inline (an app-side await inside the reply arm), which
+                    // is the shape that wedged the channel-log drain — but
+                    // here the 10s query timeout above closes the reply
+                    // stream regardless, so a slow apply bounds one voting
+                    // round at 10s instead of parking zenoh indefinitely.
+                    // Left as-is deliberately; a spill would buy little (the
+                    // payloads are applied, not forwarded to a channel).
                     .timeout(std::time::Duration::from_secs(10))
                     .await
                 {
@@ -10577,6 +10621,20 @@ where
                         // poll is tighter than the outer 1s because
                         // backfill is user-triggered and stop() latency
                         // is a UX concern.
+                        //
+                        // ZEB-812: this loop must NEVER await subscriber_tx.
+                        // A `send().await` here holds zenoh's reply channel
+                        // hostage while waiting on engine backpressure —
+                        // the reply channel fills, zenoh's single net
+                        // thread parks in `flume wait_send<Reply>`, and the
+                        // node's ENTIRE zenoh transport wedges (ZEB-803).
+                        // The parked await also starves the closing-poll
+                        // arm below. Replies go through a local spill
+                        // (bounded by the page `limit`) with try_send
+                        // forwarding; the blocking delivery happens in
+                        // `flush()` after the stream closes.
+                        let mut spill =
+                            crate::reply_spill::ReplySpill::new(subscriber_tx_qr.clone());
                         let drained_clean: bool = loop {
                             tokio::select! {
                                 biased;
@@ -10584,7 +10642,7 @@ where
                                     let Ok(reply) = res else { break true; };
                                     if let Ok(sample) = reply.into_result() {
                                         let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
-                                        if subscriber_tx_qr.send(bytes).await.is_err() {
+                                        if !spill.accept(bytes) {
                                             // subscriber_rx dropped (engine
                                             // teardown). No point serving more
                                             // backfill requests if we can't
@@ -10600,7 +10658,10 @@ where
                                         // every N replies. `total_estimate` is
                                         // `None` — we don't know the total until
                                         // the receiver closes (Zenoh streams
-                                        // replies one-at-a-time).
+                                        // replies one-at-a-time). `fetched` now
+                                        // counts replies pulled off the zenoh
+                                        // stream (ZEB-812), which may run ahead
+                                        // of what the engine has absorbed.
                                         if backfill_progress_interval > 0
                                             && (fetched as usize)
                                                 .is_multiple_of(backfill_progress_interval)
@@ -10621,8 +10682,21 @@ where
                                 }
                             }
                         };
+                        // ZEB-812: the zenoh stream is closed; deliver what
+                        // the consumer hasn't absorbed yet. Blocking on the
+                        // engine HERE is the intended request-level
+                        // backpressure (no next request until this page
+                        // lands), and flush() keeps the closing poll live.
+                        // ShutdownAbandoned matches the !drained_clean
+                        // no-report shutdown semantics.
+                        let flushed_clean = drained_clean
+                            && match spill.flush(&closing_qr).await {
+                                crate::reply_spill::FlushOutcome::Flushed => true,
+                                crate::reply_spill::FlushOutcome::ConsumerGone => return,
+                                crate::reply_spill::FlushOutcome::ShutdownAbandoned => false,
+                            };
                         // Spec §10: emit a final progress tick at end-of-
-                        // request. We always fire on `drained_clean`
+                        // request. We always fire on a clean drain+flush
                         // (including `fetched == 0`) so the UI can
                         // distinguish "backfill finished with zero
                         // results" from "backfill is still in flight" —
@@ -10634,8 +10708,12 @@ where
                         // unknown, `None`) from the terminal one.
                         // Skip on shutdown — the consumer is going away
                         // and a final tick after the closing flag
-                        // flipped is racy noise.
-                        if drained_clean {
+                        // flipped is racy noise. ZEB-812: the gate is
+                        // `flushed_clean` — a report only fires once the
+                        // page has actually LANDED in the engine channel,
+                        // preserving the pre-spill meaning of a report
+                        // for BackfillLatch callers.
+                        if flushed_clean {
                             (emit_backfill_progress_qr)(fetched, Some(fetched));
                             // ZEB-418 P3a: page-completion report for
                             // callers that asked (BackfillLatch).
@@ -11371,6 +11449,265 @@ mod channel_log_adapter_tests {
         }
 
         closing.store(true, Ordering::SeqCst);
+        drop(qreq_tx);
+    }
+
+    /// ZEB-812 shared harness: a qr-driver adapter whose queryable answers
+    /// every backfill GET with `replies` distinct one-byte packets, a
+    /// deliberately SMALL subscriber channel (`sub_bound`), and a progress
+    /// collector with interval 1 — so each reply pulled off the zenoh
+    /// stream is externally observable regardless of what the consumer
+    /// does. Warms the queryable with one actively-consumed request (the
+    /// declaration race from the sibling test) before returning.
+    #[allow(clippy::type_complexity)]
+    async fn qr_stalled_consumer_harness(
+        channel_hex: &str,
+        replies: usize,
+        sub_bound: usize,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::Sender<crate::community_channel_log_engine::BackfillQueryRequest>,
+        mpsc::Receiver<Vec<u8>>,
+        mpsc::Sender<Vec<u8>>,
+        mpsc::Sender<Vec<u8>>,
+        Arc<std::sync::Mutex<Vec<(u32, Option<u32>)>>>,
+        Arc<AtomicBool>,
+        Arc<zenoh::Session>,
+    ) {
+        use crate::community_channel_log_engine::BackfillQueryRequest;
+
+        let cfg = hermetic_zenoh_config();
+        let session = Arc::new(zenoh::open(cfg).await.expect("zenoh open"));
+
+        let (pub_tx, pub_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (sub_tx, mut sub_rx) = mpsc::channel::<Vec<u8>>(sub_bound);
+        let (qreq_tx, qreq_rx) = mpsc::channel::<BackfillQueryRequest>(2);
+
+        let n = replies;
+        let read_for_query = Arc::new(
+            move |_since: Option<crate::owner_state_types::Hlc>,
+                  _limit: usize,
+                  _watermark: Option<Vec<u8>>| {
+                Box::pin(async move { (0..n).map(|i| vec![i as u8]).collect::<Vec<_>>() })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Vec<u8>>> + Send>>
+            },
+        );
+
+        let ticks: Arc<std::sync::Mutex<Vec<(u32, Option<u32>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ticks_emit = Arc::clone(&ticks);
+        let emit_progress: Arc<dyn Fn(u32, Option<u32>) + Send + Sync + 'static> =
+            Arc::new(move |fetched, total| {
+                ticks_emit.lock().unwrap().push((fetched, total));
+            });
+
+        let closing = Arc::new(AtomicBool::new(false));
+        let adapter = spawn_channel_log_zenoh_adapter(
+            Arc::clone(&session),
+            "eeff".repeat(8),
+            channel_hex.repeat(8),
+            pub_rx,
+            sub_tx.clone(),
+            qreq_rx,
+            read_for_query,
+            emit_progress,
+            1, // a progress tick per pulled reply — the ZEB-812 observable
+            64,
+            Arc::clone(&closing),
+            None,
+        );
+        // The pub side is unused but must stay alive for the adapter's
+        // lifetime — it rides back to the caller in the return tuple.
+
+        // Warm up: fire actively-consumed requests until one drains all
+        // `replies` packets (queryable declaration is async; early GETs see
+        // a closed stream). Consuming concurrently keeps the small channel
+        // from filling during warmup.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            qreq_tx
+                .send(BackfillQueryRequest {
+                    since: None,
+                    limit: replies,
+                    outcome_tx: Some(tx),
+                    watermark_sealed: None,
+                })
+                .await
+                .expect("qreq send (warmup)");
+            let mut rx = rx;
+            let mut got = 0usize;
+            let report = loop {
+                tokio::select! {
+                    r = &mut rx => break r.ok(),
+                    p = sub_rx.recv() => {
+                        p.expect("sub_rx open during warmup");
+                        got += 1;
+                    }
+                }
+            };
+            while sub_rx.try_recv().is_ok() {
+                got += 1;
+            }
+            if report.map(|r| r.replies) == Some(replies) {
+                assert_eq!(got, replies, "warmup consumed exactly one page");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queryable never came online within 15s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        ticks.lock().unwrap().clear();
+
+        (
+            adapter, qreq_tx, sub_rx, sub_tx, pub_tx, ticks, closing, session,
+        )
+    }
+
+    /// ZEB-812 invariant: draining zenoh's reply stream must NEVER block on
+    /// engine (subscriber-channel) backpressure. A stalled consumer with a
+    /// full subscriber channel must not stop replies being pulled off the
+    /// zenoh stream — that block is exactly what backed up into zenoh's net
+    /// thread (`flume wait_send<Reply>`) and wedged the whole session in
+    /// ZEB-803. The mid-drain progress ticks are the direct observable:
+    /// with interval 1, the highest `total=None` tick IS the number of
+    /// replies pulled, no matter what the consumer does. Second half pins
+    /// spill-is-not-drop: once the consumer resumes, every reply arrives,
+    /// in order, and the page report fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zeb812_qr_driver_pulls_full_reply_stream_despite_stalled_consumer() {
+        use crate::community_channel_log_engine::BackfillQueryRequest;
+
+        const REPLIES: usize = 32;
+        const SUB_BOUND: usize = 4; // production is 64; what matters is FULL
+
+        let (_adapter, qreq_tx, mut sub_rx, _sub_tx, _pub_tx, ticks, closing, _session) =
+            qr_stalled_consumer_harness("3344", REPLIES, SUB_BOUND).await;
+
+        // Fire a request and do NOT consume sub_rx: the stalled-consumer
+        // wedge. The zenoh stream must still be fully pulled.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        qreq_tx
+            .send(BackfillQueryRequest {
+                since: None,
+                limit: REPLIES,
+                outcome_tx: Some(tx),
+                watermark_sealed: None,
+            })
+            .await
+            .expect("qreq send");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let pulled = ticks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, total)| total.is_none())
+                .map(|(n, _)| *n)
+                .max()
+                .unwrap_or(0);
+            if pulled >= REPLIES as u32 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ZEB-812: drain stalled at {pulled}/{REPLIES} replies pulled — the \
+                 reply-drain loop is blocking on subscriber-channel backpressure \
+                 instead of draining zenoh's reply stream"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Spill is not drop: resume consuming; every packet arrives in order.
+        let mut got: Vec<u8> = Vec::with_capacity(REPLIES);
+        while got.len() < REPLIES {
+            let pkt = tokio::time::timeout(std::time::Duration::from_secs(10), sub_rx.recv())
+                .await
+                .expect("resumed consumer timed out waiting for spilled replies")
+                .expect("sub_rx open");
+            assert_eq!(pkt.len(), 1);
+            got.push(pkt[0]);
+        }
+        let expect: Vec<u8> = (0..REPLIES as u8).collect();
+        assert_eq!(
+            got, expect,
+            "spilled replies must arrive complete and in order"
+        );
+
+        // And the page report fires once the flush lands.
+        let report = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .expect("page report timed out")
+            .expect("driver dropped outcome_tx");
+        assert_eq!(report.replies, REPLIES);
+
+        closing.store(true, Ordering::SeqCst);
+        drop(qreq_tx);
+    }
+
+    /// ZEB-812 companion invariant: a stalled consumer must not make
+    /// `stop()` latency unbounded. The drain loop's 500ms closing-poll arm
+    /// only runs between select iterations — an await parked inside the
+    /// reply arm's body starves it, so pre-fix the qr task (and therefore
+    /// the adapter JoinHandle, which joins it) never exits. Post-fix both
+    /// the drain phase and the spill-flush phase keep the closing poll
+    /// live, so the adapter must come down within a few seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zeb812_qr_driver_shutdown_unblocks_despite_stalled_consumer() {
+        use crate::community_channel_log_engine::BackfillQueryRequest;
+
+        const REPLIES: usize = 32;
+        const SUB_BOUND: usize = 4;
+
+        let (adapter, qreq_tx, _sub_rx, _sub_tx, _pub_tx, ticks, closing, _session) =
+            qr_stalled_consumer_harness("5566", REPLIES, SUB_BOUND).await;
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        qreq_tx
+            .send(BackfillQueryRequest {
+                since: None,
+                limit: REPLIES,
+                outcome_tx: Some(tx),
+                watermark_sealed: None,
+            })
+            .await
+            .expect("qreq send");
+
+        // Wait until the drain has demonstrably started (≥1 reply pulled)
+        // so closing flips mid-wedge, not before the GET.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let pulled = ticks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, total)| total.is_none())
+                .map(|(n, _)| *n)
+                .max()
+                .unwrap_or(0);
+            if pulled >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain never started within 10s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        closing.store(true, Ordering::SeqCst);
+        // Exit must come from the closing flag, not from a closed request
+        // channel — keep the sender alive across the join.
+        let join = tokio::time::timeout(std::time::Duration::from_secs(5), adapter).await;
+        assert!(
+            join.is_ok(),
+            "ZEB-812: adapter did not shut down within 5s of the closing flag — \
+             the reply-drain (or spill-flush) is parked on subscriber-channel \
+             backpressure with the closing poll starved"
+        );
         drop(qreq_tx);
     }
 
