@@ -357,6 +357,30 @@ impl LogPolicy for MembershipPolicy {
         let owned: Vec<SignedMembershipEvent> = events.iter().map(|e| (*e).clone()).collect();
         materialize_with_now(&owned, ctx.verify.admin_addr, Some(ctx.now_floor_ms))
     }
+
+    fn supersedes(newer: &SignedMembershipEvent, older: &SignedMembershipEvent) -> bool {
+        use crate::community_membership::MembershipEventKind::{
+            CommunityRelayAnnounce, ReachabilityAnnounce,
+        };
+        // ZEB-813: only the two LWW routing-announce kinds ever supersede.
+        // Both are materialize-neutral (their `materialize` arms are no-ops),
+        // satisfying the core contract's clause (d); every other kind is
+        // durable community history and must never be compacted. Ordering by
+        // `event_sort_key` — the same canonical total order `cmp` uses —
+        // satisfies clause (a) by construction, and same-key transitivity
+        // (b) follows from it being a total order.
+        let same_key = match (&newer.kind, &older.kind) {
+            (ReachabilityAnnounce { payload: pn }, ReachabilityAnnounce { payload: po }) => {
+                newer.actor == older.actor && pn.iroh_node_id == po.iroh_node_id
+            }
+            (CommunityRelayAnnounce { payload: pn }, CommunityRelayAnnounce { payload: po }) => {
+                newer.actor == older.actor
+                    && pn.relay.relay_device_id == po.relay.relay_device_id
+            }
+            _ => false,
+        };
+        same_key && event_sort_key(newer) > event_sort_key(older)
+    }
 }
 
 impl CommunityState {
@@ -390,6 +414,25 @@ impl CommunityState {
         if let Ok(mut g) = self.bootstrap_hint.lock() {
             *g = Some(hint);
         }
+    }
+
+    /// Test-only: build a state whose log is restored from already-trusted
+    /// events, mirroring the deserialize path (`from_verified_events`) —
+    /// including its ZEB-813 supersession compaction.
+    #[cfg(test)]
+    pub(crate) fn from_trusted_events_for_test(
+        community_id: SpaceId,
+        events: impl IntoIterator<Item = SignedMembershipEvent>,
+    ) -> Self {
+        let mut state = Self::new(community_id);
+        state.log = VerifiedLog::from_verified_events(events);
+        state
+    }
+
+    /// Test-only: number of events currently in the log.
+    #[cfg(test)]
+    pub(crate) fn event_count_for_test(&self) -> usize {
+        self.log.len()
     }
 
     /// Cache version counter. Bumps on every successful insert.
@@ -482,6 +525,13 @@ impl CommunityState {
         };
         match self.log.insert(event, &policy_ctx) {
             CoreOutcome::AlreadyKnown => InsertOutcome::AlreadyKnown,
+            CoreOutcome::Superseded => {
+                // ZEB-813: a stale announce that a stored event supersedes.
+                // Nothing changed — no cache bump, no dirty mark, no
+                // persist. AlreadyKnown is exactly that contract, so
+                // callers need no new arm.
+                InsertOutcome::AlreadyKnown
+            }
             CoreOutcome::Rejected(e) => InsertOutcome::Rejected(e),
             CoreOutcome::Inserted => {
                 // Invalidate cache by bumping version. Lazy re-mat happens on

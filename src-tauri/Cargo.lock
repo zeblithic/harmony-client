@@ -2906,7 +2906,7 @@ dependencies = [
 [[package]]
 name = "harmony-athenaeum"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -2914,7 +2914,7 @@ dependencies = [
 [[package]]
 name = "harmony-compute"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "harmony-crypto",
  "thiserror 2.0.18",
@@ -2925,7 +2925,7 @@ dependencies = [
 [[package]]
 name = "harmony-contacts"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "harmony-identity",
  "hashbrown 0.15.5",
@@ -2936,7 +2936,7 @@ dependencies = [
 [[package]]
 name = "harmony-content"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "harmony-crypto",
  "harmony-zenoh",
@@ -2951,12 +2951,12 @@ dependencies = [
 [[package]]
 name = "harmony-crdt-sync"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 
 [[package]]
 name = "harmony-credential"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "harmony-crypto",
  "harmony-identity",
@@ -2967,7 +2967,7 @@ dependencies = [
 [[package]]
 name = "harmony-crypto"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "aes",
  "argon2",
@@ -2994,7 +2994,7 @@ dependencies = [
 [[package]]
 name = "harmony-discovery"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "harmony-crypto",
  "harmony-identity",
@@ -3006,7 +3006,7 @@ dependencies = [
 [[package]]
 name = "harmony-identity"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3025,7 +3025,7 @@ dependencies = [
 [[package]]
 name = "harmony-iroh"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "async-trait",
  "futures",
@@ -3037,7 +3037,7 @@ dependencies = [
 [[package]]
 name = "harmony-mailbox"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "blake3",
  "harmony-identity",
@@ -3048,7 +3048,7 @@ dependencies = [
 [[package]]
 name = "harmony-memo"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "harmony-content",
  "harmony-credential",
@@ -3062,7 +3062,7 @@ dependencies = [
 [[package]]
 name = "harmony-owner"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "bip39",
  "ciborium",
@@ -3085,7 +3085,7 @@ dependencies = [
 [[package]]
 name = "harmony-peers"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "harmony-contacts",
  "harmony-crypto",
@@ -3121,7 +3121,7 @@ dependencies = [
 [[package]]
 name = "harmony-platform"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "hashbrown 0.15.5",
  "rand_core 0.6.4",
@@ -3131,7 +3131,7 @@ dependencies = [
 [[package]]
 name = "harmony-reachability"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -3142,7 +3142,7 @@ dependencies = [
 [[package]]
 name = "harmony-runtime"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "harmony-athenaeum",
  "harmony-compute",
@@ -3167,12 +3167,12 @@ dependencies = [
 [[package]]
 name = "harmony-speculative"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 
 [[package]]
 name = "harmony-telemetry"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "serde",
  "serde_json",
@@ -3181,7 +3181,7 @@ dependencies = [
 [[package]]
 name = "harmony-tunnel"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "harmony-crypto",
  "harmony-identity",
@@ -3193,7 +3193,7 @@ dependencies = [
 [[package]]
 name = "harmony-tunnel-iroh"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "blake3",
  "ciborium",
@@ -3213,7 +3213,7 @@ dependencies = [
 [[package]]
 name = "harmony-workflow"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "harmony-compute",
  "harmony-crypto",
@@ -3223,7 +3223,7 @@ dependencies = [
 [[package]]
 name = "harmony-zenoh"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=4eb420867bbd38b8bc314f590903a7e46b4dfd70#4eb420867bbd38b8bc314f590903a7e46b4dfd70"
+source = "git+https://github.com/zeblithic/harmony.git?rev=f44e5549487aa0ac7073110b9d209eefede23549#f44e5549487aa0ac7073110b9d209eefede23549"
 dependencies = [
  "harmony-crypto",
  "harmony-identity",
