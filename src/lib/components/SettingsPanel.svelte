@@ -281,8 +281,22 @@
 
   /* Mirrors NotificationSettingsPanel's internal tab styling so the outer
      settings tabs read as the same control. */
+  /* ZEB-771: reflow instead of clipping. As a nowrap flex row the 8 tabs
+     needed 615px inside a 471px strip, and `.tabs` had no overflow strategy
+     of its own — so Communities and Friends fell outside the strip entirely
+     and were reachable only by horizontally scrolling the whole Settings
+     panel, which is the one place a user would never look for them.
+
+     A grid (rather than `flex-wrap`) for two reasons: `.tab` was `flex: 1`,
+     i.e. `flex-basis: 0`, so wrapping would have needed the basis changed to
+     `auto` and would then have produced a ragged final row of two
+     double-width tabs; and auto-fit matches the ZEB-333 remedy already in
+     NavPanel's `.mode-toggles`. The 104px floor clears the widest label
+     ("Communities", measured at 100px) with headroom for the wider font
+     metrics that made ZEB-333 a Windows-only report. */
   .tabs {
-    display: flex;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
     border-bottom: 1px solid var(--border);
     position: sticky;
     top: 0;
@@ -291,7 +305,6 @@
   }
 
   .tab {
-    flex: 1;
     padding: 8px 12px;
     border: none;
     background: none;

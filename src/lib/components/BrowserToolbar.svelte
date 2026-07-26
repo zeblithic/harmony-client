@@ -121,8 +121,22 @@
 </div>
 
 <style>
+  /* ZEB-766: wrap instead of clipping. `.toolbar-left` and `.toolbar-right`
+     are both `flex-shrink: 0`, so the only flexible item is `.search-input`
+     (`flex: 1; min-width: 0`) — once it collapses to zero there is nothing
+     left to give and the two rigid groups overflow the row. The row itself
+     was `overflow-x: visible`, so the surplus was silently clipped rather
+     than scrollable: at the default 1200x800 window that hid "New Folder"
+     and "Add folder…" entirely.
+
+     Wrapping (rather than `overflow-x: auto`) matches the ZEB-333 remedy in
+     NavPanel's `.mode-toggles` and needs no scroll affordance. `flex-shrink: 0`
+     keeps the now-taller row from being squeezed by `.file-browser`'s column
+     flex. */
   .browser-toolbar {
     display: flex;
+    flex-wrap: wrap;
+    flex-shrink: 0;
     align-items: center;
     gap: 8px;
     padding: 8px 12px;

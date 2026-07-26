@@ -64,6 +64,7 @@
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
   import { POWER_THRESHOLDS } from './lib/types';
+  import { isSettingsVisible, toggleSettingsState } from './lib/settings-visibility';
   import { NotificationService } from './lib/notification-service';
   import {
     loadNotificationSettings,
@@ -142,6 +143,17 @@
     'profile' | 'appearance' | 'account' | 'notifications' | 'network' | 'communities' | 'friends'
   >('profile');
   let appMode = $state<AppMode>('messages');
+
+  // ZEB-767: `showSettings` alone does NOT mean "Settings is on screen" —
+  // Layout also requires messages mode. Binding the gear's active/aria-pressed
+  // state to the flag made it announce success while nothing opened. Predicate
+  // and transition both live in lib/settings-visibility.ts, where the
+  // "aria-pressed never disagrees with what rendered" invariant is pinned.
+  let settingsVisible = $derived(isSettingsVisible(showSettings, appMode));
+
+  function toggleSettings() {
+    ({ showSettings, appMode } = toggleSettingsState(showSettings, appMode));
+  }
 
   // ZEB-405 (WS-C): user-controlled reveal + width of the messages-mode media
   // panel. Collapsed by default (opt-in). Bound into <Layout>, persisted here.
@@ -3842,8 +3854,8 @@
         {collapsed}
         activeNodeId={navActiveNodeId}
         onNodeClick={handleNodeClick}
-        onSettingsClick={() => { showSettings = !showSettings; }}
-        settingsActive={showSettings}
+        onSettingsClick={toggleSettings}
+        settingsActive={settingsVisible}
         profileLookup={(addr) => navService.profileLookup(addr)}
         presenceOnline={(node) => {
           // ZEB-600: reading presenceVersion registers the reactive dependency

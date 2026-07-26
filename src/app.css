@@ -343,3 +343,62 @@ html, body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
 }
+
+/* =============================================================================
+   Relay list controls (ZEB-773)
+   -----------------------------------------------------------------------------
+   Settings -> Network and Settings -> Account rendered ~10 buttons with raw
+   user-agent chrome (2px outset black border, rgb(240,240,240) fill, 0 radius)
+   inside otherwise fully themed panels. Unlike ZEB-769 the classes WERE applied
+   — they simply set sizing and cursor and never any visual property, so the UA
+   default showed through.
+
+   These live here rather than in the components because the rules were
+   duplicated verbatim across IrohRelaySettings.svelte and
+   NetworkDiscoverabilitySettings.svelte, and had ALREADY drifted: `.relay-input`
+   carried `border-radius: 3px` in one and `5px` in the other. Svelte scopes
+   component styles per component, so a shared class is the only way two files
+   can hold one treatment. Fixing this in both <style> blocks would have
+   re-created the exact condition that produced the drift.
+   ============================================================================= */
+.relay-remove,
+.relay-add-btn,
+.relay-restore-btn {
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.relay-remove {
+  padding: 1px 6px;
+}
+
+.relay-add-btn,
+.relay-restore-btn {
+  padding: 3px 8px;
+}
+
+/* Was declared twice in each component (once for sizing, once for layout);
+   merged into the single block the two declarations always meant. */
+.relay-restore-btn {
+  margin-top: 6px;
+  display: block;
+}
+
+.relay-remove:hover,
+.relay-add-btn:hover,
+.relay-restore-btn:hover {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+}
+
+.relay-remove:focus-visible,
+.relay-add-btn:focus-visible,
+.relay-restore-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

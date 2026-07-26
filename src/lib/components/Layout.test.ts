@@ -131,3 +131,41 @@ describe('Layout media panel — ZEB-405 (WS-C)', () => {
     expect(queryByTestId('media')).not.toBeInTheDocument();
   });
 });
+
+/**
+ * ZEB-767. `showSettings: true` is NOT sufficient for Settings to be on screen —
+ * Layout also requires messages mode. The left-rail gear is rendered in every
+ * mode and used to toggle `showSettings` blindly, so in the 5 non-messages modes
+ * it flipped to `aria-pressed="true"` while nothing opened: a dead control that
+ * announced success to a screen reader.
+ *
+ * App.svelte now routes to messages mode before opening (and derives the gear's
+ * pressed state from `showSettings && appMode === 'messages'`). That fix is only
+ * necessary while the asymmetry below holds, so pin it: if Settings ever renders
+ * outside messages mode, these fail and the routing can be reconsidered.
+ */
+describe('Layout settings gating — ZEB-767', () => {
+  const settingsIn = (mode: string) =>
+    render(Layout, {
+      props: {
+        ...baseSnippets,
+        settingsPanel: slot('settings', 'settings here'),
+        mintLedger: slot('mint', 'mint ledger'),
+        vineFeed: slot('vine', 'vines'),
+        mode,
+        collapsed: false,
+        showSettings: true,
+      },
+    });
+
+  it('renders Settings in messages mode when showSettings is set', () => {
+    expect(settingsIn('messages').getByTestId('settings')).toBeInTheDocument();
+  });
+
+  it.each(['mint', 'vines'])(
+    'ignores showSettings in %s mode — the state is set but nothing renders',
+    (mode) => {
+      expect(settingsIn(mode).queryByTestId('settings')).not.toBeInTheDocument();
+    },
+  );
+});

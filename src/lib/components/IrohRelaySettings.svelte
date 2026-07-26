@@ -290,11 +290,9 @@
     word-break: break-all;
   }
 
-  .relay-remove {
-    font-size: 11px;
-    padding: 1px 6px;
-    cursor: pointer;
-  }
+  /* ZEB-773: `.relay-remove` / `.relay-add-btn` / `.relay-restore-btn` are
+     styled globally in src/app.css — the rules were duplicated verbatim here
+     and in NetworkDiscoverabilitySettings.svelte, and had already drifted. */
 
   .relay-add-row {
     display: flex;
@@ -309,18 +307,9 @@
     background: var(--bg-tertiary);
     color: var(--text-primary);
     border: 1px solid var(--border);
-    border-radius: 3px;
-  }
-
-  .relay-add-btn,
-  .relay-restore-btn {
-    font-size: 11px;
-    padding: 3px 8px;
-    cursor: pointer;
-  }
-
-  .relay-restore-btn {
-    margin-top: 6px;
-    display: block;
+    /* ZEB-773: was 3px here and 5px in NetworkDiscoverabilitySettings — the
+       duplicated block had already drifted. Normalised to the 4px used by
+       every other control in the app. */
+    border-radius: 4px;
   }
 </style>

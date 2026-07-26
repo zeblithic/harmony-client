@@ -295,10 +295,19 @@
 </article>
 
 <style>
+  /* ZEB-772: keep clipped content reachable. `overflow-y: auto` scrolls only
+     the block axis — the inline axis stayed `visible`, so when a competing
+     panel squeezed this column the overflowing controls ("Propose amendment",
+     the role cards) were not merely cramped but unreachable, with no scroll
+     affordance anywhere. The grid floor in Layout.svelte stops the squeeze
+     being severe; this makes the residue reachable rather than lost, which is
+     the part that must hold at ANY width. `min-width: 0` stays: it is what
+     lets long unbroken strings wrap instead of forcing the column wider. */
   .charter-view {
     flex: 1;
     min-width: 0;
     overflow-y: auto;
+    overflow-x: auto;
     padding: 24px 20px 48px;
     background: var(--bg-primary);
   }
