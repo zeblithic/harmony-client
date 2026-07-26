@@ -6,8 +6,10 @@
 //! event-loop wiring land in later tasks.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use ciborium::{from_reader, into_writer};
 use serde::{Deserialize, Serialize};
 
 use crate::community_relay_announce::{
@@ -225,6 +227,56 @@ impl CommunityAddressBook {
         g.retain(|_, row| now_ms.saturating_sub(row.stamped_at_ms) <= row_ttl_ms(&row.entry));
         before - g.len()
     }
+}
+
+/// Sidecar file path for a community's address book:
+/// `identity_dir/communities/{community_id_hex}/addrbook.cbor` — the same
+/// `communities/{hex}/` directory `CommunitySyncRegistry::paths_for`
+/// (`community_state_sync.rs`) derives for `crdt.cbor`/`replay.cbor`, so
+/// the address book sidecar lives alongside them.
+pub fn addrbook_path(identity_dir: &Path, community: &SpaceId) -> PathBuf {
+    identity_dir
+        .join("communities")
+        .join(hex::encode(community.0))
+        .join("addrbook.cbor")
+}
+
+/// Persist `rows` to `path` via temp-file + rename — same durability
+/// posture as `community_state_persist::save_crdt` (no fsync: the address
+/// book is fully peer-recoverable via republish, so the extra durability
+/// cost doesn't pencil out at this granularity).
+///
+/// Like `save_crdt`, the fixed `.tmp` name is only race-free with a single
+/// writer per `path`; a future caller invoking this concurrently for the
+/// same community would need `tempfile::NamedTempFile::new_in` instead.
+pub fn save_addrbook(path: &Path, rows: &[AddressBookRow]) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    into_writer(rows, &mut bytes).map_err(|e| format!("encode addrbook: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {e}"))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Load rows from `path`, TTL-filtering per [`row_ttl_ms`]. A missing or
+/// corrupt file returns an empty vec — loss-safe per spec §2: the address
+/// book fully reconstructs from peer republish, so a hard error here would
+/// needlessly block engine spawn.
+pub fn load_addrbook(path: &Path, now_ms: u64) -> Vec<AddressBookRow> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let rows: Vec<AddressBookRow> = match from_reader(bytes.as_slice()) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.into_iter()
+        .filter(|row| now_ms.saturating_sub(row.stamped_at_ms) <= row_ttl_ms(&row.entry))
+        .collect()
 }
 
 #[cfg(test)]
@@ -505,5 +557,87 @@ mod tests {
             "only the stale relay row is swept"
         );
         assert_eq!(b.rows_for_community(&c2, far_future).len(), 1);
+    }
+
+    #[test]
+    fn sidecar_round_trip_preserves_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let community = SpaceId([0xAB; 16]);
+        let path = addrbook_path(dir.path(), &community);
+        assert_eq!(
+            path,
+            dir.path()
+                .join("communities")
+                .join(hex::encode(community.0))
+                .join("addrbook.cbor"),
+            "mirrors community_state_sync::paths_for's communities/{{hex}}/ layout"
+        );
+
+        let actor = OwnerAddr([0x01; 16]);
+        let now = 1_700_000_000_000;
+        let rows = vec![reach_row(0x01, actor, now), relay_row(0x02, actor, now)];
+
+        save_addrbook(&path, &rows).unwrap();
+        assert!(path.exists());
+
+        let loaded = load_addrbook(&path, now);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded
+            .iter()
+            .all(|r| r.actor == actor && r.stamped_at_ms == now));
+        assert!(loaded.iter().any(
+            |r| matches!(&r.entry, AddressBookEntry::Reachability(p) if p.iroh_node_id == [0x01; 32])
+        ));
+        assert!(loaded.iter().any(
+            |r| matches!(&r.entry, AddressBookEntry::Relay(p) if p.relay.relay_device_id == [0x02; 16])
+        ));
+    }
+
+    #[test]
+    fn load_filters_expired_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let community = SpaceId([0xCD; 16]);
+        let path = addrbook_path(dir.path(), &community);
+        let actor = OwnerAddr([0x01; 16]);
+        let now = 1_700_000_000_000;
+
+        let rows = vec![reach_row(0x01, actor, now), relay_row(0x02, actor, now)];
+        save_addrbook(&path, &rows).unwrap();
+
+        assert_eq!(
+            load_addrbook(&path, now).len(),
+            2,
+            "both rows are fresh immediately after write"
+        );
+
+        // Past the relay TTL (15 min) but before the reachability TTL
+        // (24h): relay row filtered, reachability row survives.
+        let after_relay_ttl = now + COMMUNITY_RELAY_AD_FRESHNESS_MS + 1;
+        let loaded = load_addrbook(&path, after_relay_ttl);
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(loaded[0].entry, AddressBookEntry::Reachability(_)));
+
+        // Past the reachability TTL too: nothing survives.
+        let after_reach_ttl = now + ADDRBOOK_REACHABILITY_TTL_MS + 1;
+        assert!(load_addrbook(&path, after_reach_ttl).is_empty());
+    }
+
+    #[test]
+    fn load_missing_or_corrupt_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let community = SpaceId([0xEF; 16]);
+        let path = addrbook_path(dir.path(), &community);
+
+        assert!(
+            load_addrbook(&path, 1_700_000_000_000).is_empty(),
+            "nonexistent path returns empty, not an error"
+        );
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not cbor garbage").unwrap();
+        assert!(
+            load_addrbook(&path, 1_700_000_000_000).is_empty(),
+            "corrupt bytes return empty, not an error"
+        );
     }
 }
