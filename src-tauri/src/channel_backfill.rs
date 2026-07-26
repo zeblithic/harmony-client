@@ -303,6 +303,25 @@ pub enum PageFetch {
     EngineGone,
 }
 
+/// ZEB-807 (Qodo, PR #557): which delta mechanisms a presence re-arm will
+/// actually put on the wire, for the `harmony_channel` debug line.
+///
+/// Not cosmetic. `wm = None` (empty log / fresh join) is a full-history request
+/// AND suppresses the per-author watermark vector, because the engine seals one
+/// only when `since.is_some()`. A line reading "incremental + ZEB-585 vector"
+/// on that path asserts a mechanism that is not on the wire — the same class of
+/// false claim ZEB-807 removed from this arm's own justification comment, and
+/// exactly what ZEB-803 spent a night proving costs real debugging time. The
+/// operator reading this line is trying to learn whether the vector is in play;
+/// it has to answer that honestly on both branches.
+fn presence_rearm_mode(wm: &Option<Hlc>) -> &'static str {
+    if wm.is_some() {
+        "incremental + ZEB-585 vector"
+    } else {
+        "full history (empty log — no vector to diff against)"
+    }
+}
+
 /// Floor for the driver's backoff sleeps (ms). Defensive: guards
 /// against a hot loop if the injected clock ever lags the latch's
 /// `next_retry_at` (the latch's in-flight `WaitUntil` clamp can hand
@@ -535,7 +554,8 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         tracing::debug!(
                             target: "harmony_channel",
                             since = ?wm,
-                            "re-arm: presence kick (incremental + ZEB-585 vector)"
+                            mode = presence_rearm_mode(&wm),
+                            "re-arm: presence kick"
                         );
                         latch.reset(wm);
                     }
@@ -632,7 +652,8 @@ pub async fn run_backfill_driver<Rq, RqFut, Wm, WmFut>(
                         tracing::debug!(
                             target: "harmony_channel",
                             since = ?wm,
-                            "re-arm: presence kick mid-backoff (incremental + ZEB-585 vector)"
+                            mode = presence_rearm_mode(&wm),
+                            "re-arm: presence kick mid-backoff"
                         );
                         latch.reset(wm);
                     }
@@ -1598,6 +1619,27 @@ mod tests {
         driver.abort();
     }
 
+    /// ZEB-807 (Qodo, PR #557): the presence re-arm's `mode` field must not
+    /// claim the ZEB-585 vector on the one branch that suppresses it.
+    ///
+    /// `since = None` makes the engine skip the seal entirely, so a line
+    /// reading "incremental + ZEB-585 vector" there would describe a mechanism
+    /// that is not on the wire. Cheap to pin, and the cost of getting it wrong
+    /// is an operator ruling out the vector path on false evidence.
+    #[test]
+    fn presence_rearm_mode_does_not_claim_a_vector_it_will_not_send() {
+        assert!(presence_rearm_mode(&Some(hlc(100))).contains("vector"));
+        let empty = presence_rearm_mode(&None);
+        assert!(
+            !empty.contains("incremental"),
+            "an empty-log re-arm is full history, not incremental: {empty}"
+        );
+        assert!(
+            empty.contains("no vector"),
+            "must say the vector is absent, not merely omit it: {empty}"
+        );
+    }
+
     /// ZEB-807 boundary: an EMPTY log (fresh join — `current_watermark()`
     /// yields `None`) must still request `None` on a presence kick.
     ///
@@ -1635,9 +1677,22 @@ mod tests {
             move || start.elapsed().as_millis() as u64,
             None,
         ));
-        while requests.load(Ordering::SeqCst) < 1 {
+        // Qodo (PR #557): bounded, not `while … { yield_now() }`. Under
+        // `start_paused` an unbounded spin never advances the timer, so a
+        // regression that suppresses the first request HANGS CI instead of
+        // failing it — turning a legible assertion failure into a 6h job
+        // timeout with no diagnosis.
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the driver must issue its first request without needing a timer"
+        );
         presence_tx.send(1).expect("presence bump");
         tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
         for _ in 0..128 {
