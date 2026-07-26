@@ -4360,10 +4360,10 @@ async fn persist_crdt_only(ctx: &InternalCtx) -> Result<(), CommunitySyncError> 
 pub(crate) enum RootSizeWatermark {
     /// Below every threshold — no surfacing.
     Ok,
-    /// >= 50% of the ContentId payload cap: log a warning.
+    /// At or above 50% of the ContentId payload cap: log a warning.
     NearHalf,
-    /// >= 80% of the cap: warn + degraded report — the community is close
-    /// to losing root publish/serve entirely.
+    /// At or above 80% of the cap: warn + degraded report — the community
+    /// is close to losing root publish/serve entirely.
     NearCap,
 }
 

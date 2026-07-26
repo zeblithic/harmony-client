@@ -18571,47 +18571,48 @@ mod zeb_813_supersession_tests {
     }
 
     #[test]
-    fn newer_same_actor_same_node_supersedes() {
+    fn same_actor_same_node_shares_a_lineage() {
         let a = mint_test_owner(0xA1);
         let older = announce(CID, &a, [0xAB; 32], [0x10; 16], 1_000);
         let newer = announce(CID, &a, [0xAB; 32], [0x11; 16], 2_000);
-        assert!(MembershipPolicy::supersedes(&newer, &older));
-        assert!(!MembershipPolicy::supersedes(&older, &newer));
+        let k_old = MembershipPolicy::supersession_key(&older).expect("announce must be keyed");
+        let k_new = MembershipPolicy::supersession_key(&newer).expect("announce must be keyed");
+        assert_eq!(k_old, k_new, "same (actor, node) must share one lineage");
+        // Within a lineage the core retains the cmp-maximum — the newer one.
+        assert!(event_sort_key(&newer) > event_sort_key(&older));
     }
 
     #[test]
-    fn different_actor_or_node_never_supersedes() {
+    fn different_actor_or_node_is_a_different_lineage() {
         let a = mint_test_owner(0xA1);
         let b = mint_test_owner(0xB2);
         let a_node1 = announce(CID, &a, [0xAB; 32], [0x10; 16], 1_000);
         let b_node1 = announce(CID, &b, [0xAB; 32], [0x11; 16], 2_000);
-        assert!(!MembershipPolicy::supersedes(&b_node1, &a_node1));
-        assert!(!MembershipPolicy::supersedes(&a_node1, &b_node1));
-
         let a_node2 = announce(CID, &a, [0xCD; 32], [0x12; 16], 3_000);
-        assert!(!MembershipPolicy::supersedes(&a_node2, &a_node1));
-        assert!(!MembershipPolicy::supersedes(&a_node1, &a_node2));
+
+        let key = |e| MembershipPolicy::supersession_key(e).expect("announce must be keyed");
+        assert_ne!(key(&a_node1), key(&b_node1), "different actor, same node");
+        assert_ne!(key(&a_node1), key(&a_node2), "same actor, different node");
     }
 
     #[test]
-    fn relay_announce_keys_on_relay_device_id() {
+    fn relay_announce_lineage_keys_on_relay_device_id() {
         let a = mint_test_owner(0xA1);
         let r_old = relay_announce(CID, &a, [0x0F; 16], [0x20; 16], 1_000);
         let r_new = relay_announce(CID, &a, [0x0F; 16], [0x21; 16], 2_000);
-        assert!(MembershipPolicy::supersedes(&r_new, &r_old));
-        assert!(!MembershipPolicy::supersedes(&r_old, &r_new));
-
         let r_other = relay_announce(CID, &a, [0x1F; 16], [0x22; 16], 3_000);
-        assert!(!MembershipPolicy::supersedes(&r_other, &r_old));
-
-        // Cross-kind never supersedes, either direction.
         let reach = announce(CID, &a, [0xAB; 32], [0x23; 16], 4_000);
-        assert!(!MembershipPolicy::supersedes(&reach, &r_old));
-        assert!(!MembershipPolicy::supersedes(&r_new, &reach));
+
+        let key = |e| MembershipPolicy::supersession_key(e).expect("announce must be keyed");
+        assert_eq!(key(&r_old), key(&r_new), "same (actor, relay_device_id)");
+        assert!(event_sort_key(&r_new) > event_sort_key(&r_old));
+        assert_ne!(key(&r_old), key(&r_other), "different relay_device_id");
+        // Cross-kind is never one lineage, even for the same actor.
+        assert_ne!(key(&reach), key(&r_old));
     }
 
     #[test]
-    fn membership_kinds_never_supersede() {
+    fn membership_kinds_have_no_lineage() {
         let a = mint_test_owner(0xA1);
         let join1 = join_event(CID, &a);
         let device_payload = EventPayload {
@@ -18623,14 +18624,11 @@ mod zeb_813_supersession_tests {
         };
         let device2 = sign_event(&device_payload, &a.device_key).expect("sign device announce");
 
-        assert!(!MembershipPolicy::supersedes(&device2, &join1));
-        assert!(!MembershipPolicy::supersedes(&join1, &device2));
-
-        // An announce never supersedes history, and history never
-        // supersedes an announce.
+        assert!(MembershipPolicy::supersession_key(&join1).is_none());
+        assert!(MembershipPolicy::supersession_key(&device2).is_none());
+        // Announces ARE keyed — history and announces can never collide.
         let reach = announce(CID, &a, [0xAB; 32], [0x24; 16], 5_000);
-        assert!(!MembershipPolicy::supersedes(&reach, &join1));
-        assert!(!MembershipPolicy::supersedes(&join1, &reach));
+        assert!(MembershipPolicy::supersession_key(&reach).is_some());
     }
 
     /// Core contract clause (d): dropping superseded announces must not

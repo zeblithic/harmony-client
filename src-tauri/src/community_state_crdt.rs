@@ -358,28 +358,37 @@ impl LogPolicy for MembershipPolicy {
         materialize_with_now(&owned, ctx.verify.admin_addr, Some(ctx.now_floor_ms))
     }
 
-    fn supersedes(newer: &SignedMembershipEvent, older: &SignedMembershipEvent) -> bool {
+    type SupersessionKey = AnnounceKey;
+
+    fn supersession_key(e: &SignedMembershipEvent) -> Option<AnnounceKey> {
         use crate::community_membership::MembershipEventKind::{
             CommunityRelayAnnounce, ReachabilityAnnounce,
         };
-        // ZEB-813: only the two LWW routing-announce kinds ever supersede.
-        // Both are materialize-neutral (their `materialize` arms are no-ops),
-        // satisfying the core contract's clause (d); every other kind is
-        // durable community history and must never be compacted. Ordering by
-        // `event_sort_key` — the same canonical total order `cmp` uses —
-        // satisfies clause (a) by construction, and same-key transitivity
-        // (b) follows from it being a total order.
-        let same_key = match (&newer.kind, &older.kind) {
-            (ReachabilityAnnounce { payload: pn }, ReachabilityAnnounce { payload: po }) => {
-                newer.actor == older.actor && pn.iroh_node_id == po.iroh_node_id
+        // ZEB-813: only the two LWW routing-announce kinds form supersession
+        // lineages — both are materialize-neutral (their `materialize` arms
+        // are no-ops), satisfying the core contract; every other kind is
+        // durable community history and must never be compacted. Within a
+        // lineage the core keeps the maximum under `cmp` (= event_sort_key),
+        // i.e. the newest announce per (actor, device/node).
+        match &e.kind {
+            ReachabilityAnnounce { payload } => {
+                Some(AnnounceKey::Reachability(e.actor, payload.iroh_node_id))
             }
-            (CommunityRelayAnnounce { payload: pn }, CommunityRelayAnnounce { payload: po }) => {
-                newer.actor == older.actor && pn.relay.relay_device_id == po.relay.relay_device_id
+            CommunityRelayAnnounce { payload } => {
+                Some(AnnounceKey::Relay(e.actor, payload.relay.relay_device_id))
             }
-            _ => false,
-        };
-        same_key && event_sort_key(newer) > event_sort_key(older)
+            _ => None,
+        }
     }
+}
+
+/// ZEB-813: supersession-lineage key — one lineage per (kind, actor,
+/// device/node id). Only the newest event per lineage is retained by the
+/// core `VerifiedLog`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AnnounceKey {
+    Reachability(OwnerAddr, [u8; 32]),
+    Relay(OwnerAddr, [u8; 16]),
 }
 
 impl CommunityState {
