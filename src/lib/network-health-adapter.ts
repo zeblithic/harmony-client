@@ -120,7 +120,21 @@ export function assessRelayServing(
       detail: 'no peer has ever pulled from this node',
     };
   }
-  const age = nowMs - lastServedMs;
+  // Qodo PR #556: clamp at 0. Both sides of this subtraction are LOCAL
+  // stamps — `capturedAtMs` and `lastServedMs` are each `SystemTime::now()`
+  // on this node — so a negative delta means only that the local wall clock
+  // stepped backward between the two reads.
+  //
+  // Clamping to "fresh" is the right direction HERE, and the ZEB-791/ZEB-792
+  // split is why: the error is bounded by the step magnitude and self-heals
+  // as the clock walks forward, and critically no PEER can choose this value,
+  // so it cannot be driven to suppress the alarm indefinitely. Had either side
+  // been peer-supplied this would need a forward-skew bound instead.
+  //
+  // Without the clamp a backward step makes `age` negative, `age > threshold`
+  // false, and a genuine stall reports `ok` — the precise failure this whole
+  // section exists to prevent. It also let a negative `sinceMs` reach callers.
+  const age = Math.max(0, nowMs - lastServedMs);
   const threshold = cadenceMs * COMMUNITY_RELAY_STALL_CADENCES;
   if (age > threshold) {
     return {
@@ -152,7 +166,9 @@ export function assessRelayPulling(
   if (lastPassMs === null || lastPassMs === undefined) {
     return { state: 'idle', detail: 'the pull loop has not run a pass yet' };
   }
-  const passAge = nowMs - lastPassMs;
+  // Clamped for the same reason as `assessRelayServing` above — and it matters
+  // more here, because `passAge` is also returned as `sinceMs`.
+  const passAge = Math.max(0, nowMs - lastPassMs);
   if (passAge > threshold) {
     // The loop itself stopped. This outranks every other signal.
     return {

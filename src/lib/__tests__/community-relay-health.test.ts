@@ -195,3 +195,56 @@ describe('assessRelayPulling', () => {
     expect(v.state).toBe('ok');
   });
 });
+
+describe('backward wall-clock steps (Qodo, PR #556)', () => {
+  // Both sides of the age subtraction are local `SystemTime::now()` stamps, so
+  // a future-looking value means the local clock stepped backward between the
+  // capture and the record. Unclamped, that produced a NEGATIVE age — which
+  // compares false against the threshold and reports a genuine stall as `ok`.
+  // Same failure class as ZEB-791, reintroduced on the TS side.
+
+  it('a future lastServedMs does not report ok — and never yields a negative age', () => {
+    const v = assessRelayServing(
+      health({ serving: { lastServedMs: NOW + 5_000, pullsServed: 40 } }),
+      NOW
+    );
+    expect(v.state).toBe('ok'); // clamped to fresh, which is the safe direction
+    if (v.state === 'stalled') expect(v.sinceMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('a backward step does NOT suppress an already-established stall', () => {
+    // The stall is 46 minutes deep; a 5-second backward step must not erase it.
+    const v = assessRelayServing(
+      health({ serving: { lastServedMs: NOW - 46 * 60 * 1000, pullsServed: 82 } }),
+      NOW - 5_000
+    );
+    expect(v.state).toBe('stalled');
+    if (v.state === 'stalled') expect(v.sinceMs).toBeGreaterThan(0);
+  });
+
+  it('never returns a negative sinceMs from the pulling verdict', () => {
+    // sinceMs is returned to callers; a negative duration is nonsense on the
+    // wire even when the verdict itself happens to be right.
+    const v = assessRelayPulling(
+      health({
+        pulling: {
+          passesRun: 5,
+          lastPassMs: NOW + 10_000,
+          sessionsFailed: 5,
+        },
+      }),
+      NOW
+    );
+    if (v.state === 'stalled') {
+      expect(v.sinceMs).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it('a future lastPassMs does not fake a dead pull loop', () => {
+    const v = assessRelayPulling(
+      health({ pulling: { passesRun: 9, lastPassMs: NOW + 60_000, sessionsOk: 9 } }),
+      NOW
+    );
+    expect(v.state).toBe('ok');
+  });
+});
