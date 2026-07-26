@@ -18451,3 +18451,261 @@ mod zeb_339_signer_verify_tests {
         );
     }
 }
+
+// ── ZEB-813 announce-supersession tests ───────────────────────────────────────
+
+#[cfg(test)]
+mod zeb_813_supersession_tests {
+    use super::*;
+    use crate::community_relay_announce::{
+        build_signed_community_relay_announce, CommunityRelayEntry,
+    };
+    use crate::community_state_crdt::{
+        CommunityState, InsertOutcome as CrdtInsertOutcome, MembershipPolicy,
+    };
+    use crate::reachability_record::{inner_signed_bytes, ReachabilityAnnouncePayload};
+    use ed25519_dalek::Signer;
+    use harmony_crdt_sync::verified_log::LogPolicy;
+
+    const CID: SpaceId = SpaceId([0xC1; 16]);
+
+    fn hlc(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "t".into(),
+        }
+    }
+
+    /// Signed `ReachabilityAnnounce` parameterized by node id + event id so a
+    /// log can hold several distinct announces (the fixed-id builder in the
+    /// RCH module cannot).
+    fn announce(
+        community_id: SpaceId,
+        owner: &TestOwner,
+        iroh_node_id: [u8; 32],
+        event_id: [u8; 16],
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let at = hlc(wall_ms);
+        let home_relay_url = "https://derp.example/".to_string();
+        let direct_addresses: Vec<std::net::SocketAddr> = vec![];
+        let inner = inner_signed_bytes(
+            &iroh_node_id,
+            &home_relay_url,
+            &direct_addresses,
+            wall_ms,
+            &owner.owner,
+            &at,
+            &[],
+            0,
+        )
+        .expect("inner signed bytes");
+        let identity_signature = owner.device_key.sign(&inner).to_bytes();
+        let payload = ReachabilityAnnouncePayload {
+            iroh_node_id,
+            home_relay_url,
+            direct_addresses,
+            announced_at_ms: wall_ms,
+            identity_signature,
+            butler_set: Vec::new(),
+            bs_at: 0,
+        };
+        let payload = EventPayload {
+            id: event_id,
+            community_id,
+            kind: MembershipEventKind::ReachabilityAnnounce { payload },
+            actor: owner.owner,
+            at,
+        };
+        sign_event(&payload, &owner.device_key).expect("sign envelope")
+    }
+
+    /// Signed `CommunityRelayAnnounce` parameterized by relay device id +
+    /// event id.
+    fn relay_announce(
+        community_id: SpaceId,
+        owner: &TestOwner,
+        relay_device_id: [u8; 16],
+        event_id: [u8; 16],
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let at = hlc(wall_ms);
+        let relay = CommunityRelayEntry {
+            relay_device_id,
+            iroh_endpoint_id: [0xEE; 32],
+            relay_device_ed25519_verify: [0xDD; 32],
+            home_relay: "https://derp.example/".to_string(),
+        };
+        let payload = build_signed_community_relay_announce(
+            relay,
+            wall_ms,
+            &owner.owner,
+            &at,
+            &owner.device_key,
+        )
+        .expect("build relay announce");
+        let event_payload = EventPayload {
+            id: event_id,
+            community_id,
+            kind: MembershipEventKind::CommunityRelayAnnounce { payload },
+            actor: owner.owner,
+            at,
+        };
+        sign_event(&event_payload, &owner.device_key).expect("sign relay envelope")
+    }
+
+    fn join_event(community_id: SpaceId, owner: &TestOwner) -> SignedMembershipEvent {
+        let join_payload = EventPayload {
+            id: [0x01; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: hlc(1),
+        };
+        let ev = sign_event(&join_payload, &owner.device_key).expect("sign join");
+        SignedMembershipEvent {
+            enrollment: Some(owner.cert.clone()),
+            ..ev
+        }
+    }
+
+    #[test]
+    fn same_actor_same_node_shares_a_lineage() {
+        let a = mint_test_owner(0xA1);
+        let older = announce(CID, &a, [0xAB; 32], [0x10; 16], 1_000);
+        let newer = announce(CID, &a, [0xAB; 32], [0x11; 16], 2_000);
+        let k_old = MembershipPolicy::supersession_key(&older).expect("announce must be keyed");
+        let k_new = MembershipPolicy::supersession_key(&newer).expect("announce must be keyed");
+        assert_eq!(k_old, k_new, "same (actor, node) must share one lineage");
+        // Within a lineage the core retains the cmp-maximum — the newer one.
+        assert!(event_sort_key(&newer) > event_sort_key(&older));
+    }
+
+    #[test]
+    fn different_actor_or_node_is_a_different_lineage() {
+        let a = mint_test_owner(0xA1);
+        let b = mint_test_owner(0xB2);
+        let a_node1 = announce(CID, &a, [0xAB; 32], [0x10; 16], 1_000);
+        let b_node1 = announce(CID, &b, [0xAB; 32], [0x11; 16], 2_000);
+        let a_node2 = announce(CID, &a, [0xCD; 32], [0x12; 16], 3_000);
+
+        let key = |e| MembershipPolicy::supersession_key(e).expect("announce must be keyed");
+        assert_ne!(key(&a_node1), key(&b_node1), "different actor, same node");
+        assert_ne!(key(&a_node1), key(&a_node2), "same actor, different node");
+    }
+
+    #[test]
+    fn relay_announce_lineage_keys_on_relay_device_id() {
+        let a = mint_test_owner(0xA1);
+        let r_old = relay_announce(CID, &a, [0x0F; 16], [0x20; 16], 1_000);
+        let r_new = relay_announce(CID, &a, [0x0F; 16], [0x21; 16], 2_000);
+        let r_other = relay_announce(CID, &a, [0x1F; 16], [0x22; 16], 3_000);
+        let reach = announce(CID, &a, [0xAB; 32], [0x23; 16], 4_000);
+
+        let key = |e| MembershipPolicy::supersession_key(e).expect("announce must be keyed");
+        assert_eq!(key(&r_old), key(&r_new), "same (actor, relay_device_id)");
+        assert!(event_sort_key(&r_new) > event_sort_key(&r_old));
+        assert_ne!(key(&r_old), key(&r_other), "different relay_device_id");
+        // Cross-kind is never one lineage, even for the same actor.
+        assert_ne!(key(&reach), key(&r_old));
+    }
+
+    #[test]
+    fn membership_kinds_have_no_lineage() {
+        let a = mint_test_owner(0xA1);
+        let join1 = join_event(CID, &a);
+        let device_payload = EventPayload {
+            id: [0x02; 16],
+            community_id: CID,
+            kind: MembershipEventKind::DeviceAnnounce,
+            actor: a.owner,
+            at: hlc(2_000),
+        };
+        let device2 = sign_event(&device_payload, &a.device_key).expect("sign device announce");
+
+        assert!(MembershipPolicy::supersession_key(&join1).is_none());
+        assert!(MembershipPolicy::supersession_key(&device2).is_none());
+        // Announces ARE keyed — history and announces can never collide.
+        let reach = announce(CID, &a, [0xAB; 32], [0x24; 16], 5_000);
+        assert!(MembershipPolicy::supersession_key(&reach).is_some());
+    }
+
+    /// Core contract clause (d): dropping superseded announces must not
+    /// change materialization for any event subset.
+    #[test]
+    fn materialize_neutrality_full_vs_compacted() {
+        let a = mint_test_owner(0xA1);
+        let join = join_event(CID, &a);
+        let mut full = vec![join.clone()];
+        for i in 0..8u8 {
+            full.push(announce(
+                CID,
+                &a,
+                [0xAB; 32],
+                [0x30 + i; 16],
+                1_000 + u64::from(i),
+            ));
+        }
+        let compacted = vec![join, full.last().expect("non-empty").clone()];
+        assert_eq!(
+            materialize(&full, a.owner),
+            materialize(&compacted, a.owner),
+            "dropping superseded announces must not change materialized membership"
+        );
+    }
+
+    /// The boundary mapping, and proof the stale-drop happens BEFORE verify:
+    /// the log holds only a (trusted-loaded) newer announce — no membership
+    /// exists, so if `insert_event` reached `verify_event` the older announce
+    /// would be Rejected (actor not a member). AlreadyKnown is only possible
+    /// via the core Superseded short-circuit.
+    #[test]
+    fn insert_event_maps_superseded_to_already_known() {
+        let a = mint_test_owner(0xA1);
+        let newer = announce(CID, &a, [0xAB; 32], [0x11; 16], 2_000);
+        let mut state = CommunityState::from_trusted_events_for_test(CID, [newer]);
+
+        let older = announce(CID, &a, [0xAB; 32], [0x10; 16], 1_000);
+        let ctx = VerifyContext {
+            expected_community_id: CID,
+            admin_addr: a.owner,
+            is_invite_only: false,
+        };
+        assert!(matches!(
+            state.insert_event(older, &ctx),
+            CrdtInsertOutcome::AlreadyKnown
+        ));
+        assert_eq!(state.event_count_for_test(), 1);
+    }
+
+    /// The heal moment: a stale announce pile restored through the trusted
+    /// load path compacts to join + newest announce, and materializes
+    /// identically to the full pile.
+    #[test]
+    fn from_verified_events_heals_stale_announce_pile() {
+        let a = mint_test_owner(0xA1);
+        let join = join_event(CID, &a);
+        let mut events = vec![join];
+        for i in 0..10u8 {
+            events.push(announce(
+                CID,
+                &a,
+                [0xAB; 32],
+                [0x40 + i; 16],
+                1_000 + u64::from(i),
+            ));
+        }
+        let state = CommunityState::from_trusted_events_for_test(CID, events.clone());
+        assert_eq!(
+            state.event_count_for_test(),
+            2,
+            "join + newest announce must survive; ten stale announces must not"
+        );
+        assert_eq!(
+            state.materialized(a.owner),
+            materialize(&events, a.owner),
+            "compacted state must materialize identically to the full pile"
+        );
+    }
+}

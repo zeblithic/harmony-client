@@ -357,6 +357,38 @@ impl LogPolicy for MembershipPolicy {
         let owned: Vec<SignedMembershipEvent> = events.iter().map(|e| (*e).clone()).collect();
         materialize_with_now(&owned, ctx.verify.admin_addr, Some(ctx.now_floor_ms))
     }
+
+    type SupersessionKey = AnnounceKey;
+
+    fn supersession_key(e: &SignedMembershipEvent) -> Option<AnnounceKey> {
+        use crate::community_membership::MembershipEventKind::{
+            CommunityRelayAnnounce, ReachabilityAnnounce,
+        };
+        // ZEB-813: only the two LWW routing-announce kinds form supersession
+        // lineages — both are materialize-neutral (their `materialize` arms
+        // are no-ops), satisfying the core contract; every other kind is
+        // durable community history and must never be compacted. Within a
+        // lineage the core keeps the maximum under `cmp` (= event_sort_key),
+        // i.e. the newest announce per (actor, device/node).
+        match &e.kind {
+            ReachabilityAnnounce { payload } => {
+                Some(AnnounceKey::Reachability(e.actor, payload.iroh_node_id))
+            }
+            CommunityRelayAnnounce { payload } => {
+                Some(AnnounceKey::Relay(e.actor, payload.relay.relay_device_id))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// ZEB-813: supersession-lineage key — one lineage per (kind, actor,
+/// device/node id). Only the newest event per lineage is retained by the
+/// core `VerifiedLog`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AnnounceKey {
+    Reachability(OwnerAddr, [u8; 32]),
+    Relay(OwnerAddr, [u8; 16]),
 }
 
 impl CommunityState {
@@ -390,6 +422,25 @@ impl CommunityState {
         if let Ok(mut g) = self.bootstrap_hint.lock() {
             *g = Some(hint);
         }
+    }
+
+    /// Test-only: build a state whose log is restored from already-trusted
+    /// events, mirroring the deserialize path (`from_verified_events`) —
+    /// including its ZEB-813 supersession compaction.
+    #[cfg(test)]
+    pub(crate) fn from_trusted_events_for_test(
+        community_id: SpaceId,
+        events: impl IntoIterator<Item = SignedMembershipEvent>,
+    ) -> Self {
+        let mut state = Self::new(community_id);
+        state.log = VerifiedLog::from_verified_events(events);
+        state
+    }
+
+    /// Test-only: number of events currently in the log.
+    #[cfg(test)]
+    pub(crate) fn event_count_for_test(&self) -> usize {
+        self.log.len()
     }
 
     /// Cache version counter. Bumps on every successful insert.
@@ -482,6 +533,13 @@ impl CommunityState {
         };
         match self.log.insert(event, &policy_ctx) {
             CoreOutcome::AlreadyKnown => InsertOutcome::AlreadyKnown,
+            CoreOutcome::Superseded => {
+                // ZEB-813: a stale announce that a stored event supersedes.
+                // Nothing changed — no cache bump, no dirty mark, no
+                // persist. AlreadyKnown is exactly that contract, so
+                // callers need no new arm.
+                InsertOutcome::AlreadyKnown
+            }
             CoreOutcome::Rejected(e) => InsertOutcome::Rejected(e),
             CoreOutcome::Inserted => {
                 // Invalidate cache by bumping version. Lazy re-mat happens on
