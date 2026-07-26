@@ -4224,6 +4224,18 @@ pub async fn start_node_inner(
         let mut butler_deposit_stats_for_state: Option<
             std::sync::Arc<crate::iroh_butler_acceptor::ButlerDepositStats>,
         > = None;
+        // ZEB-803: the same outer-scope hand-out for the community-relay
+        // telemetry. Both are built inside nested blocks that close before the
+        // `NetworkHealthService` construction below. Held SEPARATELY because a
+        // node can run one side without the other (relay opt-in off ⇒ no
+        // acceptor; no owner ⇒ no pull driver), and the whole point of the
+        // section is being able to say which side is dark.
+        let mut community_relay_serving_telemetry_for_state: Option<
+            std::sync::Arc<crate::network_health::CommunityRelayServingTelemetry>,
+        > = None;
+        let mut community_relay_pull_telemetry_for_state: Option<
+            std::sync::Arc<crate::network_health::CommunityRelayPullTelemetry>,
+        > = None;
         // ZEB-217 Sub-C Phase 2 Task 13: per-community engine pool +
         // adapter requests handed to the event loop. Both stay None /
         // empty when no owner identity is loaded (registry depends on
@@ -10319,11 +10331,20 @@ pub async fn start_node_inner(
                                  instance"
                             );
                         }
+                        // ZEB-803: build the serving telemetry here and keep a
+                        // clone for the health service — the acceptor itself is
+                        // moved into the link manager and is unreachable after.
+                        let relay_serving_telemetry = std::sync::Arc::new(
+                            crate::network_health::CommunityRelayServingTelemetry::new(),
+                        );
+                        community_relay_serving_telemetry_for_state =
+                            Some(std::sync::Arc::clone(&relay_serving_telemetry));
                         if link_mgr
                             .install_community_relay_pull_acceptor(std::sync::Arc::new(
                                 crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor::new(
                                     relay_pull_ctx,
-                                ),
+                                )
+                                .with_telemetry(relay_serving_telemetry),
                             ))
                             .is_err()
                         {
@@ -10463,6 +10484,13 @@ pub async fn start_node_inner(
                                             s.lock().unwrap_or_else(|p| p.into_inner()).clone()
                                         })
                                     };
+                                    // ZEB-803: pull-side telemetry. Cloned out
+                                    // before the driver is moved into `spawn`.
+                                    let relay_pull_telemetry = std::sync::Arc::new(
+                                        crate::network_health::CommunityRelayPullTelemetry::new(),
+                                    );
+                                    community_relay_pull_telemetry_for_state =
+                                        Some(std::sync::Arc::clone(&relay_pull_telemetry));
                                     let pull_driver = std::sync::Arc::new(
                                         crate::community_relay_pull_driver::CommunityRelayPullDriver::new(
                                             self_owner.0,
@@ -10472,7 +10500,8 @@ pub async fn start_node_inner(
                                             relay_pull_transport,
                                             relay_ingest_ctx,
                                             joined_communities,
-                                        ),
+                                        )
+                                        .with_telemetry(relay_pull_telemetry),
                                     );
                                     community_relay_pull_driver_handle_opt =
                                         Some(pull_driver.spawn());
@@ -11972,6 +12001,18 @@ pub async fn start_node_inner(
                             nh.set_dm_fence_source(std::sync::Arc::clone(
                                 &crate::dm_outbox::DM_FENCE_STATS,
                             ));
+                            // ZEB-803: community-relay serving / pulling health.
+                            // Installed independently — an absent source means
+                            // "this node runs no such wiring", which the snapshot
+                            // reports differently from "wired and serving
+                            // nothing". The latter is the incident state, and
+                            // collapsing the two would hide it.
+                            if let Some(t) = community_relay_serving_telemetry_for_state.as_ref() {
+                                nh.set_community_relay_serving_source(std::sync::Arc::clone(t));
+                            }
+                            if let Some(t) = community_relay_pull_telemetry_for_state.as_ref() {
+                                nh.set_community_relay_pull_source(std::sync::Arc::clone(t));
+                            }
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks
