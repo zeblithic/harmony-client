@@ -89,6 +89,19 @@ pub fn row_ttl_ms(entry: &AddressBookEntry) -> u64 {
     }
 }
 
+/// The smallest possible `AddressBookKey` for a community: `Reachability`
+/// sorts before `Relay` (derived `Ord` follows enum declaration order), and
+/// an all-zero `OwnerAddr`/node-id is each field's minimum. Seeds a
+/// `BTreeMap::range` scan bounded to one community's key prefix instead of
+/// walking the whole (possibly multi-community) map — this key is never
+/// stored.
+fn community_floor(community: SpaceId) -> (SpaceId, AddressBookKey) {
+    (
+        community,
+        AddressBookKey::Reachability(OwnerAddr([0u8; 16]), [0u8; 32]),
+    )
+}
+
 #[derive(Default)]
 pub struct CommunityAddressBook {
     inner: Mutex<BTreeMap<(SpaceId, AddressBookKey), AddressBookRow>>,
@@ -136,17 +149,24 @@ impl CommunityAddressBook {
             return UpsertOutcome::Replaced;
         }
 
-        let community_row_count = g.keys().filter(|(c, _)| *c == community).count();
+        // Both scans below are bounded to this community's key prefix via
+        // `range(floor..)` + `take_while` — the (SpaceId, AddressBookKey)
+        // ordering keeps one community's rows contiguous, so this is
+        // O(this community's rows), not O(rows across every community).
+        let floor = community_floor(community);
+        let community_row_count = g
+            .range(floor.clone()..)
+            .take_while(|((c, _), _)| *c == community)
+            .count();
         if community_row_count >= ADDRBOOK_MAX_ROWS {
             return UpsertOutcome::IgnoredCapped;
         }
 
         if let AddressBookKey::Reachability(actor, _) = &key {
             let actor_reach_rows: Vec<(u64, AddressBookKey)> = g
-                .iter()
-                .filter(|((c, k), _)| {
-                    *c == community && matches!(k, AddressBookKey::Reachability(a, _) if a == actor)
-                })
+                .range(floor.clone()..)
+                .take_while(|((c, _), _)| *c == community)
+                .filter(|((_, k), _)| matches!(k, AddressBookKey::Reachability(a, _) if a == actor))
                 .map(|(k, row)| (row.stamped_at_ms, k.1.clone()))
                 .collect();
             if actor_reach_rows.len() >= ADDRBOOK_MAX_NODES_PER_MEMBER {
