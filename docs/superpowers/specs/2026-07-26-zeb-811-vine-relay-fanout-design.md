@@ -13,6 +13,10 @@
 3. **Own devices now, protocol takes N** — v1 relay set = the creator's own
    always-on devices; the ad and pull protocol are provenance-agnostic lists so
    friend/community volunteers are a later list-append, not a protocol change.
+4. **Vines are public, by intent and by default** (Jake, 2026-07-26): video
+   content on Harmony is meant to be broadly, publicly shareable. Any future
+   "private vines" support is an explicit afterthought and not a priority —
+   which is why public-read (decision 2) is the design center, not a tier.
 
 ### The v1 privacy caveat (signed off explicitly)
 
