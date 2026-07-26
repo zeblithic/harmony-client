@@ -1045,11 +1045,21 @@ async fn s5b_clean_relaunch_card_propagation_control() {
 // exchange fires the dial, now the ONLY path to a Zenoh peer mesh. Publish /
 // subscribe owner cards and measure convergence.
 //
-// SKIPS (no-op) unless HARMONY_ZENOH_DISABLE_MULTICAST=1 is set — without it the
-// nodes peer via multicast and `connect_peer` reports success off that transport,
-// a FALSE POSITIVE for the dial. The harness inherits the parent env, so run as:
-//   HARMONY_ZENOH_DISABLE_MULTICAST=1 cargo nextest run --features e2e \
-//     -E 'test(s5c_clean_dial_only_card_propagation_probe)'
+// ZEB-809: this probe used to SKIP unless HARMONY_ZENOH_DISABLE_MULTICAST=1 was
+// set, because stock zenoh let the two nodes peer via multicast and
+// `connect_peer` would then report success off that pre-existing transport — a
+// FALSE POSITIVE for the dial.
+//
+// That guard is now obsolete: `event_loop::run` disables multicast AND gossip
+// scouting by default, so a spawned node has no scouting path and the dial is
+// already the only way these two can meet. The probe is therefore valid
+// unconditionally, and now runs on every e2e sweep instead of only when someone
+// remembered the env var. Retiring the guard rather than leaving it inert —
+// a skip condition nobody can satisfy reads as "covered" while testing nothing.
+//
+// The old env var is gone; HARMONY_ZENOH_ENABLE_LAN_SCOUTING=1 now goes the
+// other way and would re-break this probe, which is exactly why it is not set
+// here.
 //
 // EXPECTED: converged=TRUE → the clean dial works; the ZEB-468 fix is "just
 // restart-safety" and cross-WAN cards are viable. converged=FALSE → the dial is
@@ -1059,17 +1069,6 @@ async fn s5b_clean_relaunch_card_propagation_control() {
 async fn s5c_clean_dial_only_card_propagation_probe() {
     use e2e_harness::driver::*;
     use std::time::Duration;
-
-    if !std::env::var("HARMONY_ZENOH_DISABLE_MULTICAST")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-    {
-        eprintln!(
-            "s5c SKIPPED: requires HARMONY_ZENOH_DISABLE_MULTICAST=1 (dial-only probe; \
-             without it nodes peer via multicast → false positive). Re-run with the env set."
-        );
-        return;
-    }
 
     let (mut run, ah, bh, mut alice, mut bob) = two_minted_nodes("s5c").await;
     let alice_owner = owner_id(&alice).await;
@@ -2334,6 +2333,45 @@ async fn s_vines_publish_feed_view_reshare() {
 
     let (mut run, ah, bh, alice, bob) = two_minted_nodes("vines").await;
     let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    // ZEB-811 (found via ZEB-809): establish a real peer relationship before
+    // expecting any vine to propagate.
+    //
+    // This test used to publish straight out of `two_minted_nodes` with NO
+    // community, NO friendship, and NO routing-record exchange — so the only
+    // way these two nodes could ever find each other was zenoh LAN multicast,
+    // which `Config::default()` happened to leave enabled. It passed for that
+    // reason and no other: with scouting disabled it failed 3/3 at a
+    // near-identical 108s, deterministically rather than flakily.
+    //
+    // That made it a FALSE POSITIVE of exactly the class
+    // `s5c_clean_dial_only_card_propagation_probe` exists to eliminate for
+    // owner cards — co-located nodes peering implicitly, so the assertion
+    // never exercised the path production actually uses. Cross-WAN there is no
+    // multicast, so what this test claimed to cover has never worked there.
+    //
+    // Vines are wildcard pub/sub over the EXISTING peer mesh and carry no
+    // peer-acquisition step of their own, and a follow builds no network path
+    // (ZEB-811). A community join fires the membership reachability exchange,
+    // which fires the ZEB-373 dial — the same mechanism `s5c` uses, and the
+    // one that has to work where multicast does not exist.
+    let community = create_community(&alice, "vines-community", true)
+        .await
+        .expect("alice creates community");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins alice's community (the peer link vines ride on)");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("roster converges before any vine is published");
 
     // Unique-per-run title so we can pick our descriptor out of a feed
     // unambiguously (feeds start empty — the Rust cache has no mock seed).
