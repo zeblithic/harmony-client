@@ -40,84 +40,97 @@ age ~1–2 months at fleet-like announce rates.
 
 ### 1. Core seam (harmony repo, `crates/harmony-crdt-sync/src/verified_log.rs`)
 
-A defaulted method on `LogPolicy`:
+> **As implemented (PR harmony#299, merged `b904b0b9`).** Review round 1 replaced
+> the original pairwise `supersedes(newer, older) -> bool` predicate with the
+> key-based seam below: Qodo showed the pairwise rule made trusted-load
+> compaction O(n²), and the key extractor gives O(n log n) restores plus
+> convergence by construction. This section describes the API that shipped.
+
+`LogPolicy` gains a required associated type and a defaulted extractor:
 
 ```rust
-/// Deterministic supersession: `newer` makes `older` redundant.
+/// Totally-ordered key naming the supersession lineage an event belongs to.
+/// Policies with no supersession semantics use `()` (never returned).
+type SupersessionKey: Ord;
+
+/// Deterministic supersession: events returning the same `Some` key form a
+/// LINEAGE of which only the `cmp`-maximum is retained. `None` (the default)
+/// means the event is never superseded and never supersedes.
 ///
-/// Contract (all four are policy obligations; the log cannot check them):
-/// (a) `supersedes(n, o)` implies `cmp(n, o) == Ordering::Greater`;
-/// (b) transitive along chains: if `supersedes(b, a)` and `supersedes(c, b)`
-///     then `supersedes(c, a)`;
-/// (c) pure — same inputs, same answer, on every replica;
-/// (d) superseded-eligible events must be MATERIALIZE-NEUTRAL: dropping a
-///     superseded event must not change `materialize`'s output for any
-///     event subset, because removal changes the strictly-prior set that
-///     future `verify` calls see.
+/// Contract (policy obligations; the log cannot check them):
+/// (a) pure — same event, same key, on every replica;
+/// (b) lineage members must be MATERIALIZE-NEUTRAL: dropping a superseded
+///     event must not change `materialize`'s output for any event subset,
+///     because removal changes the strictly-prior set future `verify`
+///     calls see.
 ///
-/// Under (a)–(c) the retained set converges to "the per-supersession-key
-/// maximum plus all never-superseded events" regardless of arrival order
-/// or merge interleaving — a join-semilattice.
-///
-/// Default: nothing supersedes anything (current behavior for all
-/// existing adopters).
-fn supersedes(_newer: &Self::Event, _older: &Self::Event) -> bool {
-    false
+/// "Retain the per-key `cmp`-maximum" is a join-semilattice, so the
+/// retained set converges regardless of arrival order or merge
+/// interleaving — transitivity and orientation, separate obligations
+/// under the old pairwise design, now hold by construction from `cmp`'s
+/// total order.
+fn supersession_key(_e: &Self::Event) -> Option<Self::SupersessionKey> {
+    None
 }
 ```
 
 `InsertOutcome` gains a variant:
 
 ```rust
-/// The event was new but an already-stored event supersedes it; it was
-/// dropped WITHOUT running `verify` (mirrors `AlreadyKnown`'s
-/// verify-skip: a stale record changes nothing, so proving it valid
-/// buys nothing). Callers treat this exactly like `AlreadyKnown`:
-/// no state change, no persistence, no dirty mark.
+/// The event was new but a stored same-key event orders `cmp`-Greater; it
+/// was dropped WITHOUT running `verify` (mirrors `AlreadyKnown`'s
+/// verify-skip: a stale record changes nothing, so proving it valid buys
+/// nothing). Callers treat this exactly like `AlreadyKnown`: no state
+/// change, no persistence, no dirty mark. MIGRATION: pre-existing exhaustive
+/// matches on `InsertOutcome` must add this arm.
 Superseded,
 ```
 
-`insert` flow becomes:
+`insert` flow:
 
 1. Dedup by id → `AlreadyKnown` (unchanged).
-2. If any stored event supersedes the candidate → `Superseded` (no verify).
+2. If the candidate has `Some(key)` and any stored event shares that key and
+   orders `cmp`-Greater → `Superseded` (no verify).
 3. Verify against the strictly-prior set (unchanged).
-4. On `Ok`: insert, then remove every stored event the candidate supersedes
-   (collect ids, then remove — `BTreeMap` borrow discipline is an implementation
-   detail).
+4. On `Ok`: insert, then retain-out every stored same-key event the candidate
+   dominates.
 
-`from_verified_events` (the trusted load path) applies the same rule after
-deduplication: drop every event superseded by another present event. **This is the heal
-moment** — the first boot on new code shrinks an over-cap log in memory before any
-publish is attempted. Implementation may be a simple pairwise pass: worst realistic
-n = 1,700 → ~2.9 M cheap discriminant comparisons, one-time at boot; not a hot path.
-
-Complexity of steps 2/4 is O(n) scan per insert. Post-compaction n is small
-(≈ members × devices + true history); acceptable without indexing.
+`from_verified_events` (the trusted load path) builds a winners map
+(`BTreeMap<SupersessionKey, EventId>`, `cmp`-Greater replaces) after
+deduplication and removes non-winners — O(n log n). **This is the heal
+moment** — the first boot on new code shrinks an over-cap log in memory before
+any publish is attempted.
 
 ### 2. Client policy (`src-tauri/src/community_state_crdt.rs`)
 
 ```rust
-fn supersedes(newer: &SignedMembershipEvent, older: &SignedMembershipEvent) -> bool {
-    use MembershipEventKind::*;
-    let same_key = match (&newer.kind, &older.kind) {
-        (ReachabilityAnnounce { payload: pn }, ReachabilityAnnounce { payload: po }) => {
-            newer.actor == older.actor && pn.iroh_node_id == po.iroh_node_id
+pub(crate) enum AnnounceKey {
+    Reachability(OwnerAddr, [u8; 32]), // actor + payload.iroh_node_id
+    Relay(OwnerAddr, [u8; 16]),        // actor + payload.relay.relay_device_id
+}
+
+impl LogPolicy for MembershipPolicy {
+    type SupersessionKey = AnnounceKey;
+    fn supersession_key(e: &SignedMembershipEvent) -> Option<AnnounceKey> {
+        // ZEB-813: only the two LWW routing-announce kinds form lineages.
+        match &e.kind {
+            ReachabilityAnnounce { payload } => {
+                Some(AnnounceKey::Reachability(e.actor, payload.iroh_node_id))
+            }
+            CommunityRelayAnnounce { payload } => {
+                Some(AnnounceKey::Relay(e.actor, payload.relay.relay_device_id))
+            }
+            _ => None,
         }
-        (CommunityRelayAnnounce { payload: pn }, CommunityRelayAnnounce { payload: po }) => {
-            newer.actor == older.actor
-                && pn.relay.relay_device_id == po.relay.relay_device_id
-        }
-        _ => false,
-    };
-    same_key && event_sort_key(newer) > event_sort_key(older)
+    }
+    // …
 }
 ```
 
-Supersession keys, from the actual payload structs: `ReachabilityAnnouncePayload.
-iroh_node_id` (`[u8; 32]`, wire `nd`; defined in core `harmony-reachability`
-`src/record.rs`) and `CommunityRelayAnnouncePayload.relay.relay_device_id`
-(`[u8; 16]`, wire `rd`; `community_relay_announce.rs`).
+Key components, from the actual payload structs: `ReachabilityAnnouncePayload.iroh_node_id`
+(`[u8; 32]`, wire `nd`; defined in core `harmony-reachability` `src/record.rs`) and
+`CommunityRelayAnnouncePayload.relay.relay_device_id` (`[u8; 16]`, wire `rd`;
+`community_relay_announce.rs`).
 
 Explicitly **excluded** from supersession: `DeviceAnnounce` (materializes enrolled
 device keys — it is history), and every membership/config/governance kind.
@@ -127,24 +140,31 @@ device keys — it is history), and every membership/config/governance kind.
 persistence gating, cache bumping) already handles `AlreadyKnown` with exactly the
 semantics `Superseded` needs. No new plumbing through the engine.
 
-The ordering key reuses `event_sort_key` — the same canonical total order `cmp` uses —
-satisfying contract (a) by construction; same-key transitivity (b) follows from total
-order; (c) is trivially true (pure function of the two events).
+Within a lineage the winner is the `cmp`-maximum, and `MembershipPolicy::cmp` is
+`event_sort_key`'s canonical total order — so "newest announce wins" needs no
+separate ordering rule, and purity (a) is trivially true (key is a pure function
+of the event).
 
 ### 3. Un-silence the cliff (`src-tauri/src/community_state_sync.rs`)
 
 In `encode_root_packet`, after the encrypt step, measure `blob_ciphertext.len()`
 against `MAX_PAYLOAD_SIZE`:
 
-- ≥ 50%: `tracing::warn!` with community id, byte count, and percentage. Fires at most
-  once per publish attempt (publishes are debounced), so no rate limiting needed.
-- ≥ 80%: additionally `report_degraded(…, "state_root_near_cap", …)` — the existing
+- Classifier `RootSizeWatermark { Ok, NearHalf (≥ 50%), NearCap (≥ 80%, ≤ cap),
+  OverCap (> cap) }` over `blob_ciphertext.len()`.
+- NearHalf: `tracing::warn!` with community id, byte count, and percentage.
+- NearCap: warn + `report_degraded(…, "state_root_near_cap", …)` — the existing
   degraded-path plumbing that reaches the frontend banner.
-- On the `for_book` size failure itself: `report_degraded(…, "state_root_over_cap", …)`
-  in both the publish path (today: warn + retry into the same wall) and the query-serve
-  path (today: warn + silently withhold the reply).
+- OverCap (including the `for_book` failure arm in both the publish path and the
+  query-serve path): warn + `report_degraded(…, "state_root_over_cap", …)`.
 
-No behavior change below 50%.
+**As implemented (#560 review round 1):** `encode_root_packet` runs per
+query-serve request, not only per debounced publish, so emission is latched to
+watermark TRANSITIONS via a per-engine `AtomicU8` holding the last-seen level:
+crossing a threshold emits once, steady state is silent, shrinking re-arms,
+re-crossing re-emits. `OverCap` is a real classifier level (not just the error
+arm) precisely so the latch cannot oscillate between NearCap and the failure
+path. No behavior change below 50%.
 
 ### 4. What is deliberately NOT here
 
