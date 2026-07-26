@@ -279,7 +279,7 @@ impl CommunityRelayPullDriver {
                 // NOT a failure (nothing was tried), so it gets its own counter
                 // rather than inflating `sessionsFailed`.
                 if let Some(t) = self.telemetry.as_ref() {
-                    t.record_no_relay(&community.0);
+                    t.record_no_relay();
                 }
                 tracing::debug!(
                     community = ?community,
@@ -444,6 +444,11 @@ mod tests {
     struct MockTransport {
         ingested: usize,
         calls: StdMutex<Vec<([u8; 16], SpaceId, RelayPullQuery)>>,
+        /// ZEB-803 (CodeRabbit, PR #556): drive the `Err` arm of
+        /// `pull_session`. Without this the failure path — the silent path the
+        /// module comment singles out as invisible in production logs — had no
+        /// driver-level coverage at all.
+        fail: bool,
     }
 
     impl MockTransport {
@@ -451,6 +456,15 @@ mod tests {
             Self {
                 ingested,
                 calls: StdMutex::new(Vec::new()),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                ingested: 0,
+                calls: StdMutex::new(Vec::new()),
+                fail: true,
             }
         }
 
@@ -473,6 +487,9 @@ mod tests {
                 query.community_id,
                 query.clone(),
             ));
+            if self.fail {
+                return Err("mock transport: forced failure".to_string());
+            }
             // Exercise the ack-builder so a panic in it is caught by the test:
             // pretend we ingested one content id.
             let _ = ack_builder(&[[0xCD; 32]]);
@@ -640,14 +657,43 @@ mod tests {
              would send an operator hunting a transport fault that isn't there"
         );
         assert_eq!(s.sessions_ok, 0);
+        // CodeRabbit PR #556: the counter carries this signal; the session ring
+        // must stay clean so a many-community node cannot evict its ok/failed
+        // rows with non-session events.
+        assert!(
+            s.recent.is_empty(),
+            "no-relay is a counter, not a session outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pull_session_is_recorded_by_the_driver() {
+        // CodeRabbit PR #556: the Err arm had no driver-level coverage, and it
+        // is the path that logs at debug only — invisible in production. A
+        // counter that is never incremented is worth nothing, so the call site
+        // needs its own test, not just the telemetry unit.
+        let now = 1_700_000_000_000u64;
+        let transport = Arc::new(MockTransport::failing());
+        let community = SpaceId([0xBE; 16]);
+        let (driver, telemetry) =
+            make_driver_with_telemetry(transport.clone(), vec![community], now, true);
+
+        driver.run_one_pass(now).await;
+
+        let s = telemetry.summary();
+        assert_eq!(s.passes_run, 1);
+        assert_eq!(s.sessions_failed, 1, "the Err arm must be recorded");
+        assert_eq!(s.sessions_ok, 0);
+        assert_eq!(s.passes_no_relay, 0, "a relay WAS available and was tried");
+        assert_eq!(s.blobs_ingested, 0);
         assert_eq!(s.recent.len(), 1);
-        assert_eq!(s.recent[0].outcome, "noRelay");
+        assert_eq!(s.recent[0].outcome, "failed");
     }
 
     #[tokio::test]
     async fn successful_pull_records_session_and_ingest_counts() {
         let now = 1_700_000_000_000u64;
-        let transport = Arc::new(MockTransport::new(0));
+        let transport = Arc::new(MockTransport::new(3));
         let community = SpaceId([0xCD; 16]);
         let (driver, telemetry) =
             make_driver_with_telemetry(transport.clone(), vec![community], now, true);
@@ -659,8 +705,14 @@ mod tests {
         assert_eq!(s.passes_no_relay, 0);
         assert_eq!(s.sessions_ok, 1, "one relay seeded ⇒ one session");
         assert_eq!(s.sessions_failed, 0);
+        // CodeRabbit PR #556: with n == 0 this test never reached the
+        // `ingested > 0` branch it is named for, so blobs_ingested and
+        // last_ingest_ms were untested from the call site.
+        assert_eq!(s.blobs_ingested, 3);
+        assert!(s.last_ingest_ms.is_some());
         assert_eq!(s.recent.len(), 1);
         assert_eq!(s.recent[0].outcome, "ok");
+        assert_eq!(s.recent[0].ingested, 3);
     }
 
     #[tokio::test]

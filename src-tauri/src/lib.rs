@@ -10337,14 +10337,14 @@ pub async fn start_node_inner(
                         let relay_serving_telemetry = std::sync::Arc::new(
                             crate::network_health::CommunityRelayServingTelemetry::new(),
                         );
-                        community_relay_serving_telemetry_for_state =
-                            Some(std::sync::Arc::clone(&relay_serving_telemetry));
                         if link_mgr
                             .install_community_relay_pull_acceptor(std::sync::Arc::new(
                                 crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor::new(
                                     relay_pull_ctx,
                                 )
-                                .with_telemetry(relay_serving_telemetry),
+                                .with_telemetry(std::sync::Arc::clone(
+                                    &relay_serving_telemetry,
+                                )),
                             ))
                             .is_err()
                         {
@@ -10353,6 +10353,22 @@ pub async fn start_node_inner(
                                  installed on iroh link manager — keeping the prior \
                                  instance"
                             );
+                        } else {
+                            // ZEB-803 (CodeRabbit, PR #556): publish the source
+                            // ONLY on the success path. On failure the PRIOR
+                            // acceptor is kept and this telemetry is attached to
+                            // an instance nobody holds — so it would sit at zero
+                            // forever while the live acceptor served normally.
+                            //
+                            // That is not a cosmetic gap: zeroed-but-present is
+                            // precisely how this section encodes "wired and
+                            // serving nothing", the incident state. Publishing on
+                            // the failure path would make a duplicate-install
+                            // warning masquerade as the outage the field exists
+                            // to detect — a false positive manufactured by the
+                            // alarm's own wiring.
+                            community_relay_serving_telemetry_for_state =
+                                Some(relay_serving_telemetry);
                         }
 
                         // C/D/E. The pull driver, sender deposit client, and

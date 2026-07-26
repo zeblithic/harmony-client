@@ -321,6 +321,26 @@ pub struct CommunityRelayServingHealth {
     /// until this node serves its first. **This is the field the incident
     /// wanted**: cadence is ~7m30s per peer, so a value older than ~3 cadences
     /// while peers are believed connected is the signature.
+    ///
+    /// ## Why this counts empty responses, unlike the pulling side
+    ///
+    /// CodeRabbit (PR #556) observed that `handle_pull_inbound` returns `Ok(())`
+    /// for a session that handed over no entries, so this advances on every
+    /// empty poll — and asked whether that should mirror the pulling side's
+    /// `sessions_ok` vs `blobs_ingested` split.
+    ///
+    /// Kept deliberately. The two sides answer different questions. On the
+    /// pulling side the question is "am I receiving my history", so payload is
+    /// the signal. On the serving side the question is "**is my acceptor still
+    /// answering peers**", and an empty response is a completely successful
+    /// answer — the relay simply held nothing. A relay with an empty hold is the
+    /// normal steady state, and demoting it would mean a correctly-functioning
+    /// acceptor reports the stall signature whenever traffic is quiet, which is
+    /// the false positive this section must not manufacture.
+    ///
+    /// The incident signature is *zero pulls served at all* — no connection
+    /// handled for 46 minutes — and that is exactly what this field catches.
+    /// Payload volume is the pulling side's business.
     pub last_served_ms: Option<u64>,
     /// Per-peer, so one stuck peer is distinguishable from a dead acceptor.
     /// Sorted by `last_served_ms` desc. Bounded — see `COMMUNITY_RELAY_PEER_CAP`.
@@ -665,9 +685,23 @@ impl CommunityRelayPullTelemetry {
     }
 
     /// Silent path 3: a joined community with no fresh relay to pull from.
-    pub fn record_no_relay(&self, community: &[u8; 16]) {
+    ///
+    /// **Counter only — deliberately does NOT push to the `recent` ring**
+    /// (CodeRabbit, PR #556). Two reasons, one root cause: this is not a
+    /// session outcome, and forcing it into the session ring required
+    /// inventing an all-zero `relay_device` that ships as a
+    /// plausible-looking `"00000000"` device id. Worse, it emitted one row
+    /// per (pass, community), so a node joined to more than
+    /// `COMMUNITY_RELAY_PULL_RING_CAP` communities with stale announces
+    /// refilled the whole ring every pass and evicted the `ok`/`failed` rows
+    /// the ring exists to preserve — starving the diagnostic to report the
+    /// non-diagnostic. `passes_no_relay` already carries the signal.
+    ///
+    /// Cost: per-community attribution ("*which* community has no relay") is
+    /// not on the wire. Acceptable at current cardinality (1–2 communities per
+    /// node) and properly solved by ZEB-762's per-engine health shape.
+    pub fn record_no_relay(&self) {
         self.passes_no_relay.fetch_add(1, Ordering::Relaxed);
-        self.push(community, &[0u8; 16], "noRelay", 0);
     }
 
     /// A completed pull session. `ingested == 0` is a success, not a failure —
@@ -5047,7 +5081,7 @@ mod tests {
         // distinguishable from a relay that was tried and failed, because the
         // remedies differ (stale/absent announce vs transport fault).
         let p = CommunityRelayPullTelemetry::new();
-        p.record_no_relay(&[3u8; 16]);
+        p.record_no_relay();
         p.record_session_failed(&[3u8; 16], &[4u8; 16]);
         let s = p.summary();
         assert_eq!(s.passes_no_relay, 1);
@@ -5056,8 +5090,12 @@ mod tests {
             s.sessions_ok, 0,
             "neither path may be mistaken for a success"
         );
+        // CodeRabbit PR #556: no-relay is a counter, not a session outcome. It
+        // must NOT enter the session ring — it has no relay device to name, and
+        // one row per (pass, community) could evict every ok/failed row on a
+        // many-community node.
         let outcomes: Vec<&str> = s.recent.iter().map(|h| h.outcome.as_str()).collect();
-        assert_eq!(outcomes, vec!["noRelay", "failed"]);
+        assert_eq!(outcomes, vec!["failed"], "ring holds sessions only");
     }
 
     #[test]
@@ -5087,7 +5125,8 @@ mod tests {
         t.record_served(&[0xEEu8; 32]);
         let p = CommunityRelayPullTelemetry::new();
         p.record_pass_start();
-        p.record_no_relay(&[5u8; 16]);
+        p.record_no_relay();
+        p.record_session_ok(&[5u8; 16], &[6u8; 16], 2);
         let health = CommunityRelayHealth {
             serving: t.summary(),
             pulling: p.summary(),
