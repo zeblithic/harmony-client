@@ -8424,17 +8424,24 @@ pub async fn start_node_inner(
                     //      rule feedback_metadata_before_irreversible_write —
                     //      re-reading per community would let different
                     //      communities disagree on what address we're at).
-                    //   2. Iterate joined communities via
+                    //   2. Iterate every spawned community via
                     //      `registry.known_ids()`.
                     //   3. For each, reserve an HLC, build the inner
                     //      identity-signed `ReachabilityAnnouncePayload`,
-                    //      wrap in `MembershipEventKind::ReachabilityAnnounce`,
-                    //      sign the outer envelope with the harmony
-                    //      identity, and insert via
-                    //      `engine.insert_local_event`.
-                    //   4. Per-community failures log + continue — the
+                    //      then gate on membership (`known_ids()` is
+                    //      spawned engines, not Joined communities).
+                    //   4. ZEB-815: accumulate the payload as an
+                    //      `AddressBookRow` and, after the loop, hand the
+                    //      batch to `address_book_sync::publish_own_rows`
+                    //      — local ingest through the same gate a peer's
+                    //      row takes, then a sealed publish on each
+                    //      community's `harmony/addrbook/{hex}/records`.
+                    //      No community-CRDT event is minted (Task 6
+                    //      flag day; the announce kind survives only for
+                    //      the delta/boot consumers until Task 7).
+                    //   5. Per-community failures log + continue — the
                     //      publisher loop is long-running, one broken
-                    //      community CRDT must not abort all publishing.
+                    //      community must not abort all publishing.
                     //
                     // Skipped entirely when iroh bind failed (no
                     // endpoint to snapshot). When NO communities are
@@ -8471,11 +8478,14 @@ pub async fn start_node_inner(
                         let friend_pub_cell_for_cb = std::sync::Arc::clone(&friend_pub_cell);
                         let crdt_state_for_cb = std::sync::Arc::clone(&crdt_state);
                         let kt_for_cb = std::sync::Arc::clone(&kt);
-                        // ZEB-339: ReachabilityAnnounce is a community-membership
-                        // event. T4 rewired RCH2 verify to check BOTH the outer
-                        // event sig AND the inner `identity_signature` against the
-                        // resolved enrolled device key (#2). Sign both with device
-                        // #2, not the Reticulum-derived PrivateIdentity.
+                        // ZEB-339: the inner `identity_signature` must be made
+                        // with the enrolled device key (#2), NOT the
+                        // Reticulum-derived PrivateIdentity — every verifier
+                        // resolves the signer's enrolled key to check it.
+                        // (ZEB-815 retired the outer event signature this note
+                        // also used to cover; the device-#2 requirement is
+                        // unchanged, and the address-book ingest gate checks
+                        // the same inner signature against the row's `device`.)
                         let community_signing_key_for_cb =
                             std::sync::Arc::clone(&community_signing_key_arc);
                         let self_owner_for_cb = self_owner;
@@ -8645,6 +8655,12 @@ pub async fn start_node_inner(
                                         crate::owner_state_types::SpaceId,
                                         crate::community_channel_log::ChannelKey,
                                     > = std::collections::HashMap::new();
+                                    // Enrolled device key #2 — signs the inner
+                                    // payload, identifies us to the membership
+                                    // gate below, and is the row's `device`.
+                                    // Loop-invariant, so bound once.
+                                    let self_device_vk =
+                                        community_signing_key.verifying_key().to_bytes();
                                     let community_ids = registry.known_ids().await;
                                     for community_id in community_ids {
                                         // 3a. Reserve an HLC for this
@@ -8706,6 +8722,52 @@ pub async fn start_node_inner(
                                             );
                                             continue;
                                         };
+                                        // 3d. Membership gate — the SAME
+                                        //     predicate every receiver applies
+                                        //     (`ingest_sealed_packet` calls it
+                                        //     per row), so we never mint a row
+                                        //     for a community that would
+                                        //     reject it.
+                                        //
+                                        //     Not redundant with the loop
+                                        //     bound: `known_ids()` is every
+                                        //     SPAWNED engine, not every Joined
+                                        //     community — an admin removal
+                                        //     while we are online, or the
+                                        //     window between spawn and Join,
+                                        //     leaves an engine we hold but no
+                                        //     membership. The old
+                                        //     `insert_local_event` path got
+                                        //     this for free from
+                                        //     `verify_event`'s RCH5; on the
+                                        //     address-book path it has to be
+                                        //     explicit, or a stale row lands in
+                                        //     our own book, our actor-keyed
+                                        //     resolver, and the sidecar.
+                                        //
+                                        //     Re-resolves the engine internally
+                                        //     rather than reusing the one above
+                                        //     — one map lookup per community
+                                        //     per publish tick (60-min cadence)
+                                        //     buys calling the receiver's
+                                        //     predicate verbatim instead of
+                                        //     re-deriving it here.
+                                        if !crate::voice_presence::beacon_signer_is_member(
+                                            &registry,
+                                            &community_id,
+                                            &actor,
+                                            &self_device_vk,
+                                        )
+                                        .await
+                                        {
+                                            tracing::debug!(
+                                                community_id = ?community_id,
+                                                "not an enrolled Joined member of this community; \
+                                                 skipping its ReachabilityAnnounce row"
+                                            );
+                                            continue;
+                                        }
+
                                         addrbook_keys.insert(
                                             community_id,
                                             crate::address_book_sync::derive_addrbook_key(
@@ -8714,7 +8776,7 @@ pub async fn start_node_inner(
                                             ),
                                         );
 
-                                        // 3d. ZEB-815: the announce is an
+                                        // 3e. ZEB-815: the announce is an
                                         //     address-book ROW now, not a
                                         //     community-CRDT event — the
                                         //     inner signed payload is
@@ -8731,9 +8793,7 @@ pub async fn start_node_inner(
                                                         payload,
                                                     ),
                                                 actor,
-                                                device: community_signing_key
-                                                    .verifying_key()
-                                                    .to_bytes(),
+                                                device: self_device_vk,
                                                 at: hlc,
                                                 stamped_at_ms: announced_at_ms,
                                             },
@@ -10656,10 +10716,16 @@ pub async fn start_node_inner(
                                     // E. Relay publish-fn + publisher. Mirrors the
                                     //    reachability publish-fn: for each opted-in
                                     //    community this node is ALSO a Joined
-                                    //    member of, mint an HLC, build the signed
+                                    //    member of, mint an HLC and build the signed
                                     //    CommunityRelayAnnounce (inner sig HLC ==
-                                    //    outer EventPayload.at), and insert it via
-                                    //    that community's engine.
+                                    //    the row's `at`). ZEB-815: the payload
+                                    //    becomes an `AddressBookRow` published via
+                                    //    `address_book_sync::publish_own_rows` — no
+                                    //    community-CRDT event is minted. The
+                                    //    rendezvous slot refresh runs AFTER that
+                                    //    publish, because it ranks this node
+                                    //    against a relay resolver the publish has
+                                    //    just fed with our own ad.
                                     let relay_publish_fn: crate::community_relay_publisher::RelayPublishFn = {
                                         let registry = std::sync::Arc::clone(&registry);
                                         let signing_key =
@@ -66027,11 +66093,13 @@ async fn connectivity_force_republish(
 /// `ReachabilityAnnounce` immediately, INSTEAD of waiting for the next
 /// startup / network-change / 60-min idle tick.
 ///
-/// The publisher's loop iterates `registry.known_ids()` and, for each
-/// community, signs + inserts a `ReachabilityAnnounce` carrying this device's
-/// DURABLE butler-set (the seal-targets a fully-offline recipient's DM deposit
-/// resolves). Two state changes the publisher does NOT otherwise observe make
-/// the advertised announce stale, so they call this:
+/// The publisher's loop iterates `registry.known_ids()` and, for each community
+/// it is an enrolled Joined member of, signs a `ReachabilityAnnounce` carrying
+/// this device's DURABLE butler-set (the seal-targets a fully-offline
+/// recipient's DM deposit resolves) and publishes it as an address-book record
+/// (ZEB-815 — it is no longer inserted into the community CRDT). Two state
+/// changes the publisher does NOT otherwise observe make the advertised
+/// announce stale, so they call this:
 ///
 ///  * **community create / join** — a freshly-joined member must publish a
 ///    per-community announce so co-members (the sender's resolver) learn its
@@ -66648,8 +66716,9 @@ pub(crate) async fn set_butler_pin_impl(
     }
 
     // durable-seal-targets: a pin change rewrites this device's advertised
-    // butler-set, so the COMMUNITY-CRDT `ReachabilityAnnounce` must be
-    // re-emitted too (the `routing_republish` above only refreshes the PKARR
+    // butler-set, so the per-community `ReachabilityAnnounce` address-book
+    // record must be re-emitted too (ZEB-815 moved it off the community CRDT;
+    // the republish trigger is unchanged). The `routing_republish` above only refreshes the PKARR
     // routing record + fleet-net self-row, not the per-community announce the
     // deposit rungs resolve seal-targets from). The fleet-net doc + snapshot are
     // already updated above, and the reachability publish-fn reads the snapshot

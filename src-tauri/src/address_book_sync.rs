@@ -1461,6 +1461,140 @@ mod tests {
         );
     }
 
+    /// Build a correctly-signed reachability row plus the wiring
+    /// `publish_own_rows` needs, for the two policy-branch tests below.
+    /// Returns the row and a drain task that answers (and records) publishes.
+    fn own_row_fixture(seed: u8) -> (AddressBookRow, OwnerAddr) {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let actor = OwnerAddr([seed; 16]);
+        let ts = 1_700_000_000_000u64;
+        let at = hlc(ts);
+        let payload = build_signed_payload_with_key(
+            [seed; 32],
+            "https://derp.example/".into(),
+            vec![],
+            ts,
+            &actor,
+            &at,
+            Vec::new(),
+            0,
+            &sk,
+        )
+        .expect("build signed reachability payload");
+        (
+            AddressBookRow {
+                entry: AddressBookEntry::Reachability(payload),
+                actor,
+                device: sk.verifying_key().to_bytes(),
+                at,
+                stamped_at_ms: ts,
+            },
+            actor,
+        )
+    }
+
+    /// A row that fails OUR OWN gate is one every member would reject at
+    /// theirs, so it must not reach the wire — and must leave the book, the
+    /// resolver, and the persist task untouched. Guards the `bad => continue`
+    /// branch: publishing first and gating second would still pass the happy
+    /// path test above.
+    #[tokio::test]
+    async fn rejected_own_row_is_not_published() {
+        use futures::FutureExt;
+
+        let community = SpaceId([0xD2; 16]);
+        let (mut row, actor) = own_row_fixture(0x71);
+        // Corrupt the inner signature — the same failure a broken minting
+        // path would produce.
+        if let AddressBookEntry::Reachability(p) = &mut row.entry {
+            p.identity_signature[0] ^= 0xFF;
+        }
+
+        let book = CommunityAddressBook::new();
+        let rr = ReachabilityResolver::new();
+        let crr = CommunityRelayResolver::new();
+        let dirty = AddrbookDirtyHub::new();
+        let (publish_tx, mut publish_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::PublishRequest>(8);
+
+        let key_fn = |c: &SpaceId| Some(derive_addrbook_key(&EpochKey::new([7u8; 32]), c));
+        publish_own_rows(
+            &key_fn,
+            &book,
+            &rr,
+            &crr,
+            &publish_tx,
+            vec![(community, row)],
+            &dirty,
+        )
+        .await;
+
+        assert!(
+            publish_rx.try_recv().is_err(),
+            "a row that fails our own gate is never sent"
+        );
+        assert!(
+            book.rows_for_community(&community, 1_700_000_000_000)
+                .is_empty(),
+            "and never stored"
+        );
+        assert!(rr.resolve(&actor).is_empty(), "and never fanned out");
+        assert!(
+            dirty
+                .handle(community.0)
+                .notified()
+                .now_or_never()
+                .is_none(),
+            "and never marks the book dirty"
+        );
+    }
+
+    /// No key for a community means we cannot seal anything a member could
+    /// open — the row still belongs in OUR book (it is our own address, and
+    /// the sidecar should keep it), but nothing goes on the wire. Guards the
+    /// `key_fn` → `None` branch against both failure directions: dropping the
+    /// row entirely, or publishing it unsealed.
+    #[tokio::test]
+    async fn own_row_without_a_key_stays_local() {
+        let community = SpaceId([0xD3; 16]);
+        let ts = 1_700_000_000_000u64;
+        let (row, actor) = own_row_fixture(0x72);
+
+        let book = CommunityAddressBook::new();
+        let rr = ReachabilityResolver::new();
+        let crr = CommunityRelayResolver::new();
+        let dirty = AddrbookDirtyHub::new();
+        let (publish_tx, mut publish_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::PublishRequest>(8);
+
+        let key_fn = |_: &SpaceId| None;
+        publish_own_rows(
+            &key_fn,
+            &book,
+            &rr,
+            &crr,
+            &publish_tx,
+            vec![(community, row.clone())],
+            &dirty,
+        )
+        .await;
+
+        assert!(
+            publish_rx.try_recv().is_err(),
+            "a community we hold no key for gets nothing on the wire"
+        );
+        assert_eq!(
+            book.rows_for_community(&community, ts),
+            vec![row],
+            "but the row is still in our own book"
+        );
+        assert_eq!(
+            rr.resolve(&actor).len(),
+            1,
+            "and still reached the resolver"
+        );
+    }
+
     /// A book too large to seal under the receiver's cap is served
     /// newest-first and truncated, never as an over-cap packet the receiver
     /// would reject before decrypting. `max_bytes` is a parameter (not the
