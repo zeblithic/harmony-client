@@ -8,7 +8,30 @@
 
 **Tech Stack:** Rust; core crate `harmony-crdt-sync` (no_std + alloc — `core::`/`alloc::` imports only); client `harmony-app` (src-tauri).
 
-**Spec:** `docs/superpowers/specs/2026-07-26-zeb-813-announce-supersession-design.md` — its §1 contract clauses (a)–(d) are normative for Task 1.
+**Spec:** `docs/superpowers/specs/2026-07-26-zeb-813-announce-supersession-design.md` (updated post-merge to the as-implemented API; its §1 contract clauses are normative).
+
+> **⚠️ As-implemented deltas (this plan is a historical execution record — do
+> not implement from the step bodies below).** Review convergence on the two
+> PRs changed the design after this plan was written:
+>
+> 1. **Core seam is key-based, not pairwise** (harmony#299 round 1, merged
+>    `b904b0b9`): `LogPolicy` gained `type SupersessionKey: Ord` + defaulted
+>    `fn supersession_key(&Event) -> Option<Self::SupersessionKey>` — there is
+>    NO `supersedes(newer, older) -> bool` method. Insert short-circuits on a
+>    stored `cmp`-Greater same-key event; `from_verified_events` compacts via
+>    an O(n log n) winners map, not a pairwise scan. Task 1/Task 3 step bodies
+>    below show the superseded pairwise API verbatim as originally planned.
+> 2. **Client policy** (Task 3) shipped as `AnnounceKey::{Reachability(OwnerAddr,
+>    [u8; 32]), Relay(OwnerAddr, [u8; 16])}` + `supersession_key`, not a
+>    `supersedes` fn.
+> 3. **Watermarks** (Task 4) shipped with an `OverCap` classifier level and a
+>    per-engine transition latch (`AtomicU8`), because `encode_root_packet`
+>    runs per query-serve request (harmony-client#560 round 1).
+>
+> The spec above reflects the shipped API; the step bodies below are a
+> historical checklist — the plan as originally written, pre-redesign.
+> Execution happened inline (the checkbox states were never ticked), and the
+> as-shipped record is the two PRs' commit history, not these steps.
 
 ## Global Constraints
 
@@ -29,7 +52,7 @@
 
 **Interfaces:**
 - Consumes: existing `LogPolicy` (associated fns `event_id`, `cmp`, `verify`, `materialize`), `VerifiedLog { events: BTreeMap<P::EventId, P::Event> }`.
-- Produces: `LogPolicy::supersedes(newer: &Self::Event, older: &Self::Event) -> bool` (defaulted `false`); `InsertOutcome::Superseded` (unit variant, no payload); compaction behavior in `insert` + `from_verified_events`. Task 3 matches on `Superseded` and implements `supersedes`.
+- Produces (as shipped, post-redesign — see the banner above): `LogPolicy::SupersessionKey: Ord` (required associated type) + `LogPolicy::supersession_key(&Self::Event) -> Option<Self::SupersessionKey>` (defaulted `None`); `InsertOutcome::Superseded` (unit variant, no payload); same-key `cmp`-Greater short-circuit in `insert` + winners-map compaction in `from_verified_events`. Task 3 matches on `Superseded` and implements `supersession_key`. *(As originally planned this line declared the pairwise `supersedes(newer, older) -> bool` API that harmony#299 round 1 replaced.)*
 
 - [ ] **Step 1: branch + write failing tests** — `git checkout -b zeb-813-verified-log-supersession origin/main`. In the existing `mod tests`, add a supersession toy policy and five tests:
 
