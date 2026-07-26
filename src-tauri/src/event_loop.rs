@@ -1219,23 +1219,73 @@ pub async fn run(
     let mut reconnect_supervisor_task: Option<tokio::task::JoinHandle<()>> = None;
 
     let mut config = zenoh::Config::default();
-    // Test/diagnostic seam (ZEB-468 dial probe): when HARMONY_ZENOH_DISABLE_MULTICAST
-    // is set, turn off Zenoh's LAN multicast scouting so two co-located nodes cannot
-    // peer via multicast — forcing the ZEB-373 dynamic iroh dial to be the ONLY Zenoh
-    // peer path. Lets the e2e harness exercise the dial in isolation (otherwise
-    // co-located nodes peer via multicast first, and `connect_peer` reports success
-    // off that pre-existing transport — a false positive for the dial). Production
-    // leaves this UNSET → multicast stays ON (default), byte-for-byte unchanged.
-    if std::env::var("HARMONY_ZENOH_DISABLE_MULTICAST")
-        .map(|v| !v.is_empty() && v != "0")
+    // ZEB-809: LAN scouting (multicast AND gossip) is OFF by default.
+    //
+    // `zenoh::Config::default()` leaves both ENABLED, which makes this session
+    // peer with every zenoh node reachable on the LAN. That is a second ingress
+    // into the very session that carries our data plane, and it bypasses the
+    // entire peer-acquisition design: no routing record, no membership check, no
+    // dial policy, no reconnect supervision. Peers are supposed to arrive via
+    // pkarr routing record → ZEB-373 iroh dial, and only that way.
+    //
+    // Measured on a four-node fleet (ZEB-803 investigation, 2026-07-26): 361
+    // transport-session events in 90 minutes, 359 of them distinct foreign zids,
+    // plus repeated connect attempts to scouted IPv6 locators the host has no
+    // route to. Our own peers use `deterministic_zid_hex`, so none of those 359
+    // were ours.
+    //
+    // We had already diagnosed this and fixed it for tests only: see
+    // `hermetic_zenoh_config` below, whose doc describes exactly this pathology
+    // and disables both knobs. Production disabled neither by default, and only
+    // multicast under an env var — half a switch, opt-out.
+    //
+    // Safe because the dial genuinely works without scouting: the e2e probe
+    // `s5c_clean_dial_only_card_propagation_probe` converges two clean
+    // co-located nodes over the iroh dial alone. Cross-WAN peers never had
+    // multicast in the first place, so this makes LAN behaviour match the path
+    // that already had to work everywhere else — and stops the LAN masking a
+    // broken dial (`zenoh-LAN-masks-iroh`).
+    //
+    // Opt-IN, not opt-out: set HARMONY_ZENOH_ENABLE_LAN_SCOUTING=1 to restore
+    // stock zenoh discovery. Inverted deliberately — the old
+    // HARMONY_ZENOH_DISABLE_MULTICAST made the safe configuration the one you
+    // had to remember to ask for.
+    //
+    // The opt-in is strict: the value must be exactly "1" (after trimming
+    // whitespace). "true", "yes", "false", or a typo all read as UNSET — for a
+    // flag whose enable direction widens the attack surface, a mis-set value
+    // must fail toward the safe default, never toward open (PR #558 review).
+    if std::env::var("HARMONY_ZENOH_ENABLE_LAN_SCOUTING")
+        .map(|v| v.trim() == "1")
         .unwrap_or(false)
     {
-        if let Err(e) = config.insert_json5("scouting/multicast/enabled", "false") {
-            let e = format!("zenoh config error (disable multicast): {e}");
-            let _ = ready_tx.send(Err(e));
-            return;
+        // Set both knobs explicitly rather than riding zenoh's defaults: the
+        // opt-in contract is "scouting ON", and it should survive a future
+        // zenoh release flipping its default posture (PR #558 review).
+        for knob in ["scouting/multicast/enabled", "scouting/gossip/enabled"] {
+            if let Err(e) = config.insert_json5(knob, "true") {
+                let e = format!("zenoh config error (enable {knob}): {e}");
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
         }
-        tracing::info!("HARMONY_ZENOH_DISABLE_MULTICAST set: LAN multicast scouting disabled");
+        tracing::warn!(
+            "HARMONY_ZENOH_ENABLE_LAN_SCOUTING=1: zenoh multicast + gossip scouting ENABLED. \
+             This session will peer with any zenoh node on the LAN, outside routing-record / \
+             dial-policy control (ZEB-809)."
+        );
+    } else {
+        for knob in ["scouting/multicast/enabled", "scouting/gossip/enabled"] {
+            if let Err(e) = config.insert_json5(knob, "false") {
+                let e = format!("zenoh config error (disable {knob}): {e}");
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        }
+        tracing::info!(
+            "ZEB-809: zenoh LAN scouting disabled (multicast + gossip); peers arrive via \
+             routing record + iroh dial only"
+        );
     }
     // ZEB-390: give this session a DETERMINISTIC zenoh id derived from our own
     // iroh node-id, so a peer dialing us via the dynamic dial driver can compute

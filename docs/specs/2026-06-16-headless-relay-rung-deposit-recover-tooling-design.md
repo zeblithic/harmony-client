@@ -110,6 +110,8 @@ This triple is airtight and needs zero changes to the message or `dm-received` p
 
 Three nodes on `xwan`-style throwaway profiles (the proven env recipe: `HARMONY_DISABLE_KEYCHAIN=1`, `HARMONY_PASSPHRASE=…`, `HARMONY_ZENOH_DISABLE_MULTICAST=1`, `HARMONY_RETICULUM_PORT=0`):
 
+> **[Update, ZEB-809 / PR #558, 2026-07-26]** `HARMONY_ZENOH_DISABLE_MULTICAST` no longer exists. LAN scouting (multicast **and** gossip) is now off by default, so the dial-only behavior this recipe wanted needs no env var at all; setting the retired var is a harmless no-op. The inverse knob is `HARMONY_ZENOH_ENABLE_LAN_SCOUTING=1` (value must be exactly `1`), which re-enables stock zenoh LAN discovery and is intentionally risky.
+
 - **Agent A = Ildwyn** — sender
 - **Agent B = AVALON** — recipient (goes offline)
 - **Agent R = Koya** — relay host (a distinct owner; only needs to be a community co-member)

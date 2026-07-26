@@ -99,6 +99,15 @@ impl NodeHandle {
             .env("HARMONY_PASSPHRASE", &config.passphrase)
             .env("HARMONY_RETICULUM_PORT", "0")
             .env("HARMONY_API_PORT", "0")
+            // ZEB-809: production disables zenoh LAN scouting by default; a
+            // runner whose shell exports the opt-in would silently re-enable it
+            // for every spawned node, handing co-located tests a peer path
+            // production doesn't have (exactly the false-positive the old s5c
+            // skip-guard existed to avoid). Strip it so hermeticity doesn't
+            // depend on the runner's environment. Layered BEFORE `extra_env`,
+            // so a test that deliberately wants scouting can still set it
+            // per-node.
+            .env_remove("HARMONY_ZENOH_ENABLE_LAN_SCOUTING")
             // ZEB-720: per-node extra env (e.g. short voting cadence), layered
             // LAST — chained after the isolation `.env(...)` calls above, so a
             // colliding key would win. Keep `extra_env` to non-isolation vars

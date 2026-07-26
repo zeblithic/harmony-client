@@ -1039,37 +1039,41 @@ async fn s5b_clean_relaunch_card_propagation_control() {
 // remaining question: does the ZEB-373 dial establish a working Zenoh peer link
 // between two CLEAN full nodes when multicast is OFF?
 //
-// Setup: mint both, kill + re-spawn already-minted (single clean session each),
-// with HARMONY_ZENOH_DISABLE_MULTICAST=1 in the env so neither can peer via
-// multicast. Then join a community (clean nodes) — the membership reachability
-// exchange fires the dial, now the ONLY path to a Zenoh peer mesh. Publish /
-// subscribe owner cards and measure convergence.
+// Setup: mint both, kill + re-spawn already-minted (single clean session each).
+// LAN scouting is off by default (ZEB-809) and the harness strips the opt-in
+// var from spawned nodes' env, so neither can peer via multicast. Then join a
+// community (clean nodes) — the membership reachability exchange fires the
+// dial, now the ONLY path to a Zenoh peer mesh. Publish / subscribe owner
+// cards and require convergence.
 //
-// SKIPS (no-op) unless HARMONY_ZENOH_DISABLE_MULTICAST=1 is set — without it the
-// nodes peer via multicast and `connect_peer` reports success off that transport,
-// a FALSE POSITIVE for the dial. The harness inherits the parent env, so run as:
-//   HARMONY_ZENOH_DISABLE_MULTICAST=1 cargo nextest run --features e2e \
-//     -E 'test(s5c_clean_dial_only_card_propagation_probe)'
+// ZEB-809: this probe used to SKIP unless HARMONY_ZENOH_DISABLE_MULTICAST=1 was
+// set, because stock zenoh let the two nodes peer via multicast and
+// `connect_peer` would then report success off that pre-existing transport — a
+// FALSE POSITIVE for the dial.
 //
-// EXPECTED: converged=TRUE → the clean dial works; the ZEB-468 fix is "just
-// restart-safety" and cross-WAN cards are viable. converged=FALSE → the dial is
-// independently broken and the fix must address it too.
+// That guard is now obsolete: `event_loop::run` disables multicast AND gossip
+// scouting by default, so a spawned node has no scouting path and the dial is
+// already the only way these two can meet. The probe is therefore valid
+// unconditionally, and now runs on every e2e sweep instead of only when someone
+// remembered the env var. Retiring the guard rather than leaving it inert —
+// a skip condition nobody can satisfy reads as "covered" while testing nothing.
+//
+// The old env var is gone; HARMONY_ZENOH_ENABLE_LAN_SCOUTING=1 now goes the
+// other way and would re-break this probe — which is why `NodeHandle::spawn`
+// strips it from every spawned node's env (a runner's exported opt-in must not
+// silently hand co-located tests a peer path production doesn't have).
+//
+// HARD-ASSERTED since ZEB-809: with scouting off by default, the dial is the
+// ONLY peer path production has on the LAN — the same position it was always
+// in cross-WAN. A probe that merely logs its result would leave a broken dial
+// green on every sweep (this probe existed because the LAN used to mask
+// exactly that). converged=FALSE now fails the test: the dial is independently
+// broken and nothing else in the product can paper over it.
 // ─────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s5c_clean_dial_only_card_propagation_probe() {
     use e2e_harness::driver::*;
     use std::time::Duration;
-
-    if !std::env::var("HARMONY_ZENOH_DISABLE_MULTICAST")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-    {
-        eprintln!(
-            "s5c SKIPPED: requires HARMONY_ZENOH_DISABLE_MULTICAST=1 (dial-only probe; \
-             without it nodes peer via multicast → false positive). Re-run with the env set."
-        );
-        return;
-    }
 
     let (mut run, ah, bh, mut alice, mut bob) = two_minted_nodes("s5c").await;
     let alice_owner = owner_id(&alice).await;
@@ -1148,6 +1152,17 @@ async fn s5c_clean_dial_only_card_propagation_probe() {
     unsubscribe_member_card(&alice, a_sub).await.ok();
     unsubscribe_member_card(&bob, b_sub).await.ok();
 
+    // ZEB-809 / PR #558 review: hard-assert. With LAN scouting off by default
+    // the dial is the only peer path, so a non-converging dial is a product
+    // outage, not a data point. Assert AFTER the unsubscribes so a red probe
+    // still cleans up its subscriptions.
+    assert!(
+        converged,
+        "S5c: clean dial-only card propagation did not converge — with LAN scouting \
+         off by default (ZEB-809) the ZEB-373 iroh dial is the ONLY zenoh peer path, \
+         so this red means the dial itself is broken"
+    );
+
     run.mark_success();
     drop((alice, bob, ah, bh));
 }
@@ -1155,7 +1170,8 @@ async fn s5c_clean_dial_only_card_propagation_probe() {
 // ─────────────────────────────────────────────────────────────────────────────
 // S5d — ZEB-468 restart-safety REGRESSION (hard-asserted). Ildwyn, 2026-06-15.
 //
-// s5b/s5c CHARACTERIZE; this one GUARDS. It is the minimal repro of the ZEB-468
+// s5b CHARACTERIZES; s5c (hard-asserted since ZEB-809) and this one GUARD. It
+// is the minimal repro of the ZEB-468
 // bug: `two_minted_nodes` mints (= RESTARTS) both nodes, which is the exact
 // restart-poisoning. No community is needed — owner cards are global and s5b
 // proved a *clean* co-located mesh routes them with no community. The ONLY
@@ -2334,6 +2350,45 @@ async fn s_vines_publish_feed_view_reshare() {
 
     let (mut run, ah, bh, alice, bob) = two_minted_nodes("vines").await;
     let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    // ZEB-811 (found via ZEB-809): establish a real peer relationship before
+    // expecting any vine to propagate.
+    //
+    // This test used to publish straight out of `two_minted_nodes` with NO
+    // community, NO friendship, and NO routing-record exchange — so the only
+    // way these two nodes could ever find each other was zenoh LAN multicast,
+    // which `Config::default()` happened to leave enabled. It passed for that
+    // reason and no other: with scouting disabled it failed 3/3 at a
+    // near-identical 108s, deterministically rather than flakily.
+    //
+    // That made it a FALSE POSITIVE of exactly the class
+    // `s5c_clean_dial_only_card_propagation_probe` exists to eliminate for
+    // owner cards — co-located nodes peering implicitly, so the assertion
+    // never exercised the path production actually uses. Cross-WAN there is no
+    // multicast, so what this test claimed to cover has never worked there.
+    //
+    // Vines are wildcard pub/sub over the EXISTING peer mesh and carry no
+    // peer-acquisition step of their own, and a follow builds no network path
+    // (ZEB-811). A community join fires the membership reachability exchange,
+    // which fires the ZEB-373 dial — the same mechanism `s5c` uses, and the
+    // one that has to work where multicast does not exist.
+    let community = create_community(&alice, "vines-community", true)
+        .await
+        .expect("alice creates community");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins alice's community (the peer link vines ride on)");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("roster converges before any vine is published");
 
     // Unique-per-run title so we can pick our descriptor out of a feed
     // unambiguously (feeds start empty — the Rust cache has no mock seed).
