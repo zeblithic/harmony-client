@@ -44,6 +44,15 @@ impl CommunityRelayResolver {
     }
 
     /// Fresh, capped advertiser entries for a community (freshest first).
+    ///
+    /// ZEB-806: the returned set may include THIS node's OWN advertisement —
+    /// deliberately unfiltered, because the two existing callers need self
+    /// present for different things: the deposit client orders self LAST and
+    /// falls back to a local self-hold write (ZEB-524), and the pull driver
+    /// drains self through the local acceptor pipeline instead of dialing
+    /// (iroh rejects self-connections). A new caller must decide what "self"
+    /// means for it — never dial an entry whose
+    /// `relay_device_ed25519_verify` equals this device's verify key.
     pub fn relays_for_community(
         &self,
         community_id: &SpaceId,

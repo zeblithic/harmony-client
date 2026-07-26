@@ -10341,7 +10341,11 @@ pub async fn start_node_inner(
                         if link_mgr
                             .install_community_relay_pull_acceptor(std::sync::Arc::new(
                                 crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor::new(
-                                    relay_pull_ctx,
+                                    // ZEB-806: the pull driver below shares this
+                                    // SAME ctx (same hold + opt-in state) for its
+                                    // local self-drain path, so clone rather than
+                                    // move — mirroring the deposit ctx above.
+                                    std::sync::Arc::clone(&relay_pull_ctx),
                                 )
                                 .with_telemetry(std::sync::Arc::clone(
                                     &relay_serving_telemetry,
@@ -10518,7 +10522,16 @@ pub async fn start_node_inner(
                                             relay_ingest_ctx,
                                             joined_communities,
                                         )
-                                        .with_telemetry(relay_pull_telemetry),
+                                        .with_telemetry(relay_pull_telemetry)
+                                        // ZEB-806: same ctx the pull acceptor
+                                        // serves remote requesters with, so the
+                                        // driver drains this node's OWN hold
+                                        // in-process when its own ad resolves
+                                        // (a self-dial is impossible — iroh
+                                        // rejects it).
+                                        .with_local_pull_ctx(std::sync::Arc::clone(
+                                            &relay_pull_ctx,
+                                        )),
                                     );
                                     community_relay_pull_driver_handle_opt =
                                         Some(pull_driver.spawn());

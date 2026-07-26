@@ -39,12 +39,15 @@ use tokio::sync::Notify;
 use crate::butler_deposit::{read_length_prefixed_with_max, write_length_prefixed};
 use crate::community_relay::{
     decode_relay_pull_response, encode_relay_pull_ack_frame, encode_relay_pull_query,
-    relay_pull_ack_sig_payload, relay_pull_sig_payload, RelayPullAckFrame, RelayPullQuery,
-    RELAY_PULL_MAX_FRAME_BYTES,
+    relay_pull_ack_sig_payload, relay_pull_sig_payload, RelayPullAck, RelayPullAckFrame,
+    RelayPullQuery, RELAY_PULL_MAX_FRAME_BYTES,
 };
 use crate::community_relay_announce::CommunityRelayEntry;
 use crate::community_relay_pull::{open_and_ingest, RelayIngestCtx};
 use crate::community_relay_resolver::CommunityRelayResolver;
+use crate::iroh_community_relay_acceptor::{
+    handle_relay_pull_ack, handle_relay_pull_query, RelayPullCtx,
+};
 use crate::iroh_endpoint::IrohEndpoint;
 use crate::owner_state_types::SpaceId;
 
@@ -212,6 +215,16 @@ pub struct CommunityRelayPullDriver {
     /// `network_health_snapshot`. `None` when nothing installed a source (unit
     /// tests, pre-boot); recording is then a no-op.
     telemetry: Option<Arc<crate::network_health::CommunityRelayPullTelemetry>>,
+    /// ZEB-806: THIS node's own relay-hold pipeline — the SAME ctx the pull
+    /// acceptor serves remote requesters with, shared by boot wiring when the
+    /// node runs the community-relay acceptors. A relay volunteer's own
+    /// advertisement resolves fresh in its own resolver, and iroh refuses
+    /// self-connections, so a dial can never drain the node's OWN hold; with
+    /// this ctx wired, `run_one_pass` drains it in-process instead. Without
+    /// the drain, deposits senders leave in the volunteer's hold FOR the
+    /// volunteer sit until TTL and are lost. Mirrors the deposit side's
+    /// ZEB-524 `local_relay_ctx`.
+    local_pull_ctx: Option<Arc<dyn RelayPullCtx>>,
 }
 
 impl CommunityRelayPullDriver {
@@ -236,7 +249,17 @@ impl CommunityRelayPullDriver {
             wake: Arc::new(Notify::new()),
             interval: Duration::from_millis(COMMUNITY_RELAY_PULL_INTERVAL_MS),
             telemetry: None,
+            local_pull_ctx: None,
         }
+    }
+
+    /// ZEB-806: install the local self-hold pull ctx (builder-style, mirroring
+    /// [`Self::with_telemetry`]). Boot wiring passes the SAME `Arc` the pull
+    /// acceptor drives for remote requesters, so the local drain and the
+    /// remote serve path see one hold + one opt-in state.
+    pub fn with_local_pull_ctx(mut self, ctx: Arc<dyn RelayPullCtx>) -> Self {
+        self.local_pull_ctx = Some(ctx);
+        self
     }
 
     /// ZEB-803: install the pull health telemetry sink. Builder-style so boot
@@ -268,6 +291,12 @@ impl CommunityRelayPullDriver {
         if let Some(t) = self.telemetry.as_ref() {
             t.record_pass_start();
         }
+        // ZEB-806: this device's ed25519 verify key, for recognizing our OWN
+        // advertisement among the resolved relays. Same identity + same id
+        // space as the deposit client's ZEB-524 self check (`relay_device_id`
+        // would be WRONG here — it is a 16-byte device-address id, not this
+        // 32-byte signing identity; see the ticket for the near-miss).
+        let self_relay_vk = self.device_signing_key.verifying_key().to_bytes();
         let communities = (self.joined_communities)();
         for community in communities {
             let relays = self.resolver.relays_for_community(&community, now_ms);
@@ -290,11 +319,29 @@ impl CommunityRelayPullDriver {
             for relay in &relays {
                 let query = self.build_query(&community);
                 let ack_builder = self.make_ack_builder(community);
-                match self
-                    .transport
-                    .pull_session(relay, &query, self.ingest.as_ref(), &ack_builder)
-                    .await
-                {
+                // ZEB-806: our own advertisement can never be dialed (iroh
+                // rejects self-connections — before this branch every such
+                // attempt failed at connect, once per cadence, forever, and
+                // permanently inflated `sessionsFailed` on healthy volunteer
+                // nodes). Drain the local hold through the acceptor's own
+                // pipeline instead; with no ctx wired, record the failure
+                // rather than burn a doomed dial.
+                let is_self = relay.relay_device_ed25519_verify == self_relay_vk;
+                let outcome = if is_self {
+                    match self.local_pull_ctx.as_deref() {
+                        Some(ctx) => self.local_pull_session(ctx, &query, &ack_builder).await,
+                        None => Err(
+                            "ZEB-806: own relay ad resolved but no local pull ctx wired; \
+                             skipping the impossible self-dial"
+                                .to_string(),
+                        ),
+                    }
+                } else {
+                    self.transport
+                        .pull_session(relay, &query, self.ingest.as_ref(), &ack_builder)
+                        .await
+                };
+                match outcome {
                     Ok(n) => {
                         // ZEB-803 silent path 2: `n == 0` is a healthy answer
                         // (the relay held nothing for us) and previously logged
@@ -313,6 +360,7 @@ impl CommunityRelayPullDriver {
                                 community = ?community,
                                 relay_device = %hex::encode(relay.relay_device_id),
                                 ingested = n,
+                                is_self,
                                 "ZEB-458 pull: ingested blobs from relay"
                             );
                         }
@@ -330,12 +378,54 @@ impl CommunityRelayPullDriver {
                             community = ?community,
                             relay_device = %hex::encode(relay.relay_device_id),
                             error = %e,
+                            is_self,
                             "ZEB-458 pull: pull session failed; skipping relay"
                         );
                     }
                 }
             }
         }
+    }
+
+    /// ZEB-806: one pull "session" against THIS node's own relay hold, run
+    /// fully in-process. Drives the SAME acceptor pipeline a remote requester
+    /// gets — [`handle_relay_pull_query`] (community gate, cert, membership,
+    /// and signature checks included) → [`open_and_ingest`] →
+    /// [`handle_relay_pull_ack`] — so the local short-circuit is not an auth
+    /// bypass, only a skipped dial. The ack frame is built AFTER
+    /// `open_and_ingest` returns, so the client-honesty contract (ack only
+    /// durably-ingested content ids) is preserved verbatim; the frame→handler
+    /// argument mapping mirrors the iroh pull shell's ack read in
+    /// `iroh_community_relay_acceptor`.
+    async fn local_pull_session(
+        &self,
+        ctx: &dyn RelayPullCtx,
+        query: &RelayPullQuery,
+        ack_builder: &(dyn for<'a> Fn(&'a [[u8; 32]]) -> RelayPullAckFrame + Send + Sync),
+    ) -> Result<usize, String> {
+        let resp = handle_relay_pull_query(query, ctx)
+            .await
+            .map_err(|e| format!("local pull query: {e}"))?;
+        let ids = open_and_ingest(&resp.entries, self.ingest.as_ref()).await;
+        let ingested_count = ids.len();
+        if !ids.is_empty() {
+            let frame = ack_builder(&ids);
+            let ack = RelayPullAck {
+                content_ids: frame.content_ids.clone(),
+            };
+            handle_relay_pull_ack(
+                &frame.recipient_owner,
+                &frame.community_id,
+                &ack,
+                &frame.requester_enrollment_cert,
+                &frame.signer_certs_cbor,
+                &frame.sig,
+                ctx,
+            )
+            .await
+            .map_err(|e| format!("local pull ack: {e}"))?;
+        }
+        Ok(ingested_count)
     }
 
     /// Build a signed pull query for `community`. The signature binds
@@ -890,5 +980,297 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("wait_until: condition not met within the cap");
+    }
+
+    // ── ZEB-806: a relay volunteer's own ad is drained locally, never dialed ──
+
+    use harmony_content::cid::{ContentFlags, ContentId};
+
+    use crate::community_membership::mint_test_owner;
+    use crate::community_relay::{build_relay_deposit_frame, RelayHeldBlob};
+    use crate::community_relay_announce::CommunityRelayEntry as Entry;
+    use crate::community_relay_hold_crdt::RelayHoldDoc;
+    use crate::dm_signing::ed25519_priv_to_x25519;
+    use crate::iroh_community_relay_acceptor::RelayPullCtx;
+
+    /// Mock [`RelayPullCtx`]: a fixed held set + a record of `mark_pulled`
+    /// calls. `now_secs` is pinned inside `mint_test_owner`'s cert validity
+    /// window (same value as the ZEB-524 deposit-side mock) so the FULL
+    /// acceptor pipeline — cert and signature verification included — admits
+    /// the driver's self-query.
+    struct MockLocalPullCtx {
+        held: StdMutex<Vec<(String, RelayHeldBlob)>>,
+        marked: StdMutex<Vec<(Vec<String>, String)>>,
+    }
+
+    impl MockLocalPullCtx {
+        fn new(held: Vec<(String, RelayHeldBlob)>) -> Self {
+            Self {
+                held: StdMutex::new(held),
+                marked: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn marked(&self) -> Vec<(Vec<String>, String)> {
+            self.marked.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl RelayPullCtx for MockLocalPullCtx {
+        async fn serves_community(&self, _c: &SpaceId) -> bool {
+            true
+        }
+        async fn is_joined_member(&self, _c: &SpaceId, _o: &[u8; 16]) -> bool {
+            true
+        }
+        fn now_secs(&self) -> u64 {
+            1_700_000_100
+        }
+        async fn held_for(
+            &self,
+            _recipient_owner: &[u8; 16],
+            _requester_device: &str,
+        ) -> Vec<(String, RelayHeldBlob)> {
+            self.held.lock().unwrap().clone()
+        }
+        async fn mark_pulled(&self, keys: &[String], device: String) -> Result<(), String> {
+            self.marked.lock().unwrap().push((keys.to_vec(), device));
+            Ok(())
+        }
+    }
+
+    /// [`RelayIngestCtx`] with real device privs + an ingest record, so the
+    /// local drain can actually OPEN a blob sealed to the driver's device.
+    struct RecordingIngest {
+        privs: Vec<Zeroizing<[u8; 32]>>,
+        ingested: StdMutex<Vec<[u8; 16]>>,
+    }
+
+    #[async_trait]
+    impl RelayIngestCtx for RecordingIngest {
+        fn device_x25519_privs(&self) -> Vec<Zeroizing<[u8; 32]>> {
+            self.privs.clone()
+        }
+        async fn ingest_recovered(
+            &self,
+            sender_owner: [u8; 16],
+            _payload: DepositPayload,
+        ) -> Result<(), String> {
+            self.ingested.lock().unwrap().push(sender_owner);
+            Ok(())
+        }
+    }
+
+    /// Driver whose identity is a REAL minted owner (valid Master cert +
+    /// enrolled device key — required because the local drain runs the full
+    /// acceptor auth pipeline), with its OWN ad seeded in the resolver.
+    /// Returns everything the assertions need.
+    #[allow(clippy::type_complexity)]
+    fn self_relay_driver(
+        me: &crate::community_membership::TestOwner,
+        community: SpaceId,
+        now: u64,
+        held: Vec<(String, RelayHeldBlob)>,
+        wire_local_ctx: bool,
+    ) -> (
+        CommunityRelayPullDriver,
+        Arc<MockTransport>,
+        Arc<MockLocalPullCtx>,
+        Arc<RecordingIngest>,
+        Arc<crate::network_health::CommunityRelayPullTelemetry>,
+        Arc<CommunityRelayResolver>,
+    ) {
+        let my_vk = me.cert.device_pubkeys.classical.ed25519_verify;
+        let resolver = Arc::new(CommunityRelayResolver::new());
+        resolver.update(
+            community,
+            OwnerAddr(me.owner.0),
+            CommunityRelayAnnouncePayload {
+                relay: Entry {
+                    relay_device_id: [0x66; 16],
+                    iroh_endpoint_id: [0x67; 32],
+                    relay_device_ed25519_verify: my_vk,
+                    home_relay: String::new(),
+                },
+                ad_at: now,
+                identity_signature: [0; 64],
+            },
+            hlc(now),
+        );
+        let transport = Arc::new(MockTransport::new(0));
+        let local = Arc::new(MockLocalPullCtx::new(held));
+        let ingest = Arc::new(RecordingIngest {
+            privs: vec![ed25519_priv_to_x25519(&me.device_key)],
+            ingested: StdMutex::new(Vec::new()),
+        });
+        let telemetry = Arc::new(crate::network_health::CommunityRelayPullTelemetry::new());
+        let joined: JoinedCommunitiesFn = Arc::new(move || vec![community]);
+        let mut driver = CommunityRelayPullDriver::new(
+            me.owner.0,
+            harmony_owner::cbor::to_canonical(&me.cert).expect("encode cert"),
+            Arc::new(me.device_key.clone()),
+            Arc::clone(&resolver),
+            transport.clone() as Arc<dyn RelayPullTransport>,
+            ingest.clone() as Arc<dyn RelayIngestCtx>,
+            joined,
+        )
+        .with_telemetry(Arc::clone(&telemetry));
+        if wire_local_ctx {
+            driver = driver.with_local_pull_ctx(local.clone() as Arc<dyn RelayPullCtx>);
+        }
+        (driver, transport, local, ingest, telemetry, resolver)
+    }
+
+    #[tokio::test]
+    async fn own_relay_ad_drains_local_hold_without_dialing() {
+        // THE ZEB-806 regression test: a blob a sender deposited into OUR hold
+        // FOR US is opened, ingested, and acked under our own device id — with
+        // zero dials. Before the fix this entry sat until TTL (the self-dial
+        // died at connect every cadence) and the deposit was lost.
+        let me = mint_test_owner(0x21);
+        let my_vk = me.cert.device_pubkeys.classical.ed25519_verify;
+        let community = SpaceId([0xC5; 16]);
+        let now = 1_700_000_100_000u64;
+
+        let sender = mint_test_owner(0x5A);
+        let payload = DepositPayload {
+            cidnotify_packet: Some(vec![0xAA; 4]),
+            storage_blob: vec![0xAB; 5],
+            invite_packet: None,
+            revocation_push: None,
+            grant_push: None,
+            grant_revoke: None,
+        };
+        let frame = build_relay_deposit_frame(
+            me.owner.0,
+            &my_vk,
+            sender.owner.0,
+            community,
+            vec![0xDE],
+            &sender.device_key,
+            &payload,
+        )
+        .expect("build deposit frame");
+        let blob = RelayHeldBlob {
+            sender_owner: sender.owner.0,
+            sealed_blob: frame.sealed_blob,
+        };
+        let cid = ContentId::for_book(
+            &blob.sealed_blob,
+            ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("for_book")
+        .to_bytes();
+        let held = vec![("hold-key-0".to_string(), blob)];
+
+        let (driver, transport, local, ingest, telemetry, _resolver) =
+            self_relay_driver(&me, community, now, held, true);
+
+        driver.run_one_pass(now).await;
+
+        assert!(
+            transport.calls().is_empty(),
+            "our own ad must NEVER produce a dial — iroh rejects self-connections"
+        );
+        assert_eq!(
+            ingest.ingested.lock().unwrap().clone(),
+            vec![sender.owner.0],
+            "the self-held blob must reach ingest_recovered with the relay-authenticated sender"
+        );
+        let marked = local.marked();
+        assert_eq!(marked.len(), 1, "the drained blob must be acked");
+        assert_eq!(
+            marked[0].0,
+            vec![RelayHoldDoc::key(&me.owner.0, &cid)],
+            "ack must translate the content id to OUR hold key"
+        );
+        assert_eq!(
+            marked[0].1,
+            hex::encode(my_vk),
+            "the ack must be recorded under OUR device id, draining OUR backlog"
+        );
+        let s = telemetry.summary();
+        assert_eq!(
+            s.sessions_ok, 1,
+            "the local drain is a real, successful session"
+        );
+        assert_eq!(
+            s.sessions_failed, 0,
+            "ZEB-803 telemetry: no permanent failure floor on a healthy volunteer"
+        );
+        assert_eq!(s.blobs_ingested, 1);
+    }
+
+    #[tokio::test]
+    async fn own_relay_ad_without_local_ctx_is_recorded_failed_not_dialed() {
+        // Degraded wiring (no local ctx): the impossible dial is still never
+        // attempted, and the condition stays VISIBLE as a failed session
+        // rather than silently skipped — mirroring ZEB-524's None arm.
+        let me = mint_test_owner(0x22);
+        let community = SpaceId([0xC6; 16]);
+        let now = 1_700_000_100_000u64;
+
+        let (driver, transport, local, _ingest, telemetry, _resolver) =
+            self_relay_driver(&me, community, now, Vec::new(), false);
+
+        driver.run_one_pass(now).await;
+
+        assert!(
+            transport.calls().is_empty(),
+            "still no dial without the ctx"
+        );
+        assert!(local.marked().is_empty());
+        let s = telemetry.summary();
+        assert_eq!(s.sessions_failed, 1, "unwired self-drain must stay visible");
+        assert_eq!(s.sessions_ok, 0);
+    }
+
+    #[tokio::test]
+    async fn distinct_relay_is_still_dialed_with_local_ctx_wired() {
+        // The local drain must not swallow REMOTE relays: an ad from a
+        // different device keeps going through the network transport, and the
+        // local hold is left alone.
+        let me = mint_test_owner(0x23);
+        let community = SpaceId([0xC7; 16]);
+        let now = 1_700_000_100_000u64;
+
+        let (driver, transport, local, _ingest, telemetry, resolver) =
+            self_relay_driver(&me, community, now, Vec::new(), true);
+        // Overwrite the resolver ad with a DIFFERENT device's (fresher stamp).
+        resolver.update(
+            community,
+            OwnerAddr(me.owner.0),
+            CommunityRelayAnnouncePayload {
+                relay: Entry {
+                    relay_device_id: [0x77; 16],
+                    iroh_endpoint_id: [0x78; 32],
+                    relay_device_ed25519_verify: [0x79; 32],
+                    home_relay: String::new(),
+                },
+                ad_at: now + 1,
+                identity_signature: [0; 64],
+            },
+            hlc(now + 1),
+        );
+
+        driver.run_one_pass(now + 1).await;
+
+        assert_eq!(
+            transport.calls().len(),
+            1,
+            "a distinct relay must still be dialed through the transport"
+        );
+        assert_eq!(transport.calls()[0].0, [0x77; 16]);
+        assert!(
+            local.marked().is_empty(),
+            "the local hold must not be touched for a remote relay"
+        );
+        let s = telemetry.summary();
+        assert_eq!(s.sessions_ok, 1);
+        assert_eq!(s.sessions_failed, 0);
     }
 }
