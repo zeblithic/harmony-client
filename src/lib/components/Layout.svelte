@@ -244,7 +244,22 @@
 <style>
   .layout {
     display: grid;
-    grid-template-columns: var(--nav-width) 1fr 1fr;
+    /* ZEB-772: floor the text column. This base 3-column form is the variant
+       that applies while Settings is open (`.msg-media-open`/`.msg-media-closed`
+       override it otherwise), and a bare `1fr` let Settings starve the content
+       column — measured 990px -> 504px here, and 694px -> 232px on a narrower
+       nav, clipping the charter's "Propose amendment" to a 4px sliver.
+
+       A `1fr` track is `minmax(auto, 1fr)` and would normally refuse to shrink
+       below its content's min-content size; `.text-area`'s `overflow-y: auto`
+       silently opts it out, because an element with non-visible overflow has an
+       automatic minimum size of zero. So the floor has to be stated explicitly.
+
+       360px only binds between 769px and ~960px of viewport (below 769px the
+       `.collapsed` rule drops to two columns), so wide windows are unaffected
+       and the narrow band trades a little Settings width for a readable
+       document column. */
+    grid-template-columns: var(--nav-width) minmax(360px, 1fr) 1fr;
     grid-template-areas: "nav text media";
     /* ZEB-406: fill the .app-shell column (banner reserves its own height above)
        instead of pinning to 100vh, which used to force the layout under a

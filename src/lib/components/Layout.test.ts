@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { render, fireEvent } from '@testing-library/svelte';
 import { createRawSnippet, tick } from 'svelte';
 import Layout from './Layout.svelte';
+import { isSettingsVisible } from '../settings-visibility';
+import type { AppMode } from '../types';
 
 // Minimal single-root snippets so we can drive Layout's slots from a test.
 const slot = (id: string, label: string) =>
@@ -130,4 +132,88 @@ describe('Layout media panel — ZEB-405 (WS-C)', () => {
     expect(queryByLabelText('Hide media panel')).not.toBeInTheDocument();
     expect(queryByTestId('media')).not.toBeInTheDocument();
   });
+});
+
+/**
+ * ZEB-767. `showSettings: true` is NOT sufficient for Settings to be on screen —
+ * Layout also requires messages mode. The left-rail gear is rendered in every
+ * mode and used to toggle `showSettings` blindly, so in the 5 non-messages modes
+ * it flipped to `aria-pressed="true"` while nothing opened: a dead control that
+ * announced success to a screen reader.
+ *
+ * App.svelte now routes to messages mode before opening (and derives the gear's
+ * pressed state from `showSettings && appMode === 'messages'`). That fix is only
+ * necessary while the asymmetry below holds, so pin it: if Settings ever renders
+ * outside messages mode, these fail and the routing can be reconsidered.
+ */
+describe('Layout settings gating — ZEB-767', () => {
+  const settingsIn = (mode: string, collapsed = false) =>
+    render(Layout, {
+      props: {
+        ...baseSnippets,
+        settingsPanel: slot('settings', 'settings here'),
+        mintLedger: slot('mint', 'mint ledger'),
+        vineFeed: slot('vine', 'vines'),
+        mode,
+        collapsed,
+        showSettings: true,
+      },
+    });
+
+  it('renders Settings in messages mode when showSettings is set', () => {
+    expect(settingsIn('messages').getByTestId('settings')).toBeInTheDocument();
+  });
+
+  it.each(['mint', 'vines'])(
+    'ignores showSettings in %s mode — the state is set but nothing renders',
+    (mode) => {
+      expect(settingsIn(mode).queryByTestId('settings')).not.toBeInTheDocument();
+    },
+  );
+
+  it('ignores showSettings on a collapsed layout even in messages mode', () => {
+    expect(settingsIn('messages', true).queryByTestId('settings')).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * ZEB-767 — the cross-check that `aria-pressed` cannot lie.
+ *
+ * The gear binds its active / `aria-pressed` state to `isSettingsVisible`, so
+ * that predicate must agree with whether Layout actually renders the panel, for
+ * every input combination.
+ *
+ * The oracle here is the **rendered DOM**, deliberately. An earlier version of
+ * this guard lived beside the predicate and compared it against a hand-written
+ * restatement of the same rule — which meant it agreed with the predicate's
+ * blind spot (`collapsed`) instead of catching it, and passed while the gear
+ * still reported a panel that was not on screen below the responsive
+ * breakpoint. A guard that re-derives what it is checking tests the author's
+ * model, not the behaviour.
+ */
+describe('isSettingsVisible agrees with what Layout renders — ZEB-767', () => {
+  const MODES = ['messages', 'files', 'vines', 'mint', 'mail', 'network', 'spellbook'] as const;
+
+  for (const mode of MODES) {
+    for (const showSettings of [false, true]) {
+      for (const collapsed of [false, true]) {
+        it(`mode=${mode} showSettings=${showSettings} collapsed=${collapsed}`, () => {
+          const { queryByTestId } = render(Layout, {
+            props: {
+              ...baseSnippets,
+              settingsPanel: slot('settings', 'settings here'),
+              mintLedger: slot('mint', 'mint ledger'),
+              vineFeed: slot('vine', 'vines'),
+              mode,
+              collapsed,
+              showSettings,
+            },
+          });
+          const rendered = queryByTestId('settings') !== null;
+          const pressed = isSettingsVisible(showSettings, mode as AppMode, collapsed);
+          expect(pressed).toBe(rendered);
+        });
+      }
+    }
+  }
 });

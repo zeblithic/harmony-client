@@ -178,10 +178,35 @@
   .more-container {
     position: relative;
   }
+  /* ZEB-769: the expanded-rail variant received no visual treatment and fell
+     back to the user-agent default (13.33px / 0 padding / 2px outset black
+     border), beside siblings styled at 10.5px / 4px 6px / no border.
+
+     The button DOES carry NavPanel's `.nav-action-btn` class — the class is
+     passed down and applied. What fails is the selector: Svelte scopes
+     `.nav-action-btn` to NavPanel's component hash, and this element carries
+     MoreMenu's, so the rule never matches. Adding the class again would be a
+     no-op; the declarations have to live here, where the scope matches.
+
+     Values mirror `.nav-action-btn` (NavPanel.svelte) deliberately. The
+     compact sibling `.more-icon-button` below was always styled — only the
+     expanded variant was missed. */
   .more-button {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    width: 100%;
+    padding: 6px 10px;
+    border: none;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .more-button:hover {
+    background: var(--accent);
+    color: var(--on-accent);
   }
   .more-icon-button {
     width: 40px;
