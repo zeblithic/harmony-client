@@ -117,23 +117,23 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # (butler deposits, targeted invites); identity_hash() excludes encryption keys,
 # so no owner/device ids change. Cross-repo agreement is pinned by tests in
 # dm_signing.rs (ZEB-372).
-harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7" }
-harmony-identity = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7" }
-harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7" }
-harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7" }
-harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7" }
-harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7" }
-harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7", features = ["recovery"] }
+harmony-runtime = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
+harmony-identity = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
+harmony-content = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
+harmony-compute = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
+harmony-telemetry = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
+harmony-mailbox = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
+harmony-owner = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7", features = ["recovery"] }
 # ZEB-716: direct dep for `hash::truncated_hash` — the primitive behind
 # harmony-identity's device address_hash — so the community-invite wire
 # commitment delegates to it instead of open-coding SHA256[..16]. Already in
 # the lock transitively; the ml-dsa/ml-kem pins below exist for its benefit.
-harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7", features = ["password-envelope"] }
+harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7", features = ["password-envelope"] }
 # ZEB-737 (ZEB-571 item 3): harmony-crdt-sync is the reusable backfill/backoff
 # latch primitive that `channel_backfill.rs` now delegates to (the drivers +
 # the `Hlc` watermark binding stay client-side). Pinned to the same
 # workspace-wide rev as the lockstep crates above; pkarr keeps its own pin.
-harmony-crdt-sync = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7" }
+harmony-crdt-sync = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
 # ZEB-323 Phase 2b: pkarr-based discovery policies. Deliberately held at its
 # OWN rev (currently 80f6d80) — a SEPARATE pin from the workspace-wide rev of
 # the crates above, NOT kept in lockstep with it. Bumped independently only
@@ -147,7 +147,7 @@ harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "80f6d
 # that Move 1 rewires the dormant DM unicast fan-out onto. Pinned to the same
 # workspace-wide rev as the crates above. Imported here in Task 1 so later
 # tasks can wire it; this task only bumps the pin + clears dead Reticulum refs.
-harmony-tunnel = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7" }
+harmony-tunnel = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
 # ZEB-739 (ZEB-571 item 4, slice 1): the iroh library tier. harmony-iroh is the
 # reusable iroh Endpoint wrapper (relay/rebind lifecycle) + ALPN-keyed dispatch
 # seam; harmony-tunnel-iroh is the per-peer PQ TunnelManager + initiator/responder
@@ -155,9 +155,9 @@ harmony-tunnel = { git = "https://github.com/zeblithic/harmony.git", rev = "3e29
 # to these (the app keeps the ALPN consts, key provisioning, DeviceTunnelContact→
 # TunnelPeer mapping, the CompatSink impl, and the zenoh bridge). Same lockstep
 # rev as the crates above; both are the I/O-bearing (std) form.
-harmony-iroh = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7" }
-harmony-tunnel-iroh = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7" }
-harmony-reachability = { git = "https://github.com/zeblithic/harmony.git", rev = "3e295eebfbc77565c044629a2f921dba72c0f3e7" }
+harmony-iroh = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
+harmony-tunnel-iroh = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
+harmony-reachability = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
 # ZEB-380: relay-URL validation (scheme + host checks) in connectivity_settings.rs.
 # Already in the lock transitively (reqwest/iroh); a direct entry just makes it importable.
 url = "2"
