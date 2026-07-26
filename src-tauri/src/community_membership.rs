@@ -5485,6 +5485,27 @@ pub const MATERIALIZE_PENDING_EXPIRY_MS: u64 = 30 * 86_400_000;
 /// kept as a separate const for clarity at the call site.
 pub const ADMIN_PROPOSAL_EXPIRY_MS: u64 = 30 * 86_400_000;
 
+/// ZEB-792: how far into the FUTURE a peer-minted proposal wall may sit and
+/// still count as live. ±30 minutes, matching
+/// [`REACHABILITY_TIMESTAMP_SKEW_MAX_MS`] and
+/// `friend_intro::INTRODUCTION_MAX_FORWARD_SKEW_MS` — enough for ordinary
+/// device drift, far short of a usable expiry bypass.
+///
+/// Why a bound is needed at all: expiry is measured as
+/// `now_ms.saturating_sub(e.at.wall_ms)`, and `e.at.wall_ms` is minted by the
+/// *proposing peer* — the party the window exists to constrain. Any future
+/// stamp saturates the subtraction to `0`, and `0 <= EXPIRY` always holds, so
+/// without a forward bound a peer picks its own expiry by picking its own
+/// clock. The codebase already bounds every other peer-supplied stamp in both
+/// directions (`community_relay_announce::fresh_relay_entry`,
+/// `friend_intro`); this constant closes the one gap.
+///
+/// Safe because the `now_ms` side is NOT peer-influenced: callers pass this
+/// device's own minted HLC wall, and `reserve_next_hlc_for_device` derives it
+/// from this device's previous stamp alone (ZEB-790). Should that ever change
+/// to merge remote walls, this bound must gain a clamp or it weakens.
+pub const ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS: u64 = 30 * 60 * 1000;
+
 /// ZEB-321 RCH4: maximum allowed skew (ms) between a
 /// ReachabilityAnnounce payload's `announced_at_ms` and the event's
 /// HLC `wall_ms`. ±30 minutes — generous enough to tolerate normal
@@ -5893,7 +5914,17 @@ pub(crate) fn plan_admin_proposal_auto_exec<'a>(
             ),
             _ => false,
         })
-        .filter(|e| now_ms.saturating_sub(e.at.wall_ms) <= ADMIN_PROPOSAL_EXPIRY_MS)
+        // ZEB-792: bound the peer-minted wall in BOTH directions. The backward
+        // bound is the 30-day expiry; the forward bound exists because
+        // `saturating_sub` collapses every future stamp to age 0, which reads
+        // as permanently live. This is not merely "a stale proposal lingers":
+        // `MintProposal` below is reachable only when this filter yields
+        // nothing, so one future-stamped event both keeps itself countersignable
+        // and suppresses every legitimate replacement for this (target, level).
+        .filter(|e| {
+            now_ms.saturating_sub(e.at.wall_ms) <= ADMIN_PROPOSAL_EXPIRY_MS
+                && e.at.wall_ms.saturating_sub(now_ms) <= ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS
+        })
         .min_by_key(|e| e.id);
 
     let Some(canonical) = canonical else {
@@ -7097,6 +7128,81 @@ mod plan_admin_proposal_tests {
             plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, 1_500),
             AdminProposalPlan::MintProposal
         ));
+    }
+
+    // (i) ZEB-792: a proposal stamped far in the FUTURE is not live.
+    //
+    // The peer mints `e.at.wall_ms`, so before the forward bound the peer chose
+    // its own expiry: `now.saturating_sub(future)` is 0, and `0 <= EXPIRY`
+    // always holds. Asserting `MintProposal` pins BOTH halves of the defect —
+    // the stale proposal is no longer countersignable, and (because
+    // `MintProposal` is reachable only when the live set is empty) a legitimate
+    // proposal can be raised again.
+    #[test]
+    fn plan_mint_when_only_candidate_is_stamped_in_the_future() {
+        let target = OwnerAddr([1; 16]);
+        let proposer = OwnerAddr([3; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        let now = 1_000_000_u64;
+        // A year ahead — the magnitude is the peer's to choose, which is the point.
+        let far_future = now + 365 * 24 * 3_600 * 1_000;
+        events.insert(pid, mk_proposal(pid, proposer, target, 100, far_future));
+        assert!(
+            matches!(
+                plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, now),
+                AdminProposalPlan::MintProposal
+            ),
+            "a future-stamped proposal must not occupy the canonical slot"
+        );
+    }
+
+    // (j) ZEB-792 boundary: ordinary device drift is still tolerated. A wall
+    // exactly `ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS` ahead is live (`<=`), so a
+    // peer whose clock runs a few minutes fast is countersigned as before.
+    // Without this, the fix would trade a security hole for an availability one.
+    #[test]
+    fn plan_countersign_tolerates_benign_forward_skew() {
+        let target = OwnerAddr([1; 16]);
+        let proposer = OwnerAddr([3; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        let now = 1_000_000_u64;
+        let just_inside = now + ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS;
+        events.insert(pid, mk_proposal(pid, proposer, target, 100, just_inside));
+        assert!(
+            matches!(
+                plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, now),
+                AdminProposalPlan::Countersign(id) if id == pid
+            ),
+            "a proposal exactly at the forward-skew bound must stay countersignable"
+        );
+    }
+
+    // (k) ZEB-792 boundary, other side: one millisecond past the bound is not
+    // live. Paired with (j) this pins the comparison as `<=` rather than `<`.
+    #[test]
+    fn plan_mint_when_candidate_exceeds_forward_skew_bound() {
+        let target = OwnerAddr([1; 16]);
+        let proposer = OwnerAddr([3; 16]);
+        let me = OwnerAddr([2; 16]);
+        let pid: EventId = [9u8; 16];
+        let mat = MaterializedMembership::default();
+        let mut events = BTreeMap::new();
+        let now = 1_000_000_u64;
+        let just_outside = now + ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS + 1;
+        events.insert(pid, mk_proposal(pid, proposer, target, 100, just_outside));
+        assert!(
+            matches!(
+                plan_admin_proposal_auto_exec(&mat, events.values(), target, 100, me, now),
+                AdminProposalPlan::MintProposal
+            ),
+            "one ms past the forward-skew bound must not be live"
+        );
     }
 }
 
