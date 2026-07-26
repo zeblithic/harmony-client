@@ -1039,11 +1039,12 @@ async fn s5b_clean_relaunch_card_propagation_control() {
 // remaining question: does the ZEB-373 dial establish a working Zenoh peer link
 // between two CLEAN full nodes when multicast is OFF?
 //
-// Setup: mint both, kill + re-spawn already-minted (single clean session each),
-// with HARMONY_ZENOH_DISABLE_MULTICAST=1 in the env so neither can peer via
-// multicast. Then join a community (clean nodes) — the membership reachability
-// exchange fires the dial, now the ONLY path to a Zenoh peer mesh. Publish /
-// subscribe owner cards and measure convergence.
+// Setup: mint both, kill + re-spawn already-minted (single clean session each).
+// LAN scouting is off by default (ZEB-809) and the harness strips the opt-in
+// var from spawned nodes' env, so neither can peer via multicast. Then join a
+// community (clean nodes) — the membership reachability exchange fires the
+// dial, now the ONLY path to a Zenoh peer mesh. Publish / subscribe owner
+// cards and require convergence.
 //
 // ZEB-809: this probe used to SKIP unless HARMONY_ZENOH_DISABLE_MULTICAST=1 was
 // set, because stock zenoh let the two nodes peer via multicast and
@@ -1058,12 +1059,16 @@ async fn s5b_clean_relaunch_card_propagation_control() {
 // a skip condition nobody can satisfy reads as "covered" while testing nothing.
 //
 // The old env var is gone; HARMONY_ZENOH_ENABLE_LAN_SCOUTING=1 now goes the
-// other way and would re-break this probe, which is exactly why it is not set
-// here.
+// other way and would re-break this probe — which is why `NodeHandle::spawn`
+// strips it from every spawned node's env (a runner's exported opt-in must not
+// silently hand co-located tests a peer path production doesn't have).
 //
-// EXPECTED: converged=TRUE → the clean dial works; the ZEB-468 fix is "just
-// restart-safety" and cross-WAN cards are viable. converged=FALSE → the dial is
-// independently broken and the fix must address it too.
+// HARD-ASSERTED since ZEB-809: with scouting off by default, the dial is the
+// ONLY peer path production has on the LAN — the same position it was always
+// in cross-WAN. A probe that merely logs its result would leave a broken dial
+// green on every sweep (this probe existed because the LAN used to mask
+// exactly that). converged=FALSE now fails the test: the dial is independently
+// broken and nothing else in the product can paper over it.
 // ─────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s5c_clean_dial_only_card_propagation_probe() {
@@ -1147,6 +1152,17 @@ async fn s5c_clean_dial_only_card_propagation_probe() {
     unsubscribe_member_card(&alice, a_sub).await.ok();
     unsubscribe_member_card(&bob, b_sub).await.ok();
 
+    // ZEB-809 / PR #558 review: hard-assert. With LAN scouting off by default
+    // the dial is the only peer path, so a non-converging dial is a product
+    // outage, not a data point. Assert AFTER the unsubscribes so a red probe
+    // still cleans up its subscriptions.
+    assert!(
+        converged,
+        "S5c: clean dial-only card propagation did not converge — with LAN scouting \
+         off by default (ZEB-809) the ZEB-373 iroh dial is the ONLY zenoh peer path, \
+         so this red means the dial itself is broken"
+    );
+
     run.mark_success();
     drop((alice, bob, ah, bh));
 }
@@ -1154,7 +1170,8 @@ async fn s5c_clean_dial_only_card_propagation_probe() {
 // ─────────────────────────────────────────────────────────────────────────────
 // S5d — ZEB-468 restart-safety REGRESSION (hard-asserted). Ildwyn, 2026-06-15.
 //
-// s5b/s5c CHARACTERIZE; this one GUARDS. It is the minimal repro of the ZEB-468
+// s5b CHARACTERIZES; s5c (hard-asserted since ZEB-809) and this one GUARD. It
+// is the minimal repro of the ZEB-468
 // bug: `two_minted_nodes` mints (= RESTARTS) both nodes, which is the exact
 // restart-poisoning. No community is needed — owner cards are global and s5b
 // proved a *clean* co-located mesh routes them with no community. The ONLY

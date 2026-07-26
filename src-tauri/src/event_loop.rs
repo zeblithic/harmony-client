@@ -1250,12 +1250,27 @@ pub async fn run(
     // stock zenoh discovery. Inverted deliberately — the old
     // HARMONY_ZENOH_DISABLE_MULTICAST made the safe configuration the one you
     // had to remember to ask for.
+    //
+    // The opt-in is strict: the value must be exactly "1" (after trimming
+    // whitespace). "true", "yes", "false", or a typo all read as UNSET — for a
+    // flag whose enable direction widens the attack surface, a mis-set value
+    // must fail toward the safe default, never toward open (PR #558 review).
     if std::env::var("HARMONY_ZENOH_ENABLE_LAN_SCOUTING")
-        .map(|v| !v.is_empty() && v != "0")
+        .map(|v| v.trim() == "1")
         .unwrap_or(false)
     {
+        // Set both knobs explicitly rather than riding zenoh's defaults: the
+        // opt-in contract is "scouting ON", and it should survive a future
+        // zenoh release flipping its default posture (PR #558 review).
+        for knob in ["scouting/multicast/enabled", "scouting/gossip/enabled"] {
+            if let Err(e) = config.insert_json5(knob, "true") {
+                let e = format!("zenoh config error (enable {knob}): {e}");
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        }
         tracing::warn!(
-            "HARMONY_ZENOH_ENABLE_LAN_SCOUTING set: zenoh multicast + gossip scouting ENABLED. \
+            "HARMONY_ZENOH_ENABLE_LAN_SCOUTING=1: zenoh multicast + gossip scouting ENABLED. \
              This session will peer with any zenoh node on the LAN, outside routing-record / \
              dial-policy control (ZEB-809)."
         );
