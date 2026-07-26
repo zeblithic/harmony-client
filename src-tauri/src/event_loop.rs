@@ -1742,6 +1742,7 @@ pub async fn run(
                                 // thread (see `reply_spill` module doc).
                                 let mut spill = crate::reply_spill::ReplySpill::new(
                                     subscriber_tx_rf.clone(),
+                                    ROOT_FETCH_SPILL_MAX,
                                 );
                                 let drained_clean: bool = loop {
                                     tokio::select! {
@@ -1767,10 +1768,15 @@ pub async fn run(
                                                 }
                                                 let bytes: Vec<u8> =
                                                     sample.payload().to_bytes().to_vec();
-                                                if !spill.accept(bytes) {
-                                                    return; // engine teardown
+                                                match spill.accept(bytes) {
+                                                    crate::reply_spill::AcceptOutcome::Accepted => {
+                                                        replies = replies.saturating_add(1);
+                                                    }
+                                                    crate::reply_spill::AcceptOutcome::DroppedFull => {}
+                                                    crate::reply_spill::AcceptOutcome::ConsumerGone => {
+                                                        return; // engine teardown
+                                                    }
                                                 }
-                                                replies = replies.saturating_add(1);
                                             }
                                         }
                                         _ = tokio::time::sleep(Duration::from_millis(500)) => {
@@ -1778,6 +1784,11 @@ pub async fn run(
                                         }
                                     }
                                 };
+                                if spill.dropped() > 0 {
+                                    tracing::warn!(key = %key_rf, dropped = spill.dropped(),
+                                        "owner-state root fetch: reply storm exceeded spill cap; \
+                                         overflow dropped (next reconcile re-fetches)");
+                                }
                                 // ZEB-812: post-drain delivery; report only
                                 // once the page has landed (or never, on
                                 // shutdown/teardown — matching the old
@@ -9475,8 +9486,10 @@ pub fn spawn_community_state_zenoh_adapter(
                         // park zenoh's net thread (see `reply_spill`
                         // module doc).
                         let mut replies: usize = 0;
-                        let mut spill =
-                            crate::reply_spill::ReplySpill::new(subscriber_tx_rf.clone());
+                        let mut spill = crate::reply_spill::ReplySpill::new(
+                            subscriber_tx_rf.clone(),
+                            ROOT_FETCH_SPILL_MAX,
+                        );
                         let drained_clean: bool = loop {
                             tokio::select! {
                                 biased;
@@ -9485,10 +9498,15 @@ pub fn spawn_community_state_zenoh_adapter(
                                     if let Ok(sample) = reply.into_result() {
                                         let bytes: Vec<u8> =
                                             sample.payload().to_bytes().to_vec();
-                                        if !spill.accept(bytes) {
-                                            return; // engine teardown
+                                        match spill.accept(bytes) {
+                                            crate::reply_spill::AcceptOutcome::Accepted => {
+                                                replies = replies.saturating_add(1);
+                                            }
+                                            crate::reply_spill::AcceptOutcome::DroppedFull => {}
+                                            crate::reply_spill::AcceptOutcome::ConsumerGone => {
+                                                return; // engine teardown
+                                            }
                                         }
-                                        replies = replies.saturating_add(1);
                                     }
                                 }
                                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
@@ -9496,6 +9514,11 @@ pub fn spawn_community_state_zenoh_adapter(
                                 }
                             }
                         };
+                        if spill.dropped() > 0 {
+                            tracing::warn!(key = %key_rf, dropped = spill.dropped(),
+                                "community state-root fetch: reply storm exceeded spill cap; \
+                                 overflow dropped (next reconcile re-fetches)");
+                        }
                         // ZEB-812: post-drain delivery; report only once
                         // the page has landed (or never, on shutdown/
                         // teardown — the old no-report semantics).
@@ -10630,11 +10653,14 @@ where
                         // node's ENTIRE zenoh transport wedges (ZEB-803).
                         // The parked await also starves the closing-poll
                         // arm below. Replies go through a local spill
-                        // (bounded by the page `limit`) with try_send
-                        // forwarding; the blocking delivery happens in
-                        // `flush()` after the stream closes.
-                        let mut spill =
-                            crate::reply_spill::ReplySpill::new(subscriber_tx_qr.clone());
+                        // (capped — one GET's volume is limit × responders,
+                        // and the responder count is unbounded) with
+                        // try_send forwarding; the blocking delivery
+                        // happens in `flush()` after the stream closes.
+                        let mut spill = crate::reply_spill::ReplySpill::new(
+                            subscriber_tx_qr.clone(),
+                            CHANNEL_BACKFILL_SPILL_MAX,
+                        );
                         let drained_clean: bool = loop {
                             tokio::select! {
                                 biased;
@@ -10642,16 +10668,28 @@ where
                                     let Ok(reply) = res else { break true; };
                                     if let Ok(sample) = reply.into_result() {
                                         let bytes: Vec<u8> = sample.payload().to_bytes().to_vec();
-                                        if !spill.accept(bytes) {
-                                            // subscriber_rx dropped (engine
-                                            // teardown). No point serving more
-                                            // backfill requests if we can't
-                                            // deliver replies — exit the qr
-                                            // task entirely so we don't loop
-                                            // back, fire another session.get,
-                                            // and spin until the 1s closing
-                                            // poll catches up.
-                                            return;
+                                        match spill.accept(bytes) {
+                                            crate::reply_spill::AcceptOutcome::Accepted => {}
+                                            crate::reply_spill::AcceptOutcome::DroppedFull => {
+                                                // Cap overflow (reply storm):
+                                                // dropped + counted; surfaced
+                                                // after the drain. Not counted
+                                                // in `fetched` — progress and
+                                                // the page report describe
+                                                // what will actually land.
+                                                continue;
+                                            }
+                                            crate::reply_spill::AcceptOutcome::ConsumerGone => {
+                                                // subscriber_rx dropped (engine
+                                                // teardown). No point serving more
+                                                // backfill requests if we can't
+                                                // deliver replies — exit the qr
+                                                // task entirely so we don't loop
+                                                // back, fire another session.get,
+                                                // and spin until the 1s closing
+                                                // poll catches up.
+                                                return;
+                                            }
                                         }
                                         fetched = fetched.saturating_add(1);
                                         // Spec §10: emit channel-backfill-progress
@@ -10682,6 +10720,11 @@ where
                                 }
                             }
                         };
+                        if spill.dropped() > 0 {
+                            tracing::warn!(%key, dropped = spill.dropped(),
+                                "channel backfill: reply storm exceeded spill cap; \
+                                 overflow dropped (RBSR / next backfill round re-fetches)");
+                        }
                         // ZEB-812: the zenoh stream is closed; deliver what
                         // the consumer hasn't absorbed yet. Blocking on the
                         // engine HERE is the intended request-level
@@ -10964,6 +11007,21 @@ const CHANNEL_BACKFILL_DEFAULT_LIMIT: usize = 256;
 /// and prevents a misbehaving local engine from issuing oversized
 /// requests on the driver side.
 const CHANNEL_BACKFILL_MAX_LIMIT: usize = 1000;
+
+/// ZEB-812: cap on the channel-backfill reply spill (`reply_spill` module).
+/// One GET's reply volume is `limit × responders` under
+/// `ConsolidationMode::None`, and the responder count is unbounded (every
+/// community member may answer), so the spill needs its own explicit bound:
+/// 8 pages ≈ 8 simultaneous responders at the max page limit before overflow
+/// drops kick in (dropped replies are re-fetched by RBSR / the next round).
+const CHANNEL_BACKFILL_SPILL_MAX: usize = 8 * CHANNEL_BACKFILL_MAX_LIMIT;
+
+/// ZEB-812: cap on the root-fetch reply spills (owner-state + community
+/// state-root drivers). Roots are one small wire (≤ MAX_ROOT_WIRE_BYTES,
+/// enforced at the owner-state site) per responder per GET, so 1024 pending
+/// covers three orders of magnitude more responders than any real fleet
+/// before overflow drops kick in.
+const ROOT_FETCH_SPILL_MAX: usize = 1024;
 
 /// Outcome of parsing a channel-log backfill selector key.
 ///
@@ -11537,12 +11595,21 @@ mod channel_log_adapter_tests {
                 .expect("qreq send (warmup)");
             let mut rx = rx;
             let mut got = 0usize;
+            // PR #559 review (Qodo): the deadline must bound THIS await too,
+            // not just the between-attempts check — otherwise an adapter
+            // that produces neither report nor packets wedges the test
+            // instead of failing it within the stated budget.
             let report = loop {
                 tokio::select! {
                     r = &mut rx => break r.ok(),
                     p = sub_rx.recv() => {
                         p.expect("sub_rx open during warmup");
                         got += 1;
+                    }
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        panic!(
+                            "warmup wedged: no page report or packet before the 15s deadline"
+                        );
                     }
                 }
             };

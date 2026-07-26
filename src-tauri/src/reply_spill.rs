@@ -16,21 +16,45 @@
 //!
 //! 1. **While the zenoh stream is open** — [`ReplySpill::accept`] each drained
 //!    payload. It buffers locally and forwards with `try_send` only; it never
-//!    awaits. Memory stays bounded by construction: these drains process one
-//!    GET at a time, and one GET's reply count is capped by the request's
-//!    clamped `limit`, so the spill can never hold more than one page.
+//!    awaits. The buffer carries an explicit `max_pending` cap: one GET's
+//!    reply volume is `limit × responders`, and with
+//!    `ConsolidationMode::None` the responder count is NOT bounded by the
+//!    protocol (a large community can answer a backfill GET from every
+//!    member — the ZEB-803 measurement was one page × 3 peers). Overflow
+//!    beyond the cap is **dropped and counted** ([`ReplySpill::dropped`]),
+//!    never blocked on: every spill-backed path is an anti-entropy loop
+//!    (RBSR / periodic full reconcile / next backfill round), so a dropped
+//!    pre-verification packet is re-fetched later, while blocking is the
+//!    ZEB-803 wedge itself. Callers surface the drop count loudly.
 //! 2. **After the stream closes** — [`ReplySpill::flush`] delivers whatever
 //!    the consumer hasn't absorbed yet. Blocking on the engine *here* is the
 //!    natural request-level backpressure point (the driver won't take its
-//!    next request until the page lands), and the closing flag stays live
-//!    because the send-permit acquisition is a select ARM (cancel-safe
-//!    `reserve()`), not an await buried inside an arm body.
-//!
-//! Spill is not drop: nothing is discarded except on the two paths that
-//! already abandon work today — consumer teardown and node shutdown.
+//!    next request until the page lands), and the closing flag stays live:
+//!    it is checked at the top of every iteration AND while parked, because
+//!    the send-permit acquisition is a cancel-safe `reserve()` select ARM,
+//!    not an await buried inside an arm body. Shutdown never reports a
+//!    completed flush (PR #559 review).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Per-payload result of [`ReplySpill::accept`].
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub enum AcceptOutcome {
+    /// Forwarded to the engine channel immediately, or buffered within the
+    /// cap for the post-drain flush.
+    Accepted,
+    /// The spill is at `max_pending` and the channel is full: the payload
+    /// was dropped (and counted). Safe by design on these paths — the next
+    /// anti-entropy round re-fetches it; blocking instead would recreate
+    /// the ZEB-803 wedge.
+    DroppedFull,
+    /// The engine receiver is gone (engine teardown); the caller should
+    /// exit its drive loop (same semantics as a failed `send` before
+    /// ZEB-812).
+    ConsumerGone,
+}
 
 /// Terminal state of a [`ReplySpill::flush`].
 #[derive(Debug, PartialEq, Eq)]
@@ -40,9 +64,9 @@ pub enum FlushOutcome {
     /// The engine receiver is gone (engine teardown); remaining payloads
     /// were dropped with it. Callers should exit their drive loop.
     ConsumerGone,
-    /// The closing flag flipped while the consumer was still wedged;
-    /// remaining payloads were abandoned, matching the pre-existing
-    /// no-report shutdown semantics of the drains this serves.
+    /// The closing flag was (or flipped) set while payloads remained;
+    /// they were abandoned, matching the pre-existing no-report shutdown
+    /// semantics of the drains this serves.
     ShutdownAbandoned,
 }
 
@@ -50,27 +74,44 @@ pub enum FlushOutcome {
 pub struct ReplySpill {
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     buf: VecDeque<Vec<u8>>,
+    max_pending: usize,
+    dropped: usize,
 }
 
 impl ReplySpill {
-    pub fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+    /// `max_pending` bounds the buffer (payload count, not bytes — the
+    /// payloads on these paths are already individually size-capped by
+    /// their call sites). Size it as a generous multiple of the page
+    /// `limit` so only a genuine reply storm (many simultaneous
+    /// responders) ever trips it.
+    pub fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>, max_pending: usize) -> Self {
         Self {
             tx,
             buf: VecDeque::new(),
+            max_pending,
+            dropped: 0,
         }
     }
 
-    /// Accept one drained reply payload: buffer it, then forward as much of
-    /// the buffer as fits RIGHT NOW (`try_send` only — never awaits, so the
-    /// caller's reply-drain loop never blocks on the engine).
-    ///
-    /// Returns `false` when the engine receiver is gone; the caller should
-    /// exit its drive loop (same semantics as a failed `send` before
-    /// ZEB-812).
-    #[must_use]
-    pub fn accept(&mut self, bytes: Vec<u8>) -> bool {
+    /// Accept one drained reply payload: forward as much as fits RIGHT NOW
+    /// (`try_send` only — never awaits, so the caller's reply-drain loop
+    /// never blocks on the engine), buffering the remainder up to
+    /// `max_pending`.
+    pub fn accept(&mut self, bytes: Vec<u8>) -> AcceptOutcome {
+        if self.buf.len() >= self.max_pending {
+            // Cap first, then still try to make room for the NEXT reply.
+            self.dropped = self.dropped.saturating_add(1);
+            if !self.try_flush() {
+                return AcceptOutcome::ConsumerGone;
+            }
+            return AcceptOutcome::DroppedFull;
+        }
         self.buf.push_back(bytes);
-        self.try_flush()
+        if self.try_flush() {
+            AcceptOutcome::Accepted
+        } else {
+            AcceptOutcome::ConsumerGone
+        }
     }
 
     /// Forward buffered payloads until the channel is full or the buffer is
@@ -94,14 +135,26 @@ impl ReplySpill {
         self.buf.len()
     }
 
+    /// Payloads dropped at the cap so far. Callers surface a non-zero
+    /// count loudly after the drain — a drop is recoverable (anti-entropy
+    /// re-fetches) but should never be invisible.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
     /// Post-drain delivery of everything still buffered, in order. Call this
     /// ONLY after the zenoh reply stream has closed — blocking on the engine
     /// here is harmless to the transport and is the intended request-level
-    /// backpressure. The `closing` flag is polled every 500ms even while the
-    /// consumer is wedged: `reserve()` is a cancel-safe select arm, so no
-    /// payload is lost when the poll arm wins.
+    /// backpressure. The `closing` flag is honored at the top of every
+    /// iteration (a shutdown never reports `Flushed`, even when the
+    /// consumer has capacity — PR #559 review) and polled every 500ms while
+    /// parked: `reserve()` is a cancel-safe select arm, so no payload is
+    /// lost when the poll arm wins.
     pub async fn flush(mut self, closing: &AtomicBool) -> FlushOutcome {
         while !self.buf.is_empty() {
+            if closing.load(Ordering::SeqCst) {
+                return FlushOutcome::ShutdownAbandoned;
+            }
             tokio::select! {
                 biased;
                 permit = self.tx.reserve() => {
@@ -131,33 +184,62 @@ mod tests {
     #[tokio::test]
     async fn accept_forwards_while_capacity_and_spills_on_full_without_blocking() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
-        let mut spill = ReplySpill::new(tx);
+        let mut spill = ReplySpill::new(tx, 64);
 
         // 10 accepts against a 2-slot channel with no consumer: 2 forwarded,
         // 8 spilled, zero awaits (this test would deadlock otherwise —
         // single-threaded runtime, no consumer task).
         for i in 0..10u8 {
-            assert!(spill.accept(vec![i]));
+            assert_eq!(spill.accept(vec![i]), AcceptOutcome::Accepted);
         }
         assert_eq!(spill.pending(), 8);
+        assert_eq!(spill.dropped(), 0);
         assert_eq!(rx.recv().await.unwrap(), vec![0]);
         assert_eq!(rx.recv().await.unwrap(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn accept_drops_and_counts_beyond_the_cap() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let mut spill = ReplySpill::new(tx, 3);
+
+        // 1 forwarded + 3 buffered = at cap; the next two drop.
+        for i in 0..4u8 {
+            assert_eq!(spill.accept(vec![i]), AcceptOutcome::Accepted, "i={i}");
+        }
+        assert_eq!(spill.accept(vec![4]), AcceptOutcome::DroppedFull);
+        assert_eq!(spill.accept(vec![5]), AcceptOutcome::DroppedFull);
+        assert_eq!(spill.pending(), 3);
+        assert_eq!(spill.dropped(), 2);
+
+        // Everything that was ACCEPTED still arrives, in order, once the
+        // consumer drains — drops only ever discard the overflow.
+        let closing = AtomicBool::new(false);
+        let consumer = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Some(pkt) = rx.recv().await {
+                got.push(pkt[0]);
+            }
+            got
+        });
+        assert_eq!(spill.flush(&closing).await, FlushOutcome::Flushed);
+        assert_eq!(consumer.await.unwrap(), vec![0, 1, 2, 3]);
     }
 
     #[tokio::test]
     async fn accept_reports_consumer_gone() {
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         drop(rx);
-        let mut spill = ReplySpill::new(tx);
-        assert!(!spill.accept(vec![7]));
+        let mut spill = ReplySpill::new(tx, 64);
+        assert_eq!(spill.accept(vec![7]), AcceptOutcome::ConsumerGone);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flush_delivers_everything_in_order_to_a_slow_consumer() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
-        let mut spill = ReplySpill::new(tx);
+        let mut spill = ReplySpill::new(tx, 64);
         for i in 0..16u8 {
-            assert!(spill.accept(vec![i]));
+            assert_eq!(spill.accept(vec![i]), AcceptOutcome::Accepted);
         }
         let closing = AtomicBool::new(false);
 
@@ -179,9 +261,9 @@ mod tests {
     #[tokio::test]
     async fn flush_reports_consumer_gone() {
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let mut spill = ReplySpill::new(tx);
-        assert!(spill.accept(vec![1]));
-        assert!(spill.accept(vec![2])); // spilled: channel is full
+        let mut spill = ReplySpill::new(tx, 64);
+        assert_eq!(spill.accept(vec![1]), AcceptOutcome::Accepted);
+        assert_eq!(spill.accept(vec![2]), AcceptOutcome::Accepted); // spilled: full
         drop(rx);
         let closing = AtomicBool::new(false);
         assert_eq!(spill.flush(&closing).await, FlushOutcome::ConsumerGone);
@@ -190,17 +272,34 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flush_abandons_on_closing_while_consumer_wedged() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let mut spill = ReplySpill::new(tx);
-        assert!(spill.accept(vec![1]));
-        assert!(spill.accept(vec![2])); // wedged: full channel, live receiver, no consumer
+        let mut spill = ReplySpill::new(tx, 64);
+        assert_eq!(spill.accept(vec![1]), AcceptOutcome::Accepted);
+        assert_eq!(spill.accept(vec![2]), AcceptOutcome::Accepted); // wedged: full, no consumer
         let closing = AtomicBool::new(true); // shutdown already requested
         let start = std::time::Instant::now();
         assert_eq!(spill.flush(&closing).await, FlushOutcome::ShutdownAbandoned);
-        // One 500ms poll tick, give or take scheduling — the budget is far
-        // below any regression that would matter (an unbounded wedge).
+        // With the top-of-loop check this returns without even one poll
+        // tick; the generous budget guards only against an unbounded wedge.
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "closing poll did not fire promptly"
         );
+    }
+
+    /// PR #559 review (CodeRabbit): shutdown must never report `Flushed`,
+    /// even when the consumer has freed capacity and the biased `reserve()`
+    /// arm would win every iteration.
+    #[tokio::test]
+    async fn flush_abandons_on_preset_closing_even_with_capacity_available() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let mut spill = ReplySpill::new(tx, 64);
+        assert_eq!(spill.accept(vec![1]), AcceptOutcome::Accepted); // forwarded
+        assert_eq!(spill.accept(vec![2]), AcceptOutcome::Accepted); // buffered
+        assert_eq!(rx.recv().await.unwrap(), vec![1]); // capacity now free
+
+        let closing = AtomicBool::new(true);
+        assert_eq!(spill.flush(&closing).await, FlushOutcome::ShutdownAbandoned);
+        // The buffered payload was abandoned, not delivered post-shutdown.
+        assert!(rx.try_recv().is_err(), "no delivery after closing");
     }
 }
