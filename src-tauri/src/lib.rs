@@ -31219,11 +31219,17 @@ pub struct MentionScanDto {
     /// beyond it. Remedy: widen `limit`, or advance `since` and re-poll.
     pub truncated_channels: Vec<String>,
     /// Community ids that could not be scanned at all — no engine is
-    /// running for them, so *none* of their channels were read. Usually a
-    /// community still starting up; a community whose Space carries no
-    /// `admin_addr` never gets an engine and stays listed. Remedy: retry.
-    /// Distinct from `truncated_channels` because widening `limit` does
-    /// nothing here — there was no read to widen.
+    /// running for them, so *none* of their channels were read: one still
+    /// starting, one joined while the node was already up, or a Space
+    /// carrying no `admin_addr`, which never gets an engine and so stays
+    /// listed. Remedy: retry. Distinct from `truncated_channels` because
+    /// widening `limit` does nothing here — there was no read to widen.
+    ///
+    /// No claim is made about how often this is non-empty. Measuring one
+    /// node showed its API answering only after every engine had spawned,
+    /// so a scan right after boot came back complete — which is the
+    /// opposite of what the review that prompted this field predicted, and
+    /// too small a sample to promise either way.
     pub unavailable_communities: Vec<String>,
     /// Channel ids their community knows about but which have no log
     /// engine registered, so they were not read. Remedy: retry.

@@ -493,9 +493,15 @@ Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
 >   non-mention messages can hide older mentions behind the window. Remedy:
 >   widen `limit`, or advance `since` and re-poll.
 > - `unavailableCommunities` — no engine is running for that community, so
->   *none* of its channels were read. Usually a community still starting up:
->   a scan issued seconds after boot can legitimately report most of your
->   communities here. Remedy: retry.
+>   *none* of its channels were read: a community still starting, one joined
+>   while the node was already running, or a Space carrying no `admin_addr`
+>   (which never gets an engine, so it stays listed). Remedy: retry.
+>
+>   On the node this was measured against the API did not begin answering
+>   until after every engine had spawned, so a scan right after boot came
+>   back complete rather than listing everything. Do not rely on that
+>   ordering — it was one node with a handful of communities, and nothing
+>   guarantees it.
 > - `unavailableChannels` — the community knows the channel but no log engine
 >   is registered for it. Remedy: retry.
 >
