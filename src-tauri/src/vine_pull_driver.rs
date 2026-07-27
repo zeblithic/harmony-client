@@ -1387,7 +1387,12 @@ mod tests {
     /// every page boundary, so the caller-owned sink still holds page 1's
     /// last tuple even though the future was never polled to completion and
     /// no `PullSessionResult` was ever returned.
-    #[tokio::test]
+    ///
+    /// `start_paused` puts the deadline on LOGICAL time: the clock only
+    /// jumps when every task is parked, so the 200ms budget can never
+    /// expire while the client is still working through page 1 — the one
+    /// way a wall-clock budget could make this test flaky on a loaded host.
+    #[tokio::test(start_paused = true)]
     async fn deadline_drop_preserves_page_boundary_progress() {
         let (client, server) = tokio::io::duplex(1 << 20);
         let (mut client_read, mut client_write) = tokio::io::split(client);
