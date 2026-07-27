@@ -83,19 +83,37 @@ relay pull protocol (length-prefixed CBOR frames over `open_bi`) but
 
 Frames:
 
-- `VinePullQuery { creator_addr: OwnerAddr, since_created_at: u64, limit: u16 }`
+- `VinePullQuery { creator_addr: OwnerAddr, after: (u64, VineId), limit: u16 }`
   → `VinePullResponse { descriptors: Vec<WireVineDescriptor> }` — wire-form
   descriptors with their existing dual signatures (identity `#3` + device `#2`)
-  intact, so the puller verifies authenticity independent of the relay.
+  intact, so the puller verifies authenticity independent of the relay. The
+  cursor is the lossless tuple `(created_at_ms, vine descriptor id)` with
+  strictly-greater tuple ordering server-side (`created_at` alone is not
+  unique — equal-timestamp descriptors would be skipped); pages are served in
+  ascending tuple order. First pull uses the tuple minimum.
 - `VineContentRequest { cid: ContentId }` → chunked content frames. **Allowlist:**
   only CIDs referenced by `video_cid` of descriptors this node serves for that
   creator — the serve loop resolves the allowlist from its own vine store, not
   from the requester's claims. (Same posture as `put_serveable`: serving is an
   explicit decision per CID class.)
-- Caps: `limit ≤ 256` descriptors/page; per-connection byte budget and a
-  concurrent-sessions cap on the acceptor (values chosen at implementation with
-  the other acceptors' caps as precedent); idle timeout = the existing
-  `DEFAULT_RELAY_IO_DEADLINE_MS` (30 s) per exchange.
+- Caps (concrete v1 defaults — named constants, tunable, but every bound MUST
+  exist because this endpoint is public/unauthenticated):
+  - `limit ≤ 256` descriptors/page.
+  - Frame-size ceilings on every length-prefixed read: request + descriptor
+    frames `VINE_QUERY_MAX_FRAME_BYTES = 64 KiB`; content chunk frames
+    `VINE_CONTENT_MAX_FRAME_BYTES = 16 MiB` (precedent:
+    `RELAY_PULL_MAX_FRAME_BYTES`, `community_relay.rs`). Oversize prefix →
+    close the connection without allocating.
+  - `VINE_RELAY_MAX_CONCURRENT_SESSIONS = 8` acceptor-wide (semaphore); at
+    capacity, new connections are accepted and immediately closed with an
+    app close code — the client treats it as offline and retries next
+    cadence. (New bound: the community-relay acceptor bounds only by
+    per-exchange deadline, which is insufficient for a public endpoint.)
+  - Per-connection byte budget `VINE_RELAY_SESSION_BYTE_BUDGET = 256 MiB`
+    served bytes; exceeded → close (a follower resumes from its cursor on
+    the next session).
+  - Idle timeout = the existing `DEFAULT_RELAY_IO_DEADLINE_MS` (30 s) per
+    exchange.
 
 v1 relays are the creator's own devices, which already store the descriptors
 (vine store) and video (CAS) — "hold" is serving what is already there. No
@@ -110,20 +128,35 @@ structure.
 
 Per cadence, for each followed creator:
 
-1. **Skip if mesh-live:** if the creator's descriptors are already arriving via
-   the wildcard subscription (shared community/friendship peers), the pull is a
-   no-op — cheap check against feed-cache recency for that creator; pull runs
-   anyway on first follow (cursor 0) to backfill history the mesh never carried.
+1. **Skip if mesh-live — bounded:** if the creator's descriptors are already
+   arriving via the wildcard subscription (shared community/friendship peers),
+   the pull may be skipped this cadence — cheap check against feed-cache
+   recency for that creator. But recency is not completeness (one descriptor
+   arriving over the mesh proves nothing about the ones the mesh missed), so
+   the skip is bounded: at most `VINE_PULL_SKIP_MAX_CONSECUTIVE = 4`
+   consecutive cadences (~30 min), after which a repair pull runs regardless
+   and resets the counter. Redundant repair pulls are cheap — the since-cursor
+   query returns little/nothing new and ingest is id-keyed-deduped. Pull runs
+   unconditionally on first follow (cursor 0) to backfill history the mesh
+   never carried.
 2. **Resolve** the creator's `vines` pkarr slot — per-creator cooldown
    `PKARR_REFRESH_COOLDOWN` (15 min, existing constant); cache the relay set.
 3. **Select a relay** — freshest-first; **skip any entry whose `iroh_node_id`
    equals a local endpoint id** (the ZEB-806 lesson, applied from day one — with
    a unit test, not a comment).
-4. **Pull session:** query since the per-creator cursor; verify each descriptor
-   through the **same validation/ingest path the wildcard subscriber uses**
-   (signature checks, feed-cache admission, id-keyed LWW) so mesh and relay
-   arrivals deduplicate naturally and no second trust path exists. Advance the
-   cursor only past durably-ingested descriptors.
+4. **Pull session:** query after the per-creator tuple cursor; verify each
+   descriptor through the **same validation/ingest path the wildcard
+   subscriber uses** (signature checks, feed-cache admission, id-keyed LWW) so
+   mesh and relay arrivals deduplicate naturally and no second trust path
+   exists. Cursor advance distinguishes two failure kinds: a descriptor that
+   fails **verification** (bad signature — the relay served garbage) is
+   logged, counted in telemetry, and **skipped**, and does NOT block the
+   cursor (each descriptor is independently dual-signed, so skipping a
+   poisoned entry cannot forge or hide later ones — a withholding relay could
+   omit it anyway); a descriptor that verifies but fails **local ingest**
+   (durability error) stops cursor advance at the last durable entry so the
+   next session retries it. The cursor therefore advances past
+   verified-and-ingested and verified-invalid-skipped entries only.
 5. **Video fetch fallback:** the content-fetch path gains one fallback — if the
    mesh GET fails AND the CID belongs to a followed creator's vine, fetch over a
    vine-relay session to a relay from that creator's cached set. No change to
@@ -136,8 +169,12 @@ cache).
 ## 4. Testing
 
 - **Unit:** pkarr `vines` record round-trip + size-cap error; slot-key
-  derivation stability; pull-frame codecs; self-entry skip; cursor advance only
-  on durable ingest; allowlist refuses non-vine CIDs.
+  derivation stability; pull-frame codecs; self-entry skip; tuple-cursor
+  ordering with equal `created_at` values (no skip, no duplicate); an
+  injected invalid descriptor at the page high-watermark is skipped without
+  blocking cursor advance, while a durability failure does block it;
+  allowlist refuses non-vine CIDs; mesh-live skip counter forces a repair
+  pull at `VINE_PULL_SKIP_MAX_CONSECUTIVE`.
 - **Integration:** pull driver against a mock serve ctx (mirroring the ZEB-806
   test structure): full-fidelity drain, dedupe against mesh-delivered
   descriptors, mesh-GET fallback selection.

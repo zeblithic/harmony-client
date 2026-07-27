@@ -234,11 +234,14 @@ impl CommunityAddressBook {
         UpsertOutcome::Inserted
     }
 
-    /// Fresh rows for a community (TTL-filtered per [`row_ttl_ms`]).
+    /// Fresh rows for a community (TTL-filtered per [`row_ttl_ms`]). Range-
+    /// scoped to the community's key prefix like `upsert`'s scans — this runs
+    /// on the snapshot-serve and sidecar-persist paths, so it must not walk
+    /// other communities' rows under the lock.
     pub fn rows_for_community(&self, community: &SpaceId, now_ms: u64) -> Vec<AddressBookRow> {
         let g = self.inner.lock().unwrap();
-        g.iter()
-            .filter(|((c, _), _)| c == community)
+        g.range(community_floor(*community)..)
+            .take_while(|((c, _), _)| c == community)
             .filter(|(_, row)| now_ms.saturating_sub(row.stamped_at_ms) <= row_ttl_ms(&row.entry))
             .map(|(_, row)| row.clone())
             .collect()

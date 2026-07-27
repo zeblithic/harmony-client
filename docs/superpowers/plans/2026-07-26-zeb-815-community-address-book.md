@@ -15,7 +15,7 @@
 - Topics: `harmony/addrbook/{community_id_hex}/records` (live), `harmony/addrbook/{community_id_hex}/snapshot` (queryable). Seal AAD: `b"harmony-addrbook-v1"`. Sentinel channel: `ChannelId([1u8; 16])`. HKDF info: `b"addrbook:"`.
 - Old `MembershipEventKind::ReachabilityAnnounce`("a") / `CommunityRelayAnnounce`("b") events: **decode + verify_event arms stay forever** (history must verify); minting and consumption are removed. Flag-day rollout — no dual-write.
 - All resolver/consumer contracts unchanged: `ReachabilityResolver::update` supervisor kicks, `CommunityRelayResolver` read semantics (self entries stay — ZEB-524/ZEB-806), `remove_advertiser`/`remove_owner` eviction shape.
-- Cargo from `src-tauri/`; gates: `cargo fmt --all -- --check`, `cargo clippy --all-targets --features test-fixtures --locked -- -D warnings`, `cargo nextest run --locked --features test-fixtures` scoped per task (`-E` filters), full `scripts/test-select --context round` only at the end (lib change relinks ~97 integration binaries — never per-task).
+- Cargo from `src-tauri/`; gates: `cargo fmt --all -- --check`, `cargo clippy --all-targets --features test-fixtures --locked -- -D warnings`, `cargo nextest run --locked --features test-fixtures` scoped per task (`-E` filters — the documented ZEB-631 iterative-selection exception; lib change relinks ~97 integration binaries, so never `--all-targets` per-task), `scripts/test-select --context round` at the end as the *local* convergence gate. Final pre-merge validation is CI's full-workspace `--all-targets` nextest suite (3 shards + roll-up gate) — test-select is never the final gate.
 - Commit after each task; trailer: `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>` + `Claude-Session: https://claude.ai/code/session_01MsT6ZD7kqbpbKoeenyQPtc`.
 
 ---
@@ -273,7 +273,7 @@ Note: `beacon_signer_is_member` is the same gate presence ingest uses (community
 
 - [ ] **Step 1:** `cargo fmt --all` then `cargo fmt --all -- --check`.
 - [ ] **Step 2:** `cargo clippy --all-targets --features test-fixtures --locked -- -D warnings` (use `${pipestatus[1]}` if piping).
-- [ ] **Step 3:** `scripts/test-select --context round` (full selection — budget ~50 min relink; run ONCE here, not per-task).
+- [ ] **Step 3:** `scripts/test-select --context round` (budget ~50 min relink; run ONCE here, not per-task). Paste the printed `round=… bucket=…` summary line into the ledger/task report so the selection is auditable. This is the *local* gate only — final pre-merge validation is CI's full-workspace `--all-targets` suite (3 shards + roll-up), which must be green on the PR.
 - [ ] **Step 4:** Spec conformance sweep — reread `docs/superpowers/specs/2026-07-26-zeb-815-community-address-book-design.md` §1–§7 against the diff; add an as-implemented note to the spec for any shipped deltas (banner pattern from the ZEB-813 spec).
 - [ ] **Step 5:** Fleet-validation notes into the PR body: post-deploy assertions (membership log growth ≈ 0 events/day on the fleet community; root blob flat; addrbook.cbor present and small; join bootstrap works with a fresh profile).
 - [ ] **Step 6: Commit + open PR** (`Fixes ZEB-815` in body; PR footer per convention; ONE CodeRabbit trigger at open, then zero `@`).

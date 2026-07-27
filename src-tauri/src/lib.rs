@@ -8362,14 +8362,22 @@ pub async fn start_node_inner(
                                         })
                                         .unwrap_or(false)
                                 };
-                                // The membership filter the old event replay applied,
-                                // kept verbatim in shape: a row's actor must be a
-                                // CURRENT Joined member. The live ingest path gates on
-                                // membership per row, but a trusted sidecar load
-                                // bypasses that gate entirely — without this filter a
-                                // peer who Left or was Kicked while we were offline
-                                // would come back into the routing tables at boot.
-                                rows.retain(|row| is_joined(&row.actor));
+                                // Same per-row gate the live ingest path applies
+                                // (`beacon_signer_is_member` → `device_is_enrolled`):
+                                // the row's actor must be a CURRENT Joined member AND
+                                // the row's device currently enrolled for that actor.
+                                // A trusted sidecar load bypasses the live gate
+                                // entirely — without this filter a peer who Left or
+                                // was Kicked (or a device retired) while we were
+                                // offline would come back into the routing tables at
+                                // boot.
+                                rows.retain(|row| {
+                                    crate::voice_presence::device_is_enrolled(
+                                        &current,
+                                        &row.actor,
+                                        &row.device,
+                                    )
+                                });
                                 // ZEB-329: tail value — the seed for THIS community
                                 // (the Network Health peer list is scoped immediately
                                 // on restart; the on_epoch_event hook only fires on
@@ -43169,7 +43177,7 @@ pub(crate) async fn leave_community_impl(
         }
         if let Some(dir) = identity_dir {
             let path = crate::community_address_book::addrbook_path(&dir, &space_id);
-            if let Err(e) = std::fs::remove_file(&path) {
+            if let Err(e) = tokio::fs::remove_file(&path).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(
                         community_id = %hex::encode(space_id.0),
