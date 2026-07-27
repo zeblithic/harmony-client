@@ -4155,11 +4155,20 @@
       resolveVideo={resolveVideoFn}
       ownAddress={myAddress || undefined}
       getShareFollows={tauriAdapter ? async () => {
-        const s = await tauriAdapter!.invoke('get_vine_settings', {}) as { shareFollows: boolean };
+        const s = await tauriAdapter!.invoke('get_vine_settings', {}) as { shareFollows: boolean; shareVinesPublicly: boolean };
         return s.shareFollows;
       } : undefined}
       onSetShareFollows={tauriAdapter ? async (on: boolean) => {
-        await tauriAdapter!.invoke('set_vine_settings', { shareFollows: on });
+        const s = await tauriAdapter!.invoke('get_vine_settings', {}) as { shareFollows: boolean; shareVinesPublicly: boolean };
+        await tauriAdapter!.invoke('set_vine_settings', { shareFollows: on, shareVinesPublicly: s.shareVinesPublicly });
+      } : undefined}
+      getShareVinesPublicly={tauriAdapter ? async () => {
+        const s = await tauriAdapter!.invoke('get_vine_settings', {}) as { shareFollows: boolean; shareVinesPublicly: boolean };
+        return s.shareVinesPublicly;
+      } : undefined}
+      onSetShareVinesPublicly={tauriAdapter ? async (on: boolean) => {
+        const s = await tauriAdapter!.invoke('get_vine_settings', {}) as { shareFollows: boolean; shareVinesPublicly: boolean };
+        await tauriAdapter!.invoke('set_vine_settings', { shareFollows: s.shareFollows, shareVinesPublicly: on });
       } : undefined}
     />
     {#if showVinePublish}

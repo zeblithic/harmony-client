@@ -725,6 +725,39 @@ describe('feed-level delete (ZEB-670 creator tombstone)', () => {
       expect((screen.getByTestId('share-follows-toggle') as HTMLInputElement).checked).toBe(true);
     });
 
+    it('Share-my-vines-publicly toggle reads and writes through the props', async () => {
+      const getShareVinesPublicly = vi.fn().mockResolvedValue(true);
+      const onSetShareVinesPublicly = vi.fn().mockResolvedValue(undefined);
+      renderDiscover({ getShareVinesPublicly, onSetShareVinesPublicly });
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      await waitFor(() => expect(getShareVinesPublicly).toHaveBeenCalled());
+
+      await fireEvent.click(screen.getByTestId('share-vines-publicly-toggle'));
+      await waitFor(() => expect(onSetShareVinesPublicly).toHaveBeenCalledWith(false));
+    });
+
+    it('keeps the share-vines-publicly toggle disabled when the read fails', async () => {
+      const getShareVinesPublicly = vi.fn().mockRejectedValue(new Error('ipc down'));
+      const onSetShareVinesPublicly = vi.fn();
+      renderDiscover({ getShareVinesPublicly, onSetShareVinesPublicly });
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('ipc down'));
+      expect((screen.getByTestId('share-vines-publicly-toggle') as HTMLInputElement).disabled).toBe(true);
+      expect(onSetShareVinesPublicly).not.toHaveBeenCalled();
+    });
+
+    it('surfaces a share-vines-publicly write failure and reverts the box', async () => {
+      const getShareVinesPublicly = vi.fn().mockResolvedValue(true);
+      const onSetShareVinesPublicly = vi.fn().mockRejectedValue(new Error('not connected'));
+      renderDiscover({ getShareVinesPublicly, onSetShareVinesPublicly });
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      await waitFor(() => expect(getShareVinesPublicly).toHaveBeenCalled());
+
+      await fireEvent.click(screen.getByTestId('share-vines-publicly-toggle'));
+      await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('not connected'));
+      expect((screen.getByTestId('share-vines-publicly-toggle') as HTMLInputElement).checked).toBe(true);
+    });
+
     it('shows the graph-only empty state copy', () => {
       renderDiscover({ discoverVines: [] });
       expect(screen.getByText(/no algorithm, just your social graph/)).toBeTruthy();

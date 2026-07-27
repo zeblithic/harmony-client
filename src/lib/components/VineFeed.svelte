@@ -31,6 +31,8 @@
     ownAddress,
     getShareFollows,
     onSetShareFollows,
+    getShareVinesPublicly,
+    onSetShareVinesPublicly,
   }: {
     followedVines?: VineVideo[];
     discoverVines?: VineVideo[];
@@ -65,6 +67,10 @@
     getShareFollows?: () => Promise<boolean>;
     /** ZEB-671: flip the backend share_follows setting (Tune sheet). */
     onSetShareFollows?: (on: boolean) => Promise<void>;
+    /** ZEB-811: read the backend share_vines_publicly setting (Tune sheet). */
+    getShareVinesPublicly?: () => Promise<boolean>;
+    /** ZEB-811: flip the backend share_vines_publicly setting (Tune sheet). */
+    onSetShareVinesPublicly?: (on: boolean) => Promise<void>;
   } = $props();
 
   let feedFilter = $state<FeedFilter>('all');
@@ -99,6 +105,13 @@
   let shareFollowsLoaded = $state(false);
   let shareFollowsBusy = $state(false);
   let shareFollowsError = $state('');
+  /** Backend share_vines_publicly state, loaded when the Tune sheet opens. */
+  let shareVinesPublicly = $state(true);
+  /** True once getShareVinesPublicly() has succeeded — same disabled-until-
+   *  read gate as shareFollowsLoaded above. */
+  let shareVinesPubliclyLoaded = $state(false);
+  let shareVinesPubliclyBusy = $state(false);
+  let shareVinesPubliclyError = $state('');
   /** Focus target when the Tune sheet opens (dialog a11y). */
   let tuneSheetEl = $state<HTMLDivElement | null>(null);
 
@@ -254,6 +267,17 @@
         shareFollowsLoaded = false;
       }
     }
+    shareVinesPubliclyError = '';
+    if (getShareVinesPublicly) {
+      try {
+        shareVinesPublicly = await getShareVinesPublicly();
+        shareVinesPubliclyLoaded = true;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        shareVinesPubliclyError = msg;
+        shareVinesPubliclyLoaded = false;
+      }
+    }
   }
 
   async function handleShareFollowsToggle(e: Event) {
@@ -271,6 +295,24 @@
       input.checked = shareFollows;
     } finally {
       shareFollowsBusy = false;
+    }
+  }
+
+  async function handleShareVinesPubliclyToggle(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const want = input.checked;
+    if (!onSetShareVinesPublicly) return;
+    shareVinesPubliclyBusy = true;
+    try {
+      await onSetShareVinesPublicly(want);
+      shareVinesPublicly = want;
+      shareVinesPubliclyError = '';
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      shareVinesPubliclyError = msg;
+      input.checked = shareVinesPublicly;
+    } finally {
+      shareVinesPubliclyBusy = false;
     }
   }
 
@@ -662,6 +704,22 @@
           <p class="tune-error" role="alert">{shareFollowsError}</p>
         {/if}
       {/if}
+      {#if getShareVinesPublicly && onSetShareVinesPublicly}
+        <label class="tune-row">
+          <input
+            type="checkbox"
+            checked={shareVinesPublicly}
+            disabled={shareVinesPubliclyBusy || !shareVinesPubliclyLoaded}
+            onchange={handleShareVinesPubliclyToggle}
+            data-testid="share-vines-publicly-toggle"
+          />
+          <span>Share my vines publicly</span>
+        </label>
+        <p class="tune-help">Publishes a relay record so followers outside your communities can fetch your vines.</p>
+        {#if shareVinesPubliclyError}
+          <p class="tune-error" role="alert">{shareVinesPubliclyError}</p>
+        {/if}
+      {/if}
       <button type="button" class="tune-done" onclick={() => { tuneOpen = false; }}>
         Done · {discoverGraphVines.length} {discoverGraphVines.length === 1 ? 'vine' : 'vines'} in Discover
       </button>
@@ -952,6 +1010,12 @@
   .tune-divider {
     border-top: 1px solid var(--border);
     margin: 6px 0 0;
+  }
+
+  .tune-help {
+    margin: 0;
+    font-size: 0.7rem;
+    color: var(--text-secondary);
   }
 
   .tune-error {
