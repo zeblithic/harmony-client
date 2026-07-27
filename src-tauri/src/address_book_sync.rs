@@ -1127,6 +1127,203 @@ mod tests {
         assert_eq!(resolved[0].announced_at_ms, now_ms);
     }
 
+    // ── Task 7: membership eviction ─────────────────────────────────
+
+    /// The three stores `ingest_verified_row` writes into, bundled so the seed
+    /// helpers below read as one call rather than a wall of arguments.
+    struct Sinks {
+        book: CommunityAddressBook,
+        reach: ReachabilityResolver,
+        relay: CommunityRelayResolver,
+    }
+
+    impl Sinks {
+        fn new() -> Self {
+            Self {
+                book: CommunityAddressBook::new(),
+                reach: ReachabilityResolver::new(),
+                relay: CommunityRelayResolver::new(),
+            }
+        }
+
+        /// Seed one reachability row through the real ingest gate (signature
+        /// and all), asserting it landed — the eviction test below needs a
+        /// book whose contents got there the way production's does.
+        fn seed_reach(
+            &self,
+            community: SpaceId,
+            actor: OwnerAddr,
+            sk: &ed25519_dalek::SigningKey,
+            node_id: [u8; 32],
+            ts: u64,
+        ) {
+            let at = hlc(ts);
+            let payload = build_signed_payload_with_key(
+                node_id,
+                "https://derp.example/".into(),
+                vec![],
+                ts,
+                &actor,
+                &at,
+                Vec::new(),
+                0,
+                sk,
+            )
+            .expect("build signed reachability payload");
+            let row = AddressBookRow {
+                entry: AddressBookEntry::Reachability(payload),
+                actor,
+                device: sk.verifying_key().to_bytes(),
+                at,
+                stamped_at_ms: ts,
+            };
+            assert_eq!(
+                ingest_verified_row(&self.book, &self.reach, &self.relay, community, row, ts),
+                IngestOutcome::Applied(UpsertOutcome::Inserted),
+            );
+        }
+
+        /// Relay-row counterpart of [`Sinks::seed_reach`].
+        fn seed_relay(
+            &self,
+            community: SpaceId,
+            actor: OwnerAddr,
+            sk: &ed25519_dalek::SigningKey,
+            relay_device_id: [u8; 16],
+            ts: u64,
+        ) {
+            let at = hlc(ts);
+            let entry = CommunityRelayEntry {
+                relay_device_id,
+                iroh_endpoint_id: [0x55; 32],
+                relay_device_ed25519_verify: sk.verifying_key().to_bytes(),
+                home_relay: "https://r.example/".into(),
+            };
+            let payload = build_signed_community_relay_announce(entry, ts, &actor, &at, sk)
+                .expect("build signed relay payload");
+            let row = AddressBookRow {
+                entry: AddressBookEntry::Relay(payload),
+                actor,
+                device: sk.verifying_key().to_bytes(),
+                at,
+                stamped_at_ms: ts,
+            };
+            assert_eq!(
+                ingest_verified_row(&self.book, &self.reach, &self.relay, community, row, ts),
+                IngestOutcome::Applied(UpsertOutcome::Inserted),
+            );
+        }
+
+        fn book_actors(&self, community: &SpaceId, ts: u64) -> Vec<OwnerAddr> {
+            self.book
+                .rows_for_community(community, ts)
+                .into_iter()
+                .map(|r| r.actor)
+                .collect()
+        }
+    }
+
+    /// The eviction half of the ZEB-815 flag-day: the calls the delta hook's
+    /// Kick and Leave arms make must clear the departed member from the
+    /// address book as well as from the two resolvers.
+    ///
+    /// The book is COMMUNITY-scoped and `ReachabilityResolver::remove_owner`
+    /// is OWNER-global — a difference the arms depend on (the book eviction
+    /// runs ungated while the resolver eviction sits behind the ZEB-634
+    /// co-membership consult). Both departures here are from community A
+    /// while the same members hold rows in community B, which is exactly the
+    /// case that tells the two scopes apart.
+    #[test]
+    fn kick_evicts_book_rows_and_leave_evicts_book_rows() {
+        let community_a = SpaceId([0xA1; 16]);
+        let community_b = SpaceId([0xB2; 16]);
+        let ts = 1_700_000_000_000u64;
+
+        let s = Sinks::new();
+
+        let kicked_sk = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let leaver_sk = ed25519_dalek::SigningKey::from_bytes(&[0x52; 32]);
+        let bystander_sk = ed25519_dalek::SigningKey::from_bytes(&[0x53; 32]);
+        let kicked = OwnerAddr([0x51; 16]);
+        let leaver = OwnerAddr([0x52; 16]);
+        let bystander = OwnerAddr([0x53; 16]);
+
+        // Community A: all three, with the kicked member also advertising a
+        // relay (both entry kinds must go).
+        s.seed_reach(community_a, kicked, &kicked_sk, [0x01; 32], ts);
+        s.seed_relay(community_a, kicked, &kicked_sk, [0xD1; 16], ts);
+        s.seed_reach(community_a, leaver, &leaver_sk, [0x02; 32], ts);
+        s.seed_reach(community_a, bystander, &bystander_sk, [0x03; 32], ts);
+        // Community B: the same two departing members still hold rows there.
+        s.seed_reach(community_b, kicked, &kicked_sk, [0x04; 32], ts);
+        s.seed_reach(community_b, leaver, &leaver_sk, [0x05; 32], ts);
+
+        assert_eq!(s.book_actors(&community_a, ts).len(), 4);
+        assert_eq!(s.book_actors(&community_b, ts).len(), 2);
+
+        // ── Kick arm, community A ──
+        // The relay retraction + book eviction run unconditionally; the
+        // owner-global resolver eviction is what the consult gates (the
+        // kicked member is a co-member of B, so a faithful arm SKIPS it).
+        assert_eq!(s.relay.remove_advertiser(&community_a, &kicked), 1);
+        assert_eq!(
+            s.book.remove_owner(&community_a, &kicked),
+            2,
+            "both the reachability and the relay row for the kicked member"
+        );
+
+        assert!(
+            !s.book_actors(&community_a, ts).contains(&kicked),
+            "kicked member's rows are gone from community A"
+        );
+        assert!(
+            s.book_actors(&community_b, ts).contains(&kicked),
+            "community-scoped: the kicked member's community B rows survive"
+        );
+        assert!(
+            s.relay
+                .relays_for_community(&community_a, ts)
+                .iter()
+                .all(|e| e.relay_device_id != [0xD1; 16]),
+            "kicked member's relay ad retracted from community A"
+        );
+        assert!(
+            !s.reach.resolve(&kicked).is_empty(),
+            "co-member of B: the owner-global reachability records survive"
+        );
+
+        // ── Leave arm, community A, then the leaver's LAST community ──
+        assert_eq!(s.book.remove_owner(&community_a, &leaver), 1);
+        assert!(
+            !s.book_actors(&community_a, ts).contains(&leaver),
+            "leaver's rows are gone from community A"
+        );
+        assert!(
+            s.book_actors(&community_b, ts).contains(&leaver),
+            "community-scoped: the leaver's community B rows survive"
+        );
+
+        // Leaving B too — now the consult finds no other shared community, so
+        // the arm also runs the owner-global resolver eviction. It returns
+        // BOTH of the leaver's node-ids: the resolver never knew which
+        // community each was announced in, which is precisely why the arm has
+        // to consult the projection before calling it.
+        assert_eq!(s.book.remove_owner(&community_b, &leaver), 1);
+        assert_eq!(s.reach.remove_owner(&leaver).len(), 2);
+        assert!(
+            s.book_actors(&community_b, ts).iter().all(|a| *a != leaver),
+            "leaver evicted from every community's book"
+        );
+        assert!(
+            s.reach.resolve(&leaver).is_empty(),
+            "last shared community: reachability records evicted"
+        );
+
+        // The bystander is untouched throughout.
+        assert!(s.book_actors(&community_a, ts).contains(&bystander));
+        assert!(!s.reach.resolve(&bystander).is_empty());
+    }
+
     // ── Task 5: sync-task decision cores ────────────────────────────
 
     /// The snapshot requester's rate limiter, exercised on BOTH sides of the

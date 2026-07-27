@@ -496,7 +496,8 @@ pub struct AddressBookRuntime {
     /// readers (Task 7) — every community's rows live in this one book.
     pub book: Arc<crate::community_address_book::CommunityAddressBook>,
     /// Ingest fan-out targets — the exact resolvers the CRDT membership-delta
-    /// hook feeds today (spec §4), so dial + deposit consumers are unchanged.
+    /// hook fed before ZEB-815 (spec §4), so dial + deposit consumers are
+    /// unchanged by the move.
     pub reachability_resolver: Arc<crate::reachability_resolver::ReachabilityResolver>,
     pub community_relay_resolver: Arc<crate::community_relay_resolver::CommunityRelayResolver>,
     /// Sidecar root — the same `identity_dir` `CommunitySyncRegistry` derives
@@ -538,11 +539,11 @@ enum ZenohEvent {
 /// The publisher is NOT in this bundle (see following paragraph).
 ///
 /// Construction of the endpoint + link manager lives in `start_node`
-/// (rather than inside `event_loop::run`) so the per-community
-/// membership-delta consumer closure can capture the resolver and route
-/// freshly-inserted `ReachabilityAnnounce` events into it without a
-/// separate plumbing pass. The link manager is passed in pre-built so
-/// the event loop owns only the `spawn_accept_loop` call.
+/// (rather than inside `event_loop::run`) so the resolver's feeders can
+/// capture it without a separate plumbing pass: the address-book ingest
+/// path adds records (ZEB-815) and the per-community membership-delta
+/// consumer closure evicts on Leave/Kick. The link manager is passed in
+/// pre-built so the event loop owns only the `spawn_accept_loop` call.
 ///
 /// ZEB-321 Phase 1 Task 9 update: the `ReachabilityPublisher` is NOT in
 /// this bundle. The publisher's real `publish_fn` closure needs to
