@@ -20,7 +20,9 @@ use harmony_pkarr::{
 };
 
 use crate::iroh_endpoint::IrohEndpoint;
-use crate::pkarr_vines::{build_vines_record_blob, vines_key_for_epoch, VineRelayEntry, VineRelayRecordPayload};
+use crate::pkarr_vines::{
+    build_vines_record_blob, vines_key_for_epoch, VineRelayEntry, VineRelayRecordPayload,
+};
 use crate::reachability_record::REACHABILITY_RECORD_TTL_MS;
 
 /// Publication handle for the case-E vines record.

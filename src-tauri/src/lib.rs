@@ -1643,8 +1643,7 @@ pub struct NodeState {
     /// Case E lifecycle manager (ZEB-811) — registers / unregisters this
     /// device's own vine relay-set pkarr publication when the "Share vines
     /// publicly" toggle changes or the owner's own-vine count crosses 0.
-    pub pkarr_vines_publisher:
-        Option<std::sync::Arc<pkarr_vines_publisher::PkarrVinesPublisher>>,
+    pub pkarr_vines_publisher: Option<std::sync::Arc<pkarr_vines_publisher::PkarrVinesPublisher>>,
 
     /// Case C lifecycle manager — registers / unregisters per-community
     /// pkarr publications on community join/leave/kick events.
@@ -9379,8 +9378,8 @@ pub async fn start_node_inner(
                                 })
                                 .unwrap_or(0)
                         });
-                    let pkarr_vines_pub = std::sync::Arc::new(
-                        pkarr_vines_publisher::PkarrVinesPublisher::new(
+                    let pkarr_vines_pub =
+                        std::sync::Arc::new(pkarr_vines_publisher::PkarrVinesPublisher::new(
                             std::sync::Arc::clone(&pkarr_publisher_arc),
                             vines_own_addr,
                             (*signing_key_arc).clone(),
@@ -9388,8 +9387,7 @@ pub async fn start_node_inner(
                             iroh_endpoint_arc.clone(),
                             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                             has_own_vines,
-                        ),
-                    );
+                        ));
                     if vine_settings_loaded.share_vines_publicly {
                         pkarr_vines_pub.enable().await;
                         tracing::info!(
