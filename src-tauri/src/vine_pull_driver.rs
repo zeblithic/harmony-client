@@ -1183,7 +1183,11 @@ mod tests {
         assert_eq!(result.cursor, (just_inside, "edge".to_string()));
 
         let just_outside = TEST_NOW_SECS + VINE_PULL_INVALID_FORWARD_SKEW_SECS + 1;
-        let anchor_created_at = TEST_NOW_SECS - 10;
+        // Above the filler block's max (`TEST_NOW_SECS - 1`): a real relay
+        // page is strictly ascending by `(created_at, id)`, so the anchor
+        // must not sort behind the rows preceding it. Dating it below them
+        // would make this test assert a BACKWARDS cursor move.
+        let anchor_created_at = TEST_NOW_SECS + 1;
         let (rows, verdicts) = full_page_with_tail(vec![
             (
                 descriptor_json("anchor", anchor_created_at),
@@ -1201,6 +1205,81 @@ mod tests {
             "one second past `SKEW` is outside the window and must not advance"
         );
         assert_eq!(result.cursor, (anchor_created_at, "anchor".to_string()));
+    }
+
+    /// A page whose rows are ALL refused by the clamp advances nothing, so
+    /// the session must end via the zero-cursor-advance guard rather than
+    /// re-request the identical page forever. This is a distinct control
+    /// flow into that guard from
+    /// `full_page_of_unparseable_rows_ends_session_without_looping`: those
+    /// rows `continue` before ingest, whereas these parse, reach ingest,
+    /// consume a verdict, and fall through the clamp's refusal branch.
+    #[tokio::test]
+    async fn full_page_of_refused_rows_ends_session_without_looping() {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+
+        // Strictly ascending, as a real relay page is — and every row far
+        // beyond `now_secs + SKEW`.
+        let rows: Vec<Vec<u8>> = (0..VINE_PULL_PAGE_LIMIT_MAX)
+            .map(|i| {
+                descriptor_json(
+                    &format!("evil{i:03}"),
+                    u64::MAX - VINE_PULL_PAGE_LIMIT_MAX as u64 + i as u64,
+                )
+            })
+            .collect();
+
+        let server_task = tokio::spawn(async move {
+            let _query = read_fake_query(&mut server_read).await;
+            write_fake_page_response(&mut server_write, rows).await;
+            let _ = server_write.shutdown().await;
+
+            // The session must be over: a second query would arrive well
+            // within this bound if a fully-refused page looped.
+            let second = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                read_fake_query(&mut server_read),
+            )
+            .await;
+            assert!(
+                second.is_err(),
+                "a fully-refused page must end the session, not re-request itself"
+            );
+        });
+
+        let ingest = ScriptedIngest::new(vec![
+            IngestVerdict::SkipInvalid;
+            VINE_PULL_PAGE_LIMIT_MAX as usize
+        ]);
+
+        // A non-empty starting cursor, so the assertion below proves the
+        // durable tuple is PRESERVED rather than merely still at its default.
+        let seed_cursor = (1_699_999_000u64, "seed".to_string());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_vine_pull_client_session(
+                &mut client_read,
+                &mut client_write,
+                "creator-refused",
+                seed_cursor.clone(),
+                &ingest,
+                TEST_NOW_MS,
+            ),
+        )
+        .await
+        .expect("session must terminate promptly, not loop forever")
+        .expect("session must not error");
+
+        server_task.await.expect("server task must not panic");
+
+        assert_eq!(
+            result.cursor, seed_cursor,
+            "no refused row may move the cursor off the last durable tuple"
+        );
+        assert_eq!(result.ingested, 0);
+        assert_eq!(result.skipped_invalid, VINE_PULL_PAGE_LIMIT_MAX as u32);
     }
 
     #[test]
