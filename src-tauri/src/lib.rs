@@ -127,6 +127,7 @@ pub mod community_dfrost_log;
 pub mod community_dfrost_log_engine;
 pub mod community_dfrost_types;
 pub mod community_fork;
+pub mod community_gateway_dial_driver;
 pub mod community_invite;
 pub mod community_membership;
 pub mod community_presence;
