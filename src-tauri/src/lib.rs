@@ -1407,6 +1407,16 @@ pub struct NodeState {
     /// task (populated by T11b). Held so stop_inner can abort it.
     pub community_relay_refresher_handle: Option<tokio::task::JoinHandle<()>>,
 
+    /// ZEB-811 Task 8: join handle for the vine-pull follower driver task
+    /// (`vine_pull_driver::VinePullDriver::spawn`). Held so stop_inner can
+    /// abort it.
+    pub vine_pull_driver_handle: Option<tokio::task::JoinHandle<()>>,
+    /// ZEB-811 Task 8: wake handle for the vine-pull driver
+    /// (`VinePullDriver::wake_handle`) — follow/unfollow IPCs `notify_one()`
+    /// this so a fresh follow pulls within seconds instead of waiting out
+    /// the idle cadence.
+    pub vine_pull_wake: Option<std::sync::Arc<tokio::sync::Notify>>,
+
     /// ZEB-418 SP2 P2: dm-outhold dataset (sender-side outbound-hold blobs,
     /// spec D12). `Some` while the node is running and an owner identity is
     /// loaded; `None` before the FleetSyncEngine is wired at startup or
@@ -2045,6 +2055,11 @@ impl Default for NodeState {
             community_relay_pull_driver_handle: None,
             community_relay_gc_handle: None,
             community_relay_refresher_handle: None,
+            // ZEB-811 Task 8: vine-pull driver handle + wake stay None until
+            // start_node wires the driver (mirrors the community-relay
+            // pull-driver handle above).
+            vine_pull_driver_handle: None,
+            vine_pull_wake: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles stay
             // None until start_node wires the FleetSyncEngines (mirrors
             // dm-inbox).
@@ -2776,6 +2791,13 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         if let Some(h) = guard.community_relay_refresher_handle.take() {
             h.abort();
         }
+        // ZEB-811 Task 8: abort the vine-pull driver task (None until Task 8's
+        // spawn site populates it, so this is a correct no-op pre-boot) and
+        // drop the wake handle so a restart rebuilds a fresh one.
+        if let Some(h) = guard.vine_pull_driver_handle.take() {
+            h.abort();
+        }
+        guard.vine_pull_wake = None;
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -4144,6 +4166,14 @@ pub async fn start_node_inner(
         let mut community_relay_pull_driver_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut community_relay_gc_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut community_relay_refresher_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
+        // ZEB-811 Task 8: carrier for the vine-pull driver's JoinHandle (built
+        // alongside the community-relay pull driver, inside the same
+        // `if let Some(ep_arc) = iroh_endpoint_arc.as_ref()` gate below) and its
+        // wake handle (stashed on NodeState so follow/unfollow IPCs can
+        // `notify_one()` it — no error-path abort needed for a bare `Arc<Notify>`,
+        // mirroring `community_relay_publisher_force_opt` above).
+        let mut vine_pull_driver_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
+        let mut vine_pull_wake_opt: Option<std::sync::Arc<tokio::sync::Notify>> = None;
         let mut relay_sync_handles_opt: Option<crate::event_loop::RelaySyncHandles> = None;
         // ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync engines + their
         // NodeState handles. Built alongside the dm-inbox engine when an
@@ -4343,6 +4373,16 @@ pub async fn start_node_inner(
         > = None;
         let mut community_relay_pull_telemetry_for_state: Option<
             std::sync::Arc<crate::network_health::CommunityRelayPullTelemetry>,
+        > = None;
+        // ZEB-811 Task 8: same outer-scope hand-out for the vine-relay
+        // serving/pulling telemetry (Task 6/7's structs). Held separately for
+        // the same reason as the community-relay pair above — a node can
+        // serve without pulling or pull without serving.
+        let mut vine_relay_serving_telemetry_for_state: Option<
+            std::sync::Arc<crate::network_health::VineRelayServingTelemetry>,
+        > = None;
+        let mut vine_pull_telemetry_for_state: Option<
+            std::sync::Arc<crate::network_health::VinePullTelemetry>,
         > = None;
         // ZEB-217 Sub-C Phase 2 Task 13: per-community engine pool +
         // adapter requests handed to the event loop. Both stay None /
@@ -9912,7 +9952,11 @@ pub async fn start_node_inner(
                     pkarr_publisher_for_state = Some(pkarr_publisher_arc);
                     pkarr_friend_publisher_for_state =
                         Some(std::sync::Arc::clone(&pkarr_friend_pub));
-                    pkarr_resolver_for_state = Some(pkarr_resolver_arc);
+                    // ZEB-811 Task 8: clone (not move) — the vine-pull driver
+                    // wiring further below (still inside this same block)
+                    // also needs `pkarr_resolver_arc` to resolve creators'
+                    // relay sets.
+                    pkarr_resolver_for_state = Some(std::sync::Arc::clone(&pkarr_resolver_arc));
                     pkarr_relay_client_for_state = Some(pkarr_relay_client);
                     pkarr_invite_publisher_for_state = Some(pkarr_invite_pub);
                     pkarr_identity_publisher_for_state = Some(pkarr_identity_pub);
@@ -10670,6 +10714,16 @@ pub async fn start_node_inner(
                                 "ZEB-811: vine-relay acceptor already installed on \
                                  iroh link manager — keeping the prior instance"
                             );
+                        } else {
+                            // ZEB-811 Task 8: publish the source ONLY on the
+                            // success path, mirroring the community-relay
+                            // serving telemetry above (CodeRabbit, PR #556) —
+                            // otherwise a duplicate-install warning would leave
+                            // this telemetry attached to an acceptor instance
+                            // nobody holds, sitting at zero forever while the
+                            // live (prior) acceptor serves normally.
+                            vine_relay_serving_telemetry_for_state =
+                                Some(vine_relay_serving_telemetry);
                         }
 
                         // C/D/E. The pull driver, sender deposit client, and
@@ -10831,6 +10885,74 @@ pub async fn start_node_inner(
                                     );
                                     community_relay_pull_driver_handle_opt =
                                         Some(pull_driver.spawn());
+
+                                    // ZEB-811 Task 8: vine-pull follower
+                                    // driver. Spawned in this same
+                                    // iroh-endpoint gate as the community-relay
+                                    // wiring above, but needs none of that
+                                    // wiring's dial-cert material — only this
+                                    // device's own iroh endpoint id (to filter
+                                    // a creator's self-relay entry, ZEB-806)
+                                    // and a dial deadline. `driver.spawn()`
+                                    // returns immediately (the loop runs in
+                                    // its own task) — never inline-awaited
+                                    // here, per the start_node inline-await
+                                    // hazard.
+                                    let vine_pull_transport: std::sync::Arc<
+                                        dyn crate::vine_pull_driver::VinePullTransport,
+                                    > = std::sync::Arc::new(
+                                        crate::vine_pull_driver::IrohVinePullTransport {
+                                            endpoint: std::sync::Arc::clone(ep_arc),
+                                            io_deadline: std::time::Duration::from_millis(
+                                                crate::iroh_butler_acceptor::DEFAULT_BUTLER_IO_DEADLINE_MS,
+                                            ),
+                                        },
+                                    );
+                                    let vine_pull_ingest: std::sync::Arc<
+                                        dyn crate::vine_pull_driver::VineIngestCtx,
+                                    > = std::sync::Arc::new(
+                                        crate::vine_pull_driver::ProdVineIngestCtx {
+                                            cache: std::sync::Arc::clone(&vine_feed_cache),
+                                            followed_set: std::sync::Arc::clone(&followed_set),
+                                        },
+                                    );
+                                    let vine_pull_followed_set =
+                                        std::sync::Arc::clone(&followed_set);
+                                    let vine_pull_followed_creators: crate::vine_pull_driver::FollowedCreatorsFn =
+                                        std::sync::Arc::new(move || {
+                                            vine_pull_followed_set
+                                                .lock()
+                                                .map(|g| g.iter().cloned().collect())
+                                                .unwrap_or_default()
+                                        });
+                                    let vine_pull_cache_for_recency =
+                                        std::sync::Arc::clone(&vine_feed_cache);
+                                    let vine_pull_last_received_ms: crate::vine_pull_driver::LastReceivedMsFn =
+                                        std::sync::Arc::new(move |creator: &str| {
+                                            vine_pull_cache_for_recency
+                                                .lock()
+                                                .ok()
+                                                .and_then(|c| c.last_received_ms_for_creator(creator))
+                                        });
+                                    let vine_pull_telemetry = std::sync::Arc::new(
+                                        crate::network_health::VinePullTelemetry::new(),
+                                    );
+                                    vine_pull_telemetry_for_state =
+                                        Some(std::sync::Arc::clone(&vine_pull_telemetry));
+                                    let vine_pull_driver = std::sync::Arc::new(
+                                        crate::vine_pull_driver::VinePullDriver::new(
+                                            *ep_arc.node_id().as_bytes(),
+                                            std::sync::Arc::clone(&pkarr_resolver_arc),
+                                            vine_pull_transport,
+                                            vine_pull_ingest,
+                                            vine_pull_followed_creators,
+                                            vine_pull_last_received_ms,
+                                            app_data_dir.join("vine_pull.cbor"),
+                                        )
+                                        .with_telemetry(vine_pull_telemetry),
+                                    );
+                                    vine_pull_wake_opt = Some(vine_pull_driver.wake_handle());
+                                    vine_pull_driver_handle_opt = Some(vine_pull_driver.spawn());
 
                                     // D. Sender relay deposit client → inject into
                                     //    the DmOutbox (the drain's last-resort
@@ -12145,6 +12267,12 @@ pub async fn start_node_inner(
                         guard.community_relay_gc_handle = community_relay_gc_handle_opt.take();
                         guard.community_relay_refresher_handle =
                             community_relay_refresher_handle_opt.take();
+                        // ZEB-811 Task 8: stash the vine-pull driver's wake
+                        // handle + JoinHandle (mirrors the community-relay
+                        // pair just above — wake is Clone like `force`, the
+                        // JoinHandle is `.take()`n since stop_inner aborts it).
+                        guard.vine_pull_wake = vine_pull_wake_opt.clone();
+                        guard.vine_pull_driver_handle = vine_pull_driver_handle_opt.take();
                         // ZEB-418 SP2 P2: store the dm-outhold + fleet-net
                         // dataset handles (no IPC surface yet — stop_inner
                         // and the send_dm hold-write/apply-sweeper paths
@@ -12450,6 +12578,15 @@ pub async fn start_node_inner(
                             if let Some(t) = community_relay_pull_telemetry_for_state.as_ref() {
                                 nh.set_community_relay_pull_source(std::sync::Arc::clone(t));
                             }
+                            // ZEB-811 Task 8: vine-relay serving / pulling
+                            // health. Same additive, independently-absent
+                            // shape as the community-relay pair above.
+                            if let Some(t) = vine_relay_serving_telemetry_for_state.as_ref() {
+                                nh.set_vine_relay_serving_source(std::sync::Arc::clone(t));
+                            }
+                            if let Some(t) = vine_pull_telemetry_for_state.as_ref() {
+                                nh.set_vine_pull_source(std::sync::Arc::clone(t));
+                            }
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks
@@ -12645,6 +12782,11 @@ pub async fn start_node_inner(
             // aborting them they would leak (run forever holding Arc clones).
             community_relay_publisher_handle_opt,
             community_relay_pull_driver_handle_opt,
+            // ZEB-811 Task 8: carry the vine-pull driver's JoinHandle out too
+            // — same rationale as the community-relay handles above (a
+            // lock-poison rollback that skips the guard block would otherwise
+            // leak the spawned task).
+            vine_pull_driver_handle_opt,
             community_relay_gc_handle_opt,
             community_relay_refresher_handle_opt,
             node_addr_for_response,
@@ -12674,6 +12816,7 @@ pub async fn start_node_inner(
         relay_optin_engine_for_cleanup,
         mut community_relay_publisher_handle_for_cleanup,
         mut community_relay_pull_driver_handle_for_cleanup,
+        mut vine_pull_driver_handle_for_cleanup,
         mut community_relay_gc_handle_for_cleanup,
         mut community_relay_refresher_handle_for_cleanup,
         node_addr_for_response,
@@ -12855,6 +12998,11 @@ pub async fn start_node_inner(
             h.abort();
         }
         if let Some(h) = community_relay_pull_driver_handle_for_cleanup.take() {
+            h.abort();
+        }
+        // ZEB-811 Task 8: same abort-if-Some cleanup for the vine-pull
+        // driver's task.
+        if let Some(h) = vine_pull_driver_handle_for_cleanup.take() {
             h.abort();
         }
         if let Some(h) = community_relay_gc_handle_for_cleanup.take() {
@@ -19468,6 +19616,14 @@ pub(crate) fn follow_vine_creator_impl(
         }
     }
 
+    // ZEB-811 Task 8: wake the vine-pull driver so a fresh follow pulls
+    // within seconds instead of waiting out the idle cadence (~7.5 min) —
+    // the driver's first action for a newly-followed creator is a full
+    // backfill from the genesis cursor (0, "").
+    if let Some(w) = &guard.vine_pull_wake {
+        w.notify_one();
+    }
+
     // ZEB-671: share the updated follow list on the wire (public + opt-out)
     // and refresh the Discover graph — the degree-1 set changed. The
     // graph refresh consumes the guard.
@@ -19510,6 +19666,13 @@ pub(crate) fn unfollow_vine_creator_impl(
         {
             tracing::error!("follow_tx full — unfollow update not sent to event loop");
         }
+    }
+
+    // ZEB-811 Task 8: wake the vine-pull driver so the next pass prunes this
+    // creator's sidecar entry promptly rather than waiting out the idle
+    // cadence.
+    if let Some(w) = &guard.vine_pull_wake {
+        w.notify_one();
     }
 
     // ZEB-671: share the updated follow list on the wire (public + opt-out)
@@ -75256,6 +75419,10 @@ mod start_node_race_tests {
             community_relay_pull_driver_handle: None,
             community_relay_gc_handle: None,
             community_relay_refresher_handle: None,
+            // ZEB-811 Task 8: vine-pull driver handle + wake unused in race
+            // tests.
+            vine_pull_driver_handle: None,
+            vine_pull_wake: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles unused
             // in race tests.
             dm_outhold_doc: None,

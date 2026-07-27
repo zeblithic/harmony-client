@@ -84,6 +84,12 @@ pub struct NetworkHealthSnapshot {
     /// wire type would read as that.
     #[serde(default)]
     pub community_relay: Option<CommunityRelayHealth>,
+    /// ZEB-811 Task 8: vine-relay serving/pulling health — the same
+    /// present-iff-wired, unwired-side-zeroed shape as `community_relay`
+    /// (see that field's doc for the incident-state rationale). `#[serde(default)]`
+    /// keeps a pre-ZEB-811 snapshot forward-compatible.
+    #[serde(default)]
+    pub vine_relay: Option<VineRelayHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -852,6 +858,24 @@ pub struct VinePullingHealth {
     pub recent: Vec<VinePullHit>,
 }
 
+/// ZEB-811 Task 8: combined vine-relay serving/pulling health, assembled by
+/// `NetworkHealthService::snapshot` into `NetworkHealthSnapshot.vine_relay`.
+/// Same two-sided shape as [`CommunityRelayHealth`] and for the same
+/// reason: serving (Task 6) and pulling (Task 7) are independent wiring —
+/// a node can run a vine relay without following anyone, or follow without
+/// ever being dialed as a relay — and a peer observing either side dark
+/// can't tell which fault it's looking at without both counters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VineRelayHealth {
+    /// Outbound: are we serving descriptor/content pulls to peers relaying
+    /// through us?
+    pub serving: VineRelayServingHealth,
+    /// Inbound: are we successfully pulling followed creators' descriptor
+    /// feeds from their advertised relays?
+    pub pulling: VinePullingHealth,
+}
+
 /// ZEB-811: one pull-session outcome. Short-form ids only (ZEB-329).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1063,6 +1087,8 @@ impl NetworkHealthSnapshot {
             dm_fence: None,
             // ZEB-803: no service ⇒ no relay telemetry source wired.
             community_relay: None,
+            // ZEB-811 Task 8: no service ⇒ no vine-relay telemetry wired.
+            vine_relay: None,
         }
     }
 }
@@ -1493,6 +1519,17 @@ pub struct NetworkHealthService {
     /// able to say which side was dark. Installed at boot via
     /// [`set_community_relay_pull_source`](Self::set_community_relay_pull_source).
     community_relay_pulling: Option<std::sync::Arc<CommunityRelayPullTelemetry>>,
+    /// ZEB-811 Task 8: vine-relay ACCEPTOR (serving) telemetry — the SAME
+    /// `Arc` the acceptor shell increments. `None` on nodes with no vine
+    /// relay acceptor installed. Installed at boot via
+    /// [`set_vine_relay_serving_source`](Self::set_vine_relay_serving_source).
+    vine_relay_serving: Option<std::sync::Arc<VineRelayServingTelemetry>>,
+    /// ZEB-811 Task 8: vine PULL-DRIVER (follower) telemetry — the SAME
+    /// `Arc` the driver loop increments. Held separately from the serving
+    /// source for the same reason as the community-relay pair: a node can
+    /// run one without the other. Installed at boot via
+    /// [`set_vine_pull_source`](Self::set_vine_pull_source).
+    vine_pull: Option<std::sync::Arc<VinePullTelemetry>>,
 }
 
 impl NetworkHealthService {
@@ -1524,6 +1561,8 @@ impl NetworkHealthService {
             dm_fence: None,
             community_relay_serving: None,
             community_relay_pulling: None,
+            vine_relay_serving: None,
+            vine_pull: None,
         }
     }
 
@@ -1606,6 +1645,23 @@ impl NetworkHealthService {
         src: std::sync::Arc<CommunityRelayPullTelemetry>,
     ) {
         self.community_relay_pulling = Some(src);
+    }
+
+    /// ZEB-811 Task 8: install the vine-relay ACCEPTOR (serving) telemetry
+    /// source (the same `Arc` the acceptor shell writes). Additive — when
+    /// unset, `snapshot().vine_relay` reports `None` for a node with no
+    /// vine-relay acceptor.
+    pub(crate) fn set_vine_relay_serving_source(
+        &mut self,
+        src: std::sync::Arc<VineRelayServingTelemetry>,
+    ) {
+        self.vine_relay_serving = Some(src);
+    }
+
+    /// ZEB-811 Task 8: install the vine PULL-DRIVER (follower) telemetry
+    /// source.
+    pub(crate) fn set_vine_pull_source(&mut self, src: std::sync::Arc<VinePullTelemetry>) {
+        self.vine_pull = Some(src);
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -1868,6 +1924,16 @@ impl NetworkHealthService {
             ) {
                 (None, None) => None,
                 (serving, pulling) => Some(CommunityRelayHealth {
+                    serving: serving.map(|s| s.summary()).unwrap_or_default(),
+                    pulling: pulling.map(|p| p.summary()).unwrap_or_default(),
+                }),
+            },
+            // ZEB-811 Task 8: same present-iff-wired, unwired-side-zeroed
+            // shape as `community_relay` above — see that field's match arm
+            // doc for the rationale.
+            vine_relay: match (self.vine_relay_serving.as_ref(), self.vine_pull.as_ref()) {
+                (None, None) => None,
+                (serving, pulling) => Some(VineRelayHealth {
                     serving: serving.map(|s| s.summary()).unwrap_or_default(),
                     pulling: pulling.map(|p| p.summary()).unwrap_or_default(),
                 }),
@@ -3431,6 +3497,9 @@ mod tests {
         // disabled — `my_network: None` already covers "still starting up". A
         // reason is only ever set by the IPC stamp from NodeState.
         assert!(s.transport_disabled_reason.is_none());
+        // ZEB-811 Task 8: no service ⇒ no vine-relay telemetry wired — same
+        // "no wiring" vs "wired and idle" distinction as `community_relay`.
+        assert_eq!(s.vine_relay, None);
     }
 
     #[test]
@@ -3513,6 +3582,7 @@ mod tests {
             butler_deposits: None,
             dm_fence: None,
             community_relay: None,
+            vine_relay: None,
         }
     }
 
@@ -5371,6 +5441,50 @@ mod tests {
         }
         assert!(pulling["recent"][0].get("communityShort").is_some());
         assert!(pulling["recent"][0].get("relayDeviceShort").is_some());
+        assert!(pulling["recent"][0].get("capturedAtMs").is_some());
+    }
+
+    #[test]
+    fn vine_relay_health_wire_keys_are_camel_case() {
+        // ZEB-811 Task 8: same contract as `relay_health_wire_keys_are_camel_case`
+        // above — Task 10's e2e polls `vineRelay.pulling` by these exact
+        // serde-rename keys, so a wrong key means a silent e2e timeout.
+        let t = VineRelayServingTelemetry::new();
+        t.record_served(64);
+        let p = VinePullTelemetry::new();
+        p.record_pass_start();
+        p.record_no_relay();
+        p.record_session_ok("aa".repeat(16).as_str(), &[6u8; 32], 2);
+        let health = VineRelayHealth {
+            serving: t.summary(),
+            pulling: p.summary(),
+        };
+        let v = serde_json::to_value(&health).expect("serialize");
+        let serving = &v["serving"];
+        for k in [
+            "sessionsServed",
+            "sessionsRejected",
+            "sessionsFailed",
+            "bytesServed",
+            "lastServedMs",
+        ] {
+            assert!(serving.get(k).is_some(), "missing serving key {k}");
+        }
+        let pulling = &v["pulling"];
+        for k in [
+            "passesRun",
+            "lastPassMs",
+            "sessionsOk",
+            "sessionsFailed",
+            "descriptorsIngested",
+            "lastIngestMs",
+            "passesNoRelay",
+            "recent",
+        ] {
+            assert!(pulling.get(k).is_some(), "missing pulling key {k}");
+        }
+        assert!(pulling["recent"][0].get("creatorShort").is_some());
+        assert!(pulling["recent"][0].get("relayEndpointShort").is_some());
         assert!(pulling["recent"][0].get("capturedAtMs").is_some());
     }
 
