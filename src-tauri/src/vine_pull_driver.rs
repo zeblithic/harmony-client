@@ -779,12 +779,20 @@ impl VinePullDriver {
         }
 
         // ZEB-819: single merge point for BOTH outcomes, so page-boundary
-        // progress has exactly one path into the durable cursor. On `Ok`
-        // this is a no-op (the session's last commit equals `res.cursor`,
-        // already assigned above); on `Err` — including the IO deadline
-        // dropping the session future, which returns nothing at all — it is
-        // what rescues the pages that did complete. Guarded so a stale
-        // commit can never rewind the durable cursor.
+        // progress has exactly one path into the durable cursor. The rule is
+        // MAX(cursor returned by the candidate that succeeded, highest
+        // tuple any candidate committed) — not "rescue only on Err":
+        //   * `Err` (including the IO deadline dropping the session future,
+        //     which returns nothing at all) — this is what rescues the pages
+        //     that did complete;
+        //   * `Ok` — a no-op when the successful candidate is the only one
+        //     that got anywhere, but it still bites when an EARLIER
+        //     candidate committed further before failing and the one that
+        //     finally succeeded returned a LOWER cursor (a partial-mirror
+        //     relay). Those rows were already ingested durably this pass, so
+        //     taking the lower result at face value would rewind past them.
+        // Guarded so a stale commit can never rewind the durable cursor.
+        // Pinned by `failover_keeps_the_higher_committed_cursor_over_a_lower_success`.
         if let Some(p) = progress.take() {
             if p > st.cursor {
                 st.cursor = p;
@@ -1486,15 +1494,23 @@ mod tests {
     /// has nothing to flag.
     type PullCall = (VineRelayEntry, String, (u64, String));
 
+    /// ZEB-819: one scripted page-boundary commit — the cursor a single
+    /// `pull_pages` call publishes to the sink before returning, or `None`
+    /// for a call that commits nothing. Aliased so the queue's type stays
+    /// readable (and clippy's `type_complexity` has nothing to flag).
+    type ScriptedCommit = Option<(u64, String)>;
+
     #[derive(Default)]
     struct MockTransport {
         calls: std::sync::Mutex<Vec<PullCall>>,
         script: std::sync::Mutex<VecDeque<Result<PullSessionResult, String>>>,
         /// ZEB-819: page-boundary progress this mock commits into the
-        /// caller's sink BEFORE returning its scripted result — the mock's
-        /// stand-in for a real session that finished pages and only then
-        /// hit the IO deadline.
-        commit_before_result: Option<(u64, String)>,
+        /// caller's sink BEFORE returning each scripted result — the mock's
+        /// stand-in for a real session that finished pages and only then hit
+        /// the IO deadline. Positionally aligned with `script`; an exhausted
+        /// queue commits nothing, so tests that don't care omit it and drive
+        /// the identical code path they did before ZEB-819.
+        commits: std::sync::Mutex<VecDeque<ScriptedCommit>>,
     }
 
     impl MockTransport {
@@ -1502,14 +1518,17 @@ mod tests {
             Self {
                 calls: std::sync::Mutex::new(Vec::new()),
                 script: std::sync::Mutex::new(results.into()),
-                commit_before_result: None,
+                commits: std::sync::Mutex::new(VecDeque::new()),
             }
         }
 
-        /// Every `pull_pages` call commits `cursor` into the caller's sink
-        /// before returning (see [`MockTransport::commit_before_result`]).
-        fn committing(mut self, cursor: (u64, String)) -> Self {
-            self.commit_before_result = Some(cursor);
+        /// Script one page-boundary commit PER CALL, aligned with
+        /// `with_results`' outcomes: entry *i* lands in the caller's sink
+        /// just before outcome *i* is returned. Per-call rather than a
+        /// single shared value on purpose — it is what lets a test attribute
+        /// committed progress to one specific candidate relay.
+        fn committing(mut self, commits: Vec<ScriptedCommit>) -> Self {
+            self.commits = std::sync::Mutex::new(commits.into());
             self
         }
 
@@ -1532,7 +1551,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((relay.clone(), creator.to_string(), cursor.clone()));
-            if let Some(committed) = self.commit_before_result.clone() {
+            if let Some(Some(committed)) = self.commits.lock().unwrap().pop_front() {
                 progress.commit(committed);
             }
             self.script
@@ -2082,7 +2101,7 @@ mod tests {
         // Pages 1..n landed durably (committed), then the session died.
         let transport = Arc::new(
             MockTransport::with_results(vec![Err("vine pull IO timeout".to_string())])
-                .committing((7, "g".to_string())),
+                .committing(vec![Some((7, "g".to_string()))]),
         );
         let followed = creator.clone();
         let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
@@ -2110,6 +2129,92 @@ mod tests {
             st.cursor,
             (7, "g".to_string()),
             "a failed session's committed page progress must still be persisted"
+        );
+    }
+
+    /// ZEB-819, the design's least obvious consequence: ONE sink is shared
+    /// across the candidate failover loop and merged as a MAX, so a FAILED
+    /// candidate's committed progress outranks a LATER candidate's
+    /// successful-but-lower returned cursor.
+    ///
+    /// Candidate A completes pages (committing `(9,"x")`) and then dies;
+    /// candidate B succeeds, but its relay's mirror only reaches `(5,"y")`.
+    /// Taking B's result at face value would rewind the durable cursor past
+    /// rows THIS VERY PASS already ingested durably. Only A commits here
+    /// (the mock's commit script is per-call), so this also pins that the
+    /// sink is shared across candidates rather than scoped to one, and that
+    /// the merge runs AFTER the loop's `st.cursor = res.cursor` assignment.
+    #[tokio::test]
+    async fn failover_keeps_the_higher_committed_cursor_over_a_lower_success() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "ba".repeat(16);
+        let now = 1_700_000_000_000u64;
+        let died_ahead = VineRelayEntry {
+            iroh_endpoint_id: [0x99; 32],
+            home_relay: "https://ahead-then-died".to_string(),
+        };
+        let lagging = VineRelayEntry {
+            iroh_endpoint_id: [0xAB; 32],
+            home_relay: "https://lagging-mirror".to_string(),
+        };
+
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (0, String::new()), // first follow: always pulls
+                    last_pull_attempt_ms: 0,
+                    consecutive_skips: 0,
+                    relay_set: vec![died_ahead.clone(), lagging.clone()],
+                    relays_fetched_at_ms: now, // cooldown active: no resolve
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        let transport = Arc::new(
+            MockTransport::with_results(vec![
+                Err("vine pull IO timeout".to_string()),
+                Ok(PullSessionResult {
+                    cursor: (5, "y".to_string()),
+                    ingested: 1,
+                    skipped_invalid: 0,
+                }),
+            ])
+            .committing(vec![Some((9, "x".to_string())), None]),
+        );
+        let followed = creator.clone();
+        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
+        let last_received: LastReceivedMsFn = Arc::new(|_| None);
+
+        let driver = VinePullDriver::new(
+            [0xFF; 32],
+            inert_pkarr_resolver(),
+            transport.clone(),
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path.clone(),
+        );
+
+        driver.run_one_pass(now).await;
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 2, "the failed candidate must fail over to B");
+        assert_eq!(calls[0].0.iroh_endpoint_id, died_ahead.iroh_endpoint_id);
+        assert_eq!(calls[1].0.iroh_endpoint_id, lagging.iroh_endpoint_id);
+
+        let st = load_vine_pull(&sidecar_path)
+            .per_creator
+            .get(&creator)
+            .cloned()
+            .expect("creator state must persist");
+        assert_eq!(
+            st.cursor,
+            (9, "x".to_string()),
+            "the merge is a MAX: a succeeding candidate's LOWER cursor must not \
+             rewind progress an earlier failed candidate already committed"
         );
     }
 }
