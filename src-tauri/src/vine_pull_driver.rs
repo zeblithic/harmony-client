@@ -69,6 +69,14 @@ pub const VINE_PULL_INTERVAL_MS: u64 =
 /// the driver between resolves, including across resolve failures.
 pub const VINE_PKARR_RESOLVE_COOLDOWN_MS: u64 = 15 * 60 * 1000;
 
+/// ZEB-818: an unverifiable row may advance the pull cursor only within a
+/// plausible clock window. Rows that fail ingest AND claim a `created_at`
+/// further than this ahead of local time are treated as hostile-relay
+/// cursor poisoning and do not advance. Seconds domain (descriptor
+/// `created_at` is seconds; the session clock is ms). 30 min matches the
+/// house forward-skew defaults (cf. `friend_intro::INTRODUCTION_MAX_FORWARD_SKEW_MS`).
+pub const VINE_PULL_INVALID_FORWARD_SKEW_SECS: u64 = 30 * 60;
+
 /// Consecutive passes a creator may be skipped while live mesh delivery
 /// looks fresher than the last pull attempt, before the driver forces a
 /// pull anyway. See the module doc's "bounded mesh-live skip" section.
@@ -252,7 +260,24 @@ where
                 }
                 IngestVerdict::SkipInvalid => {
                     skipped_invalid += 1;
-                    cursor = candidate;
+                    // ZEB-818: this row is unverifiable, so its claimed
+                    // `created_at` is attacker-chosen. Advancing to an
+                    // implausibly future one would let a hostile relay poison
+                    // the persisted cursor past every genuine descriptor
+                    // forever. `created_at` is seconds, `now_ms` is ms — the
+                    // comparison is in the seconds domain. A full page of
+                    // these advances nothing and ends the session via the
+                    // zero-advance guard below.
+                    if candidate.0 > now_ms / 1000 + VINE_PULL_INVALID_FORWARD_SKEW_SECS {
+                        tracing::debug!(
+                            creator,
+                            created_at = candidate.0,
+                            "ZEB-818 pull: refusing cursor advance to an implausibly \
+                             future-dated unverifiable row"
+                        );
+                    } else {
+                        cursor = candidate;
+                    }
                 }
                 IngestVerdict::Halt => {
                     return Ok(PullSessionResult {
@@ -997,6 +1022,185 @@ mod tests {
             "a duplicate must never inflate the ingest telemetry counter"
         );
         assert_eq!(result.skipped_invalid, 0);
+    }
+
+    // ── ZEB-818: unverified-cursor forward-skew clamp ──
+
+    /// The session clock every skew test runs against. `now_ms` is
+    /// MILLISECONDS; a descriptor's `created_at` is SECONDS — the clamp
+    /// compares in the seconds domain, so both are pinned here rather than
+    /// spelled inline where a factor of 1000 could hide.
+    const TEST_NOW_MS: u64 = 1_700_000_000_000;
+    const TEST_NOW_SECS: u64 = TEST_NOW_MS / 1000;
+
+    /// The `(after_created_at, after_id)` cursor a query carries — the wire
+    /// form of the tuple the row loop produced.
+    fn query_cursor(q: &VinePullQuery) -> (u64, &str) {
+        (q.after_created_at, q.after_id.as_str())
+    }
+
+    /// Pads `tail` out to a page of exactly `VINE_PULL_PAGE_LIMIT_MAX` rows
+    /// with ordinary past-dated rows the ingest accepts, returning the rows
+    /// and the matching verdict script. The page must be exactly full for
+    /// the session to issue a SECOND query — the only place the cursor the
+    /// row loop produced becomes observable on the wire.
+    fn full_page_with_tail(
+        tail: Vec<(Vec<u8>, IngestVerdict)>,
+    ) -> (Vec<Vec<u8>>, Vec<IngestVerdict>) {
+        let filler = VINE_PULL_PAGE_LIMIT_MAX as usize - tail.len();
+        let mut rows: Vec<Vec<u8>> = (0..filler)
+            .map(|i| {
+                descriptor_json(
+                    &format!("fill{i:03}"),
+                    TEST_NOW_SECS - filler as u64 + i as u64,
+                )
+            })
+            .collect();
+        let mut verdicts = vec![IngestVerdict::Advance; filler];
+        for (row, verdict) in tail {
+            rows.push(row);
+            verdicts.push(verdict);
+        }
+        assert_eq!(rows.len(), VINE_PULL_PAGE_LIMIT_MAX as usize);
+        (rows, verdicts)
+    }
+
+    /// Drives one session over duplex: the server answers the first query
+    /// with `rows`, captures the SECOND query (the one carrying the cursor
+    /// the row loop just produced), then answers it with an empty page so
+    /// the session ends. Both halves are under an outer timeout so a
+    /// regression fails fast instead of hanging the suite.
+    async fn run_session_capturing_second_query(
+        rows: Vec<Vec<u8>>,
+        verdicts: Vec<IngestVerdict>,
+    ) -> (PullSessionResult, VinePullQuery) {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+
+        let server_task = tokio::spawn(async move {
+            let _first = read_fake_query(&mut server_read).await;
+            write_fake_page_response(&mut server_write, rows).await;
+            let second = read_fake_query(&mut server_read).await;
+            // Short page ends the session.
+            write_fake_page_response(&mut server_write, vec![]).await;
+            // `tokio::io::split` shares the stream via an internal Arc — a
+            // bare drop does NOT half-close it (see the note at the top of
+            // `cursor_advances_past_invalid_but_not_past_halt`).
+            let _ = server_write.shutdown().await;
+            second
+        });
+
+        let ingest = ScriptedIngest::new(verdicts);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_vine_pull_client_session(
+                &mut client_read,
+                &mut client_write,
+                "creator-skew",
+                (0, String::new()),
+                &ingest,
+                TEST_NOW_MS,
+            ),
+        )
+        .await
+        .expect("session must terminate promptly, not hang")
+        .expect("session must not error");
+
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+            .await
+            .expect("server task must finish promptly")
+            .expect("server task must not panic");
+
+        (result, second)
+    }
+
+    /// ZEB-818: an unverifiable row with an implausibly future `created_at`
+    /// must not advance the cursor — a hostile relay could otherwise poison
+    /// the persisted cursor past all genuine descriptors forever.
+    #[tokio::test]
+    async fn skip_invalid_refuses_cursor_advance_past_forward_skew() {
+        let (rows, verdicts) = full_page_with_tail(vec![
+            (descriptor_json("ok", 1_700_000_100), IngestVerdict::Advance),
+            (
+                descriptor_json("evil", u64::MAX),
+                IngestVerdict::SkipInvalid,
+            ),
+        ]);
+
+        let (result, second_query) = run_session_capturing_second_query(rows, verdicts).await;
+
+        assert_eq!(
+            query_cursor(&second_query),
+            (1_700_000_100, "ok"),
+            "the next query must resume from the last genuine row, never from \
+             the poisoned far-future one"
+        );
+        assert_eq!(result.cursor, (1_700_000_100, "ok".to_string()));
+        assert_eq!(result.ingested, VINE_PULL_PAGE_LIMIT_MAX as u32 - 1);
+        assert_eq!(
+            result.skipped_invalid, 1,
+            "the refused row is still counted as skipped-invalid"
+        );
+    }
+
+    /// Plausibly-timed invalid rows must STILL advance the cursor
+    /// (tombstones, trim victims — refusing them would livelock the driver
+    /// on any ordinary invalid region).
+    #[tokio::test]
+    async fn skip_invalid_within_skew_still_advances() {
+        let (rows, verdicts) = full_page_with_tail(vec![(
+            descriptor_json("dead", 1_700_000_050),
+            IngestVerdict::SkipInvalid,
+        )]);
+
+        let (result, second_query) = run_session_capturing_second_query(rows, verdicts).await;
+
+        assert_eq!(
+            query_cursor(&second_query),
+            (1_700_000_050, "dead"),
+            "an ordinary invalid row must still move the cursor past itself"
+        );
+        assert_eq!(result.cursor, (1_700_000_050, "dead".to_string()));
+        assert_eq!(result.skipped_invalid, 1);
+    }
+
+    /// Boundary: `created_at == now_secs + SKEW` advances;
+    /// `created_at == now_secs + SKEW + 1` is refused.
+    #[tokio::test]
+    async fn skip_invalid_skew_boundary_is_exact() {
+        let just_inside = TEST_NOW_SECS + VINE_PULL_INVALID_FORWARD_SKEW_SECS;
+        let (rows, verdicts) = full_page_with_tail(vec![(
+            descriptor_json("edge", just_inside),
+            IngestVerdict::SkipInvalid,
+        )]);
+        let (result, second_query) = run_session_capturing_second_query(rows, verdicts).await;
+        assert_eq!(
+            query_cursor(&second_query),
+            (just_inside, "edge"),
+            "exactly `SKEW` seconds ahead is still inside the window"
+        );
+        assert_eq!(result.cursor, (just_inside, "edge".to_string()));
+
+        let just_outside = TEST_NOW_SECS + VINE_PULL_INVALID_FORWARD_SKEW_SECS + 1;
+        let anchor_created_at = TEST_NOW_SECS - 10;
+        let (rows, verdicts) = full_page_with_tail(vec![
+            (
+                descriptor_json("anchor", anchor_created_at),
+                IngestVerdict::Advance,
+            ),
+            (
+                descriptor_json("edge-plus-one", just_outside),
+                IngestVerdict::SkipInvalid,
+            ),
+        ]);
+        let (result, second_query) = run_session_capturing_second_query(rows, verdicts).await;
+        assert_eq!(
+            query_cursor(&second_query),
+            (anchor_created_at, "anchor"),
+            "one second past `SKEW` is outside the window and must not advance"
+        );
+        assert_eq!(result.cursor, (anchor_created_at, "anchor".to_string()));
     }
 
     #[test]
