@@ -9439,6 +9439,15 @@ pub async fn start_node_inner(
                                 })
                                 .unwrap_or(0)
                         });
+                    // ZEB-811 final review: named (not anonymous) so the
+                    // vine-relay serve acceptor installed later in this same
+                    // boot sequence can hold a clone of the SAME atomic —
+                    // `PkarrVinesPublisher::enable`/`disable` mutate it live,
+                    // so the serve ctx's gate check reflects a settings
+                    // toggle on the very next request, no acceptor reinstall
+                    // needed.
+                    let vine_share_publicly_gate =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let pkarr_vines_pub =
                         std::sync::Arc::new(pkarr_vines_publisher::PkarrVinesPublisher::new(
                             std::sync::Arc::clone(&pkarr_publisher_arc),
@@ -9446,7 +9455,7 @@ pub async fn start_node_inner(
                             (*signing_key_arc).clone(),
                             identity_pub_64,
                             iroh_endpoint_arc.clone(),
-                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            std::sync::Arc::clone(&vine_share_publicly_gate),
                             has_own_vines,
                         ));
                     if vine_settings_loaded.share_vines_publicly {
@@ -10719,6 +10728,11 @@ pub async fn start_node_inner(
                         > = std::sync::Arc::new(crate::vine_relay::ProdVineRelayServeCtx {
                             cache: std::sync::Arc::clone(&vine_feed_cache),
                             content_store: std::sync::Arc::clone(&content_store),
+                            // ZEB-811 final review: request-time share gate +
+                            // own-creator scope — see `ProdVineRelayServeCtx`
+                            // doc. Same atomic `PkarrVinesPublisher` toggles.
+                            own_creator_addr: node_addr.clone(),
+                            share_gate: std::sync::Arc::clone(&vine_share_publicly_gate),
                         });
                         if link_mgr
                             .install_vine_relay_acceptor(std::sync::Arc::new(

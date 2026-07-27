@@ -298,3 +298,12 @@ cache).
     (sessions, descriptors ingested/served) rather than only on the
     end-to-end outcome, so a pass can't be explained by an accidental
     non-relay delivery path.
+
+12. **Multi-device creators publish only their own device's relay, not a
+    fleet-aggregated set.** Each device signs and publishes
+    `relay_set = [self]` under the same per-creator vines pkarr slot key, so
+    a creator enrolled on more than one device produces last-writer-wins
+    overwrites rather than the merged ≤4-entry set §1 describes — followers
+    only ever see whichever device published most recently. Aggregating
+    relay entries across a creator's fleet, so followers see every device's
+    relay rather than just the last publisher's, is left as future work.

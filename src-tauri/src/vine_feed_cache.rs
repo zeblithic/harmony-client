@@ -791,15 +791,23 @@ impl VineFeedCache {
     }
 
     /// ZEB-811: true when `cid_hex` is the `video_cid` of at least one
-    /// signature-retaining cached descriptor (any creator). Backs the
-    /// vine-relay serve ctx's content allowlist — resolved from THIS node's
-    /// own cache, never from a requester's claim, so an anonymous peer
-    /// cannot turn this node into an open blob-serving proxy for arbitrary
-    /// CIDs. Mirrors the same sig-retained filter as
+    /// signature-retaining cached descriptor from `creator` SPECIFICALLY.
+    /// Backs the vine-relay serve ctx's content allowlist — resolved from
+    /// THIS node's own cache, never from a requester's claim, so an
+    /// anonymous peer cannot turn this node into an open blob-serving proxy
+    /// for arbitrary CIDs. Mirrors the same sig-retained filter as
     /// `descriptors_for_creator_page`.
-    pub fn video_cid_is_served(&self, cid_hex: &str) -> bool {
+    ///
+    /// ZEB-811 final review: scoped to `creator` (the caller passes its own
+    /// address) rather than "any cached creator" — a v1 vine relay serves
+    /// only its own creator's content, and the caller (`ProdVineRelayServeCtx`)
+    /// already enforces the same scope on `descriptors_for_creator_page`;
+    /// this scope must match or the content path would leak a broader
+    /// allowlist than the descriptor path.
+    pub fn video_cid_is_served(&self, creator: &str, cid_hex: &str) -> bool {
         self.descriptors.values().any(|cv| {
-            (cv.descriptor.sig.is_some() || cv.descriptor.device_sig.is_some())
+            cv.descriptor.creator_address == creator
+                && (cv.descriptor.sig.is_some() || cv.descriptor.device_sig.is_some())
                 && cv.descriptor.video_cid == cid_hex
         })
     }
@@ -1469,6 +1477,25 @@ impl VineFeedCache {
     #[cfg(test)]
     pub fn len_tombstones(&self) -> usize {
         self.tombstones.len()
+    }
+
+    /// ZEB-811: test-only descriptor seeder — inserts `descriptor` directly
+    /// into the cache, bypassing `on_descriptor_sample`'s signature-
+    /// verification pipeline entirely. Callers set `sig`/`device_sig` on the
+    /// payload themselves to control whether a row is signature-retaining
+    /// (served) or not — this exists to test the SERVE-SIDE filters
+    /// (`descriptors_for_creator_page`, `video_cid_is_served`), not
+    /// signature correctness (covered separately by the real-ingest tests).
+    #[cfg(test)]
+    pub fn seed_descriptor_for_test(&mut self, descriptor: VineDescriptorPayload) {
+        self.descriptors.insert(
+            descriptor.id.clone(),
+            CachedVine {
+                descriptor,
+                received_at_ms: 0,
+                source: VineSource::Followed,
+            },
+        );
     }
 
     /// Number of cached descriptors. Test helper.

@@ -36,6 +36,15 @@
 //!   this node dial the mesh on its behalf. The served bytes are
 //!   re-verified against the CID (`ContentId::verify_hash`) before being
 //!   handed to the wire.
+//! - **Share gate + own-creator scope** (`ProdVineRelayServeCtx`): both
+//!   descriptor pages and content are refused unless `share_vines_publicly`
+//!   is on (checked live, per request) AND the requested creator is THIS
+//!   node's own creator address — a v1 relay never serves another (e.g.
+//!   followed) creator's cached vines. Without this, an anonymous peer
+//!   could probe an arbitrary creator address against this node and learn
+//!   whether it's followed/discovered from an empty-vs-nonempty response —
+//!   a zero-auth read of the private follow graph that the sig-presence
+//!   filter alone does not prevent.
 //!
 //! ## Wire shape
 //!
@@ -267,14 +276,51 @@ pub trait VineRelayServeCtx: Send + Sync {
 /// `VineFeedCache` + `ContentStore` — the same state the local IPCs and
 /// event loop already maintain, so a vine relay serves exactly what it has
 /// locally cached (nothing is fetched on a requester's behalf).
+///
+/// ZEB-811 final review: gated on TWO conditions, both enforced at
+/// REQUEST time (not just at acceptor-install time, so a live settings
+/// toggle takes effect on the very next request without an acceptor
+/// reinstall):
+///
+/// - `share_gate` OFF → serve nothing (empty descriptor page, refused
+///   content) — this is a live mirror of `share_vines_publicly`, the SAME
+///   `Arc<AtomicBool>` `PkarrVinesPublisher` toggles via `enable`/`disable`.
+/// - `creator != own_creator_addr` → serve nothing. A v1 vine relay serves
+///   ONLY its own creator's vines: both the pull driver and the video
+///   fallback dial a creator's OWN published relay set, so nothing in this
+///   branch needs cross-creator serving. Without this scope, an anonymous
+///   peer holding this node's endpoint id could query `descriptors_page`
+///   for an arbitrary creator address and learn whether THIS node follows
+///   or has discovered them from the empty-vs-nonempty response — a
+///   zero-auth probe of the node's private follow graph that the
+///   sig-presence-only filter (`VineFeedCache::descriptors_for_creator_page`)
+///   does nothing to prevent, since it filters by SIGNATURE, not by
+///   creator identity.
 pub struct ProdVineRelayServeCtx {
     pub cache: Arc<std::sync::Mutex<crate::vine_feed_cache::VineFeedCache>>,
     pub content_store: Arc<dyn crate::content_store::ContentStore>,
+    /// This node's own creator address (`node_addr` hex) — the only
+    /// creator this relay will ever serve. See struct doc.
+    pub own_creator_addr: String,
+    /// Live mirror of `share_vines_publicly`: the SAME `Arc<AtomicBool>`
+    /// `PkarrVinesPublisher` reads/writes via `enable`/`disable`, so a
+    /// runtime toggle is observed on the very next request.
+    pub share_gate: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ProdVineRelayServeCtx {
+    fn gate_open(&self) -> bool {
+        self.share_gate.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[async_trait::async_trait]
 impl VineRelayServeCtx for ProdVineRelayServeCtx {
     fn descriptors_page(&self, creator: &str, after: &(u64, String), limit: usize) -> Vec<Vec<u8>> {
+        // Both checks are request-time, not install-time — see struct doc.
+        if !self.gate_open() || creator != self.own_creator_addr {
+            return Vec::new();
+        }
         // A poisoned lock fails closed (empty page) rather than panicking —
         // this ctx serves an anonymous, unauthenticated peer.
         let Ok(cache) = self.cache.lock() else {
@@ -288,13 +334,20 @@ impl VineRelayServeCtx for ProdVineRelayServeCtx {
     }
 
     fn video_cid_is_served(&self, cid_hex: &str) -> bool {
+        if !self.gate_open() {
+            return false;
+        }
         let Ok(cache) = self.cache.lock() else {
             return false;
         };
-        cache.video_cid_is_served(cid_hex)
+        // Scoped to `own_creator_addr` — see struct doc.
+        cache.video_cid_is_served(&self.own_creator_addr, cid_hex)
     }
 
     async fn video_bytes(&self, cid_hex: &str) -> Option<Vec<u8>> {
+        // No redundant gate/scope check here: `run_vine_relay_session`'s
+        // `serve_content` only ever calls `video_bytes` after
+        // `video_cid_is_served` (above) has already passed.
         let cid_bytes = crate::parse_cid_hex(cid_hex).ok()?;
         let cid = crate::owner_state_types::ContentId::from_bytes(cid_bytes);
         // `get_local` ONLY — never `get` — so an anonymous requester can
@@ -1057,5 +1110,144 @@ mod tests {
         // Releasing one permit frees a slot.
         permits.pop();
         assert!(admission.try_admit().is_some());
+    }
+
+    // ── ZEB-811 final review: ProdVineRelayServeCtx share gate + own-creator scope ──
+
+    /// Build a signature-retaining descriptor fixture — `sig` is a fake
+    /// string, not a real signature; these tests exercise the SERVE-SIDE
+    /// gate/scope filters, not signature verification (that's Task 5's own
+    /// ingest tests).
+    fn signed_descriptor(
+        id: &str,
+        creator: &str,
+        video_cid: &str,
+        created_at: u64,
+    ) -> crate::VineDescriptorPayload {
+        crate::VineDescriptorPayload {
+            id: id.to_string(),
+            creator_address: creator.to_string(),
+            creator_name: "Name".to_string(),
+            created_at,
+            video_cid: video_cid.to_string(),
+            title: None,
+            reshare_of: None,
+            original_creator_address: None,
+            original_creator_name: None,
+            identity_pub: Some("fake-identity-pub".to_string()),
+            sig: Some("fake-sig".to_string()),
+            device_sig: None,
+        }
+    }
+
+    /// Mint a real `ContentId` for `bytes` (so `ContentId::verify_hash`
+    /// actually passes) and its hex string.
+    fn make_content(bytes: Vec<u8>) -> (String, Vec<u8>) {
+        use harmony_content::cid::{ContentFlags, ContentId};
+        let cid = ContentId::for_book(&bytes, ContentFlags::default()).expect("build content id");
+        (hex::encode(cid.to_bytes()), bytes)
+    }
+
+    #[tokio::test]
+    async fn share_gate_off_serves_nothing_even_for_own_creator() {
+        let own = "own-creator-addr";
+        let (video_cid_hex, video_bytes) = make_content(b"own creator's video bytes".to_vec());
+
+        let mut cache = crate::vine_feed_cache::VineFeedCache::new();
+        cache.seed_descriptor_for_test(signed_descriptor("v1", own, &video_cid_hex, 100));
+
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let cid_bytes = crate::parse_cid_hex(&video_cid_hex).expect("parse cid hex");
+        content_store
+            .put(
+                crate::owner_state_types::ContentId::from_bytes(cid_bytes),
+                video_bytes,
+            )
+            .await
+            .expect("seed content store");
+
+        let ctx = ProdVineRelayServeCtx {
+            cache: Arc::new(std::sync::Mutex::new(cache)),
+            content_store,
+            own_creator_addr: own.to_string(),
+            share_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)), // OFF
+        };
+
+        let page = ctx.descriptors_page(own, &(0, String::new()), 10);
+        assert!(
+            page.is_empty(),
+            "gate OFF must serve no descriptors, even for the own creator"
+        );
+        assert!(
+            !ctx.video_cid_is_served(&video_cid_hex),
+            "gate OFF must refuse content too"
+        );
+    }
+
+    #[tokio::test]
+    async fn serves_only_own_creator_not_a_followed_other() {
+        let own = "own-creator-addr";
+        let other = "followed-other-addr";
+        let (own_cid_hex, own_bytes) = make_content(b"own creator's video".to_vec());
+        let (other_cid_hex, other_bytes) = make_content(b"other creator's video".to_vec());
+
+        let mut cache = crate::vine_feed_cache::VineFeedCache::new();
+        cache.seed_descriptor_for_test(signed_descriptor("own-v1", own, &own_cid_hex, 100));
+        cache.seed_descriptor_for_test(signed_descriptor("other-v1", other, &other_cid_hex, 100));
+
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        content_store
+            .put(
+                crate::owner_state_types::ContentId::from_bytes(
+                    crate::parse_cid_hex(&own_cid_hex).expect("parse own cid hex"),
+                ),
+                own_bytes.clone(),
+            )
+            .await
+            .expect("seed own content");
+        content_store
+            .put(
+                crate::owner_state_types::ContentId::from_bytes(
+                    crate::parse_cid_hex(&other_cid_hex).expect("parse other cid hex"),
+                ),
+                other_bytes,
+            )
+            .await
+            .expect("seed other content");
+
+        let ctx = ProdVineRelayServeCtx {
+            cache: Arc::new(std::sync::Mutex::new(cache)),
+            content_store,
+            own_creator_addr: own.to_string(),
+            share_gate: Arc::new(std::sync::atomic::AtomicBool::new(true)), // ON
+        };
+
+        // Own creator: served.
+        let own_page = ctx.descriptors_page(own, &(0, String::new()), 10);
+        assert_eq!(
+            own_page.len(),
+            1,
+            "own creator's descriptors must be served"
+        );
+        assert!(
+            ctx.video_cid_is_served(&own_cid_hex),
+            "own creator's video cid must be allowlisted"
+        );
+        assert_eq!(ctx.video_bytes(&own_cid_hex).await, Some(own_bytes));
+
+        // Other (followed) creator: refused — a v1 relay serves only its
+        // own creator, and this is exactly what defeats the follow-graph
+        // probe the final review flagged.
+        let other_page = ctx.descriptors_page(other, &(0, String::new()), 10);
+        assert!(
+            other_page.is_empty(),
+            "a followed OTHER creator's descriptors must not be served"
+        );
+        assert!(
+            !ctx.video_cid_is_served(&other_cid_hex),
+            "a followed OTHER creator's video cid must not be allowlisted"
+        );
     }
 }
