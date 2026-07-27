@@ -3096,7 +3096,7 @@ dependencies = [
 [[package]]
 name = "harmony-pkarr"
 version = "0.1.0"
-source = "git+https://github.com/zeblithic/harmony.git?rev=b922213798bf39bc6a22b1fac003c3d4780285ee#b922213798bf39bc6a22b1fac003c3d4780285ee"
+source = "git+https://github.com/zeblithic/harmony.git?rev=e64e2671c1ef863c09045920361b1dd00cfcceab#e64e2671c1ef863c09045920361b1dd00cfcceab"
 dependencies = [
  "async-trait",
  "axum",
