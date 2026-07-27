@@ -245,6 +245,7 @@ pub mod pkarr_identity_publisher;
 pub mod pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
 pub mod pkarr_vines;
+pub mod pkarr_vines_publisher;
 pub mod profile;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;
@@ -1639,6 +1640,12 @@ pub struct NodeState {
     pub pkarr_identity_publisher:
         Option<std::sync::Arc<pkarr_identity_publisher::PkarrIdentityPublisher>>,
 
+    /// Case E lifecycle manager (ZEB-811) — registers / unregisters this
+    /// device's own vine relay-set pkarr publication when the "Share vines
+    /// publicly" toggle changes or the owner's own-vine count crosses 0.
+    pub pkarr_vines_publisher:
+        Option<std::sync::Arc<pkarr_vines_publisher::PkarrVinesPublisher>>,
+
     /// Case C lifecycle manager — registers / unregisters per-community
     /// pkarr publications on community join/leave/kick events.
     pub pkarr_community_publisher:
@@ -1801,6 +1808,9 @@ impl NodeState {
         self.pkarr_relay_client = None;
         self.pkarr_invite_publisher = None;
         self.pkarr_identity_publisher = None;
+        // ZEB-811 Task 4: drop the Case-E vines publisher so a restart
+        // rebuilds it against the fresh pkarr publisher / iroh endpoint.
+        self.pkarr_vines_publisher = None;
         self.pkarr_community_publisher = None;
         self.connectivity_settings_path = None;
         // ZEB-329: drop the synthesis-only service so a restart
@@ -2090,6 +2100,7 @@ impl Default for NodeState {
             pkarr_relay_client: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
+            pkarr_vines_publisher: None,
             pkarr_community_publisher: None,
             connectivity_settings_path: None,
             pkarr_publisher_handle: None,
@@ -4532,6 +4543,11 @@ pub async fn start_node_inner(
         > = None;
         let mut pkarr_identity_publisher_for_state: Option<
             std::sync::Arc<pkarr_identity_publisher::PkarrIdentityPublisher>,
+        > = None;
+        // ZEB-811 Task 4: lifted Case-E vines publisher (built in the pkarr
+        // setup block, alongside the other flavor managers).
+        let mut pkarr_vines_publisher_for_state: Option<
+            std::sync::Arc<pkarr_vines_publisher::PkarrVinesPublisher>,
         > = None;
         let mut pkarr_community_publisher_for_state: Option<
             std::sync::Arc<pkarr_community_publisher::PkarrCommunityPublisher>,
@@ -9333,6 +9349,59 @@ pub async fn start_node_inner(
                         }
                     }
 
+                    // ── ZEB-811 Task 4: Case-E vines publisher ──
+                    //
+                    // Publishes this device's own vine relay-set record
+                    // (self iroh endpoint + home relay) under the vines
+                    // pkarr slot, gated on `share_vines_publicly` AND the
+                    // owner having at least one own published vine. Keyed
+                    // by the owner's public hex address (`node_addr`) —
+                    // NOT the identity pub — since a follower who never
+                    // exchanged identity material still holds the address
+                    // (see `pkarr_vines` module doc). `has_own_vines`
+                    // re-counts the local cache fresh on every gate check /
+                    // publish tick rather than tracking a running counter,
+                    // since `vine_feed_cache` is the single source of
+                    // truth and the cache is small.
+                    let vines_own_addr = node_addr.clone();
+                    let vines_feed_cache_for_gate = std::sync::Arc::clone(&vine_feed_cache);
+                    let vines_own_addr_for_gate = vines_own_addr.clone();
+                    let has_own_vines: std::sync::Arc<dyn Fn() -> usize + Send + Sync> =
+                        std::sync::Arc::new(move || {
+                            vines_feed_cache_for_gate
+                                .lock()
+                                .map(|cache| {
+                                    cache
+                                        .list_descriptors()
+                                        .iter()
+                                        .filter(|v| v.creator_address == vines_own_addr_for_gate)
+                                        .count()
+                                })
+                                .unwrap_or(0)
+                        });
+                    let pkarr_vines_pub = std::sync::Arc::new(
+                        pkarr_vines_publisher::PkarrVinesPublisher::new(
+                            std::sync::Arc::clone(&pkarr_publisher_arc),
+                            vines_own_addr,
+                            (*signing_key_arc).clone(),
+                            identity_pub_64,
+                            iroh_endpoint_arc.clone(),
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            has_own_vines,
+                        ),
+                    );
+                    if vine_settings_loaded.share_vines_publicly {
+                        pkarr_vines_pub.enable().await;
+                        tracing::info!(
+                            "ZEB-811: vines sharing ON — case-E relay record published \
+                             iff at least one own vine exists"
+                        );
+                    } else {
+                        tracing::info!(
+                            "ZEB-811: vines sharing OFF — case-E relay record not published"
+                        );
+                    }
+
                     // Restore case-B if enabled (connectivity_settings loaded above, hoisted by ZEB-380).
                     if connectivity_settings.identity_discoverable {
                         pkarr_identity_pub.enable().await;
@@ -9847,6 +9916,7 @@ pub async fn start_node_inner(
                     pkarr_relay_client_for_state = Some(pkarr_relay_client);
                     pkarr_invite_publisher_for_state = Some(pkarr_invite_pub);
                     pkarr_identity_publisher_for_state = Some(pkarr_identity_pub);
+                    pkarr_vines_publisher_for_state = Some(pkarr_vines_pub);
                     pkarr_community_publisher_for_state = Some(pkarr_community_pub);
                     pkarr_settings_path_for_state = Some(connectivity_settings_path);
                     pkarr_publisher_handle_for_state = Some(pkarr_publisher_join);
@@ -12182,6 +12252,7 @@ pub async fn start_node_inner(
                         guard.pkarr_relay_client = pkarr_relay_client_for_state.take();
                         guard.pkarr_invite_publisher = pkarr_invite_publisher_for_state.take();
                         guard.pkarr_identity_publisher = pkarr_identity_publisher_for_state.take();
+                        guard.pkarr_vines_publisher = pkarr_vines_publisher_for_state.take();
                         guard.pkarr_community_publisher =
                             pkarr_community_publisher_for_state.take();
                         guard.connectivity_settings_path = pkarr_settings_path_for_state.take();
@@ -16242,9 +16313,27 @@ pub(crate) async fn publish_vine_descriptor(
         .await
         .map_err(|_| "event loop not running".to_string())?;
 
-    reply_rx
+    let result = reply_rx
         .await
-        .map_err(|_| "event loop dropped publish request".to_string())?
+        .map_err(|_| "event loop dropped publish request".to_string())?;
+
+    if result.is_ok() {
+        // ZEB-811 Task 4: force-republish the case-E vines relay record.
+        // Covers "first vine ever" flipping the has-vines gate (the record
+        // was skipped/unregistered until now) without waiting for the next
+        // scheduled pkarr cadence tick; a cheap no-op when already
+        // registered with the gate open. Spawned, never inline-awaited —
+        // this IPC must not block on pkarr network I/O.
+        let vines_publisher = state
+            .lock()
+            .ok()
+            .and_then(|g| g.pkarr_vines_publisher.clone());
+        if let Some(vp) = vines_publisher {
+            tokio::spawn(async move { vp.republish().await });
+        }
+    }
+
+    result
 }
 
 /// Publish a vine descriptor to the mesh network via Zenoh pub/sub.
@@ -19205,10 +19294,13 @@ fn get_vine_settings(state: tauri::State<'_, Mutex<NodeState>>) -> Result<VineSe
 /// `share_follows` off publishes an EMPTY signed list — the LWW
 /// retraction that clears this owner's edges on every receiver — and
 /// suppresses all further publishes; flipping it on republishes the
-/// current list. `share_vines_publicly` is persisted here but has no
-/// live wire effect yet — Task 4 wires the pkarr vines publisher this
-/// flag gates. Persisting to disk is best-effort (path is `None` until
-/// a node has started).
+/// current list. `share_vines_publicly` is persisted here AND (ZEB-811
+/// Task 4) toggles the case-E pkarr vines publisher — detached, since
+/// this seam is sync (holds the std `Mutex` guard) and can't await the
+/// publisher's own registration RPC directly; see
+/// `pkarr_vines_publisher::PkarrVinesPublisher::enable`/`disable`.
+/// Persisting to disk is best-effort (path is `None` until a node has
+/// started).
 pub(crate) fn set_vine_settings_impl(
     state: &Mutex<NodeState>,
     share_follows: bool,
@@ -19216,6 +19308,7 @@ pub(crate) fn set_vine_settings_impl(
 ) -> Result<(), String> {
     let mut guard = state.lock().map_err(|e| format!("lock: {e}"))?;
     let changed = guard.vine_share_follows != share_follows;
+    let publicly_changed = guard.vine_share_publicly != share_vines_publicly;
 
     // Disabling is TRANSACTIONAL (Greptile PR #447 P1): the empty-list
     // retraction must be signed and queued BEFORE the flag flips —
@@ -19230,10 +19323,25 @@ pub(crate) fn set_vine_settings_impl(
     }
 
     guard.vine_share_follows = share_follows;
-    // ZEB-811: persist-first — no transactional retraction needed yet,
-    // since nothing publishes off this flag until Task 4 lands.
+    // ZEB-811: persist-first — the live pkarr toggle below is spawned
+    // AFTER this assignment so a settings-load race never observes the
+    // old value.
     guard.vine_share_publicly = share_vines_publicly;
-    // ZEB-811 Task 4 wires the publisher enable/disable here
+    // ZEB-811 Task 4: live toggle the case-E vines relay publication.
+    // Detached (not awaited) — this fn is sync and holds the guard; the
+    // spawned task runs to completion independent of this call's return.
+    // No-op when no node is running (`pkarr_vines_publisher` is `None`).
+    if publicly_changed {
+        if let Some(vp) = guard.pkarr_vines_publisher.clone() {
+            tokio::spawn(async move {
+                if share_vines_publicly {
+                    vp.enable().await;
+                } else {
+                    vp.disable().await;
+                }
+            });
+        }
+    }
     if let Some(path) = guard.vine_settings_path.clone() {
         vine_settings::save(
             &path,
@@ -75136,6 +75244,7 @@ mod start_node_race_tests {
             pkarr_relay_client: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
+            pkarr_vines_publisher: None,
             pkarr_community_publisher: None,
             connectivity_settings_path: None,
             pkarr_publisher_handle: None,
