@@ -129,8 +129,10 @@ pub fn verify_vines_record(
 
 /// Resolve a creator's vine relay set: query the 3-epoch tolerance window in
 /// parallel (same pattern as the identity-keyed resolve, `lib.rs`
-/// `add_friend_by_key`), take the freshest record across relays, verify it,
-/// and return the bound relay set.
+/// `add_friend_by_key`), take the freshest **verified** record across relays,
+/// and return the bound relay set. Verification runs per candidate inside the
+/// resolver (ZEB-817) — see the call site below for why post-hoc verification
+/// of a single freshest-by-seq winner is not sufficient for this case.
 pub async fn resolve_vine_relays(
     resolver: &harmony_pkarr::PkarrResolver,
     creator_addr_hex: &str,
@@ -141,11 +143,28 @@ pub async fn resolve_vine_relays(
     for epoch_id in epoch_window {
         verifying_keys.push(vines_key_for_epoch(creator_addr_hex, epoch_id)?.verifying_key());
     }
+    // ZEB-817: verify INSIDE the resolver, not after it. The vines slot key
+    // derives from the creator's public address, so anyone can publish a
+    // self-consistent record there (outer sig, inner sig and freshness all
+    // pass — the inner sig verifies against the record's OWN embedded
+    // identity pub). Verifying only the resolver's freshest-by-seq winner
+    // would let a squat with a higher seq shadow the genuine record AND pin
+    // the resolver's seq-highwater + positive cache with itself, hiding the
+    // genuine record for the process lifetime. `_with` ranks candidates
+    // freshest-first and takes the first that passes this predicate;
+    // candidates that fail it touch neither surface.
+    let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+        verify_vines_record(rec, creator_addr_hex, now_ms).is_ok()
+    };
     let rec = resolver
-        .resolve_window_freshest(&verifying_keys)
+        .resolve_window_freshest_with(&verifying_keys, &verify)
         .await
         .map_err(|e| format!("pkarr resolve: {e}"))?
+        // A record that exists but verifies for nobody now lands here too —
+        // correct: the pull driver treats this Err as "retry next pass" and
+        // deliberately preserves its cached relay hint meanwhile.
         .ok_or_else(|| "no vines record found for creator".to_string())?;
+    // Re-run the (pure, cheap) chain on the winner to get the decoded payload.
     let payload = verify_vines_record(&rec, creator_addr_hex, now_ms)?;
     Ok(payload.relay_set)
 }

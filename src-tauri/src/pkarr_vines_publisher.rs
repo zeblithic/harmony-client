@@ -413,11 +413,29 @@ mod tests {
     /// time the background driver retries against a closed listener).
     async fn test_publisher() -> (Arc<PkarrPublisher>, harmony_pkarr::testing::MockPkarrRelay) {
         let relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
-        let pool = harmony_pkarr::RelayPool::new(vec![relay.base_url.clone()]);
-        let client = Arc::new(harmony_pkarr::RelayClient::new(pool));
-        let publisher = Arc::new(PkarrPublisher::new(client));
-        let _driver = Arc::clone(&publisher).spawn();
+        let publisher = single_relay_publisher(&relay);
         (publisher, relay)
+    }
+
+    /// A client whose pool contains exactly ONE relay.
+    fn single_relay_client(
+        relay: &harmony_pkarr::testing::MockPkarrRelay,
+    ) -> Arc<harmony_pkarr::RelayClient> {
+        Arc::new(harmony_pkarr::RelayClient::new(
+            harmony_pkarr::RelayPool::new(vec![relay.base_url.clone()]),
+        ))
+    }
+
+    /// A spawned publisher writing to exactly ONE relay. Each
+    /// `MockPkarrRelay` keeps a single envelope per key (latest write wins),
+    /// so two records competing for the SAME slot key need one relay each —
+    /// see `squatted_slot_still_resolves_genuine_relay_set`.
+    fn single_relay_publisher(
+        relay: &harmony_pkarr::testing::MockPkarrRelay,
+    ) -> Arc<PkarrPublisher> {
+        let publisher = Arc::new(PkarrPublisher::new(single_relay_client(relay)));
+        let _driver = Arc::clone(&publisher).spawn();
+        publisher
     }
 
     fn build_id_pub(sk: &ed25519_dalek::SigningKey) -> [u8; 64] {
@@ -631,6 +649,150 @@ mod tests {
         assert!(
             relay_set.is_empty(),
             "a stale reconcile must never reopen serving after a later disable"
+        );
+    }
+
+    /// ZEB-817 wiring: a squatter record on one relay with a higher seq must
+    /// not shadow the genuine relay-set record on another relay, because
+    /// `resolve_vine_relays` now verifies per-candidate INSIDE the resolver
+    /// (`resolve_window_freshest_with`) instead of verifying only the
+    /// freshest-by-seq winner the resolver had already committed to.
+    ///
+    /// Why the squat is even possible: the vines slot key derives from the
+    /// creator's PUBLIC address (`PkarrCase::Vines`), so anyone holding that
+    /// address can compute the slot and publish a record there that passes
+    /// the outer signature, its own inner signature AND freshness — the inner
+    /// sig verifies against the record's own embedded `harmony_identity_pub`,
+    /// which is self-certified. Only `verify_vines_record`'s identity-pub→
+    /// address binding separates the squat from the genuine record, and that
+    /// check used to run after the resolver had already picked one winner by
+    /// seq (and pinned its seq-highwater + positive cache with it).
+    #[tokio::test]
+    async fn squatted_slot_still_resolves_genuine_relay_set() {
+        const ATTACKER_ENDPOINT: [u8; 32] = [9u8; 32];
+
+        let genuine_relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
+        let squat_relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
+
+        // The resolver under test spans BOTH relays — what a follower with a
+        // multi-relay pool actually sees. Squat listed FIRST: it carries both
+        // the higher seq and the earlier answer.
+        let resolver = harmony_pkarr::PkarrResolver::new(Arc::new(
+            harmony_pkarr::RelayClient::new(harmony_pkarr::RelayPool::new(vec![
+                squat_relay.base_url.clone(),
+                genuine_relay.base_url.clone(),
+            ])),
+        ));
+
+        // The genuine creator must be a REAL identity: `verify_vines_record`
+        // binds the record's identity pub to the claimed creator address, so
+        // an arbitrary hex address (as the bookkeeping-only tests above use)
+        // would fail the binding for EVERY candidate and prove nothing.
+        let identity = crate::vine_signing::test_identity();
+        let genuine_addr = crate::vine_signing::signer_address(&identity);
+        let endpoint = test_endpoint().await;
+        let genuine_endpoint_id = *endpoint.node_id().as_bytes();
+        let vp = PkarrVinesPublisher::new(
+            single_relay_publisher(&genuine_relay),
+            genuine_addr.clone(),
+            crate::vine_signing::identity_signing_key(&identity),
+            crate::vine_signing::identity_pub_64(&identity),
+            Some(endpoint),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|| 1),
+        );
+        vp.enable().await;
+
+        // Wait for the genuine record to land BEFORE publishing the squat, so
+        // the squat is guaranteed the higher BEP44 seq (seq is the
+        // `SignedPacket` timestamp, minted at publish time).
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(attempts < 80, "genuine vines publish did not land");
+            if let Ok(relay_set) =
+                crate::pkarr_vines::resolve_vine_relays(&resolver, &genuine_addr, now_ms()).await
+            {
+                if !relay_set.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // The squatter: a DIFFERENT identity signing its own record, under
+        // the SAME slot key (derived from the GENUINE creator's address), on
+        // its own relay.
+        let attacker = crate::vine_signing::test_identity();
+        let attacker_sk = crate::vine_signing::identity_signing_key(&attacker);
+        let attacker_pub = crate::vine_signing::identity_pub_64(&attacker);
+        let addr_for_key = genuine_addr.clone();
+        let key_builder: EphemeralKeyBuilder = Arc::new(move |at_ms| {
+            vines_key_for_epoch(&addr_for_key, current_epoch_id(at_ms))
+                .expect("creator address hex comes from a real identity — always valid hex")
+        });
+        let record_builder: RecordBuilder = Arc::new(move |at_ms| {
+            let blob = build_vines_record_blob(&VineRelayRecordPayload {
+                relay_set: vec![VineRelayEntry {
+                    iroh_endpoint_id: ATTACKER_ENDPOINT,
+                    home_relay: "https://attacker.example".to_string(),
+                }],
+                issued_at_ms: at_ms,
+            })
+            .expect("single-entry blob is within budget");
+            PkarrRoutingRecord::sign_new(
+                blob,
+                attacker_pub,
+                at_ms,
+                at_ms + REACHABILITY_RECORD_TTL_MS,
+                &attacker_sk,
+            )
+            .expect("sign — fixed-size buffers should not fail")
+        });
+        let squat_publisher = single_relay_publisher(&squat_relay);
+        squat_publisher
+            .register("squat".to_string(), key_builder, record_builder)
+            .await;
+
+        // Wait for the squat's PUT to actually land. Probed through a
+        // squat-relay-ONLY resolver — a separate instance, so its cache and
+        // seq-highwater cannot contaminate the resolver under test — and via
+        // raw `resolve_freshest`, so the wait is independent of whether
+        // `resolve_vine_relays` filters the squat.
+        let squat_probe = harmony_pkarr::PkarrResolver::new(single_relay_client(&squat_relay));
+        let slot_key = vines_key_for_epoch(&genuine_addr, current_epoch_id(now_ms()))
+            .expect("creator address hex is valid")
+            .verifying_key();
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(attempts < 80, "squat publish did not land");
+            if let Ok(Some(rec)) = squat_probe.resolve_freshest(&slot_key).await {
+                assert_eq!(
+                    rec.harmony_identity_pub, attacker_pub,
+                    "the squat relay must be holding the ATTACKER's record"
+                );
+                break;
+            }
+        }
+
+        // The squat is fresher by seq and answers first, but it fails the
+        // address binding — the genuine relay set must still resolve.
+        let relay_set = crate::pkarr_vines::resolve_vine_relays(&resolver, &genuine_addr, now_ms())
+            .await
+            .expect("genuine relay set must resolve despite the squatted slot");
+        assert!(
+            relay_set
+                .iter()
+                .any(|e| e.iroh_endpoint_id == genuine_endpoint_id),
+            "genuine endpoint must be present in the resolved relay set"
+        );
+        assert!(
+            relay_set
+                .iter()
+                .all(|e| e.iroh_endpoint_id != ATTACKER_ENDPOINT),
+            "attacker endpoint must never appear in a resolved relay set"
         );
     }
 
