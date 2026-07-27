@@ -725,6 +725,147 @@ pub struct VineRelayServingHealth {
     pub last_served_ms: Option<u64>,
 }
 
+/// Cap on [`VinePullTelemetry`]'s `recent` ring — mirrors
+/// `COMMUNITY_RELAY_PULL_RING_CAP`'s rationale (a many-creator node must
+/// not have its ok/failed rows evicted by an unbounded ring).
+const VINE_PULL_RING_CAP: usize = 32;
+
+/// ZEB-811: process-lifetime vine-pull counters (follower side), shared
+/// (`Arc`) between [`crate::vine_pull_driver::VinePullDriver`] (writer) and
+/// `network_health_snapshot` (reader, Task 8). Mirrors
+/// [`CommunityRelayPullTelemetry`] and copies its three load-bearing
+/// conventions verbatim: `record_pass_start` is recorded first and
+/// unconditionally in every pass (proves the loop is alive even with
+/// nothing to do); a followed creator with no dialable relay is a counter
+/// only (`record_no_relay`), never a `recent` ring row (it isn't a session
+/// outcome); and `ingested == 0` on a completed session is still success —
+/// it means the relay (or the mesh, having beaten it there) held nothing
+/// new, not that anything failed.
+#[derive(Debug, Default)]
+pub struct VinePullTelemetry {
+    passes_run: AtomicU64,
+    last_pass_ms: AtomicU64,
+    sessions_ok: AtomicU64,
+    sessions_failed: AtomicU64,
+    descriptors_ingested: AtomicU64,
+    last_ingest_ms: AtomicU64,
+    passes_no_relay: AtomicU64,
+    recent: Mutex<VecDeque<VinePullHit>>,
+}
+
+impl VinePullTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the START of a pull pass. Deliberately recorded before any
+    /// work, and unconditionally — including when no creators are followed —
+    /// because this counter's job is to prove the loop is alive, not that it
+    /// found something to do.
+    pub fn record_pass_start(&self) {
+        self.passes_run.fetch_add(1, Ordering::Relaxed);
+        self.last_pass_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// A followed creator with no dialable relay this pass (either nothing
+    /// resolved, or every resolved entry was filtered as our own). Counter
+    /// only — deliberately does NOT push to the `recent` ring, for the same
+    /// reason `CommunityRelayPullTelemetry::record_no_relay` doesn't: it is
+    /// not a session outcome, and forcing it into the ring would let a node
+    /// following many creators with stale relay ads evict the ok/failed rows
+    /// the ring exists to preserve.
+    pub fn record_no_relay(&self) {
+        self.passes_no_relay.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A completed pull session. `ingested == 0` is a success, not a
+    /// failure — it means nothing new was left to pull (the relay held
+    /// nothing new, or the mesh already delivered every row as a duplicate).
+    pub fn record_session_ok(&self, creator: &str, relay_endpoint_id: &[u8; 32], ingested: u32) {
+        self.sessions_ok.fetch_add(1, Ordering::Relaxed);
+        if ingested > 0 {
+            self.descriptors_ingested
+                .fetch_add(u64::from(ingested), Ordering::Relaxed);
+            self.last_ingest_ms.store(now_ms(), Ordering::Relaxed);
+        }
+        self.push(creator, relay_endpoint_id, "ok", ingested);
+    }
+
+    pub fn record_session_failed(&self, creator: &str, relay_endpoint_id: &[u8; 32]) {
+        self.sessions_failed.fetch_add(1, Ordering::Relaxed);
+        self.push(creator, relay_endpoint_id, "failed", 0);
+    }
+
+    fn push(&self, creator: &str, relay_endpoint_id: &[u8; 32], outcome: &str, ingested: u32) {
+        // `creator` is already a hex address string, so its first 8 hex
+        // characters ARE the first 4 bytes, short-form per ZEB-329.
+        let creator_short = creator.get(..8).unwrap_or(creator).to_string();
+        let hit = VinePullHit {
+            creator_short,
+            relay_endpoint_short: hex::encode(&relay_endpoint_id[..4]),
+            outcome: outcome.to_string(),
+            ingested,
+            captured_at_ms: now_ms(),
+        };
+        let mut ring = self.recent.lock().expect("vine pull ring lock");
+        if ring.len() == VINE_PULL_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(hit);
+    }
+
+    pub fn summary(&self) -> VinePullingHealth {
+        let last_pass = self.last_pass_ms.load(Ordering::Relaxed);
+        let last_ingest = self.last_ingest_ms.load(Ordering::Relaxed);
+        VinePullingHealth {
+            passes_run: self.passes_run.load(Ordering::Relaxed),
+            last_pass_ms: (last_pass != 0).then_some(last_pass),
+            sessions_ok: self.sessions_ok.load(Ordering::Relaxed),
+            sessions_failed: self.sessions_failed.load(Ordering::Relaxed),
+            descriptors_ingested: self.descriptors_ingested.load(Ordering::Relaxed),
+            last_ingest_ms: (last_ingest != 0).then_some(last_ingest),
+            passes_no_relay: self.passes_no_relay.load(Ordering::Relaxed),
+            recent: self
+                .recent
+                .lock()
+                .expect("vine pull ring lock")
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+/// ZEB-811: wire shape for [`VinePullTelemetry::summary`]. The
+/// service-field/snapshot assembly into [`NetworkHealthSnapshot`] is Task 8;
+/// this struct is produced and consumed standalone until then.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VinePullingHealth {
+    pub passes_run: u64,
+    pub last_pass_ms: Option<u64>,
+    pub sessions_ok: u64,
+    pub sessions_failed: u64,
+    pub descriptors_ingested: u64,
+    pub last_ingest_ms: Option<u64>,
+    pub passes_no_relay: u64,
+    pub recent: Vec<VinePullHit>,
+}
+
+/// ZEB-811: one pull-session outcome. Short-form ids only (ZEB-329).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VinePullHit {
+    pub creator_short: String,
+    pub relay_endpoint_short: String,
+    /// `"ok"` | `"failed"`.
+    pub outcome: String,
+    /// Descriptors newly ingested by this session (`0` for a failure or a
+    /// no-op success).
+    pub ingested: u32,
+    pub captured_at_ms: u64,
+}
+
 /// ZEB-803: process-lifetime relay-pulling counters, shared (`Arc`) between
 /// [`crate::community_relay_pull_driver::CommunityRelayPullDriver`] (writer) and
 /// `network_health_snapshot` (reader).

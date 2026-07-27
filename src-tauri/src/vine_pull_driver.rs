@@ -1,0 +1,1340 @@
+//! ZEB-811 Task 7: `vine_pull_driver.rs` — follower-side cadenced pull
+//! driver.
+//!
+//! The FOLLOWER half of ZEB-811's relay fan-out: for every creator this
+//! node follows, dial a relay from that creator's pkarr-published relay set
+//! (`pkarr_vines::resolve_vine_relays`, Task 2) and page the creator's
+//! signed descriptor feed over `harmony/vine-relay/v1` (Task 6), advancing a
+//! durable `(created_at, id)` cursor per creator. Modeled closely on
+//! [`crate::community_relay_pull_driver::CommunityRelayPullDriver`] — see
+//! that module for the wake/interval spawn shape and the three
+//! load-bearing telemetry conventions this copies verbatim (see
+//! [`crate::network_health::VinePullTelemetry`]).
+//!
+//! ## Why a pure client-session loop
+//!
+//! [`run_vine_pull_client_session`] is generic over any
+//! `AsyncRead`/`AsyncWrite` pair — mirrors `vine_relay::run_vine_relay_session`'s
+//! pure/production-shell split — so the cursor-advance rules (the
+//! Advance/SkipInvalid/Halt mapping, and the "unparseable JSON never moves
+//! the cursor" guard) are unit-testable over `tokio::io::duplex` without a
+//! real iroh connection. [`IrohVinePullTransport`] is the thin production
+//! shell that dials the relay and drives this loop under one overall
+//! deadline.
+//!
+//! ## Bounded mesh-live skip (recency is not completeness)
+//!
+//! A creator's descriptors also arrive live over the existing
+//! zenoh-over-iroh publish/subscribe mesh, so most pull passes would find
+//! nothing new. [`VinePullDriver::run_one_pass`] skips a creator whose mesh
+//! delivery looks fresher than the last pull attempt — but only for
+//! [`VINE_PULL_SKIP_MAX_CONSECUTIVE`] consecutive passes, then forces a
+//! pull anyway. Live delivery fans out over a lossy gossip mesh: it proves
+//! *something* arrived recently, never that *everything* did, so an
+//! unbounded skip could leave a relay-only descriptor page (one the mesh
+//! never carried) unpulled forever.
+
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Notify;
+
+use crate::iroh_framing::{read_len_prefixed, write_len_prefixed, Endian};
+use crate::pkarr_vines::{resolve_vine_relays, VineRelayEntry};
+use crate::vine_relay::{
+    decode_vine_pull_response, encode_vine_pull_request, VinePullQuery, VinePullRequest,
+    VINE_CONTENT_MAX_FRAME_BYTES, VINE_PULL_PAGE_LIMIT_MAX, VINE_QUERY_MAX_FRAME_BYTES,
+    VINE_RELAY_ALPN,
+};
+
+/// Periodic floor between vine pull passes. Reuses the community-relay
+/// advertisement refresh cadence (~7.5 min, `community_relay_pull_driver::
+/// COMMUNITY_RELAY_PULL_INTERVAL_MS`'s sibling constant) — a creator's relay
+/// ad refreshes about this often, so re-checking on the same cadence keeps
+/// the pull driver in step without inventing a bespoke interval. The driver
+/// is also woken immediately via [`VinePullDriver::wake_handle`]; this is
+/// only the idle backstop.
+pub const VINE_PULL_INTERVAL_MS: u64 =
+    crate::community_relay_announce::COMMUNITY_RELAY_AD_REFRESH_MS;
+
+/// Minimum spacing between pkarr resolves of the SAME creator's vine relay
+/// set. Mirrors `PKARR_REFRESH_COOLDOWN` (`reachability_resolver.rs:37`,
+/// `pub(crate)` to that module's own tree, hence a same-value alias here
+/// rather than a re-export) — a creator's relay set changes about as
+/// rarely as a reachability record, so re-resolving it on every pull pass
+/// would hammer pkarr for no benefit. The cached `relay_set` hint carries
+/// the driver between resolves, including across resolve failures.
+pub const VINE_PKARR_RESOLVE_COOLDOWN_MS: u64 = 15 * 60 * 1000;
+
+/// Consecutive passes a creator may be skipped while live mesh delivery
+/// looks fresher than the last pull attempt, before the driver forces a
+/// pull anyway. See the module doc's "bounded mesh-live skip" section.
+pub const VINE_PULL_SKIP_MAX_CONSECUTIVE: u32 = 4;
+
+/// Sync closure over `NodeState.followed_set`'s own mutex (an
+/// `Arc<Mutex<HashSet<String>>>`, `lib.rs`). Unlike
+/// `community_relay_pull_driver::JoinedCommunitiesFn`'s analogous seam, no
+/// refresher task is needed here — the follow set is already continuously
+/// maintained by the follow/unfollow IPCs.
+pub type FollowedCreatorsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// Reads `VineFeedCache::last_received_ms_for_creator` (Task 5) as an
+/// injectable seam — like [`FollowedCreatorsFn`], a plain sync closure over
+/// the SAME `Arc<Mutex<VineFeedCache>>` the event loop and the production
+/// [`VineIngestCtx`] share, so the driver's mesh-live skip logic is
+/// unit-testable without a real cache. Not itself part of the ctx trait:
+/// the brief's interface list names this a direct dependency, separate from
+/// `on_descriptor_sample` (which only reaches the driver through
+/// [`VineIngestCtx::ingest_descriptor`]).
+pub type LastReceivedMsFn = Arc<dyn Fn(&str) -> Option<u64> + Send + Sync>;
+
+// =====================================================================
+// Transport + ingest seams
+// =====================================================================
+
+/// One full pull session against a relay for one creator: page the
+/// descriptor feed starting after `cursor`, ingesting each row, until a page
+/// comes back shorter than the wire limit or an [`IngestVerdict::Halt`]
+/// stops the session early. Seam so [`VinePullDriver`] is unit-testable
+/// without iroh. The prod impl is [`IrohVinePullTransport`].
+#[async_trait::async_trait]
+pub trait VinePullTransport: Send + Sync {
+    async fn pull_pages(
+        &self,
+        relay: &VineRelayEntry,
+        creator: &str,
+        cursor: (u64, String),
+        ingest: &dyn VineIngestCtx,
+    ) -> Result<PullSessionResult, String>;
+}
+
+/// Injectable ingest seam for one descriptor row's raw JSON bytes. Sync (not
+/// async) because the production impl only ever needs a `std::sync::Mutex`
+/// lock, mirroring `VineFeedCache::on_descriptor_sample`'s own signature.
+pub trait VineIngestCtx: Send + Sync {
+    fn ingest_descriptor(&self, creator: &str, json_bytes: &[u8], now_ms: u64) -> IngestVerdict;
+}
+
+/// Outcome of ingesting one descriptor row, and what it does to the pull
+/// cursor (see [`run_vine_pull_client_session`] for the exact mapping).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestVerdict {
+    /// Accepted (newly inserted OR already present — a mesh-delivered
+    /// duplicate is a cheap no-op, not a fault). The cursor advances past
+    /// this row.
+    Advance,
+    /// Rejected on its own merits (bad signature, stale, malformed field) —
+    /// each descriptor is independently dual-signed, so skipping this row
+    /// can never forge or hide a later one. The cursor still advances past
+    /// it: re-fetching a row that will never validate would loop forever.
+    SkipInvalid,
+    /// Infrastructure failure (a poisoned cache lock, or the ctx receiving
+    /// a topic it cannot map at all) rather than anything about this row.
+    /// The session stops immediately with the cursor left at the last
+    /// durable row, so the next session retries this row from scratch.
+    Halt,
+}
+
+/// Outcome of one full pull session against one relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullSessionResult {
+    pub cursor: (u64, String),
+    pub ingested: u32,
+    pub skipped_invalid: u32,
+}
+
+/// Minimal fields parsed out of a descriptor's raw JSON *before* handing it
+/// to [`VineIngestCtx::ingest_descriptor`] — the cursor-advance decision
+/// needs `(created_at, id)` regardless of whether ingest accepts, rejects,
+/// or halts on the row, and a row whose JSON doesn't even parse this far
+/// must not advance the cursor at all (`descriptor.rs`'s wire shape is
+/// `#[serde(rename_all = "camelCase")]`, so `created_at` unmarshals from the
+/// wire key `createdAt`; extra fields on the object are ignored by serde_json
+/// by default, so this doesn't need the descriptor's full shape).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CursorFields {
+    id: String,
+    created_at: u64,
+}
+
+/// The pure vine-pull client session loop: request pages starting at
+/// `cursor`, ingest each row, and stop when a page is shorter than the wire
+/// limit or ingest returns [`IngestVerdict::Halt`]. Generic over any
+/// `AsyncRead`/`AsyncWrite` pair (mirrors `vine_relay::run_vine_relay_session`)
+/// so it is directly unit-testable over `tokio::io::duplex` without a real
+/// iroh connection. [`IrohVinePullTransport::pull_pages`] is the production
+/// shell that dials the relay and drives this loop under one overall
+/// deadline.
+async fn run_vine_pull_client_session<R, W>(
+    recv: &mut R,
+    send: &mut W,
+    creator: &str,
+    mut cursor: (u64, String),
+    ingest: &dyn VineIngestCtx,
+    now_ms: u64,
+) -> Result<PullSessionResult, String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut ingested: u32 = 0;
+    let mut skipped_invalid: u32 = 0;
+    loop {
+        let query = VinePullRequest::Query(VinePullQuery {
+            creator_addr: creator.to_string(),
+            after_created_at: cursor.0,
+            after_id: cursor.1.clone(),
+            limit: VINE_PULL_PAGE_LIMIT_MAX,
+        });
+        let req_bytes =
+            encode_vine_pull_request(&query).map_err(|e| format!("encode query: {e}"))?;
+        write_len_prefixed(
+            send,
+            &req_bytes,
+            VINE_QUERY_MAX_FRAME_BYTES,
+            Endian::Le,
+            false,
+        )
+        .await
+        .map_err(|e| format!("write query: {e}"))?;
+
+        let resp_bytes = read_len_prefixed(recv, VINE_CONTENT_MAX_FRAME_BYTES, Endian::Le, true)
+            .await
+            .map_err(|e| format!("read response: {e}"))?;
+        let resp =
+            decode_vine_pull_response(&resp_bytes).map_err(|e| format!("decode response: {e}"))?;
+        let page_len = resp.descriptors.len();
+
+        for row in &resp.descriptors {
+            let bytes = row.as_slice();
+            let Ok(fields) = serde_json::from_slice::<CursorFields>(bytes) else {
+                // JSON doesn't even parse this far: cannot derive a cursor
+                // tuple for it, so it is dropped without ever reaching
+                // ingest and the cursor stays at the last good row.
+                skipped_invalid += 1;
+                continue;
+            };
+            let candidate = (fields.created_at, fields.id);
+            match ingest.ingest_descriptor(creator, bytes, now_ms) {
+                IngestVerdict::Advance => {
+                    ingested += 1;
+                    cursor = candidate;
+                }
+                IngestVerdict::SkipInvalid => {
+                    skipped_invalid += 1;
+                    cursor = candidate;
+                }
+                IngestVerdict::Halt => {
+                    return Ok(PullSessionResult {
+                        cursor,
+                        ingested,
+                        skipped_invalid,
+                    });
+                }
+            }
+        }
+
+        if page_len < VINE_PULL_PAGE_LIMIT_MAX as usize {
+            break;
+        }
+    }
+    Ok(PullSessionResult {
+        cursor,
+        ingested,
+        skipped_invalid,
+    })
+}
+
+// =====================================================================
+// Production transport
+// =====================================================================
+
+/// Production [`VinePullTransport`]: dial the relay's
+/// `harmony/vine-relay/v1` ALPN and drive [`run_vine_pull_client_session`]
+/// over the opened bi-stream, bounded by `io_deadline` for the WHOLE
+/// dial + session + finish exchange (mirrors
+/// `community_relay_pull_driver::IrohRelayPullTransport::pull_session`'s
+/// single overall deadline).
+pub struct IrohVinePullTransport {
+    pub endpoint: Arc<crate::iroh_endpoint::IrohEndpoint>,
+    pub io_deadline: Duration,
+}
+
+#[async_trait::async_trait]
+impl VinePullTransport for IrohVinePullTransport {
+    async fn pull_pages(
+        &self,
+        relay: &VineRelayEntry,
+        creator: &str,
+        cursor: (u64, String),
+        ingest: &dyn VineIngestCtx,
+    ) -> Result<PullSessionResult, String> {
+        let exchange = async {
+            let ep_id = iroh::EndpointId::from_bytes(&relay.iroh_endpoint_id)
+                .map_err(|e| format!("relay endpoint id: {e}"))?;
+            let mut addr = iroh::EndpointAddr::new(ep_id);
+            if !relay.home_relay.is_empty() {
+                match relay.home_relay.parse::<iroh::RelayUrl>() {
+                    Ok(url) => addr = addr.with_relay_url(url),
+                    Err(e) => tracing::trace!(
+                        relay = %relay.home_relay,
+                        "ZEB-811 pull: skip malformed relay home_relay: {e}"
+                    ),
+                }
+            }
+            let conn = self
+                .endpoint
+                .inner()
+                .connect(addr, VINE_RELAY_ALPN)
+                .await
+                .map_err(|e| format!("connect: {e}"))?;
+            let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+
+            let result = run_vine_pull_client_session(
+                &mut recv,
+                &mut send,
+                creator,
+                cursor,
+                ingest,
+                now_ms(),
+            )
+            .await?;
+
+            send.finish().map_err(|e| format!("finish: {e}"))?;
+            // Dialer-driven close, mirroring the community-relay pull
+            // transport: the relay's serve loop waits on the peer to close.
+            conn.close(0u32.into(), b"");
+            Ok::<PullSessionResult, String>(result)
+        };
+        tokio::time::timeout(self.io_deadline, exchange)
+            .await
+            .map_err(|_| "vine pull IO timeout".to_string())?
+    }
+}
+
+// =====================================================================
+// Production ingest ctx
+// =====================================================================
+
+/// Production [`VineIngestCtx`]: locks the node's `VineFeedCache` +
+/// followed-set and routes each descriptor through
+/// `VineFeedCache::on_descriptor_sample` under a synthetic
+/// `harmony/vines/{creator}` topic (the SAME topic shape the live mesh
+/// receive path uses, so admission — signature, tombstone, age-window
+/// checks — is identical whether a descriptor arrived over the mesh or a
+/// relay pull).
+pub struct ProdVineIngestCtx {
+    pub cache: Arc<std::sync::Mutex<crate::vine_feed_cache::VineFeedCache>>,
+    pub followed_set: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl VineIngestCtx for ProdVineIngestCtx {
+    fn ingest_descriptor(&self, creator: &str, json_bytes: &[u8], now_ms: u64) -> IngestVerdict {
+        let Ok(mut cache) = self.cache.lock() else {
+            return IngestVerdict::Halt;
+        };
+        let Ok(followed) = self.followed_set.lock() else {
+            return IngestVerdict::Halt;
+        };
+        let key_expr = format!("harmony/vines/{creator}");
+        match cache.on_descriptor_sample(&key_expr, json_bytes, &followed, now_ms) {
+            Some(crate::vine_feed_cache::DescriptorOutcome::Inserted { .. })
+            | Some(crate::vine_feed_cache::DescriptorOutcome::AlreadyPresent) => {
+                IngestVerdict::Advance
+            }
+            Some(crate::vine_feed_cache::DescriptorOutcome::Rejected(_)) => {
+                IngestVerdict::SkipInvalid
+            }
+            // Only reachable if `key_expr` somehow doesn't parse as a vine
+            // descriptor topic, which cannot happen for a synthetic
+            // `harmony/vines/{creator}` string we just built ourselves —
+            // treated conservatively as an infra fault rather than silently
+            // accepted or rejected.
+            None => IngestVerdict::Halt,
+        }
+    }
+}
+
+// =====================================================================
+// Sidecar persistence
+// =====================================================================
+
+/// ZEB-811 Task 7: per-node sidecar tracking pull progress for every
+/// followed creator. Lives at `vine_pull.cbor` in `app_data_dir`, beside
+/// `follows.json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VinePullSidecar {
+    pub per_creator: BTreeMap<String, CreatorPullState>,
+}
+
+/// One followed creator's pull-driver bookkeeping.
+///
+/// The cached `relay_set` is a DIALING HINT ONLY: every descriptor pulled
+/// through it is independently re-verified on arrival
+/// (`vine_signing::verify_descriptor[_v2]`, inside
+/// `VineFeedCache::on_descriptor_sample`) exactly like a fresh mesh delivery
+/// would be. This mirrors the ZEB-815 boot-seed rule for the address-book
+/// sidecar (`lib.rs`, the "BOOT-PROBE 10" address-book routing seed block):
+/// rows loaded from a locally-written cache are re-verified through the
+/// SAME gate a peer's live data takes, so a tampered or truncated sidecar
+/// can misdirect a dial at worst, never inject trusted state as a second
+/// path around verification.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CreatorPullState {
+    pub cursor: (u64, String),
+    pub last_pull_attempt_ms: u64,
+    pub consecutive_skips: u32,
+    pub relay_set: Vec<VineRelayEntry>,
+    pub relays_fetched_at_ms: u64,
+}
+
+/// Persist the sidecar via temp-file + rename — same durability posture as
+/// `community_address_book::save_addrbook` (no fsync: pull progress is
+/// fully re-derivable from a slower next pull if lost, so the extra
+/// durability cost doesn't pencil out at this granularity). Like
+/// `save_addrbook`, the fixed `.tmp` name is only race-free with a single
+/// writer per `path` (true here — one `VinePullDriver` per process owns it).
+pub fn save_vine_pull(path: &Path, sidecar: &VinePullSidecar) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(sidecar, &mut bytes)
+        .map_err(|e| format!("encode vine pull sidecar: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {e}"))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Load the sidecar. Missing or corrupt (truncated/undecodable) loads as an
+/// empty default — loss-safe: a lost sidecar just means the next pull pass
+/// re-derives cursors from scratch (a slower re-pull, never a boot-time
+/// hard failure), and every row it seeds is re-verified on arrival anyway
+/// (see [`CreatorPullState`]'s doc comment).
+pub fn load_vine_pull(path: &Path) -> VinePullSidecar {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return VinePullSidecar::default(),
+    };
+    ciborium::from_reader(bytes.as_slice()).unwrap_or_default()
+}
+
+// =====================================================================
+// VinePullDriver
+// =====================================================================
+
+/// Cadenced follower-side pull driver: for every followed creator, pull
+/// fresh descriptor pages from one of that creator's advertised relays,
+/// skipping creators the live mesh appears to have already delivered for
+/// (bounded — see the module doc). Spawned by Task 8 via [`Self::spawn`].
+pub struct VinePullDriver {
+    /// This node's own iroh endpoint id — a creator's relay set can list
+    /// this node itself (e.g. a creator who is also a vine relay for their
+    /// own feed); ZEB-806 already taught the community-relay driver that
+    /// iroh's self-connection rejection turns such an entry into a
+    /// permanent doomed-dial loop if not filtered before dialing.
+    self_endpoint_id: [u8; 32],
+    pkarr_resolver: Arc<harmony_pkarr::PkarrResolver>,
+    transport: Arc<dyn VinePullTransport>,
+    ingest: Arc<dyn VineIngestCtx>,
+    followed_creators: FollowedCreatorsFn,
+    last_received_ms: LastReceivedMsFn,
+    sidecar_path: PathBuf,
+    sidecar: std::sync::Mutex<VinePullSidecar>,
+    wake: Arc<Notify>,
+    interval: Duration,
+    /// ZEB-811: pull-side health telemetry, shared with
+    /// `network_health_snapshot` (Task 8). `None` when nothing installed a
+    /// source (unit tests, pre-boot); recording is then a no-op.
+    telemetry: Option<Arc<crate::network_health::VinePullTelemetry>>,
+}
+
+impl VinePullDriver {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        self_endpoint_id: [u8; 32],
+        pkarr_resolver: Arc<harmony_pkarr::PkarrResolver>,
+        transport: Arc<dyn VinePullTransport>,
+        ingest: Arc<dyn VineIngestCtx>,
+        followed_creators: FollowedCreatorsFn,
+        last_received_ms: LastReceivedMsFn,
+        sidecar_path: PathBuf,
+    ) -> Self {
+        let sidecar = load_vine_pull(&sidecar_path);
+        Self {
+            self_endpoint_id,
+            pkarr_resolver,
+            transport,
+            ingest,
+            followed_creators,
+            last_received_ms,
+            sidecar_path,
+            sidecar: std::sync::Mutex::new(sidecar),
+            wake: Arc::new(Notify::new()),
+            interval: Duration::from_millis(VINE_PULL_INTERVAL_MS),
+            telemetry: None,
+        }
+    }
+
+    /// ZEB-811: install the pull health telemetry sink. Builder-style so
+    /// boot wiring can attach it without growing `new`'s already-long
+    /// arity (mirrors `CommunityRelayPullDriver::with_telemetry`).
+    pub fn with_telemetry(
+        mut self,
+        telemetry: Arc<crate::network_health::VinePullTelemetry>,
+    ) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Clone the wake handle so external callers (a follow/unfollow IPC, or
+    /// a test) can trigger an immediate pull pass without holding the whole
+    /// `Arc<Self>`.
+    pub fn wake_handle(&self) -> Arc<Notify> {
+        Arc::clone(&self.wake)
+    }
+
+    /// One pull pass: prune sidecar state for creators no longer followed,
+    /// then attempt a pull for every followed creator. Errors are logged
+    /// and skipped — one bad relay/creator never aborts the pass.
+    pub async fn run_one_pass(&self, now_ms: u64) {
+        // Recorded FIRST and unconditionally — before the followed-set
+        // read, before any relay work — so this counter can prove the loop
+        // is alive even on a pass with nothing to do (mirrors
+        // `CommunityRelayPullTelemetry::record_pass_start`'s doc comment).
+        if let Some(t) = self.telemetry.as_ref() {
+            t.record_pass_start();
+        }
+
+        let followed = (self.followed_creators)();
+        let followed_set: HashSet<&str> = followed.iter().map(String::as_str).collect();
+        {
+            let mut sc = self.sidecar.lock().expect("vine pull sidecar lock");
+            sc.per_creator
+                .retain(|creator, _| followed_set.contains(creator.as_str()));
+        }
+
+        for creator in &followed {
+            self.pull_one_creator(creator, now_ms).await;
+        }
+
+        let snapshot = self.sidecar.lock().expect("vine pull sidecar lock").clone();
+        let path = self.sidecar_path.clone();
+        match tokio::task::spawn_blocking(move || save_vine_pull(&path, &snapshot)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "ZEB-811 pull: sidecar save failed"),
+            Err(e) => tracing::warn!(error = %e, "ZEB-811 pull: sidecar save task panicked"),
+        }
+    }
+
+    async fn pull_one_creator(&self, creator: &str, now_ms: u64) {
+        let mut st = {
+            let mut sc = self.sidecar.lock().expect("vine pull sidecar lock");
+            sc.per_creator
+                .entry(creator.to_string())
+                .or_default()
+                .clone()
+        };
+
+        // Bounded mesh-live skip — recency is not completeness. First
+        // follow (genesis cursor) always pulls: it backfills history the
+        // mesh never carried, so the skip condition never applies to it.
+        let first_follow = st.cursor == (0, String::new());
+        let mesh_is_fresh = !first_follow
+            && (self.last_received_ms)(creator)
+                .map(|last_ms| last_ms > st.last_pull_attempt_ms)
+                .unwrap_or(false);
+        if mesh_is_fresh && st.consecutive_skips < VINE_PULL_SKIP_MAX_CONSECUTIVE {
+            st.consecutive_skips += 1;
+            self.store_creator_state(creator, st);
+            return;
+        }
+        st.consecutive_skips = 0;
+        st.last_pull_attempt_ms = now_ms;
+
+        if now_ms.saturating_sub(st.relays_fetched_at_ms) >= VINE_PKARR_RESOLVE_COOLDOWN_MS {
+            match resolve_vine_relays(&self.pkarr_resolver, creator, now_ms).await {
+                Ok(rs) => {
+                    st.relay_set = rs;
+                    st.relays_fetched_at_ms = now_ms;
+                }
+                Err(e) => {
+                    // Keep the cached hint — a stale relay set is still
+                    // better than none, and the next cooldown window will
+                    // retry the resolve.
+                    tracing::debug!(
+                        creator,
+                        error = %e,
+                        "ZEB-811 pull: relay resolve failed; using cached hint"
+                    );
+                }
+            }
+        }
+
+        // ZEB-806 lesson, day one: a creator's own advertised relay set can
+        // list this node itself. iroh rejects self-connections, so an
+        // unfiltered self-entry becomes a permanent doomed-dial. Filter
+        // BEFORE picking a candidate, never after a failed dial.
+        let candidates: Vec<VineRelayEntry> = st
+            .relay_set
+            .iter()
+            .filter(|r| r.iroh_endpoint_id != self.self_endpoint_id)
+            .cloned()
+            .collect();
+
+        let Some(relay) = candidates.into_iter().next() else {
+            if let Some(t) = self.telemetry.as_ref() {
+                t.record_no_relay();
+            }
+            self.store_creator_state(creator, st);
+            return;
+        };
+
+        match self
+            .transport
+            .pull_pages(&relay, creator, st.cursor.clone(), self.ingest.as_ref())
+            .await
+        {
+            Ok(res) => {
+                st.cursor = res.cursor;
+                if let Some(t) = self.telemetry.as_ref() {
+                    t.record_session_ok(creator, &relay.iroh_endpoint_id, res.ingested);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    creator,
+                    error = %e,
+                    "ZEB-811 pull: pull session failed; skipping relay"
+                );
+                if let Some(t) = self.telemetry.as_ref() {
+                    t.record_session_failed(creator, &relay.iroh_endpoint_id);
+                }
+            }
+        }
+
+        self.store_creator_state(creator, st);
+    }
+
+    fn store_creator_state(&self, creator: &str, st: CreatorPullState) {
+        let mut sc = self.sidecar.lock().expect("vine pull sidecar lock");
+        sc.per_creator.insert(creator.to_string(), st);
+    }
+
+    /// Spawn the driver loop: one immediate startup pass, then a pass on
+    /// every `wake` notification or `interval` tick. Returns the
+    /// `JoinHandle` the caller may `abort()` on shutdown.
+    pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            self.run_one_pass(now_ms()).await;
+            let mut ticker = tokio::time::interval(self.interval);
+            // `Skip` collapses a backlog of missed ticks (e.g. after a slow
+            // pass) into a single tick at the next period boundary, rather
+            // than firing every missed tick back-to-back.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // `interval` fires the first tick immediately; the startup
+            // pass above already covered it.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = self.wake.notified() => {
+                        self.run_one_pass(now_ms()).await;
+                    }
+                    _ = ticker.tick() => {
+                        self.run_one_pass(now_ms()).await;
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Wall-clock now in epoch-ms.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+// =====================================================================
+// Tests
+// =====================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use tokio::io::AsyncWriteExt;
+
+    // ── Pure client-session-loop tests (mock ingest, no driver) ──
+
+    struct ScriptedIngest {
+        verdicts: std::sync::Mutex<VecDeque<IngestVerdict>>,
+    }
+
+    impl ScriptedIngest {
+        fn new(verdicts: Vec<IngestVerdict>) -> Self {
+            Self {
+                verdicts: std::sync::Mutex::new(verdicts.into()),
+            }
+        }
+    }
+
+    impl VineIngestCtx for ScriptedIngest {
+        fn ingest_descriptor(
+            &self,
+            _creator: &str,
+            _json_bytes: &[u8],
+            _now_ms: u64,
+        ) -> IngestVerdict {
+            self.verdicts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected extra ingest_descriptor call")
+        }
+    }
+
+    fn descriptor_json(id: &str, created_at: u64) -> Vec<u8> {
+        format!(r#"{{"id":"{id}","createdAt":{created_at}}}"#).into_bytes()
+    }
+
+    async fn read_fake_query<R: AsyncRead + Unpin>(r: &mut R) -> VinePullQuery {
+        let bytes = read_len_prefixed(r, VINE_QUERY_MAX_FRAME_BYTES, Endian::Le, false)
+            .await
+            .expect("read query frame");
+        match crate::vine_relay::decode_vine_pull_request(&bytes).expect("decode query") {
+            VinePullRequest::Query(q) => q,
+            VinePullRequest::Content(_) => panic!("expected a Query request"),
+        }
+    }
+
+    async fn write_fake_page_response<W: AsyncWrite + Unpin>(w: &mut W, rows: Vec<Vec<u8>>) {
+        let resp = crate::vine_relay::VinePullResponse {
+            descriptors: rows.into_iter().map(serde_bytes::ByteBuf::from).collect(),
+        };
+        let bytes = crate::vine_relay::encode_vine_pull_response(&resp).expect("encode response");
+        write_len_prefixed(w, &bytes, VINE_CONTENT_MAX_FRAME_BYTES, Endian::Le, true)
+            .await
+            .expect("write response frame");
+    }
+
+    #[tokio::test]
+    async fn cursor_advances_past_invalid_but_not_past_halt() {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+
+        let rows = vec![
+            descriptor_json("row1", 100),
+            descriptor_json("row2", 200), // bad-sig, but JSON parses fine
+            descriptor_json("row3", 300),
+            descriptor_json("row4", 400), // triggers Halt
+        ];
+        let server_task = tokio::spawn(async move {
+            let _query = read_fake_query(&mut server_read).await;
+            write_fake_page_response(&mut server_write, rows).await;
+            // `tokio::io::split` shares the underlying stream via an
+            // internal Arc — a bare `drop` does NOT half-close it, so the
+            // client's read would otherwise never see EOF if it tried a
+            // second page. This session never does (Halt returns first),
+            // but shutting down here keeps the fixture correct regardless.
+            let _ = server_write.shutdown().await;
+        });
+
+        let ingest = ScriptedIngest::new(vec![
+            IngestVerdict::Advance,
+            IngestVerdict::SkipInvalid,
+            IngestVerdict::Advance,
+            IngestVerdict::Halt,
+        ]);
+
+        let result = run_vine_pull_client_session(
+            &mut client_read,
+            &mut client_write,
+            "creator-x",
+            (0, String::new()),
+            &ingest,
+            1_700_000_000_000,
+        )
+        .await
+        .expect("session must not error");
+
+        server_task.await.expect("server task must not panic");
+
+        assert_eq!(
+            result.cursor,
+            (300, "row3".to_string()),
+            "cursor must land on row 3's tuple, never row 4's (the Halt row)"
+        );
+        assert_eq!(result.ingested, 2);
+        assert_eq!(result.skipped_invalid, 1);
+    }
+
+    #[tokio::test]
+    async fn unparseable_row_does_not_advance_cursor() {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+
+        let rows = vec![
+            descriptor_json("row1", 100),
+            descriptor_json("row2", 200),
+            b"not even json{{{".to_vec(),
+        ];
+        let server_task = tokio::spawn(async move {
+            let _query = read_fake_query(&mut server_read).await;
+            write_fake_page_response(&mut server_write, rows).await;
+            let _ = server_write.shutdown().await;
+        });
+
+        // Only two entries: the garbage row's JSON fails to parse before
+        // ever reaching ingest, so a third call would be a test bug.
+        let ingest = ScriptedIngest::new(vec![IngestVerdict::Advance, IngestVerdict::Advance]);
+
+        let result = run_vine_pull_client_session(
+            &mut client_read,
+            &mut client_write,
+            "creator-y",
+            (0, String::new()),
+            &ingest,
+            1_700_000_000_000,
+        )
+        .await
+        .expect("session must not error");
+
+        server_task.await.expect("server task must not panic");
+
+        assert_eq!(result.cursor, (200, "row2".to_string()));
+        assert_eq!(result.ingested, 2);
+        assert_eq!(result.skipped_invalid, 1);
+    }
+
+    #[test]
+    fn sidecar_round_trip_and_corrupt_file_loads_empty() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("vine_pull.cbor");
+
+        let sidecar = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                "addr1".to_string(),
+                CreatorPullState {
+                    cursor: (42, "v1".to_string()),
+                    last_pull_attempt_ms: 100,
+                    consecutive_skips: 2,
+                    relay_set: vec![VineRelayEntry {
+                        iroh_endpoint_id: [9u8; 32],
+                        home_relay: "https://r".to_string(),
+                    }],
+                    relays_fetched_at_ms: 50,
+                },
+            )]),
+        };
+        save_vine_pull(&path, &sidecar).expect("save");
+        assert_eq!(load_vine_pull(&path), sidecar);
+
+        // A truncated/garbage file must load as an empty default, not error.
+        std::fs::write(&path, [0xFFu8, 0x00]).expect("write garbage");
+        assert_eq!(load_vine_pull(&path), VinePullSidecar::default());
+
+        // A missing file must also load as an empty default.
+        let missing = dir.path().join("does_not_exist.cbor");
+        assert_eq!(load_vine_pull(&missing), VinePullSidecar::default());
+    }
+
+    // ── Driver-level tests (mock transport + mock ingest) ──
+
+    #[derive(Default)]
+    struct MockTransport {
+        calls: std::sync::Mutex<Vec<(VineRelayEntry, String, (u64, String))>>,
+        script: std::sync::Mutex<VecDeque<Result<PullSessionResult, String>>>,
+    }
+
+    impl MockTransport {
+        fn with_results(results: Vec<Result<PullSessionResult, String>>) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                script: std::sync::Mutex::new(results.into()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(VineRelayEntry, String, (u64, String))> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VinePullTransport for MockTransport {
+        async fn pull_pages(
+            &self,
+            relay: &VineRelayEntry,
+            creator: &str,
+            cursor: (u64, String),
+            _ingest: &dyn VineIngestCtx,
+        ) -> Result<PullSessionResult, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((relay.clone(), creator.to_string(), cursor.clone()));
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(PullSessionResult {
+                    cursor,
+                    ingested: 0,
+                    skipped_invalid: 0,
+                }))
+        }
+    }
+
+    struct StubIngest;
+
+    impl VineIngestCtx for StubIngest {
+        fn ingest_descriptor(
+            &self,
+            _creator: &str,
+            _json_bytes: &[u8],
+            _now_ms: u64,
+        ) -> IngestVerdict {
+            IngestVerdict::Advance
+        }
+    }
+
+    /// A `PkarrResolver` wired to an empty relay pool. Any test that keeps
+    /// the sidecar's resolve cooldown active never actually calls it, so
+    /// this avoids spinning up a mock pkarr relay server in every test —
+    /// only `resolve_cooldown_uses_cached_relay_hint` needs a live one.
+    fn inert_pkarr_resolver() -> Arc<harmony_pkarr::PkarrResolver> {
+        Arc::new(harmony_pkarr::PkarrResolver::new(Arc::new(
+            harmony_pkarr::RelayClient::new(harmony_pkarr::RelayPool::new(Vec::new())),
+        )))
+    }
+
+    fn temp_sidecar_path(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("vine_pull.cbor")
+    }
+
+    #[tokio::test]
+    async fn first_follow_always_pulls_and_backfills() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "aa".repeat(16);
+        let now = 1_700_000_000_000u64;
+        let relay = VineRelayEntry {
+            iroh_endpoint_id: [0x11; 32],
+            home_relay: String::new(),
+        };
+
+        // Relays already resolved recently (cooldown active, so this pass
+        // never touches the resolver) — genesis cursor, so this is a
+        // creator that's never had a successful pull yet.
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (0, String::new()),
+                    last_pull_attempt_ms: 0,
+                    consecutive_skips: 0,
+                    relay_set: vec![relay.clone()],
+                    relays_fetched_at_ms: now,
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
+            cursor: (now, "v1".to_string()),
+            ingested: 1,
+            skipped_invalid: 0,
+        })]));
+        let followed = creator.clone();
+        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
+        // Mesh recency looks fresher than last_pull_attempt_ms (0) — this
+        // WOULD trigger a skip if first-follow didn't override it.
+        let last_received: LastReceivedMsFn = Arc::new(|_| Some(999_999_999));
+
+        let driver = VinePullDriver::new(
+            [0xFF; 32],
+            inert_pkarr_resolver(),
+            transport.clone(),
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path.clone(),
+        );
+
+        driver.run_one_pass(now).await;
+
+        assert_eq!(
+            transport.calls().len(),
+            1,
+            "first follow must always pull, never skip"
+        );
+        let st = load_vine_pull(&sidecar_path)
+            .per_creator
+            .get(&creator)
+            .cloned()
+            .expect("creator state must persist");
+        assert_eq!(st.cursor, (now, "v1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn mesh_live_skip_is_bounded_at_four() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "bb".repeat(16);
+        let now0 = 1_700_000_000_000u64;
+        let relay = VineRelayEntry {
+            iroh_endpoint_id: [0x22; 32],
+            home_relay: String::new(),
+        };
+
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (500, "seed".to_string()), // NOT first-follow
+                    last_pull_attempt_ms: now0,
+                    consecutive_skips: 0,
+                    relay_set: vec![relay.clone()],
+                    relays_fetched_at_ms: now0,
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
+            cursor: (now0 + 100, "repair".to_string()),
+            ingested: 1,
+            skipped_invalid: 0,
+        })]));
+        let followed = creator.clone();
+        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
+        // Mesh always looks fresher than last_pull_attempt_ms, which stays
+        // pinned at now0 across every skipped pass.
+        let last_received: LastReceivedMsFn = Arc::new(move |_| Some(now0 + 1));
+
+        let driver = VinePullDriver::new(
+            [0xFF; 32],
+            inert_pkarr_resolver(),
+            transport.clone(),
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path.clone(),
+        );
+
+        for i in 1..=4u64 {
+            driver.run_one_pass(now0 + 10 * i).await;
+            assert!(
+                transport.calls().is_empty(),
+                "skip {i} must not dial the relay"
+            );
+        }
+        driver.run_one_pass(now0 + 1000).await;
+        assert_eq!(
+            transport.calls().len(),
+            1,
+            "the 5th pass must force a repair pull"
+        );
+
+        let st = load_vine_pull(&sidecar_path)
+            .per_creator
+            .get(&creator)
+            .cloned()
+            .expect("creator state must persist");
+        assert_eq!(
+            st.consecutive_skips, 0,
+            "a successful repair pull resets the skip counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_relay_entry_is_never_dialed() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "cc".repeat(16);
+        let now = 1_700_000_000_000u64;
+        let self_ep = [0xAA; 32];
+        let mine = VineRelayEntry {
+            iroh_endpoint_id: self_ep,
+            home_relay: "https://self".to_string(),
+        };
+        let other = VineRelayEntry {
+            iroh_endpoint_id: [0xBB; 32],
+            home_relay: "https://other".to_string(),
+        };
+
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (0, String::new()), // first follow: always pulls
+                    last_pull_attempt_ms: 0,
+                    consecutive_skips: 0,
+                    relay_set: vec![mine.clone(), other.clone()],
+                    relays_fetched_at_ms: now,
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
+            cursor: (now, "v".to_string()),
+            ingested: 0,
+            skipped_invalid: 0,
+        })]));
+        let followed = creator.clone();
+        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
+        let last_received: LastReceivedMsFn = Arc::new(|_| None);
+
+        let driver = VinePullDriver::new(
+            self_ep,
+            inert_pkarr_resolver(),
+            transport.clone(),
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path,
+        );
+
+        driver.run_one_pass(now).await;
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1, "exactly one relay must be dialed");
+        assert_eq!(
+            calls[0].0.iroh_endpoint_id, other.iroh_endpoint_id,
+            "self relay entry must be filtered before dialing"
+        );
+    }
+
+    #[tokio::test]
+    async fn mesh_delivered_duplicate_is_a_cheap_no_op() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "ff".repeat(16);
+        let now = 1_700_000_000_000u64;
+        let relay = VineRelayEntry {
+            iroh_endpoint_id: [0x44; 32],
+            home_relay: String::new(),
+        };
+
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (0, String::new()),
+                    last_pull_attempt_ms: 0,
+                    consecutive_skips: 0,
+                    relay_set: vec![relay.clone()],
+                    relays_fetched_at_ms: now,
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        // Simulates a session where every row was AlreadyPresent (the mesh
+        // delivered first): production `ProdVineIngestCtx` maps that to
+        // Advance for each row, so the cursor still moves, but nothing NEW
+        // was ingested.
+        let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
+            cursor: (now, "dup".to_string()),
+            ingested: 0,
+            skipped_invalid: 0,
+        })]));
+        let followed = creator.clone();
+        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
+        let last_received: LastReceivedMsFn = Arc::new(|_| None);
+        let telemetry = Arc::new(crate::network_health::VinePullTelemetry::new());
+
+        let driver = VinePullDriver::new(
+            [0; 32],
+            inert_pkarr_resolver(),
+            transport,
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path.clone(),
+        )
+        .with_telemetry(Arc::clone(&telemetry));
+
+        driver.run_one_pass(now).await;
+
+        let s = telemetry.summary();
+        assert_eq!(
+            s.sessions_ok, 1,
+            "ingested == 0 must still be recorded as a successful session"
+        );
+        assert_eq!(s.sessions_failed, 0);
+        assert_eq!(s.descriptors_ingested, 0);
+
+        let st = load_vine_pull(&sidecar_path)
+            .per_creator
+            .get(&creator)
+            .cloned()
+            .expect("creator state must persist");
+        assert_eq!(
+            st.cursor,
+            (now, "dup".to_string()),
+            "cursor must still advance even when nothing new was ingested"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_cooldown_uses_cached_relay_hint() {
+        // Nothing published for this creator, so a live resolve attempt
+        // would error — proving the cached hint wins on its own merits,
+        // not merely because resolve was skipped by luck.
+        let relay_srv = harmony_pkarr::testing::MockPkarrRelay::start().await;
+        let pool = harmony_pkarr::RelayPool::new(vec![relay_srv.base_url.clone()]);
+        let client = Arc::new(harmony_pkarr::RelayClient::new(pool));
+        let resolver = Arc::new(harmony_pkarr::PkarrResolver::new(client));
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "ee".repeat(16); // valid hex address
+        let now = 1_700_000_000_000u64;
+        let cached_relay = VineRelayEntry {
+            iroh_endpoint_id: [0x33; 32],
+            home_relay: "https://cached".to_string(),
+        };
+
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (0, String::new()),
+                    last_pull_attempt_ms: 0,
+                    consecutive_skips: 0,
+                    relay_set: vec![cached_relay.clone()],
+                    relays_fetched_at_ms: 0, // outside cooldown: resolve WILL be attempted
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
+            cursor: (now, "v".to_string()),
+            ingested: 0,
+            skipped_invalid: 0,
+        })]));
+        let followed = creator.clone();
+        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
+        let last_received: LastReceivedMsFn = Arc::new(|_| None);
+
+        let driver = VinePullDriver::new(
+            [0; 32],
+            resolver,
+            transport.clone(),
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path.clone(),
+        );
+
+        driver.run_one_pass(now).await;
+
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].0, cached_relay,
+            "a failed resolve must fall back to the cached relay hint"
+        );
+
+        let st = load_vine_pull(&sidecar_path)
+            .per_creator
+            .get(&creator)
+            .cloned()
+            .expect("creator state must persist");
+        assert_eq!(
+            st.relay_set,
+            vec![cached_relay],
+            "the cached relay_set must be preserved (not wiped) on a resolve error"
+        );
+    }
+
+    #[tokio::test]
+    async fn unfollowed_creator_state_is_pruned() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let stale_creator = "dd".repeat(16);
+        let now = 1_700_000_000_000u64;
+
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(stale_creator.clone(), CreatorPullState::default())]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        let transport = Arc::new(MockTransport::with_results(Vec::new()));
+        let followed_fn: FollowedCreatorsFn = Arc::new(Vec::new);
+        let last_received: LastReceivedMsFn = Arc::new(|_| None);
+
+        let driver = VinePullDriver::new(
+            [0; 32],
+            inert_pkarr_resolver(),
+            transport.clone(),
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path.clone(),
+        );
+
+        driver.run_one_pass(now).await;
+
+        assert!(
+            transport.calls().is_empty(),
+            "an unfollowed creator must never be dialed"
+        );
+        let loaded = load_vine_pull(&sidecar_path);
+        assert!(
+            loaded.per_creator.is_empty(),
+            "the unfollowed creator's state must be pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_pass_counter_beats_before_target_read() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+
+        let transport = Arc::new(MockTransport::with_results(Vec::new()));
+        let followed_fn: FollowedCreatorsFn = Arc::new(Vec::new);
+        let last_received: LastReceivedMsFn = Arc::new(|_| None);
+        let telemetry = Arc::new(crate::network_health::VinePullTelemetry::new());
+
+        let driver = VinePullDriver::new(
+            [0; 32],
+            inert_pkarr_resolver(),
+            transport,
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path,
+        )
+        .with_telemetry(Arc::clone(&telemetry));
+
+        driver.run_one_pass(1_700_000_000_000).await;
+        driver.run_one_pass(1_700_000_000_001).await;
+
+        let s = telemetry.summary();
+        assert_eq!(
+            s.passes_run, 2,
+            "the loop must prove liveness even with zero followed creators"
+        );
+        assert!(s.last_pass_ms.is_some());
+        assert_eq!(s.sessions_ok, 0);
+        assert_eq!(s.sessions_failed, 0);
+        assert_eq!(
+            s.passes_no_relay, 0,
+            "no followed creators ⇒ no no-relay rows"
+        );
+    }
+}

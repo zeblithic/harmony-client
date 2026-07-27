@@ -289,6 +289,7 @@ pub mod tunnel_manager;
 pub mod tunnel_task;
 pub mod vine_feed_cache;
 pub mod vine_follow_graph;
+pub mod vine_pull_driver;
 pub mod vine_relay;
 pub mod vine_settings;
 pub mod vine_signing;
