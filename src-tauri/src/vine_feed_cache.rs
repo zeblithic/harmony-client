@@ -788,6 +788,17 @@ impl VineFeedCache {
         out
     }
 
+    /// Cheap presence probe by vine id. `delete_vine_impl`'s post-tombstone
+    /// reconcile hook polls this under the cache lock on a 25ms cadence —
+    /// `list_descriptors` (full DTO clone + sort, up to MAX_DESCRIPTORS
+    /// rows) is far too heavy for that loop (Qodo PR #564 round 1).
+    /// Equivalent to `list_descriptors().iter().any(|v| v.id == vine_id)`:
+    /// that listing maps over this same map unfiltered, and tombstone
+    /// application removes the entry outright rather than marking it.
+    pub fn has_descriptor(&self, vine_id: &str) -> bool {
+        self.descriptors.contains_key(vine_id)
+    }
+
     /// ZEB-811: paginated per-creator descriptors for vine-relay serving.
     /// Ascending `(created_at, id)` tuple order; returns only rows
     /// strictly greater than the `after` cursor, up to `limit` rows —

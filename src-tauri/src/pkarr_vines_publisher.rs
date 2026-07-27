@@ -890,7 +890,7 @@ mod tests {
             .expect("creator address hex is valid")
             .verifying_key();
         let mut attempts = 0;
-        loop {
+        let squat_announced_at_ms = loop {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             attempts += 1;
             assert!(attempts < 80, "squat publish did not land");
@@ -899,9 +899,37 @@ mod tests {
                     rec.harmony_identity_pub, attacker_pub,
                     "the squat relay must be holding the ATTACKER's record"
                 );
-                break;
+                break rec.announced_at_ms;
             }
-        }
+        };
+
+        // Pin the premise AT assertion time (CodeRabbit PR #564 round 1):
+        // the squat must actually outrank the genuine record, or a genuine
+        // republish landing after the squat would let the assertions below
+        // pass even with per-candidate verification reverted — a silent
+        // false positive. BEP44 `seq` is not surfaced by the resolver API,
+        // but seq and `announced_at_ms` are both minted from the
+        // publish-time clock, and the wait loops above serialize the two
+        // mints (the genuine record was OBSERVED landed before the squat
+        // ever registered) — so strictly later announced_at pins the
+        // strictly higher seq.
+        let genuine_probe = harmony_pkarr::PkarrResolver::new(single_relay_client(&genuine_relay));
+        let genuine_rec = genuine_probe
+            .resolve_freshest(&slot_key)
+            .await
+            .expect("genuine-relay probe must not error")
+            .expect("genuine relay must still hold the genuine record");
+        assert_eq!(
+            genuine_rec.harmony_identity_pub,
+            crate::vine_signing::identity_pub_64(&identity),
+            "the genuine relay must be holding the GENUINE record"
+        );
+        assert!(
+            squat_announced_at_ms > genuine_rec.announced_at_ms,
+            "premise: the squat record must be strictly fresher than the genuine \
+             one (squat {squat_announced_at_ms} vs genuine {})",
+            genuine_rec.announced_at_ms
+        );
 
         // The squat is fresher by seq and answers first, but it fails the
         // address binding — the genuine relay set must still resolve.

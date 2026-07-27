@@ -131,11 +131,12 @@
   Flesh both out with the same fixtures as Step 2 (they share the two-relay setup; write real bodies, the comments above are the scenarios to encode).
 
 - [ ] **Step 4: Run tests to verify they fail** (fns don't exist yet):
-  `cargo nextest run -p harmony-pkarr --features test-fixtures -E 'test(verified_resolve)' ; echo "EXPECT compile error: resolve_freshest_with not found"`
+  `cargo nextest run --locked -p harmony-pkarr --features test-fixtures -E 'test(verified_resolve)' ; echo "EXPECT compile error: resolve_freshest_with not found"`
 
 - [ ] **Step 5: Implement `resolve_freshest_with`.** Copy the body of `resolve_freshest` (`resolver.rs:209-258`) into the new generic fn and change exactly two regions:
 
   Candidate loop — collect instead of reduce (replaces `:222-239`):
+
 ```rust
         let mut candidates: Vec<(u64, PkarrRoutingRecord)> = Vec::new();
         for (_relay, envelope) in hits {
@@ -168,12 +169,12 @@
 - [ ] **Step 7: Doc-comment the unverified fns.** On `resolve_freshest` and `resolve_window_freshest` add: `/// NOTE (ZEB-817): callers resolving slots whose keys derive from public inputs (e.g. Case E vines) MUST use the _with variant — this fn accepts the freshest self-certified record without caller verification.`
 
 - [ ] **Step 8: Run the new tests + full crate suite:**
-  `cargo nextest run -p harmony-pkarr --features test-fixtures && echo NEXTEST_GATE_OK`
+  `cargo nextest run --locked -p harmony-pkarr --features test-fixtures && echo NEXTEST_GATE_OK`
   Expected: all pass including the 3 new tests.
 
 - [ ] **Step 9: fmt + clippy gates (un-piped):**
   `cargo fmt --all -- --check && echo FMT_GATE_OK`
-  `cargo clippy -p harmony-pkarr --all-targets -- -D warnings && echo CLIPPY_GATE_OK` (match the repo's CI clippy invocation if stricter).
+  `cargo clippy --locked -p harmony-pkarr --all-targets -- -D warnings && echo CLIPPY_GATE_OK` (match the repo's CI clippy invocation if stricter).
 
 - [ ] **Step 10: Commit:**
   `git add crates/harmony-pkarr/src/resolver.rs && git commit -m "pkarr: verified freshest-resolve variants — unverified records cannot win, pin the highwater, or enter the cache (ZEB-817)"`
@@ -217,7 +218,7 @@
 
   Write the real body following the existing helpers (`test_publisher` `:414-421` builds a publisher against one relay; clone the pattern for the second relay). The attacker publisher's `RecordBuilder` signs with the attacker identity but publishes under the SAME ephemeral slot key (`vines_key_for_epoch(&genuine_addr, epoch)`).
 
-- [ ] **Step 4: Run it — expect failure** (attacker's fresher record wins today, resolve errors on binding): `cd src-tauri && cargo test squatted_slot_still_resolves_genuine_relay_set -- --nocapture ; echo "EXPECT FAIL"`
+- [ ] **Step 4: Run it — expect failure** (attacker's fresher record wins today, resolve errors on binding): `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(squatted_slot_still_resolves_genuine_relay_set)' ; echo "EXPECT FAIL"`
   NOTE: this requires the Step 2 pin bump to compile against the `_with` API only in Step 5 — if the test needs `_with` to even express, reorder: bump pin (Step 2), write test, watch it fail against the OLD `resolve_vine_relays` body, then fix in Step 5. The test as written calls only `resolve_vine_relays`, so it compiles either way.
 
 - [ ] **Step 5: Adopt the verified variant.** In `pkarr_vines.rs` `resolve_vine_relays`, replace the resolve + post-verify (`:144-149`) with:
@@ -237,7 +238,7 @@
   (The second `verify_vines_record` re-runs a pure, cheap chain to get the decoded payload; keep the existing tail of the fn that maps `payload.relay_set`.)
 
 - [ ] **Step 6: Run the new test + both module suites:**
-  `cd src-tauri && cargo test pkarr_vines && echo VINES_TESTS_OK`
+  `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(pkarr_vines)' && echo VINES_TESTS_OK`
   Expected: new test passes; all existing `pkarr_vines`/`pkarr_vines_publisher` tests still pass.
 
 - [ ] **Step 7: Commit:**
@@ -282,7 +283,7 @@
 
   Write real bodies using the duplex fixture idiom (`tokio::io::duplex(1 << 16)`, server task, `server_write.shutdown().await`, outer 5 s timeout — see `:905-940`).
 
-- [ ] **Step 2: Run to verify the first fails** (today the cursor advances to `u64::MAX`): `cd src-tauri && cargo test skip_invalid_refuses -- --nocapture ; echo "EXPECT FAIL"`
+- [ ] **Step 2: Run to verify the first fails** (today the cursor advances to `u64::MAX`): `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(skip_invalid_refuses)' ; echo "EXPECT FAIL"`
 
 - [ ] **Step 3: Implement.** Add near the other consts (`:70` area):
 
@@ -312,7 +313,7 @@ pub const VINE_PULL_INVALID_FORWARD_SKEW_SECS: u64 = 30 * 60;
             }
 ```
 
-- [ ] **Step 4: Run all session tests:** `cd src-tauri && cargo test vine_pull_driver && echo PULL_TESTS_OK` — new tests pass, existing `cursor_advances_past_invalid_but_not_past_halt` still passes (its invalid rows are plausibly timed; if it used far-future timestamps, fix the fixture timestamps, not the invariant).
+- [ ] **Step 4: Run all session tests:** `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(vine_pull_driver)' && echo PULL_TESTS_OK` — new tests pass, existing `cursor_advances_past_invalid_but_not_past_halt` still passes (its invalid rows are plausibly timed; if it used far-future timestamps, fix the fixture timestamps, not the invariant).
 
 - [ ] **Step 5: Commit:** `git add src-tauri/src/vine_pull_driver.rs && git commit -m "vine pull: unverifiable rows advance the cursor only within 30min forward skew (ZEB-818)"`
 
@@ -367,7 +368,7 @@ pub const VINE_PULL_INVALID_FORWARD_SKEW_SECS: u64 = 30 * 60;
     }
 ```
 
-- [ ] **Step 2: Run to verify failure** (no `PullProgressSink` yet — compile error): `cd src-tauri && cargo test progress_sink -- --nocapture ; echo "EXPECT compile error"`
+- [ ] **Step 2: Run to verify failure** (no `PullProgressSink` yet — compile error): `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(progress_sink)' ; echo "EXPECT compile error"`
 
 - [ ] **Step 3: Implement the sink** (near `PullSessionResult`):
 
@@ -402,7 +403,7 @@ impl PullProgressSink {
   - `pull_one_creator`: create `let progress = PullProgressSink::default();` before the candidate loop (`:663`), pass a clone to each `pull_pages` call; after the loop, in BOTH arms: `if let Some(p) = progress.take() { if p > st.cursor { st.cursor = p; } }` — on `Ok`, `res.cursor` equals the final commit so this is a no-op; on `Err` it rescues completed pages.
   - Update `MockTransport` (`:1062-1085`) to accept and (for the new test) drive the sink; update `StubIngest`-based session tests' direct `run_vine_pull_client_session` calls with a sink arg.
 
-- [ ] **Step 5: Run the full module:** `cd src-tauri && cargo test vine_pull_driver && echo PULL_TESTS_OK` — all pass.
+- [ ] **Step 5: Run the full module:** `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(vine_pull_driver)' && echo PULL_TESTS_OK` — all pass.
 
 - [ ] **Step 6: Commit:** `git add src-tauri/src/vine_pull_driver.rs && git commit -m "vine pull: page-boundary progress sink survives the IO deadline (ZEB-819)"`
 
@@ -410,6 +411,7 @@ impl PullProgressSink {
 
 **Files:**
 - Modify: `src-tauri/src/pkarr_vines_publisher.rs` (`reconcile_locked` branch 4, `:281-293`; tests)
+- Modify: `src-tauri/src/lib.rs` (`delete_vine_impl` — post-tombstone reconcile trigger, spec §5)
 
 **Interfaces:**
 - Consumes: existing retraction path (`:302-318`), `build_retraction_blob` (`:61-67`), `publisher.active_handles()` (`:294-299`), test tiers (`:399-483`, `:558-635`), `Arc<AtomicUsize>` count-swap pattern (`:664-673`).
@@ -434,7 +436,7 @@ impl PullProgressSink {
 
   Note the empty-set retraction makes `resolve_vine_relays` return `Ok(vec![])` (payload decodes, `relay_set` empty) — assert exactly that.
 
-- [ ] **Step 2: Run to verify failure** (today the handle is unregistered; the old non-empty record persists on the mock relay, so the poll for an empty set times out): `cd src-tauri && cargo test zero_own_vines_with_share_on -- --nocapture ; echo "EXPECT FAIL"`
+- [ ] **Step 2: Run to verify failure** (today the handle is unregistered; the old non-empty record persists on the mock relay, so the poll for an empty set times out): `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(zero_own_vines_with_share_on)' ; echo "EXPECT FAIL"`
 
 - [ ] **Step 3: Implement.** Replace branch 4 (`:290-293`) with the disable-path shape:
 
@@ -460,16 +462,18 @@ impl PullProgressSink {
 
   then reuse/share the retraction-only `RecordBuilder` registration currently at `:302-318` (extract it into a private helper `async fn register_retraction(&self, ...)` called from both the share==false branch and this one, so the two paths cannot drift).
 
-- [ ] **Step 4: Run the module suite:** `cd src-tauri && cargo test pkarr_vines_publisher && echo PUB_TESTS_OK` — new test + all 11 existing pass (esp. `enable_does_not_register_without_own_vines` `:638` — a fresh enable with zero vines has no active handle, so it must still register nothing).
+- [ ] **Step 4: Wire the delete trigger** (spec §5 — without it the new branch only runs at the scheduled pkarr cadence, leaving the headline ZEB-822 scenario unresolved for up to ~3.5 days). In `src-tauri/src/lib.rs` `delete_vine_impl`, after the tombstone publish acks, spawn (never inline-await) a bounded wait — up to ~2s of 25ms polls — for the loopback echo to evict the deleted vine from the feed cache, then call `pkarr_vines_publisher.republish()`. The reconcile must OBSERVE zero own vines, and the count it reads is updated asynchronously by the loopback echo, so reconciling immediately races the eviction. Do NOT apply the tombstone locally to win that race: `on_tombstone_sample` returns `AlreadyApplied` for the echo, which suppresses its `vine-removed` emission and its ZEB-670 pin-guarded blob eviction. Exhausting the wait degrades to exactly the pre-hook cadence-tick behavior. Cover the trigger in the `delete_vine` test suite.
 
-- [ ] **Step 5: Commit:** `git add src-tauri/src/pkarr_vines_publisher.rs && git commit -m "vines publisher: actively retract when the last own vine disappears while sharing is on (ZEB-822)"`
+- [ ] **Step 5: Run the module suites:** `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(pkarr_vines_publisher) or test(delete_vine)' && echo PUB_TESTS_OK` — new test + all existing pass (esp. `enable_does_not_register_without_own_vines` `:638` — a fresh enable with zero vines has no active handle, so it must still register nothing).
+
+- [ ] **Step 6: Commit:** `git add src-tauri/src/pkarr_vines_publisher.rs src-tauri/src/lib.rs && git commit -m "vines publisher: actively retract when the last own vine disappears while sharing is on (ZEB-822)"`
 
 ### Task 6: Full gates + branch finish (PR B)
 
 **Files:** none new — verification only (controller runs these; listed for the record).
 
 - [ ] **Step 1:** `cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri && cargo fmt --all -- --check && echo FMT_GATE_OK`
-- [ ] **Step 2:** `cargo clippy --all-targets -- -D warnings && echo CLIPPY_GATE_OK` (match CI's exact clippy line)
+- [ ] **Step 2:** `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings && echo CLIPPY_GATE_OK` (CI's exact clippy line)
 - [ ] **Step 3:** `cd /Users/zeblith/work/zeblithic/harmony-client && scripts/test-select --full` (pin bump changes the dep graph — full sweep is mandatory; read the summary line, un-piped)
 - [ ] **Step 4:** `cd src-tauri && cargo build --bin harmony-app && echo BUILD_OK`, then run the follow-only e2e with the fresh binary pinned (`HARMONY_APP_BIN`): `s_vines_follow_only` must pass.
 - [ ] **Step 5:** Frontend untouched — no tsc/vitest needed unless the sweep says otherwise.

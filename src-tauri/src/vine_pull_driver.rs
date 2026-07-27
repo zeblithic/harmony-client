@@ -189,8 +189,16 @@ pub struct PullProgressSink(Arc<std::sync::Mutex<Option<(u64, String)>>>);
 impl PullProgressSink {
     /// Monotone: only advances (strictly greater tuple order), so a stale
     /// commit from a failed earlier candidate cannot regress progress.
+    ///
+    /// Poison is RECOVERED, not propagated (both methods): the sink exists
+    /// to preserve progress across another task's failure, and the slot is
+    /// a plain `Option` that is valid at every instruction — a panic while
+    /// the lock was held cannot leave it torn. Panicking here would turn
+    /// one earlier panic into a permanently broken pull path (every later
+    /// commit/take repanics until restart), which is strictly worse than
+    /// the stale-progress cost it guards against (Qodo PR #564 round 1).
     pub fn commit(&self, cursor: (u64, String)) {
-        let mut slot = self.0.lock().expect("progress sink poisoned");
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
         match slot.as_ref() {
             Some(cur) if *cur >= cursor => {}
             _ => *slot = Some(cursor),
@@ -200,7 +208,7 @@ impl PullProgressSink {
     /// Read and clear the slot. The driver calls this once per creator per
     /// pass, after every candidate relay has had its turn.
     pub fn take(&self) -> Option<(u64, String)> {
-        self.0.lock().expect("progress sink poisoned").take()
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
 
@@ -336,7 +344,9 @@ where
         // `Advance`/`AdvanceDuplicate` assign `cursor = candidate`
         // order-blind, so a hostile relay serving a below-cursor row does
         // move it backward (final review M5, pre-existing; cost is
-        // re-download work only). `commit`'s monotonicity absorbs that.
+        // re-download work only). `commit`'s monotonicity absorbs that
+        // here, and the driver's success-path assignment is monotone for
+        // the same reason — the durable cursor never follows it backward.
         progress.commit(cursor.clone());
 
         if page_len < VINE_PULL_PAGE_LIMIT_MAX as usize {
@@ -764,7 +774,16 @@ impl VinePullDriver {
                 .await
             {
                 Ok(res) => {
-                    st.cursor = res.cursor;
+                    // Monotone, mirroring the sink merge below: a hostile
+                    // relay serving below-cursor rows makes the session
+                    // return a REWOUND final cursor (the order-blind
+                    // `Advance` assignment — see the session's page-boundary
+                    // comment), and taking that at face value was the one
+                    // remaining path that could rewind the durable cursor
+                    // (CodeRabbit PR #564 round 1).
+                    if res.cursor > st.cursor {
+                        st.cursor = res.cursor;
+                    }
                     if let Some(t) = self.telemetry.as_ref() {
                         t.record_session_ok(creator, &relay.iroh_endpoint_id, res.ingested);
                     }
@@ -2220,6 +2239,75 @@ mod tests {
             (9, "x".to_string()),
             "the merge is a MAX: a succeeding candidate's LOWER cursor must not \
              rewind progress an earlier failed candidate already committed"
+        );
+    }
+
+    /// A SUCCESSFUL session whose relay handed back a below-cursor final
+    /// result (order-blind `Advance` on hostile below-cursor rows) must not
+    /// rewind the durable cursor: the driver's success-path assignment is
+    /// monotone, same as the sink merge (CodeRabbit PR #564 round 1 — the
+    /// plain `st.cursor = res.cursor` overwrite was the one remaining
+    /// rewind path).
+    #[tokio::test]
+    async fn successful_session_below_cursor_result_does_not_rewind_durable_progress() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "ba".repeat(16);
+        let now = 1_700_000_000_000u64;
+        let relay = VineRelayEntry {
+            iroh_endpoint_id: [0xAB; 32],
+            home_relay: "https://rewinding-relay".to_string(),
+        };
+
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (1_699_999_000, "durable".to_string()),
+                    last_pull_attempt_ms: 0,
+                    consecutive_skips: 0,
+                    relay_set: vec![relay.clone()],
+                    relays_fetched_at_ms: now, // cooldown active: no resolve
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
+            cursor: (5, "rewound".to_string()),
+            ingested: 1,
+            skipped_invalid: 0,
+        })]));
+        let followed = creator.clone();
+        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
+        let last_received: LastReceivedMsFn = Arc::new(|_| None);
+
+        let driver = VinePullDriver::new(
+            [0xFF; 32],
+            inert_pkarr_resolver(),
+            transport.clone(),
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path.clone(),
+        );
+        driver.run_one_pass(now).await;
+
+        assert_eq!(
+            transport.calls().len(),
+            1,
+            "the seeded relay must be pulled"
+        );
+        let st = load_vine_pull(&sidecar_path)
+            .per_creator
+            .get(&creator)
+            .cloned()
+            .expect("creator state must persist");
+        assert_eq!(
+            st.cursor,
+            (1_699_999_000, "durable".to_string()),
+            "a successful session's below-cursor result must not rewind the \
+             durable cursor"
         );
     }
 }

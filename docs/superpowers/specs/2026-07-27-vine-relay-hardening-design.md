@@ -108,8 +108,10 @@ Follow `resolve_freshest_beats_stale_relay` (`resolver.rs:528-585`): two
 4. **All candidates unverified → `Ok(None)`**, and a subsequent resolve of a
    newly published genuine record succeeds (nothing was cached or pinned).
 
-Gate: `cargo nextest run -p harmony-pkarr --features test-fixtures` + fmt +
-clippy as per repo CI.
+Gate: `cargo nextest run --locked -p harmony-pkarr --features test-fixtures`
++ `cargo fmt --all -- --check` +
+`cargo clippy --locked -p harmony-pkarr --all-targets -- -D warnings` as per
+repo CI.
 
 ## 2. ZEB-817 client — adopt the verified resolve
 
@@ -366,10 +368,16 @@ yields the **empty-set retraction** (not merely an unregistered handle).
 
 ## Gates
 
-- Core: `cargo fmt --all -- --check`, clippy per repo CI,
-  `cargo nextest run -p harmony-pkarr --features test-fixtures`.
-- Client: fmt + `clippy --all-targets` sentinel-gated un-piped, module
-  suites (`vine_pull_driver`, `pkarr_vines`, `pkarr_vines_publisher`,
+- Core: `cargo fmt --all -- --check`,
+  `cargo clippy --locked -p harmony-pkarr --all-targets -- -D warnings`,
+  `cargo nextest run --locked -p harmony-pkarr --features test-fixtures`.
+- Client: `cargo fmt --all -- --check` +
+  `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`
+  sentinel-gated un-piped, module suites via
+  `cargo nextest run --locked --features test-fixtures -E 'test(<module>)'`
+  (`vine_pull_driver`, `pkarr_vines`, `pkarr_vines_publisher`,
   `vine_relay`, rpc), `scripts/test-select --full` (dep-graph changes via
-  pin bump force it), fresh `cargo build --bin harmony-app` +
-  `s_vines_follow_only` e2e before PR.
+  pin bump force it; expands to the CI-parity
+  `cargo nextest run --locked --workspace --all-targets --features test-fixtures`),
+  fresh `cargo build --bin harmony-app` + `s_vines_follow_only` e2e before
+  PR.

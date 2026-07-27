@@ -17138,7 +17138,7 @@ pub(crate) async fn delete_vine_impl(
             for _ in 0..VINE_DELETE_RECONCILE_WAIT_TICKS {
                 let still_cached = cache_for_hook
                     .lock()
-                    .map(|c| c.list_descriptors().iter().any(|v| v.id == deleted_vine_id))
+                    .map(|c| c.has_descriptor(&deleted_vine_id))
                     // Poisoned: we can never observe the eviction, so stop
                     // waiting and reconcile on whatever the gate reads.
                     .unwrap_or(false);
