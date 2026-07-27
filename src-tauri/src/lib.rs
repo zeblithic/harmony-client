@@ -244,6 +244,7 @@ pub mod pkarr_friend_publisher;
 pub mod pkarr_identity_publisher;
 pub mod pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
+pub mod pkarr_vines;
 pub mod profile;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;

@@ -152,6 +152,18 @@ pub fn sign_follow_list(
     p.identity_pub = Some(hex::encode(private.public_identity().to_public_bytes()));
 }
 
+/// The address a hex-encoded 64-byte identity pub derives (`SHA256(pub)[:16]`,
+/// hex-encoded). Extracted from `verify_signed`'s pubkey→address binding
+/// (ZEB-811 Task 2) so `pkarr_vines::verify_vines_record` can reuse the exact
+/// same derivation instead of duplicating it.
+pub(crate) fn address_for_identity_pub_hex(identity_pub_hex: &str) -> Result<String, String> {
+    let pub_vec =
+        hex::decode(identity_pub_hex).map_err(|e| format!("identity pub is not hex: {e}"))?;
+    let identity = harmony_identity::Identity::from_public_bytes(&pub_vec)
+        .map_err(|_| "identity pub invalid".to_string())?;
+    Ok(hex::encode(identity.address_hash))
+}
+
 /// Shared verification core: pubkey→address binding, then strict
 /// Ed25519 over the canonical bytes (`verify_strict` rejects
 /// non-canonical S values / small-order R points — RFC 8032 strict
@@ -169,7 +181,7 @@ pub(crate) fn verify_signed(
         hex::decode(identity_pub).map_err(|e| format!("{what} identity pub is not hex: {e}"))?;
     let identity = harmony_identity::Identity::from_public_bytes(&pub_vec)
         .map_err(|_| format!("{what} identity pub invalid"))?;
-    if hex::encode(identity.address_hash) != claimed_address {
+    if address_for_identity_pub_hex(identity_pub).as_deref() != Ok(claimed_address) {
         return Err(format!("{what} pubkey does not match claimed address"));
     }
     let sig_bytes: [u8; 64] = hex::decode(sig)
@@ -390,6 +402,38 @@ pub fn verify_reaction_v2(r: &VineReactionPayload, now_secs: u64) -> Result<(), 
     )
 }
 
+// ── Test/fixture-only identity-minting helpers (ZEB-811 Task 2) ──────────
+//
+// Shared with `pkarr_vines.rs`'s record-verification test so it doesn't
+// duplicate key-minting code. `test_identity` mirrors this module's own
+// pre-existing test helper (moved here so it's reachable outside `mod
+// tests`); `identity_pub_64`/`identity_signing_key` bridge a
+// `PrivateIdentity` to the raw types `PkarrRoutingRecord::sign_new` needs.
+// `PrivateIdentity` keeps its Ed25519 `SigningKey` field private (no public
+// accessor), so `identity_signing_key` recovers it from
+// `to_private_bytes()`'s `[X25519 secret(32) ‖ Ed25519 secret(32)]` layout.
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) fn test_identity() -> harmony_identity::PrivateIdentity {
+    harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng)
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) fn identity_pub_64(identity: &harmony_identity::PrivateIdentity) -> [u8; 64] {
+    identity.public_identity().to_public_bytes()
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) fn identity_signing_key(
+    identity: &harmony_identity::PrivateIdentity,
+) -> ed25519_dalek::SigningKey {
+    let priv_bytes = identity.to_private_bytes();
+    let ed_seed: [u8; 32] = priv_bytes[32..]
+        .try_into()
+        .expect("to_private_bytes returns 64 bytes");
+    ed25519_dalek::SigningKey::from_bytes(&ed_seed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,10 +441,6 @@ mod tests {
     /// A mutation applied to a signed payload to prove the signature
     /// covers the mutated field.
     type Tamper<T> = Box<dyn Fn(&mut T)>;
-
-    fn test_identity() -> harmony_identity::PrivateIdentity {
-        harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng)
-    }
 
     fn addr_of(private: &harmony_identity::PrivateIdentity) -> String {
         hex::encode(private.public_identity().address_hash)
