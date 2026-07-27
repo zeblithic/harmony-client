@@ -48,7 +48,10 @@
     onDelete?: (vine: VineVideo) => Promise<void> | void;
     onFollow?: (address: string, name: string) => void;
     onUnfollow?: (address: string) => void;
-    resolveVideo?: (cid: string) => Promise<string>;
+    /** ZEB-811: creatorAddress is the video's OWNING creator (originalCreatorAddress
+     * for a reshare, else creatorAddress) — the fallback dials THAT creator's
+     * relay set on a mesh miss, never the resharer's. */
+    resolveVideo?: (cid: string, creatorAddress: string) => Promise<string>;
     getReaction?: (vineId: string) => { count: number; likedByMe: boolean };
     onToggleLike?: (vine: VineVideo) => void;
     onViewOriginal?: (vineId: string) => void;
@@ -431,12 +434,15 @@
     return set;
   });
 
+  // ZEB-811: cid -> the video's OWNING creator address (originalCreatorAddress
+  // for a reshare, else creatorAddress) — resolveVideo's relay fallback dials
+  // THAT creator's relay set on a mesh miss, never the resharer's.
   let windowCids = $derived.by(() => {
-    const set = new Set<string>();
+    const m = new Map<string, string>();
     for (const v of filteredVines) {
-      if (windowIds.has(v.id)) set.add(v.videoCid);
+      if (windowIds.has(v.id)) m.set(v.videoCid, v.originalCreatorAddress ?? v.creatorAddress);
     }
-    return set;
+    return m;
   });
 
   $effect(() => {
@@ -452,10 +458,10 @@
     if (next) videoUrls = next;
     const resolver = resolveVideo;
     if (!resolver) return;
-    for (const cid of want) {
+    for (const [cid, creatorAddress] of want) {
       if (videoUrls.has(cid) || pendingCids.has(cid)) continue;
       pendingCids.add(cid);
-      resolver(cid)
+      resolver(cid, creatorAddress)
         .then(url => {
           pendingCids.delete(cid);
           // The component may have unmounted, or the window may have moved,

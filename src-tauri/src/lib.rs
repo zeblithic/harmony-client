@@ -1416,6 +1416,12 @@ pub struct NodeState {
     /// this so a fresh follow pulls within seconds instead of waiting out
     /// the idle cadence.
     pub vine_pull_wake: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// ZEB-811 Task 9: the driver itself (a second `Arc` clone taken
+    /// alongside the wake handle, before `.spawn()` consumes its own clone)
+    /// — `fetch_vine_video_impl` reads `cached_relays_for` off this to
+    /// decide the relay fallback without adding a third IPC-facing channel
+    /// for a read that's already cheap to lock.
+    pub vine_pull_driver: Option<std::sync::Arc<crate::vine_pull_driver::VinePullDriver>>,
 
     /// ZEB-418 SP2 P2: dm-outhold dataset (sender-side outbound-hold blobs,
     /// spec D12). `Some` while the node is running and an owner identity is
@@ -2060,6 +2066,9 @@ impl Default for NodeState {
             // pull-driver handle above).
             vine_pull_driver_handle: None,
             vine_pull_wake: None,
+            // ZEB-811 Task 9: the driver Arc itself stays None alongside the
+            // handle + wake above until start_node wires it.
+            vine_pull_driver: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles stay
             // None until start_node wires the FleetSyncEngines (mirrors
             // dm-inbox).
@@ -2798,6 +2807,9 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
             h.abort();
         }
         guard.vine_pull_wake = None;
+        // ZEB-811 Task 9: drop the driver Arc too — a restart rebuilds a
+        // fresh one alongside the handle + wake above.
+        guard.vine_pull_driver = None;
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -4174,6 +4186,13 @@ pub async fn start_node_inner(
         // mirroring `community_relay_publisher_force_opt` above).
         let mut vine_pull_driver_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut vine_pull_wake_opt: Option<std::sync::Arc<tokio::sync::Notify>> = None;
+        // ZEB-811 Task 9: carrier for a second `Arc` clone of the driver
+        // itself, taken at construction time BEFORE `.spawn()` (which takes
+        // `self: Arc<Self>` by value) consumes its own clone — stashed on
+        // NodeState so `fetch_vine_video_impl` can read `cached_relays_for`.
+        let mut vine_pull_driver_opt: Option<
+            std::sync::Arc<crate::vine_pull_driver::VinePullDriver>,
+        > = None;
         let mut relay_sync_handles_opt: Option<crate::event_loop::RelaySyncHandles> = None;
         // ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync engines + their
         // NodeState handles. Built alongside the dm-inbox engine when an
@@ -10952,6 +10971,15 @@ pub async fn start_node_inner(
                                         .with_telemetry(vine_pull_telemetry),
                                     );
                                     vine_pull_wake_opt = Some(vine_pull_driver.wake_handle());
+                                    // ZEB-811 Task 9: clone the Arc BEFORE
+                                    // `.spawn()` below moves the original
+                                    // (its receiver is `self: Arc<Self>`) —
+                                    // this clone is what NodeState stashes
+                                    // for `cached_relays_for` reads; the one
+                                    // `.spawn()` takes only ever powers the
+                                    // background loop.
+                                    vine_pull_driver_opt =
+                                        Some(std::sync::Arc::clone(&vine_pull_driver));
                                     vine_pull_driver_handle_opt = Some(vine_pull_driver.spawn());
 
                                     // D. Sender relay deposit client → inject into
@@ -12273,6 +12301,11 @@ pub async fn start_node_inner(
                         // JoinHandle is `.take()`n since stop_inner aborts it).
                         guard.vine_pull_wake = vine_pull_wake_opt.clone();
                         guard.vine_pull_driver_handle = vine_pull_driver_handle_opt.take();
+                        // ZEB-811 Task 9: stash the driver Arc itself (Clone,
+                        // like `force`/`wake` above — `fetch_vine_video_impl`
+                        // reads it repeatedly across the node's lifetime, so
+                        // it is never `.take()`n).
+                        guard.vine_pull_driver = vine_pull_driver_opt.clone();
                         // ZEB-418 SP2 P2: store the dm-outhold + fleet-net
                         // dataset handles (no IPC surface yet — stop_inner
                         // and the send_dm hold-write/apply-sweeper paths
@@ -25436,6 +25469,329 @@ async fn fetch_avatar(
     reply_rx
         .await
         .map_err(|_| "event loop dropped fetch request".to_string())?
+}
+
+// =====================================================================
+// ZEB-811 Task 9: vine video fetch — mesh-first with vine-relay fallback
+// =====================================================================
+
+/// Pure decision layer for `fetch_vine_video`'s relay fallback (unit-tested
+/// without any mesh/network state — see `fetch_vine_tests` below). The mesh
+/// attempt itself has ALREADY happened by the time a caller reaches this:
+/// this fn only decides whether a relay fallback is even worth trying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VideoFetchPlan {
+    /// No relay attempt: either the creator isn't followed (their relay set
+    /// is no more trustworthy an oracle than the mesh miss already was), or
+    /// followed but every cached relay entry filtered out as self.
+    MeshOnly,
+    /// Try each relay in order (best-effort) until one serves the CID.
+    MeshThenRelay(Vec<crate::pkarr_vines::VineRelayEntry>),
+}
+
+/// `followed`: is `creator_address` in this node's followed set. `cached_relays`:
+/// the creator's raw cached relay-set hint (`VinePullDriver::cached_relays_for`,
+/// unfiltered). `self_ep`: this node's own iroh endpoint id — filtered out
+/// here (never in the accessor) because a creator's advertised relay set can
+/// list this node itself (ZEB-806: iroh rejects self-dials, so an unfiltered
+/// self-entry would be a permanent doomed dial).
+fn plan_video_fetch(
+    followed: bool,
+    cached_relays: Vec<crate::pkarr_vines::VineRelayEntry>,
+    self_ep: [u8; 32],
+) -> VideoFetchPlan {
+    if !followed {
+        return VideoFetchPlan::MeshOnly;
+    }
+    let relays: Vec<crate::pkarr_vines::VineRelayEntry> = cached_relays
+        .into_iter()
+        .filter(|r| r.iroh_endpoint_id != self_ep)
+        .collect();
+    if relays.is_empty() {
+        VideoFetchPlan::MeshOnly
+    } else {
+        VideoFetchPlan::MeshThenRelay(relays)
+    }
+}
+
+/// Dial one vine relay over `harmony/vine-relay/v1` and fetch `cid_hex`'s
+/// content bytes. Mirrors `vine_pull_driver::IrohVinePullTransport::pull_pages`'s
+/// dial pattern (`EndpointAddr::new(ep).with_relay_url(home_relay)`, one
+/// overall `tokio::time::timeout` around the whole exchange) but drives the
+/// simpler single-shot content request/response instead of the paged
+/// descriptor loop.
+async fn fetch_video_from_vine_relay(
+    endpoint: &crate::iroh_endpoint::IrohEndpoint,
+    relay: &crate::pkarr_vines::VineRelayEntry,
+    cid_hex: &str,
+) -> Result<Vec<u8>, String> {
+    let io_deadline =
+        std::time::Duration::from_millis(crate::vine_relay::VINE_RELAY_IO_DEADLINE_MS);
+    let exchange = async {
+        let ep_id = iroh::EndpointId::from_bytes(&relay.iroh_endpoint_id)
+            .map_err(|e| format!("relay endpoint id: {e}"))?;
+        let mut addr = iroh::EndpointAddr::new(ep_id);
+        if !relay.home_relay.is_empty() {
+            match relay.home_relay.parse::<iroh::RelayUrl>() {
+                Ok(url) => addr = addr.with_relay_url(url),
+                Err(e) => tracing::trace!(
+                    relay = %relay.home_relay,
+                    "ZEB-811: skip malformed vine relay home_relay: {e}"
+                ),
+            }
+        }
+        let conn = endpoint
+            .inner()
+            .connect(addr, crate::vine_relay::VINE_RELAY_ALPN)
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+
+        let req =
+            crate::vine_relay::VinePullRequest::Content(crate::vine_relay::VineContentRequest {
+                cid_hex: cid_hex.to_string(),
+            });
+        let req_bytes = crate::vine_relay::encode_vine_pull_request(&req)
+            .map_err(|e| format!("encode: {e}"))?;
+        crate::iroh_framing::write_len_prefixed(
+            &mut send,
+            &req_bytes,
+            crate::vine_relay::VINE_QUERY_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            false,
+        )
+        .await
+        .map_err(|e| format!("write request: {e}"))?;
+        // Task 6 gotcha: `tokio::io::split`'s write half does NOT half-close
+        // on drop (the underlying stream is Arc-shared) — `SendStream::finish()`
+        // is the real signal. This session sends exactly one request, so
+        // finishing right after the write lets the relay's read loop end
+        // gracefully (`ClientEof`) instead of idling out the full deadline.
+        send.finish().map_err(|e| format!("finish: {e}"))?;
+
+        let meta_bytes = crate::iroh_framing::read_len_prefixed(
+            &mut recv,
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .map_err(|e| format!("read meta: {e}"))?;
+        let meta = crate::vine_relay::decode_vine_content_meta(&meta_bytes)
+            .map_err(|e| format!("decode meta: {e}"))?;
+        if !meta.ok {
+            conn.close(0u32.into(), b"");
+            return Err("relay refused content (unlisted or unavailable)".to_string());
+        }
+
+        let mut bytes = Vec::with_capacity(meta.size as usize);
+        while (bytes.len() as u64) < meta.size {
+            let chunk = crate::iroh_framing::read_len_prefixed(
+                &mut recv,
+                crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+                crate::iroh_framing::Endian::Le,
+                true,
+            )
+            .await
+            .map_err(|e| format!("read chunk: {e}"))?;
+            bytes.extend_from_slice(&chunk);
+        }
+        conn.close(0u32.into(), b"");
+        Ok::<Vec<u8>, String>(bytes)
+    };
+    tokio::time::timeout(io_deadline, exchange)
+        .await
+        .map_err(|_| "vine relay content IO timeout".to_string())?
+}
+
+/// Shared seam for `fetch_vine_video` (GUI command + headless RPC). Mesh
+/// first (the identical `FetchRequest` `fetch_content` sends); on a mesh
+/// miss for a followed creator, falls back to that creator's cached vine
+/// relays over `harmony/vine-relay/v1`. Any fallback failure — no relay
+/// available, every dial/read failing, or a hash mismatch on the returned
+/// bytes — returns the ORIGINAL mesh error, never the relay's: the fallback
+/// is best-effort, and surfacing a relay-dial error for a CID that simply
+/// doesn't exist anywhere would mislead the caller.
+pub(crate) async fn fetch_vine_video_impl(
+    state: &Mutex<NodeState>,
+    cid_hex: String,
+    creator_address: String,
+) -> Result<Vec<u8>, String> {
+    if cid_hex.is_empty() || !cid_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid CID hex: {cid_hex}"));
+    }
+
+    let fetch_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid_hex.clone(),
+            reply: reply_tx,
+            max_bytes: None,
+            serveable: false,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    let mesh_err = match reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())?
+    {
+        Ok(bytes) => return Ok(bytes),
+        Err(e) => e,
+    };
+
+    // Mesh missed. Gather what the fallback plan needs from NodeState under
+    // one short lock, then release it before any relay network I/O.
+    let (followed, cached_relays, self_ep, endpoint) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let followed = guard
+            .followed_set
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|g| g.contains(&creator_address)))
+            .unwrap_or(false);
+        let cached_relays = guard
+            .vine_pull_driver
+            .as_ref()
+            .map(|d| d.cached_relays_for(&creator_address))
+            .unwrap_or_default();
+        let self_ep = guard
+            .iroh_endpoint
+            .as_ref()
+            .map(|ep| *ep.node_id().as_bytes())
+            .unwrap_or([0u8; 32]);
+        (
+            followed,
+            cached_relays,
+            self_ep,
+            guard.iroh_endpoint.clone(),
+        )
+    };
+
+    let VideoFetchPlan::MeshThenRelay(relays) = plan_video_fetch(followed, cached_relays, self_ep)
+    else {
+        return Err(mesh_err);
+    };
+    let Some(endpoint) = endpoint else {
+        return Err(mesh_err);
+    };
+    let Ok(cid_bytes) = parse_cid_hex(&cid_hex) else {
+        return Err(mesh_err);
+    };
+    let cid = crate::owner_state_types::ContentId::from_bytes(cid_bytes);
+
+    for relay in &relays {
+        let bytes = match fetch_video_from_vine_relay(&endpoint, relay, &cid_hex).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(
+                    creator = %creator_address,
+                    error = %e,
+                    "ZEB-811: vine relay content fallback failed; trying next relay"
+                );
+                continue;
+            }
+        };
+        // The relay is untrusted — re-verify against the CID we actually
+        // asked for BEFORE admitting or returning anything it sent back.
+        if !cid.verify_hash(&bytes) {
+            tracing::debug!(
+                creator = %creator_address,
+                "ZEB-811: vine relay content hash mismatch; rejecting"
+            );
+            continue;
+        }
+
+        let content_store = {
+            let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+            guard.content_store.clone()
+        };
+        if let Some(store) = content_store {
+            // Plain `put` (not `put_serveable`): admits for local playback,
+            // mirroring what mesh-fetch admission does, without adding this
+            // CID to the anonymous vine-relay serve allowlist (that
+            // allowlist is descriptor-driven and unrelated). Best-effort —
+            // a store failure still returns the already-verified bytes.
+            if let Err(e) = store.put(cid, bytes.clone()).await {
+                tracing::debug!(
+                    error = %e,
+                    "ZEB-811: vine relay content admit failed; returning bytes uncached"
+                );
+            }
+        }
+        return Ok(bytes);
+    }
+
+    Err(mesh_err)
+}
+
+/// ZEB-811 Task 9: mesh-first video fetch with a vine-relay fallback for
+/// followed creators (spec §3 step 5). Thin wrapper over
+/// `fetch_vine_video_impl`; see there for the full behavior.
+#[tauri::command]
+async fn fetch_vine_video(
+    cid: String,
+    creator_address: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<u8>, String> {
+    fetch_vine_video_impl(state.inner(), cid, creator_address).await
+}
+
+#[cfg(test)]
+mod fetch_vine_tests {
+    use super::*;
+
+    const SELF_EP: [u8; 32] = [0xAA; 32];
+
+    fn other() -> crate::pkarr_vines::VineRelayEntry {
+        crate::pkarr_vines::VineRelayEntry {
+            iroh_endpoint_id: [0xBB; 32],
+            home_relay: "https://other".to_string(),
+        }
+    }
+
+    fn self_entry() -> crate::pkarr_vines::VineRelayEntry {
+        crate::pkarr_vines::VineRelayEntry {
+            iroh_endpoint_id: SELF_EP,
+            home_relay: "https://self".to_string(),
+        }
+    }
+
+    #[test]
+    fn relay_fallback_only_for_followed_creators_and_never_self() {
+        assert!(matches!(
+            plan_video_fetch(false, vec![other()], SELF_EP),
+            VideoFetchPlan::MeshOnly
+        ));
+        assert!(matches!(
+            plan_video_fetch(true, vec![], SELF_EP),
+            VideoFetchPlan::MeshOnly
+        ));
+        let VideoFetchPlan::MeshThenRelay(r) =
+            plan_video_fetch(true, vec![self_entry(), other()], SELF_EP)
+        else {
+            panic!("expected MeshThenRelay")
+        };
+        assert_eq!(r.len(), 1, "self entry filtered");
+        assert_eq!(r[0].iroh_endpoint_id, other().iroh_endpoint_id);
+    }
+
+    #[test]
+    fn all_self_relays_falls_back_to_mesh_only() {
+        // A followed creator whose ENTIRE cached relay set is this node's
+        // own entry must not manufacture a relay attempt out of nothing.
+        assert!(matches!(
+            plan_video_fetch(true, vec![self_entry()], SELF_EP),
+            VideoFetchPlan::MeshOnly
+        ));
+    }
 }
 
 /// ZEB-345: structured profile-page document returned to the frontend.
@@ -68095,6 +68451,7 @@ pub fn run() {
             set_replication_tier,
             fetch_content,
             fetch_avatar,
+            fetch_vine_video,
             fetch_profile_doc,
             export_content,
             ingest_content,
@@ -75423,6 +75780,8 @@ mod start_node_race_tests {
             // tests.
             vine_pull_driver_handle: None,
             vine_pull_wake: None,
+            // ZEB-811 Task 9: the driver Arc unused in race tests.
+            vine_pull_driver: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles unused
             // in race tests.
             dm_outhold_doc: None,

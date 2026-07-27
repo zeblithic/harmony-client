@@ -1503,7 +1503,13 @@
     return 'video/mp4';
   }
 
-  let resolveVideoFn = $state<((cid: string) => Promise<string>) | undefined>(undefined);
+  // ZEB-811 Task 9: creatorAddress is optional so VinePublishDialog's
+  // self-preview call (resolveVideo(cid), no creator in scope — the video
+  // was just locally ingested and hasn't been published yet) keeps working
+  // unchanged; it defaults to '' below, which never matches a followed
+  // address, so that path is always mesh-only (correct: self content is
+  // already locally cached, no relay fallback is ever needed for it).
+  let resolveVideoFn = $state<((cid: string, creatorAddress?: string) => Promise<string>) | undefined>(undefined);
 
   const avatarResolver = new AvatarResolver();
   $effect(() => () => avatarResolver.destroy());
@@ -2331,8 +2337,8 @@
       // ZEB-345 Task 10: wire the lazy profile-page resolver so panel opens can
       // fetch_profile_doc. No eager per-member resolution (unlike avatars).
       profilePageResolver.connectAdapter(adapter);
-      resolveVideoFn = async (cid: string) => {
-        const bytes = (await adapter.invoke('fetch_content', { cid })) as number[];
+      resolveVideoFn = async (cid: string, creatorAddress = '') => {
+        const bytes = (await adapter.invoke('fetch_vine_video', { cid, creatorAddress })) as number[];
         const mime = detectVideoMime(bytes);
         const blob = new Blob([new Uint8Array(bytes)], { type: mime });
         return URL.createObjectURL(blob);

@@ -394,10 +394,12 @@ describe('VineFeed', () => {
         followedVines: five, viewedIds: new Set<string>(), resolveVideo, onMarkViewed: vi.fn(),
       } });
       // Newest-first order: vine-05 plays (index 0); window = vine-05 + vine-04.
+      // ZEB-811: resolveVideo also receives the card's creatorAddress (the
+      // relay-fallback dial target).
       await waitFor(() => expect(container.querySelectorAll('[data-testid="stage-video"]').length).toBe(2));
-      expect(resolveVideo).toHaveBeenCalledWith('cid-5');
-      expect(resolveVideo).toHaveBeenCalledWith('cid-4');
-      expect(resolveVideo).not.toHaveBeenCalledWith('cid-1');
+      expect(resolveVideo).toHaveBeenCalledWith('cid-5', 'addr-5');
+      expect(resolveVideo).toHaveBeenCalledWith('cid-4', 'addr-4');
+      expect(resolveVideo).not.toHaveBeenCalledWith('cid-1', 'addr-1');
     });
 
     it('revokes blob URLs when cards leave the window', async () => {

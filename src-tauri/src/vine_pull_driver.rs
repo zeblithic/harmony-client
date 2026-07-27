@@ -529,6 +529,24 @@ impl VinePullDriver {
         Arc::clone(&self.wake)
     }
 
+    /// ZEB-811 Task 9: read `creator`'s cached relay-set hint out of the
+    /// sidecar (`CreatorPullState::relay_set`) for the video-fetch fallback.
+    /// Returns the RAW list — unfiltered, including a possible self-entry —
+    /// mirroring what `pull_one_creator` sees before ITS OWN self-filter
+    /// step (`lib.rs`'s `plan_video_fetch` does that filtering on the
+    /// caller's side; this accessor stays a plain read with no policy of its
+    /// own). Empty for a creator with no sidecar row yet (never pulled, or
+    /// pruned as unfollowed).
+    pub fn cached_relays_for(&self, creator: &str) -> Vec<VineRelayEntry> {
+        self.sidecar
+            .lock()
+            .expect("vine pull sidecar lock")
+            .per_creator
+            .get(creator)
+            .map(|st| st.relay_set.clone())
+            .unwrap_or_default()
+    }
+
     /// One pull pass: prune sidecar state for creators no longer followed,
     /// then attempt a pull for every followed creator. Errors are logged
     /// and skipped — one bad relay/creator never aborts the pass.
@@ -1348,6 +1366,56 @@ mod tests {
         assert_eq!(
             s.passes_no_relay, 0,
             "no followed creators ⇒ no no-relay rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_relays_for_reads_the_sidecar_hint_raw() {
+        // ZEB-811 Task 9: the accessor must return exactly what the sidecar
+        // holds — including a self-entry, since self-filtering is the
+        // caller's job (`plan_video_fetch`), not this accessor's.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "ff".repeat(16);
+        let relays = vec![
+            VineRelayEntry {
+                iroh_endpoint_id: [0x11; 32],
+                home_relay: "https://one".to_string(),
+            },
+            VineRelayEntry {
+                iroh_endpoint_id: [0x22; 32],
+                home_relay: "https://two".to_string(),
+            },
+        ];
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (0, String::new()),
+                    last_pull_attempt_ms: 0,
+                    consecutive_skips: 0,
+                    relay_set: relays.clone(),
+                    relays_fetched_at_ms: 0,
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        let driver = VinePullDriver::new(
+            [0; 32],
+            inert_pkarr_resolver(),
+            Arc::new(MockTransport::with_results(Vec::new())),
+            Arc::new(StubIngest),
+            Arc::new(Vec::new),
+            Arc::new(|_| None),
+            sidecar_path,
+        );
+
+        assert_eq!(driver.cached_relays_for(&creator), relays);
+        assert_eq!(
+            driver.cached_relays_for("never-followed"),
+            Vec::new(),
+            "an unknown creator must read as an empty hint, not panic"
         );
     }
 }
