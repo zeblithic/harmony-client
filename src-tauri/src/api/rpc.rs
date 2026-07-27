@@ -2125,6 +2125,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_vine_video_rpc_is_registered_and_wired() {
+        // ZEB-811 Task 9 review fix round 1 (Important): dedicated proof,
+        // same shape as the vine-follow parity test above — this seam also
+        // requires a connected node, so valid camelCase args on a default
+        // NodeState must reach the `_impl` seam and surface its
+        // `Command("not connected")` error (NOT `UnknownCommand`, which
+        // would mean unregistered). snake_case args must be rejected by the
+        // arg struct's `deny_unknown_fields` + required-field contract.
+        let reg = build_registry();
+
+        let err = reg
+            .dispatch(
+                "fetch_vine_video",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "cid": "ab", "creatorAddress": "cd".repeat(16) }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::Command(_)),
+            "expected Command (not connected), got {err:?}"
+        );
+
+        let bad = reg
+            .dispatch(
+                "fetch_vine_video",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "cid": "ab", "creator_address": "cd".repeat(16) }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(bad, RpcError::BadArgs(_)),
+            "snake_case args must be rejected, got {bad:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn storage_buddy_rpcs_are_registered_and_wired() {
         // ZEB-669 S2 (PR #449 review): same proof shape as the vine-follow
         // parity test — valid-shaped args on a default NodeState must reach

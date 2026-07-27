@@ -25514,94 +25514,128 @@ fn plan_video_fetch(
     }
 }
 
-/// Dial one vine relay over `harmony/vine-relay/v1` and fetch `cid_hex`'s
-/// content bytes. Mirrors `vine_pull_driver::IrohVinePullTransport::pull_pages`'s
-/// dial pattern (`EndpointAddr::new(ep).with_relay_url(home_relay)`, one
-/// overall `tokio::time::timeout` around the whole exchange) but drives the
-/// simpler single-shot content request/response instead of the paged
-/// descriptor loop.
-async fn fetch_video_from_vine_relay(
-    endpoint: &crate::iroh_endpoint::IrohEndpoint,
-    relay: &crate::pkarr_vines::VineRelayEntry,
-    cid_hex: &str,
-) -> Result<Vec<u8>, String> {
-    let io_deadline =
-        std::time::Duration::from_millis(crate::vine_relay::VINE_RELAY_IO_DEADLINE_MS);
-    let exchange = async {
-        let ep_id = iroh::EndpointId::from_bytes(&relay.iroh_endpoint_id)
-            .map_err(|e| format!("relay endpoint id: {e}"))?;
-        let mut addr = iroh::EndpointAddr::new(ep_id);
-        if !relay.home_relay.is_empty() {
-            match relay.home_relay.parse::<iroh::RelayUrl>() {
-                Ok(url) => addr = addr.with_relay_url(url),
-                Err(e) => tracing::trace!(
-                    relay = %relay.home_relay,
-                    "ZEB-811: skip malformed vine relay home_relay: {e}"
-                ),
-            }
-        }
-        let conn = endpoint
-            .inner()
-            .connect(addr, crate::vine_relay::VINE_RELAY_ALPN)
-            .await
-            .map_err(|e| format!("connect: {e}"))?;
-        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+/// Read a vine-relay content response (`VineContentMeta` + chunk stream) off
+/// `recv`. Generic over any `AsyncRead` so the size-cap behavior below is
+/// unit-testable over `tokio::io::duplex` without a real iroh connection
+/// (mirrors `vine_relay::run_vine_relay_session` /
+/// `vine_pull_driver::run_vine_pull_client_session`'s pure/shell split).
+///
+/// ZEB-811 review fix round 1 (CRITICAL): `meta.size` is an untrusted `u64`
+/// claim from the relay. The original code passed it straight into
+/// `Vec::with_capacity` — a malicious/compromised relay claiming
+/// `size: u64::MAX` aborts the whole client process via allocator failure,
+/// reachable on any mesh-miss for a followed creator's video. Fixed two
+/// ways: (1) reject `meta.size > max_bytes` BEFORE any allocation, and (2)
+/// re-check the ACTUAL accumulated byte count against `max_bytes` after
+/// every chunk, independent of what `meta.size` claimed — so a relay that
+/// under-reports `meta.size` but then streams past it is cut off too, not
+/// just one that over-reports.
+async fn read_vine_content_response<R>(recv: &mut R, max_bytes: u64) -> Result<Vec<u8>, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let meta_bytes = crate::iroh_framing::read_len_prefixed(
+        recv,
+        crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+        crate::iroh_framing::Endian::Le,
+        true,
+    )
+    .await
+    .map_err(|e| format!("read meta: {e}"))?;
+    let meta = crate::vine_relay::decode_vine_content_meta(&meta_bytes)
+        .map_err(|e| format!("decode meta: {e}"))?;
+    if !meta.ok {
+        return Err("relay refused content (unlisted or unavailable)".to_string());
+    }
+    if meta.size > max_bytes {
+        return Err(format!(
+            "relay claimed oversize content: {} bytes (max {max_bytes})",
+            meta.size
+        ));
+    }
 
-        let req =
-            crate::vine_relay::VinePullRequest::Content(crate::vine_relay::VineContentRequest {
-                cid_hex: cid_hex.to_string(),
-            });
-        let req_bytes = crate::vine_relay::encode_vine_pull_request(&req)
-            .map_err(|e| format!("encode: {e}"))?;
-        crate::iroh_framing::write_len_prefixed(
-            &mut send,
-            &req_bytes,
-            crate::vine_relay::VINE_QUERY_MAX_FRAME_BYTES,
-            crate::iroh_framing::Endian::Le,
-            false,
-        )
-        .await
-        .map_err(|e| format!("write request: {e}"))?;
-        // Task 6 gotcha: `tokio::io::split`'s write half does NOT half-close
-        // on drop (the underlying stream is Arc-shared) — `SendStream::finish()`
-        // is the real signal. This session sends exactly one request, so
-        // finishing right after the write lets the relay's read loop end
-        // gracefully (`ClientEof`) instead of idling out the full deadline.
-        send.finish().map_err(|e| format!("finish: {e}"))?;
-
-        let meta_bytes = crate::iroh_framing::read_len_prefixed(
-            &mut recv,
+    let mut bytes = Vec::with_capacity(meta.size as usize);
+    while (bytes.len() as u64) < meta.size {
+        let chunk = crate::iroh_framing::read_len_prefixed(
+            recv,
             crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
             crate::iroh_framing::Endian::Le,
             true,
         )
         .await
-        .map_err(|e| format!("read meta: {e}"))?;
-        let meta = crate::vine_relay::decode_vine_content_meta(&meta_bytes)
-            .map_err(|e| format!("decode meta: {e}"))?;
-        if !meta.ok {
-            conn.close(0u32.into(), b"");
-            return Err("relay refused content (unlisted or unavailable)".to_string());
+        .map_err(|e| format!("read chunk: {e}"))?;
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > max_bytes {
+            return Err("relay streamed past the content-size cap".to_string());
         }
+    }
+    Ok(bytes)
+}
 
-        let mut bytes = Vec::with_capacity(meta.size as usize);
-        while (bytes.len() as u64) < meta.size {
-            let chunk = crate::iroh_framing::read_len_prefixed(
-                &mut recv,
-                crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
-                crate::iroh_framing::Endian::Le,
-                true,
-            )
-            .await
-            .map_err(|e| format!("read chunk: {e}"))?;
-            bytes.extend_from_slice(&chunk);
+/// Dial one vine relay over `harmony/vine-relay/v1` and fetch `cid_hex`'s
+/// content bytes. Mirrors `vine_pull_driver::IrohVinePullTransport::pull_pages`'s
+/// dial pattern (`EndpointAddr::new(ep).with_relay_url(home_relay)`) but
+/// drives the simpler single-shot content request/response instead of the
+/// paged descriptor loop.
+///
+/// ZEB-811 review fix round 1 (Important): no per-attempt deadline here —
+/// `fetch_vine_video_impl` wraps the WHOLE multi-relay attempt loop in one
+/// shared `VINE_RELAY_IO_DEADLINE_MS` timeout, so a per-call timeout of the
+/// same duration would only let a slow relay N consume up to N ×
+/// `VINE_RELAY_IO_DEADLINE_MS` before falling back to the mesh error.
+async fn fetch_video_from_vine_relay(
+    endpoint: &crate::iroh_endpoint::IrohEndpoint,
+    relay: &crate::pkarr_vines::VineRelayEntry,
+    cid_hex: &str,
+) -> Result<Vec<u8>, String> {
+    let ep_id = iroh::EndpointId::from_bytes(&relay.iroh_endpoint_id)
+        .map_err(|e| format!("relay endpoint id: {e}"))?;
+    let mut addr = iroh::EndpointAddr::new(ep_id);
+    if !relay.home_relay.is_empty() {
+        match relay.home_relay.parse::<iroh::RelayUrl>() {
+            Ok(url) => addr = addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                relay = %relay.home_relay,
+                "ZEB-811: skip malformed vine relay home_relay: {e}"
+            ),
         }
-        conn.close(0u32.into(), b"");
-        Ok::<Vec<u8>, String>(bytes)
-    };
-    tokio::time::timeout(io_deadline, exchange)
+    }
+    let conn = endpoint
+        .inner()
+        .connect(addr, crate::vine_relay::VINE_RELAY_ALPN)
         .await
-        .map_err(|_| "vine relay content IO timeout".to_string())?
+        .map_err(|e| format!("connect: {e}"))?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+
+    let req = crate::vine_relay::VinePullRequest::Content(crate::vine_relay::VineContentRequest {
+        cid_hex: cid_hex.to_string(),
+    });
+    let req_bytes =
+        crate::vine_relay::encode_vine_pull_request(&req).map_err(|e| format!("encode: {e}"))?;
+    crate::iroh_framing::write_len_prefixed(
+        &mut send,
+        &req_bytes,
+        crate::vine_relay::VINE_QUERY_MAX_FRAME_BYTES,
+        crate::iroh_framing::Endian::Le,
+        false,
+    )
+    .await
+    .map_err(|e| format!("write request: {e}"))?;
+    // Task 6 gotcha: `tokio::io::split`'s write half does NOT half-close
+    // on drop (the underlying stream is Arc-shared) — `SendStream::finish()`
+    // is the real signal. This session sends exactly one request, so
+    // finishing right after the write lets the relay's read loop end
+    // gracefully (`ClientEof`) instead of idling out the full deadline.
+    send.finish().map_err(|e| format!("finish: {e}"))?;
+
+    // ZEB-559's GUI-uploader cap: a legitimately published vine can never
+    // exceed it, and it's smaller than the relay's own
+    // `VINE_RELAY_SESSION_BYTE_BUDGET` (256 MiB vs 100 MiB) anyway, so a
+    // larger claim is definitionally bogus regardless of which bound you
+    // reason from. Reused rather than adding a second cap.
+    let result = read_vine_content_response(&mut recv, VINE_VIDEO_MAX_BYTES).await;
+    conn.close(0u32.into(), b"");
+    result
 }
 
 /// Shared seam for `fetch_vine_video` (GUI command + headless RPC). Mesh
@@ -25687,49 +25721,73 @@ pub(crate) async fn fetch_vine_video_impl(
     };
     let cid = crate::owner_state_types::ContentId::from_bytes(cid_bytes);
 
-    for relay in &relays {
-        let bytes = match fetch_video_from_vine_relay(&endpoint, relay, &cid_hex).await {
-            Ok(b) => b,
-            Err(e) => {
+    // ZEB-811 review fix round 1 (Important): ONE shared deadline across
+    // EVERY relay attempt, not `VINE_RELAY_IO_DEADLINE_MS` per relay — a
+    // UI-facing tap-to-play fetch must not wait up to
+    // `relays.len() * VINE_RELAY_IO_DEADLINE_MS` before falling back to the
+    // mesh error. Whichever attempt is in flight when the shared deadline
+    // elapses is cancelled by `timeout` (dropping its future mid-await) and
+    // the ORIGINAL mesh error is returned, same as any other fallback
+    // failure. Scoped to the network attempts only — the local
+    // `ContentStore::put` admission below runs outside this deadline so a
+    // slow-but-local disk write can't discard already hash-verified bytes.
+    let relay_attempts = async {
+        for relay in &relays {
+            let bytes = match fetch_video_from_vine_relay(&endpoint, relay, &cid_hex).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(
+                        creator = %creator_address,
+                        error = %e,
+                        "ZEB-811: vine relay content fallback failed; trying next relay"
+                    );
+                    continue;
+                }
+            };
+            // The relay is untrusted — re-verify against the CID we
+            // actually asked for BEFORE admitting or returning anything it
+            // sent back.
+            if !cid.verify_hash(&bytes) {
                 tracing::debug!(
                     creator = %creator_address,
-                    error = %e,
-                    "ZEB-811: vine relay content fallback failed; trying next relay"
+                    "ZEB-811: vine relay content hash mismatch; rejecting"
                 );
                 continue;
             }
-        };
-        // The relay is untrusted — re-verify against the CID we actually
-        // asked for BEFORE admitting or returning anything it sent back.
-        if !cid.verify_hash(&bytes) {
+            return Some(bytes);
+        }
+        None
+    };
+    let verified_bytes = tokio::time::timeout(
+        std::time::Duration::from_millis(crate::vine_relay::VINE_RELAY_IO_DEADLINE_MS),
+        relay_attempts,
+    )
+    .await
+    .ok()
+    .flatten();
+
+    let Some(bytes) = verified_bytes else {
+        return Err(mesh_err);
+    };
+
+    let content_store = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_store.clone()
+    };
+    if let Some(store) = content_store {
+        // Plain `put` (not `put_serveable`): admits for local playback,
+        // mirroring what mesh-fetch admission does, without adding this
+        // CID to the anonymous vine-relay serve allowlist (that
+        // allowlist is descriptor-driven and unrelated). Best-effort —
+        // a store failure still returns the already-verified bytes.
+        if let Err(e) = store.put(cid, bytes.clone()).await {
             tracing::debug!(
-                creator = %creator_address,
-                "ZEB-811: vine relay content hash mismatch; rejecting"
+                error = %e,
+                "ZEB-811: vine relay content admit failed; returning bytes uncached"
             );
-            continue;
         }
-
-        let content_store = {
-            let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-            guard.content_store.clone()
-        };
-        if let Some(store) = content_store {
-            // Plain `put` (not `put_serveable`): admits for local playback,
-            // mirroring what mesh-fetch admission does, without adding this
-            // CID to the anonymous vine-relay serve allowlist (that
-            // allowlist is descriptor-driven and unrelated). Best-effort —
-            // a store failure still returns the already-verified bytes.
-            if let Err(e) = store.put(cid, bytes.clone()).await {
-                tracing::debug!(
-                    error = %e,
-                    "ZEB-811: vine relay content admit failed; returning bytes uncached"
-                );
-            }
-        }
-        return Ok(bytes);
     }
-
-    Err(mesh_err)
+    Ok(bytes)
 }
 
 /// ZEB-811 Task 9: mesh-first video fetch with a vine-relay fallback for
@@ -25791,6 +25849,98 @@ mod fetch_vine_tests {
             plan_video_fetch(true, vec![self_entry()], SELF_EP),
             VideoFetchPlan::MeshOnly
         ));
+    }
+
+    #[tokio::test]
+    async fn oversize_content_meta_size_rejected_before_allocation() {
+        // ZEB-811 review fix round 1 (CRITICAL): an untrusted relay's
+        // claimed `meta.size` must never reach `Vec::with_capacity`
+        // unchecked — `u64::MAX` would abort the whole client process via
+        // allocator failure. Drives the real read loop over a duplex pair
+        // with a tiny `max_bytes` so the fixture stays cheap; the
+        // relay-under-test still claims a wildly oversize `size` regardless,
+        // proving the cap is enforced on the CLAIM, not just on what a
+        // well-behaved relay happens to send.
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let (_server_read, mut server_write) = tokio::io::split(server);
+
+        let meta = crate::vine_relay::VineContentMeta {
+            ok: true,
+            size: u64::MAX,
+        };
+        let meta_bytes = crate::vine_relay::encode_vine_content_meta(&meta).expect("encode meta");
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &meta_bytes,
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write meta");
+
+        // A generous wall-clock net, not the mechanism under test: if the
+        // fix regressed back to an unchecked `Vec::with_capacity(u64::MAX)`,
+        // this would abort the process long before any timeout fired, not
+        // hang — the timeout only guards against this test itself stalling
+        // for an unrelated reason.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_vine_content_response(&mut client_read, 100),
+        )
+        .await
+        .expect("must reject promptly, not hang");
+
+        assert!(
+            result.is_err(),
+            "an oversize meta.size claim must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_streamed_past_claimed_size_is_cut_off() {
+        // Belt-and-braces half of the same fix: a relay that under-reports
+        // `meta.size` (so the pre-check passes) but then streams past it
+        // must still be rejected, on the ACTUAL accumulated byte count.
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let (_server_read, mut server_write) = tokio::io::split(server);
+
+        let meta = crate::vine_relay::VineContentMeta { ok: true, size: 10 };
+        let meta_bytes = crate::vine_relay::encode_vine_content_meta(&meta).expect("encode meta");
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &meta_bytes,
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write meta");
+        // Claims 10 bytes, actually sends 200 — well over the tiny 50-byte
+        // test cap below.
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &vec![7u8; 200],
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write oversize chunk");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_vine_content_response(&mut client_read, 50),
+        )
+        .await
+        .expect("must reject promptly, not hang");
+
+        assert!(
+            result.is_err(),
+            "streaming past the cap must be rejected even when meta.size understated it"
+        );
     }
 }
 
