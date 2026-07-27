@@ -17083,6 +17083,22 @@ pub(crate) async fn delete_vine_impl(
         .await
         .map_err(|_| "event loop dropped publish request".to_string())??;
 
+    // ZEB-822: force-reconcile the case-E vines relay record — the mirror of
+    // the post-publish hook in `publish_vine_descriptor_impl`. Deleting your
+    // LAST own vine flips the has-vines gate CLOSED, and the publisher only
+    // retracts the already-published relay-set record when something
+    // reconciles; without this the stale positive record would stay
+    // discoverable until the next scheduled pkarr cadence tick (up to ~3.5
+    // days). A cheap no-op when other vines remain. Spawned, never
+    // inline-awaited — this IPC must not block on pkarr network I/O.
+    let vines_publisher = state
+        .lock()
+        .ok()
+        .and_then(|g| g.pkarr_vines_publisher.clone());
+    if let Some(vp) = vines_publisher {
+        tokio::spawn(async move { vp.republish().await });
+    }
+
     Ok(DeleteVineResult { published: true })
 }
 

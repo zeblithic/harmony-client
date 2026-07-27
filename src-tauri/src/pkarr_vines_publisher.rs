@@ -10,7 +10,10 @@
 //! same endpoint id. Freshness comes entirely from the core
 //! `PkarrPublisher`'s own scheduled cadence (`compute_next_publish_at`) plus
 //! the explicit [`PkarrVinesPublisher::republish`] hook fired after every
-//! successful vine publish (covers "first vine ever" flipping the gate).
+//! successful vine publish (covers "first vine ever" flipping the gate OPEN)
+//! and after every successful vine delete (covers "last vine gone" flipping it
+//! CLOSED, so the published relay set is actively retracted rather than left
+//! to the next cadence tick — ZEB-822).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -576,8 +579,11 @@ mod tests {
     /// toggle-off does — not merely unregister the handle and leave the last
     /// positive record discoverable until its 7-day TTL runs out. This is the
     /// one gate-closing path with NO settings change and NO watcher behind it
-    /// (see the module doc), so the post-publish `reconcile` is the only thing
-    /// that can react to it.
+    /// (see the module doc), so it is reached only when something calls
+    /// `reconcile` — which is why ZEB-822 also wired the post-tombstone
+    /// `republish()` hook in `delete_vine_impl`. Without that hook the
+    /// already-registered gate-open builder would still self-heal, but only at
+    /// its next cadence tick (up to ~3.5 days), not on the delete.
     ///
     /// What the assertion turns on: `Ok(vec![])` means a record IS present at
     /// the slot and decodes to an empty relay set — the retraction. An
@@ -626,8 +632,13 @@ mod tests {
         }
 
         // The owner deletes their last vine. `share` is NEVER touched — the
-        // count closure is the only input that changes, and `reconcile` (what
-        // the post-delete `republish` hook calls) is the only reaction.
+        // count closure is the only input that changes. Calling `reconcile()`
+        // directly stands in for the publisher's whole trigger set, every
+        // member of which funnels through this same body: `delete_vine_impl`'s
+        // post-tombstone `republish()` hook (the path that reaches THIS
+        // scenario in production), `publish_vine_descriptor_impl`'s
+        // post-publish hook, `set_vine_settings_impl`'s toggle, and boot
+        // `enable()`.
         count.store(0, Ordering::Relaxed);
         vp.reconcile().await;
 
