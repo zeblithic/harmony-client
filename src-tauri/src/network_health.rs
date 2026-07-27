@@ -19,7 +19,7 @@
 //! between the two IPCs.
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -90,6 +90,13 @@ pub struct NetworkHealthSnapshot {
     /// keeps a pre-ZEB-811 snapshot forward-compatible.
     #[serde(default)]
     pub vine_relay: Option<VineRelayHealth>,
+    /// ZEB-824: member session-bootstrap ("gateway dial") health. `None` when
+    /// the driver isn't wired (no iroh endpoint / no owner identity); `Some`
+    /// with zeroed counters means wired-but-idle — the distinction matters for
+    /// the same reason as `community_relay`'s. `#[serde(default)]` keeps
+    /// pre-field snapshots forward-compatible.
+    #[serde(default)]
+    pub gateway_bootstrap: Option<GatewayBootstrapHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1005,6 +1012,118 @@ impl CommunityRelayPullTelemetry {
     }
 }
 
+/// ZEB-824: per-community session-bootstrap ("gateway dial") health. Written by
+/// [`crate::community_gateway_dial_driver::CommunityGatewayDialDriver`], read by
+/// `network_health_snapshot`. The pass counter proves the loop is alive even
+/// when every community is healthy (ZEB-803 lesson).
+#[derive(Debug, Default)]
+pub struct GatewayBootstrapTelemetry {
+    passes_run: AtomicU64,
+    last_pass_ms: AtomicU64,
+    beacons_seeded: AtomicU64,
+    no_beacon: AtomicU64,
+    rejected_non_member: AtomicU64,
+    /// community bytes → (last outcome, stamped at). Bounded by the node's
+    /// joined-community count (1–2 today); no ring needed.
+    per_community: Mutex<HashMap<[u8; 16], (GatewayBootstrapOutcome, u64)>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayBootstrapOutcome {
+    Healthy,
+    StarvedWaiting,
+    NoBeacon,
+    BeaconSeeded,
+    RejectedNonMember,
+}
+
+impl GatewayBootstrapOutcome {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::StarvedWaiting => "starvedWaiting",
+            Self::NoBeacon => "noBeacon",
+            Self::BeaconSeeded => "beaconSeeded",
+            Self::RejectedNonMember => "rejectedNonMember",
+        }
+    }
+}
+
+impl GatewayBootstrapTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Recorded FIRST and unconditionally each pass — before the joined-set
+    /// read — so an alive-but-idle loop is distinguishable from a dead task.
+    pub fn record_pass_start(&self) {
+        self.passes_run.fetch_add(1, Ordering::Relaxed);
+        self.last_pass_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn record_outcome(&self, community: &[u8; 16], outcome: GatewayBootstrapOutcome) {
+        match outcome {
+            GatewayBootstrapOutcome::BeaconSeeded => {
+                self.beacons_seeded.fetch_add(1, Ordering::Relaxed);
+            }
+            GatewayBootstrapOutcome::NoBeacon => {
+                self.no_beacon.fetch_add(1, Ordering::Relaxed);
+            }
+            GatewayBootstrapOutcome::RejectedNonMember => {
+                self.rejected_non_member.fetch_add(1, Ordering::Relaxed);
+            }
+            GatewayBootstrapOutcome::Healthy | GatewayBootstrapOutcome::StarvedWaiting => {}
+        }
+        self.per_community
+            .lock()
+            .expect("gateway bootstrap map lock")
+            .insert(*community, (outcome, now_ms()));
+    }
+
+    pub fn summary(&self) -> GatewayBootstrapHealth {
+        let last_pass = self.last_pass_ms.load(Ordering::Relaxed);
+        let mut per: Vec<GatewayCommunityBootstrapHealth> = self
+            .per_community
+            .lock()
+            .expect("gateway bootstrap map lock")
+            .iter()
+            .map(|(cid, (outcome, at))| GatewayCommunityBootstrapHealth {
+                community_short: hex::encode(&cid[..4]),
+                outcome: outcome.wire().to_string(),
+                at_ms: *at,
+            })
+            .collect();
+        per.sort_by(|a, b| a.community_short.cmp(&b.community_short));
+        GatewayBootstrapHealth {
+            passes_run: self.passes_run.load(Ordering::Relaxed),
+            last_pass_ms: (last_pass != 0).then_some(last_pass),
+            beacons_seeded: self.beacons_seeded.load(Ordering::Relaxed),
+            no_beacon: self.no_beacon.load(Ordering::Relaxed),
+            rejected_non_member: self.rejected_non_member.load(Ordering::Relaxed),
+            per_community: per,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayBootstrapHealth {
+    pub passes_run: u64,
+    pub last_pass_ms: Option<u64>,
+    pub beacons_seeded: u64,
+    pub no_beacon: u64,
+    pub rejected_non_member: u64,
+    pub per_community: Vec<GatewayCommunityBootstrapHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayCommunityBootstrapHealth {
+    pub community_short: String,
+    pub outcome: String,
+    pub at_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ReachabilityStatus {
@@ -1100,6 +1219,8 @@ impl NetworkHealthSnapshot {
             community_relay: None,
             // ZEB-811 Task 8: no service ⇒ no vine-relay telemetry wired.
             vine_relay: None,
+            // ZEB-824: no service ⇒ no gateway-dial driver telemetry wired.
+            gateway_bootstrap: None,
         }
     }
 }
@@ -1541,6 +1662,11 @@ pub struct NetworkHealthService {
     /// run one without the other. Installed at boot via
     /// [`set_vine_pull_source`](Self::set_vine_pull_source).
     vine_pull: Option<std::sync::Arc<VinePullTelemetry>>,
+    /// ZEB-824: gateway-dial DRIVER telemetry — the SAME `Arc` the driver loop
+    /// increments. `None` on nodes with no driver installed (no iroh endpoint /
+    /// no owner identity). Installed at boot via
+    /// [`set_gateway_bootstrap_source`](Self::set_gateway_bootstrap_source).
+    gateway_bootstrap: Option<std::sync::Arc<GatewayBootstrapTelemetry>>,
 }
 
 impl NetworkHealthService {
@@ -1574,6 +1700,7 @@ impl NetworkHealthService {
             community_relay_pulling: None,
             vine_relay_serving: None,
             vine_pull: None,
+            gateway_bootstrap: None,
         }
     }
 
@@ -1673,6 +1800,13 @@ impl NetworkHealthService {
     /// source.
     pub(crate) fn set_vine_pull_source(&mut self, src: std::sync::Arc<VinePullTelemetry>) {
         self.vine_pull = Some(src);
+    }
+
+    /// ZEB-824: install the gateway-dial DRIVER telemetry source (the same
+    /// `Arc` the driver loop writes). Additive — when unset,
+    /// `snapshot().gateway_bootstrap` reports `None`.
+    pub fn set_gateway_bootstrap_source(&mut self, src: std::sync::Arc<GatewayBootstrapTelemetry>) {
+        self.gateway_bootstrap = Some(src);
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -1949,6 +2083,9 @@ impl NetworkHealthService {
                     pulling: pulling.map(|p| p.summary()).unwrap_or_default(),
                 }),
             },
+            // ZEB-824: present iff the driver is wired; a wired-but-idle driver
+            // reports zeroed counters rather than suppressing the section.
+            gateway_bootstrap: self.gateway_bootstrap.as_ref().map(|t| t.summary()),
         }
     }
 
@@ -3594,6 +3731,7 @@ mod tests {
             dm_fence: None,
             community_relay: None,
             vine_relay: None,
+            gateway_bootstrap: None,
         }
     }
 
@@ -3878,6 +4016,69 @@ mod tests {
         // No snake_case key leakage past the camelCase rename.
         assert!(bd.get("rejected_unauthorized").is_none());
         assert!(bd.get("rejected_other").is_none());
+    }
+
+    // ── ZEB-824: member gateway-bootstrap health ────
+    #[test]
+    fn gateway_bootstrap_health_serializes_camelcase() {
+        let t = GatewayBootstrapTelemetry::new();
+        t.record_pass_start();
+        t.record_outcome(&[0xAB; 16], GatewayBootstrapOutcome::BeaconSeeded);
+        t.record_outcome(&[0xCD; 16], GatewayBootstrapOutcome::NoBeacon);
+        let json = serde_json::to_value(t.summary()).expect("serialize");
+        assert_eq!(json["passesRun"], 1);
+        assert_eq!(json["beaconsSeeded"], 1);
+        assert_eq!(json["noBeacon"], 1);
+        let per = json["perCommunity"].as_array().expect("perCommunity array");
+        assert_eq!(per.len(), 2);
+        // Sorted by communityShort for deterministic output.
+        assert_eq!(per[0]["communityShort"], "abababab");
+        assert_eq!(per[0]["outcome"], "beaconSeeded");
+        assert!(per[0]["atMs"].as_u64().is_some());
+    }
+
+    /// The wiring Task 4's boot path depends on: an installed source surfaces
+    /// under `gatewayBootstrap`; an absent one leaves the section `null` (the
+    /// `butlerDeposits`/`dmFence` convention).
+    #[tokio::test]
+    async fn snapshot_gateway_bootstrap_section_present_iff_source_installed() {
+        let telemetry = std::sync::Arc::new(GatewayBootstrapTelemetry::new());
+        telemetry.record_pass_start();
+        telemetry.record_outcome(&[0x11; 16], GatewayBootstrapOutcome::RejectedNonMember);
+
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_gateway_bootstrap_source(std::sync::Arc::clone(&telemetry));
+
+        let snap = svc.snapshot().await;
+        let health = snap
+            .gateway_bootstrap
+            .as_ref()
+            .expect("section present when wired");
+        assert_eq!(health.passes_run, 1);
+        assert_eq!(health.rejected_non_member, 1);
+        assert!(health.last_pass_ms.is_some());
+        let v = serde_json::to_value(&snap).expect("snapshot serializes");
+        let gb = &v["gatewayBootstrap"];
+        assert_eq!(gb["rejectedNonMember"], serde_json::json!(1));
+        assert_eq!(gb["perCommunity"][0]["outcome"], "rejectedNonMember");
+        assert!(gb.get("rejected_non_member").is_none());
+
+        let svc2 = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        assert!(svc2.snapshot().await.gateway_bootstrap.is_none());
     }
 
     // ── ZEB-710: drain-fence degraded-mode counters in the snapshot ────
