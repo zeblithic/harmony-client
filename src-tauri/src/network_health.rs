@@ -1023,11 +1023,18 @@ pub struct GatewayBootstrapTelemetry {
     beacons_seeded: AtomicU64,
     no_beacon: AtomicU64,
     rejected_non_member: AtomicU64,
+    engine_unregistered: AtomicU64,
     /// community bytes → (last outcome, stamped at). Bounded by the node's
     /// joined-community count (1–2 today); no ring needed.
     per_community: Mutex<HashMap<[u8; 16], (GatewayBootstrapOutcome, u64)>>,
 }
 
+/// Every terminal verdict a single community's pass can reach. **Record one for
+/// every community examined, including the not-actionable cases** — a pass that
+/// `continue`s without recording leaves the community absent from
+/// `perCommunity`, and absence cannot be told apart from "never evaluated".
+/// That conflation is the ZEB-803 blind spot (an uncounted path reading as
+/// idleness) reappearing at per-community granularity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayBootstrapOutcome {
     Healthy,
@@ -1035,6 +1042,15 @@ pub enum GatewayBootstrapOutcome {
     NoBeacon,
     BeaconSeeded,
     RejectedNonMember,
+    /// Nobody else in the community — skipped by design, nothing to dial. Row
+    /// only, no counter: this is a steady state, not an event worth totalling.
+    SoloCommunity,
+    /// No engine registered for this community, so the pass cannot resolve an
+    /// epoch key and dies before attempting anything. Counted, because it is a
+    /// *fault* that otherwise presents as `noBeacon == 0` on a starved
+    /// community — which reads as "we never attempted" and sends an operator
+    /// hunting in the rendezvous/pkarr layer instead of at engine registration.
+    EngineUnregistered,
 }
 
 impl GatewayBootstrapOutcome {
@@ -1045,6 +1061,8 @@ impl GatewayBootstrapOutcome {
             Self::NoBeacon => "noBeacon",
             Self::BeaconSeeded => "beaconSeeded",
             Self::RejectedNonMember => "rejectedNonMember",
+            Self::SoloCommunity => "soloCommunity",
+            Self::EngineUnregistered => "engineUnregistered",
         }
     }
 }
@@ -1072,7 +1090,12 @@ impl GatewayBootstrapTelemetry {
             GatewayBootstrapOutcome::RejectedNonMember => {
                 self.rejected_non_member.fetch_add(1, Ordering::Relaxed);
             }
-            GatewayBootstrapOutcome::Healthy | GatewayBootstrapOutcome::StarvedWaiting => {}
+            GatewayBootstrapOutcome::EngineUnregistered => {
+                self.engine_unregistered.fetch_add(1, Ordering::Relaxed);
+            }
+            GatewayBootstrapOutcome::Healthy
+            | GatewayBootstrapOutcome::StarvedWaiting
+            | GatewayBootstrapOutcome::SoloCommunity => {}
         }
         self.per_community
             .lock()
@@ -1100,6 +1123,7 @@ impl GatewayBootstrapTelemetry {
             beacons_seeded: self.beacons_seeded.load(Ordering::Relaxed),
             no_beacon: self.no_beacon.load(Ordering::Relaxed),
             rejected_non_member: self.rejected_non_member.load(Ordering::Relaxed),
+            engine_unregistered: self.engine_unregistered.load(Ordering::Relaxed),
             per_community: per,
         }
     }
@@ -1113,14 +1137,25 @@ pub struct GatewayBootstrapHealth {
     pub beacons_seeded: u64,
     pub no_beacon: u64,
     pub rejected_non_member: u64,
+    pub engine_unregistered: u64,
+    /// One row per community that has reached a verdict — **not a census of
+    /// joined communities**. A community absent here has never been evaluated;
+    /// a reader must not treat absence as health.
     pub per_community: Vec<GatewayCommunityBootstrapHealth>,
 }
 
+/// The latest verdict for one community. Rows are keyed by community and
+/// overwritten in place, so this is a last-outcome-wins projection, never a
+/// history.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayCommunityBootstrapHealth {
     pub community_short: String,
     pub outcome: String,
+    /// Wall ms of the last recorded verdict. Rows are never evicted — leaving a
+    /// community does not remove its row — so a verdict is only meaningful
+    /// together with this stamp: read `outcome` without checking `at_ms` and a
+    /// fossil reads as current.
     pub at_ms: u64,
 }
 
@@ -3648,6 +3683,9 @@ mod tests {
         // ZEB-811 Task 8: no service ⇒ no vine-relay telemetry wired — same
         // "no wiring" vs "wired and idle" distinction as `community_relay`.
         assert_eq!(s.vine_relay, None);
+        // ZEB-824: same distinction — `None` means the dial driver is not wired,
+        // never a zeroed `Some` (which would read as "wired and idle").
+        assert_eq!(s.gateway_bootstrap, None);
     }
 
     #[test]
@@ -4035,6 +4073,63 @@ mod tests {
         assert_eq!(per[0]["communityShort"], "abababab");
         assert_eq!(per[0]["outcome"], "beaconSeeded");
         assert!(per[0]["atMs"].as_u64().is_some());
+
+        // Same contract as `vine_relay_health_wire_keys_are_camel_case`: Task 5's
+        // e2e and any operator dashboard poll these exact serde-rename keys, so a
+        // wrong key is a silent timeout, not a failure. Sweep EVERY key of both
+        // DTOs — `lastPassMs` in particular is the natural "is the dial loop
+        // alive" probe and is asserted nowhere else on the wire.
+        for k in [
+            "passesRun",
+            "lastPassMs",
+            "beaconsSeeded",
+            "noBeacon",
+            "rejectedNonMember",
+            "engineUnregistered",
+            "perCommunity",
+        ] {
+            assert!(json.get(k).is_some(), "missing gatewayBootstrap key {k}");
+        }
+        for k in ["communityShort", "outcome", "atMs"] {
+            assert!(per[0].get(k).is_some(), "missing perCommunity key {k}");
+        }
+        // No snake_case leakage past the camelCase rename.
+        assert!(json.get("passes_run").is_none());
+        assert!(json.get("engine_unregistered").is_none());
+        assert!(per[0].get("community_short").is_none());
+    }
+
+    /// Closes the three branches the two camelCase tests never reach: the
+    /// `last_pass_ms` sentinel's `None` arm, the arms that record a row without
+    /// bumping any counter, and the map's last-outcome-wins overwrite.
+    #[test]
+    fn gateway_bootstrap_summary_sentinel_and_uncounted_arms() {
+        let t = GatewayBootstrapTelemetry::new();
+        // No pass yet ⇒ null on the wire, never the epoch.
+        assert_eq!(t.summary().last_pass_ms, None);
+        assert!(serde_json::to_value(t.summary()).expect("serialize")["lastPassMs"].is_null());
+
+        // The three arms that record a row but bump no counter. Three writes to
+        // ONE community also pin the overwrite.
+        t.record_outcome(&[0x01; 16], GatewayBootstrapOutcome::Healthy);
+        t.record_outcome(&[0x01; 16], GatewayBootstrapOutcome::SoloCommunity);
+        t.record_outcome(&[0x01; 16], GatewayBootstrapOutcome::StarvedWaiting);
+        t.record_outcome(&[0x02; 16], GatewayBootstrapOutcome::SoloCommunity);
+        let s = t.summary();
+        // … none of them bumps a counter …
+        assert_eq!(
+            (
+                s.beacons_seeded,
+                s.no_beacon,
+                s.rejected_non_member,
+                s.engine_unregistered
+            ),
+            (0, 0, 0, 0)
+        );
+        // … and the map keeps ONE row per community, the latest.
+        assert_eq!(s.per_community.len(), 2);
+        assert_eq!(s.per_community[0].outcome, "starvedWaiting");
+        assert_eq!(s.per_community[1].outcome, "soloCommunity");
     }
 
     /// The wiring Task 4's boot path depends on: an installed source surfaces
@@ -4045,6 +4140,7 @@ mod tests {
         let telemetry = std::sync::Arc::new(GatewayBootstrapTelemetry::new());
         telemetry.record_pass_start();
         telemetry.record_outcome(&[0x11; 16], GatewayBootstrapOutcome::RejectedNonMember);
+        telemetry.record_outcome(&[0x22; 16], GatewayBootstrapOutcome::EngineUnregistered);
 
         let mut svc = NetworkHealthService::new(
             std::sync::Arc::new(FakeIroh { ready: true }),
@@ -4063,11 +4159,14 @@ mod tests {
             .expect("section present when wired");
         assert_eq!(health.passes_run, 1);
         assert_eq!(health.rejected_non_member, 1);
+        assert_eq!(health.engine_unregistered, 1);
         assert!(health.last_pass_ms.is_some());
         let v = serde_json::to_value(&snap).expect("snapshot serializes");
         let gb = &v["gatewayBootstrap"];
         assert_eq!(gb["rejectedNonMember"], serde_json::json!(1));
+        assert_eq!(gb["engineUnregistered"], serde_json::json!(1));
         assert_eq!(gb["perCommunity"][0]["outcome"], "rejectedNonMember");
+        assert_eq!(gb["perCommunity"][1]["outcome"], "engineUnregistered");
         assert!(gb.get("rejected_non_member").is_none());
 
         let svc2 = NetworkHealthService::new(
