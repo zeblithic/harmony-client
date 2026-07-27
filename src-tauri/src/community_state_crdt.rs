@@ -17,6 +17,8 @@
 use core::cmp::Ordering;
 use harmony_crdt_sync::verified_log::{LogPolicy, VerifiedLog};
 use serde::{Deserialize, Serialize};
+// Sole non-scoped consumer is `set_event_log_for_test`, gated the same way.
+#[cfg(any(test, feature = "test-fixtures"))]
 use std::collections::BTreeMap;
 
 use crate::community_membership::{
