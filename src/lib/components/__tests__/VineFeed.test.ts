@@ -399,7 +399,11 @@ describe('VineFeed', () => {
       await waitFor(() => expect(container.querySelectorAll('[data-testid="stage-video"]').length).toBe(2));
       expect(resolveVideo).toHaveBeenCalledWith('cid-5', 'addr-5');
       expect(resolveVideo).toHaveBeenCalledWith('cid-4', 'addr-4');
-      expect(resolveVideo).not.toHaveBeenCalledWith('cid-1', 'addr-1');
+      // Argument-agnostic: an out-of-window card must not be resolved at
+      // all, not merely "not resolved with these exact args" — the latter
+      // would still pass if the card resolved with a different (or
+      // undefined) second argument.
+      expect(resolveVideo.mock.calls.map((c) => c[0])).not.toContain('cid-1');
     });
 
     it('revokes blob URLs when cards leave the window', async () => {

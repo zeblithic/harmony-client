@@ -804,8 +804,19 @@ impl VinePullTelemetry {
 
     fn push(&self, creator: &str, relay_endpoint_id: &[u8; 32], outcome: &str, ingested: u32) {
         // `creator` is already a hex address string, so its first 8 hex
-        // characters ARE the first 4 bytes, short-form per ZEB-329.
-        let creator_short = creator.get(..8).unwrap_or(creator).to_string();
+        // characters ARE the first 4 bytes, short-form per ZEB-329. Never
+        // fall back to the full string on a non-char-boundary byte index
+        // (hex values never hit this, but the fallback direction must not
+        // invert the short-only invariant for any non-hex input) — truncate
+        // on the nearest char boundary at or before 8 instead.
+        let end = creator
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(creator.len()))
+            .take_while(|i| *i <= 8)
+            .last()
+            .unwrap_or(0);
+        let creator_short = creator[..end].to_string();
         let hit = VinePullHit {
             creator_short,
             relay_endpoint_short: hex::encode(&relay_endpoint_id[..4]),
@@ -5486,6 +5497,33 @@ mod tests {
         assert!(pulling["recent"][0].get("creatorShort").is_some());
         assert!(pulling["recent"][0].get("relayEndpointShort").is_some());
         assert!(pulling["recent"][0].get("capturedAtMs").is_some());
+    }
+
+    #[test]
+    fn creator_short_truncates_on_char_boundary_never_leaks_full_id() {
+        // ZEB-811 review fix: `creator` is a hex address string today, so
+        // byte offset 8 is always a char boundary in practice. But the
+        // fallback direction of the truncation must never leak the FULL
+        // identifier for some other input whose byte-8 offset lands
+        // mid-character — three 2-byte chars (6 bytes) followed by a
+        // 4-byte character puts byte offset 8 squarely inside that
+        // character, which is exactly the case the old
+        // `creator.get(..8).unwrap_or(creator)` fallback mishandled (`get`
+        // returns `None` on a non-boundary index, and `unwrap_or` then used
+        // the WHOLE string).
+        let creator = format!("{}{}", "é".repeat(3), "😀secret-should-not-leak");
+        let p = VinePullTelemetry::new();
+        p.record_session_ok(&creator, &[1u8; 32], 1);
+        let summary = p.summary();
+        let hit = &summary.recent[0];
+        assert_eq!(
+            hit.creator_short, "ééé",
+            "must truncate to the last char boundary at or before byte 8"
+        );
+        assert!(
+            !hit.creator_short.contains("secret"),
+            "must never fall back to leaking the full identifier"
+        );
     }
 
     #[test]

@@ -227,6 +227,7 @@ where
         let resp =
             decode_vine_pull_response(&resp_bytes).map_err(|e| format!("decode response: {e}"))?;
         let page_len = resp.descriptors.len();
+        let cursor_before = cursor.clone();
 
         for row in &resp.descriptors {
             let bytes = row.as_slice();
@@ -264,6 +265,17 @@ where
         }
 
         if page_len < VINE_PULL_PAGE_LIMIT_MAX as usize {
+            break;
+        }
+        if cursor == cursor_before {
+            // A full page that advanced nothing (e.g. every row is
+            // unparseable) would otherwise re-request the identical page
+            // forever — treat it like Halt: stop, cursor stays at the last
+            // durable tuple.
+            tracing::debug!(
+                creator,
+                "ZEB-811 pull: full page advanced no cursor; ending session"
+            );
             break;
         }
     }
@@ -635,33 +647,41 @@ impl VinePullDriver {
             .cloned()
             .collect();
 
-        let Some(relay) = candidates.into_iter().next() else {
+        if candidates.is_empty() {
             if let Some(t) = self.telemetry.as_ref() {
                 t.record_no_relay();
             }
             self.store_creator_state(creator, st);
             return;
-        };
+        }
 
-        match self
-            .transport
-            .pull_pages(&relay, creator, st.cursor.clone(), self.ingest.as_ref())
-            .await
-        {
-            Ok(res) => {
-                st.cursor = res.cursor;
-                if let Some(t) = self.telemetry.as_ref() {
-                    t.record_session_ok(creator, &relay.iroh_endpoint_id, res.ingested);
+        // Try every candidate in order within this pass, stopping at the
+        // first success — a dead head-of-list relay must not block the
+        // creator indefinitely just because the set is only re-resolved
+        // every VINE_PKARR_RESOLVE_COOLDOWN_MS and pkarr order is stable.
+        // Mirrors `fetch_vine_video_impl`'s multi-relay iteration (`lib.rs`).
+        for relay in &candidates {
+            match self
+                .transport
+                .pull_pages(relay, creator, st.cursor.clone(), self.ingest.as_ref())
+                .await
+            {
+                Ok(res) => {
+                    st.cursor = res.cursor;
+                    if let Some(t) = self.telemetry.as_ref() {
+                        t.record_session_ok(creator, &relay.iroh_endpoint_id, res.ingested);
+                    }
+                    break;
                 }
-            }
-            Err(e) => {
-                tracing::debug!(
-                    creator,
-                    error = %e,
-                    "ZEB-811 pull: pull session failed; skipping relay"
-                );
-                if let Some(t) = self.telemetry.as_ref() {
-                    t.record_session_failed(creator, &relay.iroh_endpoint_id);
+                Err(e) => {
+                    tracing::debug!(
+                        creator,
+                        error = %e,
+                        "ZEB-811 pull: pull session failed; trying next relay"
+                    );
+                    if let Some(t) = self.telemetry.as_ref() {
+                        t.record_session_failed(creator, &relay.iroh_endpoint_id);
+                    }
                 }
             }
         }
@@ -862,6 +882,72 @@ mod tests {
         assert_eq!(result.cursor, (200, "row2".to_string()));
         assert_eq!(result.ingested, 2);
         assert_eq!(result.skipped_invalid, 1);
+    }
+
+    #[tokio::test]
+    async fn full_page_of_unparseable_rows_ends_session_without_looping() {
+        // ZEB-811 review fix round 1: a FULL page (== VINE_PULL_PAGE_LIMIT_MAX)
+        // whose rows are all unparseable advances the cursor nowhere —
+        // without the fix, the loop would re-request the identical page
+        // forever. The server task here answers exactly ONE query and then
+        // asserts a second one never arrives; the whole session is also
+        // wrapped in an outer timeout so a regression fails fast instead of
+        // hanging the suite.
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+
+        let rows: Vec<Vec<u8>> = (0..VINE_PULL_PAGE_LIMIT_MAX)
+            .map(|_| b"not even json{{{".to_vec())
+            .collect();
+        assert_eq!(rows.len(), VINE_PULL_PAGE_LIMIT_MAX as usize);
+
+        let server_task = tokio::spawn(async move {
+            let _query = read_fake_query(&mut server_read).await;
+            write_fake_page_response(&mut server_write, rows).await;
+            let _ = server_write.shutdown().await;
+
+            // Proves the client never re-requests the identical page: a
+            // second query would be readable well within this bound if the
+            // loop-forever bug regressed.
+            let second = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                read_fake_query(&mut server_read),
+            )
+            .await;
+            assert!(
+                second.is_err(),
+                "the client must not re-request an identical full page"
+            );
+        });
+
+        // No row ever parses far enough to reach ingest.
+        let ingest = ScriptedIngest::new(vec![]);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_vine_pull_client_session(
+                &mut client_read,
+                &mut client_write,
+                "creator-z",
+                (0, String::new()),
+                &ingest,
+                1_700_000_000_000,
+            ),
+        )
+        .await
+        .expect("session must terminate promptly, not loop forever")
+        .expect("session must not error");
+
+        server_task.await.expect("server task must not panic");
+
+        assert_eq!(
+            result.cursor,
+            (0, String::new()),
+            "cursor must stay at the initial tuple — nothing advanced it"
+        );
+        assert_eq!(result.ingested, 0);
+        assert_eq!(result.skipped_invalid, VINE_PULL_PAGE_LIMIT_MAX as u32);
     }
 
     #[tokio::test]
@@ -1216,6 +1302,87 @@ mod tests {
         assert_eq!(
             calls[0].0.iroh_endpoint_id, other.iroh_endpoint_id,
             "self relay entry must be filtered before dialing"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_failover_tries_next_candidate_on_failure() {
+        // ZEB-811 review fix round 1: only the first relay was ever dialed
+        // per pass — a dead head-of-list relay would block the creator
+        // indefinitely. This proves the pass fails over to the next
+        // candidate within the SAME pass, mirroring
+        // `fetch_vine_video_impl`'s multi-relay iteration (`lib.rs`).
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "dd".repeat(16);
+        let now = 1_700_000_000_000u64;
+        let dead = VineRelayEntry {
+            iroh_endpoint_id: [0x44; 32],
+            home_relay: "https://dead".to_string(),
+        };
+        let alive = VineRelayEntry {
+            iroh_endpoint_id: [0x55; 32],
+            home_relay: "https://alive".to_string(),
+        };
+
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (0, String::new()), // first follow: always pulls
+                    last_pull_attempt_ms: 0,
+                    consecutive_skips: 0,
+                    relay_set: vec![dead.clone(), alive.clone()],
+                    relays_fetched_at_ms: now,
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        // First candidate (dead) fails; the pass must fail over to the
+        // second (alive) rather than giving up after index 0.
+        let transport = Arc::new(MockTransport::with_results(vec![
+            Err("connection refused".to_string()),
+            Ok(PullSessionResult {
+                cursor: (now, "v".to_string()),
+                ingested: 1,
+                skipped_invalid: 0,
+            }),
+        ]));
+        let followed = creator.clone();
+        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
+        let last_received: LastReceivedMsFn = Arc::new(|_| None);
+
+        let driver = VinePullDriver::new(
+            [0xFF; 32],
+            inert_pkarr_resolver(),
+            transport.clone(),
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path.clone(),
+        );
+
+        driver.run_one_pass(now).await;
+
+        let calls = transport.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "both candidates must be dialed: the dead one, then the failover"
+        );
+        assert_eq!(calls[0].0.iroh_endpoint_id, dead.iroh_endpoint_id);
+        assert_eq!(calls[1].0.iroh_endpoint_id, alive.iroh_endpoint_id);
+
+        let st = load_vine_pull(&sidecar_path)
+            .per_creator
+            .get(&creator)
+            .cloned()
+            .expect("creator state must persist");
+        assert_eq!(
+            st.cursor,
+            (now, "v".to_string()),
+            "cursor must reflect the SUCCESSFUL relay's result"
         );
     }
 

@@ -135,11 +135,61 @@ impl PkarrVinesPublisher {
         self.sync_registration().await;
     }
 
-    /// Mark sharing off and unregister unconditionally. Called from
+    /// Mark sharing off. `unregister` alone only stops FUTURE republishing —
+    /// it does not withdraw a record already sitting on the DHT, so the last
+    /// positive relay-set would otherwise stay discoverable for up to its
+    /// 7-day TTL after the user disables sharing. If the handle is currently
+    /// registered (there is something to retract), replace its content with
+    /// the explicit empty-`relay_set` retraction instead: re-registering
+    /// schedules an immediate publish tick (`PkarrPublisher::register`'s doc
+    /// comment) and leaves the handle registered afterward, since
+    /// unregistering right after would race that in-flight publish's
+    /// `cancelled` check and could cancel it before the PUT executes.
+    /// `enable`/`republish` overwrite this with real content again on the
+    /// next toggle. If nothing was ever registered, this is a safe no-op
+    /// (nothing to retract), matching the prior behavior. Called from
     /// `set_vine_settings_impl` when the user flips the toggle off.
     pub async fn disable(&self) {
         self.share.store(false, Ordering::Relaxed);
-        self.publisher.unregister(HANDLE).await;
+
+        if !self
+            .publisher
+            .active_handles()
+            .await
+            .contains(&HANDLE.to_string())
+        {
+            return;
+        }
+
+        let id_sk = self.identity_signing_key.clone();
+        let id_pub = self.identity_pub;
+        let record_builder: RecordBuilder = Arc::new(move |at_ms| {
+            PkarrRoutingRecord::sign_new(
+                build_retraction_blob(at_ms),
+                id_pub,
+                at_ms,
+                at_ms + REACHABILITY_RECORD_TTL_MS,
+                &id_sk,
+            )
+            .expect("sign — fixed-size buffers should not fail")
+        });
+
+        self.publisher
+            .register(HANDLE.to_string(), self.key_builder(), record_builder)
+            .await;
+    }
+
+    /// Shared ephemeral-key builder: derives the current epoch's vines slot
+    /// key from this device's own address. Used by both the real-content
+    /// path (`sync_registration`) and the retraction path (`disable`) so the
+    /// retraction lands under the exact same slot it's withdrawing.
+    fn key_builder(&self) -> EphemeralKeyBuilder {
+        let own_addr_for_key = self.own_addr_hex.clone();
+        Arc::new(move |at_ms| {
+            let epoch_id = current_epoch_id(at_ms);
+            vines_key_for_epoch(&own_addr_for_key, epoch_id)
+                .expect("own address hex is derived from our own identity — always valid hex")
+        })
     }
 
     /// Re-evaluate the gate against the CURRENT `share` flag + own vine
@@ -173,13 +223,6 @@ impl PkarrVinesPublisher {
             return;
         }
 
-        let own_addr_for_key = self.own_addr_hex.clone();
-        let key_builder: EphemeralKeyBuilder = Arc::new(move |at_ms| {
-            let epoch_id = current_epoch_id(at_ms);
-            vines_key_for_epoch(&own_addr_for_key, epoch_id)
-                .expect("own address hex is derived from our own identity — always valid hex")
-        });
-
         let id_sk = self.identity_signing_key.clone();
         let id_pub = self.identity_pub;
         let endpoint_for_builder = Arc::clone(&endpoint);
@@ -209,7 +252,7 @@ impl PkarrVinesPublisher {
         });
 
         self.publisher
-            .register(HANDLE.to_string(), key_builder, record_builder)
+            .register(HANDLE.to_string(), self.key_builder(), record_builder)
             .await;
     }
 }
@@ -344,10 +387,79 @@ mod tests {
             .contains(&HANDLE.to_string()));
 
         vp.disable().await;
-        assert!(!publisher
+        // Disable actively retracts (Qodo finding, ZEB-811 review): the
+        // handle stays registered — now emitting the empty-relay-set
+        // retraction rather than being unregistered outright, which would
+        // leave the last positive record resolvable until its 7-day TTL.
+        // `disable_after_enable_publishes_retraction` below proves the
+        // resolvable content is actually the retraction, not just that the
+        // handle is still registered.
+        assert!(publisher
             .active_handles()
             .await
             .contains(&HANDLE.to_string()));
+    }
+
+    /// Proves the actual fix, not just the registration-bookkeeping side
+    /// effect above: after `enable` publishes a real relay-set record and
+    /// `disable` is called, a follower resolving the creator's vines slot
+    /// must see the empty-relay-set retraction, not the stale positive
+    /// record riding out its TTL.
+    #[tokio::test]
+    async fn disable_after_enable_publishes_retraction() {
+        let (publisher, relay) = test_publisher().await;
+        let pool = harmony_pkarr::RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(harmony_pkarr::RelayClient::new(pool));
+        let resolver = Arc::new(harmony_pkarr::PkarrResolver::new(client));
+
+        let endpoint = test_endpoint().await;
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let addr = "aabbccdd00112233aabbccdd00112233".to_string();
+        let vp = PkarrVinesPublisher::new(
+            Arc::clone(&publisher),
+            addr.clone(),
+            sk.clone(),
+            build_id_pub(&sk),
+            Some(endpoint),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|| 1),
+        );
+
+        vp.enable().await;
+
+        // Wait for the positive record to land, so the retraction we wait
+        // for next is a genuine overwrite rather than a race with the very
+        // first publish.
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(attempts < 80, "initial vines publish did not land");
+            if let Ok(relay_set) =
+                crate::pkarr_vines::resolve_vine_relays(&resolver, &addr, now_ms()).await
+            {
+                if !relay_set.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        vp.disable().await;
+
+        // Poll until the resolved record is the empty-relay-set retraction.
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(attempts < 80, "retraction did not land after disable");
+            if let Ok(relay_set) =
+                crate::pkarr_vines::resolve_vine_relays(&resolver, &addr, now_ms()).await
+            {
+                if relay_set.is_empty() {
+                    return;
+                }
+            }
+        }
     }
 
     #[tokio::test]

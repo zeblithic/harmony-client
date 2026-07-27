@@ -25568,7 +25568,8 @@ where
         ));
     }
 
-    let mut bytes = Vec::with_capacity(meta.size as usize);
+    // Reserve incrementally rather than trusting the claim up front.
+    let mut bytes = Vec::with_capacity(meta.size.min(1 << 20) as usize);
     while (bytes.len() as u64) < meta.size {
         let chunk = crate::iroh_framing::read_len_prefixed(
             recv,
@@ -25578,10 +25579,24 @@ where
         )
         .await
         .map_err(|e| format!("read chunk: {e}"))?;
+        if chunk.is_empty() {
+            // Never advances bytes.len() toward meta.size — a relay
+            // drip-feeding empty frames would otherwise keep this loop
+            // alive indefinitely (unterminating for any caller without an
+            // outer deadline).
+            return Err("relay sent an empty content chunk".to_string());
+        }
+        let remaining = meta.size - bytes.len() as u64;
+        if chunk.len() as u64 > remaining {
+            return Err("relay sent a chunk larger than the declared content size".to_string());
+        }
         bytes.extend_from_slice(&chunk);
         if bytes.len() as u64 > max_bytes {
             return Err("relay streamed past the content-size cap".to_string());
         }
+    }
+    if bytes.len() as u64 != meta.size {
+        return Err("relay content ended short of the declared size".to_string());
     }
     Ok(bytes)
 }
@@ -25954,6 +25969,97 @@ mod fetch_vine_tests {
         assert!(
             result.is_err(),
             "streaming past the cap must be rejected even when meta.size understated it"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_content_chunk_is_rejected() {
+        // ZEB-811 review fix round 1: an empty len-prefixed frame never
+        // advances `bytes.len()` toward `meta.size`, so a relay drip-feeding
+        // empty frames would otherwise keep the read loop alive forever —
+        // here, past this test's bounded timeout, since the relay never
+        // sends a second frame or closes the stream. A regression back to
+        // the unchecked loop hangs on the second `read_len_prefixed` call
+        // rather than erroring on the first.
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let (_server_read, mut server_write) = tokio::io::split(server);
+
+        let meta = crate::vine_relay::VineContentMeta { ok: true, size: 10 };
+        let meta_bytes = crate::vine_relay::encode_vine_content_meta(&meta).expect("encode meta");
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &meta_bytes,
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write meta");
+        // An empty content frame — the relay sends nothing, forever.
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &[],
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write empty chunk");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_vine_content_response(&mut client_read, 1000),
+        )
+        .await
+        .expect("must reject promptly on the empty chunk, not hang waiting for more data");
+
+        assert!(result.is_err(), "an empty content chunk must be rejected");
+    }
+
+    #[tokio::test]
+    async fn chunk_overshooting_declared_size_is_rejected() {
+        // Distinct from `content_streamed_past_claimed_size_is_cut_off`:
+        // this proves the per-chunk check against the DECLARED `meta.size`,
+        // not just the caller's `max_bytes` cap — a generous `max_bytes`
+        // alone would not have caught this before the fix.
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let (_server_read, mut server_write) = tokio::io::split(server);
+
+        let meta = crate::vine_relay::VineContentMeta { ok: true, size: 5 };
+        let meta_bytes = crate::vine_relay::encode_vine_content_meta(&meta).expect("encode meta");
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &meta_bytes,
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write meta");
+        // Claims 5 bytes total but sends a 50-byte first chunk — well under
+        // a generous max_bytes, so only the declared-size check catches it.
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &[7u8; 50],
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write oversize chunk");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_vine_content_response(&mut client_read, 1_000_000),
+        )
+        .await
+        .expect("must reject promptly, not hang");
+
+        assert!(
+            result.is_err(),
+            "a chunk larger than the declared remaining size must be rejected"
         );
     }
 }

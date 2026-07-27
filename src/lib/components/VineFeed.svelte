@@ -272,6 +272,10 @@
     }
     shareVinesPubliclyError = '';
     if (getShareVinesPublicly) {
+      // Reset the gate BEFORE awaiting the read: a prior successful open
+      // leaves it true, and a pending re-read must not let the toggle
+      // stay interactive against a stale displayed value in the meantime.
+      shareVinesPubliclyLoaded = false;
       try {
         shareVinesPublicly = await getShareVinesPublicly();
         shareVinesPubliclyLoaded = true;

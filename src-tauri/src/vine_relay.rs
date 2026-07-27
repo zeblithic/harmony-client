@@ -107,6 +107,18 @@ pub const VINE_PULL_PAGE_LIMIT_MAX: u16 = 256;
 /// header; the last chunk is `size % VINE_CONTENT_CHUNK_BYTES` (or a full
 /// chunk when it divides evenly).
 pub const VINE_CONTENT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+/// Hard ceiling on the number of requests a single session may serve,
+/// independent of the per-exchange idle deadline and the session byte
+/// budget. Without this, an anonymous client whose requests barely advance
+/// the byte budget — e.g. querying a non-served creator, or with the share
+/// gate off, both of which return an almost-empty page every time — can
+/// renew the idle deadline forever with cheap requests and hold one of
+/// `VINE_RELAY_MAX_CONCURRENT_SESSIONS` admission slots indefinitely. 64
+/// comfortably covers any legitimate pull session: the pull driver pages at
+/// up to `VINE_PULL_PAGE_LIMIT_MAX` (256) rows per request, and a video
+/// transfer is a single `Content` request regardless of how many chunks its
+/// response is split into.
+pub const VINE_RELAY_MAX_REQUESTS_PER_SESSION: usize = 64;
 
 /// ZEB-811: emit at most one admission-saturation warning per this many ms —
 /// same throttle shape as `iroh_tunnel_acceptor::REJECT_WARN_INTERVAL_MS` (a
@@ -353,6 +365,17 @@ impl VineRelayServeCtx for ProdVineRelayServeCtx {
         // `get_local` ONLY — never `get` — so an anonymous requester can
         // never make this node dial the mesh on its behalf.
         let bytes = self.content_store.get_local(&cid).await.ok().flatten()?;
+        // `ContentStore` exposes no size/stat probe cheaper than a full
+        // read, so the cap can only be checked AFTER the allocation —
+        // residual risk is bounded, not attacker-controlled per request:
+        // `get_local` only ever returns content THIS node already locally
+        // admitted (via `put`/`put_serveable`), never a network blob sized
+        // by a remote claim, so the one-time allocation cost here is capped
+        // by what is already sitting in local storage, not by anything an
+        // anonymous requester can inflate on demand.
+        if bytes.len() as u64 > crate::VINE_VIDEO_MAX_BYTES {
+            return None;
+        }
         cid.verify_hash(&bytes).then_some(bytes)
     }
 }
@@ -462,6 +485,11 @@ pub enum VineRelaySessionEnd {
     BudgetExceeded,
     /// A response write failed at the transport level.
     WriteFailed,
+    /// The session served `VINE_RELAY_MAX_REQUESTS_PER_SESSION` requests —
+    /// closed to bound how long a single peer can hold an admission slot,
+    /// independent of the per-exchange idle deadline and byte budget (see
+    /// that constant's doc comment).
+    RequestCapExceeded,
 }
 
 /// Outcome of one session: how it ended and the total response bytes
@@ -489,7 +517,16 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut bytes_served: u64 = 0;
+    let mut request_count: usize = 0;
     loop {
+        if request_count >= VINE_RELAY_MAX_REQUESTS_PER_SESSION {
+            return VineRelaySessionResult {
+                end: VineRelaySessionEnd::RequestCapExceeded,
+                bytes_served,
+            };
+        }
+        request_count += 1;
+
         let read_res = tokio::time::timeout(
             cfg.io_deadline,
             read_len_prefixed(recv, VINE_QUERY_MAX_FRAME_BYTES, Endian::Le, false),
@@ -1091,6 +1128,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn request_cap_ends_session_cleanly() {
+        // An anonymous client whose queries barely advance the byte budget
+        // (a non-served creator returns an almost-empty page every time,
+        // exactly like `MockCtx::empty()` here) must not hold an admission
+        // slot forever by renewing the idle deadline with cheap requests —
+        // VINE_RELAY_MAX_REQUESTS_PER_SESSION bounds the total request
+        // count independent of bytes served or idle timing.
+        let (mut client_read, mut client_write, mut server_read, mut server_write) =
+            duplex_pair(1 << 20);
+
+        let ctx = MockCtx::empty(); // every page comes back empty
+        let cfg = fast_cfg();
+
+        let req = VinePullRequest::Query(VinePullQuery {
+            creator_addr: "alice-addr".to_string(),
+            after_created_at: 0,
+            after_id: String::new(),
+            limit: 10,
+        });
+        let req_bytes = encode_vine_pull_request(&req).expect("encode query");
+        // One more request than the cap — proves the cap itself ends the
+        // session, not the client simply running out of requests to send.
+        for _ in 0..(VINE_RELAY_MAX_REQUESTS_PER_SESSION + 1) {
+            write_len_prefixed(
+                &mut client_write,
+                &req_bytes,
+                VINE_QUERY_MAX_FRAME_BYTES,
+                Endian::Le,
+                false,
+            )
+            .await
+            .expect("write query frame");
+        }
+        client_write
+            .shutdown()
+            .await
+            .expect("shutdown client_write");
+
+        let result = run_vine_relay_session(&mut server_read, &mut server_write, &ctx, &cfg).await;
+        assert_eq!(result.end, VineRelaySessionEnd::RequestCapExceeded);
+        server_write
+            .shutdown()
+            .await
+            .expect("shutdown server_write");
+
+        // Exactly the cap's worth of responses were written — never the
+        // client's extra (cap + 1)th request.
+        let mut served = 0;
+        loop {
+            let read_res = tokio::time::timeout(
+                Duration::from_millis(500),
+                read_len_prefixed(
+                    &mut client_read,
+                    VINE_CONTENT_MAX_FRAME_BYTES,
+                    Endian::Le,
+                    true,
+                ),
+            )
+            .await
+            .expect("read must not hang");
+            match read_res {
+                Ok(_) => served += 1,
+                Err(_) => break,
+            }
+        }
+        assert_eq!(served, VINE_RELAY_MAX_REQUESTS_PER_SESSION);
+    }
+
     #[test]
     fn admission_cap_rejects_ninth_session() {
         let admission = VineRelayAdmission::new(VINE_RELAY_MAX_CONCURRENT_SESSIONS);
@@ -1248,6 +1354,46 @@ mod tests {
         assert!(
             !ctx.video_cid_is_served(&other_cid_hex),
             "a followed OTHER creator's video cid must not be allowlisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_bytes_refuses_oversize_cached_content() {
+        // `ContentStore` has no size/stat probe, so the cap is enforced
+        // AFTER `get_local`'s full read — this proves it's enforced at all,
+        // even for content the node's own cache legitimately allowlists.
+        let own = "own-creator-addr";
+        let oversize_len = (crate::VINE_VIDEO_MAX_BYTES + 1) as usize;
+        let (video_cid_hex, video_bytes) = make_content(vec![9u8; oversize_len]);
+
+        let mut cache = crate::vine_feed_cache::VineFeedCache::new();
+        cache.seed_descriptor_for_test(signed_descriptor("v1", own, &video_cid_hex, 100));
+
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let cid_bytes = crate::parse_cid_hex(&video_cid_hex).expect("parse cid hex");
+        content_store
+            .put(
+                crate::owner_state_types::ContentId::from_bytes(cid_bytes),
+                video_bytes,
+            )
+            .await
+            .expect("seed content store");
+
+        let ctx = ProdVineRelayServeCtx {
+            cache: Arc::new(std::sync::Mutex::new(cache)),
+            content_store,
+            own_creator_addr: own.to_string(),
+            share_gate: Arc::new(std::sync::atomic::AtomicBool::new(true)), // ON
+        };
+
+        assert!(
+            ctx.video_cid_is_served(&video_cid_hex),
+            "the cid is legitimately allowlisted via the served descriptor"
+        );
+        assert!(
+            ctx.video_bytes(&video_cid_hex).await.is_none(),
+            "content over VINE_VIDEO_MAX_BYTES must never be served, even locally cached"
         );
     }
 }

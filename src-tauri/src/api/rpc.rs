@@ -2097,14 +2097,35 @@ mod tests {
             "defaults must be public-by-intent true/true"
         );
 
+        // Asymmetric values + read-back on the SAME state: pins WHICH field
+        // each arg binds to. Both params are `bool`, so a positional swap
+        // (`share_follows`/`share_vines_publicly` wired to each other's
+        // parameter) would otherwise compile and pass silently — this repo
+        // already treats that exact hazard as worth pinning, see
+        // `file_sharing_rpcs_bind_args_to_the_right_parameters`.
+        let state = test_state();
         reg.dispatch(
             "set_vine_settings",
-            test_state(),
+            state.clone(),
             test_sink(),
             serde_json::json!({ "shareFollows": true, "shareVinesPublicly": false }),
         )
         .await
         .expect("set_vine_settings must reach the seam on a default NodeState");
+        let back = reg
+            .dispatch(
+                "get_vine_settings",
+                state,
+                test_sink(),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("read-back");
+        assert_eq!(
+            back,
+            serde_json::json!({ "shareFollows": true, "shareVinesPublicly": false }),
+            "each arg must bind to its own parameter"
+        );
 
         // The arg struct must actually REJECT a wrong shape (snake_case, or
         // either field missing) — deny_unknown_fields is enforced elsewhere,

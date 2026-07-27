@@ -12,7 +12,7 @@
 
 use crate::{VineDescriptorPayload, VineReactionPayload, VineVideoDto};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// ZEB-147: max descriptors retained in the cache. On insert into a full
@@ -302,6 +302,36 @@ struct CachedVine {
     descriptor: VineDescriptorPayload,
     received_at_ms: u64,
     source: VineSource,
+}
+
+/// One candidate row in `descriptors_for_creator_page`'s bounded top-k
+/// max-heap, ordered solely by the `(created_at, id)` cursor tuple — never
+/// derive `Ord`/`PartialOrd` off the full `CachedVine` (it has no natural
+/// order and its `descriptor.id` isn't unique enough alone to compare
+/// against `after`).
+struct PageCandidate<'a> {
+    key: (u64, &'a str),
+    cv: &'a CachedVine,
+}
+
+impl PartialEq for PageCandidate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for PageCandidate<'_> {}
+
+impl PartialOrd for PageCandidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PageCandidate<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -765,28 +795,47 @@ impl VineFeedCache {
     /// Only rows carrying a retained `sig` or `device_sig` are served: a
     /// relay must not hand out an unverifiable row (legacy pre-ZEB-811
     /// disk rows are silently excluded rather than served bare).
+    ///
+    /// Uses a bounded top-k max-heap (`PageCandidate`) rather than
+    /// collect-all-then-sort — see the method body's comment.
     pub fn descriptors_for_creator_page(
         &self,
         creator: &str,
         after: &(u64, String),
         limit: usize,
     ) -> Vec<VineDescriptorPayload> {
-        let mut rows: Vec<&CachedVine> = self
-            .descriptors
-            .values()
-            .filter(|cv| cv.descriptor.creator_address == creator)
-            .filter(|cv| cv.descriptor.sig.is_some() || cv.descriptor.device_sig.is_some())
-            .filter(|cv| {
-                (cv.descriptor.created_at, cv.descriptor.id.as_str()) > (after.0, after.1.as_str())
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            (a.descriptor.created_at, a.descriptor.id.as_str())
-                .cmp(&(b.descriptor.created_at, b.descriptor.id.as_str()))
-        });
-        rows.into_iter()
-            .take(limit)
-            .map(|cv| cv.descriptor.clone())
+        if limit == 0 {
+            return Vec::new();
+        }
+        // Bounded top-k via a size-`limit` max-heap (O(n log limit)) rather
+        // than collect-all-then-full-sort (O(n log n)): vine-relay is
+        // deliberately unauthenticated (module doc), so this page query is
+        // an attacker-reachable hot path and a large cache must not turn a
+        // small wire `limit` into an O(n log n) scan+sort on every request.
+        // The heap holds at most `limit` candidates at any time; only the
+        // final `limit`-sized result is sorted.
+        let mut heap: BinaryHeap<PageCandidate> = BinaryHeap::with_capacity(limit + 1);
+        for cv in self.descriptors.values() {
+            if cv.descriptor.creator_address != creator {
+                continue;
+            }
+            if cv.descriptor.sig.is_none() && cv.descriptor.device_sig.is_none() {
+                continue;
+            }
+            let key = (cv.descriptor.created_at, cv.descriptor.id.as_str());
+            if key <= (after.0, after.1.as_str()) {
+                continue;
+            }
+            if heap.len() < limit {
+                heap.push(PageCandidate { key, cv });
+            } else if heap.peek().is_some_and(|max| key < max.key) {
+                heap.pop();
+                heap.push(PageCandidate { key, cv });
+            }
+        }
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|c| c.cv.descriptor.clone())
             .collect()
     }
 

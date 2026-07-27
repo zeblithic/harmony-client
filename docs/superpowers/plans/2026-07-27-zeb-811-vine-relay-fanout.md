@@ -19,7 +19,7 @@
 - Descriptors travel as their original **JSON bytes** (`VineDescriptorPayload`, `lib.rs:15604`) inside CBOR frames — the puller feeds those exact bytes to ingest. The pkarr record payload is CBOR with 2-char keys (reachability conventions).
 - Vine addresses are hex `String`s (`creator_address`); slot derivation ikm = `hex::decode(creator_address)` (HKDF accepts any ikm length).
 - Cross-repo: Task 1 lands `PkarrCase::Vines` in `~/work/zeblithic/harmony` (own PR). The client pins `harmony-pkarr` at its **own** rev (src-tauri/Cargo.toml lines 145 and 262 — both must move together; the 13-crate `b904b0b9` lockstep set is untouched).
-- Gates per task: `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings` (both default and `--features test-fixtures` configs) from `src-tauri/`. `scripts/test-select --context task` for local iteration; the full-workspace `--all-targets` CI suite is the final gate. Before ANY e2e run: `cargo build --bin harmony-app` (the harness freshness gate hard-fails on a stale binary, `bin_resolver.rs:66`).
+- Gates per task: `cargo fmt --all -- --check` and `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings` from `src-tauri/`. `scripts/test-select --context task` for local iteration — paste its printed `round=… bucket=…` summary line into task reports. The `harmony-pkarr` rev bump (Task 1) is a dependency-graph change, so any round touching it needs `scripts/test-select --full` instead of the selective mapping (this is what actually ran for this PR). The full-workspace `cargo nextest run --locked --workspace --all-targets --features test-fixtures` CI-parity sweep is the final gate regardless. Before ANY e2e run: `cargo build --bin harmony-app` (the harness freshness gate hard-fails on a stale binary, `bin_resolver.rs:66`).
 - RPC arg structs use `#[serde(rename_all = "camelCase", deny_unknown_fields)]`; adding RPC verbs requires updating the `registry_has_exactly_the_curated_v1_surface` pin test in `src-tauri/src/api/rpc.rs`.
 - No worktrees. Commit at every task boundary at minimum.
 
@@ -650,13 +650,15 @@ git add -A && git commit -m "e2e: follow-only vine delivery over the relay path 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-07-26-zeb-811-vine-relay-fanout-design.md` (append an "As-implemented notes" section)
 
-- [ ] **Step 1: Full local gate sweep**
+- [ ] **Step 1: Full local gate sweep** — CI-parity commands, not the
+      iterative `scripts/test-select` runner: this is the final gate, and
+      the `harmony-pkarr` rev bump (Task 1) is a dependency-graph change
+      that makes selective test-mapping unreliable anyway.
 
 ```bash
 cd src-tauri && cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features test-fixtures -- -D warnings
-scripts/test-select --context round
+cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+cargo nextest run --locked --workspace --all-targets --features test-fixtures
 ```
 
 - [ ] **Step 2: e2e sweep** (fresh binary first): `s_vines_follow_only` + `s_vines_publish_feed_view_reshare`.
