@@ -413,13 +413,22 @@ mod tests {
         let resolver = Arc::new(harmony_pkarr::PkarrResolver::new(client));
 
         let endpoint = test_endpoint().await;
-        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
-        let addr = "aabbccdd00112233aabbccdd00112233".to_string();
+        // `verify_vines_record` binds the record's identity pub to the
+        // CLAIMED creator address (`address_for_identity_pub_hex`), so
+        // unlike the bookkeeping-only tests above, `addr` here must be a
+        // REAL derived address for the signing identity — an arbitrary
+        // hex string (like the bookkeeping tests use) would fail that
+        // binding check and every resolve would return `Err`, not the
+        // positive-then-retraction sequence this test exercises.
+        let identity = crate::vine_signing::test_identity();
+        let addr = crate::vine_signing::signer_address(&identity);
+        let sk = crate::vine_signing::identity_signing_key(&identity);
+        let id_pub = crate::vine_signing::identity_pub_64(&identity);
         let vp = PkarrVinesPublisher::new(
             Arc::clone(&publisher),
             addr.clone(),
-            sk.clone(),
-            build_id_pub(&sk),
+            sk,
+            id_pub,
             Some(endpoint),
             Arc::new(AtomicBool::new(false)),
             Arc::new(|| 1),

@@ -1362,9 +1362,16 @@ mod tests {
         // `ContentStore` has no size/stat probe, so the cap is enforced
         // AFTER `get_local`'s full read — this proves it's enforced at all,
         // even for content the node's own cache legitimately allowlists.
+        // The cid here is a synthetic 32-byte identifier rather than one
+        // minted via `make_content`'s `ContentId::for_book` (which itself
+        // caps a payload at 1 MiB, well under the 100 MiB size this test
+        // needs) — `verify_hash` is never reached because the size cap
+        // returns `None` first, so the cid need not actually hash the seeded
+        // bytes.
         let own = "own-creator-addr";
+        let video_cid_hex = hex::encode([0xABu8; 32]);
         let oversize_len = (crate::VINE_VIDEO_MAX_BYTES + 1) as usize;
-        let (video_cid_hex, video_bytes) = make_content(vec![9u8; oversize_len]);
+        let video_bytes = vec![9u8; oversize_len];
 
         let mut cache = crate::vine_feed_cache::VineFeedCache::new();
         cache.seed_descriptor_for_test(signed_descriptor("v1", own, &video_cid_hex, 100));
