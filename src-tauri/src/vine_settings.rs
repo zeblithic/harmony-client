@@ -164,10 +164,17 @@ mod tests {
     fn legacy_file_without_share_vines_publicly_defaults_true() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vine_settings.json");
-        std::fs::write(&path, r#"{"version":1,"share_follows":false,"last_published_updated_at":7}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"share_follows":false,"last_published_updated_at":7}"#,
+        )
+        .unwrap();
         let s = load_or_default(&path);
         assert!(!s.share_follows);
-        assert!(s.share_vines_publicly, "legacy files must default the new gate ON");
+        assert!(
+            s.share_vines_publicly,
+            "legacy files must default the new gate ON"
+        );
     }
 
     #[test]

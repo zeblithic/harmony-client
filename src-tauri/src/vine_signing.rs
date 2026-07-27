@@ -412,18 +412,27 @@ pub fn verify_reaction_v2(r: &VineReactionPayload, now_secs: u64) -> Result<(), 
 // `PrivateIdentity` keeps its Ed25519 `SigningKey` field private (no public
 // accessor), so `identity_signing_key` recovers it from
 // `to_private_bytes()`'s `[X25519 secret(32) ‖ Ed25519 secret(32)]` layout.
+//
+// `cfg(test)` only, not `any(test, feature = "test-fixtures")`: every
+// current caller is an inline `#[cfg(test)] mod tests` (this file and
+// `pkarr_vines.rs`), never a `tests/*.rs` integration test reached only via
+// the `test-fixtures` feature. The wider gate compiled these in for a
+// feature-only, non-`cfg(test)` pass with zero callers — `cargo clippy
+// --all-targets --features test-fixtures -D warnings` (the CI-parity gate;
+// see CLAUDE.md) flags that pass as dead code (ZEB-811 Task 3 review). Widen
+// back to `any(...)` if a `tests/*.rs` file ever needs these directly.
 
-#[cfg(any(test, feature = "test-fixtures"))]
+#[cfg(test)]
 pub(crate) fn test_identity() -> harmony_identity::PrivateIdentity {
     harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng)
 }
 
-#[cfg(any(test, feature = "test-fixtures"))]
+#[cfg(test)]
 pub(crate) fn identity_pub_64(identity: &harmony_identity::PrivateIdentity) -> [u8; 64] {
     identity.public_identity().to_public_bytes()
 }
 
-#[cfg(any(test, feature = "test-fixtures"))]
+#[cfg(test)]
 pub(crate) fn identity_signing_key(
     identity: &harmony_identity::PrivateIdentity,
 ) -> ed25519_dalek::SigningKey {
