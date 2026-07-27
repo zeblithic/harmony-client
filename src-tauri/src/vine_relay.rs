@@ -143,10 +143,18 @@ pub enum VinePullRequest {
     Content(VineContentRequest),
 }
 
-/// A page of descriptors. Each element is the descriptor's ORIGINAL JSON
-/// bytes (the same bytes the creator signed over) — the relay never
-/// re-serializes, so the follower's signature verification sees exactly
-/// what was signed.
+/// A page of descriptors. Each element is `serde_json::to_vec` of a
+/// `VineDescriptorPayload` re-serialized from the relay's cache
+/// (`VineFeedCache::descriptors_for_creator_page` returns parsed structs,
+/// not the creator's original wire bytes — none are retained anywhere, so
+/// re-serializing is the only option). This is verification-safe, not just
+/// convenient: `vine_signing::verify_descriptor` checks the signature
+/// against `descriptor_canonical_bytes(d)`, a deterministic field-based
+/// encoding derived from the struct — NOT the raw wire bytes — and
+/// `VineDescriptorPayload`'s serde mapping round-trips every field
+/// (including `sig`/`identity_pub`) losslessly. A follower verifying this
+/// re-serialized copy is verifying the identical canonical bytes the
+/// creator originally signed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VinePullResponse {
     #[serde(rename = "ds")]
