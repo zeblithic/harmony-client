@@ -208,9 +208,24 @@ pub fn ingest_verified_row(
     if matches!(outcome, UpsertOutcome::Inserted | UpsertOutcome::Replaced) {
         match row.entry {
             AddressBookEntry::Reachability(p) => {
+                // `ReachabilityResolver` clamps forward skew internally
+                // (`FUTURE_SKEW_TOLERANCE_MS`), so the raw payload is safe.
                 reachability_resolver.update(row.actor, p, row.at);
             }
-            AddressBookEntry::Relay(p) => {
+            AddressBookEntry::Relay(mut p) => {
+                // `CommunityRelayResolver` has NO internal clamp and LWWs on
+                // the raw `ad_at`, while `fresh_relay_entry` hides far-future
+                // ads on read — unclamped, a far-future `ad_at` (hostile or
+                // just a wrong clock) would squat the advertiser's LWW slot
+                // invisibly and freeze out their honest refreshes until the
+                // wall clock caught up. Clamp the RESOLVER's copy the same
+                // way `upsert` clamps the book row's stamp; the book keeps
+                // the signed original, so snapshot serve is unaffected and
+                // every peer re-applies this clamp at its own ingest.
+                p.ad_at = p.ad_at.min(
+                    now_ms
+                        .saturating_add(crate::community_address_book::ADDRBOOK_SKEW_TOLERANCE_MS),
+                );
                 community_relay_resolver.update(community, row.actor, p, row.at);
             }
         }
@@ -670,21 +685,41 @@ pub fn seal_snapshot_bounded(
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
     rows.sort_by(|a, b| b.stamped_at_ms.cmp(&a.stamped_at_ms));
-    loop {
-        let packet = seal_records(key, community, &rows)?;
-        if packet.len() <= max_bytes || rows.is_empty() {
-            return Ok(packet);
+    let full = seal_records(key, community, &rows)?;
+    if full.len() <= max_bytes || rows.is_empty() {
+        return Ok(full);
+    }
+    // Over cap: binary-search the LARGEST newest-first prefix whose sealed
+    // packet fits (a halving loop here once dropped rows that had room —
+    // slightly-over-cap books lost half their set). Invariants: `lo` seals
+    // under the cap (`best` holds that packet once lo > 0), `hi` seals over.
+    // O(log n) seals, each bounded by the over-cap packet's cost.
+    let mut lo = 0usize;
+    let mut hi = rows.len();
+    let mut best: Option<Vec<u8>> = None;
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        let packet = seal_records(key, community, &rows[..mid])?;
+        if packet.len() <= max_bytes {
+            lo = mid;
+            best = Some(packet);
+        } else {
+            hi = mid;
         }
-        let keep = rows.len() / 2;
-        tracing::warn!(
-            community = %hex::encode(&community.0[..4]),
-            len = packet.len(),
-            max = max_bytes,
-            rows = rows.len(),
-            keep,
-            "addrbook snapshot over cap; serving the newest rows only"
-        );
-        rows.truncate(keep);
+    }
+    tracing::warn!(
+        community = %hex::encode(&community.0[..4]),
+        len = full.len(),
+        max = max_bytes,
+        rows = rows.len(),
+        kept = lo,
+        "addrbook snapshot over cap; serving the largest newest-first prefix that fits"
+    );
+    match best {
+        Some(packet) => Ok(packet),
+        // lo == 0: not even one row fits — serve the sealed empty set (the
+        // same terminal the old loop had), never an over-cap packet.
+        None => seal_records(key, community, &[]),
     }
 }
 
@@ -2244,6 +2279,117 @@ mod tests {
         assert!(
             oldest_kept > 1_000,
             "truncation drops the OLDEST rows first (kept floor {oldest_kept})"
+        );
+    }
+
+    /// A slightly-over-cap book serves the LARGEST newest-first prefix that
+    /// fits — not a halved set. Cap = one byte under the full packet, so
+    /// exactly one row must go; anything less than 7-of-8 served is the old
+    /// halving regression.
+    #[test]
+    fn oversize_snapshot_keeps_largest_fitting_prefix() {
+        let community = SpaceId([0xC7; 16]);
+        let key = fixture_key(&community);
+        let rows: Vec<AddressBookRow> = (1..=8u8).map(|i| row(i, 1_000 + i as u64)).collect();
+
+        let full = seal_snapshot_bounded(&key, &community, rows.clone(), usize::MAX)
+            .expect("seal under an unbounded cap");
+        let cap = full.len() - 1;
+        let trimmed = seal_snapshot_bounded(&key, &community, rows, cap).expect("seal under cap");
+        assert!(trimmed.len() <= cap, "served packet fits the cap");
+        let served = open_records(&key, &community, &trimmed).expect("open trimmed");
+        assert_eq!(
+            served.len(),
+            7,
+            "one byte over the cap costs exactly one row, not half the set"
+        );
+        assert!(
+            served.iter().all(|r| r.stamped_at_ms > 1_001),
+            "the single dropped row is the oldest-stamped one"
+        );
+    }
+
+    /// A far-future `ad_at` on a validly-signed relay row must not squat the
+    /// resolver's LWW slot: `CommunityRelayResolver` has no internal clamp
+    /// (unlike `ReachabilityResolver`), and `fresh_relay_entry` hides
+    /// far-future ads on read — so without the ingest-side clamp the entry
+    /// would be invisible AND block the advertiser's honest refreshes until
+    /// the wall clock caught up.
+    #[test]
+    fn far_future_relay_ad_is_clamped_before_resolver_fanout() {
+        let community = SpaceId([0xC8; 16]);
+        let ts = 1_700_000_000_000u64;
+        let at = hlc(ts);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x63; 32]);
+        let actor = OwnerAddr([0x0C; 16]);
+        let far_future = ts + 3_600_000; // 1 h ahead, well past the 5 min clamp
+
+        let mk_row = |ad_at: u64, device_seed: u8| {
+            let payload = build_signed_community_relay_announce(
+                CommunityRelayEntry {
+                    relay_device_id: [device_seed; 16],
+                    iroh_endpoint_id: [0xAB; 32],
+                    relay_device_ed25519_verify: sk.verifying_key().to_bytes(),
+                    home_relay: "https://r.example/".into(),
+                },
+                ad_at,
+                &actor,
+                &at,
+                &sk,
+            )
+            .expect("build signed relay payload");
+            AddressBookRow {
+                entry: AddressBookEntry::Relay(payload),
+                actor,
+                device: sk.verifying_key().to_bytes(),
+                at: at.clone(),
+                stamped_at_ms: ad_at,
+            }
+        };
+
+        let book = CommunityAddressBook::new();
+        let reach = ReachabilityResolver::new();
+        let relay = CommunityRelayResolver::new();
+
+        assert_eq!(
+            ingest_verified_row(
+                &book,
+                &reach,
+                &relay,
+                community,
+                mk_row(far_future, 0x77),
+                ts
+            ),
+            IngestOutcome::Applied(UpsertOutcome::Inserted)
+        );
+        // The clamped resolver copy stays within the read path's future
+        // tolerance, so the entry is VISIBLE instead of future-hidden.
+        assert_eq!(
+            relay.relays_for_community(&community, ts).len(),
+            1,
+            "clamped far-future ad is fresh on read, not hidden"
+        );
+
+        // An honest refresh newer than the CLAMP (ts + skew < ad_at' < ts +
+        // freshness) must win the LWW slot — with the unclamped far-future
+        // stamp squatting it, this update would have been ignored.
+        let honest = ts + crate::community_address_book::ADDRBOOK_SKEW_TOLERANCE_MS + 1;
+        assert_eq!(
+            ingest_verified_row(
+                &book,
+                &reach,
+                &relay,
+                community,
+                mk_row(honest, 0x77),
+                honest
+            ),
+            IngestOutcome::Applied(UpsertOutcome::Replaced),
+            "honest refresh lands in the book past the clamped squat"
+        );
+        assert_eq!(
+            relay.relays_for_community(&community, honest).len(),
+            1,
+            "and the resolver accepted it (unclamped squat would have pinned the slot)"
         );
     }
 }
