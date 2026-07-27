@@ -53,6 +53,35 @@ fn build_blob(
     build_vines_record_blob(&payload).ok()
 }
 
+/// Explicit empty-relay-set retraction, published when the gate has flipped
+/// closed since registration (e.g. the owner's last vine was deleted
+/// without an explicit settings toggle — no separate watcher for that path
+/// in v1, see module doc). `unwrap_or_default` on the encode is safe: an
+/// empty `relay_set` can never exceed `pkarr_vines`'s blob size budget.
+fn build_retraction_blob(now_ms: u64) -> Vec<u8> {
+    build_vines_record_blob(&VineRelayRecordPayload {
+        relay_set: vec![],
+        issued_at_ms: now_ms,
+    })
+    .unwrap_or_default()
+}
+
+/// What the registered closure actually publishes on every tick: the real
+/// self-entry blob when the gate is open, or the retraction above when it
+/// isn't. Pure — same live-read inputs the closure captures, so a test can
+/// pin "the next closure invocation" behavior without any network/tokio
+/// machinery.
+fn build_blob_or_retraction(
+    share: bool,
+    own_vine_count: usize,
+    endpoint_id: [u8; 32],
+    home_relay: String,
+    now_ms: u64,
+) -> Vec<u8> {
+    build_blob(share, own_vine_count, endpoint_id, home_relay, now_ms)
+        .unwrap_or_else(|| build_retraction_blob(now_ms))
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -167,20 +196,8 @@ impl PkarrVinesPublisher {
                 .unwrap_or_default();
             let share = share_flag.load(Ordering::Relaxed);
             let own_vine_count = has_own_vines();
-            let blob = build_blob(share, own_vine_count, endpoint_id, home_relay, at_ms)
-                .unwrap_or_else(|| {
-                    // The gate flipped closed between registration and this
-                    // scheduled tick (e.g. the owner's last vine was deleted
-                    // without an explicit settings toggle — no separate
-                    // watcher exists for that in v1, see module doc).
-                    // Publish an explicit empty-set retraction rather than
-                    // stale self-entry content.
-                    build_vines_record_blob(&VineRelayRecordPayload {
-                        relay_set: vec![],
-                        issued_at_ms: at_ms,
-                    })
-                    .unwrap_or_default()
-                });
+            let blob =
+                build_blob_or_retraction(share, own_vine_count, endpoint_id, home_relay, at_ms);
             PkarrRoutingRecord::sign_new(
                 blob,
                 id_pub,
@@ -227,6 +244,48 @@ mod tests {
     fn blob_contains_self_entry_when_enabled() {
         let b = test_builder(true, 3);
         let blob = b().expect("enabled with vines publishes");
+        let p: crate::pkarr_vines::VineRelayRecordPayload =
+            ciborium::from_reader(blob.as_slice()).unwrap();
+        assert_eq!(p.relay_set.len(), 1);
+        assert_eq!(p.relay_set[0].iroh_endpoint_id, TEST_SELF_ENDPOINT);
+    }
+
+    /// Pins the gate-flip-closed scenario the registered `RecordBuilder`
+    /// closure must handle without a `disable`/`republish` call landing
+    /// first (e.g. the owner's last vine was deleted, dropping
+    /// `own_vine_count` to 0, with `share` never touched): the closure
+    /// calls `build_blob_or_retraction` with these exact live-read inputs
+    /// on its next invocation, so exercising the pure combinator directly
+    /// pins that behavior without any network/tokio machinery.
+    #[test]
+    fn retraction_blob_when_gate_flips_closed_after_registration() {
+        let blob = build_blob_or_retraction(
+            /*share=*/ true,
+            /*own_vine_count=*/ 0,
+            TEST_SELF_ENDPOINT,
+            "https://relay.example".to_string(),
+            1_000,
+        );
+        let p: crate::pkarr_vines::VineRelayRecordPayload =
+            ciborium::from_reader(blob.as_slice()).unwrap();
+        assert!(
+            p.relay_set.is_empty(),
+            "gate closed — must retract, never republish stale self-entry content"
+        );
+        assert_eq!(p.issued_at_ms, 1_000);
+    }
+
+    /// Same combinator, gate-open branch: must match `build_blob`'s output
+    /// exactly (the closure's normal-path behavior), not the retraction.
+    #[test]
+    fn full_blob_when_gate_open() {
+        let blob = build_blob_or_retraction(
+            true,
+            3,
+            TEST_SELF_ENDPOINT,
+            "https://relay.example".to_string(),
+            1_000,
+        );
         let p: crate::pkarr_vines::VineRelayRecordPayload =
             ciborium::from_reader(blob.as_slice()).unwrap();
         assert_eq!(p.relay_set.len(), 1);
