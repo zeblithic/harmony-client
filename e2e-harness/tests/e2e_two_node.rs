@@ -2510,6 +2510,94 @@ async fn s_vines_publish_feed_view_reshare() {
     drop((alice, bob, ah, bh));
 }
 
+/// ZEB-811: a node's own `creatorAddress` (`vine_signing::signer_address`) has
+/// no dedicated RPC — it's a signing-only identity, deliberately distinct from
+/// `get_owner_state`'s `ownerId` (the device-address hash; the two notions
+/// never converge). The cheapest verified source is a node's OWN just-
+/// published vine: Task 5's self-ingest guarantees the publisher's own
+/// descriptor lands in its own feed immediately, carrying `creatorAddress`.
+/// Callers MUST publish at least one vine on `node` before calling this.
+async fn node_vine_address(node: &NodeHandle) -> String {
+    let feed = e2e_harness::driver::list_vine_videos(node)
+        .await
+        .expect("list_vine_videos for creatorAddress lookup");
+    feed.first()
+        .and_then(|d| d.get("creatorAddress"))
+        .and_then(serde_json::Value::as_str)
+        .expect("node's own published vine carries creatorAddress")
+        .to_string()
+}
+
+/// ZEB-811: follow-only cross-node delivery over the vine relay path. Two
+/// nodes with NO relationship of any kind — the exact gap the ticket
+/// documents (the mesh-path sibling above needs a community join to pass
+/// without LAN scouting). Alice's own device is her v1 relay; Bob discovers
+/// it via the public pkarr `vines` slot and pulls descriptors + video with no
+/// community, no friendship, and no shared mesh.
+///
+/// View + reshare legs assert on Bob's PULLED copies only — v1 has no
+/// reverse channel, so Alice never sees Bob's reshare (spec §6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s_vines_follow_only() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let (mut run, _ah, _bh, alice, bob) = two_minted_nodes("vines-follow").await;
+
+    // Alice: confirm the gate defaults ON, then publish one vine. Address
+    // discovery (`node_vine_address`) reads it back from Alice's own feed, so
+    // it necessarily runs AFTER the publish it reads from — publish comes
+    // first here, unlike the mesh-path sibling where `owner_id` (a distinct,
+    // pre-existing identifier) is available before any vine exists.
+    let settings = get_vine_settings(&alice).await.unwrap();
+    assert_eq!(
+        settings["shareVinesPublicly"], true,
+        "public-by-default (spec product decision 4)"
+    );
+    let alice_owner = owner_id(&alice).await;
+    let title = format!(
+        "e2e-vine-follow-{}",
+        &alice_owner[..8.min(alice_owner.len())]
+    );
+    let (vine_id, video_cid) = publish_vine(&alice, &title, "alice").await.unwrap();
+    let alice_addr = node_vine_address(&alice).await;
+
+    // Bob: follow by address — no community, no friendship, no multicast.
+    assert!(follow_vine_creator(&bob, &alice_addr).await.unwrap());
+
+    // Descriptor leg: bob's feed gains the vine via the pull driver (pkarr
+    // publish + resolve + pull; generous deadline, poll only — a follow fires
+    // an immediate wake+pull pass, so this is bounded by pkarr publish→resolve
+    // latency, not the driver's ~7.5min cadenced retry).
+    poll_until(Duration::from_secs(240), || async {
+        Ok(list_vine_videos(&bob)
+            .await?
+            .iter()
+            .any(|v| v["id"] == vine_id.as_str())
+            .then_some(()))
+    })
+    .await
+    .expect("descriptor must arrive over the relay path");
+
+    // Video leg: relay content fetch (mesh GET cannot succeed — no shared mesh).
+    let bytes = fetch_vine_video(&bob, &video_cid, &alice_addr)
+        .await
+        .expect("video over vine-relay");
+    assert!(!bytes.is_empty());
+
+    // View + reshare legs on the PULLED copies (v1 has no reverse channel).
+    assert!(mark_vine_viewed(&bob, &vine_id).await.unwrap());
+    let reshare_of = reshare_vine(&bob, &vine_id, "bob").await.unwrap();
+    assert_eq!(reshare_of, vine_id);
+    assert!(list_vine_videos(&bob)
+        .await
+        .unwrap()
+        .iter()
+        .any(|v| v["reshareOf"] == vine_id.as_str() && v["viewed"] == false));
+
+    run.mark_success();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // S6-ADDRBOOK (ZEB-815 Task 8): join → channel create → post → read-back on
 // the REAL binary, with ZERO address-book-announce CRDT events available

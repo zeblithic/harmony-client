@@ -474,6 +474,71 @@ pub async fn reshare_vine(
         .map(str::to_string)
 }
 
+// ── Vine follow + relay path (ZEB-811) ────────────────────────────────────────
+//
+// A follow builds no network path of its own (ZEB-811) — it only wakes the
+// pull driver, which resolves the followed creator's pkarr `vines` slot and
+// pulls descriptors/content over `harmony/vine-relay/v1`. These wrap the
+// headless verbs the follow-only e2e scenario drives, with NO community and
+// NO friendship in play.
+
+/// Follow a creator by address (no name label). Returns `true` if this is a
+/// newly-added follow, `false` if the address was already followed.
+pub async fn follow_vine_creator(node: &NodeHandle, address: &str) -> anyhow::Result<bool> {
+    let v = node
+        .rpc("follow_vine_creator", json!({ "address": address }))
+        .await?;
+    v.get("followed").and_then(Value::as_bool).ok_or_else(|| {
+        anyhow::anyhow!("follow_vine_creator expected {{ followed: bool }}, got: {v}")
+    })
+}
+
+/// Read the local vine-settings gates (`{ shareFollows, shareVinesPublicly }`).
+pub async fn get_vine_settings(node: &NodeHandle) -> anyhow::Result<Value> {
+    node.rpc("get_vine_settings", json!({})).await
+}
+
+/// Set BOTH vine-settings gates — the RPC has no partial-update form (Task 3
+/// decision), so every call must pass both bools.
+pub async fn set_vine_settings(
+    node: &NodeHandle,
+    share_follows: bool,
+    share_vines_publicly: bool,
+) -> anyhow::Result<()> {
+    node.rpc(
+        "set_vine_settings",
+        json!({ "shareFollows": share_follows, "shareVinesPublicly": share_vines_publicly }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Fetch a followed creator's video: mesh-first, vine-relay fallback (Task 9).
+/// The RPC returns the raw bytes as a JSON number array (same shape as the
+/// GUI's `fetch_content`/`fetch_avatar`); decode it back to `Vec<u8>` here so
+/// callers see plain bytes.
+pub async fn fetch_vine_video(
+    node: &NodeHandle,
+    cid: &str,
+    creator: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let v = node
+        .rpc(
+            "fetch_vine_video",
+            json!({ "cid": cid, "creatorAddress": creator }),
+        )
+        .await?;
+    v.as_array()
+        .ok_or_else(|| anyhow::anyhow!("fetch_vine_video expected a JSON byte array, got: {v}"))?
+        .iter()
+        .map(|b| {
+            b.as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| anyhow::anyhow!("fetch_vine_video: non-byte element {b} in {v}"))
+        })
+        .collect()
+}
+
 // ── Profile cards (ZEB-341) + peer-profile broadcast (ZEB-281) — ZEB-464 ──────
 //
 // Card propagation rides a Zenoh broadcast topic keyed by the owner's 16-byte
