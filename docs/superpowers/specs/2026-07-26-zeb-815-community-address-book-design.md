@@ -60,7 +60,11 @@ struct AddressBookRow {
   the community (`beacon_signer_is_member` pattern). Non-member records are
   rejected, not stored.
 - **Bounds** (storage-enforced, not read-time-only):
-  - `ADDRBOOK_MAX_NODES_PER_MEMBER = 8` — oldest-stamp eviction beyond it.
+  - `ADDRBOOK_MAX_NODES_PER_MEMBER = 8` reachability rows and
+    `ADDRBOOK_MAX_RELAYS_PER_MEMBER = 8` relay rows per (community, member) —
+    oldest-stamp eviction of the member's own same-class row beyond either
+    (relay device ids are self-asserted, so the relay class needs its own
+    bound).
   - `ADDRBOOK_MAX_ROWS = 4096` hard cap per community (expected occupancy is
     `members × nodes-per-member + relay ads`, far below it; the cap guards
     against a hostile flood that slips past the membership gate).
@@ -166,8 +170,10 @@ bootstrap no longer depends on community-state root publish at all.
   responder).
 - **Clock skew:** stamp clamped at ingest (5 min tolerance); a wildly-future stamp
   cannot pin a row unevictably.
-- **Record flood:** membership gate first, then per-member node cap, then the
-  4096-row hard cap. A hostile *member* can at most churn their own 8 rows.
+- **Record flood:** membership gate first, then the per-member per-class caps,
+  then the 4096-row hard cap. A hostile *member* can at most churn their own
+  8 + 8 rows (reachability + relay); the write-side sweep reclaims expired
+  rows so a stopped flood self-heals without a restart.
 
 ## 7. Testing
 
@@ -219,6 +225,12 @@ spec'd behavior was dropped:
   roster-change-woken fires only; the join-time first fire stays immediate so
   bootstrap latency is unchanged. Prevents synchronized re-query storms on
   mass roster flap.
+- **Final-review I1 fix (post-review):** the §1 write-side sweep is
+  implemented inside `upsert` (community-scoped range sweep before any
+  LWW/cap decision), and the relay class got its own per-member cap
+  (`ADDRBOOK_MAX_RELAYS_PER_MEMBER = 8`) closing the self-asserted
+  `relay_device_id` flood path. `publish_own_rows` also bounds its per-record
+  event-loop reply wait (`ADDRBOOK_PUBLISH_REPLY_TIMEOUT_MS`, review M1).
 - **e2e claim precision:** `s6_addrbook_join_message_delivery` proves
   join + message delivery with **zero** announce events in either membership
   log, but invite redemption's `seed_from_pkarr` confounds attribution of the

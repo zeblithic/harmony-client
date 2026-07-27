@@ -1132,7 +1132,7 @@ pub struct NodeState {
     /// community's rows: the pool's `Unsubscribe` only aborts that community's
     /// sync tasks, deliberately leaving the rows for this eviction path.
     /// `None` until a node with an owner identity is running.
-    pub community_address_book:
+    pub(crate) community_address_book:
         Option<std::sync::Arc<crate::community_address_book::CommunityAddressBook>>,
     /// ZEB-537: the live community-presence roster map, shared with the event
     /// loop's subscriber + sweeper tasks. IPC reads the roster from here.

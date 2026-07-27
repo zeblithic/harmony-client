@@ -57,6 +57,13 @@ pub const ADDRBOOK_SNAPSHOT_IDLE_REQUERY_MS: u64 = 30 * 60_000;
 /// requester is off the critical path (live records keep filling the book).
 pub const ADDRBOOK_SNAPSHOT_GET_TIMEOUT_MS: u64 = 10_000;
 
+/// Bound on waiting for the event loop's per-record publish reply in
+/// `publish_own_rows`. A live loop replies promptly and a dead loop fails the
+/// preceding `send` fast, so this should never fire — it keeps the 60-min
+/// publisher cadence from being structurally downstream of zenoh liveness if
+/// a reply is ever silently dropped.
+pub const ADDRBOOK_PUBLISH_REPLY_TIMEOUT_MS: u64 = 10_000;
+
 /// Debounce between an ingest marking the book dirty and the sidecar write.
 /// Coalesces a snapshot's row burst into one file write.
 pub const ADDRBOOK_PERSIST_DEBOUNCE_MS: u64 = 2_000;
@@ -554,16 +561,25 @@ pub async fn publish_own_rows(
             );
             continue;
         }
-        match reply_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(
+        match tokio::time::timeout(
+            Duration::from_millis(ADDRBOOK_PUBLISH_REPLY_TIMEOUT_MS),
+            reply_rx,
+        )
+        .await
+        {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => tracing::warn!(
                 community = %community_hex,
                 err = %e,
                 "addrbook record publish failed"
             ),
-            Err(_) => tracing::warn!(
+            Ok(Err(_)) => tracing::warn!(
                 community = %community_hex,
                 "event loop dropped the addrbook publish request"
+            ),
+            Err(_) => tracing::warn!(
+                community = %community_hex,
+                "timed out waiting for the addrbook publish reply"
             ),
         }
     }
