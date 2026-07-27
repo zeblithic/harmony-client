@@ -199,6 +199,12 @@ struct OpenJoinSetup {
     alice_comm_sk: Arc<SigningKey>,
     alice_addr: OwnerAddr,
     bob_addr: OwnerAddr,
+    /// The exact 64-byte composite identity pub (X25519 ‖ Ed25519) handed to
+    /// `CommunityRendezvousPublisher::new`, which writes it into every slot
+    /// record's `harmony_identity_pub`. Exposed so a resolve-side test can pin
+    /// the identity bytes it read against the ones the publisher signed with,
+    /// rather than merely asserting they are non-zero (ZEB-824).
+    alice_identity_pub: [u8; 64],
     epoch_key: EpochKey,
     community_id: SpaceId,
     bob_bootstrap_join: SignedMembershipEvent,
@@ -647,6 +653,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         alice_comm_sk,
         alice_addr,
         bob_addr,
+        alice_identity_pub: alice_pub,
         epoch_key,
         community_id,
         bob_bootstrap_join,
@@ -1316,6 +1323,17 @@ async fn identified_resolve_returns_beacon_identity() {
         )
         .await;
 
+        // Slot 0 answers on the FIRST batch when we are not filtering ourselves.
+        // Paired with the `batches_tried == curve.len()` assertion in
+        // `identified_resolve_filters_own_endpoint`, this makes the widening
+        // claim a real differential: same curve, same published record, and the
+        // batch count moves 1 → full-curve purely because of the self-filter.
+        assert_eq!(
+            outcome.batches_tried, 1,
+            "an unfiltered live slot 0 must resolve on the first batch"
+        );
+        assert_eq!(outcome.winning_slot, Some(0), "slot 0 is the live beacon");
+
         let beacon = outcome.payload.expect("alice's slot-0 beacon must resolve");
         assert_eq!(
             beacon.payload.iroh_node_id,
@@ -1323,8 +1341,17 @@ async fn identified_resolve_returns_beacon_identity() {
             "payload must be alice's endpoint"
         );
         // The outer record's identity must ride along (this is what the plain
-        // resolve_rendezvous throws away).
-        assert_ne!(beacon.beacon_identity_pub, [0u8; 64]);
+        // resolve_rendezvous throws away) — pinned to the EXACT bytes the
+        // publisher signed the record with. A mere non-zero check would also
+        // pass if the resolver returned `rec.inner_sig`, which is likewise
+        // `[u8; 64]` and likewise non-zero; that bug would then surface only as
+        // Task 3's membership gate rejecting every beacon forever.
+        assert_eq!(
+            beacon.beacon_identity_pub, setup.alice_identity_pub,
+            "beacon_identity_pub must be the record's harmony_identity_pub — the composite \
+             X25519 ‖ Ed25519 pub the rendezvous publisher was constructed with — and not \
+             some other 64-byte field of the record"
+        );
 
         setup.publisher_handle.abort();
         setup.alice_ep.shutdown().await;
@@ -1347,18 +1374,35 @@ async fn identified_resolve_filters_own_endpoint() {
         assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
         await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
 
+        let cfg = harmony_app::community_rendezvous::rendezvous_config_from_env();
         let outcome = harmony_app::community_rendezvous::resolve_rendezvous_identified(
             &setup.pkarr_resolver,
             &setup.epoch_key,
             *setup.alice_ep.node_id().as_bytes(), // we ARE alice
             wall_ms(),
-            &harmony_app::community_rendezvous::rendezvous_config_from_env(),
+            &cfg,
         )
         .await;
 
         assert!(
             outcome.payload.is_none(),
             "own beacon record must be filtered, not returned as a dial candidate"
+        );
+        assert_eq!(
+            outcome.winning_slot, None,
+            "a filtered slot must not be reported as a winner"
+        );
+        // The OTHER half of the spec §5 claim: filtering happens at the decode
+        // layer, so our own slot reads as EMPTY and the escalating driver keeps
+        // widening — it must exhaust the whole curve rather than stopping at the
+        // batch that contained our record. Had the filter instead short-circuited
+        // the driver (or had slot 0 answered), this would be 1, not the full
+        // curve length.
+        assert_eq!(
+            outcome.batches_tried,
+            cfg.batch_curve.len(),
+            "self-filtered slot 0 must read as empty so the driver widens through \
+             every batch in the curve"
         );
 
         setup.publisher_handle.abort();
