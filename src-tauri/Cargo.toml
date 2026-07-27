@@ -135,14 +135,15 @@ harmony-crypto = { git = "https://github.com/zeblithic/harmony.git", rev = "b904
 # workspace-wide rev as the lockstep crates above; pkarr keeps its own pin.
 harmony-crdt-sync = { git = "https://github.com/zeblithic/harmony.git", rev = "b904b0b9f8a0351867d2367c6a2d1e0921dfd4e7" }
 # ZEB-323 Phase 2b: pkarr-based discovery policies. Deliberately held at its
-# OWN rev (currently 80f6d80) — a SEPARATE pin from the workspace-wide rev of
+# OWN rev (currently 88861ae, main merge of ZEB-817 verified-resolve) — a
+# SEPARATE pin from the workspace-wide rev of
 # the crates above, NOT kept in lockstep with it. Bumped independently only
 # when pkarr itself needs it, so an owner/runtime bump like harmony#286 does
 # not drag in unrelated pkarr changes. Provenance: RelayPool/health +
 # real-wire-format work (was 2aaf403b in ZEB-380 PR1 — see git history).
 # test-fixtures feature is activated only for the dev-dependency below
 # so MockPkarrRelay is excluded from release binaries (round-1 review fix).
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "e64e2671c1ef863c09045920361b1dd00cfcceab" }
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "88861ae5ae4461000ed041db907c3fa674824e6f" }
 # ZEB-473 (DM-over-iroh, Move 1a): harmony-tunnel is the PQ iroh tunnel crate
 # that Move 1 rewires the dormant DM unicast fan-out onto. Pinned to the same
 # workspace-wide rev as the crates above. Imported here in Task 1 so later
@@ -259,7 +260,7 @@ tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util", "io-util"] }
 # Activate test-fixtures feature for harmony-pkarr in dev/test builds only,
 # so MockPkarrRelay (an axum HTTP server) is excluded from release binaries.
-harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "e64e2671c1ef863c09045920361b1dd00cfcceab", features = ["test-fixtures"] }
+harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "88861ae5ae4461000ed041db907c3fa674824e6f", features = ["test-fixtures"] }
 
 # ZEB-156: harmony-runtime (pinned above) provides the narrow
 # `NodeRuntime::remove_content` + `StorageTier::remove` delegates this

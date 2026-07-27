@@ -10,7 +10,10 @@
 //! same endpoint id. Freshness comes entirely from the core
 //! `PkarrPublisher`'s own scheduled cadence (`compute_next_publish_at`) plus
 //! the explicit [`PkarrVinesPublisher::republish`] hook fired after every
-//! successful vine publish (covers "first vine ever" flipping the gate).
+//! successful vine publish (covers "first vine ever" flipping the gate OPEN)
+//! and after every successful vine delete (covers "last vine gone" flipping it
+//! CLOSED, so the published relay set is actively retracted rather than left
+//! to the next cadence tick — ZEB-822).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -204,8 +207,9 @@ impl PkarrVinesPublisher {
 
     /// Shared ephemeral-key builder: derives the current epoch's vines slot
     /// key from this device's own address. Used by both the real-content
-    /// and retraction paths inside `reconcile_locked` so the retraction
-    /// lands under the exact same slot it's withdrawing.
+    /// path in `reconcile_locked` and the retraction path in
+    /// `register_retraction`, so the retraction lands under the exact same
+    /// slot it's withdrawing.
     fn key_builder(&self) -> EphemeralKeyBuilder {
         let own_addr_for_key = self.own_addr_hex.clone();
         Arc::new(move |at_ms| {
@@ -278,19 +282,26 @@ impl PkarrVinesPublisher {
             return;
         }
 
-        // Gate closed. `share == false` (explicit toggle-off) actively
-        // retracts a previously-registered positive record instead of
+        // Gate closed. BOTH ways it can close actively retract rather than
         // merely unregistering — `unregister` alone only stops FUTURE
         // republishing, it does not withdraw a record already sitting on
         // the DHT, so the last positive relay-set would otherwise stay
-        // discoverable for up to its 7-day TTL (round 1 fix, Qodo #1,
-        // preserved here). `share == true` but no own vines (yet, or not
-        // anymore) has nothing meaningful to retract in v1 — plain
-        // unregister is enough, unchanged from the original behavior.
-        if share {
-            self.publisher.unregister(HANDLE).await;
-            return;
-        }
+        // discoverable for up to its 7-day TTL:
+        //
+        //  - `share == false`: the explicit settings toggle-off (round 1
+        //    fix, Qodo #1).
+        //  - `share == true` with zero own vines: the owner deleted their
+        //    last vine and never touched settings (ZEB-822). Identical
+        //    stale-record exposure, so identical remedy — this used to be a
+        //    plain `unregister`, which stranded the last positive record to
+        //    TTL decay.
+        //
+        // Either way there is only something to retract if THIS process
+        // still holds the registration; otherwise any record on the DHT is
+        // from an earlier process run we no longer publish for (the restart
+        // hole — pre-existing on the disable path, accepted, now shared).
+        // Note the early return replaces branch 4's old `unregister` call,
+        // which was a no-op precisely because the handle is absent here.
         if !self
             .publisher
             .active_handles()
@@ -299,6 +310,20 @@ impl PkarrVinesPublisher {
         {
             return;
         }
+        self.register_retraction().await;
+    }
+
+    /// Register the retraction-only publication: a `RecordBuilder` emitting
+    /// the empty-relay-set record, replacing whatever positive record this
+    /// device last published under the same slot. Shared by both gate-closed
+    /// flavors in `reconcile_locked` so they cannot drift apart.
+    ///
+    /// NEVER pair this with `unregister`: `unregister` sets the entry's
+    /// `cancelled` flag and the core publish loop short-circuits on it
+    /// (`publisher.rs`), so register-then-unregister would publish nothing at
+    /// all. The handle deliberately STAYS registered afterwards, republishing
+    /// the retraction on the normal cadence.
+    async fn register_retraction(&self) {
         let id_sk = self.identity_signing_key.clone();
         let id_pub = self.identity_pub;
         let record_builder: RecordBuilder = Arc::new(move |at_ms| {
@@ -413,11 +438,29 @@ mod tests {
     /// time the background driver retries against a closed listener).
     async fn test_publisher() -> (Arc<PkarrPublisher>, harmony_pkarr::testing::MockPkarrRelay) {
         let relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
-        let pool = harmony_pkarr::RelayPool::new(vec![relay.base_url.clone()]);
-        let client = Arc::new(harmony_pkarr::RelayClient::new(pool));
-        let publisher = Arc::new(PkarrPublisher::new(client));
-        let _driver = Arc::clone(&publisher).spawn();
+        let publisher = single_relay_publisher(&relay);
         (publisher, relay)
+    }
+
+    /// A client whose pool contains exactly ONE relay.
+    fn single_relay_client(
+        relay: &harmony_pkarr::testing::MockPkarrRelay,
+    ) -> Arc<harmony_pkarr::RelayClient> {
+        Arc::new(harmony_pkarr::RelayClient::new(
+            harmony_pkarr::RelayPool::new(vec![relay.base_url.clone()]),
+        ))
+    }
+
+    /// A spawned publisher writing to exactly ONE relay. Each
+    /// `MockPkarrRelay` keeps a single envelope per key (latest write wins),
+    /// so two records competing for the SAME slot key need one relay each —
+    /// see `squatted_slot_still_resolves_genuine_relay_set`.
+    fn single_relay_publisher(
+        relay: &harmony_pkarr::testing::MockPkarrRelay,
+    ) -> Arc<PkarrPublisher> {
+        let publisher = Arc::new(PkarrPublisher::new(single_relay_client(relay)));
+        let _driver = Arc::clone(&publisher).spawn();
+        publisher
     }
 
     fn build_id_pub(sk: &ed25519_dalek::SigningKey) -> [u8; 64] {
@@ -532,6 +575,107 @@ mod tests {
         }
     }
 
+    /// ZEB-822: deleting your last own vine while "share vines publicly" stays
+    /// ON must ACTIVELY retract the published relay set, exactly as an explicit
+    /// toggle-off does — not merely unregister the handle and leave the last
+    /// positive record discoverable until its 7-day TTL runs out. This is the
+    /// one gate-closing path with NO settings change and NO watcher behind it
+    /// (see the module doc), so it is reached only when something calls
+    /// `reconcile` — which is why ZEB-822 also wired the post-tombstone
+    /// `republish()` hook in `delete_vine_impl`. Without that hook the
+    /// already-registered gate-open builder would still self-heal, but only at
+    /// its next cadence tick (up to ~3.5 days), not on the delete.
+    ///
+    /// What the assertion turns on: `Ok(vec![])` means a record IS present at
+    /// the slot and decodes to an empty relay set — the retraction. An
+    /// `Err("no vines record found for creator")` would mean absent/undecodable,
+    /// which is the TTL-decay end state this test exists to rule out. So the
+    /// poll must accept ONLY the `Ok`-and-empty shape.
+    #[tokio::test]
+    async fn zero_own_vines_with_share_on_retracts_instead_of_ttl_decay() {
+        let (publisher, relay) = test_publisher().await;
+        let resolver = harmony_pkarr::PkarrResolver::new(single_relay_client(&relay));
+
+        let endpoint = test_endpoint().await;
+        // Real identity, as in `disable_after_enable_publishes_retraction`:
+        // `verify_vines_record` binds the record's identity pub to the claimed
+        // creator address, so a placeholder hex address would make EVERY
+        // resolve return `Err` and the empty-vs-absent distinction this test
+        // turns on would be unobservable.
+        let identity = crate::vine_signing::test_identity();
+        let addr = crate::vine_signing::signer_address(&identity);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let count_for_closure = Arc::clone(&count);
+        let vp = PkarrVinesPublisher::new(
+            Arc::clone(&publisher),
+            addr.clone(),
+            crate::vine_signing::identity_signing_key(&identity),
+            crate::vine_signing::identity_pub_64(&identity),
+            Some(endpoint),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(move || count_for_closure.load(Ordering::Relaxed)),
+        );
+
+        // Sharing on with one own vine: the real relay-set record lands.
+        vp.enable().await;
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(attempts < 80, "initial vines publish did not land");
+            if let Ok(relay_set) =
+                crate::pkarr_vines::resolve_vine_relays(&resolver, &addr, now_ms()).await
+            {
+                if !relay_set.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // The owner deletes their last vine. `share` is NEVER touched — the
+        // count closure is the only input that changes. Calling `reconcile()`
+        // directly stands in for the publisher's whole trigger set, every
+        // member of which funnels through this same body: `delete_vine_impl`'s
+        // post-tombstone `republish()` hook (the path that reaches THIS
+        // scenario in production), `publish_vine_descriptor_impl`'s
+        // post-publish hook, `set_vine_settings_impl`'s toggle, and boot
+        // `enable()`.
+        count.store(0, Ordering::Relaxed);
+        vp.reconcile().await;
+
+        // The resolvable record must become the empty-set retraction. Merely
+        // unregistering would leave the stale POSITIVE record sitting on the
+        // relay — this loop would then spin out and fail.
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(
+                attempts < 80,
+                "retraction did not land after the last own vine disappeared"
+            );
+            if let Ok(relay_set) =
+                crate::pkarr_vines::resolve_vine_relays(&resolver, &addr, now_ms()).await
+            {
+                if relay_set.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // And the handle STAYS registered, like the disable path's: the
+        // retraction is republished on the normal cadence, and a
+        // register-then-unregister would have cancelled the pending publish
+        // outright (nothing would ever land).
+        assert!(
+            publisher
+                .active_handles()
+                .await
+                .contains(&HANDLE.to_string()),
+            "the retraction publication must stay registered, not be unregistered"
+        );
+    }
+
     /// ZEB-811 round 2 (Greptile P1): a detached settings-toggle reconcile
     /// racing another must converge on whichever setting was applied LAST —
     /// a stale `enable`'s reconcile finishing AFTER a later `disable`'s
@@ -634,16 +778,199 @@ mod tests {
         );
     }
 
+    /// ZEB-817 wiring: a squatter record on one relay with a higher seq must
+    /// not shadow the genuine relay-set record on another relay, because
+    /// `resolve_vine_relays` now verifies per-candidate INSIDE the resolver
+    /// (`resolve_window_freshest_with`) instead of verifying only the
+    /// freshest-by-seq winner the resolver had already committed to.
+    ///
+    /// Why the squat is even possible: the vines slot key derives from the
+    /// creator's PUBLIC address (`PkarrCase::Vines`), so anyone holding that
+    /// address can compute the slot and publish a record there that passes
+    /// the outer signature, its own inner signature AND freshness — the inner
+    /// sig verifies against the record's own embedded `harmony_identity_pub`,
+    /// which is self-certified. Only `verify_vines_record`'s identity-pub→
+    /// address binding separates the squat from the genuine record, and that
+    /// check used to run after the resolver had already picked one winner by
+    /// seq (and pinned its seq-highwater + positive cache with it).
+    #[tokio::test]
+    async fn squatted_slot_still_resolves_genuine_relay_set() {
+        const ATTACKER_ENDPOINT: [u8; 32] = [9u8; 32];
+
+        let genuine_relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
+        let squat_relay = harmony_pkarr::testing::MockPkarrRelay::start().await;
+
+        // The resolver under test spans BOTH relays — what a follower with a
+        // multi-relay pool actually sees. Squat listed FIRST: it carries both
+        // the higher seq and the earlier answer.
+        let resolver = harmony_pkarr::PkarrResolver::new(Arc::new(
+            harmony_pkarr::RelayClient::new(harmony_pkarr::RelayPool::new(vec![
+                squat_relay.base_url.clone(),
+                genuine_relay.base_url.clone(),
+            ])),
+        ));
+
+        // The genuine creator must be a REAL identity: `verify_vines_record`
+        // binds the record's identity pub to the claimed creator address, so
+        // an arbitrary hex address (as the bookkeeping-only tests above use)
+        // would fail the binding for EVERY candidate and prove nothing.
+        let identity = crate::vine_signing::test_identity();
+        let genuine_addr = crate::vine_signing::signer_address(&identity);
+        let endpoint = test_endpoint().await;
+        let genuine_endpoint_id = *endpoint.node_id().as_bytes();
+        let vp = PkarrVinesPublisher::new(
+            single_relay_publisher(&genuine_relay),
+            genuine_addr.clone(),
+            crate::vine_signing::identity_signing_key(&identity),
+            crate::vine_signing::identity_pub_64(&identity),
+            Some(endpoint),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|| 1),
+        );
+        vp.enable().await;
+
+        // Wait for the genuine record to land BEFORE publishing the squat, so
+        // the squat is guaranteed the higher BEP44 seq (seq is the
+        // `SignedPacket` timestamp, minted at publish time).
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(attempts < 80, "genuine vines publish did not land");
+            if let Ok(relay_set) =
+                crate::pkarr_vines::resolve_vine_relays(&resolver, &genuine_addr, now_ms()).await
+            {
+                if !relay_set.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // The squatter: a DIFFERENT identity signing its own record, under
+        // the SAME slot key (derived from the GENUINE creator's address), on
+        // its own relay.
+        let attacker = crate::vine_signing::test_identity();
+        let attacker_sk = crate::vine_signing::identity_signing_key(&attacker);
+        let attacker_pub = crate::vine_signing::identity_pub_64(&attacker);
+        let addr_for_key = genuine_addr.clone();
+        let key_builder: EphemeralKeyBuilder = Arc::new(move |at_ms| {
+            vines_key_for_epoch(&addr_for_key, current_epoch_id(at_ms))
+                .expect("creator address hex comes from a real identity — always valid hex")
+        });
+        let record_builder: RecordBuilder = Arc::new(move |at_ms| {
+            let blob = build_vines_record_blob(&VineRelayRecordPayload {
+                relay_set: vec![VineRelayEntry {
+                    iroh_endpoint_id: ATTACKER_ENDPOINT,
+                    home_relay: "https://attacker.example".to_string(),
+                }],
+                issued_at_ms: at_ms,
+            })
+            .expect("single-entry blob is within budget");
+            PkarrRoutingRecord::sign_new(
+                blob,
+                attacker_pub,
+                at_ms,
+                at_ms + REACHABILITY_RECORD_TTL_MS,
+                &attacker_sk,
+            )
+            .expect("sign — fixed-size buffers should not fail")
+        });
+        let squat_publisher = single_relay_publisher(&squat_relay);
+        squat_publisher
+            .register("squat".to_string(), key_builder, record_builder)
+            .await;
+
+        // Wait for the squat's PUT to actually land. Probed through a
+        // squat-relay-ONLY resolver — a separate instance, so its cache and
+        // seq-highwater cannot contaminate the resolver under test — and via
+        // raw `resolve_freshest`, so the wait is independent of whether
+        // `resolve_vine_relays` filters the squat.
+        let squat_probe = harmony_pkarr::PkarrResolver::new(single_relay_client(&squat_relay));
+        let slot_key = vines_key_for_epoch(&genuine_addr, current_epoch_id(now_ms()))
+            .expect("creator address hex is valid")
+            .verifying_key();
+        let mut attempts = 0;
+        let squat_announced_at_ms = loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(attempts < 80, "squat publish did not land");
+            if let Ok(Some(rec)) = squat_probe.resolve_freshest(&slot_key).await {
+                assert_eq!(
+                    rec.harmony_identity_pub, attacker_pub,
+                    "the squat relay must be holding the ATTACKER's record"
+                );
+                break rec.announced_at_ms;
+            }
+        };
+
+        // Pin the premise AT assertion time (CodeRabbit PR #564 round 1):
+        // the squat must actually outrank the genuine record, or a genuine
+        // republish landing after the squat would let the assertions below
+        // pass even with per-candidate verification reverted — a silent
+        // false positive. BEP44 `seq` is not surfaced by the resolver API,
+        // but seq and `announced_at_ms` are both minted from the
+        // publish-time clock, and the wait loops above serialize the two
+        // mints (the genuine record was OBSERVED landed before the squat
+        // ever registered) — so strictly later announced_at pins the
+        // strictly higher seq.
+        let genuine_probe = harmony_pkarr::PkarrResolver::new(single_relay_client(&genuine_relay));
+        let genuine_rec = genuine_probe
+            .resolve_freshest(&slot_key)
+            .await
+            .expect("genuine-relay probe must not error")
+            .expect("genuine relay must still hold the genuine record");
+        assert_eq!(
+            genuine_rec.harmony_identity_pub,
+            crate::vine_signing::identity_pub_64(&identity),
+            "the genuine relay must be holding the GENUINE record"
+        );
+        assert!(
+            squat_announced_at_ms > genuine_rec.announced_at_ms,
+            "premise: the squat record must be strictly fresher than the genuine \
+             one (squat {squat_announced_at_ms} vs genuine {})",
+            genuine_rec.announced_at_ms
+        );
+
+        // The squat is fresher by seq and answers first, but it fails the
+        // address binding — the genuine relay set must still resolve.
+        let relay_set = crate::pkarr_vines::resolve_vine_relays(&resolver, &genuine_addr, now_ms())
+            .await
+            .expect("genuine relay set must resolve despite the squatted slot");
+        assert!(
+            relay_set
+                .iter()
+                .any(|e| e.iroh_endpoint_id == genuine_endpoint_id),
+            "genuine endpoint must be present in the resolved relay set"
+        );
+        assert!(
+            relay_set
+                .iter()
+                .all(|e| e.iroh_endpoint_id != ATTACKER_ENDPOINT),
+            "attacker endpoint must never appear in a resolved relay set"
+        );
+    }
+
+    /// The other side of ZEB-822's retraction: sharing ON with zero own vines
+    /// from a FRESH state (nothing ever registered by this process) must
+    /// register nothing — neither the positive record nor a retraction. A
+    /// retraction here would be this process publishing a record for a slot it
+    /// never published to, purely as a side effect of the user enabling a
+    /// setting; the active-handle check in `reconcile_locked` is what prevents
+    /// it. Uses a real identity so the "resolve stays Err" half is meaningful
+    /// (a placeholder address fails `verify_vines_record`'s binding and would
+    /// return `Err` even if a record HAD been published).
     #[tokio::test]
     async fn enable_does_not_register_without_own_vines() {
-        let (publisher, _relay) = test_publisher().await;
+        let (publisher, relay) = test_publisher().await;
+        let resolver = harmony_pkarr::PkarrResolver::new(single_relay_client(&relay));
         let endpoint = test_endpoint().await;
-        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let identity = crate::vine_signing::test_identity();
+        let addr = crate::vine_signing::signer_address(&identity);
         let vp = PkarrVinesPublisher::new(
             Arc::clone(&publisher),
-            "aabbcc".to_string(),
-            sk.clone(),
-            build_id_pub(&sk),
+            addr.clone(),
+            crate::vine_signing::identity_signing_key(&identity),
+            crate::vine_signing::identity_pub_64(&identity),
             Some(endpoint),
             Arc::new(AtomicBool::new(false)),
             Arc::new(|| 0),
@@ -654,6 +981,18 @@ mod tests {
             .active_handles()
             .await
             .contains(&HANDLE.to_string()));
+
+        // Give the background publish driver a window to issue any PUT a
+        // wrongly-registered builder would have produced, then confirm the
+        // slot is genuinely empty — not merely that bookkeeping looks right.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            crate::pkarr_vines::resolve_vine_relays(&resolver, &addr, now_ms())
+                .await
+                .is_err(),
+            "nothing was ever published for this slot — enabling with zero vines \
+             must not publish a retraction for a record that does not exist"
+        );
     }
 
     #[tokio::test]
