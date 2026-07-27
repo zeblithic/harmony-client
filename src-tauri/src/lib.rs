@@ -3280,6 +3280,56 @@ fn feed_revoked_from_dm_store(
     proj.union_from_members(crdt.revoked_dm_devices.iter().map(|(o, set)| (*o, set)));
 }
 
+/// ZEB-815: the two UI signals a newly-applied reachability record owes the
+/// frontend, in the one place that knows how to fire them.
+///
+/// Before the flag-day the `ReachabilityAnnounce` delta arm fired both inline:
+/// a Network-Health notify (event-driven refresh for `ConnectionStatusChip` /
+/// `NetworkHealthView` — the panels do not poll) and one
+/// `connectivity-reachability-changed` per actor (`DiagnosticsPanel`). Routing
+/// records now arrive over the address-book topic instead, and
+/// `address_book_sync` deliberately depends on neither `network_health` nor
+/// `tauri` — so it calls back through
+/// [`crate::address_book_sync::AddrbookIngestObserver`] and this type supplies
+/// the behaviour.
+///
+/// Both calls are synchronous (an mpsc send and a fire-and-forget emit), so
+/// nothing here can hold a lock across an await.
+struct ReachabilityUiSignals {
+    /// The late-populated NetworkHealthService cell. A `None` read is the
+    /// normal pre-install / iroh-bind-failed case, not an error.
+    network_health: std::sync::Arc<
+        std::sync::RwLock<Option<std::sync::Arc<crate::network_health::NetworkHealthService>>>,
+    >,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+}
+
+impl crate::address_book_sync::AddrbookIngestObserver for ReachabilityUiSignals {
+    fn reachability_applied(
+        &self,
+        actors: &std::collections::BTreeSet<crate::owner_state_types::OwnerAddr>,
+    ) {
+        // ONE notify for the batch: the service rate-limits internally, so the
+        // old per-event granularity bought nothing.
+        if let Some(nh) = self
+            .network_health
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+        {
+            nh.notify();
+        }
+        // One emit per distinct actor — the granularity the old arm had, and
+        // the shape `ConnectivityReachabilityChangedPayload` expects.
+        for actor in actors {
+            self.sink.emit(
+                "connectivity-reachability-changed",
+                serde_json::json!({ "actor": hex::encode(actor.0) }),
+            );
+        }
+    }
+}
+
 /// Start the harmony node with an embedded NodeRuntime.
 ///
 /// Generates/loads identity, creates the runtime, and spawns the event loop
@@ -4577,6 +4627,17 @@ pub async fn start_node_inner(
             let guard = state.lock().expect("NodeState mutex poisoned");
             std::sync::Arc::clone(&guard.network_health_hook_cell)
         };
+        // ZEB-815: one observer for every address-book ingest path — the sync
+        // pool's live subscriber and snapshot requester (threaded via
+        // `AddressBookRuntime`) and the reachability publisher's own rows
+        // (which report back by return value instead). Built here because this
+        // is the first point where BOTH signal handles exist.
+        let addrbook_ingest_observer: std::sync::Arc<
+            dyn crate::address_book_sync::AddrbookIngestObserver,
+        > = std::sync::Arc::new(ReachabilityUiSignals {
+            network_health: std::sync::Arc::clone(&network_health_hook_cell),
+            sink: app.clone(),
+        });
         // ZEB-325 Phase 2c: outer-scope clone of the iroh link manager so
         // the owner-loaded block below can install the handshake
         // dispatcher once `community_registry` / `dm_outbox` /
@@ -5979,7 +6040,9 @@ pub async fn start_node_inner(
                     // only to build the pkarr butler-set advert) — this is the
                     // missing wire from that durable doc to the dialer. The self
                     // row is excluded (never dial ourselves). Mirrors the
-                    // ReachabilityAnnounce boot-replay further below (~7912).
+                    // address-book boot seed further below (search
+                    // `BOOT-PROBE 10`), which ZEB-815 put in place of the
+                    // ReachabilityAnnounce event replay this once pointed at.
                     {
                         let siblings = {
                             let doc = fleet_net_doc.lock().await;
@@ -7046,28 +7109,27 @@ pub async fn start_node_inner(
                                 let signing_key_for_epoch = std::sync::Arc::clone(&signing_key_arc);
                                 let self_owner_for_epoch = self_owner;
                                 let crdt_state_for_epoch = std::sync::Arc::clone(&crdt_state);
-                                // ZEB-321 Phase 1 Task 8: resolver feed hook.
-                                // The on_epoch_event closure already fires
-                                // on EVERY delta (not just epoch-kind ones —
-                                // see the function's doc); piggyback the
-                                // ReachabilityAnnounce dispatch here so we
-                                // don't grow `run_community_delta_consumer`'s
-                                // callback list. Both the resolver and the
-                                // AppHandle clone cheaply (Arc internals).
+                                // ZEB-321 Phase 1 Task 8, narrowed by ZEB-815:
+                                // resolver EVICTION hook. The on_epoch_event
+                                // closure already fires on EVERY delta (not just
+                                // epoch-kind ones — see the function's doc), so
+                                // the Leave/Kick evictions ride here rather than
+                                // growing `run_community_delta_consumer`'s
+                                // callback list. Additions no longer come through
+                                // this closure at all — routing rows arrive over
+                                // the address-book topic. The resolver and the
+                                // sink both clone cheaply (Arc internals); the
+                                // sink is still needed for the eviction arms'
+                                // `connectivity-reachability-changed` emit.
                                 let reachability_resolver_for_hook = reachability_resolver.clone();
                                 let app_for_reachability = app.clone();
-                                // ZEB-458 P4B: feed the in-memory
-                                // CommunityRelayResolver from freshly-applied
-                                // CommunityRelayAnnounce membership events, the
-                                // relay-resolver analogue of the
-                                // ReachabilityAnnounce hook above. Captured the
-                                // same way (Arc clone) so the async block can
-                                // move a per-invocation clone. This is the live
-                                // half of the loop: publisher inserts the
-                                // CommunityRelayAnnounce event → it replicates
-                                // via community state → this arm seeds the
-                                // resolver → the pull driver + sender client
-                                // read it and dial relays.
+                                // ZEB-458 P4B, likewise narrowed by ZEB-815: the
+                                // relay-resolver analogue. It is now only the
+                                // Leave/Kick `remove_advertiser` half — the
+                                // publisher writes an address-book row instead of
+                                // inserting a CommunityRelayAnnounce event, and
+                                // ingest is what seeds this resolver for the pull
+                                // driver + sender client to dial.
                                 let community_relay_resolver_for_hook =
                                     std::sync::Arc::clone(&community_relay_resolver);
                                 // ZEB-329: capture the shared
@@ -7211,9 +7273,10 @@ pub async fn start_node_inner(
                                     let community_id = delta.community_id;
                                     let event = delta.event.clone();
                                     let local_addr_epoch = self_owner_for_epoch;
-                                    // ZEB-321 Phase 1 Task 8: resolver feed hook
-                                    // captures (resolver, app) per invocation
-                                    // so the async block can move them.
+                                    // ZEB-321 Phase 1 Task 8 (ZEB-815: eviction
+                                    // only): resolver-hook captures (resolver,
+                                    // sink) per invocation so the async block
+                                    // can move them.
                                     let resolver = reachability_resolver_for_hook.clone();
                                     let app = app_for_reachability.clone();
                                     // ZEB-458 P4B: per-invocation clone so the
@@ -8484,6 +8547,13 @@ pub async fn start_node_inner(
                         let addrbook_crr_for_pub = std::sync::Arc::clone(&community_relay_resolver);
                         let addrbook_dirty_for_pub = addrbook_dirty_hub.clone();
                         let addrbook_publish_tx_for_pub = publish_tx.clone();
+                        // ZEB-815: our OWN reachability row used to reach the UI
+                        // the same way a peer's did — mint an announce, insert
+                        // it, let the delta arm fire both signals. Keeping that
+                        // parity means signalling here too, off what
+                        // `publish_own_rows` reports it applied.
+                        let addrbook_observer_for_pub =
+                            std::sync::Arc::clone(&addrbook_ingest_observer);
                         let publish_fn: crate::reachability_publisher::PublishFn =
                             std::sync::Arc::new(move || {
                                 // Per-invocation clones — the closure is
@@ -8515,6 +8585,8 @@ pub async fn start_node_inner(
                                 let addrbook_crr = std::sync::Arc::clone(&addrbook_crr_for_pub);
                                 let addrbook_dirty = addrbook_dirty_for_pub.clone();
                                 let addrbook_publish_tx = addrbook_publish_tx_for_pub.clone();
+                                let addrbook_observer =
+                                    std::sync::Arc::clone(&addrbook_observer_for_pub);
                                 Box::pin(async move {
                                     // 1. Snapshot iroh state ONCE.
                                     let node_id_bytes: [u8; 32] = *ep.node_id().as_bytes();
@@ -8784,7 +8856,7 @@ pub async fn start_node_inner(
                                             move |c: &crate::owner_state_types::SpaceId| {
                                                 addrbook_keys.get(c).cloned()
                                             };
-                                        crate::address_book_sync::publish_own_rows(
+                                        let applied = crate::address_book_sync::publish_own_rows(
                                             &key_fn,
                                             &addrbook_book,
                                             &addrbook_rr,
@@ -8794,6 +8866,12 @@ pub async fn start_node_inner(
                                             &addrbook_dirty,
                                         )
                                         .await;
+                                        // Parity with the pre-flag-day path: our
+                                        // own announce landing in the resolver
+                                        // refreshed the panels too.
+                                        if !applied.is_empty() {
+                                            addrbook_observer.reachability_applied(&applied);
+                                        }
                                     }
 
                                     // ── ZEB-371: reconcile Case-D friend slots ──
@@ -10894,6 +10972,16 @@ pub async fn start_node_inner(
                                                         move |c: &crate::owner_state_types::SpaceId| {
                                                             addrbook_keys.get(c).cloned()
                                                         };
+                                                    // ZEB-815: no UI signal here.
+                                                    // These rows are Relay-kind, and
+                                                    // the CommunityRelayAnnounce delta
+                                                    // arm this replaced deliberately
+                                                    // fired neither the Network-Health
+                                                    // notify nor the Tauri emit — a
+                                                    // relay ad is not a
+                                                    // connectivity-panel input. The
+                                                    // returned set is empty for the
+                                                    // same reason.
                                                     crate::address_book_sync::publish_own_rows(
                                                         &key_fn,
                                                         &addrbook_book,
@@ -11390,6 +11478,7 @@ pub async fn start_node_inner(
                         community_relay_resolver: crr,
                         identity_dir: identity_dir.clone(),
                         dirty_hub: addrbook_dirty_hub.clone(),
+                        ingest_observer: Some(std::sync::Arc::clone(&addrbook_ingest_observer)),
                     }
                 });
                 // Mint Phase 2 sync: thread handles into event_loop::run.

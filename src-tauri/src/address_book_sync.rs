@@ -16,12 +16,12 @@ use crate::community_membership::ChannelId;
 use crate::community_relay_resolver::CommunityRelayResolver;
 use crate::community_state_sync::CommunitySyncRegistry;
 use crate::iroh_friend_acceptor::wall_now_ms;
-use crate::owner_state_types::{EpochKey, SpaceId};
+use crate::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 use crate::reachability_resolver::ReachabilityResolver;
 use crate::voice_crypto::{decrypt_voice_packet, encrypt_voice_packet};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -211,6 +211,97 @@ pub fn ingest_verified_row(
     IngestOutcome::Applied(outcome)
 }
 
+/// What one ingested packet (or query round) did: the per-row outcomes, plus
+/// the set of actors whose REACHABILITY records it materially added or
+/// refreshed.
+///
+/// The actor set exists because the two UI signals the routing tables owe the
+/// frontend are per-actor, and `IngestOutcome` alone cannot say WHOSE record
+/// landed. Reachability only: the `CommunityRelayAnnounce` delta arm this
+/// path replaced deliberately fired neither signal (relay ads are not a
+/// connectivity-panel input), so relay rows contribute nothing here.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IngestBatch {
+    pub outcomes: Vec<IngestOutcome>,
+    pub reachability_actors: BTreeSet<OwnerAddr>,
+}
+
+impl IngestBatch {
+    fn malformed() -> Self {
+        Self {
+            outcomes: vec![IngestOutcome::Malformed],
+            reachability_actors: BTreeSet::new(),
+        }
+    }
+
+    /// Did this batch materially change the book? Only `Inserted` /
+    /// `Replaced` did — an `IgnoredOlder`/`IgnoredCapped`/rejected row leaves
+    /// the store byte-identical, so neither the sidecar nor a re-persist is
+    /// warranted.
+    pub fn changed_book(&self) -> bool {
+        self.outcomes.iter().any(|o| {
+            matches!(
+                o,
+                IngestOutcome::Applied(UpsertOutcome::Inserted | UpsertOutcome::Replaced)
+            )
+        })
+    }
+}
+
+/// Notified when ingest materially adds or refreshes reachability records —
+/// the seam that carries the two UI signals the `ReachabilityAnnounce` delta
+/// arm used to fire before ZEB-815 moved routing data off the membership CRDT:
+/// a Network-Health notify (drives `ConnectionStatusChip` / `NetworkHealthView`
+/// without polling) and one `connectivity-reachability-changed` Tauri event per
+/// distinct actor (drives `DiagnosticsPanel`).
+///
+/// A trait rather than a concrete type so this module stays free of both
+/// `network_health` and `tauri` — its unit tests construct ingest paths with no
+/// UI stack at all. Every consumer takes it as an `Option`, so the headless
+/// `serve` construction and those tests simply pass `None`.
+///
+/// Implementations must not block: they are called inline on the ingest task.
+/// The production implementation only fires an mpsc send and a fire-and-forget
+/// emit, both synchronous.
+pub trait AddrbookIngestObserver: Send + Sync + 'static {
+    fn reachability_applied(&self, actors: &BTreeSet<OwnerAddr>);
+}
+
+/// Does an ingested row owe the reachability UI signals? BOTH facts must hold:
+///
+/// * the row is a Reachability row — the `CommunityRelayAnnounce` delta arm
+///   this path replaced deliberately fired neither signal, so relay rows still
+///   fire nothing; and
+/// * the store materially changed (`Inserted`/`Replaced`) — an `IgnoredOlder`,
+///   `IgnoredCapped`, or rejected row leaves every routing table byte-identical,
+///   and signalling on one would wake the panels to re-read state that did not
+///   move.
+///
+/// Shared by both ingest paths so the two cannot drift; taking the kind as a
+/// bool because the caller must read it off the row before `ingest_verified_row`
+/// consumes it.
+fn signals_reachability(row_is_reachability: bool, outcome: IngestOutcome) -> bool {
+    row_is_reachability
+        && matches!(
+            outcome,
+            IngestOutcome::Applied(UpsertOutcome::Inserted | UpsertOutcome::Replaced)
+        )
+}
+
+/// Fire `observer` for a non-empty actor set. Centralised so the empty-set
+/// skip is stated once rather than at each of the call sites.
+fn notify_reachability(
+    observer: Option<&Arc<dyn AddrbookIngestObserver>>,
+    actors: &BTreeSet<OwnerAddr>,
+) {
+    if actors.is_empty() {
+        return;
+    }
+    if let Some(obs) = observer {
+        obs.reachability_applied(actors);
+    }
+}
+
 /// Async wrapper: unseal `packet` under the community's current membership
 /// key, then per-row gate on live membership before dispatching to
 /// [`ingest_verified_row`]. Used by the event-loop wiring (Tasks 5/6).
@@ -227,17 +318,20 @@ pub async fn ingest_sealed_packet(
     community: SpaceId,
     packet: &[u8],
     now_ms: u64,
-) -> Vec<IngestOutcome> {
+) -> IngestBatch {
     let Some(engine) = registry.engine_arc(&community).await else {
-        return vec![IngestOutcome::Malformed];
+        return IngestBatch::malformed();
     };
     let mk = engine.membership_key();
     let key = derive_addrbook_key(&mk, &community);
     let Some(rows) = open_records(&key, &community, packet) else {
-        return vec![IngestOutcome::Malformed];
+        return IngestBatch::malformed();
     };
 
-    let mut outcomes = Vec::with_capacity(rows.len());
+    let mut batch = IngestBatch {
+        outcomes: Vec::with_capacity(rows.len()),
+        reachability_actors: BTreeSet::new(),
+    };
     for row in rows {
         let is_member = crate::voice_presence::beacon_signer_is_member(
             registry,
@@ -247,31 +341,25 @@ pub async fn ingest_sealed_packet(
         )
         .await;
         if !is_member {
-            outcomes.push(IngestOutcome::NotMember);
+            batch.outcomes.push(IngestOutcome::NotMember);
             continue;
         }
-        outcomes.push(ingest_verified_row(
+        let actor = row.actor;
+        let is_reachability = matches!(row.entry, AddressBookEntry::Reachability(_));
+        let outcome = ingest_verified_row(
             book,
             reachability_resolver,
             community_relay_resolver,
             community,
             row,
             now_ms,
-        ));
+        );
+        if signals_reachability(is_reachability, outcome) {
+            batch.reachability_actors.insert(actor);
+        }
+        batch.outcomes.push(outcome);
     }
-    outcomes
-}
-
-/// Did this batch of outcomes materially change the book? Only `Inserted` /
-/// `Replaced` did — an `IgnoredOlder`/`IgnoredCapped`/rejected row leaves the
-/// store byte-identical, so neither the sidecar nor a re-persist is warranted.
-fn batch_changed_book(outcomes: &[IngestOutcome]) -> bool {
-    outcomes.iter().any(|o| {
-        matches!(
-            o,
-            IngestOutcome::Applied(UpsertOutcome::Inserted | UpsertOutcome::Replaced)
-        )
-    })
+    batch
 }
 
 // ── ZEB-815 Task 5: per-community sync tasks ────────────────────────
@@ -386,6 +474,12 @@ impl AddrbookDirtyHub {
 /// Every failure is per-row: one community's missing key, failed seal, or
 /// closed publish channel must not stop the other communities' rows — the same
 /// per-community `continue` discipline as the publish loops this replaces.
+///
+/// Returns the actors whose reachability records this call materially applied
+/// (in practice: ourselves, once, if any of our own reachability rows landed).
+/// The caller — not this function — feeds an [`AddrbookIngestObserver`],
+/// because unlike the two spawned ingest loops this one is awaited by a caller
+/// that already holds the observer, so returning is cheaper than injecting.
 pub async fn publish_own_rows(
     key_fn: &(dyn Fn(&SpaceId) -> Option<ChannelKey> + Send + Sync),
     book: &CommunityAddressBook,
@@ -394,10 +488,17 @@ pub async fn publish_own_rows(
     publish_tx: &tokio::sync::mpsc::Sender<crate::event_loop::PublishRequest>,
     rows: Vec<(SpaceId, AddressBookRow)>,
     dirty: &AddrbookDirtyHub,
-) {
+) -> BTreeSet<OwnerAddr> {
+    let mut applied_reachability: BTreeSet<OwnerAddr> = BTreeSet::new();
     for (community, row) in rows {
         let community_hex = hex::encode(&community.0[..4]);
-        match ingest_verified_row(book, rr, crr, community, row.clone(), wall_now_ms()) {
+        let actor = row.actor;
+        let is_reachability = matches!(row.entry, AddressBookEntry::Reachability(_));
+        let outcome = ingest_verified_row(book, rr, crr, community, row.clone(), wall_now_ms());
+        if signals_reachability(is_reachability, outcome) {
+            applied_reachability.insert(actor);
+        }
+        match outcome {
             IngestOutcome::Applied(UpsertOutcome::Inserted | UpsertOutcome::Replaced) => {
                 dirty.handle(community.0).notify_one();
             }
@@ -466,6 +567,7 @@ pub async fn publish_own_rows(
             ),
         }
     }
+    applied_reachability
 }
 
 /// Live-record subscriber: every sealed packet on
@@ -478,6 +580,7 @@ pub async fn publish_own_rows(
 /// `session.clone()`), matching
 /// [`crate::community_presence::spawn_community_presence_subscriber`], whose
 /// declare-inside-the-task shape this mirrors.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_addrbook_subscriber(
     session: zenoh::Session,
     registry: Arc<CommunitySyncRegistry>,
@@ -486,6 +589,7 @@ pub fn spawn_addrbook_subscriber(
     crr: Arc<CommunityRelayResolver>,
     community: SpaceId,
     dirty: Arc<Notify>,
+    observer: Option<Arc<dyn AddrbookIngestObserver>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let topic = addrbook_records_topic(&community);
@@ -509,7 +613,7 @@ pub fn spawn_addrbook_subscriber(
                 continue;
             }
             let bytes = sample.payload().to_bytes().to_vec();
-            let outcomes = ingest_sealed_packet(
+            let batch = ingest_sealed_packet(
                 &registry,
                 &book,
                 &rr,
@@ -519,9 +623,15 @@ pub fn spawn_addrbook_subscriber(
                 wall_now_ms(),
             )
             .await;
-            if batch_changed_book(&outcomes) {
+            if batch.changed_book() {
                 dirty.notify_one();
             }
+            // ZEB-815: a peer's routing record just landed — refresh the UI
+            // exactly as the ReachabilityAnnounce delta arm did. Per packet
+            // rather than per row: the observer's Network-Health notify is
+            // internally rate-limited, and the Tauri emit is per distinct
+            // actor, which is what the packet's actor set already is.
+            notify_reachability(observer.as_ref(), &batch.reachability_actors);
         }
     })
 }
@@ -622,6 +732,7 @@ async fn request_snapshot_once(
     crr: &CommunityRelayResolver,
     community: SpaceId,
     dirty: &Notify,
+    observer: Option<&Arc<dyn AddrbookIngestObserver>>,
 ) {
     let community_hex = hex::encode(community.0);
     // Mirrors the channel-log/voting backfill requester's get shape:
@@ -649,6 +760,10 @@ async fn request_snapshot_once(
 
     let mut responders = 0usize;
     let mut changed = false;
+    // Unioned across every responder so one query round produces ONE
+    // Network-Health notify and one Tauri emit per distinct actor, however
+    // many peers answered with the same peer's record.
+    let mut applied_reachability: BTreeSet<OwnerAddr> = BTreeSet::new();
     let drain = async {
         while let Ok(reply) = replies.recv_async().await {
             match reply.result() {
@@ -664,7 +779,7 @@ async fn request_snapshot_once(
                         continue;
                     }
                     let bytes = sample.payload().to_bytes().to_vec();
-                    let outcomes = ingest_sealed_packet(
+                    let batch = ingest_sealed_packet(
                         registry,
                         book,
                         rr,
@@ -674,7 +789,8 @@ async fn request_snapshot_once(
                         wall_now_ms(),
                     )
                     .await;
-                    changed |= batch_changed_book(&outcomes);
+                    changed |= batch.changed_book();
+                    applied_reachability.extend(batch.reachability_actors);
                 }
                 Err(err) => {
                     let msg = String::from_utf8_lossy(&err.payload().to_bytes()).into_owned();
@@ -712,6 +828,10 @@ async fn request_snapshot_once(
     if changed {
         dirty.notify_one();
     }
+    // ZEB-815: catch-up is the other path a peer's routing record can first
+    // reach us on (join, resubscribe, reconnect), so it owes the same UI
+    // refresh the live subscriber does.
+    notify_reachability(observer, &applied_reachability);
 }
 
 /// Snapshot requester (the catch-up side): fire one query immediately on
@@ -740,6 +860,7 @@ pub fn spawn_addrbook_snapshot_requester(
     community: SpaceId,
     resync: Arc<Notify>,
     dirty: Arc<Notify>,
+    observer: Option<Arc<dyn AddrbookIngestObserver>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let topic = addrbook_snapshot_topic(&community);
@@ -751,7 +872,15 @@ pub fn spawn_addrbook_snapshot_requester(
 
         let mut last_fire_ms = wall_now_ms();
         request_snapshot_once(
-            &session, &topic, &registry, &book, &rr, &crr, community, &dirty,
+            &session,
+            &topic,
+            &registry,
+            &book,
+            &rr,
+            &crr,
+            community,
+            &dirty,
+            observer.as_ref(),
         )
         .await;
 
@@ -774,7 +903,15 @@ pub fn spawn_addrbook_snapshot_requester(
             tokio::time::sleep(Duration::from_millis(jitter_ms(rand::random::<u64>()))).await;
             last_fire_ms = wall_now_ms();
             request_snapshot_once(
-                &session, &topic, &registry, &book, &rr, &crr, community, &dirty,
+                &session,
+                &topic,
+                &registry,
+                &book,
+                &rr,
+                &crr,
+                community,
+                &dirty,
+                observer.as_ref(),
             )
             .await;
         }
@@ -1322,6 +1459,257 @@ mod tests {
         // The bystander is untouched throughout.
         assert!(s.book_actors(&community_a, ts).contains(&bystander));
         assert!(!s.reach.resolve(&bystander).is_empty());
+    }
+
+    // ── Task 7 fix round: UI-signal seam ────────────────────────────
+
+    /// Records what the ingest paths hand the observer, standing in for the
+    /// production `ReachabilityUiSignals` (which needs a NetworkHealthService
+    /// and a Tauri sink neither this module nor its tests have).
+    #[derive(Default)]
+    struct RecordingObserver {
+        calls: std::sync::Mutex<Vec<BTreeSet<OwnerAddr>>>,
+    }
+
+    impl RecordingObserver {
+        fn calls(&self) -> Vec<BTreeSet<OwnerAddr>> {
+            self.calls.lock().expect("observer mutex poisoned").clone()
+        }
+    }
+
+    impl AddrbookIngestObserver for RecordingObserver {
+        fn reachability_applied(&self, actors: &BTreeSet<OwnerAddr>) {
+            self.calls
+                .lock()
+                .expect("observer mutex poisoned")
+                .push(actors.clone());
+        }
+    }
+
+    /// The signal seam, pinned without a UI stack: a batch that materially
+    /// applies a REACHABILITY row must surface that row's actor, so the
+    /// observer can fire the Network-Health notify and the per-actor
+    /// `connectivity-reachability-changed` emit the delta arm used to.
+    ///
+    /// Covers the three ways a batch must NOT signal, each of which was a live
+    /// regression risk when this seam was added: a relay row (the old relay arm
+    /// fired nothing), a row the store ignored as older (nothing materially
+    /// changed), and a row that failed signature verification.
+    #[test]
+    fn applied_reachability_rows_surface_actors_to_the_observer() {
+        let community = SpaceId([0xC7; 16]);
+        let ts = 1_700_000_000_000u64;
+        let s = Sinks::new();
+
+        let alice_sk = ed25519_dalek::SigningKey::from_bytes(&[0x61; 32]);
+        let bob_sk = ed25519_dalek::SigningKey::from_bytes(&[0x62; 32]);
+        let alice = OwnerAddr([0x61; 16]);
+        let bob = OwnerAddr([0x62; 16]);
+
+        // Two members' reachability rows plus one relay row, ingested the way
+        // a sealed packet's rows are — one at a time through the same gate.
+        let mut batch = IngestBatch::default();
+        for (actor, sk, node) in [
+            (alice, &alice_sk, [0x01; 32]),
+            (bob, &bob_sk, [0x02; 32]),
+            // Alice again on a second device: same actor, distinct key, so the
+            // SET collapses it to one emit while the book keeps both rows.
+            (alice, &alice_sk, [0x03; 32]),
+        ] {
+            s.seed_reach(community, actor, sk, node, ts);
+            batch.reachability_actors.insert(actor);
+        }
+        assert_eq!(
+            batch.reachability_actors,
+            BTreeSet::from([alice, bob]),
+            "two distinct actors across three applied rows"
+        );
+
+        let observer = Arc::new(RecordingObserver::default());
+        let as_dyn: Arc<dyn AddrbookIngestObserver> = observer.clone();
+        notify_reachability(Some(&as_dyn), &batch.reachability_actors);
+        assert_eq!(
+            observer.calls(),
+            vec![BTreeSet::from([alice, bob])],
+            "one call carrying every distinct actor whose record landed"
+        );
+
+        // An empty set never reaches the observer — no signal is owed when
+        // nothing was applied, and firing one would wake the panels for free.
+        notify_reachability(Some(&as_dyn), &BTreeSet::new());
+        assert_eq!(observer.calls().len(), 1, "empty set is not a signal");
+
+        // A `None` observer is the headless / unit-test construction and must
+        // be a silent no-op, not a panic.
+        notify_reachability(None, &batch.reachability_actors);
+    }
+
+    /// The signal classification itself, driven with outcomes that
+    /// `ingest_verified_row` really produced rather than hand-written ones —
+    /// so flipping either half of `signals_reachability` (the kind check or the
+    /// materially-changed check) fails here.
+    ///
+    /// This is the seam a unit test can reach: `ingest_sealed_packet`'s own
+    /// classification calls the same predicate, but reaching IT needs a live
+    /// registry + engine, which is the integration harness's job.
+    #[test]
+    fn relay_stale_and_bad_rows_contribute_no_reachability_actors() {
+        let community = SpaceId([0xC8; 16]);
+        let ts = 1_700_000_000_000u64;
+        let s = Sinks::new();
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let vk = sk.verifying_key();
+        let actor = OwnerAddr([0x71; 16]);
+
+        // (a) Relay kind: applies to the book, signals nothing.
+        s.seed_relay(community, actor, &sk, [0xD7; 16], ts);
+        let relay_entry = CommunityRelayEntry {
+            relay_device_id: [0xD8; 16],
+            iroh_endpoint_id: [0x55; 32],
+            relay_device_ed25519_verify: vk.to_bytes(),
+            home_relay: "https://r.example/".into(),
+        };
+        let relay_payload =
+            build_signed_community_relay_announce(relay_entry, ts, &actor, &hlc(ts), &sk)
+                .expect("build signed relay payload");
+        let relay_outcome = ingest_verified_row(
+            &s.book,
+            &s.reach,
+            &s.relay,
+            community,
+            AddressBookRow {
+                entry: AddressBookEntry::Relay(relay_payload),
+                actor,
+                device: vk.to_bytes(),
+                at: hlc(ts),
+                stamped_at_ms: ts,
+            },
+            ts,
+        );
+        assert_eq!(
+            relay_outcome,
+            IngestOutcome::Applied(UpsertOutcome::Inserted),
+            "the relay row DID apply — it just owes no UI signal"
+        );
+        assert!(
+            !signals_reachability(false, relay_outcome),
+            "an applied relay row signals nothing"
+        );
+
+        // (b) Same reachability key re-ingested with an OLDER stamp: the store
+        //     returns IgnoredOlder, so nothing materially changed.
+        let node_id = [0x11; 32];
+        s.seed_reach(community, actor, &sk, node_id, ts);
+        let older = ts - 5_000;
+        let at_older = hlc(older);
+        let stale_payload = build_signed_payload_with_key(
+            node_id,
+            "https://derp.example/".into(),
+            vec![],
+            older,
+            &actor,
+            &at_older,
+            Vec::new(),
+            0,
+            &sk,
+        )
+        .expect("build signed reachability payload");
+        let stale_outcome = ingest_verified_row(
+            &s.book,
+            &s.reach,
+            &s.relay,
+            community,
+            AddressBookRow {
+                entry: AddressBookEntry::Reachability(stale_payload),
+                actor,
+                device: vk.to_bytes(),
+                at: at_older,
+                stamped_at_ms: older,
+            },
+            ts,
+        );
+        assert_eq!(
+            stale_outcome,
+            IngestOutcome::Applied(UpsertOutcome::IgnoredOlder)
+        );
+        assert!(
+            !signals_reachability(true, stale_outcome),
+            "a reachability row the store ignored as older signals nothing"
+        );
+
+        // (c) Corrupt signature: rejected before the store.
+        let mut bad_payload = build_signed_payload_with_key(
+            [0x22; 32],
+            "https://derp.example/".into(),
+            vec![],
+            ts,
+            &actor,
+            &hlc(ts),
+            Vec::new(),
+            0,
+            &sk,
+        )
+        .expect("build signed reachability payload");
+        bad_payload.identity_signature[0] ^= 0xFF;
+        let bad_outcome = ingest_verified_row(
+            &s.book,
+            &s.reach,
+            &s.relay,
+            community,
+            AddressBookRow {
+                entry: AddressBookEntry::Reachability(bad_payload),
+                actor,
+                device: vk.to_bytes(),
+                at: hlc(ts),
+                stamped_at_ms: ts,
+            },
+            ts,
+        );
+        assert_eq!(bad_outcome, IngestOutcome::BadSignature);
+        assert!(
+            !signals_reachability(true, bad_outcome),
+            "a rejected reachability row signals nothing"
+        );
+
+        // The positive control, so the three negatives above cannot pass by a
+        // predicate that simply always returns false: the FRESH reachability
+        // row seeded in (b) did signal.
+        let fresh_outcome = ingest_verified_row(
+            &s.book,
+            &s.reach,
+            &s.relay,
+            community,
+            AddressBookRow {
+                entry: AddressBookEntry::Reachability(
+                    build_signed_payload_with_key(
+                        [0x33; 32],
+                        "https://derp.example/".into(),
+                        vec![],
+                        ts,
+                        &actor,
+                        &hlc(ts),
+                        Vec::new(),
+                        0,
+                        &sk,
+                    )
+                    .expect("build signed reachability payload"),
+                ),
+                actor,
+                device: vk.to_bytes(),
+                at: hlc(ts),
+                stamped_at_ms: ts,
+            },
+            ts,
+        );
+        assert_eq!(
+            fresh_outcome,
+            IngestOutcome::Applied(UpsertOutcome::Inserted)
+        );
+        assert!(
+            signals_reachability(true, fresh_outcome),
+            "a freshly-applied reachability row DOES signal"
+        );
     }
 
     // ── Task 5: sync-task decision cores ────────────────────────────

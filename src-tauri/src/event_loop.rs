@@ -509,6 +509,13 @@ pub struct AddressBookRuntime {
     /// outside this pool entirely, and a pool-local `Notify` would leave that
     /// change unpersisted until a peer echoed it back.
     pub dirty_hub: crate::address_book_sync::AddrbookDirtyHub,
+    /// ZEB-815: UI-signal seam for remote reachability additions — the
+    /// Network-Health notify + `connectivity-reachability-changed` emit the
+    /// `ReachabilityAnnounce` delta arm fired before routing data moved off the
+    /// membership CRDT. `None` leaves both signals unfired, which is correct for
+    /// callers with no UI stack (unit tests, and any construction that bypasses
+    /// `start_node`).
+    pub ingest_observer: Option<Arc<dyn crate::address_book_sync::AddrbookIngestObserver>>,
 }
 
 /// Events bridged from spawned Zenoh tasks back to the main select loop.
@@ -4245,6 +4252,7 @@ pub async fn run(
             community_relay_resolver,
             identity_dir,
             dirty_hub,
+            ingest_observer,
         } = addrbook;
         tokio::spawn(async move {
             use std::collections::HashMap;
@@ -4329,6 +4337,7 @@ pub async fn run(
                             std::sync::Arc::clone(&community_relay_resolver),
                             community,
                             std::sync::Arc::clone(&dirty),
+                            ingest_observer.clone(),
                         );
                         let requester_handle =
                             crate::address_book_sync::spawn_addrbook_snapshot_requester(
@@ -4340,6 +4349,7 @@ pub async fn run(
                                 community,
                                 resync,
                                 std::sync::Arc::clone(&dirty),
+                                ingest_observer.clone(),
                             );
                         let persist_handle = crate::address_book_sync::spawn_addrbook_persist_task(
                             std::sync::Arc::clone(&book),
