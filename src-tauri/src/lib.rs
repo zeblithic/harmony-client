@@ -19587,18 +19587,25 @@ pub(crate) fn set_vine_settings_impl(
     // AFTER this assignment so a settings-load race never observes the
     // old value.
     guard.vine_share_publicly = share_vines_publicly;
-    // ZEB-811 Task 4: live toggle the case-E vines relay publication.
-    // Detached (not awaited) — this fn is sync and holds the guard; the
-    // spawned task runs to completion independent of this call's return.
-    // No-op when no node is running (`pkarr_vines_publisher` is `None`).
+    // ZEB-811 Task 4 / round 2 review fix (Greptile P1): live toggle the
+    // case-E vines relay publication. `set_desired_share` writes the
+    // shared gate SYNCHRONOUSLY — before the detached task below is even
+    // spawned — so (a) local serving reflects the new setting immediately
+    // (the same atomic backs `ProdVineRelayServeCtx::share_gate`), and (b)
+    // two rapid toggles always apply their synchronous writes in true call
+    // order (both happen under this fn's `state.lock()`), so whichever
+    // detached `reconcile()` task's network I/O finishes last, it still
+    // converges on the LATEST setting rather than whatever value its own
+    // call captured — see `PkarrVinesPublisher::reconcile`'s doc comment
+    // for the full race analysis. The spawned task itself is detached (not
+    // awaited) — this fn is sync and holds the guard; it runs to
+    // completion independent of this call's return. No-op when no node is
+    // running (`pkarr_vines_publisher` is `None`).
     if publicly_changed {
         if let Some(vp) = guard.pkarr_vines_publisher.clone() {
+            vp.set_desired_share(share_vines_publicly);
             tokio::spawn(async move {
-                if share_vines_publicly {
-                    vp.enable().await;
-                } else {
-                    vp.disable().await;
-                }
+                vp.reconcile().await;
             });
         }
     }

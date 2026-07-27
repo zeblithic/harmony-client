@@ -97,12 +97,25 @@ pub struct PkarrVinesPublisher {
     /// `None` when no iroh endpoint is up (degraded boot) — nothing dialable
     /// to advertise, so the gate never passes regardless of settings/vines.
     endpoint: Option<Arc<IrohEndpoint>>,
-    /// Mirrors `NodeState.vine_share_publicly`; kept in sync by `enable`/
-    /// `disable` (called from `set_vine_settings_impl`'s detached toggle)
-    /// and re-read fresh on every publish tick so a settings flip that
-    /// races an in-flight publish still degrades gracefully.
+    /// Mirrors `NodeState.vine_share_publicly` — and IS the exact same
+    /// atomic `ProdVineRelayServeCtx::share_gate` reads live on every
+    /// anonymous relay request (wired up at construction in `lib.rs`).
+    /// Round 2 fix (Greptile P1): `set_desired_share` writes this
+    /// SYNCHRONOUSLY from `set_vine_settings_impl`, before the detached
+    /// `reconcile()` task is even spawned — so local serving reflects a
+    /// settings toggle immediately, and `reconcile` (which re-reads this
+    /// value fresh at execution time, never a captured parameter) always
+    /// converges on the latest desired value no matter which detached
+    /// reconcile task happens to finish its network I/O last. See
+    /// `reconcile`'s doc comment for the full race analysis.
     share: Arc<AtomicBool>,
     has_own_vines: Arc<dyn Fn() -> usize + Send + Sync>,
+    /// Serializes `reconcile()` bodies. Without this, two detached
+    /// settings-toggle tasks (or a toggle racing the post-publish
+    /// `republish` hook) could interleave their `PkarrPublisher::register`/
+    /// `unregister` calls and leave the DHT publication inconsistent with
+    /// the (already-correct) `share` atomic — Greptile P1, ZEB-811 round 2.
+    reconcile_lock: tokio::sync::Mutex<()>,
 }
 
 impl PkarrVinesPublisher {
@@ -124,65 +137,75 @@ impl PkarrVinesPublisher {
             endpoint,
             share,
             has_own_vines,
+            reconcile_lock: tokio::sync::Mutex::new(()),
         }
     }
 
-    /// Mark sharing on and (re-)register iff the gate passes (own vine
-    /// count > 0). Called at boot when the loaded setting is true, and from
-    /// `set_vine_settings_impl` when the user flips the toggle on.
+    /// Mark sharing on and reconcile. Safe to use as a single-shot call
+    /// (e.g. at boot, from the loaded setting) where there is no concurrent
+    /// settings toggle to race — `set_vine_settings_impl` (the seam that
+    /// DOES race) calls `set_desired_share` + `reconcile` directly instead,
+    /// so the synchronous atomic write happens before ANY detached task is
+    /// spawned; see those methods' doc comments.
     pub async fn enable(&self) {
-        self.share.store(true, Ordering::Relaxed);
-        self.sync_registration().await;
+        self.set_desired_share(true);
+        self.reconcile().await;
     }
 
-    /// Mark sharing off. `unregister` alone only stops FUTURE republishing —
-    /// it does not withdraw a record already sitting on the DHT, so the last
-    /// positive relay-set would otherwise stay discoverable for up to its
-    /// 7-day TTL after the user disables sharing. If the handle is currently
-    /// registered (there is something to retract), replace its content with
-    /// the explicit empty-`relay_set` retraction instead: re-registering
-    /// schedules an immediate publish tick (`PkarrPublisher::register`'s doc
-    /// comment) and leaves the handle registered afterward, since
-    /// unregistering right after would race that in-flight publish's
-    /// `cancelled` check and could cancel it before the PUT executes.
-    /// `enable`/`republish` overwrite this with real content again on the
-    /// next toggle. If nothing was ever registered, this is a safe no-op
-    /// (nothing to retract), matching the prior behavior. Called from
-    /// `set_vine_settings_impl` when the user flips the toggle off.
+    /// Mark sharing off and reconcile — see `enable`'s doc comment for the
+    /// single-shot-caller caveat.
     pub async fn disable(&self) {
-        self.share.store(false, Ordering::Relaxed);
+        self.set_desired_share(false);
+        self.reconcile().await;
+    }
 
-        if !self
-            .publisher
-            .active_handles()
-            .await
-            .contains(&HANDLE.to_string())
-        {
-            return;
-        }
+    /// Write the desired share-publicly value to the shared atomic
+    /// SYNCHRONOUSLY (no `.await`). This is the SAME `Arc<AtomicBool>`
+    /// `ProdVineRelayServeCtx::share_gate` reads live on every anonymous
+    /// relay request, so a toggle takes effect for local SERVING
+    /// immediately — before `reconcile`'s (network-bound) pkarr
+    /// publish/retract has even started, let alone finished.
+    ///
+    /// This is also the linchpin of `reconcile`'s race-freedom (ZEB-811
+    /// round 2, Greptile P1): `set_vine_settings_impl` calls this
+    /// synchronously, then spawns a detached `reconcile()` task. Two rapid
+    /// settings calls therefore always apply their `set_desired_share`
+    /// writes in true call order (both happen under `NodeState`'s mutex,
+    /// never interleaved) — so by the time EITHER detached reconcile task
+    /// starts running, `share` already holds the FINAL desired value, no
+    /// matter which task was spawned first or which one's network I/O
+    /// happens to finish last.
+    pub fn set_desired_share(&self, desired: bool) {
+        self.share.store(desired, Ordering::Relaxed);
+    }
 
-        let id_sk = self.identity_signing_key.clone();
-        let id_pub = self.identity_pub;
-        let record_builder: RecordBuilder = Arc::new(move |at_ms| {
-            PkarrRoutingRecord::sign_new(
-                build_retraction_blob(at_ms),
-                id_pub,
-                at_ms,
-                at_ms + REACHABILITY_RECORD_TTL_MS,
-                &id_sk,
-            )
-            .expect("sign — fixed-size buffers should not fail")
-        });
-
-        self.publisher
-            .register(HANDLE.to_string(), self.key_builder(), record_builder)
-            .await;
+    /// Re-evaluate the gate against the CURRENT `share` flag (re-read
+    /// HERE — under the lock, at execution time — never a value captured
+    /// when a caller's task was spawned) and own vine count, and
+    /// register/retract/unregister accordingly. Serialized by
+    /// `reconcile_lock`: two detached settings-toggle tasks (or a toggle
+    /// racing the post-publish `republish` hook) can therefore never
+    /// interleave their `PkarrPublisher::register`/`unregister` calls.
+    ///
+    /// Why this is race-free regardless of task ordering: `set_desired_share`
+    /// always completes synchronously before its caller spawns a
+    /// `reconcile()` task, so by the time ANY reconcile body runs, `share`
+    /// already holds the latest setting. Whichever reconcile happens to
+    /// acquire `reconcile_lock` FIRST applies that (already-correct) value;
+    /// every subsequent reconcile — including one spawned earlier but
+    /// scheduled later — reads the SAME value and reapplies it redundantly
+    /// (idempotent, harmless). The convergent outcome depends only on the
+    /// latest `set_desired_share` call, never on which task's network I/O
+    /// happens to finish last.
+    pub async fn reconcile(&self) {
+        let _guard = self.reconcile_lock.lock().await;
+        self.reconcile_locked().await;
     }
 
     /// Shared ephemeral-key builder: derives the current epoch's vines slot
     /// key from this device's own address. Used by both the real-content
-    /// path (`sync_registration`) and the retraction path (`disable`) so the
-    /// retraction lands under the exact same slot it's withdrawing.
+    /// and retraction paths inside `reconcile_locked` so the retraction
+    /// lands under the exact same slot it's withdrawing.
     fn key_builder(&self) -> EphemeralKeyBuilder {
         let own_addr_for_key = self.own_addr_hex.clone();
         Arc::new(move |at_ms| {
@@ -201,10 +224,12 @@ impl PkarrVinesPublisher {
     /// cheap no-op (replaces the map entry with an equivalent one and wakes
     /// the core publish loop early — `publisher.rs:97`).
     pub async fn republish(&self) {
-        self.sync_registration().await;
+        self.reconcile().await;
     }
 
-    async fn sync_registration(&self) {
+    /// The actual reconcile body — only ever called with `reconcile_lock`
+    /// held (via `reconcile`). Never call this directly.
+    async fn reconcile_locked(&self) {
         let Some(endpoint) = self.endpoint.clone() else {
             self.publisher.unregister(HANDLE).await;
             return;
@@ -218,31 +243,67 @@ impl PkarrVinesPublisher {
         let share = self.share.load(Ordering::Relaxed);
         let own_vine_count = (self.has_own_vines)();
 
-        if build_blob(share, own_vine_count, endpoint_id, home_relay, now_ms).is_none() {
-            self.publisher.unregister(HANDLE).await;
+        if build_blob(share, own_vine_count, endpoint_id, home_relay, now_ms).is_some() {
+            let id_sk = self.identity_signing_key.clone();
+            let id_pub = self.identity_pub;
+            let endpoint_for_builder = Arc::clone(&endpoint);
+            let share_flag = Arc::clone(&self.share);
+            let has_own_vines = Arc::clone(&self.has_own_vines);
+            let record_builder: RecordBuilder = Arc::new(move |at_ms| {
+                // Fresh read on EVERY publish (never boot-frozen — ZEB-521):
+                // a home relay captured once at register time would go
+                // stale for the life of the process.
+                let endpoint_id = *endpoint_for_builder.node_id().as_bytes();
+                let home_relay = endpoint_for_builder
+                    .home_relay()
+                    .map(|r| r.to_string())
+                    .unwrap_or_default();
+                let share = share_flag.load(Ordering::Relaxed);
+                let own_vine_count = has_own_vines();
+                let blob =
+                    build_blob_or_retraction(share, own_vine_count, endpoint_id, home_relay, at_ms);
+                PkarrRoutingRecord::sign_new(
+                    blob,
+                    id_pub,
+                    at_ms,
+                    at_ms + REACHABILITY_RECORD_TTL_MS,
+                    &id_sk,
+                )
+                .expect("sign — fixed-size buffers should not fail")
+            });
+
+            self.publisher
+                .register(HANDLE.to_string(), self.key_builder(), record_builder)
+                .await;
             return;
         }
 
+        // Gate closed. `share == false` (explicit toggle-off) actively
+        // retracts a previously-registered positive record instead of
+        // merely unregistering — `unregister` alone only stops FUTURE
+        // republishing, it does not withdraw a record already sitting on
+        // the DHT, so the last positive relay-set would otherwise stay
+        // discoverable for up to its 7-day TTL (round 1 fix, Qodo #1,
+        // preserved here). `share == true` but no own vines (yet, or not
+        // anymore) has nothing meaningful to retract in v1 — plain
+        // unregister is enough, unchanged from the original behavior.
+        if share {
+            self.publisher.unregister(HANDLE).await;
+            return;
+        }
+        if !self
+            .publisher
+            .active_handles()
+            .await
+            .contains(&HANDLE.to_string())
+        {
+            return;
+        }
         let id_sk = self.identity_signing_key.clone();
         let id_pub = self.identity_pub;
-        let endpoint_for_builder = Arc::clone(&endpoint);
-        let share_flag = Arc::clone(&self.share);
-        let has_own_vines = Arc::clone(&self.has_own_vines);
         let record_builder: RecordBuilder = Arc::new(move |at_ms| {
-            // Fresh read on EVERY publish (never boot-frozen — ZEB-521): a
-            // home relay captured once at register time would go stale for
-            // the life of the process.
-            let endpoint_id = *endpoint_for_builder.node_id().as_bytes();
-            let home_relay = endpoint_for_builder
-                .home_relay()
-                .map(|r| r.to_string())
-                .unwrap_or_default();
-            let share = share_flag.load(Ordering::Relaxed);
-            let own_vine_count = has_own_vines();
-            let blob =
-                build_blob_or_retraction(share, own_vine_count, endpoint_id, home_relay, at_ms);
             PkarrRoutingRecord::sign_new(
-                blob,
+                build_retraction_blob(at_ms),
                 id_pub,
                 at_ms,
                 at_ms + REACHABILITY_RECORD_TTL_MS,
@@ -469,6 +530,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// ZEB-811 round 2 (Greptile P1): a detached settings-toggle reconcile
+    /// racing another must converge on whichever setting was applied LAST —
+    /// a stale `enable`'s reconcile finishing AFTER a later `disable`'s
+    /// must never reopen serving.
+    ///
+    /// Modeled deterministically, without sleeps or real thread-scheduling
+    /// races: `reconcile()` takes no parameter and always re-reads `share`
+    /// at ITS OWN execution time, so the only thing that determines its
+    /// outcome is the ORDER reconcile CALLS actually *execute* in relative
+    /// to `share`'s writes — never which settings call originally
+    /// triggered them, and never genuine OS-thread interleaving. So this
+    /// test directly encodes "the disable's own reconcile runs first, then
+    /// a stale/delayed reconcile — standing in for whatever earlier
+    /// `enable` call queued it — finally gets its turn LAST" simply by
+    /// invoking `reconcile()` in that exact sequence. (An earlier version
+    /// of this test tried to force a genuine race via `tokio::spawn` on a
+    /// multi-thread runtime; it was flaky by construction — both
+    /// `set_desired_share` writes complete so much faster than a freshly
+    /// spawned task can be scheduled that neither task reliably observed
+    /// the transient `true` value, so nothing was ever registered for the
+    /// "retraction" to land on. Sequencing the calls directly is both
+    /// deterministic and sufficient: it exercises the exact same read-path
+    /// `reconcile_locked` takes regardless of how it was invoked.)
+    #[tokio::test]
+    async fn stale_reconcile_never_reopens_serving_after_a_later_disable() {
+        let (publisher, relay) = test_publisher().await;
+        let pool = harmony_pkarr::RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(harmony_pkarr::RelayClient::new(pool));
+        let resolver = Arc::new(harmony_pkarr::PkarrResolver::new(client));
+
+        let endpoint = test_endpoint().await;
+        let identity = crate::vine_signing::test_identity();
+        let addr = crate::vine_signing::signer_address(&identity);
+        let sk = crate::vine_signing::identity_signing_key(&identity);
+        let id_pub = crate::vine_signing::identity_pub_64(&identity);
+        let vp = PkarrVinesPublisher::new(
+            Arc::clone(&publisher),
+            addr.clone(),
+            sk,
+            id_pub,
+            Some(endpoint),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|| 1),
+        );
+
+        // Sharing was already on (an earlier settings state) — establish
+        // and confirm real content is registered and resolvable.
+        vp.enable().await;
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(attempts < 80, "initial vines publish did not land");
+            if let Ok(relay_set) =
+                crate::pkarr_vines::resolve_vine_relays(&resolver, &addr, now_ms()).await
+            {
+                if !relay_set.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // The LATEST settings call disables sharing: its synchronous write
+        // (mirrors `set_vine_settings_impl`) plus its own detached
+        // reconcile both run, retracting the real content.
+        vp.set_desired_share(false);
+        vp.reconcile().await;
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(attempts < 80, "retraction did not land after disable");
+            if let Ok(relay_set) =
+                crate::pkarr_vines::resolve_vine_relays(&resolver, &addr, now_ms()).await
+            {
+                if relay_set.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        // A STALE reconcile — standing in for a duplicate/delayed
+        // reconcile task from the EARLIER `enable` that only gets its turn
+        // now, well after the disable above already landed — must NOT
+        // re-register real content just because it "was" spawned back
+        // when sharing was on. `reconcile()` has nothing to remember: it
+        // only ever reads current state, which is still `false`.
+        vp.reconcile().await;
+
+        // Give the mock relay a moment to reflect any (incorrect) PUT the
+        // stale reconcile might have issued, then assert it's STILL the
+        // retraction.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let relay_set = crate::pkarr_vines::resolve_vine_relays(&resolver, &addr, now_ms())
+            .await
+            .expect("record must still resolve (the handle stays registered post-retraction)");
+        assert!(
+            relay_set.is_empty(),
+            "a stale reconcile must never reopen serving after a later disable"
+        );
     }
 
     #[tokio::test]
