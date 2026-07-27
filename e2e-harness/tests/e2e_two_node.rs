@@ -2524,12 +2524,18 @@ async fn s_vines_publish_feed_view_reshare() {
 // test does NOT isolate the address book as the mechanism driving the dial.
 // Bob's `redeem_invite_iroh` join calls `reachability_resolver.seed_from_pkarr`
 // (`lib.rs` ~58064, case-A option A) directly off the pkarr-resolved routing
-// record, independently of the address book, and the iroh connection that
-// seeds is then reused for the roster/channel traffic below. So a real
-// two-node run always has BOTH the pkarr-seeded resolver entry and any
+// record, independently of the address book. The handshake CONNECTION itself
+// is NOT what's reused: it's explicitly closed right after the exchange
+// (`lib.rs:58553`, `conn.close(0u32.into(), b"handshake-complete")`). What IS
+// reused is the RESOLVER ENTRY that seed wrote — `IrohZenohLinkManager::new_link`
+// (`zenoh_iroh_transport.rs`) reads it via `resolve_by_node_id` to synthesize
+// the dial target for a SEPARATE zenoh-over-iroh connection it opens under a
+// different ALPN (`harmony/zenoh/v1` vs the handshake's `harmony/handshake/v1`
+// — one QUIC connection structurally cannot carry both). So a real two-node
+// run always has BOTH the pkarr-seeded resolver entry and any
 // address-book-ingested one present at once — this test cannot tell you
-// which one supplied the reachability the dial actually used. The
-// confound-free proof that the address book alone (no pkarr, no CRDT) can
+// which one supplied the reachability that `new_link` actually dialed with.
+// The confound-free proof that the address book alone (no pkarr, no CRDT) can
 // drive a resolver hit lives in the integration test
 // `addrbook_replaces_announce_events_end_to_end`
 // (`community_sync/community_sync_integration.rs`), which loops A's
