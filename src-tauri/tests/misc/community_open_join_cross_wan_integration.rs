@@ -1286,6 +1286,89 @@ async fn bob_open_join_redeem_spawns_channel_log_engine_in_session() {
     .expect("bob_open_join_redeem_spawns_channel_log_engine_in_session timed out at 60s");
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// ZEB-824: the identity-preserving, self-filtering rendezvous resolve.
+//
+// A member-side gateway dial (unlike an open-join joiner) must know WHO the
+// beacon is before trusting it, and must never dial itself. Both properties are
+// resolve-layer concerns, so they are pinned here against the same live
+// mock-relay harness the open-join tests use.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// ZEB-824: the identified resolve returns the beacon's identity alongside the
+/// payload, so a member-side caller can derive the beacon's OwnerAddr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identified_resolve_returns_beacon_identity() {
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let setup = setup_two_party_open_join().await;
+        let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
+        assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
+        await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
+
+        let outcome = harmony_app::community_rendezvous::resolve_rendezvous_identified(
+            &setup.pkarr_resolver,
+            &setup.epoch_key,
+            [0xEE; 32], // NOT alice's endpoint id — no self-filtering here
+            wall_ms(),
+            &harmony_app::community_rendezvous::rendezvous_config_from_env(),
+        )
+        .await;
+
+        let beacon = outcome.payload.expect("alice's slot-0 beacon must resolve");
+        assert_eq!(
+            beacon.payload.iroh_node_id,
+            *setup.alice_ep.node_id().as_bytes(),
+            "payload must be alice's endpoint"
+        );
+        // The outer record's identity must ride along (this is what the plain
+        // resolve_rendezvous throws away).
+        assert_ne!(beacon.beacon_identity_pub, [0u8; 64]);
+
+        setup.publisher_handle.abort();
+        setup.alice_ep.shutdown().await;
+        setup.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("identified_resolve_returns_beacon_identity timed out at 60s");
+}
+
+/// ZEB-824 self-dial hazard: a member that IS the beacon must see its own slot
+/// as empty (spec §5, decode-layer self-filter). With only slot 0 published,
+/// filtering self leaves nothing to resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identified_resolve_filters_own_endpoint() {
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let setup = setup_two_party_open_join().await;
+        let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
+        assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
+        await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
+
+        let outcome = harmony_app::community_rendezvous::resolve_rendezvous_identified(
+            &setup.pkarr_resolver,
+            &setup.epoch_key,
+            *setup.alice_ep.node_id().as_bytes(), // we ARE alice
+            wall_ms(),
+            &harmony_app::community_rendezvous::rendezvous_config_from_env(),
+        )
+        .await;
+
+        assert!(
+            outcome.payload.is_none(),
+            "own beacon record must be filtered, not returned as a dial candidate"
+        );
+
+        setup.publisher_handle.abort();
+        setup.alice_ep.shutdown().await;
+        setup.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("identified_resolve_filters_own_endpoint timed out at 60s");
+}
+
 // The escalating-batch failover test (Test 2) needs ≥2 slots to widen past a
 // dead slot 0; reference the const so an accidental N drift surfaces here.
 const _: () = assert!(RENDEZVOUS_SLOT_COUNT >= 2, "failover test needs >= 2 slots");

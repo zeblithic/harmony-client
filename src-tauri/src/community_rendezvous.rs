@@ -23,6 +23,7 @@ use harmony_pkarr::rendezvous::{
 use harmony_pkarr::PkarrResolver;
 use std::sync::Arc;
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 /// Number of enumerated rendezvous slots == the relay-advertiser cap.
 pub const RENDEZVOUS_SLOT_COUNT: usize = COMMUNITY_RELAY_ADVERTISERS_MAX;
@@ -124,6 +125,85 @@ pub async fn resolve_rendezvous(
         Arc::new(rendezvous_info),
         |blob: &[u8]| ciborium::from_reader::<ReachabilityAnnouncePayload, _>(blob).ok(),
     );
+    resolve_rendezvous_with(&resolver, now_ms, cfg).await
+}
+
+/// ZEB-824: a resolved beacon with the outer record's identity preserved, so a
+/// member-side caller can derive the beacon's `OwnerAddr` and gate on
+/// membership. The plain [`resolve_rendezvous`] decode discards the outer
+/// [`harmony_pkarr::PkarrRoutingRecord`]; open-join keeps using it (a joiner
+/// defers identity trust to admission — module doc above).
+#[derive(Debug, Clone)]
+pub struct IdentifiedBeacon {
+    pub payload: ReachabilityAnnouncePayload,
+    /// The outer record's `harmony_identity_pub` (inner-sig-verified by
+    /// `PkarrResolver::resolve`): X25519(32) ‖ Ed25519(32).
+    pub beacon_identity_pub: [u8; 64],
+}
+
+/// Client-side [`SlotResolver`] that keeps the outer record's identity and
+/// filters out our own endpoint. Mirrors the core `PkarrSlotResolver` probe
+/// (derive slot vk → resolve → post-await freshness re-check → decode); it
+/// exists because the core decode closure only sees the routing blob, so the
+/// identity cannot be recovered from inside a closure.
+struct IdentifiedSlotResolver {
+    pkarr: Arc<PkarrResolver>,
+    epoch_key_bytes: Zeroizing<Vec<u8>>,
+    /// Our own iroh endpoint id: a record pointing at ourselves reads as an
+    /// EMPTY slot, so the escalating-batch driver widens to the other slots
+    /// (spec §5 self-dial hazard; ZEB-806 lesson — compare 32-byte endpoint
+    /// ids, never 16-byte device ids).
+    self_endpoint_id: [u8; 32],
+}
+
+#[async_trait::async_trait]
+impl harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> for IdentifiedSlotResolver {
+    async fn resolve_slot(&self, slot_index: u16, epoch_id: u64) -> Option<IdentifiedBeacon> {
+        let info = rendezvous_info(slot_index, epoch_id);
+        let vk = derive_ephemeral_key(PkarrCase::Community, &self.epoch_key_bytes, &info)
+            .verifying_key();
+        let rec = match self.pkarr.resolve(&vk).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::debug!(slot = slot_index, error = ?e,
+                    "identified rendezvous probe errored — treating as a miss");
+                return None;
+            }
+        };
+        // Post-await freshness re-check, same as the core resolver (PR#306
+        // stale-clock lesson).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        rec.verify_freshness(now_ms).ok()?;
+        let payload: ReachabilityAnnouncePayload =
+            ciborium::from_reader(rec.routing_blob.as_slice()).ok()?;
+        if payload.iroh_node_id == self.self_endpoint_id {
+            return None;
+        }
+        Some(IdentifiedBeacon {
+            payload,
+            beacon_identity_pub: rec.harmony_identity_pub,
+        })
+    }
+}
+
+/// ZEB-824 production entry point: like [`resolve_rendezvous`], but yields an
+/// [`IdentifiedBeacon`] and treats our own record as an empty slot.
+pub async fn resolve_rendezvous_identified(
+    pkarr: &Arc<PkarrResolver>,
+    epoch_key: &EpochKey,
+    self_endpoint_id: [u8; 32],
+    now_ms: u64,
+    cfg: &RendezvousResolveConfig,
+) -> RendezvousResolveOutcome<IdentifiedBeacon> {
+    let resolver = IdentifiedSlotResolver {
+        pkarr: Arc::clone(pkarr),
+        epoch_key_bytes: Zeroizing::new(epoch_key.as_bytes().to_vec()),
+        self_endpoint_id,
+    };
     resolve_rendezvous_with(&resolver, now_ms, cfg).await
 }
 
