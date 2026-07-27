@@ -25922,7 +25922,7 @@ mod fetch_vine_tests {
         // test cap below.
         crate::iroh_framing::write_len_prefixed(
             &mut server_write,
-            &vec![7u8; 200],
+            &[7u8; 200],
             crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
             crate::iroh_framing::Endian::Le,
             true,
