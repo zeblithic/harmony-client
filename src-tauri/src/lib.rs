@@ -15697,22 +15697,29 @@ pub struct VineDescriptorPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_creator_name: Option<String>,
     /// ZEB-673: hex 64-byte identity pub (X25519‖Ed25519) of the creator.
-    /// `Option` because signatures exist only on the wire: disk rows
-    /// (`vine_feed_cache::DescriptorOnDisk`) never retain them
-    /// (verify-once-at-ingest, same posture as `TombstoneOnDisk`), so
-    /// records rebuilt from disk carry `None`. Wire receivers reject
-    /// `None`.
+    /// `Option` because a record must be signed to be admitted (wire
+    /// receivers reject `None`). ZEB-811: disk rows
+    /// (`vine_feed_cache::DescriptorOnDisk`) now RETAIN this field (and
+    /// `sig`/`device_sig`) so a vine-relay node can serve verifiable
+    /// descriptors after a restart — verification still happens once at
+    /// ingest, but the signed original is kept (same posture as ZEB-815's
+    /// "the book keeps the signed original"). Rows persisted before
+    /// ZEB-811 deserialize with `None` here; such legacy rows still load
+    /// and list locally but are excluded from
+    /// `VineFeedCache::descriptors_for_creator_page`, which must not serve
+    /// an unverifiable row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_pub: Option<String>,
     /// ZEB-673: hex 64-byte Ed25519 signature over
-    /// `vine_signing::descriptor_canonical_bytes`.
+    /// `vine_signing::descriptor_canonical_bytes`. ZEB-811: retained on
+    /// disk alongside `identity_pub`/`device_sig` — see `identity_pub`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
     /// ZEB-678 S2: hex 64-byte enrolled `#2` device signature over
     /// `vine_signing::descriptor_canonical_bytes_v2`. Present on records
     /// signed by the enrolled device key; its presence marks the feed as
     /// migrated (dual-path ingest requires it once the feed's authority
-    /// record is cached). Wire-only, like `sig`.
+    /// record is cached). ZEB-811: retained on disk — see `identity_pub`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_sig: Option<String>,
 }
@@ -16254,7 +16261,7 @@ pub(crate) async fn publish_vine_descriptor(
     state: &Mutex<NodeState>,
     mut descriptor: VineDescriptorPayload,
 ) -> Result<(), String> {
-    let (publish_tx, identity, dm_outbox) = {
+    let (publish_tx, identity, dm_outbox, vine_feed_cache, followed_set) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
             guard
@@ -16266,6 +16273,8 @@ pub(crate) async fn publish_vine_descriptor(
                 .clone()
                 .ok_or_else(|| "identity unavailable: cannot sign vine publish".to_string())?,
             guard.dm_outbox.clone(),
+            guard.vine_feed_cache.clone(),
+            guard.followed_set.clone(),
         )
     };
 
@@ -16316,6 +16325,30 @@ pub(crate) async fn publish_vine_descriptor(
         .map_err(|_| "event loop dropped publish request".to_string())?;
 
     if result.is_ok() {
+        // ZEB-811: the vine-relay serve source is this cache. Own descriptors
+        // must be present with their signatures regardless of zenoh loopback
+        // semantics; on_descriptor_sample is id-keyed first-write-wins, so a
+        // loopback copy (if zenoh does deliver one back to us) dedupes to a
+        // no-op. Tests construct partial NodeStates without these Arcs —
+        // skip silently when either is absent.
+        if let (Some(cache), Some(set)) = (vine_feed_cache.as_ref(), followed_set.as_ref()) {
+            if let (Ok(mut cache), Ok(set)) = (cache.lock(), set.lock()) {
+                let key = format!("harmony/vines/{}", descriptor.creator_address);
+                if let Ok(bytes) = serde_json::to_vec(&descriptor) {
+                    // Same clock source as the event loop's descriptor arm
+                    // (event_loop.rs's `harmony/vines/` sample-handling block).
+                    let now_ms = u64::try_from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0),
+                    )
+                    .unwrap_or(u64::MAX);
+                    let _ = cache.on_descriptor_sample(&key, &bytes, &set, now_ms);
+                }
+            }
+        }
+
         // ZEB-811 Task 4: force-republish the case-E vines relay record.
         // Covers "first vine ever" flipping the has-vines gate (the record
         // was skipped/unregistered until now) without waiting for the next
