@@ -31,6 +31,8 @@
     ownAddress,
     getShareFollows,
     onSetShareFollows,
+    getShareVinesPublicly,
+    onSetShareVinesPublicly,
   }: {
     followedVines?: VineVideo[];
     discoverVines?: VineVideo[];
@@ -46,7 +48,10 @@
     onDelete?: (vine: VineVideo) => Promise<void> | void;
     onFollow?: (address: string, name: string) => void;
     onUnfollow?: (address: string) => void;
-    resolveVideo?: (cid: string) => Promise<string>;
+    /** ZEB-811: creatorAddress is the video's OWNING creator (originalCreatorAddress
+     * for a reshare, else creatorAddress) — the fallback dials THAT creator's
+     * relay set on a mesh miss, never the resharer's. */
+    resolveVideo?: (cid: string, creatorAddress: string) => Promise<string>;
     getReaction?: (vineId: string) => { count: number; likedByMe: boolean };
     onToggleLike?: (vine: VineVideo) => void;
     onViewOriginal?: (vineId: string) => void;
@@ -65,6 +70,10 @@
     getShareFollows?: () => Promise<boolean>;
     /** ZEB-671: flip the backend share_follows setting (Tune sheet). */
     onSetShareFollows?: (on: boolean) => Promise<void>;
+    /** ZEB-811: read the backend share_vines_publicly setting (Tune sheet). */
+    getShareVinesPublicly?: () => Promise<boolean>;
+    /** ZEB-811: flip the backend share_vines_publicly setting (Tune sheet). */
+    onSetShareVinesPublicly?: (on: boolean) => Promise<void>;
   } = $props();
 
   let feedFilter = $state<FeedFilter>('all');
@@ -99,6 +108,13 @@
   let shareFollowsLoaded = $state(false);
   let shareFollowsBusy = $state(false);
   let shareFollowsError = $state('');
+  /** Backend share_vines_publicly state, loaded when the Tune sheet opens. */
+  let shareVinesPublicly = $state(true);
+  /** True once getShareVinesPublicly() has succeeded — same disabled-until-
+   *  read gate as shareFollowsLoaded above. */
+  let shareVinesPubliclyLoaded = $state(false);
+  let shareVinesPubliclyBusy = $state(false);
+  let shareVinesPubliclyError = $state('');
   /** Focus target when the Tune sheet opens (dialog a11y). */
   let tuneSheetEl = $state<HTMLDivElement | null>(null);
 
@@ -254,6 +270,21 @@
         shareFollowsLoaded = false;
       }
     }
+    shareVinesPubliclyError = '';
+    if (getShareVinesPublicly) {
+      // Reset the gate BEFORE awaiting the read: a prior successful open
+      // leaves it true, and a pending re-read must not let the toggle
+      // stay interactive against a stale displayed value in the meantime.
+      shareVinesPubliclyLoaded = false;
+      try {
+        shareVinesPublicly = await getShareVinesPublicly();
+        shareVinesPubliclyLoaded = true;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        shareVinesPubliclyError = msg;
+        shareVinesPubliclyLoaded = false;
+      }
+    }
   }
 
   async function handleShareFollowsToggle(e: Event) {
@@ -271,6 +302,24 @@
       input.checked = shareFollows;
     } finally {
       shareFollowsBusy = false;
+    }
+  }
+
+  async function handleShareVinesPubliclyToggle(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const want = input.checked;
+    if (!onSetShareVinesPublicly) return;
+    shareVinesPubliclyBusy = true;
+    try {
+      await onSetShareVinesPublicly(want);
+      shareVinesPublicly = want;
+      shareVinesPubliclyError = '';
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      shareVinesPubliclyError = msg;
+      input.checked = shareVinesPublicly;
+    } finally {
+      shareVinesPubliclyBusy = false;
     }
   }
 
@@ -389,12 +438,15 @@
     return set;
   });
 
+  // ZEB-811: cid -> the video's OWNING creator address (originalCreatorAddress
+  // for a reshare, else creatorAddress) — resolveVideo's relay fallback dials
+  // THAT creator's relay set on a mesh miss, never the resharer's.
   let windowCids = $derived.by(() => {
-    const set = new Set<string>();
+    const m = new Map<string, string>();
     for (const v of filteredVines) {
-      if (windowIds.has(v.id)) set.add(v.videoCid);
+      if (windowIds.has(v.id)) m.set(v.videoCid, v.originalCreatorAddress ?? v.creatorAddress);
     }
-    return set;
+    return m;
   });
 
   $effect(() => {
@@ -410,10 +462,10 @@
     if (next) videoUrls = next;
     const resolver = resolveVideo;
     if (!resolver) return;
-    for (const cid of want) {
+    for (const [cid, creatorAddress] of want) {
       if (videoUrls.has(cid) || pendingCids.has(cid)) continue;
       pendingCids.add(cid);
-      resolver(cid)
+      resolver(cid, creatorAddress)
         .then(url => {
           pendingCids.delete(cid);
           // The component may have unmounted, or the window may have moved,
@@ -660,6 +712,22 @@
         </label>
         {#if shareFollowsError}
           <p class="tune-error" role="alert">{shareFollowsError}</p>
+        {/if}
+      {/if}
+      {#if getShareVinesPublicly && onSetShareVinesPublicly}
+        <label class="tune-row">
+          <input
+            type="checkbox"
+            checked={shareVinesPublicly}
+            disabled={shareVinesPubliclyBusy || !shareVinesPubliclyLoaded}
+            onchange={handleShareVinesPubliclyToggle}
+            data-testid="share-vines-publicly-toggle"
+          />
+          <span>Share my vines publicly</span>
+        </label>
+        <p class="tune-help">Publishes a relay record so followers outside your communities can fetch your vines.</p>
+        {#if shareVinesPubliclyError}
+          <p class="tune-error" role="alert">{shareVinesPubliclyError}</p>
         {/if}
       {/if}
       <button type="button" class="tune-done" onclick={() => { tuneOpen = false; }}>
@@ -952,6 +1020,12 @@
   .tune-divider {
     border-top: 1px solid var(--border);
     margin: 6px 0 0;
+  }
+
+  .tune-help {
+    margin: 0;
+    font-size: 0.7rem;
+    color: var(--text-secondary);
   }
 
   .tune-error {

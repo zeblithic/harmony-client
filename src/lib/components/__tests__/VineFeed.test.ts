@@ -394,10 +394,16 @@ describe('VineFeed', () => {
         followedVines: five, viewedIds: new Set<string>(), resolveVideo, onMarkViewed: vi.fn(),
       } });
       // Newest-first order: vine-05 plays (index 0); window = vine-05 + vine-04.
+      // ZEB-811: resolveVideo also receives the card's creatorAddress (the
+      // relay-fallback dial target).
       await waitFor(() => expect(container.querySelectorAll('[data-testid="stage-video"]').length).toBe(2));
-      expect(resolveVideo).toHaveBeenCalledWith('cid-5');
-      expect(resolveVideo).toHaveBeenCalledWith('cid-4');
-      expect(resolveVideo).not.toHaveBeenCalledWith('cid-1');
+      expect(resolveVideo).toHaveBeenCalledWith('cid-5', 'addr-5');
+      expect(resolveVideo).toHaveBeenCalledWith('cid-4', 'addr-4');
+      // Argument-agnostic: an out-of-window card must not be resolved at
+      // all, not merely "not resolved with these exact args" — the latter
+      // would still pass if the card resolved with a different (or
+      // undefined) second argument.
+      expect(resolveVideo.mock.calls.map((c) => c[0])).not.toContain('cid-1');
     });
 
     it('revokes blob URLs when cards leave the window', async () => {
@@ -723,6 +729,39 @@ describe('feed-level delete (ZEB-670 creator tombstone)', () => {
       await fireEvent.click(screen.getByTestId('share-follows-toggle'));
       await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('not connected'));
       expect((screen.getByTestId('share-follows-toggle') as HTMLInputElement).checked).toBe(true);
+    });
+
+    it('Share-my-vines-publicly toggle reads and writes through the props', async () => {
+      const getShareVinesPublicly = vi.fn().mockResolvedValue(true);
+      const onSetShareVinesPublicly = vi.fn().mockResolvedValue(undefined);
+      renderDiscover({ getShareVinesPublicly, onSetShareVinesPublicly });
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      await waitFor(() => expect(getShareVinesPublicly).toHaveBeenCalled());
+
+      await fireEvent.click(screen.getByTestId('share-vines-publicly-toggle'));
+      await waitFor(() => expect(onSetShareVinesPublicly).toHaveBeenCalledWith(false));
+    });
+
+    it('keeps the share-vines-publicly toggle disabled when the read fails', async () => {
+      const getShareVinesPublicly = vi.fn().mockRejectedValue(new Error('ipc down'));
+      const onSetShareVinesPublicly = vi.fn();
+      renderDiscover({ getShareVinesPublicly, onSetShareVinesPublicly });
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('ipc down'));
+      expect((screen.getByTestId('share-vines-publicly-toggle') as HTMLInputElement).disabled).toBe(true);
+      expect(onSetShareVinesPublicly).not.toHaveBeenCalled();
+    });
+
+    it('surfaces a share-vines-publicly write failure and reverts the box', async () => {
+      const getShareVinesPublicly = vi.fn().mockResolvedValue(true);
+      const onSetShareVinesPublicly = vi.fn().mockRejectedValue(new Error('not connected'));
+      renderDiscover({ getShareVinesPublicly, onSetShareVinesPublicly });
+      await fireEvent.click(screen.getByTestId('tune-btn'));
+      await waitFor(() => expect(getShareVinesPublicly).toHaveBeenCalled());
+
+      await fireEvent.click(screen.getByTestId('share-vines-publicly-toggle'));
+      await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('not connected'));
+      expect((screen.getByTestId('share-vines-publicly-toggle') as HTMLInputElement).checked).toBe(true);
     });
 
     it('shows the graph-only empty state copy', () => {

@@ -29,6 +29,19 @@ pub struct VineSettings {
     /// opt-out retraction (Qodo PR #447).
     #[serde(default)]
     pub last_published_updated_at: u64,
+    /// ZEB-811: publish a pkarr relay record so followers outside this
+    /// owner's communities can fetch their vines. Vines are public by
+    /// intent (spec product decision 4), so — unlike `share_follows`,
+    /// which is opt-out by user preference — a LEGACY settings file that
+    /// predates this field must default to `true`, not serde's normal
+    /// bool default of `false`. `#[serde(default)]` would silently
+    /// un-publish every pre-ZEB-811 node on first load.
+    #[serde(default = "default_true")]
+    pub share_vines_publicly: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for VineSettings {
@@ -36,6 +49,7 @@ impl Default for VineSettings {
         VineSettings {
             share_follows: true,
             last_published_updated_at: 0,
+            share_vines_publicly: true,
         }
     }
 }
@@ -113,6 +127,7 @@ mod tests {
             &VineSettings {
                 share_follows: false,
                 last_published_updated_at: 1_700_000_400,
+                share_vines_publicly: false,
             },
         );
         let loaded = load_or_default(&path);
@@ -121,14 +136,18 @@ mod tests {
             loaded.last_published_updated_at, 1_700_000_400,
             "LWW floor must survive restarts"
         );
+        assert!(!loaded.share_vines_publicly);
         save(
             &path,
             &VineSettings {
                 share_follows: true,
                 last_published_updated_at: 0,
+                share_vines_publicly: true,
             },
         );
-        assert!(load_or_default(&path).share_follows);
+        let loaded = load_or_default(&path);
+        assert!(loaded.share_follows);
+        assert!(loaded.share_vines_publicly);
     }
 
     #[test]
@@ -139,6 +158,23 @@ mod tests {
         let loaded = load_or_default(&path);
         assert!(!loaded.share_follows);
         assert_eq!(loaded.last_published_updated_at, 0);
+    }
+
+    #[test]
+    fn legacy_file_without_share_vines_publicly_defaults_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vine_settings.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"share_follows":false,"last_published_updated_at":7}"#,
+        )
+        .unwrap();
+        let s = load_or_default(&path);
+        assert!(!s.share_follows);
+        assert!(
+            s.share_vines_publicly,
+            "legacy files must default the new gate ON"
+        );
     }
 
     #[test]

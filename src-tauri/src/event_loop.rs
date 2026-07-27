@@ -5139,7 +5139,10 @@ pub async fn run(
             }
 
             // Follow/unfollow updates are applied to followed_set directly
-            // by the Tauri command handlers. When per-creator Zenoh
+            // by the Tauri command handlers. ZEB-811 Task 8: those same
+            // handlers (`follow_vine_creator_impl` / `unfollow_vine_creator_impl`,
+            // lib.rs) also `notify_one()` the vine-pull driver's wake handle
+            // there — this arm stays a no-op. When per-creator Zenoh
             // subscriptions are added (once the publish path includes
             // /announce/), the follow_rx channel will drive Subscribe/
             // Unsubscribe actions here.

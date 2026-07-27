@@ -12,7 +12,7 @@
 
 use crate::{VineDescriptorPayload, VineReactionPayload, VineVideoDto};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// ZEB-147: max descriptors retained in the cache. On insert into a full
@@ -108,6 +108,21 @@ struct DescriptorOnDisk {
     original_creator_address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     original_creator_name: Option<String>,
+    /// ZEB-811: retained wire signature fields so a relay can serve
+    /// verifiable descriptors after a restart (previously dropped on
+    /// disk under a verify-once-at-ingest posture — see the doc comment
+    /// on `VineDescriptorPayload::identity_pub`). `#[serde(default)]` so
+    /// rows persisted before ZEB-811 deserialize with `None`; such
+    /// legacy rows still load and are listed by `list_descriptors()`
+    /// (local display never needed the signature) but are excluded from
+    /// `descriptors_for_creator_page` — a relay must not serve an
+    /// unverifiable row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_pub: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sig: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_sig: Option<String>,
     received_at_ms: u64,
     source: VineSource,
 }
@@ -289,6 +304,36 @@ struct CachedVine {
     source: VineSource,
 }
 
+/// One candidate row in `descriptors_for_creator_page`'s bounded top-k
+/// max-heap, ordered solely by the `(created_at, id)` cursor tuple — never
+/// derive `Ord`/`PartialOrd` off the full `CachedVine` (it has no natural
+/// order and its `descriptor.id` isn't unique enough alone to compare
+/// against `after`).
+struct PageCandidate<'a> {
+    key: (u64, &'a str),
+    cv: &'a CachedVine,
+}
+
+impl PartialEq for PageCandidate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for PageCandidate<'_> {}
+
+impl PartialOrd for PageCandidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PageCandidate<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedReaction {
     liked: bool,
@@ -465,12 +510,15 @@ impl VineFeedCache {
                 reshare_of: d.reshare_of,
                 original_creator_address: d.original_creator_address,
                 original_creator_name: d.original_creator_name,
-                // ZEB-673: signatures are not retained on disk —
-                // verification happens once at ingest; persisted rows are
-                // trusted local state (same posture as TombstoneOnDisk).
-                identity_pub: None,
-                sig: None,
-                device_sig: None,
+                // ZEB-811: signatures ARE retained on disk (see
+                // `DescriptorOnDisk`'s doc comment) so a relay can serve
+                // verifiable descriptors after a restart. `#[serde(default)]`
+                // means legacy pre-ZEB-811 rows restore `None` here — those
+                // rows still load and list, but `descriptors_for_creator_page`
+                // filters them out.
+                identity_pub: d.identity_pub,
+                sig: d.sig,
+                device_sig: d.device_sig,
             };
             cache.descriptors.insert(
                 d.id,
@@ -738,6 +786,91 @@ impl VineFeedCache {
             .collect();
         out.sort_by_key(|v| std::cmp::Reverse(v.created_at));
         out
+    }
+
+    /// ZEB-811: paginated per-creator descriptors for vine-relay serving.
+    /// Ascending `(created_at, id)` tuple order; returns only rows
+    /// strictly greater than the `after` cursor, up to `limit` rows —
+    /// the caller is responsible for clamping `limit` to a sane wire cap.
+    /// Only rows carrying a retained `sig` or `device_sig` are served: a
+    /// relay must not hand out an unverifiable row (legacy pre-ZEB-811
+    /// disk rows are silently excluded rather than served bare).
+    ///
+    /// Uses a bounded top-k max-heap (`PageCandidate`) rather than
+    /// collect-all-then-sort — see the method body's comment.
+    pub fn descriptors_for_creator_page(
+        &self,
+        creator: &str,
+        after: &(u64, String),
+        limit: usize,
+    ) -> Vec<VineDescriptorPayload> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        // Bounded top-k via a size-`limit` max-heap (O(n log limit)) rather
+        // than collect-all-then-full-sort (O(n log n)): vine-relay is
+        // deliberately unauthenticated (module doc), so this page query is
+        // an attacker-reachable hot path and a large cache must not turn a
+        // small wire `limit` into an O(n log n) scan+sort on every request.
+        // The heap holds at most `limit` candidates at any time; only the
+        // final `limit`-sized result is sorted.
+        let mut heap: BinaryHeap<PageCandidate> = BinaryHeap::with_capacity(limit + 1);
+        for cv in self.descriptors.values() {
+            if cv.descriptor.creator_address != creator {
+                continue;
+            }
+            if cv.descriptor.sig.is_none() && cv.descriptor.device_sig.is_none() {
+                continue;
+            }
+            let key = (cv.descriptor.created_at, cv.descriptor.id.as_str());
+            if key <= (after.0, after.1.as_str()) {
+                continue;
+            }
+            if heap.len() < limit {
+                heap.push(PageCandidate { key, cv });
+            } else if heap.peek().is_some_and(|max| key < max.key) {
+                heap.pop();
+                heap.push(PageCandidate { key, cv });
+            }
+        }
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|c| c.cv.descriptor.clone())
+            .collect()
+    }
+
+    /// ZEB-811: true when `cid_hex` is the `video_cid` of at least one
+    /// signature-retaining cached descriptor from `creator` SPECIFICALLY.
+    /// Backs the vine-relay serve ctx's content allowlist — resolved from
+    /// THIS node's own cache, never from a requester's claim, so an
+    /// anonymous peer cannot turn this node into an open blob-serving proxy
+    /// for arbitrary CIDs. Mirrors the same sig-retained filter as
+    /// `descriptors_for_creator_page`.
+    ///
+    /// ZEB-811 final review: scoped to `creator` (the caller passes its own
+    /// address) rather than "any cached creator" — a v1 vine relay serves
+    /// only its own creator's content, and the caller (`ProdVineRelayServeCtx`)
+    /// already enforces the same scope on `descriptors_for_creator_page`;
+    /// this scope must match or the content path would leak a broader
+    /// allowlist than the descriptor path.
+    pub fn video_cid_is_served(&self, creator: &str, cid_hex: &str) -> bool {
+        self.descriptors.values().any(|cv| {
+            cv.descriptor.creator_address == creator
+                && (cv.descriptor.sig.is_some() || cv.descriptor.device_sig.is_some())
+                && cv.descriptor.video_cid == cid_hex
+        })
+    }
+
+    /// ZEB-811: max `received_at_ms` across `creator`'s cached rows — feeds
+    /// the vine-relay pull driver's per-creator freshness check. `None`
+    /// when no descriptor from `creator` is cached (never pulled, or all
+    /// age/capacity-pruned).
+    pub fn last_received_ms_for_creator(&self, creator: &str) -> Option<u64> {
+        self.descriptors
+            .values()
+            .filter(|cv| cv.descriptor.creator_address == creator)
+            .map(|cv| cv.received_at_ms)
+            .max()
     }
 
     /// Internal helper: build the `VineVideoDtoWithSource` for the
@@ -1297,6 +1430,9 @@ impl VineFeedCache {
                     reshare_of: cv.descriptor.reshare_of.clone(),
                     original_creator_address: cv.descriptor.original_creator_address.clone(),
                     original_creator_name: cv.descriptor.original_creator_name.clone(),
+                    identity_pub: cv.descriptor.identity_pub.clone(),
+                    sig: cv.descriptor.sig.clone(),
+                    device_sig: cv.descriptor.device_sig.clone(),
                     received_at_ms: cv.received_at_ms,
                     source: cv.source,
                 })
@@ -1390,6 +1526,25 @@ impl VineFeedCache {
     #[cfg(test)]
     pub fn len_tombstones(&self) -> usize {
         self.tombstones.len()
+    }
+
+    /// ZEB-811: test-only descriptor seeder — inserts `descriptor` directly
+    /// into the cache, bypassing `on_descriptor_sample`'s signature-
+    /// verification pipeline entirely. Callers set `sig`/`device_sig` on the
+    /// payload themselves to control whether a row is signature-retaining
+    /// (served) or not — this exists to test the SERVE-SIDE filters
+    /// (`descriptors_for_creator_page`, `video_cid_is_served`), not
+    /// signature correctness (covered separately by the real-ingest tests).
+    #[cfg(test)]
+    pub fn seed_descriptor_for_test(&mut self, descriptor: VineDescriptorPayload) {
+        self.descriptors.insert(
+            descriptor.id.clone(),
+            CachedVine {
+                descriptor,
+                received_at_ms: 0,
+                source: VineSource::Followed,
+            },
+        );
     }
 
     /// Number of cached descriptors. Test helper.
@@ -1576,6 +1731,208 @@ mod tests {
         assert!(
             matches!(out, Some(DescriptorOutcome::Rejected(ref r)) if r.contains("does not match payload creator")),
             "got {out:?}"
+        );
+    }
+
+    // ── ZEB-811: signature retention + per-creator relay pages ─────────
+
+    #[test]
+    fn disk_round_trip_retains_wire_signatures() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let followed = followed_set_with(&["alice-addr"]);
+        // `load()` age-prunes against the REAL wall clock (unlike
+        // on_descriptor_sample's synthetic now_ms), so created_at must be
+        // recent — see descriptor_insert_persists_to_disk for precedent.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+            let desc = canonical_descriptor_bytes(
+                "vine-sig-rt",
+                "alice-addr",
+                "Alice",
+                "cid-sig-rt",
+                None,
+                None,
+                now_secs.saturating_sub(60),
+                None,
+                None,
+            );
+            let out = cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
+            assert!(
+                matches!(out, Some(DescriptorOutcome::Inserted { .. })),
+                "got {out:?}"
+            );
+        }
+
+        let cache2 = VineFeedCache::load(dir.path());
+        assert_eq!(cache2.len_descriptors(), 1);
+        let page =
+            cache2.descriptors_for_creator_page(&addr("alice-addr"), &(0, String::new()), 10);
+        assert_eq!(
+            page.len(),
+            1,
+            "signed row must survive the reload and be served"
+        );
+        assert_eq!(page[0].id, "vine-sig-rt");
+        assert!(
+            page[0].sig.is_some(),
+            "sig must survive the disk round trip"
+        );
+        assert!(
+            page[0].identity_pub.is_some(),
+            "identity_pub must survive the disk round trip"
+        );
+    }
+
+    #[test]
+    fn legacy_disk_rows_without_sigs_still_load_and_are_not_served() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        // `load()` age-prunes against the REAL wall clock, so createdAt must
+        // be recent (see disk_round_trip_retains_wire_signatures).
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let disk = serde_json::json!({
+            "version": 1,
+            "descriptors": [
+                {
+                    "id": "vine-legacy",
+                    "creatorAddress": addr("alice-addr"),
+                    "creatorName": "Alice",
+                    "createdAt": now_secs.saturating_sub(60),
+                    "videoCid": "cid-legacy",
+                    "receivedAtMs": 500,
+                    "source": "followed"
+                    // no identityPub/sig/deviceSig — pre-ZEB-811 row shape
+                }
+            ],
+            "reactions": [],
+            "viewed": []
+        });
+        std::fs::write(
+            dir.path().join(VINE_FEED_FILE),
+            serde_json::to_vec_pretty(&disk).unwrap(),
+        )
+        .unwrap();
+
+        let cache = VineFeedCache::load(dir.path());
+        assert_eq!(cache.len_descriptors(), 1);
+        assert_eq!(
+            cache.list_descriptors()[0].id,
+            "vine-legacy",
+            "legacy row still loads and lists for local display"
+        );
+
+        let page = cache.descriptors_for_creator_page(&addr("alice-addr"), &(0, String::new()), 10);
+        assert!(
+            page.is_empty(),
+            "legacy unsigned row must not be served by the relay page accessor"
+        );
+    }
+
+    #[test]
+    fn creator_page_orders_by_tuple_and_breaks_created_at_ties_by_id() {
+        let mut cache = VineFeedCache::new();
+        let followed = followed_set_with(&["alice-addr", "bob-addr"]);
+
+        for (id, created_at) in [("b", 10u64), ("a", 10u64), ("c", 11u64)] {
+            let desc = canonical_descriptor_bytes(
+                id,
+                "alice-addr",
+                "Alice",
+                &format!("cid-{id}"),
+                None,
+                None,
+                created_at,
+                None,
+                None,
+            );
+            let out = cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
+            assert!(
+                matches!(out, Some(DescriptorOutcome::Inserted { .. })),
+                "insert {id} failed: {out:?}"
+            );
+        }
+        // A second creator's row must never appear in Alice's page.
+        let bob_desc = canonical_descriptor_bytes(
+            "bob-1",
+            "bob-addr",
+            "Bob",
+            "cid-bob-1",
+            None,
+            None,
+            10,
+            None,
+            None,
+        );
+        let out = cache.on_descriptor_sample(&topic("bob-addr"), &bob_desc, &followed, 1_000);
+        assert!(matches!(out, Some(DescriptorOutcome::Inserted { .. })));
+
+        let alice = addr("alice-addr");
+        let page1 = cache.descriptors_for_creator_page(&alice, &(0, String::new()), 2);
+        let ids1: Vec<&str> = page1.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids1, vec!["a", "b"]);
+
+        let page2 = cache.descriptors_for_creator_page(&alice, &(10, "b".to_string()), 2);
+        let ids2: Vec<&str> = page2.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids2, vec!["c"]);
+
+        assert!(
+            page1
+                .iter()
+                .chain(page2.iter())
+                .all(|d| d.creator_address == alice),
+            "Bob's descriptor must never appear on Alice's page"
+        );
+    }
+
+    #[test]
+    fn last_received_ms_tracks_the_freshest_row_per_creator() {
+        let mut cache = VineFeedCache::new();
+        let followed = followed_set_with(&["alice-addr"]);
+
+        let d1 = canonical_descriptor_bytes(
+            "vine-lr-1",
+            "alice-addr",
+            "Alice",
+            "cid-lr-1",
+            None,
+            None,
+            10,
+            None,
+            None,
+        );
+        let d2 = canonical_descriptor_bytes(
+            "vine-lr-2",
+            "alice-addr",
+            "Alice",
+            "cid-lr-2",
+            None,
+            None,
+            11,
+            None,
+            None,
+        );
+        // Insert the higher `received_at_ms` FIRST so a naive "last inserted
+        // wins" implementation would report the wrong (lower) value.
+        let out1 = cache.on_descriptor_sample(&topic("alice-addr"), &d1, &followed, 5_000);
+        assert!(matches!(out1, Some(DescriptorOutcome::Inserted { .. })));
+        let out2 = cache.on_descriptor_sample(&topic("alice-addr"), &d2, &followed, 1_000);
+        assert!(matches!(out2, Some(DescriptorOutcome::Inserted { .. })));
+
+        assert_eq!(
+            cache.last_received_ms_for_creator(&addr("alice-addr")),
+            Some(5_000),
+            "max received_at_ms must win, not the most recently inserted row"
+        );
+        assert_eq!(
+            cache.last_received_ms_for_creator(&addr("bob-addr")),
+            None,
+            "a creator with no cached rows must report None"
         );
     }
 

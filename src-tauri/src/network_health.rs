@@ -84,6 +84,12 @@ pub struct NetworkHealthSnapshot {
     /// wire type would read as that.
     #[serde(default)]
     pub community_relay: Option<CommunityRelayHealth>,
+    /// ZEB-811 Task 8: vine-relay serving/pulling health — the same
+    /// present-iff-wired, unwired-side-zeroed shape as `community_relay`
+    /// (see that field's doc for the incident-state rationale). `#[serde(default)]`
+    /// keeps a pre-ZEB-811 snapshot forward-compatible.
+    #[serde(default)]
+    pub vine_relay: Option<VineRelayHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -655,6 +661,246 @@ impl CommunityRelayServingTelemetry {
     }
 }
 
+/// ZEB-811: process-lifetime vine-relay-serving counters, shared (`Arc`)
+/// between [`crate::vine_relay::VineRelayAcceptor`] (writer) and
+/// `network_health_snapshot` (reader). Mirrors
+/// [`CommunityRelayServingTelemetry`], minus the per-peer breakdown (not
+/// needed yet at vine-relay's current scale) plus a `bytes_served` running
+/// total (content chunks make byte volume the more informative counter here
+/// than session count alone).
+#[derive(Debug, Default)]
+pub struct VineRelayServingTelemetry {
+    sessions_served: AtomicU64,
+    sessions_rejected: AtomicU64,
+    sessions_failed: AtomicU64,
+    bytes_served: AtomicU64,
+    last_served_ms: AtomicU64,
+}
+
+impl VineRelayServingTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one admitted-and-driven session, however it ended (client
+    /// EOF, idle timeout, an oversize/undecodable request, or a byte-budget
+    /// breach) — the connection was accepted and served, even if it ended
+    /// early. `bytes` is the session's total response-body bytes written.
+    pub fn record_served(&self, bytes: u64) {
+        self.sessions_served.fetch_add(1, Ordering::Relaxed);
+        self.bytes_served.fetch_add(bytes, Ordering::Relaxed);
+        self.last_served_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Record one connection rejected at the admission cap (never reached
+    /// `accept_bi`).
+    pub fn record_rejected(&self) {
+        self.sessions_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one connection that was admitted but never became a servable
+    /// session (`accept_bi` itself failed or timed out).
+    pub fn record_failed(&self) {
+        self.sessions_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn summary(&self) -> VineRelayServingHealth {
+        let last = self.last_served_ms.load(Ordering::Relaxed);
+        VineRelayServingHealth {
+            sessions_served: self.sessions_served.load(Ordering::Relaxed),
+            sessions_rejected: self.sessions_rejected.load(Ordering::Relaxed),
+            sessions_failed: self.sessions_failed.load(Ordering::Relaxed),
+            bytes_served: self.bytes_served.load(Ordering::Relaxed),
+            // 0 is the "never served" sentinel, same convention as
+            // `CommunityRelayServingTelemetry::summary`.
+            last_served_ms: (last != 0).then_some(last),
+        }
+    }
+}
+
+/// ZEB-811: wire shape for [`VineRelayServingTelemetry::summary`]. The
+/// service-field/snapshot assembly into [`NetworkHealthSnapshot`] is Task 8;
+/// this struct is produced and consumed standalone until then.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VineRelayServingHealth {
+    pub sessions_served: u64,
+    pub sessions_rejected: u64,
+    pub sessions_failed: u64,
+    pub bytes_served: u64,
+    pub last_served_ms: Option<u64>,
+}
+
+/// Cap on [`VinePullTelemetry`]'s `recent` ring — mirrors
+/// `COMMUNITY_RELAY_PULL_RING_CAP`'s rationale (a many-creator node must
+/// not have its ok/failed rows evicted by an unbounded ring).
+const VINE_PULL_RING_CAP: usize = 32;
+
+/// ZEB-811: process-lifetime vine-pull counters (follower side), shared
+/// (`Arc`) between [`crate::vine_pull_driver::VinePullDriver`] (writer) and
+/// `network_health_snapshot` (reader, Task 8). Mirrors
+/// [`CommunityRelayPullTelemetry`] and copies its three load-bearing
+/// conventions verbatim: `record_pass_start` is recorded first and
+/// unconditionally in every pass (proves the loop is alive even with
+/// nothing to do); a followed creator with no dialable relay is a counter
+/// only (`record_no_relay`), never a `recent` ring row (it isn't a session
+/// outcome); and `ingested == 0` on a completed session is still success —
+/// it means the relay (or the mesh, having beaten it there) held nothing
+/// new, not that anything failed.
+#[derive(Debug, Default)]
+pub struct VinePullTelemetry {
+    passes_run: AtomicU64,
+    last_pass_ms: AtomicU64,
+    sessions_ok: AtomicU64,
+    sessions_failed: AtomicU64,
+    descriptors_ingested: AtomicU64,
+    last_ingest_ms: AtomicU64,
+    passes_no_relay: AtomicU64,
+    recent: Mutex<VecDeque<VinePullHit>>,
+}
+
+impl VinePullTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the START of a pull pass. Deliberately recorded before any
+    /// work, and unconditionally — including when no creators are followed —
+    /// because this counter's job is to prove the loop is alive, not that it
+    /// found something to do.
+    pub fn record_pass_start(&self) {
+        self.passes_run.fetch_add(1, Ordering::Relaxed);
+        self.last_pass_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// A followed creator with no dialable relay this pass (either nothing
+    /// resolved, or every resolved entry was filtered as our own). Counter
+    /// only — deliberately does NOT push to the `recent` ring, for the same
+    /// reason `CommunityRelayPullTelemetry::record_no_relay` doesn't: it is
+    /// not a session outcome, and forcing it into the ring would let a node
+    /// following many creators with stale relay ads evict the ok/failed rows
+    /// the ring exists to preserve.
+    pub fn record_no_relay(&self) {
+        self.passes_no_relay.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A completed pull session. `ingested == 0` is a success, not a
+    /// failure — it means nothing new was left to pull (the relay held
+    /// nothing new, or the mesh already delivered every row as a duplicate).
+    pub fn record_session_ok(&self, creator: &str, relay_endpoint_id: &[u8; 32], ingested: u32) {
+        self.sessions_ok.fetch_add(1, Ordering::Relaxed);
+        if ingested > 0 {
+            self.descriptors_ingested
+                .fetch_add(u64::from(ingested), Ordering::Relaxed);
+            self.last_ingest_ms.store(now_ms(), Ordering::Relaxed);
+        }
+        self.push(creator, relay_endpoint_id, "ok", ingested);
+    }
+
+    pub fn record_session_failed(&self, creator: &str, relay_endpoint_id: &[u8; 32]) {
+        self.sessions_failed.fetch_add(1, Ordering::Relaxed);
+        self.push(creator, relay_endpoint_id, "failed", 0);
+    }
+
+    fn push(&self, creator: &str, relay_endpoint_id: &[u8; 32], outcome: &str, ingested: u32) {
+        // `creator` is already a hex address string, so its first 8 hex
+        // characters ARE the first 4 bytes, short-form per ZEB-329. Never
+        // fall back to the full string on a non-char-boundary byte index
+        // (hex values never hit this, but the fallback direction must not
+        // invert the short-only invariant for any non-hex input) — truncate
+        // on the nearest char boundary at or before 8 instead.
+        let end = creator
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(creator.len()))
+            .take_while(|i| *i <= 8)
+            .last()
+            .unwrap_or(0);
+        let creator_short = creator[..end].to_string();
+        let hit = VinePullHit {
+            creator_short,
+            relay_endpoint_short: hex::encode(&relay_endpoint_id[..4]),
+            outcome: outcome.to_string(),
+            ingested,
+            captured_at_ms: now_ms(),
+        };
+        let mut ring = self.recent.lock().expect("vine pull ring lock");
+        if ring.len() == VINE_PULL_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(hit);
+    }
+
+    pub fn summary(&self) -> VinePullingHealth {
+        let last_pass = self.last_pass_ms.load(Ordering::Relaxed);
+        let last_ingest = self.last_ingest_ms.load(Ordering::Relaxed);
+        VinePullingHealth {
+            passes_run: self.passes_run.load(Ordering::Relaxed),
+            last_pass_ms: (last_pass != 0).then_some(last_pass),
+            sessions_ok: self.sessions_ok.load(Ordering::Relaxed),
+            sessions_failed: self.sessions_failed.load(Ordering::Relaxed),
+            descriptors_ingested: self.descriptors_ingested.load(Ordering::Relaxed),
+            last_ingest_ms: (last_ingest != 0).then_some(last_ingest),
+            passes_no_relay: self.passes_no_relay.load(Ordering::Relaxed),
+            recent: self
+                .recent
+                .lock()
+                .expect("vine pull ring lock")
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+/// ZEB-811: wire shape for [`VinePullTelemetry::summary`]. The
+/// service-field/snapshot assembly into [`NetworkHealthSnapshot`] is Task 8;
+/// this struct is produced and consumed standalone until then.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VinePullingHealth {
+    pub passes_run: u64,
+    pub last_pass_ms: Option<u64>,
+    pub sessions_ok: u64,
+    pub sessions_failed: u64,
+    pub descriptors_ingested: u64,
+    pub last_ingest_ms: Option<u64>,
+    pub passes_no_relay: u64,
+    pub recent: Vec<VinePullHit>,
+}
+
+/// ZEB-811 Task 8: combined vine-relay serving/pulling health, assembled by
+/// `NetworkHealthService::snapshot` into `NetworkHealthSnapshot.vine_relay`.
+/// Same two-sided shape as [`CommunityRelayHealth`] and for the same
+/// reason: serving (Task 6) and pulling (Task 7) are independent wiring —
+/// a node can run a vine relay without following anyone, or follow without
+/// ever being dialed as a relay — and a peer observing either side dark
+/// can't tell which fault it's looking at without both counters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VineRelayHealth {
+    /// Outbound: are we serving descriptor/content pulls to peers relaying
+    /// through us?
+    pub serving: VineRelayServingHealth,
+    /// Inbound: are we successfully pulling followed creators' descriptor
+    /// feeds from their advertised relays?
+    pub pulling: VinePullingHealth,
+}
+
+/// ZEB-811: one pull-session outcome. Short-form ids only (ZEB-329).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VinePullHit {
+    pub creator_short: String,
+    pub relay_endpoint_short: String,
+    /// `"ok"` | `"failed"`.
+    pub outcome: String,
+    /// Descriptors newly ingested by this session (`0` for a failure or a
+    /// no-op success).
+    pub ingested: u32,
+    pub captured_at_ms: u64,
+}
+
 /// ZEB-803: process-lifetime relay-pulling counters, shared (`Arc`) between
 /// [`crate::community_relay_pull_driver::CommunityRelayPullDriver`] (writer) and
 /// `network_health_snapshot` (reader).
@@ -852,6 +1098,8 @@ impl NetworkHealthSnapshot {
             dm_fence: None,
             // ZEB-803: no service ⇒ no relay telemetry source wired.
             community_relay: None,
+            // ZEB-811 Task 8: no service ⇒ no vine-relay telemetry wired.
+            vine_relay: None,
         }
     }
 }
@@ -1282,6 +1530,17 @@ pub struct NetworkHealthService {
     /// able to say which side was dark. Installed at boot via
     /// [`set_community_relay_pull_source`](Self::set_community_relay_pull_source).
     community_relay_pulling: Option<std::sync::Arc<CommunityRelayPullTelemetry>>,
+    /// ZEB-811 Task 8: vine-relay ACCEPTOR (serving) telemetry — the SAME
+    /// `Arc` the acceptor shell increments. `None` on nodes with no vine
+    /// relay acceptor installed. Installed at boot via
+    /// [`set_vine_relay_serving_source`](Self::set_vine_relay_serving_source).
+    vine_relay_serving: Option<std::sync::Arc<VineRelayServingTelemetry>>,
+    /// ZEB-811 Task 8: vine PULL-DRIVER (follower) telemetry — the SAME
+    /// `Arc` the driver loop increments. Held separately from the serving
+    /// source for the same reason as the community-relay pair: a node can
+    /// run one without the other. Installed at boot via
+    /// [`set_vine_pull_source`](Self::set_vine_pull_source).
+    vine_pull: Option<std::sync::Arc<VinePullTelemetry>>,
 }
 
 impl NetworkHealthService {
@@ -1313,6 +1572,8 @@ impl NetworkHealthService {
             dm_fence: None,
             community_relay_serving: None,
             community_relay_pulling: None,
+            vine_relay_serving: None,
+            vine_pull: None,
         }
     }
 
@@ -1395,6 +1656,23 @@ impl NetworkHealthService {
         src: std::sync::Arc<CommunityRelayPullTelemetry>,
     ) {
         self.community_relay_pulling = Some(src);
+    }
+
+    /// ZEB-811 Task 8: install the vine-relay ACCEPTOR (serving) telemetry
+    /// source (the same `Arc` the acceptor shell writes). Additive — when
+    /// unset, `snapshot().vine_relay` reports `None` for a node with no
+    /// vine-relay acceptor.
+    pub(crate) fn set_vine_relay_serving_source(
+        &mut self,
+        src: std::sync::Arc<VineRelayServingTelemetry>,
+    ) {
+        self.vine_relay_serving = Some(src);
+    }
+
+    /// ZEB-811 Task 8: install the vine PULL-DRIVER (follower) telemetry
+    /// source.
+    pub(crate) fn set_vine_pull_source(&mut self, src: std::sync::Arc<VinePullTelemetry>) {
+        self.vine_pull = Some(src);
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -1657,6 +1935,16 @@ impl NetworkHealthService {
             ) {
                 (None, None) => None,
                 (serving, pulling) => Some(CommunityRelayHealth {
+                    serving: serving.map(|s| s.summary()).unwrap_or_default(),
+                    pulling: pulling.map(|p| p.summary()).unwrap_or_default(),
+                }),
+            },
+            // ZEB-811 Task 8: same present-iff-wired, unwired-side-zeroed
+            // shape as `community_relay` above — see that field's match arm
+            // doc for the rationale.
+            vine_relay: match (self.vine_relay_serving.as_ref(), self.vine_pull.as_ref()) {
+                (None, None) => None,
+                (serving, pulling) => Some(VineRelayHealth {
                     serving: serving.map(|s| s.summary()).unwrap_or_default(),
                     pulling: pulling.map(|p| p.summary()).unwrap_or_default(),
                 }),
@@ -3220,6 +3508,9 @@ mod tests {
         // disabled — `my_network: None` already covers "still starting up". A
         // reason is only ever set by the IPC stamp from NodeState.
         assert!(s.transport_disabled_reason.is_none());
+        // ZEB-811 Task 8: no service ⇒ no vine-relay telemetry wired — same
+        // "no wiring" vs "wired and idle" distinction as `community_relay`.
+        assert_eq!(s.vine_relay, None);
     }
 
     #[test]
@@ -3302,6 +3593,7 @@ mod tests {
             butler_deposits: None,
             dm_fence: None,
             community_relay: None,
+            vine_relay: None,
         }
     }
 
@@ -5161,6 +5453,77 @@ mod tests {
         assert!(pulling["recent"][0].get("communityShort").is_some());
         assert!(pulling["recent"][0].get("relayDeviceShort").is_some());
         assert!(pulling["recent"][0].get("capturedAtMs").is_some());
+    }
+
+    #[test]
+    fn vine_relay_health_wire_keys_are_camel_case() {
+        // ZEB-811 Task 8: same contract as `relay_health_wire_keys_are_camel_case`
+        // above — Task 10's e2e polls `vineRelay.pulling` by these exact
+        // serde-rename keys, so a wrong key means a silent e2e timeout.
+        let t = VineRelayServingTelemetry::new();
+        t.record_served(64);
+        let p = VinePullTelemetry::new();
+        p.record_pass_start();
+        p.record_no_relay();
+        p.record_session_ok("aa".repeat(16).as_str(), &[6u8; 32], 2);
+        let health = VineRelayHealth {
+            serving: t.summary(),
+            pulling: p.summary(),
+        };
+        let v = serde_json::to_value(&health).expect("serialize");
+        let serving = &v["serving"];
+        for k in [
+            "sessionsServed",
+            "sessionsRejected",
+            "sessionsFailed",
+            "bytesServed",
+            "lastServedMs",
+        ] {
+            assert!(serving.get(k).is_some(), "missing serving key {k}");
+        }
+        let pulling = &v["pulling"];
+        for k in [
+            "passesRun",
+            "lastPassMs",
+            "sessionsOk",
+            "sessionsFailed",
+            "descriptorsIngested",
+            "lastIngestMs",
+            "passesNoRelay",
+            "recent",
+        ] {
+            assert!(pulling.get(k).is_some(), "missing pulling key {k}");
+        }
+        assert!(pulling["recent"][0].get("creatorShort").is_some());
+        assert!(pulling["recent"][0].get("relayEndpointShort").is_some());
+        assert!(pulling["recent"][0].get("capturedAtMs").is_some());
+    }
+
+    #[test]
+    fn creator_short_truncates_on_char_boundary_never_leaks_full_id() {
+        // ZEB-811 review fix: `creator` is a hex address string today, so
+        // byte offset 8 is always a char boundary in practice. But the
+        // fallback direction of the truncation must never leak the FULL
+        // identifier for some other input whose byte-8 offset lands
+        // mid-character — three 2-byte chars (6 bytes) followed by a
+        // 4-byte character puts byte offset 8 squarely inside that
+        // character, which is exactly the case the old
+        // `creator.get(..8).unwrap_or(creator)` fallback mishandled (`get`
+        // returns `None` on a non-boundary index, and `unwrap_or` then used
+        // the WHOLE string).
+        let creator = format!("{}{}", "é".repeat(3), "😀secret-should-not-leak");
+        let p = VinePullTelemetry::new();
+        p.record_session_ok(&creator, &[1u8; 32], 1);
+        let summary = p.summary();
+        let hit = &summary.recent[0];
+        assert_eq!(
+            hit.creator_short, "ééé",
+            "must truncate to the last char boundary at or before byte 8"
+        );
+        assert!(
+            !hit.creator_short.contains("secret"),
+            "must never fall back to leaking the full identifier"
+        );
     }
 
     #[test]

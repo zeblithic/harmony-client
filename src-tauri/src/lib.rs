@@ -244,6 +244,8 @@ pub mod pkarr_friend_publisher;
 pub mod pkarr_identity_publisher;
 pub mod pkarr_invite_publisher;
 pub mod pkarr_resolver_adapter;
+pub mod pkarr_vines;
+pub mod pkarr_vines_publisher;
 pub mod profile;
 pub mod profile_broadcast;
 pub mod profile_card_broadcast;
@@ -287,6 +289,8 @@ pub mod tunnel_manager;
 pub mod tunnel_task;
 pub mod vine_feed_cache;
 pub mod vine_follow_graph;
+pub mod vine_pull_driver;
+pub mod vine_relay;
 pub mod vine_settings;
 pub mod vine_signing;
 pub mod vine_tombstone;
@@ -784,6 +788,11 @@ pub struct NodeState {
     /// ZEB-671: publish the follow list on the wire (public + opt-out).
     /// Loaded from `vine_settings.json` at start_node; `true` by default.
     vine_share_follows: bool,
+    /// ZEB-811: publish a pkarr relay record so followers outside this
+    /// owner's communities can fetch their vines. Vines are public by
+    /// intent, so this is `true` by default (mirrors `vine_share_follows`).
+    /// Loaded from `vine_settings.json` at start_node.
+    vine_share_publicly: bool,
     /// ZEB-671: where `set_vine_settings` persists. `None` until
     /// start_node resolves the app data dir (tests leave it `None` —
     /// persistence is a no-op, mirroring the vine cache's save path).
@@ -1398,6 +1407,22 @@ pub struct NodeState {
     /// task (populated by T11b). Held so stop_inner can abort it.
     pub community_relay_refresher_handle: Option<tokio::task::JoinHandle<()>>,
 
+    /// ZEB-811 Task 8: join handle for the vine-pull follower driver task
+    /// (`vine_pull_driver::VinePullDriver::spawn`). Held so stop_inner can
+    /// abort it.
+    pub vine_pull_driver_handle: Option<tokio::task::JoinHandle<()>>,
+    /// ZEB-811 Task 8: wake handle for the vine-pull driver
+    /// (`VinePullDriver::wake_handle`) — follow/unfollow IPCs `notify_one()`
+    /// this so a fresh follow pulls within seconds instead of waiting out
+    /// the idle cadence.
+    pub vine_pull_wake: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// ZEB-811 Task 9: the driver itself (a second `Arc` clone taken
+    /// alongside the wake handle, before `.spawn()` consumes its own clone)
+    /// — `fetch_vine_video_impl` reads `cached_relays_for` off this to
+    /// decide the relay fallback without adding a third IPC-facing channel
+    /// for a read that's already cheap to lock.
+    pub vine_pull_driver: Option<std::sync::Arc<crate::vine_pull_driver::VinePullDriver>>,
+
     /// ZEB-418 SP2 P2: dm-outhold dataset (sender-side outbound-hold blobs,
     /// spec D12). `Some` while the node is running and an owner identity is
     /// loaded; `None` before the FleetSyncEngine is wired at startup or
@@ -1633,6 +1658,11 @@ pub struct NodeState {
     pub pkarr_identity_publisher:
         Option<std::sync::Arc<pkarr_identity_publisher::PkarrIdentityPublisher>>,
 
+    /// Case E lifecycle manager (ZEB-811) — registers / unregisters this
+    /// device's own vine relay-set pkarr publication when the "Share vines
+    /// publicly" toggle changes or the owner's own-vine count crosses 0.
+    pub pkarr_vines_publisher: Option<std::sync::Arc<pkarr_vines_publisher::PkarrVinesPublisher>>,
+
     /// Case C lifecycle manager — registers / unregisters per-community
     /// pkarr publications on community join/leave/kick events.
     pub pkarr_community_publisher:
@@ -1795,6 +1825,9 @@ impl NodeState {
         self.pkarr_relay_client = None;
         self.pkarr_invite_publisher = None;
         self.pkarr_identity_publisher = None;
+        // ZEB-811 Task 4: drop the Case-E vines publisher so a restart
+        // rebuilds it against the fresh pkarr publisher / iroh endpoint.
+        self.pkarr_vines_publisher = None;
         self.pkarr_community_publisher = None;
         self.connectivity_settings_path = None;
         // ZEB-329: drop the synthesis-only service so a restart
@@ -1863,6 +1896,7 @@ impl Default for NodeState {
             voice_signal_tx: None,
             follow_mgr: None,
             vine_share_follows: true,
+            vine_share_publicly: true,
             vine_settings_path: None,
             follow_list_clock: std::sync::atomic::AtomicU64::new(0),
             followed_set: None,
@@ -2027,6 +2061,14 @@ impl Default for NodeState {
             community_relay_pull_driver_handle: None,
             community_relay_gc_handle: None,
             community_relay_refresher_handle: None,
+            // ZEB-811 Task 8: vine-pull driver handle + wake stay None until
+            // start_node wires the driver (mirrors the community-relay
+            // pull-driver handle above).
+            vine_pull_driver_handle: None,
+            vine_pull_wake: None,
+            // ZEB-811 Task 9: the driver Arc itself stays None alongside the
+            // handle + wake above until start_node wires it.
+            vine_pull_driver: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles stay
             // None until start_node wires the FleetSyncEngines (mirrors
             // dm-inbox).
@@ -2083,6 +2125,7 @@ impl Default for NodeState {
             pkarr_relay_client: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
+            pkarr_vines_publisher: None,
             pkarr_community_publisher: None,
             connectivity_settings_path: None,
             pkarr_publisher_handle: None,
@@ -2757,6 +2800,16 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         if let Some(h) = guard.community_relay_refresher_handle.take() {
             h.abort();
         }
+        // ZEB-811 Task 8: abort the vine-pull driver task (None until Task 8's
+        // spawn site populates it, so this is a correct no-op pre-boot) and
+        // drop the wake handle so a restart rebuilds a fresh one.
+        if let Some(h) = guard.vine_pull_driver_handle.take() {
+            h.abort();
+        }
+        guard.vine_pull_wake = None;
+        // ZEB-811 Task 9: drop the driver Arc too — a restart rebuilds a
+        // fresh one alongside the handle + wake above.
+        guard.vine_pull_driver = None;
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -4125,6 +4178,21 @@ pub async fn start_node_inner(
         let mut community_relay_pull_driver_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut community_relay_gc_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut community_relay_refresher_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
+        // ZEB-811 Task 8: carrier for the vine-pull driver's JoinHandle (built
+        // alongside the community-relay pull driver, inside the same
+        // `if let Some(ep_arc) = iroh_endpoint_arc.as_ref()` gate below) and its
+        // wake handle (stashed on NodeState so follow/unfollow IPCs can
+        // `notify_one()` it — no error-path abort needed for a bare `Arc<Notify>`,
+        // mirroring `community_relay_publisher_force_opt` above).
+        let mut vine_pull_driver_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
+        let mut vine_pull_wake_opt: Option<std::sync::Arc<tokio::sync::Notify>> = None;
+        // ZEB-811 Task 9: carrier for a second `Arc` clone of the driver
+        // itself, taken at construction time BEFORE `.spawn()` (which takes
+        // `self: Arc<Self>` by value) consumes its own clone — stashed on
+        // NodeState so `fetch_vine_video_impl` can read `cached_relays_for`.
+        let mut vine_pull_driver_opt: Option<
+            std::sync::Arc<crate::vine_pull_driver::VinePullDriver>,
+        > = None;
         let mut relay_sync_handles_opt: Option<crate::event_loop::RelaySyncHandles> = None;
         // ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync engines + their
         // NodeState handles. Built alongside the dm-inbox engine when an
@@ -4324,6 +4392,16 @@ pub async fn start_node_inner(
         > = None;
         let mut community_relay_pull_telemetry_for_state: Option<
             std::sync::Arc<crate::network_health::CommunityRelayPullTelemetry>,
+        > = None;
+        // ZEB-811 Task 8: same outer-scope hand-out for the vine-relay
+        // serving/pulling telemetry (Task 6/7's structs). Held separately for
+        // the same reason as the community-relay pair above — a node can
+        // serve without pulling or pull without serving.
+        let mut vine_relay_serving_telemetry_for_state: Option<
+            std::sync::Arc<crate::network_health::VineRelayServingTelemetry>,
+        > = None;
+        let mut vine_pull_telemetry_for_state: Option<
+            std::sync::Arc<crate::network_health::VinePullTelemetry>,
         > = None;
         // ZEB-217 Sub-C Phase 2 Task 13: per-community engine pool +
         // adapter requests handed to the event loop. Both stay None /
@@ -4525,6 +4603,11 @@ pub async fn start_node_inner(
         > = None;
         let mut pkarr_identity_publisher_for_state: Option<
             std::sync::Arc<pkarr_identity_publisher::PkarrIdentityPublisher>,
+        > = None;
+        // ZEB-811 Task 4: lifted Case-E vines publisher (built in the pkarr
+        // setup block, alongside the other flavor managers).
+        let mut pkarr_vines_publisher_for_state: Option<
+            std::sync::Arc<pkarr_vines_publisher::PkarrVinesPublisher>,
         > = None;
         let mut pkarr_community_publisher_for_state: Option<
             std::sync::Arc<pkarr_community_publisher::PkarrCommunityPublisher>,
@@ -9326,6 +9409,67 @@ pub async fn start_node_inner(
                         }
                     }
 
+                    // ── ZEB-811 Task 4: Case-E vines publisher ──
+                    //
+                    // Publishes this device's own vine relay-set record
+                    // (self iroh endpoint + home relay) under the vines
+                    // pkarr slot, gated on `share_vines_publicly` AND the
+                    // owner having at least one own published vine. Keyed
+                    // by the owner's public hex address (`node_addr`) —
+                    // NOT the identity pub — since a follower who never
+                    // exchanged identity material still holds the address
+                    // (see `pkarr_vines` module doc). `has_own_vines`
+                    // re-counts the local cache fresh on every gate check /
+                    // publish tick rather than tracking a running counter,
+                    // since `vine_feed_cache` is the single source of
+                    // truth and the cache is small.
+                    let vines_own_addr = node_addr.clone();
+                    let vines_feed_cache_for_gate = std::sync::Arc::clone(&vine_feed_cache);
+                    let vines_own_addr_for_gate = vines_own_addr.clone();
+                    let has_own_vines: std::sync::Arc<dyn Fn() -> usize + Send + Sync> =
+                        std::sync::Arc::new(move || {
+                            vines_feed_cache_for_gate
+                                .lock()
+                                .map(|cache| {
+                                    cache
+                                        .list_descriptors()
+                                        .iter()
+                                        .filter(|v| v.creator_address == vines_own_addr_for_gate)
+                                        .count()
+                                })
+                                .unwrap_or(0)
+                        });
+                    // ZEB-811 final review: named (not anonymous) so the
+                    // vine-relay serve acceptor installed later in this same
+                    // boot sequence can hold a clone of the SAME atomic —
+                    // `PkarrVinesPublisher::enable`/`disable` mutate it live,
+                    // so the serve ctx's gate check reflects a settings
+                    // toggle on the very next request, no acceptor reinstall
+                    // needed.
+                    let vine_share_publicly_gate =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let pkarr_vines_pub =
+                        std::sync::Arc::new(pkarr_vines_publisher::PkarrVinesPublisher::new(
+                            std::sync::Arc::clone(&pkarr_publisher_arc),
+                            vines_own_addr,
+                            (*signing_key_arc).clone(),
+                            identity_pub_64,
+                            iroh_endpoint_arc.clone(),
+                            std::sync::Arc::clone(&vine_share_publicly_gate),
+                            has_own_vines,
+                        ));
+                    if vine_settings_loaded.share_vines_publicly {
+                        pkarr_vines_pub.enable().await;
+                        tracing::info!(
+                            "ZEB-811: vines sharing ON — case-E relay record published \
+                             iff at least one own vine exists"
+                        );
+                    } else {
+                        tracing::info!(
+                            "ZEB-811: vines sharing OFF — case-E relay record not published"
+                        );
+                    }
+
                     // Restore case-B if enabled (connectivity_settings loaded above, hoisted by ZEB-380).
                     if connectivity_settings.identity_discoverable {
                         pkarr_identity_pub.enable().await;
@@ -9836,10 +9980,15 @@ pub async fn start_node_inner(
                     pkarr_publisher_for_state = Some(pkarr_publisher_arc);
                     pkarr_friend_publisher_for_state =
                         Some(std::sync::Arc::clone(&pkarr_friend_pub));
-                    pkarr_resolver_for_state = Some(pkarr_resolver_arc);
+                    // ZEB-811 Task 8: clone (not move) — the vine-pull driver
+                    // wiring further below (still inside this same block)
+                    // also needs `pkarr_resolver_arc` to resolve creators'
+                    // relay sets.
+                    pkarr_resolver_for_state = Some(std::sync::Arc::clone(&pkarr_resolver_arc));
                     pkarr_relay_client_for_state = Some(pkarr_relay_client);
                     pkarr_invite_publisher_for_state = Some(pkarr_invite_pub);
                     pkarr_identity_publisher_for_state = Some(pkarr_identity_pub);
+                    pkarr_vines_publisher_for_state = Some(pkarr_vines_pub);
                     pkarr_community_publisher_for_state = Some(pkarr_community_pub);
                     pkarr_settings_path_for_state = Some(connectivity_settings_path);
                     pkarr_publisher_handle_for_state = Some(pkarr_publisher_join);
@@ -10563,6 +10712,53 @@ pub async fn start_node_inner(
                                 Some(relay_serving_telemetry);
                         }
 
+                        // ZEB-811: install the vine-relay serve acceptor
+                        // (public-read descriptor + content fan-out). Ctx
+                        // holds the SAME vine_feed_cache + content_store Arcs
+                        // already in scope; the acceptor's telemetry Arc is
+                        // built here (mirroring the community-relay serving
+                        // telemetry just above) so Task 8 can pick it up for
+                        // the health-snapshot wiring without re-touching this
+                        // install site's shape.
+                        let vine_relay_serving_telemetry = std::sync::Arc::new(
+                            crate::network_health::VineRelayServingTelemetry::new(),
+                        );
+                        let vine_relay_ctx: std::sync::Arc<
+                            dyn crate::vine_relay::VineRelayServeCtx,
+                        > = std::sync::Arc::new(crate::vine_relay::ProdVineRelayServeCtx {
+                            cache: std::sync::Arc::clone(&vine_feed_cache),
+                            content_store: std::sync::Arc::clone(&content_store),
+                            // ZEB-811 final review: request-time share gate +
+                            // own-creator scope — see `ProdVineRelayServeCtx`
+                            // doc. Same atomic `PkarrVinesPublisher` toggles.
+                            own_creator_addr: node_addr.clone(),
+                            share_gate: std::sync::Arc::clone(&vine_share_publicly_gate),
+                        });
+                        if link_mgr
+                            .install_vine_relay_acceptor(std::sync::Arc::new(
+                                crate::vine_relay::VineRelayAcceptor::new(vine_relay_ctx)
+                                    .with_telemetry(std::sync::Arc::clone(
+                                        &vine_relay_serving_telemetry,
+                                    )),
+                            ))
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "ZEB-811: vine-relay acceptor already installed on \
+                                 iroh link manager — keeping the prior instance"
+                            );
+                        } else {
+                            // ZEB-811 Task 8: publish the source ONLY on the
+                            // success path, mirroring the community-relay
+                            // serving telemetry above (CodeRabbit, PR #556) —
+                            // otherwise a duplicate-install warning would leave
+                            // this telemetry attached to an acceptor instance
+                            // nobody holds, sitting at zero forever while the
+                            // live (prior) acceptor serves normally.
+                            vine_relay_serving_telemetry_for_state =
+                                Some(vine_relay_serving_telemetry);
+                        }
+
                         // C/D/E. The pull driver, sender deposit client, and
                         //    publisher all need the iroh endpoint (dial/announce
                         //    coordinates). Gate the whole rung on a bound
@@ -10722,6 +10918,83 @@ pub async fn start_node_inner(
                                     );
                                     community_relay_pull_driver_handle_opt =
                                         Some(pull_driver.spawn());
+
+                                    // ZEB-811 Task 8: vine-pull follower
+                                    // driver. Spawned in this same
+                                    // iroh-endpoint gate as the community-relay
+                                    // wiring above, but needs none of that
+                                    // wiring's dial-cert material — only this
+                                    // device's own iroh endpoint id (to filter
+                                    // a creator's self-relay entry, ZEB-806)
+                                    // and a dial deadline. `driver.spawn()`
+                                    // returns immediately (the loop runs in
+                                    // its own task) — never inline-awaited
+                                    // here, per the start_node inline-await
+                                    // hazard.
+                                    let vine_pull_transport: std::sync::Arc<
+                                        dyn crate::vine_pull_driver::VinePullTransport,
+                                    > = std::sync::Arc::new(
+                                        crate::vine_pull_driver::IrohVinePullTransport {
+                                            endpoint: std::sync::Arc::clone(ep_arc),
+                                            io_deadline: std::time::Duration::from_millis(
+                                                crate::iroh_butler_acceptor::DEFAULT_BUTLER_IO_DEADLINE_MS,
+                                            ),
+                                        },
+                                    );
+                                    let vine_pull_ingest: std::sync::Arc<
+                                        dyn crate::vine_pull_driver::VineIngestCtx,
+                                    > = std::sync::Arc::new(
+                                        crate::vine_pull_driver::ProdVineIngestCtx {
+                                            cache: std::sync::Arc::clone(&vine_feed_cache),
+                                            followed_set: std::sync::Arc::clone(&followed_set),
+                                        },
+                                    );
+                                    let vine_pull_followed_set =
+                                        std::sync::Arc::clone(&followed_set);
+                                    let vine_pull_followed_creators: crate::vine_pull_driver::FollowedCreatorsFn =
+                                        std::sync::Arc::new(move || {
+                                            vine_pull_followed_set
+                                                .lock()
+                                                .map(|g| g.iter().cloned().collect())
+                                                .unwrap_or_default()
+                                        });
+                                    let vine_pull_cache_for_recency =
+                                        std::sync::Arc::clone(&vine_feed_cache);
+                                    let vine_pull_last_received_ms: crate::vine_pull_driver::LastReceivedMsFn =
+                                        std::sync::Arc::new(move |creator: &str| {
+                                            vine_pull_cache_for_recency
+                                                .lock()
+                                                .ok()
+                                                .and_then(|c| c.last_received_ms_for_creator(creator))
+                                        });
+                                    let vine_pull_telemetry = std::sync::Arc::new(
+                                        crate::network_health::VinePullTelemetry::new(),
+                                    );
+                                    vine_pull_telemetry_for_state =
+                                        Some(std::sync::Arc::clone(&vine_pull_telemetry));
+                                    let vine_pull_driver = std::sync::Arc::new(
+                                        crate::vine_pull_driver::VinePullDriver::new(
+                                            *ep_arc.node_id().as_bytes(),
+                                            std::sync::Arc::clone(&pkarr_resolver_arc),
+                                            vine_pull_transport,
+                                            vine_pull_ingest,
+                                            vine_pull_followed_creators,
+                                            vine_pull_last_received_ms,
+                                            app_data_dir.join("vine_pull.cbor"),
+                                        )
+                                        .with_telemetry(vine_pull_telemetry),
+                                    );
+                                    vine_pull_wake_opt = Some(vine_pull_driver.wake_handle());
+                                    // ZEB-811 Task 9: clone the Arc BEFORE
+                                    // `.spawn()` below moves the original
+                                    // (its receiver is `self: Arc<Self>`) —
+                                    // this clone is what NodeState stashes
+                                    // for `cached_relays_for` reads; the one
+                                    // `.spawn()` takes only ever powers the
+                                    // background loop.
+                                    vine_pull_driver_opt =
+                                        Some(std::sync::Arc::clone(&vine_pull_driver));
+                                    vine_pull_driver_handle_opt = Some(vine_pull_driver.spawn());
 
                                     // D. Sender relay deposit client → inject into
                                     //    the DmOutbox (the drain's last-resort
@@ -11771,6 +12044,7 @@ pub async fn start_node_inner(
                         guard.voice_signal_tx = Some(voice_signal_tx);
                         guard.follow_mgr = Some(follow_mgr);
                         guard.vine_share_follows = vine_settings_loaded.share_follows;
+                        guard.vine_share_publicly = vine_settings_loaded.share_vines_publicly;
                         // ZEB-671: restore the LWW floor so a backwards
                         // wall clock across restarts can't publish
                         // records receivers ignore (Qodo PR #447).
@@ -12035,6 +12309,17 @@ pub async fn start_node_inner(
                         guard.community_relay_gc_handle = community_relay_gc_handle_opt.take();
                         guard.community_relay_refresher_handle =
                             community_relay_refresher_handle_opt.take();
+                        // ZEB-811 Task 8: stash the vine-pull driver's wake
+                        // handle + JoinHandle (mirrors the community-relay
+                        // pair just above — wake is Clone like `force`, the
+                        // JoinHandle is `.take()`n since stop_inner aborts it).
+                        guard.vine_pull_wake = vine_pull_wake_opt.clone();
+                        guard.vine_pull_driver_handle = vine_pull_driver_handle_opt.take();
+                        // ZEB-811 Task 9: stash the driver Arc itself (Clone,
+                        // like `force`/`wake` above — `fetch_vine_video_impl`
+                        // reads it repeatedly across the node's lifetime, so
+                        // it is never `.take()`n).
+                        guard.vine_pull_driver = vine_pull_driver_opt.clone();
                         // ZEB-418 SP2 P2: store the dm-outhold + fleet-net
                         // dataset handles (no IPC surface yet — stop_inner
                         // and the send_dm hold-write/apply-sweeper paths
@@ -12174,6 +12459,7 @@ pub async fn start_node_inner(
                         guard.pkarr_relay_client = pkarr_relay_client_for_state.take();
                         guard.pkarr_invite_publisher = pkarr_invite_publisher_for_state.take();
                         guard.pkarr_identity_publisher = pkarr_identity_publisher_for_state.take();
+                        guard.pkarr_vines_publisher = pkarr_vines_publisher_for_state.take();
                         guard.pkarr_community_publisher =
                             pkarr_community_publisher_for_state.take();
                         guard.connectivity_settings_path = pkarr_settings_path_for_state.take();
@@ -12338,6 +12624,15 @@ pub async fn start_node_inner(
                             }
                             if let Some(t) = community_relay_pull_telemetry_for_state.as_ref() {
                                 nh.set_community_relay_pull_source(std::sync::Arc::clone(t));
+                            }
+                            // ZEB-811 Task 8: vine-relay serving / pulling
+                            // health. Same additive, independently-absent
+                            // shape as the community-relay pair above.
+                            if let Some(t) = vine_relay_serving_telemetry_for_state.as_ref() {
+                                nh.set_vine_relay_serving_source(std::sync::Arc::clone(t));
+                            }
+                            if let Some(t) = vine_pull_telemetry_for_state.as_ref() {
+                                nh.set_vine_pull_source(std::sync::Arc::clone(t));
                             }
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
@@ -12534,6 +12829,11 @@ pub async fn start_node_inner(
             // aborting them they would leak (run forever holding Arc clones).
             community_relay_publisher_handle_opt,
             community_relay_pull_driver_handle_opt,
+            // ZEB-811 Task 8: carry the vine-pull driver's JoinHandle out too
+            // — same rationale as the community-relay handles above (a
+            // lock-poison rollback that skips the guard block would otherwise
+            // leak the spawned task).
+            vine_pull_driver_handle_opt,
             community_relay_gc_handle_opt,
             community_relay_refresher_handle_opt,
             node_addr_for_response,
@@ -12563,6 +12863,7 @@ pub async fn start_node_inner(
         relay_optin_engine_for_cleanup,
         mut community_relay_publisher_handle_for_cleanup,
         mut community_relay_pull_driver_handle_for_cleanup,
+        mut vine_pull_driver_handle_for_cleanup,
         mut community_relay_gc_handle_for_cleanup,
         mut community_relay_refresher_handle_for_cleanup,
         node_addr_for_response,
@@ -12744,6 +13045,11 @@ pub async fn start_node_inner(
             h.abort();
         }
         if let Some(h) = community_relay_pull_driver_handle_for_cleanup.take() {
+            h.abort();
+        }
+        // ZEB-811 Task 8: same abort-if-Some cleanup for the vine-pull
+        // driver's task.
+        if let Some(h) = vine_pull_driver_handle_for_cleanup.take() {
             h.abort();
         }
         if let Some(h) = community_relay_gc_handle_for_cleanup.take() {
@@ -15620,22 +15926,29 @@ pub struct VineDescriptorPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_creator_name: Option<String>,
     /// ZEB-673: hex 64-byte identity pub (X25519‖Ed25519) of the creator.
-    /// `Option` because signatures exist only on the wire: disk rows
-    /// (`vine_feed_cache::DescriptorOnDisk`) never retain them
-    /// (verify-once-at-ingest, same posture as `TombstoneOnDisk`), so
-    /// records rebuilt from disk carry `None`. Wire receivers reject
-    /// `None`.
+    /// `Option` because a record must be signed to be admitted (wire
+    /// receivers reject `None`). ZEB-811: disk rows
+    /// (`vine_feed_cache::DescriptorOnDisk`) now RETAIN this field (and
+    /// `sig`/`device_sig`) so a vine-relay node can serve verifiable
+    /// descriptors after a restart — verification still happens once at
+    /// ingest, but the signed original is kept (same posture as ZEB-815's
+    /// "the book keeps the signed original"). Rows persisted before
+    /// ZEB-811 deserialize with `None` here; such legacy rows still load
+    /// and list locally but are excluded from
+    /// `VineFeedCache::descriptors_for_creator_page`, which must not serve
+    /// an unverifiable row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_pub: Option<String>,
     /// ZEB-673: hex 64-byte Ed25519 signature over
-    /// `vine_signing::descriptor_canonical_bytes`.
+    /// `vine_signing::descriptor_canonical_bytes`. ZEB-811: retained on
+    /// disk alongside `identity_pub`/`device_sig` — see `identity_pub`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sig: Option<String>,
     /// ZEB-678 S2: hex 64-byte enrolled `#2` device signature over
     /// `vine_signing::descriptor_canonical_bytes_v2`. Present on records
     /// signed by the enrolled device key; its presence marks the feed as
     /// migrated (dual-path ingest requires it once the feed's authority
-    /// record is cached). Wire-only, like `sig`.
+    /// record is cached). ZEB-811: retained on disk — see `identity_pub`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_sig: Option<String>,
 }
@@ -16177,7 +16490,7 @@ pub(crate) async fn publish_vine_descriptor(
     state: &Mutex<NodeState>,
     mut descriptor: VineDescriptorPayload,
 ) -> Result<(), String> {
-    let (publish_tx, identity, dm_outbox) = {
+    let (publish_tx, identity, dm_outbox, vine_feed_cache, followed_set) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
             guard
@@ -16189,6 +16502,8 @@ pub(crate) async fn publish_vine_descriptor(
                 .clone()
                 .ok_or_else(|| "identity unavailable: cannot sign vine publish".to_string())?,
             guard.dm_outbox.clone(),
+            guard.vine_feed_cache.clone(),
+            guard.followed_set.clone(),
         )
     };
 
@@ -16234,9 +16549,51 @@ pub(crate) async fn publish_vine_descriptor(
         .await
         .map_err(|_| "event loop not running".to_string())?;
 
-    reply_rx
+    let result = reply_rx
         .await
-        .map_err(|_| "event loop dropped publish request".to_string())?
+        .map_err(|_| "event loop dropped publish request".to_string())?;
+
+    if result.is_ok() {
+        // ZEB-811: the vine-relay serve source is this cache. Own descriptors
+        // must be present with their signatures regardless of zenoh loopback
+        // semantics; on_descriptor_sample is id-keyed first-write-wins, so a
+        // loopback copy (if zenoh does deliver one back to us) dedupes to a
+        // no-op. Tests construct partial NodeStates without these Arcs —
+        // skip silently when either is absent.
+        if let (Some(cache), Some(set)) = (vine_feed_cache.as_ref(), followed_set.as_ref()) {
+            if let (Ok(mut cache), Ok(set)) = (cache.lock(), set.lock()) {
+                let key = format!("harmony/vines/{}", descriptor.creator_address);
+                if let Ok(bytes) = serde_json::to_vec(&descriptor) {
+                    // Same clock source as the event loop's descriptor arm
+                    // (event_loop.rs's `harmony/vines/` sample-handling block).
+                    let now_ms = u64::try_from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0),
+                    )
+                    .unwrap_or(u64::MAX);
+                    let _ = cache.on_descriptor_sample(&key, &bytes, &set, now_ms);
+                }
+            }
+        }
+
+        // ZEB-811 Task 4: force-republish the case-E vines relay record.
+        // Covers "first vine ever" flipping the has-vines gate (the record
+        // was skipped/unregistered until now) without waiting for the next
+        // scheduled pkarr cadence tick; a cheap no-op when already
+        // registered with the gate open. Spawned, never inline-awaited —
+        // this IPC must not block on pkarr network I/O.
+        let vines_publisher = state
+            .lock()
+            .ok()
+            .and_then(|g| g.pkarr_vines_publisher.clone());
+        if let Some(vp) = vines_publisher {
+            tokio::spawn(async move { vp.republish().await });
+        }
+    }
+
+    result
 }
 
 /// Publish a vine descriptor to the mesh network via Zenoh pub/sub.
@@ -17185,7 +17542,7 @@ mod follow_list_publish_tests {
         follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap();
         last_publish(&mut rx).expect("follow publishes");
 
-        set_vine_settings_impl(&state, false).unwrap();
+        set_vine_settings_impl(&state, false, true).unwrap();
         let (_, payload) = last_publish(&mut rx).expect("disable must retract");
         assert_eq!(payload.owner_address, node_addr);
         assert!(payload.follows.is_empty(), "retraction is an empty list");
@@ -17195,7 +17552,7 @@ mod follow_list_publish_tests {
     #[test]
     fn follow_while_sharing_disabled_publishes_nothing() {
         let (state, mut rx, _addr) = fixture(true, None);
-        set_vine_settings_impl(&state, false).unwrap();
+        set_vine_settings_impl(&state, false, true).unwrap();
         last_publish(&mut rx); // drain the retraction
 
         assert!(follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap());
@@ -17209,12 +17566,12 @@ mod follow_list_publish_tests {
     #[test]
     fn reenable_sharing_republishes_current_list() {
         let (state, mut rx, _addr) = fixture(true, None);
-        set_vine_settings_impl(&state, false).unwrap();
+        set_vine_settings_impl(&state, false, true).unwrap();
         follow_vine_creator_impl(&state, "bb".repeat(16), None).unwrap();
         follow_vine_creator_impl(&state, "cc".repeat(16), None).unwrap();
         last_publish(&mut rx); // drain the retraction (follows published nothing)
 
-        set_vine_settings_impl(&state, true).unwrap();
+        set_vine_settings_impl(&state, true, true).unwrap();
         let (_, payload) = last_publish(&mut rx).expect("re-enable must republish");
         assert_eq!(payload.follows, vec!["bb".repeat(16), "cc".repeat(16)]);
         vine_signing::verify_follow_list(&payload).expect("republished list must verify");
@@ -17227,7 +17584,7 @@ mod follow_list_publish_tests {
         // would strand peers on the stale list with all future
         // publishes suppressed.
         let (state, mut rx, _addr) = fixture(false, None);
-        let err = set_vine_settings_impl(&state, false).unwrap_err();
+        let err = set_vine_settings_impl(&state, false, true).unwrap_err();
         assert!(err.contains("cannot sign"), "got {err:?}");
         assert!(get_vine_settings_impl(&state).unwrap().share_follows);
         assert!(last_publish(&mut rx).is_none());
@@ -17245,7 +17602,7 @@ mod follow_list_publish_tests {
             owner_private_identity: Some(std::sync::Arc::new(private)),
             ..NodeState::default()
         });
-        let err = set_vine_settings_impl(&state, false).unwrap_err();
+        let err = set_vine_settings_impl(&state, false, true).unwrap_err();
         assert!(err.contains("not connected"), "got {err:?}");
         assert!(get_vine_settings_impl(&state).unwrap().share_follows);
     }
@@ -17272,11 +17629,32 @@ mod follow_list_publish_tests {
     #[test]
     fn set_vine_settings_same_value_is_a_quiet_noop() {
         let (state, mut rx, _addr) = fixture(true, None);
-        set_vine_settings_impl(&state, true).unwrap();
+        set_vine_settings_impl(&state, true, true).unwrap();
         assert!(
             last_publish(&mut rx).is_none(),
             "no transition → no retraction and no republish"
         );
+    }
+
+    #[test]
+    fn set_vine_settings_updates_share_vines_publicly_independently() {
+        // ZEB-811: share_vines_publicly has no live wire effect yet (Task 4
+        // wires the publisher), so flipping it must persist on NodeState
+        // and be readable back without touching the follow-list publish
+        // path at all.
+        let (state, mut rx, _addr) = fixture(true, None);
+        assert!(get_vine_settings_impl(&state).unwrap().share_vines_publicly);
+
+        set_vine_settings_impl(&state, true, false).unwrap();
+        assert!(!get_vine_settings_impl(&state).unwrap().share_vines_publicly);
+        assert!(
+            last_publish(&mut rx).is_none(),
+            "share_vines_publicly alone must not touch the follow-list publish path"
+        );
+
+        set_vine_settings_impl(&state, true, true).unwrap();
+        assert!(get_vine_settings_impl(&state).unwrap().share_vines_publicly);
+        assert!(last_publish(&mut rx).is_none());
     }
 }
 
@@ -17394,6 +17772,7 @@ fn build_signed_follow_list_with(
             &vine_settings::VineSettings {
                 share_follows: guard.vine_share_follows,
                 last_published_updated_at: updated_at,
+                share_vines_publicly: guard.vine_share_publicly,
             },
         );
     }
@@ -19144,11 +19523,15 @@ fn refresh_vine_graph_inputs(guard: std::sync::MutexGuard<'_, NodeState>) {
     }
 }
 
-/// Vine settings exposed to the frontend (ZEB-671).
+/// Vine settings exposed to the frontend (ZEB-671, ZEB-811).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VineSettingsDto {
     pub share_follows: bool,
+    /// ZEB-811: publish a pkarr relay record so followers outside this
+    /// owner's communities can fetch their vines. `true` by default —
+    /// vines are public by intent.
+    pub share_vines_publicly: bool,
 }
 
 /// Shared seam for `get_vine_settings`. Reads the session value on
@@ -19158,6 +19541,7 @@ pub(crate) fn get_vine_settings_impl(state: &Mutex<NodeState>) -> Result<VineSet
     let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
     Ok(VineSettingsDto {
         share_follows: guard.vine_share_follows,
+        share_vines_publicly: guard.vine_share_publicly,
     })
 }
 
@@ -19166,18 +19550,25 @@ fn get_vine_settings(state: tauri::State<'_, Mutex<NodeState>>) -> Result<VineSe
     get_vine_settings_impl(state.inner())
 }
 
-/// Shared seam for `set_vine_settings` (ZEB-671). Flipping
+/// Shared seam for `set_vine_settings` (ZEB-671, ZEB-811). Flipping
 /// `share_follows` off publishes an EMPTY signed list — the LWW
 /// retraction that clears this owner's edges on every receiver — and
 /// suppresses all further publishes; flipping it on republishes the
-/// current list. Persisting to disk is best-effort (path is `None`
-/// until a node has started).
+/// current list. `share_vines_publicly` is persisted here AND (ZEB-811
+/// Task 4) toggles the case-E pkarr vines publisher — detached, since
+/// this seam is sync (holds the std `Mutex` guard) and can't await the
+/// publisher's own registration RPC directly; see
+/// `pkarr_vines_publisher::PkarrVinesPublisher::enable`/`disable`.
+/// Persisting to disk is best-effort (path is `None` until a node has
+/// started).
 pub(crate) fn set_vine_settings_impl(
     state: &Mutex<NodeState>,
     share_follows: bool,
+    share_vines_publicly: bool,
 ) -> Result<(), String> {
     let mut guard = state.lock().map_err(|e| format!("lock: {e}"))?;
     let changed = guard.vine_share_follows != share_follows;
+    let publicly_changed = guard.vine_share_publicly != share_vines_publicly;
 
     // Disabling is TRANSACTIONAL (Greptile PR #447 P1): the empty-list
     // retraction must be signed and queued BEFORE the flag flips —
@@ -19192,6 +19583,32 @@ pub(crate) fn set_vine_settings_impl(
     }
 
     guard.vine_share_follows = share_follows;
+    // ZEB-811: persist-first — the live pkarr toggle below is spawned
+    // AFTER this assignment so a settings-load race never observes the
+    // old value.
+    guard.vine_share_publicly = share_vines_publicly;
+    // ZEB-811 Task 4 / round 2 review fix (Greptile P1): live toggle the
+    // case-E vines relay publication. `set_desired_share` writes the
+    // shared gate SYNCHRONOUSLY — before the detached task below is even
+    // spawned — so (a) local serving reflects the new setting immediately
+    // (the same atomic backs `ProdVineRelayServeCtx::share_gate`), and (b)
+    // two rapid toggles always apply their synchronous writes in true call
+    // order (both happen under this fn's `state.lock()`), so whichever
+    // detached `reconcile()` task's network I/O finishes last, it still
+    // converges on the LATEST setting rather than whatever value its own
+    // call captured — see `PkarrVinesPublisher::reconcile`'s doc comment
+    // for the full race analysis. The spawned task itself is detached (not
+    // awaited) — this fn is sync and holds the guard; it runs to
+    // completion independent of this call's return. No-op when no node is
+    // running (`pkarr_vines_publisher` is `None`).
+    if publicly_changed {
+        if let Some(vp) = guard.pkarr_vines_publisher.clone() {
+            vp.set_desired_share(share_vines_publicly);
+            tokio::spawn(async move {
+                vp.reconcile().await;
+            });
+        }
+    }
     if let Some(path) = guard.vine_settings_path.clone() {
         vine_settings::save(
             &path,
@@ -19200,6 +19617,7 @@ pub(crate) fn set_vine_settings_impl(
                 last_published_updated_at: guard
                     .follow_list_clock
                     .load(std::sync::atomic::Ordering::Relaxed),
+                share_vines_publicly,
             },
         );
     }
@@ -19213,9 +19631,10 @@ pub(crate) fn set_vine_settings_impl(
 #[tauri::command]
 async fn set_vine_settings(
     share_follows: bool,
+    share_vines_publicly: bool,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<(), String> {
-    set_vine_settings_impl(state.inner(), share_follows)
+    set_vine_settings_impl(state.inner(), share_follows, share_vines_publicly)
 }
 
 /// Shared seam for `follow_vine_creator` (GUI command + headless RPC).
@@ -19249,6 +19668,14 @@ pub(crate) fn follow_vine_creator_impl(
         {
             tracing::error!("follow_tx full — follow update not sent to event loop");
         }
+    }
+
+    // ZEB-811 Task 8: wake the vine-pull driver so a fresh follow pulls
+    // within seconds instead of waiting out the idle cadence (~7.5 min) —
+    // the driver's first action for a newly-followed creator is a full
+    // backfill from the genesis cursor (0, "").
+    if let Some(w) = &guard.vine_pull_wake {
+        w.notify_one();
     }
 
     // ZEB-671: share the updated follow list on the wire (public + opt-out)
@@ -19293,6 +19720,13 @@ pub(crate) fn unfollow_vine_creator_impl(
         {
             tracing::error!("follow_tx full — unfollow update not sent to event loop");
         }
+    }
+
+    // ZEB-811 Task 8: wake the vine-pull driver so the next pass prunes this
+    // creator's sidecar entry promptly rather than waiting out the idle
+    // cadence.
+    if let Some(w) = &guard.vine_pull_wake {
+        w.notify_one();
     }
 
     // ZEB-671: share the updated follow list on the wire (public + opt-out)
@@ -25056,6 +25490,585 @@ async fn fetch_avatar(
     reply_rx
         .await
         .map_err(|_| "event loop dropped fetch request".to_string())?
+}
+
+// =====================================================================
+// ZEB-811 Task 9: vine video fetch — mesh-first with vine-relay fallback
+// =====================================================================
+
+/// Pure decision layer for `fetch_vine_video`'s relay fallback (unit-tested
+/// without any mesh/network state — see `fetch_vine_tests` below). The mesh
+/// attempt itself has ALREADY happened by the time a caller reaches this:
+/// this fn only decides whether a relay fallback is even worth trying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VideoFetchPlan {
+    /// No relay attempt: either the creator isn't followed (their relay set
+    /// is no more trustworthy an oracle than the mesh miss already was), or
+    /// followed but every cached relay entry filtered out as self.
+    MeshOnly,
+    /// Try each relay in order (best-effort) until one serves the CID.
+    MeshThenRelay(Vec<crate::pkarr_vines::VineRelayEntry>),
+}
+
+/// `followed`: is `creator_address` in this node's followed set. `cached_relays`:
+/// the creator's raw cached relay-set hint (`VinePullDriver::cached_relays_for`,
+/// unfiltered). `self_ep`: this node's own iroh endpoint id — filtered out
+/// here (never in the accessor) because a creator's advertised relay set can
+/// list this node itself (ZEB-806: iroh rejects self-dials, so an unfiltered
+/// self-entry would be a permanent doomed dial).
+fn plan_video_fetch(
+    followed: bool,
+    cached_relays: Vec<crate::pkarr_vines::VineRelayEntry>,
+    self_ep: [u8; 32],
+) -> VideoFetchPlan {
+    if !followed {
+        return VideoFetchPlan::MeshOnly;
+    }
+    let relays: Vec<crate::pkarr_vines::VineRelayEntry> = cached_relays
+        .into_iter()
+        .filter(|r| r.iroh_endpoint_id != self_ep)
+        .collect();
+    if relays.is_empty() {
+        VideoFetchPlan::MeshOnly
+    } else {
+        VideoFetchPlan::MeshThenRelay(relays)
+    }
+}
+
+/// Read a vine-relay content response (`VineContentMeta` + chunk stream) off
+/// `recv`. Generic over any `AsyncRead` so the size-cap behavior below is
+/// unit-testable over `tokio::io::duplex` without a real iroh connection
+/// (mirrors `vine_relay::run_vine_relay_session` /
+/// `vine_pull_driver::run_vine_pull_client_session`'s pure/shell split).
+///
+/// ZEB-811 review fix round 1 (CRITICAL): `meta.size` is an untrusted `u64`
+/// claim from the relay. The original code passed it straight into
+/// `Vec::with_capacity` — a malicious/compromised relay claiming
+/// `size: u64::MAX` aborts the whole client process via allocator failure,
+/// reachable on any mesh-miss for a followed creator's video. Fixed two
+/// ways: (1) reject `meta.size > max_bytes` BEFORE any allocation, and (2)
+/// re-check the ACTUAL accumulated byte count against `max_bytes` after
+/// every chunk, independent of what `meta.size` claimed — so a relay that
+/// under-reports `meta.size` but then streams past it is cut off too, not
+/// just one that over-reports.
+async fn read_vine_content_response<R>(recv: &mut R, max_bytes: u64) -> Result<Vec<u8>, String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let meta_bytes = crate::iroh_framing::read_len_prefixed(
+        recv,
+        crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+        crate::iroh_framing::Endian::Le,
+        true,
+    )
+    .await
+    .map_err(|e| format!("read meta: {e}"))?;
+    let meta = crate::vine_relay::decode_vine_content_meta(&meta_bytes)
+        .map_err(|e| format!("decode meta: {e}"))?;
+    if !meta.ok {
+        return Err("relay refused content (unlisted or unavailable)".to_string());
+    }
+    if meta.size > max_bytes {
+        return Err(format!(
+            "relay claimed oversize content: {} bytes (max {max_bytes})",
+            meta.size
+        ));
+    }
+
+    // Reserve incrementally rather than trusting the claim up front.
+    let mut bytes = Vec::with_capacity(meta.size.min(1 << 20) as usize);
+    while (bytes.len() as u64) < meta.size {
+        let chunk = crate::iroh_framing::read_len_prefixed(
+            recv,
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .map_err(|e| format!("read chunk: {e}"))?;
+        if chunk.is_empty() {
+            // Never advances bytes.len() toward meta.size — a relay
+            // drip-feeding empty frames would otherwise keep this loop
+            // alive indefinitely (unterminating for any caller without an
+            // outer deadline).
+            return Err("relay sent an empty content chunk".to_string());
+        }
+        let remaining = meta.size - bytes.len() as u64;
+        if chunk.len() as u64 > remaining {
+            return Err("relay sent a chunk larger than the declared content size".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > max_bytes {
+            return Err("relay streamed past the content-size cap".to_string());
+        }
+    }
+    if bytes.len() as u64 != meta.size {
+        return Err("relay content ended short of the declared size".to_string());
+    }
+    Ok(bytes)
+}
+
+/// Dial one vine relay over `harmony/vine-relay/v1` and fetch `cid_hex`'s
+/// content bytes. Mirrors `vine_pull_driver::IrohVinePullTransport::pull_pages`'s
+/// dial pattern (`EndpointAddr::new(ep).with_relay_url(home_relay)`) but
+/// drives the simpler single-shot content request/response instead of the
+/// paged descriptor loop.
+///
+/// ZEB-811 review fix round 1 (Important): no per-attempt deadline here —
+/// `fetch_vine_video_impl` wraps the WHOLE multi-relay attempt loop in one
+/// shared `VINE_RELAY_IO_DEADLINE_MS` timeout, so a per-call timeout of the
+/// same duration would only let a slow relay N consume up to N ×
+/// `VINE_RELAY_IO_DEADLINE_MS` before falling back to the mesh error.
+async fn fetch_video_from_vine_relay(
+    endpoint: &crate::iroh_endpoint::IrohEndpoint,
+    relay: &crate::pkarr_vines::VineRelayEntry,
+    cid_hex: &str,
+) -> Result<Vec<u8>, String> {
+    let ep_id = iroh::EndpointId::from_bytes(&relay.iroh_endpoint_id)
+        .map_err(|e| format!("relay endpoint id: {e}"))?;
+    let mut addr = iroh::EndpointAddr::new(ep_id);
+    if !relay.home_relay.is_empty() {
+        match relay.home_relay.parse::<iroh::RelayUrl>() {
+            Ok(url) => addr = addr.with_relay_url(url),
+            Err(e) => tracing::trace!(
+                relay = %relay.home_relay,
+                "ZEB-811: skip malformed vine relay home_relay: {e}"
+            ),
+        }
+    }
+    let conn = endpoint
+        .inner()
+        .connect(addr, crate::vine_relay::VINE_RELAY_ALPN)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+
+    let req = crate::vine_relay::VinePullRequest::Content(crate::vine_relay::VineContentRequest {
+        cid_hex: cid_hex.to_string(),
+    });
+    let req_bytes =
+        crate::vine_relay::encode_vine_pull_request(&req).map_err(|e| format!("encode: {e}"))?;
+    crate::iroh_framing::write_len_prefixed(
+        &mut send,
+        &req_bytes,
+        crate::vine_relay::VINE_QUERY_MAX_FRAME_BYTES,
+        crate::iroh_framing::Endian::Le,
+        false,
+    )
+    .await
+    .map_err(|e| format!("write request: {e}"))?;
+    // Task 6 gotcha: `tokio::io::split`'s write half does NOT half-close
+    // on drop (the underlying stream is Arc-shared) — `SendStream::finish()`
+    // is the real signal. This session sends exactly one request, so
+    // finishing right after the write lets the relay's read loop end
+    // gracefully (`ClientEof`) instead of idling out the full deadline.
+    send.finish().map_err(|e| format!("finish: {e}"))?;
+
+    // ZEB-559's GUI-uploader cap: a legitimately published vine can never
+    // exceed it, and it's smaller than the relay's own
+    // `VINE_RELAY_SESSION_BYTE_BUDGET` (256 MiB vs 100 MiB) anyway, so a
+    // larger claim is definitionally bogus regardless of which bound you
+    // reason from. Reused rather than adding a second cap.
+    let result = read_vine_content_response(&mut recv, VINE_VIDEO_MAX_BYTES).await;
+    conn.close(0u32.into(), b"");
+    result
+}
+
+/// Shared seam for `fetch_vine_video` (GUI command + headless RPC). Mesh
+/// first (the identical `FetchRequest` `fetch_content` sends); on a mesh
+/// miss for a followed creator, falls back to that creator's cached vine
+/// relays over `harmony/vine-relay/v1`. Any fallback failure — no relay
+/// available, every dial/read failing, or a hash mismatch on the returned
+/// bytes — returns the ORIGINAL mesh error, never the relay's: the fallback
+/// is best-effort, and surfacing a relay-dial error for a CID that simply
+/// doesn't exist anywhere would mislead the caller.
+pub(crate) async fn fetch_vine_video_impl(
+    state: &Mutex<NodeState>,
+    cid_hex: String,
+    creator_address: String,
+) -> Result<Vec<u8>, String> {
+    if cid_hex.is_empty() || !cid_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid CID hex: {cid_hex}"));
+    }
+
+    let fetch_tx = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard
+            .fetch_tx
+            .clone()
+            .ok_or_else(|| "not connected".to_string())?
+    };
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    fetch_tx
+        .send(event_loop::FetchRequest {
+            cid_hex: cid_hex.clone(),
+            reply: reply_tx,
+            max_bytes: None,
+            serveable: false,
+        })
+        .await
+        .map_err(|_| "event loop not running".to_string())?;
+
+    let mesh_err = match reply_rx
+        .await
+        .map_err(|_| "event loop dropped fetch request".to_string())?
+    {
+        Ok(bytes) => return Ok(bytes),
+        Err(e) => e,
+    };
+
+    // Mesh missed. Gather what the fallback plan needs from NodeState under
+    // one short lock, then release it before any relay network I/O.
+    let (followed, cached_relays, self_ep, endpoint) = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let followed = guard
+            .followed_set
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|g| g.contains(&creator_address)))
+            .unwrap_or(false);
+        let cached_relays = guard
+            .vine_pull_driver
+            .as_ref()
+            .map(|d| d.cached_relays_for(&creator_address))
+            .unwrap_or_default();
+        let self_ep = guard
+            .iroh_endpoint
+            .as_ref()
+            .map(|ep| *ep.node_id().as_bytes())
+            .unwrap_or([0u8; 32]);
+        (
+            followed,
+            cached_relays,
+            self_ep,
+            guard.iroh_endpoint.clone(),
+        )
+    };
+
+    let VideoFetchPlan::MeshThenRelay(relays) = plan_video_fetch(followed, cached_relays, self_ep)
+    else {
+        return Err(mesh_err);
+    };
+    let Some(endpoint) = endpoint else {
+        return Err(mesh_err);
+    };
+    let Ok(cid_bytes) = parse_cid_hex(&cid_hex) else {
+        return Err(mesh_err);
+    };
+    let cid = crate::owner_state_types::ContentId::from_bytes(cid_bytes);
+
+    // ZEB-811 review fix round 1 (Important): ONE shared deadline across
+    // EVERY relay attempt, not `VINE_RELAY_IO_DEADLINE_MS` per relay — a
+    // UI-facing tap-to-play fetch must not wait up to
+    // `relays.len() * VINE_RELAY_IO_DEADLINE_MS` before falling back to the
+    // mesh error. Whichever attempt is in flight when the shared deadline
+    // elapses is cancelled by `timeout` (dropping its future mid-await) and
+    // the ORIGINAL mesh error is returned, same as any other fallback
+    // failure. Scoped to the network attempts only — the local
+    // `ContentStore::put` admission below runs outside this deadline so a
+    // slow-but-local disk write can't discard already hash-verified bytes.
+    let relay_attempts = async {
+        for relay in &relays {
+            let bytes = match fetch_video_from_vine_relay(&endpoint, relay, &cid_hex).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::debug!(
+                        creator = %creator_address,
+                        error = %e,
+                        "ZEB-811: vine relay content fallback failed; trying next relay"
+                    );
+                    continue;
+                }
+            };
+            // The relay is untrusted — re-verify against the CID we
+            // actually asked for BEFORE admitting or returning anything it
+            // sent back.
+            if !cid.verify_hash(&bytes) {
+                tracing::debug!(
+                    creator = %creator_address,
+                    "ZEB-811: vine relay content hash mismatch; rejecting"
+                );
+                continue;
+            }
+            return Some(bytes);
+        }
+        None
+    };
+    let verified_bytes = tokio::time::timeout(
+        std::time::Duration::from_millis(crate::vine_relay::VINE_RELAY_IO_DEADLINE_MS),
+        relay_attempts,
+    )
+    .await
+    .ok()
+    .flatten();
+
+    let Some(bytes) = verified_bytes else {
+        return Err(mesh_err);
+    };
+
+    let content_store = {
+        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        guard.content_store.clone()
+    };
+    if let Some(store) = content_store {
+        // Plain `put` (not `put_serveable`): admits for local playback,
+        // mirroring what mesh-fetch admission does, without adding this
+        // CID to the anonymous vine-relay serve allowlist (that
+        // allowlist is descriptor-driven and unrelated). Best-effort —
+        // a store failure still returns the already-verified bytes.
+        if let Err(e) = store.put(cid, bytes.clone()).await {
+            tracing::debug!(
+                error = %e,
+                "ZEB-811: vine relay content admit failed; returning bytes uncached"
+            );
+        }
+    }
+    Ok(bytes)
+}
+
+/// ZEB-811 Task 9: mesh-first video fetch with a vine-relay fallback for
+/// followed creators (spec §3 step 5). Thin wrapper over
+/// `fetch_vine_video_impl`; see there for the full behavior.
+#[tauri::command]
+async fn fetch_vine_video(
+    cid: String,
+    creator_address: String,
+    state: tauri::State<'_, Mutex<NodeState>>,
+) -> Result<Vec<u8>, String> {
+    fetch_vine_video_impl(state.inner(), cid, creator_address).await
+}
+
+#[cfg(test)]
+mod fetch_vine_tests {
+    use super::*;
+
+    const SELF_EP: [u8; 32] = [0xAA; 32];
+
+    fn other() -> crate::pkarr_vines::VineRelayEntry {
+        crate::pkarr_vines::VineRelayEntry {
+            iroh_endpoint_id: [0xBB; 32],
+            home_relay: "https://other".to_string(),
+        }
+    }
+
+    fn self_entry() -> crate::pkarr_vines::VineRelayEntry {
+        crate::pkarr_vines::VineRelayEntry {
+            iroh_endpoint_id: SELF_EP,
+            home_relay: "https://self".to_string(),
+        }
+    }
+
+    #[test]
+    fn relay_fallback_only_for_followed_creators_and_never_self() {
+        assert!(matches!(
+            plan_video_fetch(false, vec![other()], SELF_EP),
+            VideoFetchPlan::MeshOnly
+        ));
+        assert!(matches!(
+            plan_video_fetch(true, vec![], SELF_EP),
+            VideoFetchPlan::MeshOnly
+        ));
+        let VideoFetchPlan::MeshThenRelay(r) =
+            plan_video_fetch(true, vec![self_entry(), other()], SELF_EP)
+        else {
+            panic!("expected MeshThenRelay")
+        };
+        assert_eq!(r.len(), 1, "self entry filtered");
+        assert_eq!(r[0].iroh_endpoint_id, other().iroh_endpoint_id);
+    }
+
+    #[test]
+    fn all_self_relays_falls_back_to_mesh_only() {
+        // A followed creator whose ENTIRE cached relay set is this node's
+        // own entry must not manufacture a relay attempt out of nothing.
+        assert!(matches!(
+            plan_video_fetch(true, vec![self_entry()], SELF_EP),
+            VideoFetchPlan::MeshOnly
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversize_content_meta_size_rejected_before_allocation() {
+        // ZEB-811 review fix round 1 (CRITICAL): an untrusted relay's
+        // claimed `meta.size` must never reach `Vec::with_capacity`
+        // unchecked — `u64::MAX` would abort the whole client process via
+        // allocator failure. Drives the real read loop over a duplex pair
+        // with a tiny `max_bytes` so the fixture stays cheap; the
+        // relay-under-test still claims a wildly oversize `size` regardless,
+        // proving the cap is enforced on the CLAIM, not just on what a
+        // well-behaved relay happens to send.
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let (_server_read, mut server_write) = tokio::io::split(server);
+
+        let meta = crate::vine_relay::VineContentMeta {
+            ok: true,
+            size: u64::MAX,
+        };
+        let meta_bytes = crate::vine_relay::encode_vine_content_meta(&meta).expect("encode meta");
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &meta_bytes,
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write meta");
+
+        // A generous wall-clock net, not the mechanism under test: if the
+        // fix regressed back to an unchecked `Vec::with_capacity(u64::MAX)`,
+        // this would abort the process long before any timeout fired, not
+        // hang — the timeout only guards against this test itself stalling
+        // for an unrelated reason.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_vine_content_response(&mut client_read, 100),
+        )
+        .await
+        .expect("must reject promptly, not hang");
+
+        assert!(
+            result.is_err(),
+            "an oversize meta.size claim must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_streamed_past_claimed_size_is_cut_off() {
+        // Belt-and-braces half of the same fix: a relay that under-reports
+        // `meta.size` (so the pre-check passes) but then streams past it
+        // must still be rejected, on the ACTUAL accumulated byte count.
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let (_server_read, mut server_write) = tokio::io::split(server);
+
+        let meta = crate::vine_relay::VineContentMeta { ok: true, size: 10 };
+        let meta_bytes = crate::vine_relay::encode_vine_content_meta(&meta).expect("encode meta");
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &meta_bytes,
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write meta");
+        // Claims 10 bytes, actually sends 200 — well over the tiny 50-byte
+        // test cap below.
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &[7u8; 200],
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write oversize chunk");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_vine_content_response(&mut client_read, 50),
+        )
+        .await
+        .expect("must reject promptly, not hang");
+
+        assert!(
+            result.is_err(),
+            "streaming past the cap must be rejected even when meta.size understated it"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_content_chunk_is_rejected() {
+        // ZEB-811 review fix round 1: an empty len-prefixed frame never
+        // advances `bytes.len()` toward `meta.size`, so a relay drip-feeding
+        // empty frames would otherwise keep the read loop alive forever —
+        // here, past this test's bounded timeout, since the relay never
+        // sends a second frame or closes the stream. A regression back to
+        // the unchecked loop hangs on the second `read_len_prefixed` call
+        // rather than erroring on the first.
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let (_server_read, mut server_write) = tokio::io::split(server);
+
+        let meta = crate::vine_relay::VineContentMeta { ok: true, size: 10 };
+        let meta_bytes = crate::vine_relay::encode_vine_content_meta(&meta).expect("encode meta");
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &meta_bytes,
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write meta");
+        // An empty content frame — the relay sends nothing, forever.
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &[],
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write empty chunk");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_vine_content_response(&mut client_read, 1000),
+        )
+        .await
+        .expect("must reject promptly on the empty chunk, not hang waiting for more data");
+
+        assert!(result.is_err(), "an empty content chunk must be rejected");
+    }
+
+    #[tokio::test]
+    async fn chunk_overshooting_declared_size_is_rejected() {
+        // Distinct from `content_streamed_past_claimed_size_is_cut_off`:
+        // this proves the per-chunk check against the DECLARED `meta.size`,
+        // not just the caller's `max_bytes` cap — a generous `max_bytes`
+        // alone would not have caught this before the fix.
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let (_server_read, mut server_write) = tokio::io::split(server);
+
+        let meta = crate::vine_relay::VineContentMeta { ok: true, size: 5 };
+        let meta_bytes = crate::vine_relay::encode_vine_content_meta(&meta).expect("encode meta");
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &meta_bytes,
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write meta");
+        // Claims 5 bytes total but sends a 50-byte first chunk — well under
+        // a generous max_bytes, so only the declared-size check catches it.
+        crate::iroh_framing::write_len_prefixed(
+            &mut server_write,
+            &[7u8; 50],
+            crate::vine_relay::VINE_CONTENT_MAX_FRAME_BYTES,
+            crate::iroh_framing::Endian::Le,
+            true,
+        )
+        .await
+        .expect("write oversize chunk");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_vine_content_response(&mut client_read, 1_000_000),
+        )
+        .await
+        .expect("must reject promptly, not hang");
+
+        assert!(
+            result.is_err(),
+            "a chunk larger than the declared remaining size must be rejected"
+        );
+    }
 }
 
 /// ZEB-345: structured profile-page document returned to the frontend.
@@ -67715,6 +68728,7 @@ pub fn run() {
             set_replication_tier,
             fetch_content,
             fetch_avatar,
+            fetch_vine_video,
             fetch_profile_doc,
             export_content,
             ingest_content,
@@ -74909,6 +75923,7 @@ mod start_node_race_tests {
             voice_signal_tx: None,
             follow_mgr: None,
             vine_share_follows: true,
+            vine_share_publicly: true,
             vine_settings_path: None,
             follow_list_clock: std::sync::atomic::AtomicU64::new(0),
             followed_set: None,
@@ -75038,6 +76053,12 @@ mod start_node_race_tests {
             community_relay_pull_driver_handle: None,
             community_relay_gc_handle: None,
             community_relay_refresher_handle: None,
+            // ZEB-811 Task 8: vine-pull driver handle + wake unused in race
+            // tests.
+            vine_pull_driver_handle: None,
+            vine_pull_wake: None,
+            // ZEB-811 Task 9: the driver Arc unused in race tests.
+            vine_pull_driver: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles unused
             // in race tests.
             dm_outhold_doc: None,
@@ -75091,6 +76112,7 @@ mod start_node_race_tests {
             pkarr_relay_client: None,
             pkarr_invite_publisher: None,
             pkarr_identity_publisher: None,
+            pkarr_vines_publisher: None,
             pkarr_community_publisher: None,
             connectivity_settings_path: None,
             pkarr_publisher_handle: None,

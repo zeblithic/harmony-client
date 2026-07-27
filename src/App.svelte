@@ -961,6 +961,33 @@
     });
   }
 
+  // ── Vine settings (ZEB-811 review fix round 1) ──────────────────────
+  // `set_vine_settings` is a single verb that writes BOTH `shareFollows`
+  // and `shareVinesPublicly` together, so a naive "read current, patch one
+  // field, write both" handler races itself: two toggles fired close
+  // together can each read the pre-toggle state and write it back, and
+  // whichever write lands second silently resurrects the field the OTHER
+  // toggle just changed. `vineSettingsWriteChain` serializes every write
+  // through one shared snapshot — each write is queued after the previous
+  // one and builds its patch on top of that write's OWN result (not a
+  // fresh read), so a delayed write can never clobber a more recent one.
+  type VineSettingsSnapshot = { shareFollows: boolean; shareVinesPublicly: boolean };
+  let vineSettingsWriteChain: Promise<VineSettingsSnapshot | null> = Promise.resolve(null);
+
+  async function currentVineSettings(): Promise<VineSettingsSnapshot> {
+    return await tauriAdapter!.invoke('get_vine_settings', {}) as VineSettingsSnapshot;
+  }
+
+  async function setVineSetting(patch: Partial<VineSettingsSnapshot>): Promise<void> {
+    vineSettingsWriteChain = vineSettingsWriteChain.then(async (cached) => {
+      const base = cached ?? await currentVineSettings();
+      const next = { ...base, ...patch };
+      await tauriAdapter!.invoke('set_vine_settings', next);
+      return next;
+    });
+    await vineSettingsWriteChain;
+  }
+
   // ── DM creation modal (ZEB-228 Phase 4 Task 13) ─────────────────────
   // The "+ New DM" button at the bottom of the nav sidebar opens this
   // modal. Submit invokes `add_space` (DM/GroupDm wire codes), which
@@ -1503,7 +1530,13 @@
     return 'video/mp4';
   }
 
-  let resolveVideoFn = $state<((cid: string) => Promise<string>) | undefined>(undefined);
+  // ZEB-811 Task 9: creatorAddress is optional so VinePublishDialog's
+  // self-preview call (resolveVideo(cid), no creator in scope — the video
+  // was just locally ingested and hasn't been published yet) keeps working
+  // unchanged; it defaults to '' below, which never matches a followed
+  // address, so that path is always mesh-only (correct: self content is
+  // already locally cached, no relay fallback is ever needed for it).
+  let resolveVideoFn = $state<((cid: string, creatorAddress?: string) => Promise<string>) | undefined>(undefined);
 
   const avatarResolver = new AvatarResolver();
   $effect(() => () => avatarResolver.destroy());
@@ -2331,8 +2364,8 @@
       // ZEB-345 Task 10: wire the lazy profile-page resolver so panel opens can
       // fetch_profile_doc. No eager per-member resolution (unlike avatars).
       profilePageResolver.connectAdapter(adapter);
-      resolveVideoFn = async (cid: string) => {
-        const bytes = (await adapter.invoke('fetch_content', { cid })) as number[];
+      resolveVideoFn = async (cid: string, creatorAddress = '') => {
+        const bytes = (await adapter.invoke('fetch_vine_video', { cid, creatorAddress })) as number[];
         const mime = detectVideoMime(bytes);
         const blob = new Blob([new Uint8Array(bytes)], { type: mime });
         return URL.createObjectURL(blob);
@@ -4154,13 +4187,10 @@
       onPlayTargetConsumed={() => { viewOriginalTarget = null; }}
       resolveVideo={resolveVideoFn}
       ownAddress={myAddress || undefined}
-      getShareFollows={tauriAdapter ? async () => {
-        const s = await tauriAdapter!.invoke('get_vine_settings', {}) as { shareFollows: boolean };
-        return s.shareFollows;
-      } : undefined}
-      onSetShareFollows={tauriAdapter ? async (on: boolean) => {
-        await tauriAdapter!.invoke('set_vine_settings', { shareFollows: on });
-      } : undefined}
+      getShareFollows={tauriAdapter ? async () => (await currentVineSettings()).shareFollows : undefined}
+      onSetShareFollows={tauriAdapter ? async (on: boolean) => { await setVineSetting({ shareFollows: on }); } : undefined}
+      getShareVinesPublicly={tauriAdapter ? async () => (await currentVineSettings()).shareVinesPublicly : undefined}
+      onSetShareVinesPublicly={tauriAdapter ? async (on: boolean) => { await setVineSetting({ shareVinesPublicly: on }); } : undefined}
     />
     {#if showVinePublish}
       <VinePublishDialog onPublish={handleVinePublish} onPickVideo={isTauri() ? handlePickVineVideo : undefined} resolveVideo={resolveVideoFn} onClose={() => showVinePublish = false} />

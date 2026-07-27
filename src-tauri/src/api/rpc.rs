@@ -177,6 +177,24 @@ struct UnfollowVineCreatorArgs {
     address: String,
 }
 
+/// ZEB-811 Task 9: `fetch_vine_video` — mesh-first content fetch with a
+/// vine-relay fallback for a followed creator's video.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FetchVineVideoArgs {
+    cid: String,
+    creator_address: String,
+}
+
+/// ZEB-811: `set_vine_settings` — both gates are required on every call
+/// (mirrors the Tauri command signature; there is no partial-update form).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetVineSettingsArgs {
+    share_follows: bool,
+    share_vines_publicly: bool,
+}
+
 /// ZEB-527: `community_id` + capped `limit` — shared by the two recent-feed
 /// moderation read verbs (`list_recent_counter_signs`,
 /// `list_recent_moderation_events`).
@@ -1232,6 +1250,34 @@ pub fn build_registry() -> RpcRegistry {
         EmptyArgs,
         |state, _sink, _a| async move { crate::list_followed_impl(state) }
     );
+    // ZEB-811 Task 9: mesh-first video fetch with a vine-relay fallback for
+    // followed creators. Returns the raw byte `Vec<u8>` — same JSON-array
+    // shape the GUI IPC's `fetch_content`/`fetch_avatar` already return, so
+    // this is one mental model across GUI and API (file header comment).
+    rpc!(
+        m,
+        "fetch_vine_video",
+        FetchVineVideoArgs,
+        |state, _sink, a| async move {
+            crate::fetch_vine_video_impl(state, a.cid, a.creator_address).await
+        }
+    );
+    // ZEB-811: vine-settings verbs — headless parity for the Tune-sheet
+    // toggles (`share_follows`, `share_vines_publicly`).
+    rpc!(
+        m,
+        "get_vine_settings",
+        EmptyArgs,
+        |state, _sink, _a| async move { crate::get_vine_settings_impl(state) }
+    );
+    rpc!(
+        m,
+        "set_vine_settings",
+        SetVineSettingsArgs,
+        |state, _sink, a| async move {
+            crate::set_vine_settings_impl(state, a.share_follows, a.share_vines_publicly)
+        }
+    );
 
     // ZEB-669 S2: storage-buddy verbs — headless parity for the pact
     // surface (invite/accept/remove/budget/meter).
@@ -2025,6 +2071,118 @@ mod tests {
                 "{method}: expected Command (not connected), got {err:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn vine_settings_rpcs_are_registered_and_wired() {
+        // ZEB-811: unlike the follow verbs above, `get_vine_settings` and a
+        // no-op `set_vine_settings` both answer `Ok` on a default (not yet
+        // started) NodeState — neither seam requires a connected node. `Ok`
+        // here IS the wired signal: `UnknownCommand` would mean unregistered,
+        // `BadArgs` would mean the arg struct rejected the shape.
+        let reg = build_registry();
+
+        let out = reg
+            .dispatch(
+                "get_vine_settings",
+                test_state(),
+                test_sink(),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("get_vine_settings must reach the seam on a default NodeState");
+        assert_eq!(
+            out,
+            serde_json::json!({ "shareFollows": true, "shareVinesPublicly": true }),
+            "defaults must be public-by-intent true/true"
+        );
+
+        // Asymmetric values + read-back on the SAME state: pins WHICH field
+        // each arg binds to. Both params are `bool`, so a positional swap
+        // (`share_follows`/`share_vines_publicly` wired to each other's
+        // parameter) would otherwise compile and pass silently — this repo
+        // already treats that exact hazard as worth pinning, see
+        // `file_sharing_rpcs_bind_args_to_the_right_parameters`.
+        let state = test_state();
+        reg.dispatch(
+            "set_vine_settings",
+            state.clone(),
+            test_sink(),
+            serde_json::json!({ "shareFollows": true, "shareVinesPublicly": false }),
+        )
+        .await
+        .expect("set_vine_settings must reach the seam on a default NodeState");
+        let back = reg
+            .dispatch(
+                "get_vine_settings",
+                state,
+                test_sink(),
+                serde_json::json!({}),
+            )
+            .await
+            .expect("read-back");
+        assert_eq!(
+            back,
+            serde_json::json!({ "shareFollows": true, "shareVinesPublicly": false }),
+            "each arg must bind to its own parameter"
+        );
+
+        // The arg struct must actually REJECT a wrong shape (snake_case, or
+        // either field missing) — deny_unknown_fields is enforced elsewhere,
+        // this proves the required-field/casing contract for THIS struct.
+        let bad = reg
+            .dispatch(
+                "set_vine_settings",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "share_follows": true, "share_vines_publicly": false }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(bad, RpcError::BadArgs(_)),
+            "snake_case args must be rejected, got {bad:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_vine_video_rpc_is_registered_and_wired() {
+        // ZEB-811 Task 9 review fix round 1 (Important): dedicated proof,
+        // same shape as the vine-follow parity test above — this seam also
+        // requires a connected node, so valid camelCase args on a default
+        // NodeState must reach the `_impl` seam and surface its
+        // `Command("not connected")` error (NOT `UnknownCommand`, which
+        // would mean unregistered). snake_case args must be rejected by the
+        // arg struct's `deny_unknown_fields` + required-field contract.
+        let reg = build_registry();
+
+        let err = reg
+            .dispatch(
+                "fetch_vine_video",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "cid": "ab", "creatorAddress": "cd".repeat(16) }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::Command(_)),
+            "expected Command (not connected), got {err:?}"
+        );
+
+        let bad = reg
+            .dispatch(
+                "fetch_vine_video",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "cid": "ab", "creator_address": "cd".repeat(16) }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(bad, RpcError::BadArgs(_)),
+            "snake_case args must be rejected, got {bad:?}"
+        );
     }
 
     #[tokio::test]
@@ -2825,6 +2983,11 @@ mod tests {
             "follow_vine_creator",
             "unfollow_vine_creator",
             "list_followed",
+            // vine settings (ZEB-811)
+            "get_vine_settings",
+            "set_vine_settings",
+            // vine video fetch (ZEB-811 Task 9)
+            "fetch_vine_video",
             // storage buddies (ZEB-669 S2)
             "get_storage_buddies",
             "set_buddy_pledge",

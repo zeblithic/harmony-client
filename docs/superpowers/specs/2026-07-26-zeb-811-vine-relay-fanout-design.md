@@ -214,3 +214,96 @@ cache).
   own look when volunteer relays land.
 - **Live push:** pull cadence only; minutes-scale latency is the accepted feed
   semantics (Jake, 2026-07-26).
+
+## As-implemented notes (ZEB-811 branch)
+
+1. **No inner `sg` field on the vines record.** §1's payload table lists an
+   inner `sg identity_signature`, but the implementation carries only
+   `rs`/`ts`. The pkarr envelope (`PkarrRoutingRecord`) already signs the
+   blob with the `#3` identity key and embeds the identity pub, so an inner
+   signature would be redundant — the reachability flavor already zero-fills
+   its own inner signature on the pkarr path for the same reason.
+   Authenticity is `verify_inner_sig()` + freshness + the
+   identity-pub-to-address binding.
+
+2. **Cursor is `(u64, String)`, not a typed pair.** `created_at` is stored
+   and compared as seconds (`u64`), and vine descriptor ids are plain
+   `String`s rather than a dedicated id type — so the per-creator pull
+   cursor and the relay's page-ordering key are both the literal tuple
+   `(u64, String)`. Equal-`created_at` ties break on the id string.
+
+3. **On-disk descriptors retain their wire signatures.** The feed cache's
+   on-disk row carries the descriptor's wire-form signature fields
+   (previously dropped once ingest verified them), so a relay can still
+   serve verifiable descriptors after a restart — §2's "hold is serving what
+   is already there" assumed this implicitly. Rows written before this
+   change load but are treated as unsigned and are not served over the
+   relay path.
+
+4. **Publish self-ingests into the feed cache.** After a successful zenoh
+   publish, the creator's own descriptor is fed directly into their own vine
+   feed cache (id-keyed, first-write-wins) rather than relying on a zenoh
+   loopback delivery to populate it. This is best-effort — failures are
+   swallowed — but means a creator's own feed reflects a publish
+   immediately instead of waiting on a mesh round-trip.
+
+5. **No network-change republish trigger in v1.** §1 describes republish
+   triggers mirroring `ReachabilityPublisher` (startup, network-change
+   debounce, idle backstop, forced on settings change). As implemented, the
+   vines publisher registers at startup and republishes explicitly after a
+   publish or a settings toggle; there is no network-change watcher. This is
+   acceptable because a vines record's contents (endpoint id, home relay
+   URL) are churn-stable compared to reachability's direct addresses, which
+   change with the network path itself.
+
+6. **Wake-on-follow lives in the IPC handlers, not the event loop.** The
+   event loop's follow/unfollow arm stays the no-op it always was for
+   network purposes. The pull driver's wake is instead signaled directly
+   from the follow/unfollow IPC implementations, right after the existing
+   follow-set mutation.
+
+7. **Relay serve re-serializes rather than forwarding wire bytes.** The
+   vine-relay serve path deserializes cached descriptors and re-serializes
+   them for the wire response, rather than caching and forwarding the
+   original bytes verbatim. This is safe because signature verification
+   binds to the descriptor's deterministic canonical-CBOR encoding, not to
+   incidental wire-byte layout, so re-encoding cannot invalidate a
+   signature.
+
+8. **The ingest-verdict type has four variants, not three.** Beyond
+   fresh-insert and verification-failure, ingest distinguishes a
+   mesh-duplicate case from a genuinely new descriptor: both advance the
+   cursor, but only fresh inserts count toward ingest telemetry. A
+   three-variant shape would have over-counted mesh-delivered duplicates as
+   ingest activity.
+
+9. **Video fetch fallback has extra hardening beyond §3 step 5.** Before
+   allocating a buffer for a relay-served video, the fallback validates the
+   relay's claimed size against the existing vine-video size cap (the same
+   100 MiB ZEB-559 upload limit) and enforces a running-total cutoff while
+   streaming, so a malicious or buggy relay cannot force an oversized
+   allocation. All relay attempts for one fetch share a single I/O deadline
+   budget rather than each attempt getting its own timeout; the final local
+   content-store write runs outside that budget.
+
+10. **The node state carries a handle to the pull driver.** This lets the
+    video fetch fallback read the same cached relay set the pull driver
+    maintains, rather than re-resolving it independently.
+
+11. **e2e scenario notes.** `s_vines_follow_only` reads the creator's
+    address off the creator's own feed after publish rather than a
+    dedicated RPC — this is deliberately not the owner-state RPC's owner id,
+    which is different key material with a different hash formula. The
+    scenario also positively asserts on vine-relay pulling/serving telemetry
+    (sessions, descriptors ingested/served) rather than only on the
+    end-to-end outcome, so a pass can't be explained by an accidental
+    non-relay delivery path.
+
+12. **Multi-device creators publish only their own device's relay, not a
+    fleet-aggregated set.** Each device signs and publishes
+    `relay_set = [self]` under the same per-creator vines pkarr slot key, so
+    a creator enrolled on more than one device produces last-writer-wins
+    overwrites rather than the merged ≤4-entry set §1 describes — followers
+    only ever see whichever device published most recently. Aggregating
+    relay entries across a creator's fleet, so followers see every device's
+    relay rather than just the last publisher's, is left as future work.
