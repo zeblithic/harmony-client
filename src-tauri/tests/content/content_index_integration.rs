@@ -192,6 +192,7 @@ async fn ingest_list_pin_burn_roundtrip() {
                     std::sync::Arc::new(tokio::sync::Mutex::new(
                         harmony_app::community_presence::CommunityPresenceMap::new(),
                     )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
+                    None, // ZEB-815: addrbook_runtime not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
@@ -523,6 +524,7 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
                     std::sync::Arc::new(tokio::sync::Mutex::new(
                         harmony_app::community_presence::CommunityPresenceMap::new(),
                     )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
+                    None, // ZEB-815: addrbook_runtime not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
@@ -963,6 +965,7 @@ async fn fetch_complete_arm_pins_root_in_intent() {
                     std::sync::Arc::new(tokio::sync::Mutex::new(
                         harmony_app::community_presence::CommunityPresenceMap::new(),
                     )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
+                    None, // ZEB-815: addrbook_runtime not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
@@ -1257,6 +1260,7 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
                     std::sync::Arc::new(tokio::sync::Mutex::new(
                         harmony_app::community_presence::CommunityPresenceMap::new(),
                     )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
+                    None, // ZEB-815: addrbook_runtime not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test
@@ -1618,6 +1622,7 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
                     std::sync::Arc::new(tokio::sync::Mutex::new(
                         harmony_app::community_presence::CommunityPresenceMap::new(),
                     )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
+                    None, // ZEB-815: addrbook_runtime not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test

@@ -520,17 +520,23 @@ pub fn spawn_community_presence_publisher(
 /// ZEB-620 Task 5: the side effects fired when a presence apply reports a roster
 /// device-set change — extracted from the subscriber's `if changed` arm so the
 /// edge is unit-testable without standing up a live zenoh session. Bumps the
-/// ZEB-599 channel-log backfill resync watch AND kicks the reconnect supervisor
-/// into a presence sweep (re-arm all non-connected peers). Both are lossless,
+/// ZEB-599 channel-log backfill resync watch, kicks the reconnect supervisor
+/// into a presence sweep (re-arm all non-connected peers), and (ZEB-815) wakes
+/// this community's address-book snapshot requester. All three are lossless,
 /// non-blocking, and safe with no downstream consumers (`send_modify` with no
-/// receivers is a no-op; `supervisor` is `None` on iroh-disabled runs).
+/// receivers is a no-op; `supervisor` is `None` on iroh-disabled runs;
+/// `notify_one` with no waiter just leaves a permit).
 fn on_presence_roster_change(
     resync_tx: &tokio::sync::watch::Sender<u64>,
     supervisor: Option<&SupervisorHandle>,
+    addrbook_resync: Option<&Arc<tokio::sync::Notify>>,
 ) {
     resync_tx.send_modify(|e| *e = e.wrapping_add(1));
     if let Some(sup) = supervisor {
         sup.kick_sweep();
+    }
+    if let Some(n) = addrbook_resync {
+        n.notify_one();
     }
 }
 
@@ -563,6 +569,12 @@ pub fn spawn_community_presence_subscriber(
     // dropped without a registry/zenoh Delete reaching us. `None` for iroh-
     // disabled runs and test callers that bypass `start_node`.
     supervisor: Option<SupervisorHandle>,
+    // ZEB-815: this community's address-book resync handle. Fired on the same
+    // roster-change edge — a newly-visible device is exactly when a peer with
+    // a fuller address book has just become queryable, so it is the cheapest
+    // reliable trigger for a snapshot catch-up (spec §2). `None` when the
+    // address-book pool is unwired (test callers that bypass `start_node`).
+    addrbook_resync: Option<Arc<tokio::sync::Notify>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let sub = match session.declare_subscriber(&topic).await {
@@ -627,7 +639,11 @@ pub fn spawn_community_presence_subscriber(
                     supervisor_kicked = supervisor.is_some(),
                     "presence roster change → full-reconcile kick"
                 );
-                on_presence_roster_change(&resync_tx, supervisor.as_ref());
+                on_presence_roster_change(
+                    &resync_tx,
+                    supervisor.as_ref(),
+                    addrbook_resync.as_ref(),
+                );
                 let members = {
                     let g = map.lock().await;
                     g.online_owners(&community)
@@ -857,26 +873,28 @@ mod tests {
     }
 
     /// ZEB-620 Task 5: the subscriber's `if changed` edge (a roster device-set
-    /// change) fires [`on_presence_roster_change`], which both bumps the ZEB-599
-    /// resync watch AND kicks the reconnect supervisor into a presence sweep
-    /// (re-arm all non-connected peers). Drives the same `apply → changed` path
+    /// change) fires [`on_presence_roster_change`], which bumps the ZEB-599
+    /// resync watch, kicks the reconnect supervisor into a presence sweep
+    /// (re-arm all non-connected peers), and — ZEB-815 — wakes the community's
+    /// address-book snapshot requester. Drives the same `apply → changed` path
     /// the subscriber runs, then the extracted edge helper, and observes the
     /// sweep on a real `SupervisorHandle`.
-    #[test]
-    fn presence_edge_triggers_sweep() {
+    #[tokio::test]
+    async fn presence_edge_triggers_sweep() {
         use crate::reconnect_supervisor::SupervisorHandle;
 
         let mut m = CommunityPresenceMap::new();
         let c = SpaceId([7u8; 16]);
         let (resync_tx, resync_rx) = tokio::sync::watch::channel(0u64);
         let sup = SupervisorHandle::new();
+        let addrbook_resync = Arc::new(tokio::sync::Notify::new());
 
         // A first beacon is a roster device-set change (apply → true): the exact
         // edge the subscriber fires its side effects on.
         let changed = m.apply(&c, &b(1, 1, 100, 0), 1_000);
         assert!(changed, "first-device apply is a roster change");
         assert!(!sup.sweep_pending(), "no sweep before the edge fires");
-        on_presence_roster_change(&resync_tx, Some(&sup));
+        on_presence_roster_change(&resync_tx, Some(&sup), Some(&addrbook_resync));
         assert!(
             sup.sweep_pending(),
             "roster change must kick a presence sweep"
@@ -886,6 +904,14 @@ mod tests {
             1,
             "resync watch bumped alongside the sweep (ZEB-599 parity preserved)"
         );
+        // ZEB-815: the addrbook requester's wake is a stored permit, so a
+        // `notified()` that starts AFTER the fire still completes immediately.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            addrbook_resync.notified(),
+        )
+        .await
+        .expect("roster change must wake the addrbook snapshot requester");
 
         // A stale re-apply of the SAME beacon is not a roster change (apply →
         // false), so the subscriber would not reach the edge → no sweep.
@@ -897,8 +923,9 @@ mod tests {
             "no sweep without a roster change edge"
         );
 
-        // No supervisor installed (iroh-disabled / test callers) → no panic.
-        on_presence_roster_change(&resync_tx, None);
+        // Neither side effect installed (iroh-disabled / addrbook-unwired test
+        // callers) → no panic.
+        on_presence_roster_change(&resync_tx, None, None);
     }
 
     /// ZEB-622: `apply` feeds the network-health presence last-seen cache for

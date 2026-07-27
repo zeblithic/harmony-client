@@ -107,6 +107,7 @@ mod zeb398_content_policy_tests {
     }
 }
 
+pub mod address_book_sync;
 pub mod api;
 mod app_tracing;
 pub mod backup_state;
@@ -114,6 +115,7 @@ pub mod butler_deposit;
 pub mod channel_backfill;
 pub mod channel_chunk_index;
 pub mod channel_rbsr;
+pub mod community_address_book;
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
 pub mod community_device_intro_crdt;
@@ -1118,6 +1120,20 @@ pub struct NodeState {
     /// an owner identity is running.
     community_presence_request_tx:
         Option<tokio::sync::mpsc::Sender<crate::event_loop::CommunityPresenceRequest>>,
+    /// ZEB-815: control channel into the event-loop's address-book task pool.
+    /// Sent from the SAME IPC sites as `community_presence_request_tx` — a
+    /// community's address book syncs for exactly as long as the node is
+    /// subscribed to that community. `None` until a node with an owner
+    /// identity is running.
+    addrbook_request_tx: Option<tokio::sync::mpsc::Sender<crate::event_loop::AddressBookRequest>>,
+    /// ZEB-815: the node-wide address book itself — every community's routing
+    /// rows in one store, shared with the event loop's sync pool and both
+    /// publisher closures. Held here so `leave_community` can evict a departed
+    /// community's rows: the pool's `Unsubscribe` only aborts that community's
+    /// sync tasks, deliberately leaving the rows for this eviction path.
+    /// `None` until a node with an owner identity is running.
+    pub(crate) community_address_book:
+        Option<std::sync::Arc<crate::community_address_book::CommunityAddressBook>>,
     /// ZEB-537: the live community-presence roster map, shared with the event
     /// loop's subscriber + sweeper tasks. IPC reads the roster from here.
     community_presence_map:
@@ -1942,6 +1958,8 @@ impl Default for NodeState {
                 std::sync::atomic::AtomicU64::new(1),
             ),
             community_presence_request_tx: None,
+            addrbook_request_tx: None,
+            community_address_book: None,
             community_presence_map: None,
             // ZEB-290 Phase 1 Task 11 + ZEB-291 Task 19 migration: voting
             // log registry starts empty and survives stop_node (in-memory
@@ -2634,6 +2652,12 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.profile_card_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         guard.community_presence_request_tx = None;
+        // ZEB-815: dropping the sender closes the addrbook pool's request
+        // channel, whose terminal drain aborts every per-community task group.
+        // The book goes with it — a restart rebuilds an empty one and
+        // re-seeds it from each community's sidecar.
+        guard.addrbook_request_tx = None;
+        guard.community_address_book = None;
         guard.community_presence_map = None;
         // Mint Phase 2 sync: take before releasing the lock so a concurrent
         // IPC doesn't race to call notify_dirty on a shutting-down engine.
@@ -3256,6 +3280,56 @@ fn feed_revoked_from_dm_store(
     proj.union_from_members(crdt.revoked_dm_devices.iter().map(|(o, set)| (*o, set)));
 }
 
+/// ZEB-815: the two UI signals a newly-applied reachability record owes the
+/// frontend, in the one place that knows how to fire them.
+///
+/// Before the flag-day the `ReachabilityAnnounce` delta arm fired both inline:
+/// a Network-Health notify (event-driven refresh for `ConnectionStatusChip` /
+/// `NetworkHealthView` — the panels do not poll) and one
+/// `connectivity-reachability-changed` per actor (`DiagnosticsPanel`). Routing
+/// records now arrive over the address-book topic instead, and
+/// `address_book_sync` deliberately depends on neither `network_health` nor
+/// `tauri` — so it calls back through
+/// [`crate::address_book_sync::AddrbookIngestObserver`] and this type supplies
+/// the behaviour.
+///
+/// Both calls are synchronous (an mpsc send and a fire-and-forget emit), so
+/// nothing here can hold a lock across an await.
+struct ReachabilityUiSignals {
+    /// The late-populated NetworkHealthService cell. A `None` read is the
+    /// normal pre-install / iroh-bind-failed case, not an error.
+    network_health: std::sync::Arc<
+        std::sync::RwLock<Option<std::sync::Arc<crate::network_health::NetworkHealthService>>>,
+    >,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+}
+
+impl crate::address_book_sync::AddrbookIngestObserver for ReachabilityUiSignals {
+    fn reachability_applied(
+        &self,
+        actors: &std::collections::BTreeSet<crate::owner_state_types::OwnerAddr>,
+    ) {
+        // ONE notify for the batch: the service rate-limits internally, so the
+        // old per-event granularity bought nothing.
+        if let Some(nh) = self
+            .network_health
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+        {
+            nh.notify();
+        }
+        // One emit per distinct actor — the granularity the old arm had, and
+        // the shape `ConnectivityReachabilityChangedPayload` expects.
+        for actor in actors {
+            self.sink.emit(
+                "connectivity-reachability-changed",
+                serde_json::json!({ "actor": hex::encode(actor.0) }),
+            );
+        }
+    }
+}
+
 /// Start the harmony node with an embedded NodeRuntime.
 ///
 /// Generates/loads identity, creates the runtime, and spawns the event loop
@@ -3676,6 +3750,12 @@ pub async fn start_node_inner(
         guard.profile_card_next_subscription_id =
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         guard.community_presence_request_tx = None;
+        // ZEB-815: dropping the sender closes the addrbook pool's request
+        // channel, whose terminal drain aborts every per-community task group.
+        // The book goes with it — a restart rebuilds an empty one and
+        // re-seeds it from each community's sidecar.
+        guard.addrbook_request_tx = None;
+        guard.community_address_book = None;
         guard.community_presence_map = None;
         // Mint Phase 2 sync: take the prior identity's engine so it can be
         // shut down outside the lock below (same pattern as sync_engine).
@@ -3688,6 +3768,14 @@ pub async fn start_node_inner(
         // tasks symmetric with stop_inner's path so this site doesn't
         // drift if a new iroh field is added later.
         guard.clear_iroh_handles();
+        // ZEB-458 P4B: the community-relay publisher handle is NOT covered by
+        // `clear_iroh_handles`, and this rebuild path only overwrites the slot
+        // with the new identity's handle further down — so without this abort
+        // the previous identity's publisher task survives the rebuild. Mirrors
+        // stop_inner, which already aborts it.
+        if let Some(h) = guard.community_relay_publisher_handle.take() {
+            h.abort();
+        }
         tup
     };
 
@@ -4386,6 +4474,22 @@ pub async fn start_node_inner(
         // keeps `community_presence_map_for_state`.
         let (community_presence_request_tx, community_presence_request_rx) =
             tokio::sync::mpsc::channel::<crate::event_loop::CommunityPresenceRequest>(64);
+        // ZEB-815: address-book request channel + the node-wide store. Created
+        // beside the presence pair because the two are driven from the same IPC
+        // sites (subscribe/unsubscribe a community). The book holds every
+        // community's rows in one map; the event loop's pool spawns the
+        // per-community sync tasks against it.
+        let (addrbook_request_tx, addrbook_request_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::AddressBookRequest>(64);
+        let community_address_book =
+            std::sync::Arc::new(crate::community_address_book::CommunityAddressBook::new());
+        // ZEB-815 Task 6: ingest → sidecar-persist wakeups, created HERE (not
+        // inside the event loop's pool) because the reachability + relay
+        // publisher closures below are producers too: they upsert our OWN rows
+        // into the book from outside the pool entirely. A pool-local `Notify`
+        // is unreachable from them, so a locally-published row would never be
+        // persisted until a peer echoed it back.
+        let addrbook_dirty_hub = crate::address_book_sync::AddrbookDirtyHub::new();
         // ZEB-622: network-health presence last-seen cache. Created here so it can
         // be (a) wired into the presence map below — every verified beacon's
         // `apply` feeds it — and (b) installed on the NetworkHealthService at the
@@ -4462,12 +4566,12 @@ pub async fn start_node_inner(
         // the link manager needs to be live before any owner is loaded so
         // post-pair startups don't miss inbound iroh-link traffic.
         //
-        // The resolver is held here in the outer scope so the
-        // per-community membership-delta consumer closure (constructed
-        // inside the `if let Some(seed)` block below) can capture it and
-        // feed accepted `ReachabilityAnnounce` events into it. The
-        // endpoint Arc is stashed on NodeState post-spawn so Task 9's IPC
-        // handlers can reach it.
+        // The resolver is held here in the outer scope so both of its
+        // feeders can capture it: the address-book ingest path (ZEB-815 —
+        // additions) and the per-community membership-delta consumer
+        // closure constructed inside the `if let Some(seed)` block below
+        // (Leave/Kick evictions). The endpoint Arc is stashed on NodeState
+        // post-spawn so Task 9's IPC handlers can reach it.
         //
         // ZEB-321 Phase 1 Task 9: the `ReachabilityPublisher` is NOT
         // constructed here. Its real publish callback needs the
@@ -4523,6 +4627,17 @@ pub async fn start_node_inner(
             let guard = state.lock().expect("NodeState mutex poisoned");
             std::sync::Arc::clone(&guard.network_health_hook_cell)
         };
+        // ZEB-815: one observer for every address-book ingest path — the sync
+        // pool's live subscriber and snapshot requester (threaded via
+        // `AddressBookRuntime`) and the reachability publisher's own rows
+        // (which report back by return value instead). Built here because this
+        // is the first point where BOTH signal handles exist.
+        let addrbook_ingest_observer: std::sync::Arc<
+            dyn crate::address_book_sync::AddrbookIngestObserver,
+        > = std::sync::Arc::new(ReachabilityUiSignals {
+            network_health: std::sync::Arc::clone(&network_health_hook_cell),
+            sink: app.clone(),
+        });
         // ZEB-325 Phase 2c: outer-scope clone of the iroh link manager so
         // the owner-loaded block below can install the handshake
         // dispatcher once `community_registry` / `dm_outbox` /
@@ -5925,7 +6040,9 @@ pub async fn start_node_inner(
                     // only to build the pkarr butler-set advert) — this is the
                     // missing wire from that durable doc to the dialer. The self
                     // row is excluded (never dial ourselves). Mirrors the
-                    // ReachabilityAnnounce boot-replay further below (~7912).
+                    // address-book boot seed further below (search
+                    // `BOOT-PROBE 10`), which ZEB-815 put in place of the
+                    // ReachabilityAnnounce event replay this once pointed at.
                     {
                         let siblings = {
                             let doc = fleet_net_doc.lock().await;
@@ -6992,28 +7109,27 @@ pub async fn start_node_inner(
                                 let signing_key_for_epoch = std::sync::Arc::clone(&signing_key_arc);
                                 let self_owner_for_epoch = self_owner;
                                 let crdt_state_for_epoch = std::sync::Arc::clone(&crdt_state);
-                                // ZEB-321 Phase 1 Task 8: resolver feed hook.
-                                // The on_epoch_event closure already fires
-                                // on EVERY delta (not just epoch-kind ones —
-                                // see the function's doc); piggyback the
-                                // ReachabilityAnnounce dispatch here so we
-                                // don't grow `run_community_delta_consumer`'s
-                                // callback list. Both the resolver and the
-                                // AppHandle clone cheaply (Arc internals).
+                                // ZEB-321 Phase 1 Task 8, narrowed by ZEB-815:
+                                // resolver EVICTION hook. The on_epoch_event
+                                // closure already fires on EVERY delta (not just
+                                // epoch-kind ones — see the function's doc), so
+                                // the Leave/Kick evictions ride here rather than
+                                // growing `run_community_delta_consumer`'s
+                                // callback list. Additions no longer come through
+                                // this closure at all — routing rows arrive over
+                                // the address-book topic. The resolver and the
+                                // sink both clone cheaply (Arc internals); the
+                                // sink is still needed for the eviction arms'
+                                // `connectivity-reachability-changed` emit.
                                 let reachability_resolver_for_hook = reachability_resolver.clone();
                                 let app_for_reachability = app.clone();
-                                // ZEB-458 P4B: feed the in-memory
-                                // CommunityRelayResolver from freshly-applied
-                                // CommunityRelayAnnounce membership events, the
-                                // relay-resolver analogue of the
-                                // ReachabilityAnnounce hook above. Captured the
-                                // same way (Arc clone) so the async block can
-                                // move a per-invocation clone. This is the live
-                                // half of the loop: publisher inserts the
-                                // CommunityRelayAnnounce event → it replicates
-                                // via community state → this arm seeds the
-                                // resolver → the pull driver + sender client
-                                // read it and dial relays.
+                                // ZEB-458 P4B, likewise narrowed by ZEB-815: the
+                                // relay-resolver analogue. It is now only the
+                                // Leave/Kick `remove_advertiser` half — the
+                                // publisher writes an address-book row instead of
+                                // inserting a CommunityRelayAnnounce event, and
+                                // ingest is what seeds this resolver for the pull
+                                // driver + sender client to dial.
                                 let community_relay_resolver_for_hook =
                                     std::sync::Arc::clone(&community_relay_resolver);
                                 // ZEB-329: capture the shared
@@ -7038,6 +7154,18 @@ pub async fn start_node_inner(
                                 // the same choke points below).
                                 let revoked_device_projection_for_hook =
                                     revoked_device_projection.clone();
+                                // ZEB-815: the address book is the routing store the
+                                // two announce arms used to feed. Membership events no
+                                // longer ADD to it (rows arrive over the addrbook
+                                // topic), but Leave/Kick still EVICT from it — those
+                                // are membership facts and this closure is where they
+                                // land first. The dirty hub wakes the departed
+                                // community's sidecar persist task so the eviction is
+                                // durable rather than in-memory-only until the next
+                                // ingest.
+                                let addrbook_for_hook =
+                                    std::sync::Arc::clone(&community_address_book);
+                                let addrbook_dirty_for_hook = addrbook_dirty_hub.clone();
                                 // Per-session synthesized-set: avoids re-synthesizing
                                 // the same rotation/catchup within one node session.
                                 // Wrapped in Arc<Mutex<_>> so the FnMut closure can
@@ -7145,9 +7273,10 @@ pub async fn start_node_inner(
                                     let community_id = delta.community_id;
                                     let event = delta.event.clone();
                                     let local_addr_epoch = self_owner_for_epoch;
-                                    // ZEB-321 Phase 1 Task 8: resolver feed hook
-                                    // captures (resolver, app) per invocation
-                                    // so the async block can move them.
+                                    // ZEB-321 Phase 1 Task 8 (ZEB-815: eviction
+                                    // only): resolver-hook captures (resolver,
+                                    // sink) per invocation so the async block
+                                    // can move them.
                                     let resolver = reachability_resolver_for_hook.clone();
                                     let app = app_for_reachability.clone();
                                     // ZEB-458 P4B: per-invocation clone so the
@@ -7175,6 +7304,10 @@ pub async fn start_node_inner(
                                     // revoked-device projection (async block moves it).
                                     let revoked_device_projection =
                                         revoked_device_projection_for_hook.clone();
+                                    // ZEB-815: per-invocation clones for the Leave/Kick
+                                    // address-book eviction (the async block moves them).
+                                    let addrbook = std::sync::Arc::clone(&addrbook_for_hook);
+                                    let addrbook_dirty = addrbook_dirty_for_hook.clone();
                                     let projection_registry =
                                         std::sync::Arc::clone(&community_registry_for_heal);
                                     // ZEB-495: per-invocation clones for the
@@ -7220,21 +7353,17 @@ pub async fn start_node_inner(
                                         ) {
                                             let _ = profile_card_republish_tx.try_send(());
                                         }
-                                        // ZEB-321 Phase 1 Task 8: per spec §7.4,
-                                        // freshly-inserted ReachabilityAnnounce
-                                        // events feed the LWW resolver and emit
-                                        // a UI hint so the connectivity panel
-                                        // can refresh. The resolver itself
-                                        // applies the LWW comparator (spec §5.4);
-                                        // duplicate / stale deltas are no-ops.
-                                        // PR #157 round 5 (Cursor): the resolver
-                                        // tracks live cross-WAN reachability. Three
-                                        // event kinds affect it: ReachabilityAnnounce
-                                        // adds/refreshes a (owner, device) slot; Leave
-                                        // evicts all devices for the actor who left;
-                                        // Kick evicts all devices for the target who
-                                        // was kicked. All three emit the same Tauri
-                                        // event so the DiagnosticsPanel re-fetches.
+                                        // ZEB-815: the resolver tracks live cross-WAN
+                                        // reachability, and after the flag-day only
+                                        // TWO membership event kinds still affect it —
+                                        // both evictions: Leave drops every device of
+                                        // the actor who left; Kick drops every device
+                                        // of the target who was kicked. Both emit the
+                                        // same Tauri event so the DiagnosticsPanel
+                                        // re-fetches. ADDITIONS now arrive over the
+                                        // address-book topic
+                                        // (`address_book_sync::ingest_verified_row`),
+                                        // not through this consumer.
                                         let mut emit_changed: Option<crate::owner_state_types::OwnerAddr> = None;
                                         // ZEB-634 (Qodo PR #405 R1): set by the
                                         // Leave/Kick arms when the co-membership
@@ -7247,88 +7376,17 @@ pub async fn start_node_inner(
                                         // panel's re-fetch against the stale set.
                                         let mut nh_notify_after_projection = false;
                                         match &event.kind {
-                                            crate::community_membership::MembershipEventKind::ReachabilityAnnounce { payload } => {
-                                                resolver.update(
-                                                    event.actor,
-                                                    payload.clone(),
-                                                    event.at.clone(),
-                                                );
-                                                // ZEB-329: notify the
-                                                // Network Health
-                                                // rate-limiter so the
-                                                // panel re-fetches.
-                                                if let Some(nh) = network_health_cell
-                                                    .read()
-                                                    .ok()
-                                                    .and_then(|g| g.as_ref().cloned())
-                                                {
-                                                    nh.notify();
-                                                }
-                                                emit_changed = Some(event.actor);
+                                            crate::community_membership::MembershipEventKind::ReachabilityAnnounce { .. } => {
+                                                // ZEB-815: routing data now arrives via
+                                                // the address book; old events are
+                                                // ignored (decode+verify retained for
+                                                // history).
                                             }
-                                            crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { payload } => {
-                                                // ZEB-458 P4B: relay-resolver
-                                                // analogue of the
-                                                // ReachabilityAnnounce arm.
-                                                // The resolver applies LWW-by-
-                                                // ad_at on update + freshness
-                                                // on read, so a duplicate /
-                                                // stale ad is a no-op. No
-                                                // Network-Health notify (relay
-                                                // ads aren't a connectivity-
-                                                // panel signal) and no UI emit.
-                                                //
-                                                // CURRENT-membership gate
-                                                // (mirrors the boot-replay
-                                                // `is_joined` filter): a stale /
-                                                // older CommunityRelayAnnounce
-                                                // applied AFTER a later
-                                                // Leave/Kick (out-of-order
-                                                // delivery or replay) must NOT
-                                                // resurrect the departed
-                                                // advertiser — `update()` is an
-                                                // add and `remove_advertiser` is
-                                                // only a delete, so without this
-                                                // re-check the resolver would
-                                                // re-add a non-member. Read the
-                                                // advertiser's CURRENT status
-                                                // from the community's
-                                                // materialized membership and
-                                                // SKIP if not Joined.
-                                                let advertiser_is_joined = if let Some(engine) =
-                                                    registry.engine_arc(&community_id).await
-                                                {
-                                                    // Bind the Arc<Mutex<_>> to a
-                                                    // local first — `engine.state()`
-                                                    // returns by value, so locking
-                                                    // it inline would drop the
-                                                    // temporary while `st` borrows
-                                                    // it (E0716).
-                                                    let state_arc = engine.state();
-                                                    let st = state_arc.lock().await;
-                                                    st.materialized(engine.admin_addr())
-                                                        .members
-                                                        .get(&event.actor)
-                                                        .map(|m| {
-                                                            m.status
-                                                                == crate::community_membership::MemberStatus::Joined
-                                                        })
-                                                        .unwrap_or(false)
-                                                } else {
-                                                    // No engine for this
-                                                    // community (not joined /
-                                                    // torn down) → not a current
-                                                    // member; do not resurrect.
-                                                    false
-                                                };
-                                                if advertiser_is_joined {
-                                                    community_relay_resolver.update(
-                                                        community_id,
-                                                        event.actor,
-                                                        payload.clone(),
-                                                        event.at.clone(),
-                                                    );
-                                                }
+                                            crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { .. } => {
+                                                // ZEB-815: routing data now arrives via
+                                                // the address book; old events are
+                                                // ignored (decode+verify retained for
+                                                // history).
                                             }
                                             crate::community_membership::MembershipEventKind::Leave => {
                                                 // ZEB-458 P4B: retract the
@@ -7340,6 +7398,19 @@ pub async fn start_node_inner(
                                                 // remove_owner below).
                                                 community_relay_resolver
                                                     .remove_advertiser(&community_id, &event.actor);
+                                                // ZEB-815: drop the leaver's rows from
+                                                // THIS community's address book.
+                                                // Deliberately OUTSIDE the ZEB-634
+                                                // co-membership consult below: the book
+                                                // is community-scoped, so evicting here
+                                                // cannot strand a peer we still share
+                                                // another community with — that
+                                                // community keeps its own rows. Only the
+                                                // owner-global `resolver.remove_owner`
+                                                // needs the consult.
+                                                if addrbook.remove_owner(&community_id, &event.actor) > 0 {
+                                                    addrbook_dirty.handle(community_id.0).notify_one();
+                                                }
                                                 // ZEB-634 item 2: a Leave from THIS
                                                 // community must not evict a peer who
                                                 // is still a Joined co-member of
@@ -7401,6 +7472,12 @@ pub async fn start_node_inner(
                                                 // (mirrors remove_owner below).
                                                 community_relay_resolver
                                                     .remove_advertiser(&community_id, target);
+                                                // ZEB-815: as in the Leave arm above,
+                                                // for the kicked target — community-
+                                                // scoped, so ungated by the consult.
+                                                if addrbook.remove_owner(&community_id, target) > 0 {
+                                                    addrbook_dirty.handle(community_id.0).notify_one();
+                                                }
                                                 // ZEB-634 item 2: as in the Leave arm
                                                 // above, for the kicked target.
                                                 if !membership_projection
@@ -8214,75 +8291,49 @@ pub async fn start_node_inner(
 
                     community_registry_arc = Some(std::sync::Arc::clone(&registry));
 
-                    tracing::info!("BOOT-PROBE 10: healing done, entering reachability replay");
-                    // ── ZEB-321 Phase 1 PR #157 round 2 (Cursor HIGH): replay
-                    //    ReachabilityAnnounce history into the resolver ──
+                    tracing::info!(
+                        "BOOT-PROBE 10: healing done, entering address-book routing seed"
+                    );
+                    // ── ZEB-815: seed the routing resolvers from each
+                    //    community's address-book sidecar ──
                     //
-                    // The `ReachabilityResolver` is in-memory only. The hook
-                    // installed by Task 8 (in the per-community delta
-                    // consumer closure further down) updates the resolver
-                    // ONLY on freshly-inserted ReachabilityAnnounce events.
-                    // After a restart, the membership CRDT is reloaded from
-                    // disk but the resolver starts empty — so until a peer
-                    // happens to re-publish (idle interval is 60 minutes
-                    // per spec §5.6), cross-WAN dial against any peer not
-                    // yet re-announced is broken.
+                    // Both resolvers are in-memory only, so after a restart
+                    // they start empty and cross-WAN dial against any peer
+                    // that has not re-published is broken until it does
+                    // (the idle republish interval is 60 minutes). This
+                    // block closes that window at boot.
                     //
-                    // Fix: walk the event log of every just-loaded community
-                    // and feed any historical ReachabilityAnnounce events
-                    // into the resolver before the publisher starts. The
-                    // LWW projection means out-of-order replay is safe —
-                    // it converges to the same final state regardless of
-                    // call order.
+                    // Before the flag-day the seed came from replaying
+                    // historical `ReachabilityAnnounce` /
+                    // `CommunityRelayAnnounce` events out of the membership
+                    // CRDT. Those events are no longer minted, so the seed
+                    // now comes from `addrbook.cbor` — the same rows the
+                    // ingest path wrote, TTL-filtered by `load_addrbook`.
+                    //
+                    // Rows go back in through `ingest_verified_row`, the
+                    // SAME gate a peer's live row takes: it re-verifies each
+                    // row's inner signature before it reaches the store or
+                    // the resolvers. Re-verifying a file we wrote ourselves
+                    // is cheap at these row counts and means a tampered or
+                    // truncated sidecar is not a second trust path into the
+                    // routing tables. The store's LWW upsert makes the order
+                    // rows are fed irrelevant.
                     {
                         let ids = registry.known_ids().await;
-                        let mut total_replayed = 0usize;
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let mut total_seeded = 0usize;
                         for cid in &ids {
                             let Some(engine) = registry.engine_arc(cid).await else {
                                 continue;
                             };
                             let state_arc = engine.state();
-                            // Briefly hold the per-community state lock to
-                            // snapshot the event-log entries we care about,
-                            // then release before feeding the resolver
-                            // (resolver.update takes its own lock and we
-                            // don't want to hold both at once).
-                            //
-                            // PR #157 round 3 (CodeRabbit): also materialize
-                            // the current membership at snapshot time and
-                            // skip any actor not currently Joined — the live
-                            // verify_event arm enforces RCH5 (actor must be
-                            // a member at insert time), but a member who has
-                            // since Left or been Kicked would re-surface
-                            // here without this filter. Materializing at
-                            // the latest HLC is the correct gate (matches
-                            // the spec's "current member" intent for routing
-                            // — we don't want to dial Alice if she's left).
-                            // ZEB-458 P4B: extend the SAME single history scan
-                            // to also seed the CommunityRelayResolver from
-                            // historical CommunityRelayAnnounce events — the
-                            // relay-resolver analogue of the reachability
-                            // bootstrap replay. A device coming online must see
-                            // already-advertised relays before any new ad
-                            // arrives, otherwise the pull driver + sender
-                            // client find no relays to dial until a peer
-                            // re-publishes. Same still-member gate (the relay
-                            // RCH5 analogue is enforced at verify time; a since-
-                            // Left/Kicked advertiser must not re-surface) and
-                            // same LWW-safe out-of-order replay (resolver
-                            // applies LWW-by-ad_at on update + freshness on
-                            // read). Collected in the same lock-held pass so
-                            // we walk `st.events` once.
-                            let mut to_replay: Vec<(
-                                crate::owner_state_types::OwnerAddr,
-                                crate::reachability_record::ReachabilityAnnouncePayload,
-                                crate::owner_state_types::Hlc,
-                            )> = Vec::new();
-                            let mut relay_to_replay: Vec<(
-                                crate::owner_state_types::OwnerAddr,
-                                crate::community_relay_announce::CommunityRelayAnnouncePayload,
-                                crate::owner_state_types::Hlc,
-                            )> = Vec::new();
+                            let mut rows = crate::community_address_book::load_addrbook(
+                                &crate::community_address_book::addrbook_path(&identity_dir, cid),
+                                now_ms,
+                            );
                             // ZEB-329: the projection seed for this community is the
                             // block's tail value — computed UNDER the engine lock,
                             // applied AFTER it's released (the projection's contract).
@@ -8311,21 +8362,22 @@ pub async fn start_node_inner(
                                         })
                                         .unwrap_or(false)
                                 };
-                                for ev in st.events() {
-                                    match &ev.kind {
-                                        crate::community_membership::MembershipEventKind::ReachabilityAnnounce { payload } => {
-                                            if is_joined(&ev.actor) {
-                                                to_replay.push((ev.actor, payload.clone(), ev.at.clone()));
-                                            }
-                                        }
-                                        crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { payload } => {
-                                            if is_joined(&ev.actor) {
-                                                relay_to_replay.push((ev.actor, payload.clone(), ev.at.clone()));
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
+                                // Same per-row gate the live ingest path applies
+                                // (`beacon_signer_is_member` → `device_is_enrolled`):
+                                // the row's actor must be a CURRENT Joined member AND
+                                // the row's device currently enrolled for that actor.
+                                // A trusted sidecar load bypasses the live gate
+                                // entirely — without this filter a peer who Left or
+                                // was Kicked (or a device retired) while we were
+                                // offline would come back into the routing tables at
+                                // boot.
+                                rows.retain(|row| {
+                                    crate::voice_presence::device_is_enrolled(
+                                        &current,
+                                        &row.actor,
+                                        &row.device,
+                                    )
+                                });
                                 // ZEB-329: tail value — the seed for THIS community
                                 // (the Network Health peer list is scoped immediately
                                 // on restart; the on_epoch_event hook only fires on
@@ -8349,19 +8401,41 @@ pub async fn start_node_inner(
                                 }
                                 None => membership_projection.remove_community(cid),
                             }
-                            for (actor, payload, hlc) in to_replay {
-                                reachability_resolver.update(actor, payload, hlc);
-                                total_replayed += 1;
-                            }
-                            for (advertiser, payload, hlc) in relay_to_replay {
-                                community_relay_resolver.update(*cid, advertiser, payload, hlc);
+                            for row in rows {
+                                let outcome = crate::address_book_sync::ingest_verified_row(
+                                    &community_address_book,
+                                    &reachability_resolver,
+                                    &community_relay_resolver,
+                                    *cid,
+                                    row,
+                                    now_ms,
+                                );
+                                match outcome {
+                                    crate::address_book_sync::IngestOutcome::Applied(
+                                        crate::community_address_book::UpsertOutcome::Inserted
+                                        | crate::community_address_book::UpsertOutcome::Replaced,
+                                    ) => {
+                                        total_seeded += 1;
+                                    }
+                                    other => {
+                                        // Either the store declined the row (cap) or
+                                        // it failed re-verification. Neither is fatal:
+                                        // the book is fully recoverable from peer
+                                        // republish, so we drop the row and say so.
+                                        tracing::warn!(
+                                            community = %hex::encode(&cid.0[..4]),
+                                            outcome = ?other,
+                                            "ZEB-815: addrbook sidecar row not applied at boot"
+                                        );
+                                    }
+                                }
                             }
                         }
-                        if total_replayed > 0 {
+                        if total_seeded > 0 {
                             tracing::info!(
-                                replayed = total_replayed,
+                                seeded = total_seeded,
                                 communities = ids.len(),
-                                "ZEB-321 ReachabilityResolver bootstrap: replayed historical ReachabilityAnnounce events"
+                                "ZEB-815 routing bootstrap: seeded resolvers from address-book sidecars"
                             );
                             // ZEB-329: bootstrap replay touches many
                             // records but logically represents a single
@@ -8393,17 +8467,24 @@ pub async fn start_node_inner(
                     //      rule feedback_metadata_before_irreversible_write —
                     //      re-reading per community would let different
                     //      communities disagree on what address we're at).
-                    //   2. Iterate joined communities via
+                    //   2. Iterate every spawned community via
                     //      `registry.known_ids()`.
                     //   3. For each, reserve an HLC, build the inner
                     //      identity-signed `ReachabilityAnnouncePayload`,
-                    //      wrap in `MembershipEventKind::ReachabilityAnnounce`,
-                    //      sign the outer envelope with the harmony
-                    //      identity, and insert via
-                    //      `engine.insert_local_event`.
-                    //   4. Per-community failures log + continue — the
+                    //      then gate on membership (`known_ids()` is
+                    //      spawned engines, not Joined communities).
+                    //   4. ZEB-815: accumulate the payload as an
+                    //      `AddressBookRow` and, after the loop, hand the
+                    //      batch to `address_book_sync::publish_own_rows`
+                    //      — local ingest through the same gate a peer's
+                    //      row takes, then a sealed publish on each
+                    //      community's `harmony/addrbook/{hex}/records`.
+                    //      No community-CRDT event is minted (Task 6
+                    //      flag day; the announce kind survives only for
+                    //      the delta/boot consumers until Task 7).
+                    //   5. Per-community failures log + continue — the
                     //      publisher loop is long-running, one broken
-                    //      community CRDT must not abort all publishing.
+                    //      community must not abort all publishing.
                     //
                     // Skipped entirely when iroh bind failed (no
                     // endpoint to snapshot). When NO communities are
@@ -8440,11 +8521,14 @@ pub async fn start_node_inner(
                         let friend_pub_cell_for_cb = std::sync::Arc::clone(&friend_pub_cell);
                         let crdt_state_for_cb = std::sync::Arc::clone(&crdt_state);
                         let kt_for_cb = std::sync::Arc::clone(&kt);
-                        // ZEB-339: ReachabilityAnnounce is a community-membership
-                        // event. T4 rewired RCH2 verify to check BOTH the outer
-                        // event sig AND the inner `identity_signature` against the
-                        // resolved enrolled device key (#2). Sign both with device
-                        // #2, not the Reticulum-derived PrivateIdentity.
+                        // ZEB-339: the inner `identity_signature` must be made
+                        // with the enrolled device key (#2), NOT the
+                        // Reticulum-derived PrivateIdentity — every verifier
+                        // resolves the signer's enrolled key to check it.
+                        // (ZEB-815 retired the outer event signature this note
+                        // also used to cover; the device-#2 requirement is
+                        // unchanged, and the address-book ingest gate checks
+                        // the same inner signature against the row's `device`.)
                         let community_signing_key_for_cb =
                             std::sync::Arc::clone(&community_signing_key_arc);
                         let self_owner_for_cb = self_owner;
@@ -8460,6 +8544,24 @@ pub async fn start_node_inner(
                         let butler_self_device_id_hash_for_pub = this_device_id_hash;
                         let butler_self_device_vk_for_pub =
                             loaded.device_signing_key.verifying_key().to_bytes();
+                        // ZEB-815 Task 6: an announce is an address-book row
+                        // now, not a community-CRDT event. These five handles
+                        // are what replaces `engine.insert_local_event`: the
+                        // node-wide book, both resolvers the ingest gate fans
+                        // out to, the per-community dirty hub that wakes the
+                        // sidecar, and the event loop's publish channel.
+                        let addrbook_book_for_pub = std::sync::Arc::clone(&community_address_book);
+                        let addrbook_rr_for_pub = reachability_resolver.clone();
+                        let addrbook_crr_for_pub = std::sync::Arc::clone(&community_relay_resolver);
+                        let addrbook_dirty_for_pub = addrbook_dirty_hub.clone();
+                        let addrbook_publish_tx_for_pub = publish_tx.clone();
+                        // ZEB-815: our OWN reachability row used to reach the UI
+                        // the same way a peer's did — mint an announce, insert
+                        // it, let the delta arm fire both signals. Keeping that
+                        // parity means signalling here too, off what
+                        // `publish_own_rows` reports it applied.
+                        let addrbook_observer_for_pub =
+                            std::sync::Arc::clone(&addrbook_ingest_observer);
                         let publish_fn: crate::reachability_publisher::PublishFn =
                             std::sync::Arc::new(move || {
                                 // Per-invocation clones — the closure is
@@ -8485,6 +8587,14 @@ pub async fn start_node_inner(
                                 let butler_self_device_vk = butler_self_device_vk_for_pub;
                                 // ZEB-621 per-invocation clone for the address delta.
                                 let addr_fanout = std::sync::Arc::clone(&addr_fanout_for_cb);
+                                // ZEB-815 Task 6 per-invocation address-book clones.
+                                let addrbook_book = std::sync::Arc::clone(&addrbook_book_for_pub);
+                                let addrbook_rr = addrbook_rr_for_pub.clone();
+                                let addrbook_crr = std::sync::Arc::clone(&addrbook_crr_for_pub);
+                                let addrbook_dirty = addrbook_dirty_for_pub.clone();
+                                let addrbook_publish_tx = addrbook_publish_tx_for_pub.clone();
+                                let addrbook_observer =
+                                    std::sync::Arc::clone(&addrbook_observer_for_pub);
                                 Box::pin(async move {
                                     // 1. Snapshot iroh state ONCE.
                                     let node_id_bytes: [u8; 32] = *ep.node_id().as_bytes();
@@ -8583,6 +8693,26 @@ pub async fn start_node_inner(
                                     // ZEB-371 friend reconcile below still runs
                                     // (friends can exist with zero communities) —
                                     // so this is NO LONGER an early `return`.
+                                    //
+                                    // ZEB-815: the loop MINTS; the single
+                                    // publish pass after it does all the I/O,
+                                    // so every community's row comes from the
+                                    // one address snapshot taken above before
+                                    // any of them goes on the wire.
+                                    let mut addrbook_rows: Vec<(
+                                        crate::owner_state_types::SpaceId,
+                                        crate::community_address_book::AddressBookRow,
+                                    )> = Vec::new();
+                                    let mut addrbook_keys: std::collections::HashMap<
+                                        crate::owner_state_types::SpaceId,
+                                        crate::community_channel_log::ChannelKey,
+                                    > = std::collections::HashMap::new();
+                                    // Enrolled device key #2 — signs the inner
+                                    // payload, identifies us to the membership
+                                    // gate below, and is the row's `device`.
+                                    // Loop-invariant, so bound once.
+                                    let self_device_vk =
+                                        community_signing_key.verifying_key().to_bytes();
                                     let community_ids = registry.known_ids().await;
                                     for community_id in community_ids {
                                         // 3a. Reserve an HLC for this
@@ -8626,49 +8756,15 @@ pub async fn start_node_inner(
                                                 }
                                             };
 
-                                        // 3c. Mint a fresh event_id +
-                                        //     wrap in EventPayload + sign
-                                        //     the outer envelope.
-                                        let event_id: [u8; 16] = {
-                                            use rand::RngCore;
-                                            let mut buf = [0u8; 16];
-                                            rand::thread_rng().fill_bytes(&mut buf);
-                                            buf
-                                        };
-                                        let envelope = crate::community_membership::EventPayload {
-                                            id: event_id,
-                                            community_id,
-                                            kind:
-                                                crate::community_membership::MembershipEventKind::ReachabilityAnnounce {
-                                                    payload,
-                                                },
-                                            actor,
-                                            at: hlc,
-                                        };
-                                        // ZEB-339: outer SignedMembershipEvent signed
-                                        // with the enrolled device key (#2). Steady-
-                                        // state event — no cert (verifier resolves the
-                                        // signer from materialized membership).
-                                        let signed = match crate::community_membership::sign_event(
-                                            &envelope,
-                                            community_signing_key.as_ref(),
-                                        ) {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    community_id = ?community_id,
-                                                    error = %e,
-                                                    "ReachabilityAnnounce sign_event failed; \
-                                                     skipping this community"
-                                                );
-                                                continue;
-                                            }
-                                        };
-
-                                        // 3d. Insert via the per-community
-                                        //     engine. If the engine isn't
-                                        //     spawned (race with leave?),
-                                        //     log + skip.
+                                        // 3c. Resolve this community's
+                                        //     address-book seal key. The
+                                        //     engine lookup that used to feed
+                                        //     `insert_local_event` now feeds
+                                        //     the key derivation: a race with
+                                        //     leave means we hold no
+                                        //     membership key for this
+                                        //     community, so there is nothing
+                                        //     we could seal a row under.
                                         let Some(engine) = registry.engine_arc(&community_id).await
                                         else {
                                             tracing::warn!(
@@ -8678,21 +8774,111 @@ pub async fn start_node_inner(
                                             );
                                             continue;
                                         };
-                                        match engine.insert_local_event(signed).await {
-                                            Ok(_) => {
-                                                tracing::debug!(
-                                                    community_id = ?community_id,
-                                                    "ReachabilityAnnounce inserted into community CRDT"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    community_id = ?community_id,
-                                                    error = %e,
-                                                    "ReachabilityAnnounce engine.insert_local_event \
-                                                     failed; continuing with next community"
-                                                );
-                                            }
+                                        // 3d. Membership gate — the SAME
+                                        //     predicate every receiver applies
+                                        //     (`ingest_sealed_packet` calls it
+                                        //     per row), so we never mint a row
+                                        //     for a community that would
+                                        //     reject it.
+                                        //
+                                        //     Not redundant with the loop
+                                        //     bound: `known_ids()` is every
+                                        //     SPAWNED engine, not every Joined
+                                        //     community — an admin removal
+                                        //     while we are online, or the
+                                        //     window between spawn and Join,
+                                        //     leaves an engine we hold but no
+                                        //     membership. The old
+                                        //     `insert_local_event` path got
+                                        //     this for free from
+                                        //     `verify_event`'s RCH5; on the
+                                        //     address-book path it has to be
+                                        //     explicit, or a stale row lands in
+                                        //     our own book, our actor-keyed
+                                        //     resolver, and the sidecar.
+                                        //
+                                        //     Re-resolves the engine internally
+                                        //     rather than reusing the one above
+                                        //     — one map lookup per community
+                                        //     per publish tick (60-min cadence)
+                                        //     buys calling the receiver's
+                                        //     predicate verbatim instead of
+                                        //     re-deriving it here.
+                                        if !crate::voice_presence::beacon_signer_is_member(
+                                            &registry,
+                                            &community_id,
+                                            &actor,
+                                            &self_device_vk,
+                                        )
+                                        .await
+                                        {
+                                            tracing::debug!(
+                                                community_id = ?community_id,
+                                                "not an enrolled Joined member of this community; \
+                                                 skipping its ReachabilityAnnounce row"
+                                            );
+                                            continue;
+                                        }
+
+                                        addrbook_keys.insert(
+                                            community_id,
+                                            crate::address_book_sync::derive_addrbook_key(
+                                                &engine.membership_key(),
+                                                &community_id,
+                                            ),
+                                        );
+
+                                        // 3e. ZEB-815: the announce is an
+                                        //     address-book ROW now, not a
+                                        //     community-CRDT event — the
+                                        //     inner signed payload is
+                                        //     unchanged, only its carrier.
+                                        //     `device` is the enrolled key #2
+                                        //     the inner signature was made
+                                        //     with, which is what the ingest
+                                        //     gate verifies against.
+                                        addrbook_rows.push((
+                                            community_id,
+                                            crate::community_address_book::AddressBookRow {
+                                                entry:
+                                                    crate::community_address_book::AddressBookEntry::Reachability(
+                                                        payload,
+                                                    ),
+                                                actor,
+                                                device: self_device_vk,
+                                                at: hlc,
+                                                stamped_at_ms: announced_at_ms,
+                                            },
+                                        ));
+                                    }
+
+                                    // ZEB-815 Task 6: one publish pass for every
+                                    // community's row — local ingest through the
+                                    // SAME gate a peer's row takes (so `self`
+                                    // lands in our own book and resolvers, where
+                                    // the CRDT delta hook used to put it), then
+                                    // sealed onto each community's live record
+                                    // topic.
+                                    if !addrbook_rows.is_empty() {
+                                        let key_fn =
+                                            move |c: &crate::owner_state_types::SpaceId| {
+                                                addrbook_keys.get(c).cloned()
+                                            };
+                                        let applied = crate::address_book_sync::publish_own_rows(
+                                            &key_fn,
+                                            &addrbook_book,
+                                            &addrbook_rr,
+                                            &addrbook_crr,
+                                            &addrbook_publish_tx,
+                                            addrbook_rows,
+                                            &addrbook_dirty,
+                                        )
+                                        .await;
+                                        // Parity with the pre-flag-day path: our
+                                        // own announce landing in the resolver
+                                        // refreshed the panels too.
+                                        if !applied.is_empty() {
+                                            addrbook_observer.reachability_applied(&applied);
                                         }
                                     }
 
@@ -10265,12 +10451,13 @@ pub async fn start_node_inner(
                         //    The three CONNECTING HOOKS — resolver-feed on
                         //    applied CommunityRelayAnnounce, bootstrap replay of
                         //    historical announces into the resolver, and the
-                        //    republish-timer poke — are T11c. Until T11c lands
-                        //    the resolver stays empty, so the pull driver +
-                        //    sender client find no relays to dial (they are
-                        //    correctly wired, just unfed). The deposit/pull
-                        //    ACCEPTORS, the publisher (advertises THIS node), and
-                        //    the GC sweep are fully live now.
+                        //    republish-timer poke — were T11c. ZEB-815 then
+                        //    replaced the first two: relay records now reach the
+                        //    resolver through address-book ingest, and boot seeds
+                        //    it from the addrbook sidecar rather than from event
+                        //    history. The deposit/pull ACCEPTORS, the publisher
+                        //    (advertises THIS node), and the GC sweep are
+                        //    unchanged.
 
                         // One shared registry-backed membership lookup, reused by
                         // every relay ctx/client built below.
@@ -10588,10 +10775,16 @@ pub async fn start_node_inner(
                                     // E. Relay publish-fn + publisher. Mirrors the
                                     //    reachability publish-fn: for each opted-in
                                     //    community this node is ALSO a Joined
-                                    //    member of, mint an HLC, build the signed
+                                    //    member of, mint an HLC and build the signed
                                     //    CommunityRelayAnnounce (inner sig HLC ==
-                                    //    outer EventPayload.at), and insert it via
-                                    //    that community's engine.
+                                    //    the row's `at`). ZEB-815: the payload
+                                    //    becomes an `AddressBookRow` published via
+                                    //    `address_book_sync::publish_own_rows` — no
+                                    //    community-CRDT event is minted. The
+                                    //    rendezvous slot refresh runs AFTER that
+                                    //    publish, because it ranks this node
+                                    //    against a relay resolver the publish has
+                                    //    just fed with our own ad.
                                     let relay_publish_fn: crate::community_relay_publisher::RelayPublishFn = {
                                         let registry = std::sync::Arc::clone(&registry);
                                         let signing_key =
@@ -10620,6 +10813,24 @@ pub async fn start_node_inner(
                                         let relay_device_ed25519_verify =
                                             community_signing_key_arc.verifying_key().to_bytes();
                                         let ep_for_relay = std::sync::Arc::clone(ep_arc);
+                                        // ZEB-815 Task 6: same swap as the
+                                        // reachability publisher — the relay ad
+                                        // becomes an address-book row instead of
+                                        // a community-CRDT event. `addrbook_crr`
+                                        // is the SAME resolver handle
+                                        // `rendezvous_resolver` ranks slots from;
+                                        // named separately because here it is an
+                                        // ingest fan-out target, not a ranking
+                                        // input.
+                                        let addrbook_book_for_relay =
+                                            std::sync::Arc::clone(&community_address_book);
+                                        let addrbook_rr_for_relay =
+                                            reachability_resolver.clone();
+                                        let addrbook_crr_for_relay =
+                                            std::sync::Arc::clone(&community_relay_resolver);
+                                        let addrbook_dirty_for_relay =
+                                            addrbook_dirty_hub.clone();
+                                        let addrbook_publish_tx_for_relay = publish_tx.clone();
                                         std::sync::Arc::new(move || {
                                             let registry = std::sync::Arc::clone(&registry);
                                             let signing_key = std::sync::Arc::clone(&signing_key);
@@ -10632,6 +10843,15 @@ pub async fn start_node_inner(
                                                 std::sync::Arc::clone(&rendezvous_publisher);
                                             let rendezvous_resolver =
                                                 std::sync::Arc::clone(&rendezvous_resolver);
+                                            let addrbook_book =
+                                                std::sync::Arc::clone(&addrbook_book_for_relay);
+                                            let addrbook_rr = addrbook_rr_for_relay.clone();
+                                            let addrbook_crr =
+                                                std::sync::Arc::clone(&addrbook_crr_for_relay);
+                                            let addrbook_dirty =
+                                                addrbook_dirty_for_relay.clone();
+                                            let addrbook_publish_tx =
+                                                addrbook_publish_tx_for_relay.clone();
                                             Box::pin(async move {
                                                 let now_ms = std::time::SystemTime::now()
                                                     .duration_since(std::time::UNIX_EPOCH)
@@ -10652,6 +10872,25 @@ pub async fn start_node_inner(
                                                 let opted = {
                                                     optin.lock().await.opted_in_communities()
                                                 };
+                                                // ZEB-815: mint in the loop,
+                                                // publish once after it — then
+                                                // refresh the rendezvous slots,
+                                                // which must see the freshly
+                                                // upserted self ad (see below).
+                                                let mut addrbook_rows: Vec<(
+                                                    crate::owner_state_types::SpaceId,
+                                                    crate::community_address_book::AddressBookRow,
+                                                )> = Vec::new();
+                                                let mut addrbook_keys: std::collections::HashMap<
+                                                    crate::owner_state_types::SpaceId,
+                                                    crate::community_channel_log::ChannelKey,
+                                                > = std::collections::HashMap::new();
+                                                let mut slot_refreshes: Vec<(
+                                                    crate::owner_state_types::SpaceId,
+                                                    std::sync::Arc<
+                                                        crate::community_state_sync::CommunitySyncEngine,
+                                                    >,
+                                                )> = Vec::new();
                                                 for c in opted {
                                                     if !membership.is_joined(&c, &actor.0).await {
                                                         continue;
@@ -10682,38 +10921,12 @@ pub async fn start_node_inner(
                                                             continue;
                                                         }
                                                     };
-                                                    let event_id: [u8; 16] = {
-                                                        use rand::RngCore;
-                                                        let mut buf = [0u8; 16];
-                                                        rand::thread_rng().fill_bytes(&mut buf);
-                                                        buf
-                                                    };
-                                                    let envelope =
-                                                        crate::community_membership::EventPayload {
-                                                            id: event_id,
-                                                            community_id: c,
-                                                            kind: crate::community_membership::MembershipEventKind::CommunityRelayAnnounce {
-                                                                payload,
-                                                            },
-                                                            actor,
-                                                            at: hlc,
-                                                        };
-                                                    let signed = match crate::community_membership::sign_event(
-                                                        &envelope,
-                                                        signing_key.as_ref(),
-                                                    ) {
-                                                        Ok(s) => s,
-                                                        Err(e) => {
-                                                            tracing::warn!(
-                                                                community_id = ?c,
-                                                                error = %e,
-                                                                "ZEB-458: CommunityRelayAnnounce \
-                                                                 sign_event failed; skipping this \
-                                                                 community"
-                                                            );
-                                                            continue;
-                                                        }
-                                                    };
+                                                    // The engine lookup that used
+                                                    // to feed `insert_local_event`
+                                                    // now feeds the address-book
+                                                    // seal key — and still feeds
+                                                    // `refresh_slot`'s membership
+                                                    // key below.
                                                     let Some(engine) =
                                                         registry.engine_arc(&c).await
                                                     else {
@@ -10725,28 +10938,83 @@ pub async fn start_node_inner(
                                                         );
                                                         continue;
                                                     };
-                                                    if let Err(e) =
-                                                        engine.insert_local_event(signed).await
-                                                    {
-                                                        tracing::warn!(
-                                                            community_id = ?c,
-                                                            error = %e,
-                                                            "ZEB-458: CommunityRelayAnnounce \
-                                                             insert_local_event failed; continuing"
-                                                        );
-                                                    }
+                                                    addrbook_keys.insert(
+                                                        c,
+                                                        crate::address_book_sync::derive_addrbook_key(
+                                                            &engine.membership_key(),
+                                                            &c,
+                                                        ),
+                                                    );
+                                                    addrbook_rows.push((
+                                                        c,
+                                                        crate::community_address_book::AddressBookRow {
+                                                            entry:
+                                                                crate::community_address_book::AddressBookEntry::Relay(
+                                                                    payload,
+                                                                ),
+                                                            actor,
+                                                            device: signing_key
+                                                                .verifying_key()
+                                                                .to_bytes(),
+                                                            at: hlc,
+                                                            stamped_at_ms: now_ms,
+                                                        },
+                                                    ));
+                                                    slot_refreshes.push((c, engine));
+                                                }
 
-                                                    // Beacon-side: (re)publish this
-                                                    // node's rendezvous slot for `c`.
-                                                    // Ranks into a slot by its position
-                                                    // in the FRESH advertiser set; if
-                                                    // this node is at rank i < N it
-                                                    // publishes its reachability under
-                                                    // the slot key, else it unregisters
-                                                    // any stale slot. Re-published on
-                                                    // the same triggers as the relay ad
-                                                    // (refresh cadence + membership-
-                                                    // change force-wake).
+                                                // ZEB-815 Task 6: publish BEFORE
+                                                // the slot refresh below. The
+                                                // refresh ranks this node against
+                                                // `advertiser_addrs_for_community`,
+                                                // which reads the relay resolver —
+                                                // and `publish_own_rows`' local
+                                                // ingest is what puts our OWN ad
+                                                // there, exactly as
+                                                // `insert_local_event`'s delta hook
+                                                // did before it. Refreshing first
+                                                // would rank us against a set that
+                                                // is missing us.
+                                                if !addrbook_rows.is_empty() {
+                                                    let key_fn =
+                                                        move |c: &crate::owner_state_types::SpaceId| {
+                                                            addrbook_keys.get(c).cloned()
+                                                        };
+                                                    // ZEB-815: no UI signal here.
+                                                    // These rows are Relay-kind, and
+                                                    // the CommunityRelayAnnounce delta
+                                                    // arm this replaced deliberately
+                                                    // fired neither the Network-Health
+                                                    // notify nor the Tauri emit — a
+                                                    // relay ad is not a
+                                                    // connectivity-panel input. The
+                                                    // returned set is empty for the
+                                                    // same reason.
+                                                    crate::address_book_sync::publish_own_rows(
+                                                        &key_fn,
+                                                        &addrbook_book,
+                                                        &addrbook_rr,
+                                                        &addrbook_crr,
+                                                        &addrbook_publish_tx,
+                                                        addrbook_rows,
+                                                        &addrbook_dirty,
+                                                    )
+                                                    .await;
+                                                }
+
+                                                // Beacon-side: (re)publish this
+                                                // node's rendezvous slot per
+                                                // community. Ranks into a slot by
+                                                // its position in the FRESH
+                                                // advertiser set; if this node is
+                                                // at rank i < N it publishes its
+                                                // reachability under the slot key,
+                                                // else it unregisters any stale
+                                                // slot. Re-published on the same
+                                                // triggers as the relay ad
+                                                // (refresh cadence + membership-
+                                                // change force-wake).
+                                                for (c, engine) in slot_refreshes {
                                                     let advertisers = rendezvous_resolver
                                                         .advertiser_addrs_for_community(
                                                             &c, now_ms,
@@ -11202,6 +11470,25 @@ pub async fn start_node_inner(
                 let community_presence_request_rx_for_loop = Some(community_presence_request_rx);
                 let community_presence_map_for_loop =
                     std::sync::Arc::clone(&community_presence_map);
+                // ZEB-815: bundle the address-book pool's inputs. The two
+                // resolvers are the SAME handles the CRDT membership-delta hook
+                // feeds today (spec §4) — ingest fans out to them so the dial
+                // supervisor and deposit ordering see no change. Both resolver
+                // types share their state across clones (`ReachabilityResolver`
+                // is Arc-internal; the relay resolver is already an Arc), so
+                // these are handles, not copies. `None` when the community
+                // relay resolver was never built (no owner identity).
+                let addrbook_runtime_for_loop = community_relay_resolver_opt.clone().map(|crr| {
+                    crate::event_loop::AddressBookRuntime {
+                        request_rx: addrbook_request_rx,
+                        book: std::sync::Arc::clone(&community_address_book),
+                        reachability_resolver: std::sync::Arc::new(reachability_resolver.clone()),
+                        community_relay_resolver: crr,
+                        identity_dir: identity_dir.clone(),
+                        dirty_hub: addrbook_dirty_hub.clone(),
+                        ingest_observer: Some(std::sync::Arc::clone(&addrbook_ingest_observer)),
+                    }
+                });
                 // Mint Phase 2 sync: thread handles into event_loop::run.
                 let mint_sync_handles_for_loop = mint_sync_handles_opt;
                 // ZEB-417 SP1: thread the Notes adapter handles into
@@ -11394,6 +11681,9 @@ pub async fn start_node_inner(
                                 profile_card_request_rx_for_loop,
                                 community_presence_request_rx_for_loop,
                                 community_presence_map_for_loop,
+                                // ZEB-815: address-book pool inputs (request rx
+                                // + store + resolver fan-out + sidecar root).
+                                addrbook_runtime_for_loop,
                                 mint_sync_handles_for_loop,
                                 notes_sync_handles_for_loop,
                                 dm_inbox_sync_handles_for_loop,
@@ -11678,6 +11968,12 @@ pub async fn start_node_inner(
                         // shared roster map so presence IPC handlers can drive the
                         // pool and read the live roster.
                         guard.community_presence_request_tx = Some(community_presence_request_tx);
+                        // ZEB-815: the sibling sender the same IPC sites drive,
+                        // plus the book itself so `leave_community` can evict a
+                        // departed community's rows.
+                        guard.addrbook_request_tx = Some(addrbook_request_tx);
+                        guard.community_address_book =
+                            Some(std::sync::Arc::clone(&community_address_book));
                         guard.community_presence_map = Some(community_presence_map_for_state);
                         // Mint Phase 2 sync: store the engine Arc so IPC handlers
                         // can call notify_dirty() after mutations.
@@ -41703,13 +41999,16 @@ pub(crate) async fn subscribe_community_presence_impl(
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .try_into()
         .map_err(|_| "community_id length wrong".to_string())?;
-    let request_tx = {
+    let (request_tx, addrbook_tx) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.community_presence_request_tx
-            .clone()
-            .ok_or(OWNER_NOT_LOADED_MSG)?
+        (
+            g.community_presence_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.addrbook_request_tx.clone(),
+        )
     };
     request_tx
         .send(crate::event_loop::CommunityPresenceRequest::Subscribe {
@@ -41717,6 +42016,20 @@ pub(crate) async fn subscribe_community_presence_impl(
         })
         .await
         .map_err(|e| format!("community_presence_request_tx send: {e}"))?;
+    // ZEB-815: the address book subscribes on the same edge. Best-effort — a
+    // failure here degrades routing catch-up (live records still arrive once
+    // any peer publishes) and must not fail the presence subscribe, which the
+    // caller already treats as the contract of this IPC.
+    if let Some(tx) = addrbook_tx {
+        if let Err(e) = tx
+            .send(crate::event_loop::AddressBookRequest::Subscribe {
+                community_id: cid_bytes,
+            })
+            .await
+        {
+            tracing::warn!(community = %community_id, error = %e, "addrbook subscribe send failed");
+        }
+    }
     Ok(())
 }
 
@@ -41743,13 +42056,16 @@ pub(crate) async fn unsubscribe_community_presence_impl(
         .map_err(|e| format!("invalid community_id hex: {e}"))?
         .try_into()
         .map_err(|_| "community_id length wrong".to_string())?;
-    let request_tx = {
+    let (request_tx, addrbook_tx) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.community_presence_request_tx
-            .clone()
-            .ok_or(OWNER_NOT_LOADED_MSG)?
+        (
+            g.community_presence_request_tx
+                .clone()
+                .ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.addrbook_request_tx.clone(),
+        )
     };
     request_tx
         .send(crate::event_loop::CommunityPresenceRequest::Unsubscribe {
@@ -41757,6 +42073,18 @@ pub(crate) async fn unsubscribe_community_presence_impl(
         })
         .await
         .map_err(|e| format!("community_presence_request_tx send: {e}"))?;
+    // ZEB-815: tear down this community's address-book sync tasks on the same
+    // edge. Best-effort for the same reason as the Subscribe sibling.
+    if let Some(tx) = addrbook_tx {
+        if let Err(e) = tx
+            .send(crate::event_loop::AddressBookRequest::Unsubscribe {
+                community_id: cid_bytes,
+            })
+            .await
+        {
+            tracing::warn!(community = %community_id, error = %e, "addrbook unsubscribe send failed");
+        }
+    }
     Ok(())
 }
 
@@ -42789,6 +43117,76 @@ pub(crate) async fn leave_community_impl(
                 community_id = %hex::encode(space_id.0),
                 "ZEB-323 Phase 2b: unregistered case-C pkarr publication after leave"
             );
+        }
+    }
+
+    // ZEB-815: address-book teardown for a community we just left. The
+    // membership-delta hook's Leave arm only evicts the leaver's OWN rows from
+    // a community it stays in; leaving ourselves retires the whole book for
+    // this community — every remaining member's rows are routing data we have
+    // no further business holding.
+    //
+    // Order matters. `remove_community` first, so the rows are gone from the
+    // store before anything can snapshot it; then `Unsubscribe`, which aborts
+    // this community's four sync tasks (including the persist task); then the
+    // sidecar delete. A persist task that wakes in the window between the
+    // eviction and its abort can only write the post-eviction snapshot — an
+    // EMPTY sidecar, which the next boot's `load_addrbook` reads as no rows.
+    // Every step is best-effort: the Leave has already committed and a stale
+    // sidecar is recoverable (TTL + membership filter at boot), so none of
+    // this may fail the IPC.
+    {
+        let (book, addrbook_tx, identity_dir) = {
+            match state.lock() {
+                Ok(g) => (
+                    g.community_address_book.clone(),
+                    g.addrbook_request_tx.clone(),
+                    g.identity_dir.clone(),
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        community_id = %hex::encode(space_id.0),
+                        error = %e,
+                        "leave_community: NodeState poisoned; skipping addrbook teardown"
+                    );
+                    (None, None, None)
+                }
+            }
+        };
+        if let Some(book) = book {
+            let evicted = book.remove_community(&space_id);
+            tracing::debug!(
+                community_id = %hex::encode(space_id.0),
+                evicted,
+                "ZEB-815: evicted address-book rows after leave"
+            );
+        }
+        if let Some(tx) = addrbook_tx {
+            if let Err(e) = tx
+                .send(crate::event_loop::AddressBookRequest::Unsubscribe {
+                    community_id: space_id.0,
+                })
+                .await
+            {
+                tracing::warn!(
+                    community_id = %hex::encode(space_id.0),
+                    error = %e,
+                    "leave_community: addrbook unsubscribe send failed"
+                );
+            }
+        }
+        if let Some(dir) = identity_dir {
+            let path = crate::community_address_book::addrbook_path(&dir, &space_id);
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        community_id = %hex::encode(space_id.0),
+                        path = %path.display(),
+                        error = %e,
+                        "leave_community: addrbook sidecar delete failed"
+                    );
+                }
+            }
         }
     }
 
@@ -48153,13 +48551,13 @@ pub fn delta_to_change(
         // projection to MembershipChange is deferred to Task 8 (IPC wiring).
         | crate::community_membership::MembershipEventKind::AdminProposal { .. }
         | crate::community_membership::MembershipEventKind::AdminCountersign { .. }
-        // ZEB-321: ReachabilityAnnounce is connectivity-state, not
-        // membership-state; no MembershipChange is projected. Handled
-        // by the ReachabilityResolver hook in event_loop.
+        // ZEB-321 / ZEB-458: ReachabilityAnnounce and CommunityRelayAnnounce
+        // are connectivity/relay state, not membership-state; no
+        // MembershipChange is projected. ZEB-815 retired both kinds — they
+        // are neither minted nor consumed any more (routing data travels on
+        // the address-book topic); these patterns keep historical logs
+        // matching exhaustively.
         | crate::community_membership::MembershipEventKind::ReachabilityAnnounce { .. }
-        // ZEB-458: CommunityRelayAnnounce is relay-state, not
-        // membership-state; no MembershipChange is projected. Consumed
-        // by CommunityRelayResolver.
         | crate::community_membership::MembershipEventKind::CommunityRelayAnnounce { .. }
         // ZEB-713: recovery events are governance events with DERIVED
         // effects (evaluated at materialize time, not at event arrival);
@@ -65839,11 +66237,13 @@ async fn connectivity_force_republish(
 /// `ReachabilityAnnounce` immediately, INSTEAD of waiting for the next
 /// startup / network-change / 60-min idle tick.
 ///
-/// The publisher's loop iterates `registry.known_ids()` and, for each
-/// community, signs + inserts a `ReachabilityAnnounce` carrying this device's
-/// DURABLE butler-set (the seal-targets a fully-offline recipient's DM deposit
-/// resolves). Two state changes the publisher does NOT otherwise observe make
-/// the advertised announce stale, so they call this:
+/// The publisher's loop iterates `registry.known_ids()` and, for each community
+/// it is an enrolled Joined member of, signs a `ReachabilityAnnounce` carrying
+/// this device's DURABLE butler-set (the seal-targets a fully-offline
+/// recipient's DM deposit resolves) and publishes it as an address-book record
+/// (ZEB-815 — it is no longer inserted into the community CRDT). Two state
+/// changes the publisher does NOT otherwise observe make the advertised
+/// announce stale, so they call this:
 ///
 ///  * **community create / join** — a freshly-joined member must publish a
 ///    per-community announce so co-members (the sender's resolver) learn its
@@ -66460,13 +66860,15 @@ pub(crate) async fn set_butler_pin_impl(
     }
 
     // durable-seal-targets: a pin change rewrites this device's advertised
-    // butler-set, so the COMMUNITY-CRDT `ReachabilityAnnounce` must be
-    // re-emitted too (the `routing_republish` above only refreshes the PKARR
-    // routing record + fleet-net self-row, not the per-community announce the
-    // deposit rungs resolve seal-targets from). The fleet-net doc + snapshot are
-    // already updated above, and the reachability publish-fn reads the snapshot
-    // when it next runs, so waking it now makes the next announce carry the new
-    // butler-set. Best-effort; no-op when the publisher isn't running.
+    // butler-set, so the per-community `ReachabilityAnnounce` address-book
+    // record must be re-emitted too (ZEB-815 moved it off the community CRDT;
+    // the republish trigger is unchanged). The `routing_republish` above only
+    // refreshes the PKARR routing record + fleet-net self-row, not the
+    // per-community announce the deposit rungs resolve seal-targets from. The
+    // fleet-net doc + snapshot are already updated above, and the reachability
+    // publish-fn reads the snapshot when it next runs, so waking it now makes
+    // the next announce carry the new butler-set. Best-effort; no-op when the
+    // publisher isn't running.
     force_reachability_republish(state);
     Ok(())
 }
@@ -74584,6 +74986,8 @@ mod start_node_race_tests {
                 std::sync::atomic::AtomicU64::new(1),
             ),
             community_presence_request_tx: None,
+            addrbook_request_tx: None,
+            community_address_book: None,
             community_presence_map: None,
             voting_logs: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -76411,151 +76815,41 @@ mod propose_change_quorum_tests {
     }
 }
 
-// ── ZEB-321 Phase 1 Task 8 ─────────────────────────────────────────────
+// ── ZEB-321 Phase 1 Task 8 (ZEB-815: eviction half only) ───────────────
 //
 // Tests for the per-community membership-delta consumer's
-// `ReachabilityAnnounce` → `ReachabilityResolver` feed hook.
+// `ReachabilityResolver` EVICTION hooks.
 //
-// The hook itself lives in-line inside the consumer closure built by
-// `start_node` (see the `on_epoch_event` callback construction around the
+// The hooks live in-line inside the consumer closure built by `start_node`
+// (see the `on_epoch_event` callback construction around the
 // `reachability_resolver_for_hook` capture). Driving the full delta
 // consumer would require standing up `OwnerState` + `CommunityState` +
-// the engine pool, which is out of scope per the implementer brief —
-// the full CRDT-insert path is covered by Task 10's two-engine
-// integration test.
+// the engine pool, which is out of scope here — the full CRDT-insert
+// path is covered by the two-engine integration test.
 //
-// What we DO verify here is the boundary contract: given a
-// `CommunityMembershipDelta` carrying a `ReachabilityAnnounce`, the
-// resolver dispatch matches `resolver.update(event.actor, payload,
-// event.at)`. If a future refactor breaks the field-name binding (e.g.
-// renames `event.at`), this test fails at the call site.
+// What we verify is the boundary contract: given a
+// `CommunityMembershipDelta` carrying a `Leave` / `Kick`, the eviction
+// dispatch matches what the arms call. If a future refactor breaks the
+// field-name binding (e.g. renames the Kick arm's `target`), these fail
+// at the call site.
+//
+// ZEB-815 removed this module's two ADDITION tests. They mirrored the
+// `ReachabilityAnnounce` delta arm, which is now a no-op — routing rows
+// reach the resolver through `address_book_sync::ingest_verified_row`
+// instead, whose own tests
+// (`verified_reachability_row_lands_in_book_and_resolver` and siblings)
+// pin the surviving contract. Retargeting them here would have duplicated
+// that coverage; leaving them would have asserted against a copy of hook
+// logic production no longer runs.
 #[cfg(test)]
 mod zeb_321_event_loop_wiring_tests {
     use crate::community_membership::{
-        sign_event_with_identity, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        sign_event_with_identity, EventPayload, MembershipEventKind,
     };
     use crate::community_state_sync::CommunityMembershipDelta;
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
-    use crate::reachability_record::{build_signed_payload, ReachabilityAnnouncePayload};
     use crate::reachability_resolver::ReachabilityResolver;
     use harmony_identity::PrivateIdentity;
-
-    fn make_signed_announce(
-        community_id: SpaceId,
-        identity: &PrivateIdentity,
-        actor: OwnerAddr,
-        wall_ms: u64,
-    ) -> (SignedMembershipEvent, ReachabilityAnnouncePayload) {
-        let hlc = Hlc {
-            wall_ms,
-            logical: 0,
-            device_id: "dev".into(),
-        };
-        let payload = build_signed_payload(
-            [0xAB; 32],
-            "https://relay.example/".into(),
-            vec![],
-            wall_ms,
-            &actor,
-            &hlc,
-            Vec::new(),
-            0,
-            identity,
-        )
-        .expect("build signed payload");
-        let event_payload = EventPayload {
-            id: [0x77; 16],
-            community_id,
-            kind: MembershipEventKind::ReachabilityAnnounce {
-                payload: payload.clone(),
-            },
-            actor,
-            at: hlc,
-        };
-        let signed = sign_event_with_identity(&event_payload, identity).expect("sign envelope");
-        (signed, payload)
-    }
-
-    /// The hook contract: given a `CommunityMembershipDelta` whose event
-    /// kind is `ReachabilityAnnounce`, dispatching to the resolver via
-    /// the same field bindings the consumer closure uses
-    /// (`event.actor`, `payload.clone()`, `event.at.clone()`) makes the
-    /// payload retrievable via `resolver.resolve(actor)`.
-    #[test]
-    fn event_loop_routes_reachability_announce_to_resolver() {
-        let identity = PrivateIdentity::from_seed(&[0x55; 32]);
-        let actor = OwnerAddr(identity.identity.address_hash);
-        let community_id = SpaceId([0xC0; 16]);
-
-        let (signed_event, expected_payload) =
-            make_signed_announce(community_id, &identity, actor, 1_700_000_000_000);
-
-        let delta = CommunityMembershipDelta {
-            community_id,
-            event: signed_event,
-        };
-
-        // Resolver starts empty.
-        let resolver = ReachabilityResolver::new();
-        assert!(
-            resolver.resolve(&actor).is_empty(),
-            "resolver must start empty"
-        );
-
-        // Mirror the consumer closure's hook logic exactly: pattern-match
-        // the event kind, then call `resolver.update(actor, payload, hlc)`.
-        if let MembershipEventKind::ReachabilityAnnounce { payload } = &delta.event.kind {
-            resolver.update(delta.event.actor, payload.clone(), delta.event.at.clone());
-        } else {
-            panic!("expected ReachabilityAnnounce");
-        }
-
-        // Round-trip: resolver must yield exactly the payload we
-        // constructed. PR #157 round 5: resolve() now returns Vec
-        // (multi-device); a single-device announce produces exactly
-        // one entry.
-        let got = resolver.resolve(&actor);
-        assert_eq!(got.len(), 1, "exactly one device's record");
-        assert_eq!(
-            got[0], expected_payload,
-            "resolver entry must round-trip the announced payload"
-        );
-    }
-
-    /// Negative: a non-ReachabilityAnnounce delta (e.g. plain Join) must
-    /// NOT update the resolver — the hook gates on kind discriminant.
-    #[test]
-    fn non_reachability_delta_does_not_touch_resolver() {
-        let identity = PrivateIdentity::from_seed(&[0x33; 32]);
-        let actor = OwnerAddr(identity.identity.address_hash);
-        let community_id = SpaceId([0xC1; 16]);
-
-        let event_payload = EventPayload {
-            id: [0x12; 16],
-            community_id,
-            kind: MembershipEventKind::Join,
-            actor,
-            at: Hlc {
-                wall_ms: 1_000,
-                logical: 0,
-                device_id: "dev".into(),
-            },
-        };
-        let signed = sign_event_with_identity(&event_payload, &identity).expect("sign envelope");
-        let delta = CommunityMembershipDelta {
-            community_id,
-            event: signed,
-        };
-
-        let resolver = ReachabilityResolver::new();
-        if let MembershipEventKind::ReachabilityAnnounce { payload } = &delta.event.kind {
-            resolver.update(delta.event.actor, payload.clone(), delta.event.at.clone());
-        }
-        assert!(
-            resolver.resolve(&actor).is_empty(),
-            "resolver must not have an entry for a non-ReachabilityAnnounce delta"
-        );
-    }
 
     /// PR #157 round 5 (Cursor): Leave delta must evict the actor's
     /// reachability records. Mirrors the consumer-closure hook logic

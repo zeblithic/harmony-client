@@ -259,6 +259,7 @@ fn spawn_event_loop(
                     std::sync::Arc::new(tokio::sync::Mutex::new(
                         harmony_app::community_presence::CommunityPresenceMap::new(),
                     )), // ZEB-537: community_presence_map (throwaway; presence not exercised here)
+                    None, // ZEB-815: addrbook_runtime not exercised in this test
                     None, // Mint Phase 2 sync: not exercised in this test
                     None, // ZEB-417 SP1: notes_sync_handles not exercised in this test
                     None, // ZEB-418 P1: dm_inbox_sync_handles not exercised in this test

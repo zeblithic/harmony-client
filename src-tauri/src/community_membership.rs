@@ -3558,12 +3558,14 @@ pub fn materialize_with_now(
             }
 
             MembershipEventKind::ReachabilityAnnounce { .. } => {
-                // ZEB-321: no membership-state effect; handled by
-                // ReachabilityResolver hook in event_loop.
+                // ZEB-321: no membership-state effect. ZEB-815: no effect
+                // anywhere — this kind is no longer minted and its delta arm
+                // is a no-op; the resolver is fed from the address book.
+                // Retained so historical logs still decode and verify.
             }
             MembershipEventKind::CommunityRelayAnnounce { .. } => {
-                // ZEB-458: no membership-state effect; consumed by
-                // CommunityRelayResolver for the fresh advertiser set.
+                // ZEB-458: no membership-state effect. ZEB-815: same as
+                // ReachabilityAnnounce above — history-only.
             }
             MembershipEventKind::DeviceAnnounce => {
                 // ZEB-495 (ZEB-340 Part 2): add the introduced device's key to

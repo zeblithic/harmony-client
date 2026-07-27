@@ -2511,6 +2511,122 @@ async fn s_vines_publish_feed_view_reshare() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// S6-ADDRBOOK (ZEB-815 Task 8): join → channel create → post → read-back on
+// the REAL binary, with ZERO address-book-announce CRDT events available
+// ANYWHERE in the run (Tasks 1-7's flag-day deleted both
+// ReachabilityAnnounce/CommunityRelayAnnounce mint sites entirely — there is
+// no fallback path left to regress to). This proves the ordinary user-facing
+// flow (join, roster convergence, channel convergence, message delivery)
+// still works end to end on the real binary now that those CRDT mint sites
+// are gone.
+//
+// PRECISE CLAIM — read before citing this test as address-book proof: this
+// test does NOT isolate the address book as the mechanism driving the dial.
+// Bob's `redeem_invite_iroh` join calls `reachability_resolver.seed_from_pkarr`
+// (`lib.rs` ~58064, case-A option A) directly off the pkarr-resolved routing
+// record, independently of the address book. The handshake CONNECTION itself
+// is NOT what's reused: it's explicitly closed right after the exchange
+// (`lib.rs:58553`, `conn.close(0u32.into(), b"handshake-complete")`). What IS
+// reused is the RESOLVER ENTRY that seed wrote — `IrohZenohLinkManager::new_link`
+// (`zenoh_iroh_transport.rs`) reads it via `resolve_by_node_id` to synthesize
+// the dial target for a SEPARATE zenoh-over-iroh connection it opens under a
+// different ALPN (`harmony/zenoh/v1` vs the handshake's `harmony/handshake/v1`
+// — one QUIC connection structurally cannot carry both). So a real two-node
+// run always has BOTH the pkarr-seeded resolver entry and any
+// address-book-ingested one present at once — this test cannot tell you
+// which one supplied the reachability that `new_link` actually dialed with.
+// The confound-free proof that the address book alone (no pkarr, no CRDT) can
+// drive a resolver hit lives in the integration test
+// `addrbook_replaces_announce_events_end_to_end`
+// (`community_sync/community_sync_integration.rs`), which loops A's
+// `publish_own_rows` output straight into B's `ingest_sealed_packet` with no
+// pkarr in the loop at all.
+//
+// Mirrors `s_vines_publish_feed_view_reshare`'s preamble (create_community →
+// generate_invite → poll_join_iroh → roster poll).
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s6_addrbook_join_message_delivery() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let (mut run, ah, bh, alice, bob) = two_minted_nodes("addrbook").await;
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    let community = create_community(&alice, "addrbook-community", true)
+        .await
+        .expect("alice creates community");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins alice's community via iroh first-contact");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("alice sees bob joined — roster converges with no CRDT announce events available");
+
+    // A shared channel both members can post to (write_power 0).
+    let channel = create_channel(&alice, &community, "addrbook-shared", 0)
+        .await
+        .expect("alice creates shared channel");
+    poll_until(Duration::from_secs(180), || async {
+        Ok(channels_contains(&bob, &community, &channel)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("bob converges the shared channel");
+
+    // Alice posts; bob's read-back must show it — the real-binary join +
+    // channel-delivery flow works end to end with no CRDT announce events
+    // anywhere (see the file-level comment above for what this test does and
+    // does NOT isolate about the dial's reachability source).
+    let body: &[u8] = b"hello-addrbook-e2e";
+    post_channel_message(&alice, &community, &channel, body)
+        .await
+        .expect("alice's post_channel_message accepted");
+
+    let delivered = poll_until(Duration::from_secs(120), || async {
+        let msgs = list_channel_messages(&bob, &community, &channel).await?;
+        Ok(msgs.into_iter().find(|m| {
+            let body_matches = m.get("body").and_then(|b| b.as_array()).map(|arr| {
+                arr.iter()
+                    .map(|n| n.as_u64().filter(|v| *v <= u8::MAX as u64).map(|v| v as u8))
+                    .collect::<Option<Vec<u8>>>()
+            }) == Some(Some(body.to_vec()));
+            m.get("author").and_then(|a| a.as_str()) == Some(alice_owner.as_str()) && body_matches
+        }))
+    })
+    .await
+    .expect("bob's channel read-back MUST contain alice's message");
+
+    // Assert on the DTO's REAL camelCase keys (`ChannelMessageDto` is
+    // `#[serde(rename_all = "camelCase")]`) — a guessed key would make
+    // `poll_until` silently time out rather than fail loudly (ZEB-462 class).
+    assert!(
+        delivered
+            .get("messageId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "delivered message DTO must carry a non-empty messageId: {delivered:?}"
+    );
+    assert_eq!(
+        delivered.get("author").and_then(|v| v.as_str()),
+        Some(alice_owner.as_str()),
+        "delivered message DTO's author must be alice's ownerId"
+    );
+
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // S11 (ZEB-715): admin-recovery liveness path — configure designates →
 // designate initiates → cosign to threshold → current admin vetoes →
 // terminal Vetoed, membership unchanged.
