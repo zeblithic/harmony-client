@@ -16,11 +16,10 @@
 //! [`run_vine_pull_client_session`] is generic over any
 //! `AsyncRead`/`AsyncWrite` pair — mirrors `vine_relay::run_vine_relay_session`'s
 //! pure/production-shell split — so the cursor-advance rules (the
-//! Advance/SkipInvalid/Halt mapping, and the "unparseable JSON never moves
-//! the cursor" guard) are unit-testable over `tokio::io::duplex` without a
-//! real iroh connection. [`IrohVinePullTransport`] is the thin production
-//! shell that dials the relay and drives this loop under one overall
-//! deadline.
+//! [`IngestVerdict`] mapping, and the "unparseable JSON never moves the
+//! cursor" guard) are unit-testable over `tokio::io::duplex` without a real
+//! iroh connection. [`IrohVinePullTransport`] is the thin production shell
+//! that dials the relay and drives this loop under one overall deadline.
 //!
 //! ## Bounded mesh-live skip (recency is not completeness)
 //!
@@ -121,12 +120,31 @@ pub trait VineIngestCtx: Send + Sync {
 
 /// Outcome of ingesting one descriptor row, and what it does to the pull
 /// cursor (see [`run_vine_pull_client_session`] for the exact mapping).
+///
+/// ZEB-811 fix round 1: originally 3 variants (Advance/SkipInvalid/Halt),
+/// with `Advance` covering both a genuinely new insert AND a mesh-delivered
+/// duplicate (`DescriptorOutcome::AlreadyPresent`). Review caught that this
+/// collapsed the two into one counter: `PullSessionResult.ingested` would
+/// count every all-duplicate page as "ingested" activity, over-reporting
+/// pull-driver contribution when the mesh had already delivered everything.
+/// [`AdvanceDuplicate`](Self::AdvanceDuplicate) splits the duplicate case out
+/// so the cursor still advances (a duplicate is still a fully valid,
+/// already-durable row) without inflating the ingest telemetry a fleet
+/// operator reads to tell "the pull driver backfilled N rows" apart from
+/// "the mesh already had it".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestVerdict {
-    /// Accepted (newly inserted OR already present — a mesh-delivered
-    /// duplicate is a cheap no-op, not a fault). The cursor advances past
-    /// this row.
+    /// A genuinely new insert. The cursor advances past this row, and it
+    /// counts toward [`PullSessionResult::ingested`].
     Advance,
+    /// Accepted, but the mesh already delivered this exact row first (a
+    /// cheap no-op, not a fault) — `DescriptorOutcome::AlreadyPresent`.
+    /// The cursor still advances past this row (it's fully valid and
+    /// already durable), but it does NOT count toward
+    /// [`PullSessionResult::ingested`]: a duplicate must never inflate the
+    /// telemetry that distinguishes "the pull backfilled this" from "the
+    /// mesh already had it".
+    AdvanceDuplicate,
     /// Rejected on its own merits (bad signature, stale, malformed field) —
     /// each descriptor is independently dual-signed, so skipping this row
     /// can never forge or hide a later one. The cursor still advances past
@@ -223,6 +241,12 @@ where
             match ingest.ingest_descriptor(creator, bytes, now_ms) {
                 IngestVerdict::Advance => {
                     ingested += 1;
+                    cursor = candidate;
+                }
+                IngestVerdict::AdvanceDuplicate => {
+                    // Fully valid and already durable — the cursor still
+                    // advances past it, but it must not inflate the ingest
+                    // counter (see IngestVerdict's doc comment).
                     cursor = candidate;
                 }
                 IngestVerdict::SkipInvalid => {
@@ -343,9 +367,14 @@ impl VineIngestCtx for ProdVineIngestCtx {
         };
         let key_expr = format!("harmony/vines/{creator}");
         match cache.on_descriptor_sample(&key_expr, json_bytes, &followed, now_ms) {
-            Some(crate::vine_feed_cache::DescriptorOutcome::Inserted { .. })
-            | Some(crate::vine_feed_cache::DescriptorOutcome::AlreadyPresent) => {
+            Some(crate::vine_feed_cache::DescriptorOutcome::Inserted { .. }) => {
                 IngestVerdict::Advance
+            }
+            // The mesh already delivered this exact row: a cheap no-op, not
+            // a fault, but it must not inflate the ingest counter (ZEB-811
+            // fix round 1 — see IngestVerdict's doc comment).
+            Some(crate::vine_feed_cache::DescriptorOutcome::AlreadyPresent) => {
+                IngestVerdict::AdvanceDuplicate
             }
             Some(crate::vine_feed_cache::DescriptorOutcome::Rejected(_)) => {
                 IngestVerdict::SkipInvalid
@@ -817,6 +846,55 @@ mod tests {
         assert_eq!(result.skipped_invalid, 1);
     }
 
+    #[tokio::test]
+    async fn mesh_delivered_duplicate_is_a_cheap_no_op() {
+        // ZEB-811 fix round 1: exercises the REAL session loop (not a
+        // scripted `PullSessionResult`) against `IngestVerdict::AdvanceDuplicate`
+        // — the verdict `ProdVineIngestCtx` maps `DescriptorOutcome::AlreadyPresent`
+        // to. This is what actually proves a mesh-delivered duplicate is a
+        // cheap no-op: the cursor advances past it, but it never inflates
+        // `ingested`.
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+
+        let rows = vec![descriptor_json("dup1", 100), descriptor_json("dup2", 200)];
+        let server_task = tokio::spawn(async move {
+            let _query = read_fake_query(&mut server_read).await;
+            write_fake_page_response(&mut server_write, rows).await;
+            let _ = server_write.shutdown().await;
+        });
+
+        let ingest = ScriptedIngest::new(vec![
+            IngestVerdict::AdvanceDuplicate,
+            IngestVerdict::AdvanceDuplicate,
+        ]);
+
+        let result = run_vine_pull_client_session(
+            &mut client_read,
+            &mut client_write,
+            "creator-dup",
+            (0, String::new()),
+            &ingest,
+            1_700_000_000_000,
+        )
+        .await
+        .expect("an all-duplicate page must still be a successful session");
+
+        server_task.await.expect("server task must not panic");
+
+        assert_eq!(
+            result.cursor,
+            (200, "dup2".to_string()),
+            "the cursor must still advance past mesh-delivered duplicates"
+        );
+        assert_eq!(
+            result.ingested, 0,
+            "a duplicate must never inflate the ingest telemetry counter"
+        );
+        assert_eq!(result.skipped_invalid, 0);
+    }
+
     #[test]
     fn sidecar_round_trip_and_corrupt_file_loads_empty() {
         let dir = tempfile::tempdir().expect("create tempdir");
@@ -851,9 +929,16 @@ mod tests {
 
     // ── Driver-level tests (mock transport + mock ingest) ──
 
+    /// One recorded `pull_pages` call: the relay dialed, the creator, and
+    /// the cursor it was invoked with. Named alias so the field/method
+    /// types stay readable and clippy's `type_complexity` lint (which
+    /// otherwise fires on the raw nested-tuple-in-`Vec`-in-`Mutex` shape)
+    /// has nothing to flag.
+    type PullCall = (VineRelayEntry, String, (u64, String));
+
     #[derive(Default)]
     struct MockTransport {
-        calls: std::sync::Mutex<Vec<(VineRelayEntry, String, (u64, String))>>,
+        calls: std::sync::Mutex<Vec<PullCall>>,
         script: std::sync::Mutex<VecDeque<Result<PullSessionResult, String>>>,
     }
 
@@ -865,7 +950,7 @@ mod tests {
             }
         }
 
-        fn calls(&self) -> Vec<(VineRelayEntry, String, (u64, String))> {
+        fn calls(&self) -> Vec<PullCall> {
             self.calls.lock().unwrap().clone()
         }
     }
@@ -1113,78 +1198,6 @@ mod tests {
         assert_eq!(
             calls[0].0.iroh_endpoint_id, other.iroh_endpoint_id,
             "self relay entry must be filtered before dialing"
-        );
-    }
-
-    #[tokio::test]
-    async fn mesh_delivered_duplicate_is_a_cheap_no_op() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let sidecar_path = temp_sidecar_path(&dir);
-        let creator = "ff".repeat(16);
-        let now = 1_700_000_000_000u64;
-        let relay = VineRelayEntry {
-            iroh_endpoint_id: [0x44; 32],
-            home_relay: String::new(),
-        };
-
-        let seeded = VinePullSidecar {
-            per_creator: BTreeMap::from([(
-                creator.clone(),
-                CreatorPullState {
-                    cursor: (0, String::new()),
-                    last_pull_attempt_ms: 0,
-                    consecutive_skips: 0,
-                    relay_set: vec![relay.clone()],
-                    relays_fetched_at_ms: now,
-                },
-            )]),
-        };
-        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
-
-        // Simulates a session where every row was AlreadyPresent (the mesh
-        // delivered first): production `ProdVineIngestCtx` maps that to
-        // Advance for each row, so the cursor still moves, but nothing NEW
-        // was ingested.
-        let transport = Arc::new(MockTransport::with_results(vec![Ok(PullSessionResult {
-            cursor: (now, "dup".to_string()),
-            ingested: 0,
-            skipped_invalid: 0,
-        })]));
-        let followed = creator.clone();
-        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
-        let last_received: LastReceivedMsFn = Arc::new(|_| None);
-        let telemetry = Arc::new(crate::network_health::VinePullTelemetry::new());
-
-        let driver = VinePullDriver::new(
-            [0; 32],
-            inert_pkarr_resolver(),
-            transport,
-            Arc::new(StubIngest),
-            followed_fn,
-            last_received,
-            sidecar_path.clone(),
-        )
-        .with_telemetry(Arc::clone(&telemetry));
-
-        driver.run_one_pass(now).await;
-
-        let s = telemetry.summary();
-        assert_eq!(
-            s.sessions_ok, 1,
-            "ingested == 0 must still be recorded as a successful session"
-        );
-        assert_eq!(s.sessions_failed, 0);
-        assert_eq!(s.descriptors_ingested, 0);
-
-        let st = load_vine_pull(&sidecar_path)
-            .per_creator
-            .get(&creator)
-            .cloned()
-            .expect("creator state must persist");
-        assert_eq!(
-            st.cursor,
-            (now, "dup".to_string()),
-            "cursor must still advance even when nothing new was ingested"
         );
     }
 
