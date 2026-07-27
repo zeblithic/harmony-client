@@ -11,8 +11,10 @@ public routing data lives in pkarr.* Routing data is current-state with a TTL, n
 history. It does not belong in a permanent membership log — ZEB-813 was that tension
 detonating (announces were 94% of the fleet community's CRDT log and pushed the root
 blob over the 1 MiB ContentId cap, killing publish and serve fleet-wide for ~42 h).
-ZEB-813's supersession compaction bounds the log; this design removes the category
-error.
+AVALON's post-mortem growth model makes the clock explicit: announce-log growth ≈
+lineages × republish-cadence × uptime, so every community — even an idle one —
+crosses the cap on a schedule (ZEB-813 field verification, 2026-07-26). ZEB-813's
+supersession compaction bounds the log; this design removes the category error.
 
 ## Goal
 
@@ -191,3 +193,35 @@ bootstrap no longer depends on community-state root publish at all.
 3. Post-deploy verification on the fleet community per §7's fleet validation.
 4. ZEB-814 (root chunking) is *relieved* but not closed by this — the membership
    log still has a 1 MiB root; it just stops growing per-routing-refresh.
+
+## As-implemented notes (2026-07-26, branch `zeb-815-community-address-book`)
+
+Deltas between this spec and the shipped implementation — all additive; no
+spec'd behavior was dropped:
+
+- **Two Notify hubs** (`address_book_sync.rs`): `AddrbookResyncHub`
+  (presence-roster change → snapshot re-request) and `AddrbookDirtyHub`
+  (local publish → sidecar persist). The DirtyHub closed a gap this spec did
+  not call out: `publish_own_rows` upserts locally without traversing the
+  ingest path, so without it locally-published rows replicated but were never
+  persisted to the sidecar.
+- **`AddrbookIngestObserver`** trait + `IngestBatch { outcomes,
+  reachability_actors }`: ingest reports structured outcomes, and an observer
+  (implemented by `ReachabilityUiSignals` in `lib.rs`) restores the
+  `nh.notify()` + `connectivity-reachability-changed` UI emits that the old
+  CRDT delta hook fired on reachability additions.
+- **Snapshot GETs use `Locality::Remote`** — a node never answers its own
+  snapshot query (the ZEB-806 self-serve lesson, applied at the query).
+- **`seal_snapshot_bounded`** enforces `ADDRBOOK_SNAPSHOT_MAX_BYTES` (1 MiB)
+  serve-side, dropping oldest-stamped rows until the sealed snapshot fits —
+  §2 said "KB-scale" without a hard bound.
+- **Snapshot-request jitter** (`ADDRBOOK_SNAPSHOT_JITTER_MS` = 5 s) on
+  roster-change-woken fires only; the join-time first fire stays immediate so
+  bootstrap latency is unchanged. Prevents synchronized re-query storms on
+  mass roster flap.
+- **e2e claim precision:** `s6_addrbook_join_message_delivery` proves
+  join + message delivery with **zero** announce events in either membership
+  log, but invite redemption's `seed_from_pkarr` confounds attribution of the
+  dial itself (resolver-entry reuse — see the test's doc comment). The
+  confound-free proof that the book alone drives a resolver hit lives in the
+  two integration tests in `community_sync_tests.rs`.
