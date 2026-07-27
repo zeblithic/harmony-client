@@ -116,6 +116,7 @@ pub trait VinePullTransport: Send + Sync {
         creator: &str,
         cursor: (u64, String),
         ingest: &dyn VineIngestCtx,
+        progress: PullProgressSink,
     ) -> Result<PullSessionResult, String>;
 }
 
@@ -173,6 +174,36 @@ pub struct PullSessionResult {
     pub skipped_invalid: u32,
 }
 
+/// ZEB-819: caller-owned cursor-progress slot. The pull session commits
+/// after each fully processed page; the driver reads it even when the IO
+/// deadline drops the session future mid-flight, so completed pages are
+/// never re-downloaded. Tuple order (created_at, id) matches the cursor.
+///
+/// Why a side channel rather than the return value: a dropped future never
+/// returns anything at all. [`PullSessionResult`] can only report progress
+/// the session survived long enough to hand back, and the whole point of
+/// the failure this guards is that it does not get that far.
+#[derive(Clone, Default)]
+pub struct PullProgressSink(Arc<std::sync::Mutex<Option<(u64, String)>>>);
+
+impl PullProgressSink {
+    /// Monotone: only advances (strictly greater tuple order), so a stale
+    /// commit from a failed earlier candidate cannot regress progress.
+    pub fn commit(&self, cursor: (u64, String)) {
+        let mut slot = self.0.lock().expect("progress sink poisoned");
+        match slot.as_ref() {
+            Some(cur) if *cur >= cursor => {}
+            _ => *slot = Some(cursor),
+        }
+    }
+
+    /// Read and clear the slot. The driver calls this once per creator per
+    /// pass, after every candidate relay has had its turn.
+    pub fn take(&self) -> Option<(u64, String)> {
+        self.0.lock().expect("progress sink poisoned").take()
+    }
+}
+
 /// Minimal fields parsed out of a descriptor's raw JSON *before* handing it
 /// to [`VineIngestCtx::ingest_descriptor`] — the cursor-advance decision
 /// needs `(created_at, id)` regardless of whether ingest accepts, rejects,
@@ -203,6 +234,7 @@ async fn run_vine_pull_client_session<R, W>(
     mut cursor: (u64, String),
     ingest: &dyn VineIngestCtx,
     now_ms: u64,
+    progress: PullProgressSink,
 ) -> Result<PullSessionResult, String>
 where
     R: AsyncRead + Unpin,
@@ -280,6 +312,10 @@ where
                     }
                 }
                 IngestVerdict::Halt => {
+                    // ZEB-819: the rows BEFORE this one did ingest durably,
+                    // so publish exactly what `cursor` holds — the halting
+                    // row itself never moved it (see the variant's doc).
+                    progress.commit(cursor.clone());
                     return Ok(PullSessionResult {
                         cursor,
                         ingested,
@@ -288,6 +324,15 @@ where
                 }
             }
         }
+
+        // ZEB-819: page boundary. Every row of this page has been through
+        // ingest, so `cursor` is durable progress the caller may keep even
+        // if the next read never returns. One call site covers the loop's
+        // continue and both break paths below; the Halt arm above has its
+        // own. `commit` is monotone and `cursor` only ever moves forward
+        // here (the ZEB-818 skew clamp already governed what got into it),
+        // so this needs no ordering logic of its own.
+        progress.commit(cursor.clone());
 
         if page_len < VINE_PULL_PAGE_LIMIT_MAX as usize {
             break;
@@ -334,6 +379,7 @@ impl VinePullTransport for IrohVinePullTransport {
         creator: &str,
         cursor: (u64, String),
         ingest: &dyn VineIngestCtx,
+        progress: PullProgressSink,
     ) -> Result<PullSessionResult, String> {
         let exchange = async {
             let ep_id = iroh::EndpointId::from_bytes(&relay.iroh_endpoint_id)
@@ -356,6 +402,11 @@ impl VinePullTransport for IrohVinePullTransport {
                 .map_err(|e| format!("connect: {e}"))?;
             let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
 
+            // `progress` goes INSIDE the timeout-wrapped future on purpose:
+            // when the deadline fires, this whole future is dropped and its
+            // return value is lost, but the sink is the caller's — every
+            // page boundary the session reached before the drop is still
+            // readable through it.
             let result = run_vine_pull_client_session(
                 &mut recv,
                 &mut send,
@@ -363,6 +414,7 @@ impl VinePullTransport for IrohVinePullTransport {
                 cursor,
                 ingest,
                 now_ms(),
+                progress,
             )
             .await?;
 
@@ -680,6 +732,15 @@ impl VinePullDriver {
             return;
         }
 
+        // ZEB-819: one sink per creator per pass, shared by every candidate.
+        // A session killed by the IO deadline never returns a
+        // `PullSessionResult`, so the pages it DID complete would otherwise
+        // be re-downloaded on every future pass; the sink carries them out.
+        // Sharing one sink across candidates is safe because `commit` is
+        // monotone — a candidate that got less far cannot rewind one that
+        // got further.
+        let progress = PullProgressSink::default();
+
         // Try every candidate in order within this pass, stopping at the
         // first success — a dead head-of-list relay must not block the
         // creator indefinitely just because the set is only re-resolved
@@ -688,7 +749,13 @@ impl VinePullDriver {
         for relay in &candidates {
             match self
                 .transport
-                .pull_pages(relay, creator, st.cursor.clone(), self.ingest.as_ref())
+                .pull_pages(
+                    relay,
+                    creator,
+                    st.cursor.clone(),
+                    self.ingest.as_ref(),
+                    progress.clone(),
+                )
                 .await
             {
                 Ok(res) => {
@@ -708,6 +775,19 @@ impl VinePullDriver {
                         t.record_session_failed(creator, &relay.iroh_endpoint_id);
                     }
                 }
+            }
+        }
+
+        // ZEB-819: single merge point for BOTH outcomes, so page-boundary
+        // progress has exactly one path into the durable cursor. On `Ok`
+        // this is a no-op (the session's last commit equals `res.cursor`,
+        // already assigned above); on `Err` — including the IO deadline
+        // dropping the session future, which returns nothing at all — it is
+        // what rescues the pages that did complete. Guarded so a stale
+        // commit can never rewind the durable cursor.
+        if let Some(p) = progress.take() {
+            if p > st.cursor {
+                st.cursor = p;
             }
         }
 
@@ -855,6 +935,7 @@ mod tests {
             (0, String::new()),
             &ingest,
             1_700_000_000_000,
+            PullProgressSink::default(),
         )
         .await
         .expect("session must not error");
@@ -898,6 +979,7 @@ mod tests {
             (0, String::new()),
             &ingest,
             1_700_000_000_000,
+            PullProgressSink::default(),
         )
         .await
         .expect("session must not error");
@@ -958,6 +1040,7 @@ mod tests {
                 (0, String::new()),
                 &ingest,
                 1_700_000_000_000,
+                PullProgressSink::default(),
             ),
         )
         .await
@@ -1006,6 +1089,7 @@ mod tests {
             (0, String::new()),
             &ingest,
             1_700_000_000_000,
+            PullProgressSink::default(),
         )
         .await
         .expect("an all-duplicate page must still be a successful session");
@@ -1101,6 +1185,7 @@ mod tests {
                 (0, String::new()),
                 &ingest,
                 TEST_NOW_MS,
+                PullProgressSink::default(),
             ),
         )
         .await
@@ -1266,6 +1351,7 @@ mod tests {
                 seed_cursor.clone(),
                 &ingest,
                 TEST_NOW_MS,
+                PullProgressSink::default(),
             ),
         )
         .await
@@ -1280,6 +1366,78 @@ mod tests {
         );
         assert_eq!(result.ingested, 0);
         assert_eq!(result.skipped_invalid, VINE_PULL_PAGE_LIMIT_MAX as u32);
+    }
+
+    // ── ZEB-819: page-boundary cursor progress sink ──
+
+    /// The sink only ever moves forward: a stale commit (an earlier
+    /// candidate relay that got further than a later one) can never regress
+    /// progress, and `take()` clears the slot.
+    #[test]
+    fn progress_sink_is_monotone() {
+        let s = PullProgressSink::default();
+        s.commit((10, "b".into()));
+        s.commit((5, "a".into()));
+        assert_eq!(s.take(), Some((10, "b".to_string())));
+        assert_eq!(s.take(), None, "take() clears the slot");
+    }
+
+    /// ZEB-819: the IO deadline dropping the session future mid-page must
+    /// not discard the pages that already completed. The session commits at
+    /// every page boundary, so the caller-owned sink still holds page 1's
+    /// last tuple even though the future was never polled to completion and
+    /// no `PullSessionResult` was ever returned.
+    #[tokio::test]
+    async fn deadline_drop_preserves_page_boundary_progress() {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+
+        // Page 1 must be exactly FULL: a short page ends the session
+        // normally, and then there is no second query to strand.
+        let (rows, verdicts) = full_page_with_tail(Vec::new());
+        let last: CursorFields = serde_json::from_slice(rows.last().expect("a full page"))
+            .expect("the helper's filler rows parse");
+        let page_one_end = (last.created_at, last.id);
+
+        let server_task = tokio::spawn(async move {
+            let _first = read_fake_query(&mut server_read).await;
+            write_fake_page_response(&mut server_write, rows).await;
+            // The second query is deliberately NEVER answered, and both
+            // duplex halves stay alive so the client blocks on the read
+            // instead of seeing EOF — EOF would be an ordinary `Err`
+            // return, not the dropped-future path under test.
+            std::future::pending::<()>().await;
+        });
+
+        let ingest = ScriptedIngest::new(verdicts);
+        let sink = PullProgressSink::default();
+
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            run_vine_pull_client_session(
+                &mut client_read,
+                &mut client_write,
+                "creator-deadline",
+                (0, String::new()),
+                &ingest,
+                TEST_NOW_MS,
+                sink.clone(),
+            ),
+        )
+        .await;
+
+        assert!(
+            dropped.is_err(),
+            "the session must still be blocked on the unanswered second query"
+        );
+        assert_eq!(
+            sink.take(),
+            Some(page_one_end),
+            "the completed first page's cursor must survive the dropped future"
+        );
+
+        server_task.abort();
     }
 
     #[test]
@@ -1327,6 +1485,11 @@ mod tests {
     struct MockTransport {
         calls: std::sync::Mutex<Vec<PullCall>>,
         script: std::sync::Mutex<VecDeque<Result<PullSessionResult, String>>>,
+        /// ZEB-819: page-boundary progress this mock commits into the
+        /// caller's sink BEFORE returning its scripted result — the mock's
+        /// stand-in for a real session that finished pages and only then
+        /// hit the IO deadline.
+        commit_before_result: Option<(u64, String)>,
     }
 
     impl MockTransport {
@@ -1334,7 +1497,15 @@ mod tests {
             Self {
                 calls: std::sync::Mutex::new(Vec::new()),
                 script: std::sync::Mutex::new(results.into()),
+                commit_before_result: None,
             }
+        }
+
+        /// Every `pull_pages` call commits `cursor` into the caller's sink
+        /// before returning (see [`MockTransport::commit_before_result`]).
+        fn committing(mut self, cursor: (u64, String)) -> Self {
+            self.commit_before_result = Some(cursor);
+            self
         }
 
         fn calls(&self) -> Vec<PullCall> {
@@ -1350,11 +1521,15 @@ mod tests {
             creator: &str,
             cursor: (u64, String),
             _ingest: &dyn VineIngestCtx,
+            progress: PullProgressSink,
         ) -> Result<PullSessionResult, String> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((relay.clone(), creator.to_string(), cursor.clone()));
+            if let Some(committed) = self.commit_before_result.clone() {
+                progress.commit(committed);
+            }
             self.script
                 .lock()
                 .unwrap()
@@ -1866,6 +2041,70 @@ mod tests {
             driver.cached_relays_for("never-followed"),
             Vec::new(),
             "an unknown creator must read as an empty hint, not panic"
+        );
+    }
+
+    /// ZEB-819: a session that completed pages and only THEN failed (IO
+    /// deadline, dropped connection) returns no `PullSessionResult` at all,
+    /// so without the sink merge on the `Err` arm those pages are silently
+    /// re-downloaded on every subsequent pass. The driver merges the sink,
+    /// so the persisted cursor advances to the last committed page boundary.
+    #[tokio::test]
+    async fn failed_session_persists_committed_page_progress() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "ab".repeat(16);
+        let now = 1_700_000_000_000u64;
+        let relay = VineRelayEntry {
+            iroh_endpoint_id: [0x66; 32],
+            home_relay: "https://slow".to_string(),
+        };
+
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (0, String::new()), // first follow: always pulls
+                    last_pull_attempt_ms: 0,
+                    consecutive_skips: 0,
+                    relay_set: vec![relay.clone()],
+                    relays_fetched_at_ms: now, // cooldown active: no resolve
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        // Pages 1..n landed durably (committed), then the session died.
+        let transport = Arc::new(
+            MockTransport::with_results(vec![Err("vine pull IO timeout".to_string())])
+                .committing((7, "g".to_string())),
+        );
+        let followed = creator.clone();
+        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
+        let last_received: LastReceivedMsFn = Arc::new(|_| None);
+
+        let driver = VinePullDriver::new(
+            [0xFF; 32],
+            inert_pkarr_resolver(),
+            transport.clone(),
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path.clone(),
+        );
+
+        driver.run_one_pass(now).await;
+
+        assert_eq!(transport.calls().len(), 1, "the one candidate is dialed");
+        let st = load_vine_pull(&sidecar_path)
+            .per_creator
+            .get(&creator)
+            .cloned()
+            .expect("creator state must persist");
+        assert_eq!(
+            st.cursor,
+            (7, "g".to_string()),
+            "a failed session's committed page progress must still be persisted"
         );
     }
 }
