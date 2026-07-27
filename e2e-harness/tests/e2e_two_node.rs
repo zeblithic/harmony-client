@@ -2511,14 +2511,32 @@ async fn s_vines_publish_feed_view_reshare() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// S6-ADDRBOOK (ZEB-815 Task 8): join → address-book routing → channel message
-// delivery, with ZERO announce events available anywhere in the chain. The
-// ZEB-815 flag-day moved routing data (ReachabilityAnnounce /
-// CommunityRelayAnnounce) off the membership CRDT entirely, onto the sealed
-// per-community address-book topic + snapshot catch-up; this is the
-// end-to-end proof that a real binary's join → pkarr → snapshot → resolver →
-// dial → deliver chain still works with the CRDT announce path gone. Mirrors
-// `s_vines_publish_feed_view_reshare`'s preamble (create_community →
+// S6-ADDRBOOK (ZEB-815 Task 8): join → channel create → post → read-back on
+// the REAL binary, with ZERO address-book-announce CRDT events available
+// ANYWHERE in the run (Tasks 1-7's flag-day deleted both
+// ReachabilityAnnounce/CommunityRelayAnnounce mint sites entirely — there is
+// no fallback path left to regress to). This proves the ordinary user-facing
+// flow (join, roster convergence, channel convergence, message delivery)
+// still works end to end on the real binary now that those CRDT mint sites
+// are gone.
+//
+// PRECISE CLAIM — read before citing this test as address-book proof: this
+// test does NOT isolate the address book as the mechanism driving the dial.
+// Bob's `redeem_invite_iroh` join calls `reachability_resolver.seed_from_pkarr`
+// (`lib.rs` ~58064, case-A option A) directly off the pkarr-resolved routing
+// record, independently of the address book, and the iroh connection that
+// seeds is then reused for the roster/channel traffic below. So a real
+// two-node run always has BOTH the pkarr-seeded resolver entry and any
+// address-book-ingested one present at once — this test cannot tell you
+// which one supplied the reachability the dial actually used. The
+// confound-free proof that the address book alone (no pkarr, no CRDT) can
+// drive a resolver hit lives in the integration test
+// `addrbook_replaces_announce_events_end_to_end`
+// (`community_sync/community_sync_integration.rs`), which loops A's
+// `publish_own_rows` output straight into B's `ingest_sealed_packet` with no
+// pkarr in the loop at all.
+//
+// Mirrors `s_vines_publish_feed_view_reshare`'s preamble (create_community →
 // generate_invite → poll_join_iroh → roster poll).
 // ─────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2538,14 +2556,14 @@ async fn s6_addrbook_join_message_delivery() {
         .expect("generate invite");
     poll_join_iroh(&bob, &invite, Duration::from_secs(240))
         .await
-        .expect("bob joins alice's community via iroh first-contact (addrbook path only)");
+        .expect("bob joins alice's community via iroh first-contact");
     poll_until(Duration::from_secs(120), || async {
         Ok(roster_has_joined(&alice, &community, &bob_owner)
             .await?
             .then_some(()))
     })
     .await
-    .expect("alice sees bob joined — roster converges with no announce events available");
+    .expect("alice sees bob joined — roster converges with no CRDT announce events available");
 
     // A shared channel both members can post to (write_power 0).
     let channel = create_channel(&alice, &community, "addrbook-shared", 0)
@@ -2559,9 +2577,10 @@ async fn s6_addrbook_join_message_delivery() {
     .await
     .expect("bob converges the shared channel");
 
-    // Alice posts; bob's read-back must show it — exercising join → pkarr →
-    // snapshot → resolver → dial → deliver end to end, with routing data
-    // flowing exclusively over the address-book path.
+    // Alice posts; bob's read-back must show it — the real-binary join +
+    // channel-delivery flow works end to end with no CRDT announce events
+    // anywhere (see the file-level comment above for what this test does and
+    // does NOT isolate about the dial's reachability source).
     let body: &[u8] = b"hello-addrbook-e2e";
     post_channel_message(&alice, &community, &channel, body)
         .await
@@ -2579,10 +2598,7 @@ async fn s6_addrbook_join_message_delivery() {
         }))
     })
     .await
-    .expect(
-        "bob's channel read-back MUST contain alice's message — dial path built purely from \
-         address-book-derived reachability",
-    );
+    .expect("bob's channel read-back MUST contain alice's message");
 
     // Assert on the DTO's REAL camelCase keys (`ChannelMessageDto` is
     // `#[serde(rename_all = "camelCase")]`) — a guessed key would make

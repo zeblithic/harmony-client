@@ -3458,3 +3458,359 @@ async fn addrbook_replaces_announce_events_end_to_end() {
     registry_a.shutdown_all().await.expect("shutdown a");
     registry_b.shutdown_all().await.expect("shutdown b");
 }
+
+/// ZEB-815 Task 8 fix round (review Finding 2): confound-free coverage of the
+/// SNAPSHOT query/reply DATA PATH. The test above only exercises the live
+/// single-record codec (`publish_own_rows` → `seal_records` over one row);
+/// Task 5's units cover the requester's cooldown/jitter/locality, not the
+/// data flow; this closes that gap.
+///
+/// B's book holds two of admin's rows (one Reachability, one Relay — the two
+/// entry kinds a snapshot must carry alike) seeded through the real per-row
+/// gate (`ingest_verified_row`), so only the join precondition already proven
+/// above is needed (one already-enrolled actor+device, no second identity).
+/// The reply packet is built through the EXACT same call the production
+/// serve side (`spawn_addrbook_snapshot_queryable`) makes —
+/// `book.rows_for_community` then `seal_snapshot_bounded` — then fed into A's
+/// `ingest_sealed_packet`, mirroring the requester side
+/// (`request_snapshot_once`) per reply. Confirms:
+/// - A's `ReachabilityResolver` resolves admin's reachability row;
+/// - A's `CommunityRelayResolver` resolves admin's relay row from the SAME
+///   snapshot;
+/// - A's book ends up holding both rows, byte-identical to what B served;
+/// - the observer surfaces exactly ONE call carrying `{admin}` — the relay
+///   row must not double-count or contribute a signal of its own (mirrors
+///   the `signals_reachability` invariant `address_book_sync.rs`'s own unit
+///   tests pin on a hand-built `IngestBatch`; here it runs through the full
+///   sealed-packet snapshot path instead).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn addrbook_snapshot_path_ingest_end_to_end() {
+    use harmony_app::address_book_sync::{
+        derive_addrbook_key, ingest_sealed_packet, ingest_verified_row, seal_snapshot_bounded,
+        AddrbookIngestObserver, IngestOutcome, ADDRBOOK_SNAPSHOT_MAX_BYTES,
+    };
+    use harmony_app::community_address_book::{
+        AddressBookEntry, AddressBookRow, CommunityAddressBook, UpsertOutcome,
+    };
+    use harmony_app::community_relay_announce::{
+        build_signed_community_relay_announce, CommunityRelayEntry,
+    };
+    use harmony_app::community_relay_resolver::CommunityRelayResolver;
+    use harmony_app::reachability_record::build_signed_payload_with_key;
+    use harmony_app::reachability_resolver::ReachabilityResolver;
+    use std::collections::BTreeSet;
+
+    /// Same recorder shape as the test above — kept local (rather than
+    /// shared) so each test stays self-contained per this file's convention.
+    #[derive(Default)]
+    struct RecordingIngestObserver {
+        calls: std::sync::Mutex<Vec<BTreeSet<OwnerAddr>>>,
+    }
+    impl RecordingIngestObserver {
+        fn calls(&self) -> Vec<BTreeSet<OwnerAddr>> {
+            self.calls.lock().expect("observer mutex poisoned").clone()
+        }
+    }
+    impl AddrbookIngestObserver for RecordingIngestObserver {
+        fn reachability_applied(&self, actors: &BTreeSet<OwnerAddr>) {
+            self.calls
+                .lock()
+                .expect("observer mutex poisoned")
+                .push(actors.clone());
+        }
+    }
+
+    let cas_tx = spawn_shared_cas();
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_tx,
+        Duration::from_millis(2000),
+    ));
+
+    let community_id = SpaceId([4u8; 16]);
+    let mk = EpochKey::new([0x88; 32]);
+
+    let id_admin = mint_test_owner(0xc9);
+    let admin = id_admin.owner;
+    let admin_pub = [0u8; 64];
+
+    let id_b = mint_test_owner(0xd0);
+    let b_owner = id_b.owner;
+    let b_signing = signing_key_from(&id_b);
+
+    let mut resolver_map = std::collections::HashMap::new();
+    resolver_map.insert(admin, admin_pub);
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
+
+    let dir_a = tempfile::tempdir().expect("tempdir A");
+    let dir_b = tempfile::tempdir().expect("tempdir B");
+
+    // A is the ingesting side here (mirroring the snapshot REQUESTER), so it
+    // needs `Arc` for `ingest_sealed_packet`.
+    let registry_a = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "a-dev".into(),
+        content_store: Arc::clone(&cs),
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir_a.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: admin,
+        signing_key: signing_key_from(&id_admin),
+        crdt_state: None,
+        nav_emitter: None,
+        presence_resync_rx: None,
+    }));
+    let registry_b = CommunitySyncRegistry::new(CommunityRegistryConfig {
+        device_id: "b-dev".into(),
+        content_store: Arc::clone(&cs),
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir_b.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: b_owner,
+        signing_key: Arc::clone(&b_signing),
+        crdt_state: None,
+        nav_emitter: None,
+        presence_resync_rx: None,
+    });
+
+    // Root-CRDT pub/sub channels: unused, exactly as in the test above.
+    let (a_pub_tx, _a_pub_rx) = mpsc::channel(8);
+    let (_a_sub_tx, a_sub_rx) = mpsc::channel(8);
+    let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
+    let (_b_sub_tx, b_sub_rx) = mpsc::channel(8);
+
+    registry_a
+        .spawn_engine_inner_now(
+            community_id,
+            mk.clone(),
+            admin,
+            false,
+            a_pub_tx,
+            a_sub_rx,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
+        )
+        .await
+        .expect("spawn a");
+    registry_b
+        .spawn_engine_inner_now(
+            community_id,
+            mk.clone(),
+            admin,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
+        )
+        .await
+        .expect("spawn b");
+
+    // Pre-seed BOTH sides with admin's Join — A's `ingest_sealed_packet`
+    // membership gate needs admin materialized as an enrolled Joined member
+    // before it will accept admin's rows from the snapshot.
+    let admin_join_event = {
+        let payload = EventPayload {
+            id: [8u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &id_admin).expect("sign")
+    };
+    let state_a = registry_a
+        .state_for(&community_id)
+        .await
+        .expect("engine spawned");
+    {
+        let mut sa = state_a.lock().await;
+        let outcome = sa.insert_event(
+            admin_join_event.clone(),
+            &harmony_app::community_membership::VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
+    let state_b = registry_b
+        .state_for(&community_id)
+        .await
+        .expect("engine spawned");
+    {
+        let mut sb = state_b.lock().await;
+        let outcome = sb.insert_event(
+            admin_join_event,
+            &harmony_app::community_membership::VerifyContext {
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
+
+    // ── B already holds two of admin's rows (however they got there — this
+    //    test is about the SNAPSHOT round trip, not row provenance, so seed
+    //    directly through the real per-row gate rather than re-running the
+    //    publish path above). One Reachability, one Relay.
+    let book_b = CommunityAddressBook::new();
+    let rr_b = ReachabilityResolver::new();
+    let crr_b = CommunityRelayResolver::new();
+
+    let ts = 1_700_000_600_000u64;
+    let row_hlc = Hlc {
+        wall_ms: ts,
+        logical: 0,
+        device_id: "a-dev".into(),
+    };
+    let admin_device = id_admin.device_key.verifying_key().to_bytes();
+
+    let reach_payload = build_signed_payload_with_key(
+        [0xFA; 32],
+        "https://derp.example/".into(),
+        vec![],
+        ts,
+        &admin,
+        &row_hlc,
+        Vec::new(),
+        0,
+        &id_admin.device_key,
+    )
+    .expect("build signed reachability payload");
+    let reach_row = AddressBookRow {
+        entry: AddressBookEntry::Reachability(reach_payload),
+        actor: admin,
+        device: admin_device,
+        at: row_hlc.clone(),
+        stamped_at_ms: ts,
+    };
+    assert_eq!(
+        ingest_verified_row(&book_b, &rr_b, &crr_b, community_id, reach_row.clone(), ts),
+        IngestOutcome::Applied(UpsertOutcome::Inserted),
+        "B's own reachability row must seed through the real ingest gate"
+    );
+
+    let relay_entry = CommunityRelayEntry {
+        relay_device_id: [0xD9; 16],
+        iroh_endpoint_id: [0x66; 32],
+        relay_device_ed25519_verify: admin_device,
+        home_relay: "https://r.example/".into(),
+    };
+    let relay_payload = build_signed_community_relay_announce(
+        relay_entry,
+        ts,
+        &admin,
+        &row_hlc,
+        &id_admin.device_key,
+    )
+    .expect("build signed relay payload");
+    let relay_row = AddressBookRow {
+        entry: AddressBookEntry::Relay(relay_payload),
+        actor: admin,
+        device: admin_device,
+        at: row_hlc,
+        stamped_at_ms: ts,
+    };
+    assert_eq!(
+        ingest_verified_row(&book_b, &rr_b, &crr_b, community_id, relay_row.clone(), ts),
+        IngestOutcome::Applied(UpsertOutcome::Inserted),
+        "B's own relay row must seed through the real ingest gate"
+    );
+
+    // ── Build the snapshot reply through the EXACT same call the production
+    //    queryable makes: fetch this community's fresh rows, then
+    //    `seal_snapshot_bounded` under the shared address-book key.
+    let key = derive_addrbook_key(&mk, &community_id);
+    let rows_to_serve = book_b.rows_for_community(&community_id, ts);
+    assert_eq!(rows_to_serve.len(), 2, "B's book holds both seeded rows");
+    let packet = seal_snapshot_bounded(
+        &key,
+        &community_id,
+        rows_to_serve,
+        ADDRBOOK_SNAPSHOT_MAX_BYTES,
+    )
+    .expect("seal snapshot reply");
+
+    // ── A ingests the snapshot reply through the SAME `ingest_sealed_packet`
+    //    the production requester calls per reply, then feeds the applied
+    //    actors to the observer exactly as every real caller does (the
+    //    function itself never touches it).
+    let book_a = CommunityAddressBook::new();
+    let rr_a = ReachabilityResolver::new();
+    let crr_a = CommunityRelayResolver::new();
+    let observer = Arc::new(RecordingIngestObserver::default());
+
+    let batch = ingest_sealed_packet(
+        &registry_a,
+        &book_a,
+        &rr_a,
+        &crr_a,
+        community_id,
+        &packet,
+        ts,
+    )
+    .await;
+    assert!(
+        batch.changed_book(),
+        "A's book must materially change from B's snapshot reply"
+    );
+    assert_eq!(
+        batch.outcomes.len(),
+        2,
+        "the snapshot packet must carry both of B's rows"
+    );
+    if !batch.reachability_actors.is_empty() {
+        observer.reachability_applied(&batch.reachability_actors);
+    }
+
+    // A's resolver resolves admin's reachability row from the snapshot.
+    assert!(
+        !rr_a.resolve(&admin).is_empty(),
+        "A's ReachabilityResolver must resolve admin's actor after snapshot ingest"
+    );
+    // A's relay resolver resolves admin's relay row from the SAME snapshot.
+    assert!(
+        !crr_a.relays_for_community(&community_id, ts).is_empty(),
+        "A's CommunityRelayResolver must resolve admin's relay from the snapshot"
+    );
+
+    // A's book ends up holding both rows, byte-identical to what B served.
+    let rows_at_a = book_a.rows_for_community(&community_id, ts);
+    assert_eq!(
+        rows_at_a.len(),
+        2,
+        "A's book holds both rows from the snapshot"
+    );
+    assert!(
+        rows_at_a.contains(&reach_row),
+        "A's book holds B's reachability row verbatim"
+    );
+    assert!(
+        rows_at_a.contains(&relay_row),
+        "A's book holds B's relay row verbatim"
+    );
+
+    // The observer surfaces exactly one call carrying {admin} — the relay
+    // row contributes no signal of its own.
+    assert_eq!(
+        observer.calls(),
+        vec![BTreeSet::from([admin])],
+        "the observer seam surfaces admin exactly once from the snapshot round trip"
+    );
+
+    registry_a.shutdown_all().await.expect("shutdown a");
+    registry_b.shutdown_all().await.expect("shutdown b");
+}

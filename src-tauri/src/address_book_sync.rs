@@ -642,7 +642,12 @@ pub fn spawn_addrbook_subscriber(
 /// newest-first snapshot is strictly better, and the omitted rows still arrive
 /// via live records or another responder. Terminates: each iteration halves
 /// the row count, and an empty row set always seals small.
-fn seal_snapshot_bounded(
+///
+/// `pub` (not just used by [`spawn_addrbook_snapshot_queryable`]) so an
+/// integration test can build a snapshot-reply packet through the EXACT same
+/// serve-side call the production queryable makes, rather than duplicating
+/// the sort/seal/truncate logic.
+pub fn seal_snapshot_bounded(
     key: &ChannelKey,
     community: &SpaceId,
     mut rows: Vec<AddressBookRow>,
