@@ -185,8 +185,13 @@ if candidate.0 > now_ms / 1000 + VINE_PULL_INVALID_FORWARD_SKEW_SECS {
 - A full page of refused rows no longer advances the cursor → the existing
   zero-cursor-advance guard (`:270-280`) ends the session. A hostile relay
   can thereby stall pulls **from itself**, which it could already do by
-  withholding data; it can no longer sabotage pulls from other relays in
-  the set.
+  withholding data; its ability to sabotage pulls from *other* relays in
+  the set is **bounded to the 30-minute skew window, not eliminated**.
+  Within that window it can still push the persisted cursor forward (via
+  within-skew unverifiable rows, or directly on the Ok path — pre-existing),
+  shadowing every genuine row in a rolling ≤30-minute slice for the whole
+  relay set until wall-clock catches up, re-applied each pass. The clamp
+  bounds the damage; it does not remove the cross-relay effect.
 
 **Rejected alternative — cursor reset on relay-set change:** the ticket
 lists it as optional. Rejected: multi-device publishing is currently
@@ -258,9 +263,9 @@ impl PullProgressSink {
 
 ### Tests
 
-1. Session-level (duplex): serve 2 full pages then hang (no response to the
-   third query); outer `tokio::time::timeout` kills it → sink holds the
-   page-2 boundary cursor.
+1. Session-level (duplex): serve 1 full page then hang (no response to the
+   second query); outer `tokio::time::timeout` kills it → sink holds the
+   page-1 boundary cursor.
 2. Driver-level: `MockTransport` scripted to commit a cursor to the sink
    then return `Err` → after `run_one_pass`, `load_vine_pull` shows the
    committed cursor persisted (proves the `Err` arm merges progress).
@@ -307,6 +312,35 @@ Notes:
 - Branch 1 (endpoint `None` → plain unregister, `:233-236`) is left
   unchanged **intentionally**: endpoint-None is a transient boot state;
   retracting a valid record because iroh isn't up yet would be wrong.
+
+**As implemented — the delete trigger (added during review).** The branch
+above only runs when something calls `reconcile`, and at design time *no*
+production trigger did so on a vine delete: the trigger set was boot
+`enable()` (`lib.rs:9462`), the post-**publish** `republish()` hook
+(`lib.rs:16587-16593`, which implies count ≥ 1 and so takes the gate-open
+branch), and the settings toggle (`lib.rs:19608`). `delete_vine_impl`
+published its tombstone and returned without touching the publisher, so
+ZEB-822's own headline scenario — delete your last vine, never touch
+settings — reached the new branch only at the gate-open builder's next
+cadence tick (up to ~3.5 days). The fix therefore also adds a post-delete
+hook in `delete_vine_impl`, mirroring the post-publish one.
+
+That hook must observe the **post-delete** vine count, and the count comes
+from `vine_feed_cache`, which is updated asynchronously by the zenoh
+loopback echo of the tombstone. Reconciling immediately would race the
+eviction and, on a loss, re-register the *positive* builder. The publish
+path solved its analogue by applying its own descriptor to the cache
+synchronously (`lib.rs:16556-16579`); the delete path deliberately does
+**not** copy that, because `on_tombstone_sample` implements idempotency by
+returning `AlreadyApplied`, which `event_loop.rs::handle_vine_tombstone_sample`
+maps to "do nothing" — a local pre-apply would therefore suppress the
+echo's `vine-removed` emission and its ZEB-670 pin-guarded content
+eviction, stranding the deleted vine's blob on disk. Neither side effect is
+reproducible from `delete_vine_impl` (`NodeState` carries no event sink and
+no storage runtime). Instead the hook spawns a task that waits (bounded,
+≈2 s) for the descriptor to leave the cache, then calls `republish()`.
+Exhausting the wait degrades to exactly the pre-hook behavior — the
+cadence-tick retraction — never to anything worse.
 
 ### Tests
 

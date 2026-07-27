@@ -207,8 +207,9 @@ impl PkarrVinesPublisher {
 
     /// Shared ephemeral-key builder: derives the current epoch's vines slot
     /// key from this device's own address. Used by both the real-content
-    /// and retraction paths inside `reconcile_locked` so the retraction
-    /// lands under the exact same slot it's withdrawing.
+    /// path in `reconcile_locked` and the retraction path in
+    /// `register_retraction`, so the retraction lands under the exact same
+    /// slot it's withdrawing.
     fn key_builder(&self) -> EphemeralKeyBuilder {
         let own_addr_for_key = self.own_addr_hex.clone();
         Arc::new(move |at_ms| {

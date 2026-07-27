@@ -16988,6 +16988,16 @@ pub struct DeleteVineResult {
     pub published: bool,
 }
 
+/// ZEB-822: poll interval for the post-delete vines reconcile's wait on the
+/// loopback tombstone echo (see `delete_vine_impl`'s hook).
+const VINE_DELETE_RECONCILE_POLL_MS: u64 = 25;
+
+/// ZEB-822: how many `VINE_DELETE_RECONCILE_POLL_MS` ticks that wait allows
+/// before reconciling anyway (≈2 s). Deliberately generous: exhausting it only
+/// degrades the retraction to the publisher's next cadence tick, so the sole
+/// cost of a longer bound is a sleeping task.
+const VINE_DELETE_RECONCILE_WAIT_TICKS: u32 = 80;
+
 /// ZEB-670: shared seam for `delete_vine` (GUI command + headless RPC).
 ///
 /// Signs a `VineTombstonePayload` with the owner identity and publishes it
@@ -16999,7 +17009,13 @@ pub struct DeleteVineResult {
 /// Local cache application is NOT done here: our own subscriber receives
 /// the loopback echo of the publish and applies it through the same
 /// `on_tombstone_sample` path as every remote peer (mirrors how
-/// `publish_vine` relies on the `vine-received` echo).
+/// `publish_vine` relies on the `vine-received` echo). That echo is the ONLY
+/// applier by design — it is what carries the `vine-removed` emission and the
+/// ZEB-670 pin-guarded content eviction, both of which a local pre-apply would
+/// suppress (`on_tombstone_sample` reports the second application as
+/// `AlreadyApplied`, which `handle_vine_tombstone_sample` maps to "do
+/// nothing"). ZEB-822's post-delete vines reconcile therefore *waits* for the
+/// echo rather than short-circuiting it; see the hook at the end of this fn.
 pub(crate) async fn delete_vine_impl(
     state: &Mutex<NodeState>,
     vine_id: String,
@@ -17086,17 +17102,56 @@ pub(crate) async fn delete_vine_impl(
     // ZEB-822: force-reconcile the case-E vines relay record — the mirror of
     // the post-publish hook in `publish_vine_descriptor_impl`. Deleting your
     // LAST own vine flips the has-vines gate CLOSED, and the publisher only
-    // retracts the already-published relay-set record when something
-    // reconciles; without this the stale positive record would stay
+    // retracts the already-published relay-set record on a reconcile that
+    // OBSERVES zero own vines; without this the stale positive record stays
     // discoverable until the next scheduled pkarr cadence tick (up to ~3.5
-    // days). A cheap no-op when other vines remain. Spawned, never
-    // inline-awaited — this IPC must not block on pkarr network I/O.
+    // days). A cheap no-op when other vines remain.
+    //
+    // Why this WAITS for the eviction instead of applying the tombstone
+    // locally the way the publish hook applies its own descriptor above
+    // (final review I1): `reconcile` reads the vine count from this same
+    // cache, which is updated asynchronously by the loopback echo (see this
+    // fn's doc), so reconciling immediately races that eviction — lose the
+    // race and the gate-open branch re-registers the POSITIVE builder. A
+    // local pre-apply would win the race, but `on_tombstone_sample` achieves
+    // idempotency by returning `AlreadyApplied`, which makes the echo a no-op
+    // INCLUDING its `vine-removed` emission and its ZEB-670 pin-guarded
+    // content eviction (`event_loop.rs::handle_vine_tombstone_sample` returns
+    // `None` for that outcome) — it would strand the deleted vine's blob on
+    // disk and leave the row on screen. Neither side effect is reproducible
+    // here: `NodeState` carries no event sink and no storage runtime. So the
+    // echo stays the sole applier and this hook simply waits for it.
+    //
+    // Fully spawned, never inline-awaited — this IPC must not block on the
+    // echo or on pkarr network I/O. Exhausting the wait without observing the
+    // eviction degrades to exactly the pre-hook behavior (the already
+    // registered gate-open builder retracts at its next cadence tick), never
+    // to anything worse.
     let vines_publisher = state
         .lock()
         .ok()
         .and_then(|g| g.pkarr_vines_publisher.clone());
     if let Some(vp) = vines_publisher {
-        tokio::spawn(async move { vp.republish().await });
+        let cache_for_hook = std::sync::Arc::clone(&cache);
+        let deleted_vine_id = vine_id.clone();
+        tokio::spawn(async move {
+            for _ in 0..VINE_DELETE_RECONCILE_WAIT_TICKS {
+                let still_cached = cache_for_hook
+                    .lock()
+                    .map(|c| c.list_descriptors().iter().any(|v| v.id == deleted_vine_id))
+                    // Poisoned: we can never observe the eviction, so stop
+                    // waiting and reconcile on whatever the gate reads.
+                    .unwrap_or(false);
+                if !still_cached {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    VINE_DELETE_RECONCILE_POLL_MS,
+                ))
+                .await;
+            }
+            vp.republish().await;
+        });
     }
 
     Ok(DeleteVineResult { published: true })

@@ -329,9 +329,14 @@ where
         // ingest, so `cursor` is durable progress the caller may keep even
         // if the next read never returns. One call site covers the loop's
         // continue and both break paths below; the Halt arm above has its
-        // own. `commit` is monotone and `cursor` only ever moves forward
-        // here (the ZEB-818 skew clamp already governed what got into it),
-        // so this needs no ordering logic of its own.
+        // own. This needs no ordering logic of its own because `commit` is
+        // MONOTONE — that, and nothing else, is what makes the call site
+        // ordering-safe. `cursor` itself is not guaranteed forward-moving:
+        // the ZEB-818 skew clamp governs only the `SkipInvalid` arm, while
+        // `Advance`/`AdvanceDuplicate` assign `cursor = candidate`
+        // order-blind, so a hostile relay serving a below-cursor row does
+        // move it backward (final review M5, pre-existing; cost is
+        // re-download work only). `commit`'s monotonicity absorbs that.
         progress.commit(cursor.clone());
 
         if page_len < VINE_PULL_PAGE_LIMIT_MAX as usize {
