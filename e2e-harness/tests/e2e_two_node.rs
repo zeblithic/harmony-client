@@ -2579,11 +2579,46 @@ async fn s_vines_follow_only() {
     .await
     .expect("descriptor must arrive over the relay path");
 
+    // Bind the descriptor leg's outcome to the actual relay-pull mechanism —
+    // not just "bob's feed changed" — so a future regression (e.g. a new ALPN
+    // accidentally bridging zenoh) can't pass the poll above for the wrong
+    // reason.
+    let bob_health = network_health_snapshot(&bob).await.unwrap();
+    assert!(
+        bob_health["vineRelay"]["pulling"]["sessionsOk"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "bob's vineRelay.pulling.sessionsOk must be >=1 after the descriptor leg; got {bob_health}"
+    );
+    assert!(
+        bob_health["vineRelay"]["pulling"]["descriptorsIngested"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "bob's vineRelay.pulling.descriptorsIngested must be >=1 after the descriptor leg; got {bob_health}"
+    );
+
     // Video leg: relay content fetch (mesh GET cannot succeed — no shared mesh).
     let bytes = fetch_vine_video(&bob, &video_cid, &alice_addr)
         .await
         .expect("video over vine-relay");
     assert!(!bytes.is_empty());
+
+    // Alice's serving counter increments at HER session teardown, which can
+    // lag a beat behind bob having received all the bytes — poll briefly
+    // (not a bare assert) to avoid a race with that teardown, then bind the
+    // video leg to the serving side of the mechanism the same way.
+    poll_until(Duration::from_secs(30), || async {
+        let snap = network_health_snapshot(&alice).await?;
+        Ok((snap["vineRelay"]["serving"]["sessionsServed"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1)
+            .then_some(()))
+    })
+    .await
+    .expect("alice must have served at least one vine-relay session for bob's video fetch");
 
     // View + reshare legs on the PULLED copies (v1 has no reverse channel).
     assert!(mark_vine_viewed(&bob, &vine_id).await.unwrap());

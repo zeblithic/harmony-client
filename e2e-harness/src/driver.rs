@@ -539,6 +539,16 @@ pub async fn fetch_vine_video(
         .collect()
 }
 
+/// Full network-health snapshot (pkarr/dial/relay/vine-relay telemetry). Used
+/// to bind an e2e outcome to the mechanism that produced it — e.g. asserting
+/// `vineRelay.pulling`/`vineRelay.serving` counters actually moved, rather
+/// than trusting a descriptor/video leg's success in isolation (a future ALPN
+/// accidentally bridging zenoh could pass the same asserts for the wrong
+/// reason).
+pub async fn network_health_snapshot(node: &NodeHandle) -> anyhow::Result<Value> {
+    node.rpc("network_health_snapshot", json!({})).await
+}
+
 // ── Profile cards (ZEB-341) + peer-profile broadcast (ZEB-281) — ZEB-464 ──────
 //
 // Card propagation rides a Zenoh broadcast topic keyed by the owner's 16-byte
