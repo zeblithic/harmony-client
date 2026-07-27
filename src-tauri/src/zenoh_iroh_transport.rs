@@ -200,6 +200,12 @@ pub struct IrohZenohLinkManager {
     community_relay_pull_acceptor: std::sync::OnceLock<
         Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>,
     >,
+    /// ZEB-811: late-installed acceptor for inbound `harmony/vine-relay/v1`
+    /// connections (public-read vine descriptor+content serve). Same
+    /// lifecycle as the community-relay pull acceptor — no boot-window
+    /// queue; a pull arriving before install is closed and the follower's
+    /// pull driver retries on its next cadence.
+    vine_relay_acceptor: std::sync::OnceLock<Arc<crate::vine_relay::VineRelayAcceptor>>,
     /// ZEB-473 (Move 1a): late-installed acceptor for inbound
     /// `harmony/tunnel/v1` connections (the PQ DM tunnel). Same lifecycle as the
     /// butler/relay acceptors — no boot-window queue; a tunnel dial arriving
@@ -275,6 +281,7 @@ impl IrohZenohLinkManager {
             butler_deposit_acceptor: std::sync::OnceLock::new(),
             community_relay_deposit_acceptor: std::sync::OnceLock::new(),
             community_relay_pull_acceptor: std::sync::OnceLock::new(),
+            vine_relay_acceptor: std::sync::OnceLock::new(),
             tunnel_acceptor: std::sync::OnceLock::new(),
             zenoh_conns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             reconnect: Arc::new(std::sync::OnceLock::new()),
@@ -448,6 +455,16 @@ impl IrohZenohLinkManager {
         acceptor: Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>,
     ) -> Result<(), Arc<crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor>> {
         self.community_relay_pull_acceptor.set(acceptor)
+    }
+
+    /// ZEB-811: install the vine-relay acceptor used by the accept loop to
+    /// route inbound `harmony/vine-relay/v1` connections. Same install-once
+    /// lifecycle as the community-relay pull acceptor.
+    pub fn install_vine_relay_acceptor(
+        &self,
+        acceptor: Arc<crate::vine_relay::VineRelayAcceptor>,
+    ) -> Result<(), Arc<crate::vine_relay::VineRelayAcceptor>> {
+        self.vine_relay_acceptor.set(acceptor)
     }
 
     /// ZEB-473 (Move 1a): install the PQ DM tunnel acceptor used by the accept
@@ -767,6 +784,22 @@ impl IrohZenohLinkManager {
                         } else {
                             tracing::debug!(
                                 "ZEB-458: community relay pull before acceptor installed; closing"
+                            );
+                            conn.close(0u32.into(), b"");
+                        }
+                    } else if alpn_used == alpn::HARMONY_VINE_RELAY_V1 {
+                        // ZEB-811: public-read vine-relay fan-out. Spawn so a
+                        // slow/hung requester can't block the accept loop;
+                        // admission control lives inside `handle_connection`
+                        // (accept-then-close-at-capacity, so the "busy"
+                        // signal costs a saturated relay nothing).
+                        if let Some(acceptor) = mgr.vine_relay_acceptor.get().cloned() {
+                            tokio::spawn(async move {
+                                acceptor.handle_connection(conn).await;
+                            });
+                        } else {
+                            tracing::debug!(
+                                "ZEB-811: vine relay connection before acceptor installed; closing"
                             );
                             conn.close(0u32.into(), b"");
                         }

@@ -790,6 +790,20 @@ impl VineFeedCache {
             .collect()
     }
 
+    /// ZEB-811: true when `cid_hex` is the `video_cid` of at least one
+    /// signature-retaining cached descriptor (any creator). Backs the
+    /// vine-relay serve ctx's content allowlist — resolved from THIS node's
+    /// own cache, never from a requester's claim, so an anonymous peer
+    /// cannot turn this node into an open blob-serving proxy for arbitrary
+    /// CIDs. Mirrors the same sig-retained filter as
+    /// `descriptors_for_creator_page`.
+    pub fn video_cid_is_served(&self, cid_hex: &str) -> bool {
+        self.descriptors.values().any(|cv| {
+            (cv.descriptor.sig.is_some() || cv.descriptor.device_sig.is_some())
+                && cv.descriptor.video_cid == cid_hex
+        })
+    }
+
     /// ZEB-811: max `received_at_ms` across `creator`'s cached rows — feeds
     /// the vine-relay pull driver's per-creator freshness check. `None`
     /// when no descriptor from `creator` is cached (never pulled, or all

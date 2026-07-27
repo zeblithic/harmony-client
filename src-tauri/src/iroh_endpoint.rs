@@ -86,6 +86,16 @@ pub mod alpn {
     /// connect-failure. Retire `/v1` only after
     /// `protocol_versioning::MIN_SUPPORTED_TUNNEL_ALPN_GENERATION` advances to 2.
     pub const HARMONY_TUNNEL_V2: &[u8] = b"harmony/tunnel/v2";
+    /// ZEB-811: public-read vine descriptor + video fan-out protocol (see
+    /// `vine_relay`). Deliberately UNAUTHENTICATED — public vine sharing is
+    /// the design center — bounded instead by an admission cap, frame caps,
+    /// and a per-session byte budget (`vine_relay` module docs). Routed by
+    /// the accept loop to the late-installed `VineRelayAcceptor` (see
+    /// `IrohZenohLinkManager::install_vine_relay_acceptor`); connections
+    /// arriving before install are closed (the follower's pull driver
+    /// retries next cadence). Re-exported from `vine_relay` so the wire
+    /// ALPN string lives in exactly one place.
+    pub const HARMONY_VINE_RELAY_V1: &[u8] = crate::vine_relay::VINE_RELAY_ALPN;
 }
 
 /// The full set of harmony ALPNs the client endpoint advertises, in the same
@@ -104,6 +114,7 @@ pub fn all_client_alpns() -> Vec<Vec<u8>> {
         alpn::HARMONY_COMMUNITY_RELAY_PULL_V1.to_vec(),
         alpn::HARMONY_TUNNEL_V1.to_vec(),
         alpn::HARMONY_TUNNEL_V2.to_vec(),
+        alpn::HARMONY_VINE_RELAY_V1.to_vec(),
     ]
 }
 

@@ -655,6 +655,76 @@ impl CommunityRelayServingTelemetry {
     }
 }
 
+/// ZEB-811: process-lifetime vine-relay-serving counters, shared (`Arc`)
+/// between [`crate::vine_relay::VineRelayAcceptor`] (writer) and
+/// `network_health_snapshot` (reader). Mirrors
+/// [`CommunityRelayServingTelemetry`], minus the per-peer breakdown (not
+/// needed yet at vine-relay's current scale) plus a `bytes_served` running
+/// total (content chunks make byte volume the more informative counter here
+/// than session count alone).
+#[derive(Debug, Default)]
+pub struct VineRelayServingTelemetry {
+    sessions_served: AtomicU64,
+    sessions_rejected: AtomicU64,
+    sessions_failed: AtomicU64,
+    bytes_served: AtomicU64,
+    last_served_ms: AtomicU64,
+}
+
+impl VineRelayServingTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one admitted-and-driven session, however it ended (client
+    /// EOF, idle timeout, an oversize/undecodable request, or a byte-budget
+    /// breach) — the connection was accepted and served, even if it ended
+    /// early. `bytes` is the session's total response-body bytes written.
+    pub fn record_served(&self, bytes: u64) {
+        self.sessions_served.fetch_add(1, Ordering::Relaxed);
+        self.bytes_served.fetch_add(bytes, Ordering::Relaxed);
+        self.last_served_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// Record one connection rejected at the admission cap (never reached
+    /// `accept_bi`).
+    pub fn record_rejected(&self) {
+        self.sessions_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one connection that was admitted but never became a servable
+    /// session (`accept_bi` itself failed or timed out).
+    pub fn record_failed(&self) {
+        self.sessions_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn summary(&self) -> VineRelayServingHealth {
+        let last = self.last_served_ms.load(Ordering::Relaxed);
+        VineRelayServingHealth {
+            sessions_served: self.sessions_served.load(Ordering::Relaxed),
+            sessions_rejected: self.sessions_rejected.load(Ordering::Relaxed),
+            sessions_failed: self.sessions_failed.load(Ordering::Relaxed),
+            bytes_served: self.bytes_served.load(Ordering::Relaxed),
+            // 0 is the "never served" sentinel, same convention as
+            // `CommunityRelayServingTelemetry::summary`.
+            last_served_ms: (last != 0).then_some(last),
+        }
+    }
+}
+
+/// ZEB-811: wire shape for [`VineRelayServingTelemetry::summary`]. The
+/// service-field/snapshot assembly into [`NetworkHealthSnapshot`] is Task 8;
+/// this struct is produced and consumed standalone until then.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VineRelayServingHealth {
+    pub sessions_served: u64,
+    pub sessions_rejected: u64,
+    pub sessions_failed: u64,
+    pub bytes_served: u64,
+    pub last_served_ms: Option<u64>,
+}
+
 /// ZEB-803: process-lifetime relay-pulling counters, shared (`Arc`) between
 /// [`crate::community_relay_pull_driver::CommunityRelayPullDriver`] (writer) and
 /// `network_health_snapshot` (reader).

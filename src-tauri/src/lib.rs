@@ -289,6 +289,7 @@ pub mod tunnel_manager;
 pub mod tunnel_task;
 pub mod vine_feed_cache;
 pub mod vine_follow_graph;
+pub mod vine_relay;
 pub mod vine_settings;
 pub mod vine_signing;
 pub mod vine_tombstone;
@@ -10636,6 +10637,38 @@ pub async fn start_node_inner(
                             // alarm's own wiring.
                             community_relay_serving_telemetry_for_state =
                                 Some(relay_serving_telemetry);
+                        }
+
+                        // ZEB-811: install the vine-relay serve acceptor
+                        // (public-read descriptor + content fan-out). Ctx
+                        // holds the SAME vine_feed_cache + content_store Arcs
+                        // already in scope; the acceptor's telemetry Arc is
+                        // built here (mirroring the community-relay serving
+                        // telemetry just above) so Task 8 can pick it up for
+                        // the health-snapshot wiring without re-touching this
+                        // install site's shape.
+                        let vine_relay_serving_telemetry = std::sync::Arc::new(
+                            crate::network_health::VineRelayServingTelemetry::new(),
+                        );
+                        let vine_relay_ctx: std::sync::Arc<
+                            dyn crate::vine_relay::VineRelayServeCtx,
+                        > = std::sync::Arc::new(crate::vine_relay::ProdVineRelayServeCtx {
+                            cache: std::sync::Arc::clone(&vine_feed_cache),
+                            content_store: std::sync::Arc::clone(&content_store),
+                        });
+                        if link_mgr
+                            .install_vine_relay_acceptor(std::sync::Arc::new(
+                                crate::vine_relay::VineRelayAcceptor::new(vine_relay_ctx)
+                                    .with_telemetry(std::sync::Arc::clone(
+                                        &vine_relay_serving_telemetry,
+                                    )),
+                            ))
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "ZEB-811: vine-relay acceptor already installed on \
+                                 iroh link manager — keeping the prior instance"
+                            );
                         }
 
                         // C/D/E. The pull driver, sender deposit client, and
