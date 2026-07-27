@@ -2511,6 +2511,100 @@ async fn s_vines_publish_feed_view_reshare() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// S6-ADDRBOOK (ZEB-815 Task 8): join → address-book routing → channel message
+// delivery, with ZERO announce events available anywhere in the chain. The
+// ZEB-815 flag-day moved routing data (ReachabilityAnnounce /
+// CommunityRelayAnnounce) off the membership CRDT entirely, onto the sealed
+// per-community address-book topic + snapshot catch-up; this is the
+// end-to-end proof that a real binary's join → pkarr → snapshot → resolver →
+// dial → deliver chain still works with the CRDT announce path gone. Mirrors
+// `s_vines_publish_feed_view_reshare`'s preamble (create_community →
+// generate_invite → poll_join_iroh → roster poll).
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s6_addrbook_join_message_delivery() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let (mut run, ah, bh, alice, bob) = two_minted_nodes("addrbook").await;
+    let alice_owner = owner_id(&alice).await;
+    let bob_owner = owner_id(&bob).await;
+
+    let community = create_community(&alice, "addrbook-community", true)
+        .await
+        .expect("alice creates community");
+    let invite = generate_invite(&alice, &community)
+        .await
+        .expect("generate invite");
+    poll_join_iroh(&bob, &invite, Duration::from_secs(240))
+        .await
+        .expect("bob joins alice's community via iroh first-contact (addrbook path only)");
+    poll_until(Duration::from_secs(120), || async {
+        Ok(roster_has_joined(&alice, &community, &bob_owner)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("alice sees bob joined — roster converges with no announce events available");
+
+    // A shared channel both members can post to (write_power 0).
+    let channel = create_channel(&alice, &community, "addrbook-shared", 0)
+        .await
+        .expect("alice creates shared channel");
+    poll_until(Duration::from_secs(180), || async {
+        Ok(channels_contains(&bob, &community, &channel)
+            .await?
+            .then_some(()))
+    })
+    .await
+    .expect("bob converges the shared channel");
+
+    // Alice posts; bob's read-back must show it — exercising join → pkarr →
+    // snapshot → resolver → dial → deliver end to end, with routing data
+    // flowing exclusively over the address-book path.
+    let body: &[u8] = b"hello-addrbook-e2e";
+    post_channel_message(&alice, &community, &channel, body)
+        .await
+        .expect("alice's post_channel_message accepted");
+
+    let delivered = poll_until(Duration::from_secs(120), || async {
+        let msgs = list_channel_messages(&bob, &community, &channel).await?;
+        Ok(msgs.into_iter().find(|m| {
+            let body_matches = m.get("body").and_then(|b| b.as_array()).map(|arr| {
+                arr.iter()
+                    .map(|n| n.as_u64().filter(|v| *v <= u8::MAX as u64).map(|v| v as u8))
+                    .collect::<Option<Vec<u8>>>()
+            }) == Some(Some(body.to_vec()));
+            m.get("author").and_then(|a| a.as_str()) == Some(alice_owner.as_str()) && body_matches
+        }))
+    })
+    .await
+    .expect(
+        "bob's channel read-back MUST contain alice's message — dial path built purely from \
+         address-book-derived reachability",
+    );
+
+    // Assert on the DTO's REAL camelCase keys (`ChannelMessageDto` is
+    // `#[serde(rename_all = "camelCase")]`) — a guessed key would make
+    // `poll_until` silently time out rather than fail loudly (ZEB-462 class).
+    assert!(
+        delivered
+            .get("messageId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "delivered message DTO must carry a non-empty messageId: {delivered:?}"
+    );
+    assert_eq!(
+        delivered.get("author").and_then(|v| v.as_str()),
+        Some(alice_owner.as_str()),
+        "delivered message DTO's author must be alice's ownerId"
+    );
+
+    run.mark_success();
+    drop((alice, bob, ah, bh));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // S11 (ZEB-715): admin-recovery liveness path — configure designates →
 // designate initiates → cosign to threshold → current admin vetoes →
 // terminal Vetoed, membership unchanged.
