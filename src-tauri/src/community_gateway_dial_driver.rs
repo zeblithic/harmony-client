@@ -54,10 +54,45 @@ pub trait GatewayDialCtx: Send + Sync {
     async fn epoch_key_of(&self, community: &SpaceId) -> Option<EpochKey>;
 }
 
+/// Outcome of one beacon resolve attempt. `ResolveError` means no beacon was
+/// found AND at least one slot probe errored at the pkarr/transport layer —
+/// infrastructure trouble, not proof of absence.
+//
+// large_enum_variant: `Found` carries the full ~248-byte `IdentifiedBeacon`
+// while the miss arms are unit. Deliberate: exactly one short-lived value
+// exists per resolve attempt (never collected, never stored), so the size
+// asymmetry costs nothing, while boxing would add an allocation and an
+// indirection at every match site for no benefit.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum BeaconResolution {
+    Found(IdentifiedBeacon),
+    NotFound,
+    ResolveError,
+}
+
+/// Pure classification of one identified resolve (review r1 finding 2):
+/// `payload` is the winning beacon, if any; `resolve_errors` counts the slot
+/// probes that failed at the pkarr/transport layer. A hit wins outright — an
+/// errored probe on some OTHER slot does not demote a found beacon. A miss
+/// with zero errors is proof-shaped absence (`NotFound`); a miss with any
+/// errored probe carries no information and must not masquerade as one
+/// (`ResolveError`).
+fn classify_resolution(
+    payload: Option<IdentifiedBeacon>,
+    resolve_errors: usize,
+) -> BeaconResolution {
+    match payload {
+        Some(hit) => BeaconResolution::Found(hit),
+        None if resolve_errors > 0 => BeaconResolution::ResolveError,
+        None => BeaconResolution::NotFound,
+    }
+}
+
 /// The pkarr resolve seam. Prod = [`ProdBeaconResolver`]; tests stub it.
 #[async_trait::async_trait]
 pub trait BeaconResolver: Send + Sync {
-    async fn resolve_beacon(&self, epoch_key: &EpochKey, now_ms: u64) -> Option<IdentifiedBeacon>;
+    async fn resolve_beacon(&self, epoch_key: &EpochKey, now_ms: u64) -> BeaconResolution;
 }
 
 /// Production [`BeaconResolver`]: Task 1's identified resolve with the
@@ -69,16 +104,16 @@ pub struct ProdBeaconResolver {
 
 #[async_trait::async_trait]
 impl BeaconResolver for ProdBeaconResolver {
-    async fn resolve_beacon(&self, epoch_key: &EpochKey, now_ms: u64) -> Option<IdentifiedBeacon> {
-        crate::community_rendezvous::resolve_rendezvous_identified(
+    async fn resolve_beacon(&self, epoch_key: &EpochKey, now_ms: u64) -> BeaconResolution {
+        let res = crate::community_rendezvous::resolve_rendezvous_identified(
             &self.pkarr,
             epoch_key,
             self.self_endpoint_id,
             now_ms,
             &rendezvous_config_from_env(),
         )
-        .await
-        .payload
+        .await;
+        classify_resolution(res.outcome.payload, res.resolve_errors)
     }
 }
 
@@ -341,9 +376,19 @@ impl CommunityGatewayDialDriver {
                 self.record(&community, GatewayBootstrapOutcome::StarvedWaiting);
                 continue;
             }
-            let Some(hit) = self.beacons.resolve_beacon(&epoch_key, now_ms).await else {
-                self.record(&community, GatewayBootstrapOutcome::NoBeacon);
-                continue;
+            // Ladder semantics are identical for both miss flavors: the rung
+            // was already consumed before the resolve, and an errored attempt
+            // paces exactly like a missed one.
+            let hit = match self.beacons.resolve_beacon(&epoch_key, now_ms).await {
+                BeaconResolution::Found(hit) => hit,
+                BeaconResolution::NotFound => {
+                    self.record(&community, GatewayBootstrapOutcome::NoBeacon);
+                    continue;
+                }
+                BeaconResolution::ResolveError => {
+                    self.record(&community, GatewayBootstrapOutcome::ResolveError);
+                    continue;
+                }
             };
             let Ok(identity) =
                 harmony_identity::Identity::from_public_bytes(&hit.beacon_identity_pub)
@@ -503,16 +548,24 @@ mod tests {
     }
 
     struct StubBeacons {
-        hit: Option<IdentifiedBeacon>,
+        resolution: Mutex<BeaconResolution>,
         calls: AtomicU64,
     }
 
     impl StubBeacons {
         fn new(hit: Option<IdentifiedBeacon>) -> Self {
+            let resolution = match hit {
+                Some(h) => BeaconResolution::Found(h),
+                None => BeaconResolution::NotFound,
+            };
             Self {
-                hit,
+                resolution: Mutex::new(resolution),
                 calls: AtomicU64::new(0),
             }
+        }
+        /// Swap the stubbed resolution mid-test (e.g. to `ResolveError`).
+        fn set_resolution(&self, r: BeaconResolution) {
+            *self.resolution.lock().unwrap() = r;
         }
         fn calls(&self) -> u64 {
             self.calls.load(Ordering::SeqCst)
@@ -521,9 +574,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl BeaconResolver for StubBeacons {
-        async fn resolve_beacon(&self, _k: &EpochKey, _now: u64) -> Option<IdentifiedBeacon> {
+        async fn resolve_beacon(&self, _k: &EpochKey, _now: u64) -> BeaconResolution {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.hit.clone()
+            self.resolution.lock().unwrap().clone()
         }
     }
 
@@ -1362,7 +1415,11 @@ mod tests {
             driver.ladder_delay_ms(&community).is_none(),
             "un-join must prune the ladder entry"
         );
-        assert_eq!(beacons.calls(), 2, "an un-joined community must not resolve");
+        assert_eq!(
+            beacons.calls(),
+            2,
+            "an un-joined community must not resolve"
+        );
 
         // Re-join without advancing time: a fresh episode, immediate attempt,
         // armed at base.
@@ -1436,6 +1493,64 @@ mod tests {
             driver.ladder_delay_ms(&community),
             Some(GATEWAY_DIAL_RETRY_BASE_MS),
             "the post-re-registration episode must arm at base"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 10b. Resolve-error de-conflation (review r1, finding 2): a resolve that
+    //      errored at the pkarr layer must surface as `resolveError`, never as
+    //      `noBeacon` — debug logs are off in prod, so the counters are the
+    //      only signal separating "nobody published" from "pkarr is failing".
+    // ------------------------------------------------------------------
+    #[test]
+    fn classify_resolution_covers_all_three_arms() {
+        let (_identity, identity_pub) = test_identity(21);
+        let hit = beacon(identity_pub, [0xAD; 32]);
+
+        // A hit wins outright — even alongside errored probes on other slots.
+        for errors in [0usize, 3] {
+            match classify_resolution(Some(hit.clone()), errors) {
+                BeaconResolution::Found(b) => assert_eq!(b.payload.iroh_node_id, [0xAD; 32]),
+                other => panic!("a payload hit must classify as Found, got {other:?}"),
+            }
+        }
+        // A miss with zero errors is proof-shaped absence.
+        assert!(matches!(
+            classify_resolution(None, 0),
+            BeaconResolution::NotFound
+        ));
+        // A miss with any errored probe carries no information.
+        assert!(matches!(
+            classify_resolution(None, 1),
+            BeaconResolution::ResolveError
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_error_records_resolve_error_not_no_beacon() {
+        let community = SpaceId([0x25; 16]);
+        let (_member_pub, member_owner) = test_member(22);
+        let h = harness(
+            community,
+            vec![member_owner],
+            None,
+            true,
+            Some(SupervisorHandle::new()),
+        );
+        h.beacons.set_resolution(BeaconResolution::ResolveError);
+
+        h.driver.run_one_pass().await;
+
+        assert_eq!(h.beacons.calls(), 1, "a starved community must resolve");
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("resolveError")
+        );
+        let s = h.telemetry.summary();
+        assert_eq!(s.resolve_error, 1, "the errored resolve must be counted");
+        assert_eq!(
+            s.no_beacon, 0,
+            "an errored resolve must NOT masquerade as noBeacon"
         );
     }
 

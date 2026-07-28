@@ -21,6 +21,7 @@ use harmony_pkarr::rendezvous::{
     RendezvousResolveConfig, RendezvousResolveOutcome,
 };
 use harmony_pkarr::PkarrResolver;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -157,6 +158,12 @@ struct IdentifiedSlotResolver {
     /// (spec §5 self-dial hazard; ZEB-806 lesson — compare 32-byte endpoint
     /// ids, never 16-byte device ids).
     self_endpoint_id: [u8; 32],
+    /// Slot probes that failed at the pkarr/transport layer during this
+    /// resolve. To the escalating driver an errored probe still reads as a
+    /// miss (widening must continue), but the caller needs the count to tell
+    /// "no beacon published" (proof-shaped absence) apart from "resolve
+    /// infrastructure failing" (no information) — review r1 finding 2.
+    resolve_errors: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -169,6 +176,7 @@ impl harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> for IdentifiedSlo
             Ok(Some(rec)) => rec,
             Ok(None) => return None,
             Err(e) => {
+                self.resolve_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(slot = slot_index, error = ?e,
                     "identified rendezvous probe errored — treating as a miss");
                 return None;
@@ -193,21 +201,37 @@ impl harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> for IdentifiedSlo
     }
 }
 
+/// Result of an identified rendezvous resolve. `resolve_errors` counts slot
+/// probes that failed at the pkarr/transport layer during this resolve —
+/// the caller uses it to distinguish "no beacon published" (proof-shaped
+/// absence) from "resolve infrastructure failing" (no information).
+pub struct IdentifiedResolve {
+    pub outcome: RendezvousResolveOutcome<IdentifiedBeacon>,
+    pub resolve_errors: usize,
+}
+
 /// ZEB-824 production entry point: like [`resolve_rendezvous`], but yields an
-/// [`IdentifiedBeacon`] and treats our own record as an empty slot.
+/// [`IdentifiedBeacon`] and treats our own record as an empty slot. The
+/// pkarr-layer probe-error count rides along in [`IdentifiedResolve`].
 pub async fn resolve_rendezvous_identified(
     pkarr: &Arc<PkarrResolver>,
     epoch_key: &EpochKey,
     self_endpoint_id: [u8; 32],
     now_ms: u64,
     cfg: &RendezvousResolveConfig,
-) -> RendezvousResolveOutcome<IdentifiedBeacon> {
+) -> IdentifiedResolve {
+    let resolve_errors = Arc::new(AtomicUsize::new(0));
     let resolver = IdentifiedSlotResolver {
         pkarr: Arc::clone(pkarr),
         epoch_key_bytes: Zeroizing::new(epoch_key.as_bytes().to_vec()),
         self_endpoint_id,
+        resolve_errors: Arc::clone(&resolve_errors),
     };
-    resolve_rendezvous_with(&resolver, now_ms, cfg).await
+    let outcome = resolve_rendezvous_with(&resolver, now_ms, cfg).await;
+    IdentifiedResolve {
+        outcome,
+        resolve_errors: resolve_errors.load(Ordering::Relaxed),
+    }
 }
 
 #[cfg(test)]

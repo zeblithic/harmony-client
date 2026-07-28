@@ -1022,6 +1022,7 @@ pub struct GatewayBootstrapTelemetry {
     last_pass_ms: AtomicU64,
     beacons_seeded: AtomicU64,
     no_beacon: AtomicU64,
+    resolve_error: AtomicU64,
     rejected_non_member: AtomicU64,
     engine_unregistered: AtomicU64,
     /// community bytes → (last outcome, stamped at). Bounded by the node's
@@ -1040,6 +1041,14 @@ pub enum GatewayBootstrapOutcome {
     Healthy,
     StarvedWaiting,
     NoBeacon,
+    /// The resolve found no beacon AND at least one slot probe errored at the
+    /// pkarr/transport layer — infrastructure trouble, not proof of absence
+    /// (review r1 finding 2). Split from [`Self::NoBeacon`] because debug
+    /// logs are off in prod, so these counters are the only signal separating
+    /// "nobody published a beacon" from "pkarr is failing under us"; conflating
+    /// them sends an incident hunt to the publisher when the fault is the
+    /// resolve infrastructure.
+    ResolveError,
     BeaconSeeded,
     /// Historically the membership-gate rejection. That gate is gone (ZEB-824
     /// fix round 2 / spec §5c — it compared the beacon's composite
@@ -1067,6 +1076,7 @@ impl GatewayBootstrapOutcome {
             Self::Healthy => "healthy",
             Self::StarvedWaiting => "starvedWaiting",
             Self::NoBeacon => "noBeacon",
+            Self::ResolveError => "resolveError",
             Self::BeaconSeeded => "beaconSeeded",
             Self::RejectedNonMember => "rejectedNonMember",
             Self::SoloCommunity => "soloCommunity",
@@ -1094,6 +1104,9 @@ impl GatewayBootstrapTelemetry {
             }
             GatewayBootstrapOutcome::NoBeacon => {
                 self.no_beacon.fetch_add(1, Ordering::Relaxed);
+            }
+            GatewayBootstrapOutcome::ResolveError => {
+                self.resolve_error.fetch_add(1, Ordering::Relaxed);
             }
             GatewayBootstrapOutcome::RejectedNonMember => {
                 self.rejected_non_member.fetch_add(1, Ordering::Relaxed);
@@ -1130,6 +1143,7 @@ impl GatewayBootstrapTelemetry {
             last_pass_ms: (last_pass != 0).then_some(last_pass),
             beacons_seeded: self.beacons_seeded.load(Ordering::Relaxed),
             no_beacon: self.no_beacon.load(Ordering::Relaxed),
+            resolve_error: self.resolve_error.load(Ordering::Relaxed),
             rejected_non_member: self.rejected_non_member.load(Ordering::Relaxed),
             engine_unregistered: self.engine_unregistered.load(Ordering::Relaxed),
             per_community: per,
@@ -1144,6 +1158,11 @@ pub struct GatewayBootstrapHealth {
     pub last_pass_ms: Option<u64>,
     pub beacons_seeded: u64,
     pub no_beacon: u64,
+    /// Resolves that found no beacon while at least one slot probe errored at
+    /// the pkarr/transport layer. Wire key `resolveError`, next to `noBeacon`
+    /// deliberately: the two split one former bucket, and incident diagnosis
+    /// reads them together.
+    pub resolve_error: u64,
     pub rejected_non_member: u64,
     pub engine_unregistered: u64,
     /// One row per community that has reached a verdict — **not a census of
@@ -4074,12 +4093,16 @@ mod tests {
         t.record_pass_start();
         t.record_outcome(&[0xAB; 16], GatewayBootstrapOutcome::BeaconSeeded);
         t.record_outcome(&[0xCD; 16], GatewayBootstrapOutcome::NoBeacon);
+        t.record_outcome(&[0xEF; 16], GatewayBootstrapOutcome::ResolveError);
         let json = serde_json::to_value(t.summary()).expect("serialize");
         assert_eq!(json["passesRun"], 1);
         assert_eq!(json["beaconsSeeded"], 1);
         assert_eq!(json["noBeacon"], 1);
+        // Review r1 finding 2: the errored-resolve bucket is split from
+        // noBeacon and must not leak into it.
+        assert_eq!(json["resolveError"], 1);
         let per = json["perCommunity"].as_array().expect("perCommunity array");
-        assert_eq!(per.len(), 2);
+        assert_eq!(per.len(), 3);
         // Sorted by communityShort for deterministic output.
         assert_eq!(per[0]["communityShort"], "abababab");
         assert_eq!(per[0]["outcome"], "beaconSeeded");
@@ -4095,6 +4118,7 @@ mod tests {
             "lastPassMs",
             "beaconsSeeded",
             "noBeacon",
+            "resolveError",
             "rejectedNonMember",
             "engineUnregistered",
             "perCommunity",
@@ -4107,6 +4131,7 @@ mod tests {
         // No snake_case leakage past the camelCase rename.
         assert!(json.get("passes_run").is_none());
         assert!(json.get("engine_unregistered").is_none());
+        assert!(json.get("resolve_error").is_none());
         assert!(per[0].get("community_short").is_none());
     }
 
@@ -4132,10 +4157,11 @@ mod tests {
             (
                 s.beacons_seeded,
                 s.no_beacon,
+                s.resolve_error,
                 s.rejected_non_member,
                 s.engine_unregistered
             ),
-            (0, 0, 0, 0)
+            (0, 0, 0, 0, 0)
         );
         // … and the map keeps ONE row per community, the latest.
         assert_eq!(s.per_community.len(), 2);

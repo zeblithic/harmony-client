@@ -1314,7 +1314,7 @@ async fn identified_resolve_returns_beacon_identity() {
         assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
         await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
 
-        let outcome = harmony_app::community_rendezvous::resolve_rendezvous_identified(
+        let res = harmony_app::community_rendezvous::resolve_rendezvous_identified(
             &setup.pkarr_resolver,
             &setup.epoch_key,
             [0xEE; 32], // NOT alice's endpoint id — no self-filtering here
@@ -1323,18 +1323,32 @@ async fn identified_resolve_returns_beacon_identity() {
         )
         .await;
 
+        // Happy path against a live mock relay: no slot probe may error at
+        // the pkarr layer, or the ResolveError split (review r1 finding 2)
+        // would misreport this very scenario.
+        assert_eq!(
+            res.resolve_errors, 0,
+            "a clean resolve must report zero pkarr-layer probe errors"
+        );
         // Slot 0 answers on the FIRST batch when we are not filtering ourselves.
         // Paired with the `batches_tried == curve.len()` assertion in
         // `identified_resolve_filters_own_endpoint`, this makes the widening
         // claim a real differential: same curve, same published record, and the
         // batch count moves 1 → full-curve purely because of the self-filter.
         assert_eq!(
-            outcome.batches_tried, 1,
+            res.outcome.batches_tried, 1,
             "an unfiltered live slot 0 must resolve on the first batch"
         );
-        assert_eq!(outcome.winning_slot, Some(0), "slot 0 is the live beacon");
+        assert_eq!(
+            res.outcome.winning_slot,
+            Some(0),
+            "slot 0 is the live beacon"
+        );
 
-        let beacon = outcome.payload.expect("alice's slot-0 beacon must resolve");
+        let beacon = res
+            .outcome
+            .payload
+            .expect("alice's slot-0 beacon must resolve");
         assert_eq!(
             beacon.payload.iroh_node_id,
             *setup.alice_ep.node_id().as_bytes(),
@@ -1383,7 +1397,7 @@ async fn identified_resolve_filters_own_endpoint() {
         await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
 
         let cfg = harmony_app::community_rendezvous::rendezvous_config_from_env();
-        let outcome = harmony_app::community_rendezvous::resolve_rendezvous_identified(
+        let res = harmony_app::community_rendezvous::resolve_rendezvous_identified(
             &setup.pkarr_resolver,
             &setup.epoch_key,
             *setup.alice_ep.node_id().as_bytes(), // we ARE alice
@@ -1392,12 +1406,20 @@ async fn identified_resolve_filters_own_endpoint() {
         )
         .await;
 
+        // Happy path at the pkarr layer even though nothing resolves: the
+        // self-filter is a decode-layer decision, not a probe failure, so it
+        // must NOT count as a resolve error (review r1 finding 2 — this is
+        // exactly the "no beacon published" proof-shaped absence).
+        assert_eq!(
+            res.resolve_errors, 0,
+            "a self-filtered miss must report zero pkarr-layer probe errors"
+        );
         assert!(
-            outcome.payload.is_none(),
+            res.outcome.payload.is_none(),
             "own beacon record must be filtered, not returned as a dial candidate"
         );
         assert_eq!(
-            outcome.winning_slot, None,
+            res.outcome.winning_slot, None,
             "a filtered slot must not be reported as a winner"
         );
         // The OTHER half of the spec §5 claim: filtering happens at the decode
@@ -1407,7 +1429,7 @@ async fn identified_resolve_filters_own_endpoint() {
         // the driver (or had slot 0 answered), this would be 1, not the full
         // curve length.
         assert_eq!(
-            outcome.batches_tried,
+            res.outcome.batches_tried,
             cfg.batch_curve.len(),
             "self-filtered slot 0 must read as empty so the driver widens through \
              every batch in the curve"
