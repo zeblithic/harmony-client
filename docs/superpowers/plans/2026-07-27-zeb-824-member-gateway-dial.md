@@ -10,6 +10,27 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-27-zeb-824-member-gateway-dial-design.md` — read §4 (predicate), §5 (pass), §6 (edges) before implementing.
 
+> **⚠️ As-implemented deviations (2026-07-27).** This plan is the historical planning
+> record; the spec (as amended) and the shipped module docs are authoritative for how the
+> code works. Three things changed during implementation and review:
+>
+> 1. **The membership gate and `self_owner` were withdrawn.** Task 3's gate
+>    (`beacon_owner == self.self_owner || !members.contains(&beacon_owner)` ⇒
+>    `RejectedNonMember`), Task 4's 5-arg `CommunityGatewayDialDriver::new()` wiring, and
+>    Task 5's `setup.bob_addr` fifth argument were unimplementable as written: materialized
+>    membership is keyed by the master signing-only hash while the beacon yields the
+>    composite device-address hash — the repo's two deliberately non-convergent notions —
+>    so the gate would have rejected every legitimate beacon. Decision of record
+>    (spec §5c): epoch-envelope trust, open-join parity; `new()` takes 4 args; the
+>    resolve-layer endpoint-id self-filter is the only self-defense; ZEB-827 tracks the
+>    principled binding.
+> 2. **The telemetry vocabulary is 8 outcomes, not 5.** `soloCommunity` and
+>    `engineUnregistered` were added at the Task 2 freeze; `resolveError` was added in
+>    PR #565 review round 1 (pkarr resolve errors are no longer conflated with `noBeacon`).
+> 3. **The backoff ladder clears on every non-starved transition** (heal, solo,
+>    engine-unregistered, un-join — PR #565 review round 1), not only on heal as Task 3's
+>    pseudocode shows.
+
 ## Global Constraints
 
 - All cargo commands run from `src-tauri/`, always `--locked`, tests always `--features test-fixtures` (CLAUDE.md).

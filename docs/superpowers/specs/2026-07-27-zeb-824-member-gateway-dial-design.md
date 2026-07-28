@@ -292,16 +292,24 @@ described above.
   resolve within seconds of boot (fleet evidence: heal ~26 s once candidates existed).
 - **Per-community resolve ladder while starved:** 30 s base, doubling, 600 s cap — the
   `channel_backfill.rs` constants shape (`BACKFILL_RETRY_BASE_MS` / `BACKFILL_RETRY_CAP_MS`
-  precedent). Reset to base on starved→healthy transition.
+  precedent). As shipped (PR #565 review round 1) the ladder holds a strict invariant: an
+  entry exists ONLY while its community's current episode is starved — cleared on heal, on
+  solo, on engine-unregistered, and pruned when the community leaves the joined set — so a
+  re-starved episode always begins at the base rung and the map stays bounded across
+  leave/rejoin cycles.
 - **Telemetry** (`GatewayBootstrapTelemetry`, the ZEB-803 lesson — alive-but-idle must be
   distinguishable from dead): a pass counter incremented **before** the joined-set read
   (`community_relay_pull_driver.rs:288-292` precedent); per-community last outcome with
-  timestamps. As shipped the outcome vocabulary is the seven wire strings
+  timestamps. As shipped the outcome vocabulary is the eight wire strings
   `healthy | starvedWaiting | noBeacon | beaconSeeded | rejectedNonMember | soloCommunity |
-  engineUnregistered` — there is no separate `resolving` state (a resolve is synchronous
-  within the pass and lands on its terminal outcome), and the two not-actionable skips
-  (`soloCommunity`, `engineUnregistered`) are named so absence from `perCommunity` keeps
-  meaning "never evaluated" rather than "fine". INFO logs on state transitions (starved
+  engineUnregistered | resolveError` — there is no separate `resolving` state (a resolve is
+  synchronous within the pass and lands on its terminal outcome), and the two
+  not-actionable skips (`soloCommunity`, `engineUnregistered`) are named so absence from
+  `perCommunity` keeps meaning "never evaluated" rather than "fine". `resolveError`
+  (added in PR #565 review round 1) means the resolve found no beacon AND at least one
+  slot probe failed at the pkarr/transport layer — infrastructure trouble, not proof of
+  absence — so a relay outage is distinguishable from an unpublished beacon (`noBeacon`),
+  which debug-level logs cannot provide in prod. INFO logs on state transitions (starved
   detected, beacon seeded, healed); steady-state skips are recorded in telemetry rather
   than logged, the one exception being the engine-unregistered skip, which carries a DEBUG
   log.
