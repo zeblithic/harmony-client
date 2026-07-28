@@ -53187,6 +53187,49 @@ async fn reconcile_voting_from_state(
     Ok(())
 }
 
+/// ZEB-787: boot-eager voting restore. Loads each joined community's persisted
+/// voting log into `voting_logs` so read verbs (`voting_get_tier2_proposal`,
+/// the Tier-3 GET, list verbs) answer for persisted governance state
+/// immediately after a restart, rather than returning "not found" / `[]` until
+/// a mutating voting IPC lazily reconciles the community.
+///
+/// Reconcile-only: this does NOT spawn engines. The lazy
+/// `ensure_voting_engine_for` path still owns engine/subscriber creation and is
+/// idempotent with a pre-populated log (it early-returns when events are
+/// already present, then attaches the engine to the reloaded log).
+///
+/// Infallible to the caller: a per-community failure (a present-but-unreadable
+/// `voting.cbor`, which `reconcile_voting_from_state` surfaces as `Err` to
+/// disarm persistence) is logged and skipped so one bad file never blocks the
+/// other communities or boot. A missing file is already a no-op inside
+/// `reconcile_voting_from_state`.
+async fn reconcile_all_joined_communities_voting(
+    voting_logs: &VotingLogsMap,
+    identity_dir: Option<&std::path::Path>,
+    community_ids: &[crate::owner_state_types::SpaceId],
+    membership_resolver: &std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    >,
+) {
+    for &community_id in community_ids {
+        if let Err(e) = reconcile_voting_from_state(
+            voting_logs,
+            identity_dir,
+            community_id,
+            membership_resolver,
+        )
+        .await
+        {
+            tracing::warn!(
+                ?community_id,
+                err = %e,
+                "boot voting reconcile failed for community; skipping (reads will lazily \
+                 reconcile on the first mutating voting IPC for it)"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod zeb718_voting_reconcile_tests {
     use super::*;
@@ -53602,6 +53645,111 @@ mod zeb718_voting_reconcile_tests {
             t2.last_unsignal_after_threshold_ms,
             Some(LAST_UNSIGNAL_MS),
             "last_unsignal_after_threshold_ms must survive restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_all_joined_communities_voting_sweeps_and_isolates_failures() {
+        // ZEB-787: the boot sweep must (a) reconcile every joined community's
+        // persisted voting log into `voting_logs` and (b) isolate a per-
+        // community failure so one unreadable file never blocks the others.
+        use crate::community_voting_core::Lifecycle;
+        let dir = tempfile::tempdir().unwrap();
+        let cid_ok_tier2 = SpaceId([0x81; 16]);
+        let cid_ok_tier1 = SpaceId([0x82; 16]);
+        let cid_unreadable = SpaceId([0x83; 16]);
+        let actor = OwnerAddr([0xee; 16]);
+
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+
+        // Community A: a Tier-2 proposal at ThresholdReached (the ZEB-787 case).
+        {
+            let mut log = VotingLog::new();
+            let pid = log
+                .apply_with_snapshot(
+                    tier2_poll_create(actor, 1_000),
+                    &cid_ok_tier2,
+                    Some(snapshot.clone()),
+                )
+                .expect("apply tier2");
+            {
+                let st = log.polls.get_mut(&pid).expect("materialized");
+                st.meta.lifecycle = Lifecycle::ThresholdReached;
+                st.tier_state
+                    .as_tier2_mut()
+                    .expect("tier2 state")
+                    .threshold_reached_at_ms = Some(1_700_000_000_000);
+            }
+            let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid_ok_tier2);
+            crate::community_voting_persist::save_voting_log(&path, &log, &cid_ok_tier2).unwrap();
+        }
+        // Community B: a plain Tier-1 poll.
+        {
+            let mut log = VotingLog::new();
+            log.apply_with_snapshot(
+                tier1_poll_create(actor, 1_000),
+                &cid_ok_tier1,
+                Some(snapshot.clone()),
+            )
+            .expect("apply tier1");
+            let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid_ok_tier1);
+            crate::community_voting_persist::save_voting_log(&path, &log, &cid_ok_tier1).unwrap();
+        }
+        // Community C: a present-but-unreadable voting.cbor. A directory at the
+        // file path makes std::fs::read return EISDIR (a non-NotFound io error),
+        // so load_voting_log returns Err (NOT quarantine) and
+        // reconcile_voting_from_state returns Err — exercising the helper's
+        // skip-and-continue.
+        {
+            let path =
+                crate::community_voting_persist::voting_path_for(dir.path(), &cid_unreadable);
+            std::fs::create_dir_all(&path).unwrap();
+        }
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Unreadable community FIRST — proves its Err does not abort the sweep
+        // before the healthy communities are reconciled.
+        reconcile_all_joined_communities_voting(
+            &voting_logs,
+            Some(dir.path()),
+            &[cid_unreadable, cid_ok_tier2, cid_ok_tier1],
+            &resolver,
+        )
+        .await;
+
+        let map = voting_logs.lock().await;
+        assert!(
+            map.contains_key(&cid_ok_tier2),
+            "Tier-2 community reconciled despite an earlier failure in the sweep"
+        );
+        assert!(
+            map.contains_key(&cid_ok_tier1),
+            "Tier-1 community reconciled"
+        );
+        assert!(
+            !map.contains_key(&cid_unreadable),
+            "unreadable community skipped, not inserted"
+        );
+        assert_eq!(
+            map.len(),
+            2,
+            "exactly the two healthy communities are present"
+        );
+        let g = map.get(&cid_ok_tier2).unwrap().lock().await;
+        assert_eq!(
+            g.polls.len(),
+            1,
+            "Tier-2 poll rematerialized through the sweep"
         );
     }
 
