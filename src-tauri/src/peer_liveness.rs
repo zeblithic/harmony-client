@@ -736,14 +736,32 @@ mod tests {
     async fn traffic_delta_stamps_and_zero_delta_does_not() {
         let h = LivenessHandle::new();
         h.on_transport_up(peer(1), 11);
-        h.report_traffic(peer(1), 11, 40);
+        // The changed watch is the deterministic observer: `now_ms()` is
+        // wall-clock, so an equal-timestamp assertion alone could pass against
+        // a buggy `>=` re-stamp within one millisecond.
+        let mut rx = h.changed_rx();
+        rx.borrow_and_update();
+        h.report_traffic(peer(1), 11, 40); // first sample: baseline only
+        assert!(
+            !rx.has_changed().expect("changed watch alive"),
+            "a baselining first sample must not bump the changed watch"
+        );
         h.report_traffic(peer(1), 11, 41); // delta > 0 → stamp
+        assert!(
+            rx.has_changed().expect("changed watch alive"),
+            "a positive rx app-frame delta bumps the changed watch"
+        );
+        rx.borrow_and_update();
         let stamped = h.views_snapshot()[0].1.last_traffic_ms;
         assert!(
             stamped.is_some(),
             "rx app-frame delta stamps last_traffic_ms"
         );
         h.report_traffic(peer(1), 11, 41); // delta == 0 → no change
+        assert!(
+            !rx.has_changed().expect("changed watch alive"),
+            "a zero-delta re-report must not bump the changed watch"
+        );
         assert_eq!(h.views_snapshot()[0].1.last_traffic_ms, stamped);
     }
 
@@ -762,6 +780,21 @@ mod tests {
         );
         h.report_traffic(peer(1), 12, 8);
         assert!(h.views_snapshot()[0].1.last_traffic_ms.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connected_transition_does_not_stamp_traffic() {
+        // Regression pin for the ZEB-804 defect: the deleted
+        // `last_connected_ms = Some(now_ms())` establishment stamp lived in
+        // `report_path`'s Connected arm. Re-adding a stamp beside
+        // `ever_connected = true` must fail this test.
+        let h = LivenessHandle::new();
+        h.on_transport_up(peer(1), 11);
+        h.report_path(peer(1), 11, Some((LivenessMode::Direct, 10)), None);
+        assert!(
+            h.views_snapshot()[0].1.last_traffic_ms.is_none(),
+            "reaching Connected is not traffic evidence"
+        );
     }
 
     #[tokio::test(start_paused = true)]
