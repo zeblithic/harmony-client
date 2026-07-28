@@ -11563,6 +11563,62 @@ pub async fn start_node_inner(
                 None
             };
 
+        // ── ZEB-787: boot-eager voting reconcile ───────────────────────
+        // Load each joined community's persisted voting log into `voting_logs`
+        // so read verbs (voting_get_tier2_proposal, the Tier-3 GET, list verbs)
+        // answer for persisted governance state immediately after a restart,
+        // instead of returning "not found" / [] until a mutating voting IPC
+        // lazily reconciles the community. Reconcile-only — engines still spawn
+        // lazily via ensure_voting_engine_for (idempotent with a pre-populated
+        // log).
+        //
+        // Ordering (deliberate): this runs BEFORE the install block below
+        // publishes `guard.thread` (the "running" signal) and
+        // `guard.community_registry` / `guard.crdt_state`. Every voting mutation
+        // funnels through VotingEngineNodeHandles::extract, which fails with
+        // OWNER_NOT_LOADED until those Arcs are installed, so no voting IPC can
+        // succeed — and thus none can race this reconcile's insert — before it
+        // completes. Sourcing from the pre-install locals (community_registry_arc,
+        // crdt_state_for_state) rather than the not-yet-installed NodeState
+        // fields; `voting_logs` is default-constructed on NodeState and present
+        // pre-install, so it is read under a short `state` lock.
+        if let (Some(community_registry), Some(crdt_state)) =
+            (community_registry_arc.clone(), crdt_state_for_state.clone())
+        {
+            let voting_logs_boot = {
+                let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                std::sync::Arc::clone(&guard.voting_logs)
+            };
+            let community_ids = community_registry.spawned_community_ids().await;
+            let identity_dir = match crate::owner_commands::resolve_identity_dir() {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    // Collapsing to None here would make the whole boot restore a
+                    // silent no-op indistinguishable from "nothing persisted", so
+                    // log it (the lazy path still reconciles on first mutation).
+                    tracing::warn!(
+                        err = %e,
+                        "boot voting reconcile: identity dir unresolved; persisted \
+                         voting state will load lazily on the first mutating voting IPC"
+                    );
+                    None
+                }
+            };
+            let resolver: std::sync::Arc<
+                dyn crate::community_voting_log::MembershipSnapshotResolver,
+            > = std::sync::Arc::new(NodeStateMembershipResolver {
+                community_registry,
+                crdt_state,
+            });
+            reconcile_all_joined_communities_voting(
+                &voting_logs_boot,
+                identity_dir.as_deref(),
+                &community_ids,
+                &resolver,
+            )
+            .await;
+        }
+
         let node_addr_for_state = node_addr.clone();
         // ZEB-669 S2: the engine tick's planner `me`.
         let own_owner_addr_for_loop = node_addr.clone();
@@ -13694,52 +13750,6 @@ pub async fn start_node_inner(
                     // freshly spawned handle by letting it fall out of scope.
                 }
             }
-            // ── ZEB-787: boot-eager voting reconcile ───────────────────
-            // Load each joined community's persisted voting log into
-            // `voting_logs` so read verbs (voting_get_tier2_proposal, the
-            // Tier-3 GET, list verbs) answer for persisted governance state
-            // immediately after a restart, instead of returning "not found"
-            // until a mutating voting IPC lazily reconciles the community.
-            // Reconcile-only — the voting engine still spawns lazily via
-            // ensure_voting_engine_for, which is idempotent with a pre-
-            // populated log. Runs before the tick below so the first
-            // threshold/finalize/archive sweep sees restored polls.
-            {
-                let boot_handles = {
-                    let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
-                    if guard.generation == our_gen {
-                        match (guard.community_registry.clone(), guard.crdt_state.clone()) {
-                            (Some(community_registry), Some(crdt_state)) => Some((
-                                std::sync::Arc::clone(&guard.voting_logs),
-                                community_registry,
-                                crdt_state,
-                            )),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
-                };
-                if let Some((voting_logs_boot, community_registry, crdt_state_boot)) = boot_handles
-                {
-                    let community_ids = community_registry.spawned_community_ids().await;
-                    let identity_dir = crate::owner_commands::resolve_identity_dir().ok();
-                    let resolver: std::sync::Arc<
-                        dyn crate::community_voting_log::MembershipSnapshotResolver,
-                    > = std::sync::Arc::new(NodeStateMembershipResolver {
-                        community_registry,
-                        crdt_state: crdt_state_boot,
-                    });
-                    reconcile_all_joined_communities_voting(
-                        &voting_logs_boot,
-                        identity_dir.as_deref(),
-                        &community_ids,
-                        &resolver,
-                    )
-                    .await;
-                }
-            }
-
             // ── ZEB-291 Phase 2 Task 20 — periodic voting tick ─────────
             // Spawn one tick task per start_node lifetime: walks the
             // (now-tokio-Mutex) voting_logs registry every 60s in prod,
@@ -53143,10 +53153,18 @@ async fn reconcile_voting_from_state(
         }
     }
     let path = crate::community_voting_persist::voting_path_for(identity_dir, &community_id);
-    let (events, policy, poll_restore) = match crate::community_voting_persist::load_voting_log(
-        &path,
-        &community_id,
-    ) {
+    // `load_voting_log` reads `voting.cbor` with blocking `std::fs::read`; run it
+    // on the blocking pool so a large log or slow disk never parks a Tokio worker
+    // (the persistence module documents `spawn_blocking` as the repo pattern, and
+    // the boot sweep calls this once per joined community). `community_id` is
+    // `Copy`, so the outer binding is still usable for the error log below.
+    let load_community_id = community_id;
+    let loaded = tokio::task::spawn_blocking(move || {
+        crate::community_voting_persist::load_voting_log(&path, &load_community_id)
+    })
+    .await
+    .map_err(|e| format!("voting reconcile load task join error: {e}"))?;
+    let (events, policy, poll_restore) = match loaded {
         Ok(v) => v,
         Err(e) => {
             // A transient I/O error (file present but unreadable — `load`

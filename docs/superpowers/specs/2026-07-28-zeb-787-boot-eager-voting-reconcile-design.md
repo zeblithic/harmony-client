@@ -137,3 +137,47 @@ Full-suite gates before PR: `cargo fmt --all -- --check`, `cargo clippy --locked
 - **No changes** to the read verbs or the lazy `ensure_engine` path.
 - **No new dependencies.** Uses existing `reconcile_voting_from_state`, `NodeStateMembershipResolver`, `VotingLogsMap`, and the boot loop's in-scope `registry` / `crdt_state` / `identity_dir`.
 - Harmony dep revs unchanged; this is client-only.
+
+## Convergence update (PR #569 review)
+
+The first implementation placed the reconcile in `start_node`'s voting-tick
+setup block, which runs *after* the node publishes its "running" signal
+(`guard.thread = Some(..)`) and installs `community_registry`/`crdt_state` on
+`NodeState`. Review (Qodo) correctly flagged two consequences, both resolved by
+moving the reconcile **earlier** — to just before the install block (ahead of
+`guard.thread` and the `community_registry`/`crdt_state` installs):
+
+- **Readiness window (Qodo Bug 1):** with the reconcile after the running
+  signal, a client that treats `running == true` as "ready" could read voting
+  state before the sweep completed. Running the reconcile before `guard.thread`
+  is set closes the window.
+- **Concurrent-insert race (Qodo Bug 3):** with the reconcile after the
+  `community_registry`/`crdt_state` installs, a voting IPC could insert the
+  community's log first, and reconcile's final `entry(..).or_insert_with(..)`
+  would then drop the disk-restored history. Every voting mutation funnels
+  through `VotingEngineNodeHandles::extract`, which fails with
+  `OWNER_NOT_LOADED` until those Arcs are installed — so running the reconcile
+  before that install guarantees no IPC can race it. (Changing `or_insert_with`
+  to *replace* was explicitly rejected in PR #506, because it would drop
+  concurrently-added events; ordering is the correct fix.)
+
+Because the reconcile now runs before the event loop is ready, it must not
+`.await` anything that round-trips through an event-loop channel (boot-deadlock
+hazard). Verified safe: the whole path is in-memory tokio-`Mutex` reads
+(`voting_build_snapshot_for_community_at_hlc` → `state_for` →
+`engines.lock().get(..).map(|e| e.state())`) plus a `spawn_blocking` file load —
+no channel round-trips. The community engines are spawned earlier in boot, so
+their persisted membership is materialized and resolvable at the new site.
+
+Sourcing note: at the new site the `NodeState` fields aren't installed yet, so
+the reconcile reads the pre-install locals (`community_registry_arc`,
+`crdt_state_for_state`) and takes `voting_logs` under a short `state` lock (that
+`Arc` is default-constructed on `NodeState` and present pre-install).
+
+- **Blocking I/O (Qodo Bug 2):** `reconcile_voting_from_state` now wraps the
+  `load_voting_log` (`std::fs::read`) in `tokio::task::spawn_blocking`, matching
+  the persistence module's documented pattern and keeping the disk read off the
+  Tokio worker — benefiting both the boot sweep and the lazy path.
+- **Silent identity-dir no-op (CodeRabbit):** the boot block now logs a
+  `warn!` when `resolve_identity_dir()` errors, rather than collapsing to a
+  silent `None`.
