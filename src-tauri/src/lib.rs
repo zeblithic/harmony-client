@@ -53286,6 +53286,43 @@ mod zeb718_voting_reconcile_tests {
         }
     }
 
+    fn tier2_poll_create(actor: OwnerAddr, wall: u64) -> SignedVotingEvent {
+        let cfg = crate::community_voting_conviction::Tier2PollConfig {
+            proposal_text: "Ratify budget".into(),
+            // Non-zero half-life — apply rejects 0 (`half_life_seconds == 0`).
+            // The exact value is irrelevant here: this test stamps the
+            // threshold clock by hand rather than accumulating conviction.
+            half_life_seconds: 604_800,
+            // T_min <= T_max — apply rejects an inverted band.
+            threshold_min_q32: 0,
+            threshold_max_q32: 8_200_000,
+            beta: 2,
+            delegation_allowed: true,
+            auto_exec: crate::community_voting_conviction::AutoExecAction::None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&cfg, &mut payload).expect("encode tier2 cfg");
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Conviction,
+            kind: PollEventKindCode::PollCreate,
+            hlc: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            actor,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
     #[tokio::test]
     async fn reconcile_replays_persisted_voting_log() {
         let dir = tempfile::tempdir().unwrap();
@@ -53458,6 +53495,113 @@ mod zeb718_voting_reconcile_tests {
                 .map(|t3| t3.meta.community_epoch),
             Some(42),
             "Tier-3 community_epoch must survive restart, not reset to 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restores_tier2_threshold_reached_timing() {
+        // ZEB-787: a Tier-2 (Conviction) proposal that has crossed its
+        // threshold carries a tick-driven contestability clock —
+        // `threshold_reached_at_ms` / `last_unsignal_after_threshold_ms` in
+        // `Tier2ProposalState` — stamped by the tick, NOT by any signed event.
+        // Event replay alone rebuilds the poll (so it is queryable again by
+        // `voting_get_tier2_proposal`) but leaves that clock `None`, which
+        // would reset the 24h contestability window on restart. This exercises
+        // the Tier-2 arm of the `poll_restore` overlay (the Tier-1 lifecycle
+        // and Tier-3 epoch arms are covered above; the Tier-2 timing arm was
+        // not). Both the proposal's presence — the ticket's "lost across
+        // restart" claim — and its timing must survive.
+        use crate::community_voting_core::Lifecycle;
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x7a; 16]);
+        let actor = OwnerAddr([0xdd; 16]);
+
+        const THRESHOLD_REACHED_MS: i128 = 1_700_000_500_000;
+        const LAST_UNSIGNAL_MS: i128 = 1_700_000_900_000;
+
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+
+        // Materialize a Conviction poll, then simulate the tick crossing the
+        // threshold: flip lifecycle to ThresholdReached and stamp the
+        // contestability clock. Both are in-place mutations, NOT events —
+        // exactly what replay cannot reconstruct.
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply_with_snapshot(
+                tier2_poll_create(actor, 1_000),
+                &cid,
+                Some(snapshot.clone()),
+            )
+            .expect("apply tier2 create");
+        {
+            let state = log.polls.get_mut(&pid).expect("poll materialized");
+            assert_eq!(
+                state.meta.tier,
+                Tier::Conviction,
+                "fixture must seed a Conviction poll"
+            );
+            state.meta.lifecycle = Lifecycle::ThresholdReached;
+            let t2 = state
+                .tier_state
+                .as_tier2_mut()
+                .expect("Conviction poll seeds a Tier2 state");
+            assert_eq!(
+                t2.threshold_reached_at_ms, None,
+                "apply must leave the clock unset (tick-driven, not an event)"
+            );
+            t2.threshold_reached_at_ms = Some(THRESHOLD_REACHED_MS);
+            t2.last_unsignal_after_threshold_ms = Some(LAST_UNSIGNAL_MS);
+        }
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+
+        // Fresh empty registry — reconcile must load + replay + overlay.
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("reloaded");
+        let g = restored.lock().await;
+        // (1) The proposal itself survived — the ticket's core "lost across
+        //     restart" claim.
+        let state = g
+            .polls
+            .get(&pid)
+            .expect("ZEB-787: Conviction proposal must survive restart, not be lost");
+        // (2) It reloads as Conviction, so `voting_get_tier2_proposal_impl`
+        //     accepts it instead of rejecting on a tier mismatch.
+        assert_eq!(state.meta.tier, Tier::Conviction);
+        // (3) The tick-driven lifecycle survived (overlay restores `meta`).
+        assert_eq!(
+            state.meta.lifecycle,
+            Lifecycle::ThresholdReached,
+            "ThresholdReached lifecycle must survive restart, not resurrect as Open"
+        );
+        // (4) The contestability clock survived (the Tier-2 overlay arm).
+        let t2 = state
+            .tier_state
+            .as_tier2()
+            .expect("reloaded poll must still be Tier2");
+        assert_eq!(
+            t2.threshold_reached_at_ms,
+            Some(THRESHOLD_REACHED_MS),
+            "threshold_reached_at_ms must survive restart, not reset the 24h window"
+        );
+        assert_eq!(
+            t2.last_unsignal_after_threshold_ms,
+            Some(LAST_UNSIGNAL_MS),
+            "last_unsignal_after_threshold_ms must survive restart"
         );
     }
 
