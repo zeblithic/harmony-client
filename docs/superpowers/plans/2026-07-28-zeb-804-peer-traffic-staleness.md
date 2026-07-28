@@ -17,7 +17,7 @@
 - **App-frame counting is RX-only, frames-only** (`frame_rx.stream + frame_rx.datagram`): bytes count keepalives, tx counts retransmissions into blackholes — both re-create the lie (spec §3). Never "improve" this to bytes or tx.
 - No wall-clock in tests: liveness tests use the handle's real `now_ms` only where the assertion is presence/absence of a stamp (not its value); snapshot/tier tests inject `now` explicitly.
 - Run every gate in the FOREGROUND with the Bash tool `timeout` parameter — never `run_in_background`. Do not end your turn until your report file exists.
-- Iterate with `-E` filters; gate each task with `scripts/test-select --context task` from repo root; commit per task with `ZEB-804:` prefix.
+- Iterate with `-E` filters; gate each task with `scripts/test-select --context task` from repo root — paste its `round=… bucket=…` summary line into the task report; commit per task with `ZEB-804:` prefix.
 - macOS: no `timeout` binary; use the Bash tool timeout parameter. Never pipe a gate through `tail`/`head` without zsh `${pipestatus[1]}`.
 
 ---

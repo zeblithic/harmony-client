@@ -59,6 +59,13 @@
   let startupRetryHandle: ReturnType<typeof setInterval> | null = null;
   let startupRetryElapsedMs = 0;
 
+  // ZEB-804 (PR #566 review): steady-state refetch while mounted. The
+  // staleness tier and the self-test overlay TTL are computed server-side AT
+  // SNAPSHOT TIME, so a panel that refetches only on mount + events would
+  // freeze a quiet peer's badge at its mount-time tier and let an expired
+  // self-test overlay linger. 30s matches the backend's own liveness tick.
+  let steadyRefetchHandle: ReturnType<typeof setInterval> | null = null;
+
   async function refresh(): Promise<void> {
     try {
       snap = await fetchSnapshot();
@@ -129,6 +136,12 @@
   });
 
   onMount(async () => {
+    // ZEB-804 (PR #566 review): register the steady-state refetch before the
+    // first await so an unmount mid-`refresh()` cannot leak it (cleared in
+    // onDestroy, same lifecycle as nowTimer/startupRetryHandle).
+    steadyRefetchHandle = setInterval(() => {
+      if (!destroyed) void refresh();
+    }, 30_000);
     await refresh();
     // ZEB-450: don't auto-retry when transport is disabled this session — it
     // won't recover without a restart, so the banner (not a spinner) is shown.
@@ -166,6 +179,10 @@
     if (unlisten) unlisten();
     if (unlistenRelays) unlistenRelays();
     if (startupRetryHandle) clearInterval(startupRetryHandle);
+    if (steadyRefetchHandle !== null) {
+      clearInterval(steadyRefetchHandle);
+      steadyRefetchHandle = null;
+    }
     if (nowTimer !== null) {
       clearInterval(nowTimer);
       nowTimer = null;

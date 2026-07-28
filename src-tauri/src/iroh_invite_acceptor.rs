@@ -508,6 +508,29 @@ where
         Ok(())
     }
 
+    /// Write a typed `OpenJoinResponse::Rejected { reason }` and — once the
+    /// write+finish completes — stamp the ZEB-804 served-traffic registry: a
+    /// completed typed rejection is still a COMPLETED iroh-authenticated
+    /// exchange (review r1 ruling — staleness evidence, not a trust or
+    /// success signal). Transport failures propagate via `?` BEFORE the
+    /// stamp, so an exchange that never completed never stamps.
+    async fn write_open_join_rejection(
+        &self,
+        conn: &Connection,
+        send: &mut iroh::endpoint::SendStream,
+        reason: String,
+    ) -> Result<(), HandshakeAcceptError> {
+        let resp = OpenJoinResponse::Rejected { reason };
+        self.write_len_prefixed_cbor(send, &resp).await?;
+        if let Some(reg) = self.traffic.as_ref() {
+            reg.record_served(
+                *conn.remote_id().as_bytes(),
+                crate::network_health::now_ms(),
+            );
+        }
+        Ok(())
+    }
+
     /// Inbound handler for a tokenless open-join request (`0x11` packet).
     ///
     /// Snapshots the beacon engine's verification inputs (`epoch_key`,
@@ -558,10 +581,8 @@ where
                 remote_id = ?conn.remote_id(),
                 "open-join rejected: community is invite-only (countersign-gated)"
             );
-            let resp = OpenJoinResponse::Rejected {
-                reason: "community is invite-only".to_string(),
-            };
-            self.write_len_prefixed_cbor(&mut send, &resp).await?;
+            self.write_open_join_rejection(conn, &mut send, "community is invite-only".to_string())
+                .await?;
             return Err(HandshakeAcceptError::OpenJoinNotPermitted);
         }
 
@@ -607,10 +628,8 @@ where
                     "open-join rejected"
                 );
                 // Surface a typed rejection so the joiner can show a reason.
-                let resp = OpenJoinResponse::Rejected {
-                    reason: format!("{reject:?}"),
-                };
-                self.write_len_prefixed_cbor(&mut send, &resp).await?;
+                self.write_open_join_rejection(conn, &mut send, format!("{reject:?}"))
+                    .await?;
                 return Err(HandshakeAcceptError::OpenJoinRejected);
             }
         };
@@ -638,10 +657,12 @@ where
                     remote_id = ?conn.remote_id(),
                     "open-join: admitted Join rejected by engine verify_event; not reporting Admitted"
                 );
-                let resp = OpenJoinResponse::Rejected {
-                    reason: format!("join rejected on apply: {v:?}"),
-                };
-                self.write_len_prefixed_cbor(&mut send, &resp).await?;
+                self.write_open_join_rejection(
+                    conn,
+                    &mut send,
+                    format!("join rejected on apply: {v:?}"),
+                )
+                .await?;
                 return Err(HandshakeAcceptError::OpenJoinRejected);
             }
             Err(e) => {

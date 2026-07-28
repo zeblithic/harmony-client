@@ -43,7 +43,7 @@ The `run_conn_path_watcher` in `peer_liveness.rs` already owns the peer's `[u8;3
 endpoint id, a `Connection` clone, and a 30s `RTT_REFRESH_INTERVAL` tick. Each tick
 additionally samples `conn.stats()` and computes an **application-frame count**:
 
-```
+```text
 app_frames = stats.frame_rx.stream + stats.frame_rx.datagram
 ```
 
@@ -64,14 +64,17 @@ app_frames = stats.frame_rx.stream + stats.frame_rx.datagram
   `last_connected_ms` (`peer_liveness.rs:136-137`, written-never-read, `#[allow(dead_code)]`):
   rename it, change its write from "every path report" to "app-frame delta observed",
   drop the allow. The slot-level field survives `Connected↔Degraded` transitions.
-- **Surface change:** `LivenessHandle::states_snapshot()` currently returns
-  `Vec<([u8;32], LivenessStateWire)>`-shaped data; it becomes per-peer
-  `PeerLivenessView { state: LivenessStateWire, last_traffic_ms: Option<u64> }` (exact
-  current signature pinned in the plan). The wire enum itself is unchanged — the
-  timestamp is state-independent.
-- Testing seam: the watcher's stats read goes through a small `ConnStatsProbe` trait
-  (prod = `conn.stats()`; tests inject a scripted sequence), because `Connection` is not
-  constructible in unit tests.
+- **Surface change (as implemented — PR #566 review):** `states_snapshot()` is retained
+  unchanged; the per-peer timestamp rides the additive view API
+  `views_snapshot() -> Vec<([u8;32], PeerLivenessView)>` with
+  `PeerLivenessView { state: LivenessStateWire, last_traffic_ms: Option<u64> }`. The wire
+  enum itself is unchanged — the timestamp is state-independent.
+- Testing seam (as implemented — PR #566 review): there is no `ConnStatsProbe` trait.
+  The handle owns the baseline/delta bookkeeping behind
+  `report_traffic(peer, conn_id, cumulative_app_frames)`; the watcher feeds it
+  `conn.stats()` frame counts in prod and tests inject scripted cumulative counts
+  through the same method — the scripted-injection seam the trait was for, without the
+  trait (`Connection` is not constructible in unit tests).
 
 Scope note: this tick observes the **zenoh-transport connection** (the one the watcher
 tracks). Service-plane connections (relay pull, butler, pex, friend, invite, vine) are

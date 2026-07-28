@@ -662,13 +662,23 @@ pub struct PeerTrafficStamps {
     pub last_relay_pull_served_ms: Option<u64>,
 }
 
+/// Entries retained in [`PeerTrafficRegistry`]. Generous relative to the
+/// `peers[]` population the snapshot joins against — entries only matter while
+/// a peer appears in the snapshot, so evicting the least-recently-stamped
+/// entry is lossless in practice. The bound guards identity-churn growth:
+/// rejected / rate-limit-shed strangers create entries by design of the
+/// any-exchange ruling, so an unbounded map would grow with every stranger
+/// that ever completed an exchange.
+const PEER_TRAFFIC_REGISTRY_CAP: usize = 256;
+
 /// ZEB-804: in-memory per-peer served-traffic stamps, written by the iroh
 /// acceptors at their served-a-request sites and read by `snapshot`. Keyed by
 /// the FULL 32-byte iroh endpoint id — deliberately not the 4-byte-truncated
 /// ZEB-329 relay-serving map, which cannot be joined back to `peers[]`. The
 /// redaction rule governs what we log/persist; this map is in-memory only and
 /// feeds a surface that already shows full owner addrs. Call rate is one stamp
-/// per served request, so a mutex map is fine (no hot-path atomics).
+/// per served request, so a mutex map is fine (no hot-path atomics). Bounded —
+/// see [`PEER_TRAFFIC_REGISTRY_CAP`].
 ///
 /// Stamp semantics (review r1 ruling): "served" here means a COMPLETED
 /// iroh-authenticated bidirectional exchange, NOT application-level success —
@@ -676,6 +686,10 @@ pub struct PeerTrafficStamps {
 /// (pex, friend) stamp those replies too, because the peer's liveness is what
 /// [`PeerTrafficStamps::last_any_served_ms`] measures. Only the relay-pull
 /// stamp is success-only.
+///
+/// Stamps are caller-clocked, so out-of-order arrival through the mutex or a
+/// backward wall-clock step must not replace newer evidence: both record
+/// methods max-merge and never regress a stamp.
 #[derive(Debug, Default)]
 pub struct PeerTrafficRegistry {
     stamps: Mutex<HashMap<[u8; 32], PeerTrafficStamps>>,
@@ -686,27 +700,49 @@ impl PeerTrafficRegistry {
     /// application-level outcome — see the struct doc). `now_ms` is
     /// injected by the caller from its existing wall-clock source
     /// (injected-clock convention — the registry never samples time itself).
+    /// Max-merged: a stamp older than the entry's current one is a no-op.
     pub fn record_served(&self, peer: [u8; 32], now_ms: u64) {
         let mut stamps = self.stamps.lock().expect("peer traffic registry lock");
-        stamps
-            .entry(peer)
-            .and_modify(|s| s.last_any_served_ms = now_ms)
-            .or_insert(PeerTrafficStamps {
-                last_any_served_ms: now_ms,
-                last_relay_pull_served_ms: None,
-            });
+        let entry = stamps.entry(peer).or_insert(PeerTrafficStamps {
+            last_any_served_ms: 0,
+            last_relay_pull_served_ms: None,
+        });
+        entry.last_any_served_ms = entry.last_any_served_ms.max(now_ms);
+        Self::evict_beyond_cap(&mut stamps);
     }
 
     /// Record one served community-relay pull from `peer`. A relay pull is
-    /// also "any" traffic, so BOTH stamps advance.
+    /// also "any" traffic, so BOTH stamps advance — each max-merged
+    /// independently (an out-of-order pull must not regress either field).
     pub fn record_relay_pull_served(&self, peer: [u8; 32], now_ms: u64) {
         let mut stamps = self.stamps.lock().expect("peer traffic registry lock");
         let entry = stamps.entry(peer).or_insert(PeerTrafficStamps {
-            last_any_served_ms: now_ms,
+            last_any_served_ms: 0,
             last_relay_pull_served_ms: None,
         });
-        entry.last_any_served_ms = now_ms;
-        entry.last_relay_pull_served_ms = Some(now_ms);
+        entry.last_any_served_ms = entry.last_any_served_ms.max(now_ms);
+        entry.last_relay_pull_served_ms = Some(
+            entry
+                .last_relay_pull_served_ms
+                .map_or(now_ms, |prev| prev.max(now_ms)),
+        );
+        Self::evict_beyond_cap(&mut stamps);
+    }
+
+    /// On growth beyond [`PEER_TRAFFIC_REGISTRY_CAP`], evict the entry with
+    /// the oldest `last_any_served_ms` (least-recently-stamped — the same
+    /// shape as [`CommunityRelayServingTelemetry::record_served`]'s eviction).
+    /// Cheap at this cap and only runs on growth.
+    fn evict_beyond_cap(stamps: &mut HashMap<[u8; 32], PeerTrafficStamps>) {
+        if stamps.len() > PEER_TRAFFIC_REGISTRY_CAP {
+            if let Some(oldest) = stamps
+                .iter()
+                .min_by_key(|(_, s)| s.last_any_served_ms)
+                .map(|(k, _)| *k)
+            {
+                stamps.remove(&oldest);
+            }
+        }
     }
 
     /// The peer's current stamps, `None` when this node has never served it.
@@ -6499,6 +6535,75 @@ mod tests {
             reg.stamps(&p).unwrap().last_relay_pull_served_ms,
             Some(2_000),
             "a non-relay serve must not advance the relay-pull stamp"
+        );
+    }
+
+    #[test]
+    fn peer_traffic_registry_is_bounded_and_evicts_oldest_stamped() {
+        // Rejected/shed strangers create entries by design of the any-exchange
+        // ruling, so identity churn would otherwise grow the map without
+        // bound. Mirrors `serving_peer_map_is_bounded_and_evicts_least_recently_served`.
+        let reg = PeerTrafficRegistry::default();
+        let peer_for = |i: usize| {
+            let mut peer = [0u8; 32];
+            peer[0] = (i / 256) as u8;
+            peer[1] = (i % 256) as u8;
+            peer[2] = 0xEE;
+            peer
+        };
+        for i in 0..(PEER_TRAFFIC_REGISTRY_CAP + 1) {
+            reg.record_served(peer_for(i), 1_000 + i as u64);
+        }
+        assert!(
+            reg.stamps(&peer_for(0)).is_none(),
+            "the oldest-stamped entry is the one evicted"
+        );
+        // Every other entry survives with its stamp intact.
+        for i in 1..(PEER_TRAFFIC_REGISTRY_CAP + 1) {
+            assert_eq!(
+                reg.stamps(&peer_for(i)).map(|s| s.last_any_served_ms),
+                Some(1_000 + i as u64),
+                "retained entry {i} intact"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_traffic_registry_stamps_never_regress() {
+        // Stamps are caller-clocked; out-of-order arrival through the mutex or
+        // a backward wall-clock step must not replace newer evidence.
+        let reg = PeerTrafficRegistry::default();
+        let p = [9u8; 32];
+        reg.record_served(p, 2_000);
+        reg.record_served(p, 1_000);
+        assert_eq!(
+            reg.stamps(&p).unwrap().last_any_served_ms,
+            2_000,
+            "decreasing any-stamp is a no-op"
+        );
+
+        reg.record_relay_pull_served(p, 3_000);
+        reg.record_relay_pull_served(p, 2_500);
+        let s = reg.stamps(&p).unwrap();
+        assert_eq!(
+            s.last_relay_pull_served_ms,
+            Some(3_000),
+            "decreasing relay-pull stamp is a no-op"
+        );
+        assert_eq!(
+            s.last_any_served_ms, 3_000,
+            "relay pull max-merged into any"
+        );
+
+        // A non-relay stamp OLDER than the newer relay stamp: the relay field
+        // must not move AND the any field must not regress.
+        reg.record_served(p, 2_800);
+        let s = reg.stamps(&p).unwrap();
+        assert_eq!(s.last_any_served_ms, 3_000, "any-stamp must not regress");
+        assert_eq!(
+            s.last_relay_pull_served_ms,
+            Some(3_000),
+            "relay stamp untouched by an older non-relay serve"
         );
     }
 
