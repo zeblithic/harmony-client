@@ -765,6 +765,12 @@ pub struct IrohCommunityRelayDepositAcceptor {
     /// reason; this is the "unlogged beyond a counter" sink, mirroring the
     /// butler acceptor's `rejected_deposits`).
     rejected_deposits: AtomicU64,
+    /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
+    /// endpoint id (PR #566 review round 2 — a peer whose only traffic is
+    /// relay deposits must not read quiet/dark). A rejected deposit closes the
+    /// stream WITHOUT writing a response, so it is not a completed exchange
+    /// and deliberately does not stamp.
+    traffic: Option<Arc<crate::network_health::PeerTrafficRegistry>>,
 }
 
 impl IrohCommunityRelayDepositAcceptor {
@@ -777,7 +783,18 @@ impl IrohCommunityRelayDepositAcceptor {
             ctx,
             config,
             rejected_deposits: AtomicU64::new(0),
+            traffic: None,
         }
+    }
+
+    /// ZEB-804: install the per-peer served-traffic registry. Builder-style,
+    /// matching [`IrohCommunityRelayAcceptor::with_traffic_registry`].
+    pub fn with_traffic_registry(
+        mut self,
+        traffic: Arc<crate::network_health::PeerTrafficRegistry>,
+    ) -> Self {
+        self.traffic = Some(traffic);
+        self
     }
 
     /// Total rejected deposits since construction.
@@ -794,6 +811,14 @@ impl IrohCommunityRelayDepositAcceptor {
                     remote_id = ?conn.remote_id(),
                     "ZEB-458: community relay deposit accepted (ack delivered)"
                 );
+                // ZEB-804 (review r2): an acked deposit is a completed
+                // iroh-authenticated exchange — traffic evidence.
+                if let Some(reg) = self.traffic.as_ref() {
+                    reg.record_served(
+                        *conn.remote_id().as_bytes(),
+                        crate::network_health::now_ms(),
+                    );
+                }
                 // Wait for the dialer to drive the close so the ack bytes flush
                 // before `conn` drops (same race-avoidance as the butler shell).
                 let _ = tokio::time::timeout(self.config.io_deadline, conn.closed()).await;

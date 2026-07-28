@@ -10707,7 +10707,13 @@ pub async fn start_node_inner(
                                     // SAME ctx (same relay-hold doc + flush) for its
                                     // local self-hold path, so clone rather than move.
                                     std::sync::Arc::clone(&relay_deposit_ctx),
-                                ),
+                                )
+                                // ZEB-804 (review r2): acked deposits are traffic
+                                // evidence — without this a deposit-only peer
+                                // reads quiet/dark (Greptile P1).
+                                .with_traffic_registry(std::sync::Arc::clone(
+                                    &peer_traffic_registry,
+                                )),
                             ))
                             .is_err()
                         {
