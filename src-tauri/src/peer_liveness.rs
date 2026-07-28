@@ -131,10 +131,14 @@ struct PeerSlot {
     /// (never-connected vs dropped telemetry); write-only in Task 1.
     #[allow(dead_code)]
     ever_connected: bool,
-    /// Wall-clock ms of the last `Connected` transition. Read by later tasks
-    /// (last-seen telemetry); write-only in Task 1.
-    #[allow(dead_code)]
-    last_connected_ms: Option<u64>,
+    /// Wall-clock ms when an rx application-frame delta was last observed for
+    /// this peer (ZEB-804). Survives conn swaps and disconnects — it is
+    /// evidence of past exchange, not connection state.
+    last_traffic_ms: Option<u64>,
+    /// Cumulative rx app-frame count at the last `report_traffic` sample for
+    /// the CURRENT conn. Reset to `None` on any conn swap/down so a new
+    /// connection's counters are never diffed against the old one's.
+    app_frames_baseline: Option<u64>,
 }
 
 struct Inner {
@@ -158,6 +162,14 @@ impl Default for LivenessHandle {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// ZEB-804: per-peer liveness projection carrying the state AND the
+/// state-independent traffic-evidence stamp.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerLivenessView {
+    pub state: LivenessStateWire,
+    pub last_traffic_ms: Option<u64>,
 }
 
 impl LivenessHandle {
@@ -197,6 +209,7 @@ impl LivenessHandle {
                     let was_up = slot.state.is_up();
                     slot.conn_id = Some(conn_id);
                     slot.min_relay_rtt_ms = None;
+                    slot.app_frames_baseline = None;
                     slot.state = SlotState::Degraded { since_ms: now_ms() };
                     (true, was_up, true)
                 }
@@ -208,7 +221,8 @@ impl LivenessHandle {
                             conn_id: Some(conn_id),
                             min_relay_rtt_ms: None,
                             ever_connected: false,
-                            last_connected_ms: None,
+                            last_traffic_ms: None,
+                            app_frames_baseline: None,
                         },
                     );
                     (true, false, true)
@@ -239,7 +253,8 @@ impl LivenessHandle {
                             conn_id: None,
                             min_relay_rtt_ms: None,
                             ever_connected: false,
-                            last_connected_ms: None,
+                            last_traffic_ms: None,
+                            app_frames_baseline: None,
                         },
                     );
                     (true, false, true)
@@ -301,7 +316,6 @@ impl LivenessHandle {
                                 since_ms,
                             };
                             slot.ever_connected = true;
-                            slot.last_connected_ms = Some(now_ms());
                         }
                         None => {
                             slot.state = SlotState::Degraded { since_ms: now_ms() };
@@ -316,6 +330,35 @@ impl LivenessHandle {
         self.commit(changed, was_up, is_now_up);
     }
 
+    /// ZEB-804: cumulative rx app-frame sample for `conn_id`'s connection.
+    /// Conn-guarded like `report_path`. First sample for a conn baselines without
+    /// stamping (handshake-era frames must not masquerade as exchange evidence);
+    /// a later sample with a positive delta stamps `last_traffic_ms` and bumps the
+    /// changed watch.
+    pub fn report_traffic(&self, peer: [u8; 32], conn_id: usize, cumulative_app_frames: u64) {
+        let changed = {
+            let mut slots = self.inner.slots.lock().expect("slots lock");
+            match slots.get_mut(&peer) {
+                Some(slot) if slot.conn_id == Some(conn_id) => match slot.app_frames_baseline {
+                    None => {
+                        slot.app_frames_baseline = Some(cumulative_app_frames);
+                        false
+                    }
+                    Some(base) if cumulative_app_frames > base => {
+                        slot.app_frames_baseline = Some(cumulative_app_frames);
+                        slot.last_traffic_ms = Some(now_ms());
+                        true
+                    }
+                    Some(_) => false,
+                },
+                _ => false,
+            }
+        };
+        if changed {
+            self.inner.changed_tx.send_modify(|e| *e += 1);
+        }
+    }
+
     /// Registry down-edge for `conn_id`. Applied only if the slot's conn still
     /// matches — a stale down from a superseded conn is ignored so it can't kill
     /// a freshly re-established link.
@@ -328,6 +371,7 @@ impl LivenessHandle {
                     slot.state = SlotState::Disconnected { since_ms: now_ms() };
                     slot.conn_id = None;
                     slot.min_relay_rtt_ms = None;
+                    slot.app_frames_baseline = None;
                     (true, was_up, false)
                 }
                 _ => (false, false, false),
@@ -342,6 +386,24 @@ impl LivenessHandle {
         slots
             .iter()
             .map(|(p, slot)| (*p, slot.state.to_wire()))
+            .collect()
+    }
+
+    /// Telemetry snapshot of every known peer's liveness view: transport state
+    /// plus the state-independent traffic-evidence stamp.
+    pub fn views_snapshot(&self) -> Vec<([u8; 32], PeerLivenessView)> {
+        let slots = self.inner.slots.lock().expect("slots lock");
+        slots
+            .iter()
+            .map(|(p, slot)| {
+                (
+                    *p,
+                    PeerLivenessView {
+                        state: slot.state.to_wire(),
+                        last_traffic_ms: slot.last_traffic_ms,
+                    },
+                )
+            })
             .collect()
     }
 
@@ -382,6 +444,15 @@ fn now_ms() -> u64 {
 /// Refresh cadence for RTT while a connection is quiet (path events fire on
 /// open/close/selection change, not on RTT drift).
 const RTT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Received application frames (STREAM + DATAGRAM) on a connection — the
+/// ZEB-804 traffic-evidence basis. RX-only and frames-only, both load-bearing:
+/// byte counters advance on QUIC keepalives/ACKs, and tx frame counters advance
+/// on retransmissions into a blackholed path — either would let a dead-or-mute
+/// peer read fresh forever, the exact lie this exists to fix.
+pub(crate) fn app_frame_count(stats: &iroh::endpoint::ConnectionStats) -> u64 {
+    stats.frame_rx.stream + stats.frame_rx.datagram
+}
 
 /// Watch one connection's paths and feed `handle`. Owns a `Connection` clone:
 /// `Path<'_>` borrows the connection and cannot cross tasks, so each event
@@ -426,7 +497,10 @@ pub async fn run_conn_path_watcher(
                 Some(_) => report(&handle),   // any event → re-read snapshot (incl. Lagged)
                 None => break,
             },
-            _ = tick.tick() => report(&handle),
+            _ = tick.tick() => {
+                report(&handle);
+                handle.report_traffic(peer, conn_id, app_frame_count(&conn.stats()));
+            }
         }
     }
 }
@@ -622,6 +696,86 @@ mod tests {
             Some(80),
             "disconnected peer's relay rtt drops out"
         );
+    }
+
+    #[test]
+    fn app_frame_count_ignores_keepalives_and_tx() {
+        use iroh::endpoint::ConnectionStats;
+        let mut stats = ConnectionStats::default();
+        stats.frame_rx.ping = 500;
+        stats.frame_rx.acks = 900;
+        stats.udp_rx.bytes = 1_000_000;
+        stats.frame_tx.stream = 700; // retransmission-into-blackhole counterfeit
+        assert_eq!(
+            app_frame_count(&stats),
+            0,
+            "keepalives/acks/bytes/tx must not count"
+        );
+        stats.frame_rx.stream = 3;
+        stats.frame_rx.datagram = 2;
+        assert_eq!(
+            app_frame_count(&stats),
+            5,
+            "rx stream+datagram frames count"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_first_sample_baselines_without_stamp() {
+        let h = LivenessHandle::new();
+        h.on_transport_up(peer(1), 11);
+        h.report_traffic(peer(1), 11, 40); // handshake-era frames: baseline only
+        let views = h.views_snapshot();
+        assert!(
+            matches!(views.as_slice(), [(p, v)] if *p == peer(1) && v.last_traffic_ms.is_none()),
+            "first sample must baseline, never stamp"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_delta_stamps_and_zero_delta_does_not() {
+        let h = LivenessHandle::new();
+        h.on_transport_up(peer(1), 11);
+        h.report_traffic(peer(1), 11, 40);
+        h.report_traffic(peer(1), 11, 41); // delta > 0 → stamp
+        let stamped = h.views_snapshot()[0].1.last_traffic_ms;
+        assert!(
+            stamped.is_some(),
+            "rx app-frame delta stamps last_traffic_ms"
+        );
+        h.report_traffic(peer(1), 11, 41); // delta == 0 → no change
+        assert_eq!(h.views_snapshot()[0].1.last_traffic_ms, stamped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_stale_conn_ignored_and_baseline_resets_on_swap() {
+        let h = LivenessHandle::new();
+        h.on_transport_up(peer(1), 11);
+        h.report_traffic(peer(1), 11, 40);
+        h.report_traffic(peer(1), 10, 90); // superseded conn → ignored entirely
+        assert!(h.views_snapshot()[0].1.last_traffic_ms.is_none());
+        h.on_transport_up(peer(1), 12); // conn swap resets the baseline
+        h.report_traffic(peer(1), 12, 7); // NEW conn's first sample: baseline, no stamp
+        assert!(
+            h.views_snapshot()[0].1.last_traffic_ms.is_none(),
+            "a fresh conn's first cumulative sample must baseline, not diff against the old conn"
+        );
+        h.report_traffic(peer(1), 12, 8);
+        assert!(h.views_snapshot()[0].1.last_traffic_ms.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn traffic_stamp_survives_degraded_and_disconnect() {
+        let h = LivenessHandle::new();
+        h.on_transport_up(peer(1), 11);
+        h.report_traffic(peer(1), 11, 1);
+        h.report_traffic(peer(1), 11, 2);
+        let stamped = h.views_snapshot()[0].1.last_traffic_ms;
+        assert!(stamped.is_some());
+        h.report_path(peer(1), 11, None, None); // Connected→Degraded
+        assert_eq!(h.views_snapshot()[0].1.last_traffic_ms, stamped);
+        h.on_transport_down(peer(1), 11); // evidence of past exchange persists
+        assert_eq!(h.views_snapshot()[0].1.last_traffic_ms, stamped);
     }
 
     #[test]
