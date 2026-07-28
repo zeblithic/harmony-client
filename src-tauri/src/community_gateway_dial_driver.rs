@@ -239,6 +239,21 @@ impl CommunityGatewayDialDriver {
             .collect();
 
         for community in (self.joined_communities)() {
+            // The epoch key comes first because it is the ONLY signal that
+            // separates "no engine registered" from "no members": production's
+            // `members_of` returns an empty Vec for a missing engine, so a
+            // members-first order reports every registration gap as
+            // `soloCommunity` and makes `engineUnregistered` unreachable
+            // outside tests. It is a cheap in-memory registry lookup, and
+            // taking it before the ladder also keeps a registration gap from
+            // arming the backoff — an unregistered engine never attempted
+            // anything, and arming for it would delay the first REAL attempt
+            // by a full rung on every boot race.
+            let Some(epoch_key) = self.ctx.epoch_key_of(&community).await else {
+                tracing::debug!(community = ?community, "ZEB-824: no engine registered; skipping this pass");
+                self.record(&community, GatewayBootstrapOutcome::EngineUnregistered);
+                continue;
+            };
             let members = self.ctx.members_of(&community).await;
             if members.is_empty() {
                 // Solo community: nothing to dial, never starved (spec §4). It
@@ -260,16 +275,7 @@ impl CommunityGatewayDialDriver {
                 self.record(&community, GatewayBootstrapOutcome::Healthy);
                 continue;
             }
-            // Starved. The epoch key is an in-memory registry read, so it is
-            // resolved BEFORE the ladder gate: an unregistered engine never
-            // attempted anything, and arming the ladder for it would delay the
-            // first REAL attempt by a full rung on every boot race.
-            let Some(epoch_key) = self.ctx.epoch_key_of(&community).await else {
-                tracing::debug!(community = ?community, "ZEB-824: no engine registered; skipping this pass");
-                self.record(&community, GatewayBootstrapOutcome::EngineUnregistered);
-                continue;
-            };
-            // Due per the per-community ladder?
+            // Starved. Due per the per-community ladder?
             let due = {
                 let mut ladders = self.ladders.lock().unwrap_or_else(|p| p.into_inner());
                 match ladders.get_mut(&community) {
@@ -1060,6 +1066,8 @@ mod tests {
         let beacon_node_id = [0x99; 32];
         let h = harness(
             community,
+            // Non-empty deliberately: this is the pure epoch-key test, so the
+            // members check must not be able to produce the verdict.
             vec![member_owner],
             Some(beacon(member_pub, beacon_node_id)),
             // No epoch key: the registry has not registered the engine yet.
@@ -1100,6 +1108,39 @@ mod tests {
             1,
             "the first pass after registration must resolve immediately"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 9b. A MISSING engine reads as unregistered, not solo.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn missing_engine_records_unregistered_not_solo() {
+        // Task 4 review Minor 2: `ProdGatewayDialCtx::members_of` returns an
+        // EMPTY Vec when the registry has no engine — the same shape a genuinely
+        // solo community produces. A members-first pass therefore records every
+        // registration gap as `soloCommunity` and `engineUnregistered` never
+        // fires in production at all. This ctx reproduces the prod shape exactly
+        // (`epoch_key_of` → None AND `members_of` → []), so it can only pass if
+        // the epoch-key probe runs first.
+        let community = SpaceId([0x1E; 16]);
+        let (member_pub, _member_owner) = test_member(16);
+        let h = harness(
+            community,
+            Vec::new(),
+            Some(beacon(member_pub, [0xDD; 32])),
+            false,
+            Some(SupervisorHandle::new()),
+        );
+
+        h.driver.run_one_pass().await;
+
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("engineUnregistered"),
+            "an unregistered engine must not be reported as a solo community"
+        );
+        assert_eq!(h.telemetry.summary().engine_unregistered, 1);
+        assert_eq!(h.beacons.calls(), 0, "no key ⇒ nothing to resolve under");
     }
 
     // ------------------------------------------------------------------

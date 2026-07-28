@@ -199,6 +199,18 @@ Our variant does not add `verify_identity_match` either — there is no *expecte
 for a rendezvous slot — but the inner-sig + membership gate in §5 gives the member-side
 equivalent.
 
+**As implemented (Task 1).** Same architecture — client-only, no core-crate change — but a
+different mechanism than "a different closure". The core `PkarrSlotResolver`'s decode
+closure receives only the routing *blob*, so it can never see the outer record's
+`harmony_identity_pub` no matter what closure is passed. The identity-preserving variant
+therefore shipped as a client-side `SlotResolver` **impl**: `IdentifiedSlotResolver` in
+`community_rendezvous.rs`, which mirrors the core probe (same slot keys, same batch
+escalation, same freshness window) and applies the self-filter itself, yielding
+`IdentifiedBeacon { payload, beacon_identity_pub }`. The entry point is
+`resolve_rendezvous_identified`, and the self-filter still lives at the decode step, so a
+self-owned slot reads as empty and the escalating driver widens past it exactly as
+described above.
+
 ## 6. Failure modes and edges
 
 - **No beacon resolves, or the only beacon is us.** Stay on the ladder, quietly. If we are
@@ -230,10 +242,16 @@ equivalent.
   precedent). Reset to base on starved→healthy transition.
 - **Telemetry** (`GatewayBootstrapTelemetry`, the ZEB-803 lesson — alive-but-idle must be
   distinguishable from dead): a pass counter incremented **before** the joined-set read
-  (`community_relay_pull_driver.rs:288-292` precedent); per-community last outcome
-  (`healthy | starved_waiting | resolving | beacon_seeded | no_beacon | rejected_non_member`)
-  with timestamps; INFO logs on state transitions (starved detected, beacon seeded,
-  healed), DEBUG on steady-state skips.
+  (`community_relay_pull_driver.rs:288-292` precedent); per-community last outcome with
+  timestamps. As shipped the outcome vocabulary is the seven wire strings
+  `healthy | starvedWaiting | noBeacon | beaconSeeded | rejectedNonMember | soloCommunity |
+  engineUnregistered` — there is no separate `resolving` state (a resolve is synchronous
+  within the pass and lands on its terminal outcome), and the two not-actionable skips
+  (`soloCommunity`, `engineUnregistered`) are named so absence from `perCommunity` keeps
+  meaning "never evaluated" rather than "fine". INFO logs on state transitions (starved
+  detected, beacon seeded, healed); steady-state skips are recorded in telemetry rather
+  than logged, the one exception being the engine-unregistered skip, which carries a DEBUG
+  log.
 - **Surface:** a `gatewayBootstrap` block in `network_health_snapshot` (per-community
   outcome + pass counter + last-attempt age), so a fleet node is diagnosable without log
   access (the ZEB-804 lesson). Serde camelCase keys as usual for the DTO.
