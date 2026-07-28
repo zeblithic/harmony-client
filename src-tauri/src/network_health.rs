@@ -1041,6 +1041,14 @@ pub enum GatewayBootstrapOutcome {
     StarvedWaiting,
     NoBeacon,
     BeaconSeeded,
+    /// Historically the membership-gate rejection. That gate is gone (ZEB-824
+    /// fix round 2 / spec §5c — it compared the beacon's composite
+    /// device-address hash against master-flavored member keys, two
+    /// non-convergent notions, so it rejected every beacon and made the feature
+    /// a no-op). Its ONLY remaining source is a beacon whose identity bytes
+    /// fail to decode, which is a wire-format or publisher bug rather than an
+    /// admission decision — the name is kept for wire compatibility. Nonzero
+    /// here now means "malformed record", not "stranger turned away".
     RejectedNonMember,
     /// Nobody else in the community — skipped by design, nothing to dial. Row
     /// only, no counter: this is a steady state, not an event worth totalling.

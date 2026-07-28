@@ -152,34 +152,58 @@ For each joined community, in `run_one_pass(now_ms)`:
       iroh-node-id filter in the decode closure is primary; this catches a same-owner
       sibling device record, which is a candidate the fleet-sibling seed path already
       covers).
-   c. > **DEFECT — this step as specified cannot work; redesign pending.** The derived
-      > owner and the materialized membership keys are **different kinds of 16 bytes**,
-      > the documented "never converge" pair. `Identity::address_hash` is
-      > `truncated_hash(X25519_pub ‖ Ed25519_pub)` — the composite *device* hash
-      > (`harmony-identity/src/identity.rs:66-69`), and it is exactly what production
-      > stamps as a node's signing-device hash (`lib.rs:3977`). The member map is keyed
-      > by `event.actor`, bound by the enrollment cert to `cert.owner_id` = the **master**
-      > `PubKeyBundle::identity_hash()`, a signing-only hash that excludes encryption keys
-      > (`harmony-owner/src/pubkey_bundle.rs:58-79`). Confirmed experimentally:
-      > `ProdGatewayDialCtx::members_of` over a real post-admit registry returns the master
-      > addr, which differs from the composite in every byte. So the gate rejects **every**
-      > beacon, `beaconSeeded` is unreachable in production, and the feature is a no-op.
-      > No choice of publisher signing identity fixes it — the two sides are different hash
-      > functions. The fix is to bridge the two notions explicitly (resolve the beacon's
-      > device hash to an owner, e.g. the DM receive path's
-      > `resolve_signed_origin_owner`, and gate on THAT owner) rather than to compare
-      > across flavors — but note the owner-device cache is populated by peer-interaction
-      > CRDT ops, so its coverage for a never-connected member on a rebuilt node is itself
-      > an open question that the redesign must settle. Its own ticket.
+   c. **Trust gate: epoch-envelope only (open-join parity).** *Decision of record
+      (Jake, 2026-07-27, fix round 2, superseding this step's original membership
+      gate.)* Accept the beacon on the strength of what the record's envelope
+      proves and nothing more: the writer holds the community **epoch key** (outer
+      BEP44 signature) **and** the claimed identity's signing key (inner signature,
+      verified inside `PkarrResolver::resolve`). No membership containment check,
+      and no owner-level self-guard.
 
-   c. **Membership gate (as written, defective — see above):** require the derived owner to be a Joined member of X in the
-      materialized membership. The record already proves its writer holds the epoch key
-      (outer BEP44 sig) *and* the claimed identity's signing key (inner sig,
-      `record.rs:92 verify_inner_sig` runs inside `PkarrResolver::resolve`); this gate
-      additionally ensures a leaked epoch key cannot steer our dials to an attacker
-      endpoint claiming a non-member identity. Rejection: telemetry + ladder advance, no
-      seed.
-   d. **Seed:** `reachability_resolver.seed_from_pkarr(owner_addr,
+      **Why the original gate was withdrawn.** It compared
+      `Identity::address_hash` — the composite `X25519 ‖ Ed25519` *device*-address
+      hash the record yields — against materialized member keys, which are the
+      **master** `PubKeyBundle::identity_hash()`, a signing-only hash that excludes
+      encryption keys. Those are the repo's two documented non-convergent notions.
+      Measured, not argued: `ProdGatewayDialCtx::members_of` over a real post-admit
+      registry returns the master addr, differing from the composite in every byte.
+      The gate therefore rejected **every** beacon, `beaconSeeded` was unreachable,
+      and ZEB-824 was a no-op. No choice of publisher signing identity fixes this,
+      because the two sides are different hash functions over different preimages.
+
+      **Threat delta, stated plainly.** Without the membership check, anyone
+      holding the community epoch key can steer a member's *dial* at an endpoint of
+      their choosing. That is a real widening, but a bounded one: possession of the
+      epoch key is *already* a backward-secrecy breach, and this is the identical
+      trust decision open-join makes for this same record family (a joiner dials a
+      rendezvous beacon knowing only community id + epoch key). Exposure after the
+      dial stays bounded by the layers that do verify — address-book rows and
+      membership events are signature- and enrollment-checked on ingest, so a
+      hostile endpoint gets a session attempt, not authority over state. Self-dial
+      defense is unchanged and flavor-free: the resolve-layer endpoint-id filter
+      (§5's decode step) remains authoritative.
+
+      **Follow-up: ZEB-827** — the principled binding from a beacon identity to a
+      Joined member. It should carry raised priority once communities routinely run
+      volunteer relays, since that broadens the set of parties holding an epoch key
+      and so widens exactly the gap this parity decision accepts. Note the natural
+      implementation (resolve the beacon's device hash to an owner through the DM
+      path's `resolve_signed_origin_owner`) has an open premise ZEB-827 must settle
+      first: `owner_device_cache` is populated by peer-interaction CRDT ops rather
+      than by community membership, so its coverage for a never-connected member on
+      a rebuilt node — precisely ZEB-824's target case — is not established.
+
+   d. **Seed:**   d. **Seed:** keyed by the **composite** device-address owner derived in (a). Note the
+      consequence: the addrbook row for that same node arrives later under the member's
+      **master** owner, so the resolver briefly holds two entries for one node id under two
+      owners. ZEB-704's `freshest_across_owners` dial view already resolves that shape, so
+      dialing is unaffected; the cost is that until the row lands, the §4 starved predicate
+      (which matches members by master addr) cannot link the live session back to a member,
+      so the community may read as starved and spend a few extra resolves. Bounded: the
+      ladder throttles it and the addrbook snapshot at session-up closes it. ZEB-827 removes
+      the split.
+
+      `reachability_resolver.seed_from_pkarr(owner_addr,
       DeviceIdentityHash([0u8; 16]), payload)` — the zero device-hash placeholder is the
       invite-path precedent (`lib.rs:59154`).
    e. **Kick:** `supervisor.kick(payload.iroh_node_id, ReconnectTrigger::NewPeer)`
@@ -216,8 +240,9 @@ type, so the client adds a sibling entry point (e.g.
 The open-join call site keeps the existing unidentified variant; its trust argument
 (`community_rendezvous.rs:108-111`: identity binding deferred to admission) is unchanged.
 Our variant does not add `verify_identity_match` either — there is no *expected* identity
-for a rendezvous slot — but the inner-sig + membership gate in §5 gives the member-side
-equivalent.
+for a rendezvous slot — and, per the §5c decision of record, the member side does not add
+one either: the inner-sig + epoch-envelope proof is the whole trust argument on both call
+sites now.
 
 **As implemented (Task 1).** Same architecture — client-only, no core-crate change — but a
 different mechanism than "a different closure". The core `PkarrSlotResolver`'s decode
@@ -237,9 +262,11 @@ described above.
   the only live beacon we are reachable and peers dial *us*; retrying is correct and cheap.
   A resolve attempt is bounded (~7.5 s worst case: three batches × 2.5 s per-batch
   deadline).
-- **Non-member identity in a beacon record.** Rejected by the membership gate; telemetry;
-  ladder advances. The next attempt re-resolves — first-responder-wins may surface a
-  different slot.
+- **Non-member identity in a beacon record.** Accepted, per the §5c epoch-envelope
+  decision — holding the epoch key is the admission proof. The residual risk and the
+  ZEB-827 follow-up are recorded there. (What still rejects: identity bytes that fail to
+  decode, which is a malformed record rather than an admission decision, and which keeps
+  the legacy `rejectedNonMember` wire string.)
 - **Supervisor not yet installed.** The driver spawns from `start_node_inner`; the
   supervisor handle is installed by the event loop at `event_loop.rs:1536`. A first pass
   racing that install seeds the resolver and skips the kick; the event loop's own boot seed
@@ -288,8 +315,10 @@ Unit (driver module, mock resolver/supervisor seams — the reconnect supervisor
   (reuse the mock-relay publish helper from
   `tests/misc/community_open_join_cross_wan_integration.rs:674`); identity captured
   alongside payload.
-- Membership gate: beacon record with a non-member identity is not seeded and telemetry
-  records the rejection.
+- Trust gate (§5c): a beacon whose identity is unknown to the membership view IS seeded
+  and telemetry records `beaconSeeded` — the decided behavior. Separately, a record whose
+  identity bytes do not decode is not seeded and records `rejectedNonMember`, the arm's
+  only remaining source.
 - Ladder: repeated no-beacon passes space attempts 30 s → 60 s → … → 600 s cap (logical
   time / injected clock — no wall-clock budgets).
 - Seed+kick: a starved pass with a valid member beacon calls `seed_from_pkarr` once and

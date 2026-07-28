@@ -1413,24 +1413,25 @@ async fn identified_resolve_filters_own_endpoint() {
     .expect("identified_resolve_filters_own_endpoint timed out at 60s");
 }
 
-/// ZEB-824 driver plumbing, end to end against the mock relay: with an EMPTY
-/// reachability resolver, one `run_one_pass` resolves the rendezvous beacon and
-/// seeds a dial candidate. It pins the pkarr publish → identified resolve →
-/// decode → seed chain.
+/// ZEB-824 headline scenario (spec §8): a member with an EMPTY reachability
+/// resolver — rebuilt node, no addrbook sidecar, LAN scouting off — bootstraps a
+/// dial candidate out of the rendezvous beacon in a single pass, against the
+/// live mock relay.
 ///
-/// **This is NOT the spec §8 headline proof, and must not be read as one.** The
-/// member set below is SYNTHETIC — it is keyed by the owner derived from the
-/// beacon record's identity bytes, which is the flavor the driver's membership
-/// gate computes but NOT the flavor production's `members_of` returns. Verified
-/// experimentally on this very harness: `ProdGatewayDialCtx::members_of` over
-/// `registry_bob` after a real open-join admit returns `[alice_addr]` — the
-/// *master* `PubKeyBundle::identity_hash()` — whereas the driver derives
-/// `Identity::address_hash` (the composite `X25519 ‖ Ed25519` device hash).
-/// Those are the documented "never converge" pair, so in production the gate
-/// admits nothing and this scenario records `rejectedNonMember` instead of
-/// seeding. Do NOT "fix" a future failure here by editing the member set — that
-/// is what hid the defect the first time. The gate needs a redesign (spec §5c);
-/// until it lands, this test covers the resolve/seed plumbing only.
+/// **Trust model (Jake's decision, spec §5c): epoch-envelope only**, the same
+/// trust open-join already places in this record family. The driver does NOT
+/// check the beacon identity against membership — that check compared the
+/// repo's two non-convergent 16-byte notions and so rejected every beacon,
+/// making the feature a no-op. ZEB-827 carries the principled binding.
+///
+/// The flavors here are therefore PRODUCTION-FAITHFUL and deliberately
+/// mismatched, which is the point:
+/// - the member set is keyed by Alice's MASTER addr (`alice_addr`), matching
+///   what `ProdGatewayDialCtx::members_of` really returns — verified
+///   experimentally on this harness — and it now only drives the STARVED
+///   predicate;
+/// - the seed lands under the COMPOSITE device-address owner derived from the
+///   record's identity bytes, so that is what the assertions read.
 ///
 /// Kick coverage lives in the driver's own unit test
 /// (`community_gateway_dial_driver::tests::explicit_kick_fires_when_the_seed_raises_no_auto_kick`);
@@ -1447,9 +1448,10 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
         await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
         let alice_node_id = *setup.alice_ep.node_id().as_bytes();
 
-        // The SYNTHETIC member key (see the header): the owner the driver
-        // derives from the record's own identity bytes. Production's member set
-        // is keyed by the master owner addr instead, which is the open defect.
+        // The owner the driver derives from the record's identity bytes — the
+        // composite device-address hash, and the key the seed lands under.
+        // Distinct from `alice_addr` (her master addr, used for the member set
+        // below); that split is the production reality, not a harness quirk.
         let alice_beacon_owner = OwnerAddr(
             harmony_identity::Identity::from_public_bytes(&setup.alice_identity_pub)
                 .expect("alice's published identity bytes must parse")
@@ -1459,7 +1461,8 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
         // A local `GatewayDialCtx`: the traits are pub, but the lib's
         // `cfg(test)` stubs are not visible from an integration test. Alice is
         // this community's one Joined member (self excluded, as production's
-        // `ProdGatewayDialCtx::members_of` does).
+        // `ProdGatewayDialCtx::members_of` does), keyed by her MASTER addr —
+        // which is all `members_of` feeds now: the starved predicate.
         struct ItCtx {
             community: SpaceId,
             alice: OwnerAddr,
@@ -1493,7 +1496,7 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
         let driver = harmony_app::community_gateway_dial_driver::CommunityGatewayDialDriver::new(
             Arc::new(ItCtx {
                 community,
-                alice: alice_beacon_owner,
+                alice: setup.alice_addr,
                 key: setup.epoch_key.clone(),
             }),
             Arc::new(
@@ -1504,7 +1507,6 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
             ),
             Arc::clone(&resolver),
             Arc::new(move || vec![community]),
-            setup.bob_addr,
         )
         .with_telemetry(Arc::clone(&telemetry));
 
@@ -1515,8 +1517,13 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
             .expect("alice's beacon must be seeded from the mock relay in one pass");
         assert_eq!(
             owner, alice_beacon_owner,
-            "the seed must be keyed by the OwnerAddr derived from the record's identity, \
-             not by the epoch-key holder"
+            "the seed must be keyed by the composite OwnerAddr derived from the record's \
+             identity, not by the epoch-key holder and not by her master addr"
+        );
+        assert_ne!(
+            alice_beacon_owner, setup.alice_addr,
+            "precondition: the two owner flavors really are distinct here, so the \
+             assertion above is pinning the composite one specifically"
         );
         assert_eq!(
             payload.iroh_node_id, alice_node_id,
@@ -1524,9 +1531,7 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
              supervisor's record gate needs before it will dial her"
         );
         // Review INFO-1: pin the verdict too, so a future regression reports
-        // WHICH outcome the pass reached rather than only "no seed". If the §5c
-        // gate redesign lands and this member set is left synthetic, this row
-        // turns `rejectedNonMember` and names the reason.
+        // WHICH outcome the pass reached rather than only "no seed".
         let summary = telemetry.summary();
         assert_eq!(
             summary

@@ -11075,7 +11075,6 @@ pub async fn start_node_inner(
                                             ),
                                             std::sync::Arc::new(reachability_resolver.clone()),
                                             gateway_joined,
-                                            self_owner,
                                         )
                                         .with_telemetry(gateway_bootstrap_telemetry),
                                     );

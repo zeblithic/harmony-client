@@ -6,10 +6,17 @@
 //! is the session-independent escape hatch: for each joined community with no
 //! live member session ("starved"), resolve the community's rendezvous beacon
 //! from pkarr (the record open-join dials — knowledge-free, keyed only by the
-//! epoch key), verify the beacon is a Joined member, seed it into the
-//! [`ReachabilityResolver`], and kick the reconnect supervisor. Everything
-//! downstream (record-gated dial, session, addrbook subscribe + snapshot,
-//! state sync) is existing machinery.
+//! epoch key), seed it into the [`ReachabilityResolver`], and kick the reconnect
+//! supervisor. Everything downstream (record-gated dial, session, addrbook
+//! subscribe + snapshot, state sync) is existing machinery.
+//!
+//! Trust is **epoch-envelope only** — open-join parity for this record family:
+//! the record proves epoch-key possession plus the claimed identity's signing
+//! key, and that is all we require. A membership check is deliberately absent
+//! because the beacon identity and community member keys are the repo's two
+//! non-convergent 16-byte hash notions; comparing them rejected every beacon.
+//! See spec §5c and the trust-model comment in `run_one_pass`. ZEB-827 carries
+//! the principled member binding.
 //!
 //! A feeder, not a dialer. Self-contained task — no inline awaits reach back
 //! into start_node (see `crate::community_relay_pull_driver` for the shape).
@@ -128,7 +135,6 @@ pub struct CommunityGatewayDialDriver {
     beacons: Arc<dyn BeaconResolver>,
     reachability: Arc<ReachabilityResolver>,
     joined_communities: JoinedCommunitiesFn,
-    self_owner: OwnerAddr,
     wake: Arc<Notify>,
     interval: Duration,
     telemetry: Option<Arc<GatewayBootstrapTelemetry>>,
@@ -142,14 +148,12 @@ impl CommunityGatewayDialDriver {
         beacons: Arc<dyn BeaconResolver>,
         reachability: Arc<ReachabilityResolver>,
         joined_communities: JoinedCommunitiesFn,
-        self_owner: OwnerAddr,
     ) -> Self {
         Self {
             ctx,
             beacons,
             reachability,
             joined_communities,
-            self_owner,
             wake: Arc::new(Notify::new()),
             interval: Duration::from_millis(GATEWAY_DIAL_TICK_MS),
             telemetry: None,
@@ -325,36 +329,38 @@ impl CommunityGatewayDialDriver {
                 self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
                 continue;
             };
+            // ── Trust model: epoch-envelope, open-join parity (Jake, spec §5c) ──
+            // There is deliberately NO membership check here, and no owner-level
+            // self-guard. Both would compare `Identity::address_hash` (the
+            // composite X25519‖Ed25519 *device*-address hash, what this record
+            // yields) against community member keys, which are the master
+            // `PubKeyBundle::identity_hash()` (signing-only). Those are the
+            // repo's two non-convergent 16-byte notions, so any such comparison
+            // rejects EVERY beacon — measured, not theorised: a real post-admit
+            // `ProdGatewayDialCtx::members_of` returns the master addr while the
+            // driver derives the composite, differing in every byte.
+            //
+            // So we trust what the envelope proves and nothing more: the writer
+            // holds the community epoch key (outer BEP44 sig) and the claimed
+            // identity's signing key (inner sig, verified inside
+            // `PkarrResolver::resolve`). That is exactly the trust decision
+            // open-join already makes for this same record family. Self-defense
+            // is the resolve-layer endpoint-id filter, which is authoritative
+            // and flavor-free. ZEB-827 carries the principled member binding.
+            //
+            // SEEDING-FLAVOR CONSEQUENCE (deliberate, bounded). The seed lands
+            // under the COMPOSITE device-address owner, while the addrbook row
+            // for the very same node arrives later under the MASTER owner. So
+            // the resolver briefly holds two entries for one node id under two
+            // owners — which is exactly the shape ZEB-704's
+            // `freshest_across_owners` dial view already resolves, so dialing is
+            // unaffected. The cost is that until the addrbook row lands, the
+            // starved predicate cannot link the live session back to a member
+            // (it matches members by master addr), so the community may still
+            // read as starved and burn a few extra resolves. That window is
+            // ladder-throttled (30s→600s) and closed by the addrbook snapshot
+            // that fires at session-up. ZEB-827 removes the split.
             let beacon_owner = OwnerAddr(identity.address_hash);
-            // Secondary self-guard (primary is the resolve-layer endpoint-id
-            // filter): a same-owner sibling record is the fleet seed path's
-            // job, not ours (spec §5.b). Checked before the membership gate so
-            // a self-record is never reported as a stranger.
-            if beacon_owner == self.self_owner {
-                self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
-                tracing::info!(
-                    community = ?community,
-                    beacon_owner = %hex::encode(&beacon_owner.0[..4]),
-                    node_id = %hex::encode(&hit.payload.iroh_node_id[..8]),
-                    "ZEB-824: beacon rejected — our own owner address; a sibling device is the fleet seed path's job"
-                );
-                continue;
-            }
-            // The security gate: the record proves its writer holds the epoch
-            // key AND the claimed identity's signing key, but only membership
-            // stops a LEAKED epoch key from steering our dials at an attacker
-            // endpoint. When this fires in the fleet the first two questions are
-            // "which identity" and "which endpoint" — so both are on the line.
-            if !members.contains(&beacon_owner) {
-                self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
-                tracing::info!(
-                    community = ?community,
-                    beacon_owner = %hex::encode(&beacon_owner.0[..4]),
-                    node_id = %hex::encode(&hit.payload.iroh_node_id[..8]),
-                    "ZEB-824: beacon rejected — identity is not a Joined member of this community"
-                );
-                continue;
-            }
             let node_id = hit.payload.iroh_node_id;
             self.reachability
                 .seed_from_pkarr(beacon_owner, DeviceIdentityHash([0u8; 16]), hit.payload)
@@ -572,9 +578,6 @@ mod tests {
             Arc::clone(&beacons) as Arc<dyn BeaconResolver>,
             Arc::clone(&resolver),
             Arc::new(move || vec![community]),
-            // Self ≠ any test member identity: every fixture owner is a real
-            // address hash, never the all-0xFF placeholder.
-            OwnerAddr([0xFF; 16]),
         )
         .with_telemetry(Arc::clone(&telemetry));
         Harness {
@@ -867,16 +870,24 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 5. Membership gate: beacon identity NOT in members_of ⇒ no seed, no
-    //    kick, outcome RejectedNonMember.
+    // 5. Epoch-envelope trust (Jake's decision, spec §5c): a beacon whose
+    //    identity is UNKNOWN to the membership view is still seeded. This is
+    //    the decided behavior, not an oversight — see 5b for what still
+    //    rejects.
     // ------------------------------------------------------------------
     #[tokio::test]
-    async fn non_member_beacon_is_rejected_not_seeded() {
+    async fn beacon_with_identity_unknown_to_membership_is_seeded() {
+        // Before the ZEB-824 fix round this asserted the opposite. The gate it
+        // pinned compared the beacon's COMPOSITE device-address hash against
+        // master-flavored member keys, so it rejected every real beacon too —
+        // the feature was a no-op in production. Trust is now what the epoch
+        // envelope proves, matching open-join for this record family.
         let community = SpaceId([0x15; 16]);
         let (_member_pub, member_owner) = test_member(6);
-        // The beacon record is signed by an identity that is NOT a member: a
-        // leaked epoch key steering our dials at an attacker endpoint.
-        let (stranger_pub, _stranger_owner) = test_member(7);
+        // A member set that does NOT contain the beacon's identity — in
+        // production this is the normal case, because the two sides are
+        // different hash notions entirely.
+        let (stranger_pub, stranger_owner) = test_member(7);
         let beacon_node_id = [0x66; 32];
         let handle = SupervisorHandle::new();
         let h = harness(
@@ -890,9 +901,62 @@ mod tests {
         h.driver.run_one_pass().await;
 
         assert_eq!(h.beacons.calls(), 1);
+        let seeded = h
+            .resolver
+            .resolve_by_node_id(&beacon_node_id)
+            .expect("an epoch-envelope-verified beacon must be seeded");
+        assert_eq!(
+            seeded.0, stranger_owner,
+            "the seed is keyed by the owner derived from the record's identity"
+        );
+        assert_eq!(
+            handle.pending_trigger(beacon_node_id),
+            Some(ReconnectTrigger::NewPeer)
+        );
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("beaconSeeded")
+        );
+        assert_eq!(h.telemetry.summary().rejected_non_member, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // 5b. The one remaining source of RejectedNonMember: the record's identity
+    //     bytes do not decode. Defensive — a record reaching here through
+    //     `ProdBeaconResolver` already had this Ed25519 half parsed for the
+    //     inner-sig check, so firing means a wire-format or publisher bug.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn undecodable_beacon_identity_is_rejected_not_seeded() {
+        let community = SpaceId([0x1F; 16]);
+        let (_member_pub, member_owner) = test_member(17);
+        let beacon_node_id = [0xEB; 32];
+        // An Ed25519 half whose y-coordinate is not on the curve, so
+        // decompression fails. Found by searching candidates against the
+        // PRODUCTION predicate rather than guessed: the obvious `[0xFF; 32]`
+        // does NOT work, because dalek reduces a non-canonical y and then
+        // decodes it happily. The assert below is the guard that caught that.
+        let mut bad_pub = [0u8; 64];
+        bad_pub[32] = 0x02;
+        assert!(
+            harmony_identity::Identity::from_public_bytes(&bad_pub).is_err(),
+            "fixture precondition: these identity bytes must be undecodable"
+        );
+        let handle = SupervisorHandle::new();
+        let h = harness(
+            community,
+            vec![member_owner],
+            Some(beacon(bad_pub, beacon_node_id)),
+            true,
+            Some(handle.clone()),
+        );
+
+        h.driver.run_one_pass().await;
+
+        assert_eq!(h.beacons.calls(), 1);
         assert!(
             h.resolver.resolve_by_node_id(&beacon_node_id).is_none(),
-            "a non-member beacon must never enter the dial view"
+            "an undecodable identity must never enter the dial view"
         );
         assert!(handle.pending_trigger(beacon_node_id).is_none());
         assert_eq!(
@@ -1042,7 +1106,6 @@ mod tests {
             Arc::clone(&beacons) as Arc<dyn BeaconResolver>,
             resolver,
             Arc::new(Vec::new),
-            OwnerAddr([0xFF; 16]),
         )
         .with_telemetry(Arc::clone(&telemetry));
 
@@ -1143,51 +1206,6 @@ mod tests {
         );
         assert_eq!(h.telemetry.summary().engine_unregistered, 1);
         assert_eq!(h.beacons.calls(), 0, "no key ⇒ nothing to resolve under");
-    }
-
-    // ------------------------------------------------------------------
-    // 10. Secondary self-guard: our OWN identity in a beacon record is never
-    //     seeded, even when the membership view lists us.
-    // ------------------------------------------------------------------
-    #[tokio::test]
-    async fn own_identity_beacon_is_rejected_by_the_self_guard() {
-        let community = SpaceId([0x1A; 16]);
-        let (self_pub, self_owner) = test_member(11);
-        let (_member_pub, member_owner) = test_member(12);
-        let beacon_node_id = [0xAA; 32];
-        let handle = SupervisorHandle::new();
-        let resolver = Arc::new(ReachabilityResolver::new());
-        resolver.set_supervisor(handle.clone());
-        // `members_of` here INCLUDES us, so the membership clause admits the
-        // record and only the self-guard can reject it. (Production's
-        // `members_of` excludes self; this stub deliberately does not, so the
-        // guard is tested in isolation rather than shadowed.)
-        let ctx = Arc::new(StubCtx::new(
-            HashMap::from([(community, vec![self_owner, member_owner])]),
-            HashMap::from([(community, EpochKey::new([0x33; 32]))]),
-        ));
-        let beacons = Arc::new(StubBeacons::new(Some(beacon(self_pub, beacon_node_id))));
-        let telemetry = Arc::new(GatewayBootstrapTelemetry::new());
-        let driver = CommunityGatewayDialDriver::new(
-            ctx as Arc<dyn GatewayDialCtx>,
-            Arc::clone(&beacons) as Arc<dyn BeaconResolver>,
-            Arc::clone(&resolver),
-            Arc::new(move || vec![community]),
-            self_owner,
-        )
-        .with_telemetry(Arc::clone(&telemetry));
-
-        driver.run_one_pass().await;
-
-        assert!(
-            resolver.resolve_by_node_id(&beacon_node_id).is_none(),
-            "a same-owner sibling record is the fleet seed path's job, not ours"
-        );
-        assert!(handle.pending_trigger(beacon_node_id).is_none());
-        assert_eq!(
-            outcome_of(&telemetry, &community).as_deref(),
-            Some("rejectedNonMember")
-        );
     }
 
     // ------------------------------------------------------------------
