@@ -583,9 +583,14 @@ impl EngineShared {
         &self,
         root_cid: crate::owner_state_types::ContentId,
     ) -> Result<(), MintSyncError> {
+        // ZEB-805: same state-root payload class as the zenoh path below, so it
+        // takes the same budget rather than the 500 ms small-read default.
         let blob = self
             .content_store
-            .get(&root_cid)
+            .get_with_budget(
+                &root_cid,
+                std::time::Duration::from_millis(crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS),
+            )
             .await
             .map_err(|e| MintSyncError::Other(format!("content_store.get: {e}")))?
             .ok_or(MintSyncError::MissingBlob(root_cid))?;
@@ -1027,19 +1032,36 @@ async fn handle_incoming_publish_zenoh(
     }
 
     // 4. Fetch the encrypted blob from CAS using root_cid.
-    let blob_ciphertext = match content_store.get(&payload.root_cid).await {
+    let blob_ciphertext = match content_store
+        .get_with_budget(
+            &payload.root_cid,
+            std::time::Duration::from_millis(crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS),
+        )
+        .await
+    {
         Ok(Some(b)) => b,
         Ok(None) => {
-            // Blob missing — peer's CAS hasn't replicated yet, or fetch timed
-            // out. Drop this publish; CRDT eventual consistency recovers on
-            // next peer publish. Mirrors owner_state_sync's ErrPostMutation
-            // handling for missing blobs.
+            // Blob missing — peer's CAS hasn't replicated yet, or the fetch
+            // timed out.
+            //
+            // ZEB-805: this arm used to `return Ok(())`, which made a swallowed
+            // fetch failure indistinguishable from success at the call site —
+            // the worst of the three sync engines' handling of one condition.
+            // It now returns the same `MissingBlob` the sibling fetch site in
+            // this file (`handle_incoming_publish`) already returns, so the two
+            // paths agree. The engine loop logs it as "incoming publish
+            // dropped" and continues; nothing becomes fatal.
+            //
+            // `budget_ms` is logged beside the cid (whose Debug carries the
+            // payload size) so an oversized blob under an undersized budget is
+            // legible on sight.
             tracing::warn!(
                 target: "mint_sync",
                 root_cid = ?payload.root_cid,
+                budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
                 "missing mint blob (fetch timeout or not yet replicated)"
             );
-            return Ok(());
+            return Err(MintSyncError::MissingBlob(payload.root_cid));
         }
         Err(e) => {
             return Err(MintSyncError::Other(format!("content_store.get: {e}")));

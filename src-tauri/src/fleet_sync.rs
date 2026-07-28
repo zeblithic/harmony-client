@@ -1362,15 +1362,26 @@ where
     // 5. Fetch the encrypted root blob from CAS. Failures here are the
     //    TRANSIENT class (ZEB-705): return the wire frame so the engine
     //    loop can schedule a bounded retry (tracker un-advanced either way).
-    let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
+    let blob_ciphertext = match ctx
+        .content_store
+        .get_with_budget(
+            &payload.root_cid,
+            std::time::Duration::from_millis(crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS),
+        )
+        .await
+    {
         Ok(Some(b)) => b,
         Ok(None) => {
-            // A missing blob means a fetch timeout or a corrupted-admit
-            // drop. Both collapse onto the same recovery path: retry, then
-            // rely on the next state-root from any peer (CRDT eventual
-            // consistency).
+            // A missing blob means a fetch timeout or a corrupted-admit drop.
+            // Both collapse onto the same recovery path: a bounded retry.
+            //
+            // ZEB-805: `cid`'s Debug carries the payload size, and `budget_ms`
+            // is logged beside it deliberately — the size alone read as
+            // unremarkable in the incident logs precisely because the budget it
+            // was measured against was invisible.
             tracing::warn!(
                 cid = ?payload.root_cid,
+                budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
                 "incoming publish fetch miss: missing root blob (fetch timeout or admit-rejected) — will retry if budget remains"
             );
             return Inbound::FetchMiss(wire);

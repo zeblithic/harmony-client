@@ -660,8 +660,18 @@ pub enum CommunitySyncError {
     /// not yet available," not an I/O fault. Surfacing it as `Io`
     /// would misdirect operators chasing disk / network bugs and
     /// muddy any future retry-vs-give-up logic.
-    #[error("blob not found in CAS for cid {cid:?} (fetch timeout or admit-rejected)")]
-    BlobNotFound { cid: ContentId },
+    ///
+    /// ZEB-805: `budget_ms` is part of the message on purpose. The `ContentId`
+    /// Debug already prints the payload size, so the incident log carried
+    /// `ContentId(d8999d66…, 101084B, Book)` — and nobody connected it to the
+    /// 500 ms budget it was fetched under, because the budget was nowhere in
+    /// sight. Rendered together, "101084 B within 500 ms" is wrong on sight.
+    /// Keep these two numbers in the same sentence.
+    #[error(
+        "blob not found in CAS for cid {cid:?} within {budget_ms}ms \
+         (fetch timeout or admit-rejected)"
+    )]
+    BlobNotFound { cid: ContentId, budget_ms: u64 },
 
     /// Publish was signed correctly but the publisher's membership
     /// state at the publish HLC does NOT have status `Joined`. Either
@@ -3820,15 +3830,26 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         }
     };
 
-    // 6. Fetch the encrypted blob from CAS. Cache-miss is a pre-mutation
-    //    failure — the publish carries a CID we couldn't resolve in
-    //    time; CRDT eventual consistency lets the next state-root from
-    //    any peer recover.
-    let blob_ciphertext = match ctx.content_store.get(&payload.root_cid).await {
+    // 6. Fetch the encrypted blob from CAS under the state-root budget.
+    //    ZEB-805: this is a ~100 KB-and-growing payload fetched cross-WAN, so
+    //    it must NOT inherit the 500 ms default tuned for small local reads —
+    //    that mismatch is what wedged a node for 90 minutes. A miss here is
+    //    pre-mutation: the tracker stays un-advanced (the `CommitTicket` from
+    //    step 5 is dropped), so re-delivery of this same frame is admissible,
+    //    which is what makes the bounded retry in the engine loop safe.
+    let blob_ciphertext = match ctx
+        .content_store
+        .get_with_budget(
+            &payload.root_cid,
+            std::time::Duration::from_millis(crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS),
+        )
+        .await
+    {
         Ok(Some(b)) => b,
         Ok(None) => {
             return IncomingOutcome::ErrPreMutation(CommunitySyncError::BlobNotFound {
                 cid: payload.root_cid,
+                budget_ms: crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
             });
         }
         Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(e)),
