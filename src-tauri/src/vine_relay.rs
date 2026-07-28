@@ -667,6 +667,9 @@ pub struct VineRelayAcceptor {
     config: VineRelaySessionConfig,
     admission: VineRelayAdmission,
     telemetry: Option<Arc<crate::network_health::VineRelayServingTelemetry>>,
+    /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
+    /// iroh endpoint id. `None` (tests, pre-boot) — stamping is then a no-op.
+    traffic: Option<Arc<crate::network_health::PeerTrafficRegistry>>,
 }
 
 impl VineRelayAcceptor {
@@ -680,6 +683,7 @@ impl VineRelayAcceptor {
             config,
             admission: VineRelayAdmission::new(VINE_RELAY_MAX_CONCURRENT_SESSIONS),
             telemetry: None,
+            traffic: None,
         }
     }
 
@@ -691,6 +695,17 @@ impl VineRelayAcceptor {
         telemetry: Arc<crate::network_health::VineRelayServingTelemetry>,
     ) -> Self {
         self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// ZEB-804: install the per-peer served-traffic registry. Builder-style so
+    /// the boot wiring can attach it without a second constructor arity
+    /// (mirrors `IrohCommunityRelayPullAcceptor::with_traffic_registry`).
+    pub fn with_traffic_registry(
+        mut self,
+        traffic: Arc<crate::network_health::PeerTrafficRegistry>,
+    ) -> Self {
+        self.traffic = Some(traffic);
         self
     }
 
@@ -740,6 +755,16 @@ impl VineRelayAcceptor {
 
         if let Some(t) = self.telemetry.as_ref() {
             t.record_served(result.bytes_served);
+        }
+        // ZEB-804: stamp the FULL-id served-traffic registry beside the
+        // telemetry — a session that RAN on an iroh-authenticated connection is
+        // traffic evidence for that peer whatever its ending (mirroring
+        // `record_served` above, which also fires for every session end).
+        if let Some(reg) = self.traffic.as_ref() {
+            reg.record_served(
+                *conn.remote_id().as_bytes(),
+                crate::network_health::now_ms(),
+            );
         }
         tracing::debug!(
             end = ?result.end,

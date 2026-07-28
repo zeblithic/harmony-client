@@ -531,6 +531,66 @@ impl DialTelemetry {
     }
 }
 
+/// ZEB-804: the per-peer served-traffic stamps [`PeerTrafficRegistry`] holds.
+/// `last_any_served_ms` advances on EVERY served request from the peer;
+/// `last_relay_pull_served_ms` additionally pins the most recent
+/// community-relay pull specifically (the relay-pull cadence is the signal the
+/// staleness tier is derived from, spec §6).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeerTrafficStamps {
+    pub last_any_served_ms: u64,
+    pub last_relay_pull_served_ms: Option<u64>,
+}
+
+/// ZEB-804: in-memory per-peer served-traffic stamps, written by the iroh
+/// acceptors at their served-a-request sites and read by `snapshot`. Keyed by
+/// the FULL 32-byte iroh endpoint id — deliberately not the 4-byte-truncated
+/// ZEB-329 relay-serving map, which cannot be joined back to `peers[]`. The
+/// redaction rule governs what we log/persist; this map is in-memory only and
+/// feeds a surface that already shows full owner addrs. Call rate is one stamp
+/// per served request, so a mutex map is fine (no hot-path atomics).
+#[derive(Debug, Default)]
+pub struct PeerTrafficRegistry {
+    stamps: Mutex<HashMap<[u8; 32], PeerTrafficStamps>>,
+}
+
+impl PeerTrafficRegistry {
+    /// Record one served request from `peer` (any acceptor). `now_ms` is
+    /// injected by the caller from its existing wall-clock source
+    /// (injected-clock convention — the registry never samples time itself).
+    pub fn record_served(&self, peer: [u8; 32], now_ms: u64) {
+        let mut stamps = self.stamps.lock().expect("peer traffic registry lock");
+        stamps
+            .entry(peer)
+            .and_modify(|s| s.last_any_served_ms = now_ms)
+            .or_insert(PeerTrafficStamps {
+                last_any_served_ms: now_ms,
+                last_relay_pull_served_ms: None,
+            });
+    }
+
+    /// Record one served community-relay pull from `peer`. A relay pull is
+    /// also "any" traffic, so BOTH stamps advance.
+    pub fn record_relay_pull_served(&self, peer: [u8; 32], now_ms: u64) {
+        let mut stamps = self.stamps.lock().expect("peer traffic registry lock");
+        let entry = stamps.entry(peer).or_insert(PeerTrafficStamps {
+            last_any_served_ms: now_ms,
+            last_relay_pull_served_ms: None,
+        });
+        entry.last_any_served_ms = now_ms;
+        entry.last_relay_pull_served_ms = Some(now_ms);
+    }
+
+    /// The peer's current stamps, `None` when this node has never served it.
+    pub fn stamps(&self, peer: &[u8; 32]) -> Option<PeerTrafficStamps> {
+        self.stamps
+            .lock()
+            .expect("peer traffic registry lock")
+            .get(peer)
+            .copied()
+    }
+}
+
 const PKARR_FALLBACK_RING_CAP: usize = 32;
 
 /// ZEB-595: process-lifetime bounded ring of recent Case-C in-community pkarr
@@ -1287,7 +1347,12 @@ impl NetworkHealthSnapshot {
     }
 }
 
-fn now_ms() -> u64 {
+/// Wall-clock now in epoch-milliseconds (saturating to `0` before the epoch).
+/// `pub(crate)` since ZEB-804: the iroh acceptor stamp sites without a
+/// file-local wall-ms helper inject THIS clock into
+/// [`PeerTrafficRegistry`] — the same clock `snapshot` compares the stamps
+/// against.
+pub(crate) fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1729,6 +1794,13 @@ pub struct NetworkHealthService {
     /// no owner identity). Installed at boot via
     /// [`set_gateway_bootstrap_source`](Self::set_gateway_bootstrap_source).
     gateway_bootstrap: Option<std::sync::Arc<GatewayBootstrapTelemetry>>,
+    /// ZEB-804: per-peer served-traffic stamps — the SAME `Arc` every iroh
+    /// acceptor stamps at its served-a-request site. Installed at boot via
+    /// [`set_peer_traffic_source`](Self::set_peer_traffic_source).
+    /// `#[allow(dead_code)]`: written by Task 2's boot wiring, read by Task 3's
+    /// snapshot merge (which removes this allow).
+    #[allow(dead_code)]
+    peer_traffic: Option<std::sync::Arc<PeerTrafficRegistry>>,
 }
 
 impl NetworkHealthService {
@@ -1763,6 +1835,7 @@ impl NetworkHealthService {
             vine_relay_serving: None,
             vine_pull: None,
             gateway_bootstrap: None,
+            peer_traffic: None,
         }
     }
 
@@ -1872,6 +1945,13 @@ impl NetworkHealthService {
         src: std::sync::Arc<GatewayBootstrapTelemetry>,
     ) {
         self.gateway_bootstrap = Some(src);
+    }
+
+    /// ZEB-804: install the per-peer served-traffic registry (the same `Arc`
+    /// every iroh acceptor stamps). Additive — when unset, the snapshot's
+    /// traffic merge is inert.
+    pub(crate) fn set_peer_traffic_source(&mut self, src: std::sync::Arc<PeerTrafficRegistry>) {
+        self.peer_traffic = Some(src);
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -5573,6 +5653,38 @@ mod tests {
         let snap = NetworkHealthSnapshot::empty();
         assert_eq!(snap.dial_status.attempts, 0);
         assert!(snap.dial_status.recent.is_empty());
+    }
+
+    // ── ZEB-804: per-peer served-traffic registry ──
+
+    #[test]
+    fn peer_traffic_registry_stamps_and_relay_pull_specificity() {
+        let reg = PeerTrafficRegistry::default();
+        let p = [7u8; 32];
+        assert!(reg.stamps(&p).is_none());
+        reg.record_served(p, 1_000);
+        assert_eq!(
+            reg.stamps(&p),
+            Some(PeerTrafficStamps {
+                last_any_served_ms: 1_000,
+                last_relay_pull_served_ms: None
+            })
+        );
+        reg.record_relay_pull_served(p, 2_000);
+        assert_eq!(
+            reg.stamps(&p),
+            Some(PeerTrafficStamps {
+                last_any_served_ms: 2_000,
+                last_relay_pull_served_ms: Some(2_000)
+            }),
+            "a relay pull is also 'any' traffic"
+        );
+        reg.record_served(p, 3_000);
+        assert_eq!(
+            reg.stamps(&p).unwrap().last_relay_pull_served_ms,
+            Some(2_000),
+            "a non-relay serve must not advance the relay-pull stamp"
+        );
     }
 
     // ── ZEB-803: community-relay serving / pulling telemetry ──

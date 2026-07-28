@@ -4431,6 +4431,15 @@ pub async fn start_node_inner(
         let mut gateway_bootstrap_telemetry_for_state: Option<
             std::sync::Arc<crate::network_health::GatewayBootstrapTelemetry>,
         > = None;
+        // ZEB-804: ONE shared per-peer served-traffic registry, stamped by every
+        // iroh acceptor at its served-a-request site (FULL 32-byte iroh endpoint
+        // id) and read by `network_health_snapshot`. Unlike the per-acceptor
+        // telemetry Options above this is deliberately a single always-present
+        // Arc: the snapshot needs one per-peer join surface, and an empty
+        // registry honestly reads "no served-traffic evidence" (acceptors that
+        // never install simply never stamp).
+        let peer_traffic_registry =
+            std::sync::Arc::new(crate::network_health::PeerTrafficRegistry::default());
         // ZEB-217 Sub-C Phase 2 Task 13: per-community engine pool +
         // adapter requests handed to the event loop. Both stay None /
         // empty when no owner identity is loaded (registry depends on
@@ -10150,7 +10159,10 @@ pub async fn start_node_inner(
                                 Some(std::sync::Arc::new(app.clone())),
                                 pkarr_invite_publisher_for_state.clone(),
                                 crate::iroh_invite_acceptor::HandshakeAcceptorConfig::from_env(),
-                            ),
+                            )
+                            // ZEB-804: stamp served invite handshakes into the
+                            // shared per-peer traffic registry.
+                            .with_traffic_registry(std::sync::Arc::clone(&peer_traffic_registry)),
                         );
 
                         // ZEB-370 Task 9: build the friend-handshake acceptor
@@ -10265,7 +10277,10 @@ pub async fn start_node_inner(
                             // signed accept carries this node's own-fleet
                             // revocations, built fresh per handshake (a device
                             // revoked after start_node is still carried).
-                            .with_self_trust_doc(Some(std::sync::Arc::clone(&owner_trust_doc))),
+                            .with_self_trust_doc(Some(std::sync::Arc::clone(&owner_trust_doc)))
+                            // ZEB-804: stamp served friend handshakes into the
+                            // shared per-peer traffic registry.
+                            .with_traffic_registry(std::sync::Arc::clone(&peer_traffic_registry)),
                         );
 
                         // ZEB-375 (Friends Phase 2a): build the friend-PEX
@@ -10334,7 +10349,10 @@ pub async fn start_node_inner(
                             // ZEB-680 §2: wire the LIVE owner trust doc so X's
                             // auto-Proceed introduction link carries X's own-fleet
                             // revocations (built fresh per introduction).
-                            .with_self_trust_doc(Some(std::sync::Arc::clone(&owner_trust_doc))),
+                            .with_self_trust_doc(Some(std::sync::Arc::clone(&owner_trust_doc)))
+                            // ZEB-804: stamp served PEX requests into the shared
+                            // per-peer traffic registry.
+                            .with_traffic_registry(std::sync::Arc::clone(&peer_traffic_registry)),
                         );
 
                         // Multiplex all three acceptors behind the single
@@ -10402,7 +10420,10 @@ pub async fn start_node_inner(
                         let butler_acceptor = std::sync::Arc::new(
                             crate::iroh_butler_acceptor::IrohButlerDepositAcceptor::new(
                                 deposit_ctx,
-                            ),
+                            )
+                            // ZEB-804: stamp accepted deposits into the shared
+                            // per-peer traffic registry.
+                            .with_traffic_registry(std::sync::Arc::clone(&peer_traffic_registry)),
                         );
                         // ZEB-702 T5 (Component D): capture the decision-counter
                         // handle before the acceptor moves into the link manager,
@@ -10713,6 +10734,12 @@ pub async fn start_node_inner(
                                 )
                                 .with_telemetry(std::sync::Arc::clone(
                                     &relay_serving_telemetry,
+                                ))
+                                // ZEB-804: stamp served relay pulls into the
+                                // shared per-peer traffic registry (relay-pull
+                                // flavor — the staleness tier keys on it).
+                                .with_traffic_registry(std::sync::Arc::clone(
+                                    &peer_traffic_registry,
                                 )),
                             ))
                             .is_err()
@@ -10767,6 +10794,11 @@ pub async fn start_node_inner(
                                 crate::vine_relay::VineRelayAcceptor::new(vine_relay_ctx)
                                     .with_telemetry(std::sync::Arc::clone(
                                         &vine_relay_serving_telemetry,
+                                    ))
+                                    // ZEB-804: stamp served vine sessions into
+                                    // the shared per-peer traffic registry.
+                                    .with_traffic_registry(std::sync::Arc::clone(
+                                        &peer_traffic_registry,
                                     )),
                             ))
                             .is_err()
@@ -12728,6 +12760,14 @@ pub async fn start_node_inner(
                             if let Some(t) = gateway_bootstrap_telemetry_for_state.as_ref() {
                                 nh.set_gateway_bootstrap_source(std::sync::Arc::clone(t));
                             }
+                            // ZEB-804: per-peer served-traffic stamps — the SAME
+                            // registry every iroh acceptor stamps. Installed
+                            // unconditionally (unlike the sources above): the
+                            // registry always exists, and empty honestly reads
+                            // "no served-traffic evidence yet".
+                            nh.set_peer_traffic_source(std::sync::Arc::clone(
+                                &peer_traffic_registry,
+                            ));
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks

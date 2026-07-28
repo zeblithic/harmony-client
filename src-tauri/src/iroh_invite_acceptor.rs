@@ -217,6 +217,9 @@ where
     /// `verify_and_admit_open_join` call, never across the engine apply
     /// or the response write.
     open_join_limiter: TokioMutex<OpenJoinRateLimiter>,
+    /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
+    /// iroh endpoint id. `None` (tests, pre-boot) — stamping is then a no-op.
+    traffic: Option<Arc<crate::network_health::PeerTrafficRegistry>>,
 }
 
 impl<H> IrohInviteHandshakeAcceptor<H>
@@ -262,7 +265,19 @@ where
             pkarr_invite_publisher,
             config,
             open_join_limiter: TokioMutex::new(OpenJoinRateLimiter::default()),
+            traffic: None,
         }
+    }
+
+    /// ZEB-804: install the per-peer served-traffic registry. Builder-style so
+    /// the boot wiring can attach it without a second constructor arity
+    /// (mirrors `IrohCommunityRelayPullAcceptor::with_traffic_registry`).
+    pub fn with_traffic_registry(
+        mut self,
+        traffic: Arc<crate::network_health::PeerTrafficRegistry>,
+    ) -> Self {
+        self.traffic = Some(traffic);
+        self
     }
 
     /// Inbound bi-stream handler shared by the trait dispatch and the
@@ -683,6 +698,15 @@ where
     async fn handle_connection(&self, conn: Connection) {
         match self.handle_invite_handshake_inbound(&conn).await {
             Ok(bootstrap_join_id) => {
+                // ZEB-804: stamp the FULL-id served-traffic registry once per
+                // completed handshake (invite counter-sign or open-join admit —
+                // both wrote a response to an iroh-authenticated peer).
+                if let Some(reg) = self.traffic.as_ref() {
+                    reg.record_served(
+                        *conn.remote_id().as_bytes(),
+                        crate::network_health::now_ms(),
+                    );
+                }
                 tracing::info!(
                     bootstrap_join_id = %hex::encode(bootstrap_join_id),
                     remote_id = ?conn.remote_id(),

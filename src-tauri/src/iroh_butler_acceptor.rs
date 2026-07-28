@@ -1324,6 +1324,10 @@ pub struct IrohButlerDepositAcceptor {
     /// can hand a clone to `network_health_snapshot` (Task 5). Defaults fresh,
     /// so existing callers are unchanged.
     stats: Arc<ButlerDepositStats>,
+    /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
+    /// iroh endpoint id. `None` when nothing installed one (unit tests,
+    /// pre-boot) — stamping is then a no-op.
+    traffic: Option<Arc<crate::network_health::PeerTrafficRegistry>>,
 }
 
 impl IrohButlerDepositAcceptor {
@@ -1337,7 +1341,19 @@ impl IrohButlerDepositAcceptor {
             config,
             rejected_deposits: AtomicU64::new(0),
             stats: Arc::new(ButlerDepositStats::new()),
+            traffic: None,
         }
+    }
+
+    /// ZEB-804: install the per-peer served-traffic registry. Builder-style so
+    /// the boot wiring can attach it without a second constructor arity
+    /// (mirrors `IrohCommunityRelayPullAcceptor::with_traffic_registry`).
+    pub fn with_traffic_registry(
+        mut self,
+        traffic: Arc<crate::network_health::PeerTrafficRegistry>,
+    ) -> Self {
+        self.traffic = Some(traffic);
+        self
     }
 
     /// ZEB-702: install a shared [`ButlerDepositStats`] handle (default is a
@@ -1368,6 +1384,15 @@ impl IrohButlerDepositAcceptor {
         match self.handle_deposit_inbound(&conn).await {
             Ok(()) => {
                 self.stats.record_accepted();
+                // ZEB-804: stamp the FULL-id served-traffic registry (keyed on
+                // the iroh-authenticated remote id, so a peer cannot forge
+                // another peer's traffic freshness).
+                if let Some(reg) = self.traffic.as_ref() {
+                    reg.record_served(
+                        *conn.remote_id().as_bytes(),
+                        crate::network_health::now_ms(),
+                    );
+                }
                 tracing::info!(
                     remote_id = ?conn.remote_id(),
                     "ZEB-418: butler deposit accepted (ack delivered)"

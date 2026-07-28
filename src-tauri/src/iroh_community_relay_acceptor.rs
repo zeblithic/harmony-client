@@ -905,6 +905,11 @@ pub struct IrohCommunityRelayPullAcceptor {
     /// tests, pre-boot) — recording is then a no-op, so the shell's behaviour is
     /// identical whether or not health is wired.
     telemetry: Option<Arc<crate::network_health::CommunityRelayServingTelemetry>>,
+    /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
+    /// iroh endpoint id (unlike `telemetry`'s 4-byte ZEB-329 map, which cannot
+    /// be joined back to `peers[]`). Same `None`-is-a-no-op convention as
+    /// `telemetry`.
+    traffic: Option<Arc<crate::network_health::PeerTrafficRegistry>>,
 }
 
 impl IrohCommunityRelayPullAcceptor {
@@ -917,6 +922,7 @@ impl IrohCommunityRelayPullAcceptor {
             ctx,
             config,
             telemetry: None,
+            traffic: None,
         }
     }
 
@@ -930,6 +936,17 @@ impl IrohCommunityRelayPullAcceptor {
         self
     }
 
+    /// ZEB-804: install the per-peer served-traffic registry. Builder-style so
+    /// the boot wiring can attach it without a second constructor arity
+    /// (mirrors [`Self::with_telemetry`]).
+    pub fn with_traffic_registry(
+        mut self,
+        traffic: Arc<crate::network_health::PeerTrafficRegistry>,
+    ) -> Self {
+        self.traffic = Some(traffic);
+        self
+    }
+
     /// Handle one inbound relay-pull connection. On ANY failure the stream is
     /// closed uniformly with no detail. A missing ack is success, not failure.
     pub async fn handle_connection(&self, conn: Connection) {
@@ -939,6 +956,14 @@ impl IrohCommunityRelayPullAcceptor {
                 // peer cannot inflate or forge another peer's served-pull row.
                 if let Some(t) = self.telemetry.as_ref() {
                     t.record_served(conn.remote_id().as_bytes());
+                }
+                // ZEB-804: stamp the FULL-id served-traffic registry (relay-pull
+                // flavor — the staleness tier keys on this cadence).
+                if let Some(reg) = self.traffic.as_ref() {
+                    reg.record_relay_pull_served(
+                        *conn.remote_id().as_bytes(),
+                        crate::network_health::now_ms(),
+                    );
                 }
                 tracing::info!(
                     remote_id = ?conn.remote_id(),
