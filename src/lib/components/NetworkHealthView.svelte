@@ -28,6 +28,7 @@
     RelayOutcome,
   } from '../types/network-health';
   import { relayStatusLabel } from '../relay-status-label';
+  import { peerBadge, stalenessLabel } from '../networkHealthStaleness';
   import DiagnosticExportModal from './DiagnosticExportModal.svelte';
   import NetworkStatusPill from './NetworkStatusPill.svelte';
 
@@ -171,20 +172,33 @@
     }
   });
 
+  // ZEB-804: badge derivation lives in the pure helpers
+  // (networkHealthStaleness.ts) so the dark-forces-⚠ override and the age
+  // annotation are unit-testable without a component render.
   function peerStatusIcon(p: PeerHealth): string {
-    if (p.connectionMode === 'direct') return '✓';
-    // ZEB-622: relay and degraded both warn (⚠) but carry distinct titles
-    // (see peerStatusTitle) — relay is a working relay-mediated path, degraded
-    // is a live link with no selected path yet.
-    if (p.connectionMode === 'relay') return '⚠';
-    if (p.connectionMode === 'degraded') return '⚠';
-    return '✗';
+    return peerBadge(p.connectionMode, p.staleness ?? null);
+  }
+
+  // ZEB-804: traffic-evidence age for the staleness annotation. `null` when
+  // the peer has no traffic evidence ever (the incident shape — the label
+  // then reads "no traffic observed" with no age).
+  function trafficAgeMs(p: PeerHealth): number | null {
+    const traffic = p.lastTrafficMs ?? null;
+    return traffic === null ? null : Date.now() - traffic;
+  }
+
+  // ZEB-804: '' when fresh / pre-field snapshot; "quiet for Xm" /
+  // "no traffic for Xm" otherwise.
+  function peerStalenessAnnotation(p: PeerHealth): string {
+    return stalenessLabel(p.staleness ?? null, trafficAgeMs(p));
   }
 
   // ZEB-622: hover text that disambiguates the shared ⚠ icon (relay vs
   // degraded) and names each state for accessibility.
   // ZEB-623: when the peer is protocol-incompatible, prepend the reason so the
   // status hover explains the more severe failure first.
+  // ZEB-804: non-fresh staleness appends its annotation so the hover explains
+  // why a connected-looking peer carries the warn badge.
   function peerStatusTitle(p: PeerHealth): string {
     const base =
       p.connectionMode === 'direct'
@@ -194,10 +208,12 @@
           : p.connectionMode === 'degraded'
             ? 'Link up — no selected path yet (degraded)'
             : 'No connection';
+    const annotation = peerStalenessAnnotation(p);
+    const withStaleness = annotation ? `${base} — ${annotation}` : base;
     if (p.protocolIncompatReason) {
-      return `Incompatible protocol: ${p.protocolIncompatReason} — ${base}`;
+      return `Incompatible protocol: ${p.protocolIncompatReason} — ${withStaleness}`;
     }
-    return base;
+    return withStaleness;
   }
 
   // ZEB-622: recent dial-ring markers. Dial outcomes succeeded/failed plus the
@@ -298,6 +314,14 @@
                   />
                 {/if}
                 {#if p.rttMs !== null}<span>{p.rttMs}ms</span>{/if}
+                {#if p.staleness === 'quiet' || p.staleness === 'dark'}
+                  <!-- ZEB-804 (spec §6): mode/rtt above are the LAST CONFIRMED
+                       claim, not live truth — qualify them and say how long
+                       traffic has been silent. -->
+                  <span class="muted" data-testid="nh-peer-staleness"
+                    >(last confirmed — {peerStalenessAnnotation(p)})</span
+                  >
+                {/if}
                 {#if p.lastSeenMs !== null}
                   <span class="muted"
                     >last seen {Math.floor(

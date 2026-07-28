@@ -160,6 +160,31 @@ function readySnapWithIncompatiblePeer(): NetworkHealthSnapshot {
   };
 }
 
+// ZEB-804: a snapshot with a peer the liveness machine still pins as
+// direct/14ms while its traffic evidence is 2h15m old (staleness `dark`) —
+// the exact incident shape whose green check this task fixes.
+function readySnapWithDarkDirectPeer(): NetworkHealthSnapshot {
+  return {
+    ...readySnap(),
+    peers: [
+      {
+        ownerAddr: 'deadfa11'.repeat(8),
+        displayName: null,
+        sharedCommunities: ['c0ffee'],
+        connectionMode: 'direct',
+        rttMs: 14,
+        lastSeenMs: null,
+        reachabilityRecordAgeMs: null,
+        protocolIncompatReason: null,
+        lastTrafficMs: Date.now() - 8_100_000,
+        lastRelayPullServedMs: null,
+        connectedSinceMs: Date.now() - 9_000_000,
+        staleness: 'dark',
+      },
+    ],
+  };
+}
+
 describe('NetworkHealthView', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -255,6 +280,39 @@ describe('NetworkHealthView', () => {
     expect(icon.getAttribute('title')).toContain('degraded');
     // The mode label still reads "degraded" in the row body.
     expect(screen.getByTestId('nh-peer').textContent).toContain('degraded');
+  });
+
+  it('degrades a dark direct peer to ⚠ with a last-confirmed qualifier (ZEB-804)', async () => {
+    mockInvoke.mockResolvedValue(readySnapWithDarkDirectPeer());
+    render(NetworkHealthView);
+    await waitFor(() => screen.getByTestId('nh-peer'));
+
+    // The ZEB-804 lie, fixed in the DOM: direct + dark must NOT show ✓.
+    const icon = screen.getByTestId('nh-peer-icon');
+    expect(icon.textContent).toContain('⚠');
+    expect(icon.textContent).not.toContain('✓');
+    // The hover explains why a connected-looking peer warns.
+    expect(icon.getAttribute('title')).toContain('no traffic for 135m');
+
+    // Mode/rtt render with the "last confirmed" qualifier (spec §6).
+    const qualifier = screen.getByTestId('nh-peer-staleness');
+    expect(qualifier.textContent).toContain('last confirmed');
+    expect(qualifier.textContent).toContain('no traffic for 135m');
+  });
+
+  it('keeps the green check for a fresh direct peer and shows no qualifier (ZEB-804)', async () => {
+    const snap = readySnapWithDarkDirectPeer();
+    snap.peers[0] = {
+      ...snap.peers[0],
+      lastTrafficMs: Date.now() - 30_000,
+      staleness: 'fresh',
+    };
+    mockInvoke.mockResolvedValue(snap);
+    render(NetworkHealthView);
+    await waitFor(() => screen.getByTestId('nh-peer'));
+
+    expect(screen.getByTestId('nh-peer-icon').textContent).toContain('✓');
+    expect(screen.queryByTestId('nh-peer-staleness')).toBeNull();
   });
 
   it('renders a loud incompatible badge only for the protocol-incompatible peer (ZEB-623)', async () => {
