@@ -28,7 +28,7 @@ use std::sync::Mutex;
 use crate::reconnect_supervisor::PeerStateWire;
 // ZEB-622: the peer-liveness state machine's per-peer transport projection is
 // joined into PeerHealth (live mode/rtt) and folds into the last-seen freshness.
-use crate::peer_liveness::{LivenessMode, LivenessStateWire};
+use crate::peer_liveness::{LivenessMode, LivenessStateWire, PeerLivenessView};
 
 // ── Public data types (wire shape for IPC) ──────────────────────────
 
@@ -129,6 +129,28 @@ pub struct PeerHealth {
     /// when `None`), so a pre-field cached snapshot still deserializes.
     #[serde(default)]
     pub protocol_incompat_reason: Option<String>,
+    /// ZEB-804: freshest served-traffic evidence for this peer — the max of
+    /// the liveness machine's rx app-frame stamp (≤30s coarse: sampled on the
+    /// RTT tick, which only widens staleness, never fakes freshness) and the
+    /// acceptor registry's `last_any_served_ms`. `None` when neither source
+    /// has evidence. Also max-absorbed into `last_seen_ms`, which may only
+    /// GAIN freshness from it. Additive wire field — `#[serde(default)]`.
+    #[serde(default)]
+    pub last_traffic_ms: Option<u64>,
+    /// ZEB-804: most recent successfully served community-relay pull from this
+    /// peer, copied verbatim from the acceptor registry (success-only by
+    /// design — the relay-pull cadence is the staleness-tier signal). Additive
+    /// wire field — `#[serde(default)]`.
+    #[serde(default)]
+    pub last_relay_pull_served_ms: Option<u64>,
+    /// ZEB-804: when the current connection to this peer was established —
+    /// liveness `Connected.since_ms` first, else the reconnect supervisor's
+    /// `Connected.since_ms`. The establishment stamp under its honest name (it
+    /// is NOT traffic evidence; the presence cache does not feed it). `None`
+    /// when neither source reports the peer connected. Additive wire field —
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub connected_since_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1480,6 +1502,9 @@ pub fn filter_peers_by_shared_membership(
             last_seen_ms: r.last_seen_ms,
             reachability_record_age_ms: r.last_seen_ms.map(|ls| now_ms.saturating_sub(ls)),
             protocol_incompat_reason: r.protocol_incompat_reason,
+            last_traffic_ms: r.last_traffic_ms,
+            last_relay_pull_served_ms: r.last_relay_pull_served_ms,
+            connected_since_ms: r.connected_since_ms,
         });
     }
     // Sort by last_seen_ms desc; None values last.
@@ -1513,6 +1538,17 @@ pub struct ResolverPeerRecord {
     /// `NetworkHealthService::snapshot`. `None` for a compatible (or
     /// never-dialed) peer. Copied straight onto the emitted `PeerHealth`.
     pub protocol_incompat_reason: Option<String>,
+    /// ZEB-804: freshest served-traffic evidence, filled by
+    /// `NetworkHealthService::snapshot`'s traffic merge (max of the liveness
+    /// rx stamp and the registry's `last_any_served_ms`). Copied onto
+    /// `PeerHealth::last_traffic_ms`.
+    pub last_traffic_ms: Option<u64>,
+    /// ZEB-804: most recent successfully served community-relay pull, copied
+    /// verbatim from the `PeerTrafficRegistry` by the snapshot merge.
+    pub last_relay_pull_served_ms: Option<u64>,
+    /// ZEB-804: connection-establishment stamp (liveness `Connected.since_ms`
+    /// first, else the supervisor's), filled by the snapshot merge.
+    pub connected_since_ms: Option<u64>,
 }
 
 impl ResolverPeerRecord {
@@ -1638,6 +1674,15 @@ impl SupervisorSnapshot for ProdSupervisorSnapshot {
 pub trait LivenessSnapshot: Send + Sync {
     fn peer_states(&self) -> Vec<([u8; 32], LivenessStateWire)>;
     fn min_relay_rtt_ms(&self) -> Option<u32>;
+    /// ZEB-804: per-peer liveness VIEWS — the state plus the state-independent
+    /// rx-traffic stamp. Default-bodied (empty) so sources that predate the
+    /// stamp (test fakes) compile unchanged; the assembly falls back to
+    /// [`peer_states`](Self::peer_states) for the state map when this is
+    /// empty, so such a source keeps its full pre-ZEB-804 behavior and merely
+    /// contributes no traffic stamps.
+    fn peer_views(&self) -> Vec<([u8; 32], PeerLivenessView)> {
+        Vec::new()
+    }
 }
 
 /// Production source: reads the live [`LivenessHandle`] the resolver holds
@@ -1665,6 +1710,12 @@ impl LivenessSnapshot for ProdLivenessSnapshot {
     }
     fn min_relay_rtt_ms(&self) -> Option<u32> {
         self.resolver.liveness().and_then(|h| h.min_relay_rtt_ms())
+    }
+    fn peer_views(&self) -> Vec<([u8; 32], PeerLivenessView)> {
+        self.resolver
+            .liveness()
+            .map(|h| h.views_snapshot())
+            .unwrap_or_default()
     }
 }
 
@@ -1812,10 +1863,8 @@ pub struct NetworkHealthService {
     gateway_bootstrap: Option<std::sync::Arc<GatewayBootstrapTelemetry>>,
     /// ZEB-804: per-peer served-traffic stamps — the SAME `Arc` every iroh
     /// acceptor stamps at its served-a-request site. Installed at boot via
-    /// [`set_peer_traffic_source`](Self::set_peer_traffic_source).
-    /// `#[allow(dead_code)]`: written by Task 2's boot wiring, read by Task 3's
-    /// snapshot merge (which removes this allow).
-    #[allow(dead_code)]
+    /// [`set_peer_traffic_source`](Self::set_peer_traffic_source); read by
+    /// `snapshot`'s traffic merge. `None` (merge inert) until boot wires it.
     peer_traffic: Option<std::sync::Arc<PeerTrafficRegistry>>,
 }
 
@@ -1976,14 +2025,39 @@ impl NetworkHealthService {
         let now = now_ms();
 
         // ZEB-622: one read of the peer-liveness projection, reused for the
-        // per-peer connection-mode/rtt join, the last-seen freshness fold, and
-        // the `MyNetworkSummary.relay_rtt_ms` fallback. Empty when no liveness
-        // source is installed (unit tests, pre-boot) → every use is inert.
-        let liveness_states: std::collections::HashMap<[u8; 32], LivenessStateWire> = self
+        // per-peer connection-mode/rtt join, the last-seen freshness fold, the
+        // `MyNetworkSummary.relay_rtt_ms` fallback, and (ZEB-804) the traffic
+        // merge. Read as VIEWS (state + the state-independent rx-traffic
+        // stamp); the state map derives from `.state` so every existing join
+        // keeps working, and the parallel traffic map feeds the merge below. A
+        // source that predates `peer_views` (trait default: empty) falls back
+        // to `peer_states()` for the state map — full pre-ZEB-804 behavior, it
+        // merely contributes no traffic stamps. Empty when no liveness source
+        // is installed (unit tests, pre-boot) → every use is inert.
+        let liveness_views: Vec<([u8; 32], PeerLivenessView)> = self
             .liveness
             .as_ref()
-            .map(|s| s.peer_states().into_iter().collect())
+            .map(|s| s.peer_views())
             .unwrap_or_default();
+        // ZEB-804: per-peer rx-traffic stamps. The liveness stamp is ≤30s
+        // coarse (sampled on the RTT tick) — it can only lag, never lead, so
+        // the max-merges below can only GAIN freshness from it.
+        let liveness_traffic: std::collections::HashMap<[u8; 32], u64> = liveness_views
+            .iter()
+            .filter_map(|(p, v)| v.last_traffic_ms.map(|t| (*p, t)))
+            .collect();
+        let liveness_states: std::collections::HashMap<[u8; 32], LivenessStateWire> =
+            if liveness_views.is_empty() {
+                self.liveness
+                    .as_ref()
+                    .map(|s| s.peer_states().into_iter().collect())
+                    .unwrap_or_default()
+            } else {
+                liveness_views
+                    .into_iter()
+                    .map(|(p, v)| (p, v.state))
+                    .collect()
+            };
         let liveness_min_relay = self.liveness.as_ref().and_then(|s| s.min_relay_rtt_ms());
 
         // Build MyNetworkSummary with a placeholder reachability so we
@@ -2021,20 +2095,20 @@ impl NetworkHealthService {
         // supervisor last saw the peer connect (`Connected.since_ms`), joined by
         // iroh node id. Applied at the record level so the filter's sort and
         // record-age derivation both see the resolved value; never overrides a
-        // record that already has a `last_seen_ms`.
-        if !peer_states.is_empty() {
-            let connected_since: std::collections::HashMap<[u8; 32], u64> = peer_states
-                .iter()
-                .filter_map(|(node_id, state)| match state {
-                    PeerStateWire::Connected { since_ms } => Some((*node_id, *since_ms)),
-                    _ => None,
-                })
-                .collect();
-            for record in &mut records {
-                if record.last_seen_ms.is_none() {
-                    if let Some(&since_ms) = connected_since.get(&record.iroh_node_id) {
-                        record.last_seen_ms = Some(since_ms);
-                    }
+        // record that already has a `last_seen_ms`. The map is hoisted out of
+        // the fallback because the ZEB-804 merge below reuses it as the
+        // `connected_since_ms` fallback (liveness `Connected.since_ms` first).
+        let connected_since: std::collections::HashMap<[u8; 32], u64> = peer_states
+            .iter()
+            .filter_map(|(node_id, state)| match state {
+                PeerStateWire::Connected { since_ms } => Some((*node_id, *since_ms)),
+                _ => None,
+            })
+            .collect();
+        for record in &mut records {
+            if record.last_seen_ms.is_none() {
+                if let Some(&since_ms) = connected_since.get(&record.iroh_node_id) {
+                    record.last_seen_ms = Some(since_ms);
                 }
             }
         }
@@ -2124,6 +2198,42 @@ impl NetworkHealthService {
                 }
             }
             record.last_seen_ms = best;
+        }
+
+        // ZEB-804: merge the two served-traffic evidence sources onto each
+        // record (joined by iroh node id).
+        //   `connected_since_ms` — the establishment stamp under its honest
+        //   name: liveness `Connected.since_ms` first (the live transport's
+        //   view), else the supervisor's `Connected.since_ms`. The presence
+        //   cache deliberately does NOT feed it — presence is heard-from
+        //   evidence, not connection establishment.
+        //   `last_traffic_ms` — max of the liveness rx stamp and the acceptor
+        //   registry's `last_any_served_ms`; either source alone surfaces.
+        //   `last_relay_pull_served_ms` — registry value verbatim
+        //   (success-only by design).
+        // Finally `last_seen_ms` max-absorbs `last_traffic_ms`: traffic
+        // evidence may only GAIN freshness for the peer, never regress it.
+        for record in &mut records {
+            record.connected_since_ms = match liveness_states.get(&record.iroh_node_id) {
+                Some(LivenessStateWire::Connected { since_ms, .. }) => Some(*since_ms),
+                _ => connected_since.get(&record.iroh_node_id).copied(),
+            };
+            let registry_stamps = self
+                .peer_traffic
+                .as_ref()
+                .and_then(|r| r.stamps(&record.iroh_node_id));
+            record.last_traffic_ms = match (
+                liveness_traffic.get(&record.iroh_node_id).copied(),
+                registry_stamps.map(|s| s.last_any_served_ms),
+            ) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            record.last_relay_pull_served_ms =
+                registry_stamps.and_then(|s| s.last_relay_pull_served_ms);
+            if let Some(traffic) = record.last_traffic_ms {
+                record.last_seen_ms = Some(record.last_seen_ms.map_or(traffic, |b| b.max(traffic)));
+            }
         }
 
         // ZEB-623: join the per-peer protocol-compat registry onto each record
@@ -3147,6 +3257,11 @@ impl ReachabilitySnapshot for ProdReachabilitySnapshot {
                 // ZEB-623: filled by `NetworkHealthService::snapshot`'s compat
                 // join (the resolver has no view of the registry).
                 protocol_incompat_reason: None,
+                // ZEB-804: filled by `NetworkHealthService::snapshot`'s traffic
+                // merge (the resolver has no view of liveness or the registry).
+                last_traffic_ms: None,
+                last_relay_pull_served_ms: None,
+                connected_since_ms: None,
             })
             .collect()
     }
@@ -3394,6 +3509,9 @@ mod tests {
             rtt_ms: None,
             last_seen_ms: last_seen,
             protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
         }
     }
 
@@ -3542,6 +3660,9 @@ mod tests {
             last_seen_ms: None,
             reachability_record_age_ms: None,
             protocol_incompat_reason: Some("tunnel hello v0 < min 1".into()),
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
         };
         let v = serde_json::to_value(&ph).expect("serialize");
         assert_eq!(v["protocolIncompatReason"], "tunnel hello v0 < min 1");
@@ -3587,6 +3708,9 @@ mod tests {
             last_seen_ms: None,
             reachability_record_age_ms: None,
             protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
         }];
         assert_eq!(
             derive_reachability_status(&my, &peers),
@@ -3613,6 +3737,9 @@ mod tests {
             last_seen_ms: None,
             reachability_record_age_ms: None,
             protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
         }];
         assert_eq!(
             derive_reachability_status(&my, &peers),
@@ -3641,6 +3768,9 @@ mod tests {
             last_seen_ms: None,
             reachability_record_age_ms: None,
             protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
         }];
         assert_eq!(
             derive_reachability_status(&my, &peers),
@@ -3667,6 +3797,9 @@ mod tests {
             last_seen_ms: None,
             reachability_record_age_ms: None,
             protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
         }];
         assert_eq!(
             derive_reachability_status(&my, &peers),
@@ -3881,6 +4014,9 @@ mod tests {
                 last_seen_ms: Some(1_700_000_000_000 - 3_000),
                 reachability_record_age_ms: Some(3_000),
                 protocol_incompat_reason: None,
+                last_traffic_ms: None,
+                last_relay_pull_served_ms: None,
+                connected_since_ms: None,
             }],
             pkarr_status: PkarrHealthSummary {
                 identity_published: true,
@@ -5146,6 +5282,216 @@ mod tests {
             Some(9_000),
             "liveness Connected.since_ms is freshest → since_ms wins"
         );
+    }
+
+    // ── ZEB-804 Task 3: traffic-evidence merge into the snapshot ──
+
+    /// `LivenessSnapshot` double scripting full per-peer VIEWS (state +
+    /// rx-traffic stamp). `peer_states` derives from the same views so the two
+    /// projections can never disagree — mirroring the production impl, whose
+    /// `states_snapshot`/`views_snapshot` read the same slots.
+    struct FakeLivenessViews {
+        views: Vec<([u8; 32], PeerLivenessView)>,
+    }
+    impl LivenessSnapshot for FakeLivenessViews {
+        fn peer_states(&self) -> Vec<([u8; 32], LivenessStateWire)> {
+            self.views
+                .iter()
+                .map(|(p, v)| (*p, v.state.clone()))
+                .collect()
+        }
+        fn min_relay_rtt_ms(&self) -> Option<u32> {
+            None
+        }
+        fn peer_views(&self) -> Vec<([u8; 32], PeerLivenessView)> {
+            self.views.clone()
+        }
+    }
+
+    /// Both evidence sources present: `lastTrafficMs` is the MAX of the
+    /// liveness rx stamp and the registry's `last_any_served_ms` (either side
+    /// may be the fresher one — both directions covered via two peers),
+    /// `lastRelayPullServedMs` is the registry value verbatim,
+    /// `connectedSinceMs` carries the liveness `Connected.since_ms`, and
+    /// `lastSeenMs` max-absorbs the merged traffic stamp (gains freshness,
+    /// never regresses).
+    #[tokio::test]
+    async fn snapshot_merges_traffic_evidence_and_absorbs_into_last_seen() {
+        let mut table = std::collections::HashMap::new();
+        table.insert([0x9Au8; 16], vec!["c1".to_string()]);
+        table.insert([0x9Bu8; 16], vec!["c1".to_string()]);
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![
+                    make_record(0x9A, ConnectionMode::NoConnection, Some(1_000)),
+                    make_record(0x9B, ConnectionMode::NoConnection, Some(1_000)),
+                ],
+            }),
+            std::sync::Arc::new(FakeMembership { table }),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_liveness_source(std::sync::Arc::new(FakeLivenessViews {
+            views: vec![
+                (
+                    [0x9Au8; 32],
+                    PeerLivenessView {
+                        state: LivenessStateWire::Connected {
+                            mode: LivenessMode::Direct,
+                            rtt_ms: Some(5),
+                            since_ms: 2_000,
+                        },
+                        last_traffic_ms: Some(4_000),
+                    },
+                ),
+                (
+                    [0x9Bu8; 32],
+                    PeerLivenessView {
+                        state: LivenessStateWire::Connected {
+                            mode: LivenessMode::Direct,
+                            rtt_ms: Some(5),
+                            since_ms: 2_000,
+                        },
+                        last_traffic_ms: Some(8_000),
+                    },
+                ),
+            ],
+        }));
+        let reg = std::sync::Arc::new(PeerTrafficRegistry::default());
+        reg.record_relay_pull_served([0x9Au8; 32], 3_500);
+        reg.record_served([0x9Au8; 32], 6_000); // registry fresher than liveness
+        reg.record_served([0x9Bu8; 32], 6_500); // liveness fresher than registry
+        svc.set_peer_traffic_source(reg);
+        let snap = svc.snapshot().await;
+        let get = |b: u8| {
+            snap.peers
+                .iter()
+                .find(|p| p.owner_addr == hex::encode([b; 16]))
+                .expect("peer present")
+        };
+        let a = get(0x9A);
+        assert_eq!(
+            a.last_traffic_ms,
+            Some(6_000),
+            "registry side fresher → max"
+        );
+        assert_eq!(
+            a.last_relay_pull_served_ms,
+            Some(3_500),
+            "registry pull stamp verbatim"
+        );
+        assert_eq!(
+            a.connected_since_ms,
+            Some(2_000),
+            "liveness Connected.since_ms"
+        );
+        assert!(
+            a.last_seen_ms >= a.last_traffic_ms,
+            "absorption: lastSeenMs may only GAIN freshness from lastTrafficMs"
+        );
+        assert_eq!(a.last_seen_ms, Some(6_000));
+        let b = get(0x9B);
+        assert_eq!(
+            b.last_traffic_ms,
+            Some(8_000),
+            "liveness side fresher → max"
+        );
+        assert_eq!(b.last_relay_pull_served_ms, None, "no pull served → None");
+        assert_eq!(b.last_seen_ms, Some(8_000));
+    }
+
+    /// Registry-only traffic (no liveness source at all) still surfaces
+    /// `lastTrafficMs` and absorbs into `lastSeenMs`; `connectedSinceMs`
+    /// falls back to the supervisor's `Connected.since_ms` when liveness has
+    /// no opinion.
+    #[tokio::test]
+    async fn registry_only_traffic_surfaces_and_supervisor_feeds_connected_since() {
+        use crate::reconnect_supervisor::PeerStateWire;
+        let mut table = std::collections::HashMap::new();
+        table.insert([0xB1u8; 16], vec!["c1".to_string()]);
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![make_record(0xB1, ConnectionMode::NoConnection, Some(1_000))],
+            }),
+            std::sync::Arc::new(FakeMembership { table }),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_supervisor_source(std::sync::Arc::new(FakeSupervisor(vec![(
+            [0xB1u8; 32],
+            PeerStateWire::Connected { since_ms: 4_200 },
+        )])));
+        let reg = std::sync::Arc::new(PeerTrafficRegistry::default());
+        reg.record_served([0xB1u8; 32], 7_500);
+        svc.set_peer_traffic_source(reg);
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        let p = &snap.peers[0];
+        assert_eq!(
+            p.last_traffic_ms,
+            Some(7_500),
+            "registry-only traffic surfaces"
+        );
+        assert_eq!(p.last_relay_pull_served_ms, None);
+        assert_eq!(
+            p.connected_since_ms,
+            Some(4_200),
+            "supervisor Connected.since_ms fallback"
+        );
+        assert_eq!(p.last_seen_ms, Some(7_500), "absorbed traffic stamp");
+    }
+
+    /// Serde pin: the three ZEB-804 fields serialize under their exact
+    /// camelCase keys, stay PRESENT (null) when `None` (additive-with-default,
+    /// never skip_serializing_if), and leak no snake_case spelling.
+    #[test]
+    fn peer_health_traffic_fields_serialize_camel_case() {
+        let ph = PeerHealth {
+            owner_addr: "abcd".into(),
+            display_name: None,
+            shared_communities: vec![],
+            connection_mode: ConnectionMode::NoConnection,
+            rtt_ms: None,
+            last_seen_ms: Some(9_000),
+            reachability_record_age_ms: None,
+            protocol_incompat_reason: None,
+            last_traffic_ms: Some(9_000),
+            last_relay_pull_served_ms: Some(8_000),
+            connected_since_ms: Some(7_000),
+        };
+        let v = serde_json::to_value(&ph).expect("serialize");
+        assert_eq!(v["lastTrafficMs"], 9_000);
+        assert_eq!(v["lastRelayPullServedMs"], 8_000);
+        assert_eq!(v["connectedSinceMs"], 7_000);
+        // A `None` keeps the key present as an explicit null (additive wire
+        // contract — same idiom as `protocolIncompatReason` above).
+        let none = PeerHealth {
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
+            ..ph
+        };
+        let v2 = serde_json::to_value(&none).expect("serialize");
+        for k in ["lastTrafficMs", "lastRelayPullServedMs", "connectedSinceMs"] {
+            assert!(
+                v2.get(k).is_some(),
+                "key {k} must be present even when None"
+            );
+            assert!(v2[k].is_null(), "key {k} must be null when None");
+        }
+        // No snake_case leakage past the camelCase rename.
+        for k in [
+            "last_traffic_ms",
+            "last_relay_pull_served_ms",
+            "connected_since_ms",
+        ] {
+            assert!(v.get(k).is_none(), "snake key {k} must not leak");
+            assert!(v2.get(k).is_none(), "snake key {k} must not leak");
+        }
     }
 
     /// (e) Serde pin: the new `ConnectionMode::Degraded` variant serializes to
