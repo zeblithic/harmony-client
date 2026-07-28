@@ -129,8 +129,11 @@ pub async fn resolve_rendezvous(
 }
 
 /// ZEB-824: a resolved beacon with the outer record's identity preserved, so a
-/// member-side caller can derive the beacon's `OwnerAddr` and gate on
-/// membership. The plain [`resolve_rendezvous`] decode discards the outer
+/// member-side caller can derive the beacon's `OwnerAddr` — the composite
+/// device-address hash it uses as the **seed key** for the dial view. It is not
+/// an admission input: admission is epoch-envelope trust (spec §5c), so there is
+/// no membership gate on the far side of this type. The plain
+/// [`resolve_rendezvous`] decode discards the outer
 /// [`harmony_pkarr::PkarrRoutingRecord`]; open-join keeps using it (a joiner
 /// defers identity trust to admission — module doc above).
 #[derive(Debug, Clone)]
