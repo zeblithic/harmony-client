@@ -76,6 +76,34 @@ pub trait ContentStore: Send + Sync {
         self.get(cid).await
     }
 
+    /// Like `get`, but with a caller-declared network budget instead of the
+    /// store's default. Callers fetching a known-large payload class — the
+    /// community / fleet / mint state-root blobs — MUST use this: the default
+    /// budget is tuned for small, latency-sensitive reads, and a state root has
+    /// not fit inside it since communities grew past a few hundred members
+    /// (ZEB-805).
+    ///
+    /// Deliberately per-call rather than a raised global: `lib.rs` builds ONE
+    /// `RuntimeContentStore` and clones the `Arc` to ~10 consumers, so raising
+    /// `DEFAULT_FETCH_TIMEOUT_MS` would silently re-tune every latency-sensitive
+    /// path that was never part of the incident.
+    ///
+    /// INVARIANT: `budget` must stay below `fetch_via_zenoh`'s own internal
+    /// deadline (`event_loop.rs`), which is the hard backstop — a larger budget
+    /// silently becomes that deadline instead. Enforced at compile time by the
+    /// `const _: () = assert!(...)` pair beside `STATE_ROOT_FETCH_TIMEOUT_MS`.
+    ///
+    /// The default body ignores the budget and delegates, which is correct for
+    /// stores whose `get` is already local-only (e.g. `InMemoryStub`).
+    async fn get_with_budget(
+        &self,
+        cid: &ContentId,
+        budget: std::time::Duration,
+    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        let _ = budget;
+        self.get(cid).await
+    }
+
     /// Like `put`, but also marks `cid` serveable to peers over CAS even though
     /// it carries the `encrypted` flag (ZEB-395 community-root sharing). The
     /// default impl is identical to `put`; only `RuntimeContentStore` registers
@@ -158,6 +186,12 @@ pub enum CasOp {
     /// admit via a second `CasOp::PutLocal` hop before replying
     /// `Ok(Some(bytes))`. On timeout: `Ok(None)`. On hard transport
     /// error (zenoh::open failure, malformed key_expr): `Err(...)`.
+    ///
+    /// `timeout` is the CALLER's budget and is the binding deadline —
+    /// `fetch_via_zenoh` has its own, larger internal backstop, so a caller
+    /// budget above that one silently becomes it. ZEB-805: `Ok(None)` means
+    /// "not fetchable in the time you allowed", NOT "does not exist"; callers
+    /// must treat it as retryable rather than terminal.
     GetOrFetch {
         cid: ContentId,
         timeout: std::time::Duration,
@@ -187,11 +221,107 @@ pub enum CasOp {
     },
 }
 
-/// Default fetch budget for `RuntimeContentStore::get`. Wraps the
-/// Zenoh GET in `tokio::time::timeout`; on miss the subscriber drops
-/// the publish and CRDT eventual consistency carries recovery via
-/// the next state-root from any peer.
+/// Default fetch budget for `RuntimeContentStore::get`. Wraps the Zenoh GET in
+/// `tokio::time::timeout`; on miss the caller sees `Ok(None)`.
+///
+/// Tuned for SMALL, latency-sensitive reads and nothing else. State-root blobs
+/// must use [`STATE_ROOT_FETCH_TIMEOUT_MS`] via `get_with_budget` instead.
+///
+/// ZEB-805 removed a claim that used to live here — that a miss was harmless
+/// because "CRDT eventual consistency carries recovery via the next state-root
+/// from any peer". It does not. Attempts are independent; what is not
+/// independent is their difficulty. State only grows, so the "recovery" blob is
+/// LARGER than the one that just failed and is fetched under the SAME budget:
+/// the named recovery path is anti-correlated with the failure it is supposed
+/// to repair. Do not reintroduce that reasoning to justify dropping on a miss.
 pub const DEFAULT_FETCH_TIMEOUT_MS: u64 = 500;
+
+/// Fetch budget for state-root blobs (community / fleet / mint). These are a
+/// different payload class from the 500 ms default: ~100 KB and growing with
+/// membership, and frequently fetched cross-WAN.
+///
+/// ZEB-805: the default was set in 2026-05 for small local reads and never
+/// revisited while the community-state root grew past 100 KB and the fleet went
+/// cross-WAN. A state root has not fit inside 500 ms since; the four blobs
+/// dropped in the incident were 101084 B, 101682 B, and 109151 B twice.
+///
+/// 5 s sits ~3x above a pessimistic real fetch (100 KB at 500 kbps ≈ 1.6 s plus
+/// query round-trips at the fleet's worst measured 121 ms RTT), and well below
+/// both `fetch_via_zenoh`'s 30 s backstop and the 450 s relay-pull cadence — so
+/// a retry chain cannot overlap the next pull pass.
+pub const STATE_ROOT_FETCH_TIMEOUT_MS: u64 = 5_000;
+
+/// `fetch_via_zenoh` (`event_loop.rs`) wraps its reply loop in its own 30 s
+/// deadline, which is the hard backstop under every caller budget.
+const ZENOH_FETCH_BACKSTOP_MS: u64 = 30_000;
+
+// ZEB-805 budget invariants, enforced at COMPILE time rather than by a test —
+// these relate two constants, so there is no runtime state that could make them
+// true or false, and a build is a stronger gate than a test someone can skip.
+//
+// The first is the one that bit us: a caller budget at or above the backstop
+// silently BECOMES the backstop, so the caller's number stops meaning anything.
+// That is precisely the 60x nested-timeout confusion this ticket found — a
+// 500 ms outer under a 30 s inner, where the inner was unreachable dead code.
+const _: () = assert!(
+    STATE_ROOT_FETCH_TIMEOUT_MS < ZENOH_FETCH_BACKSTOP_MS,
+    "state-root budget must stay strictly under the fetch_via_zenoh backstop, \
+     or the caller's budget silently becomes that backstop"
+);
+const _: () = assert!(
+    STATE_ROOT_FETCH_TIMEOUT_MS > DEFAULT_FETCH_TIMEOUT_MS,
+    "the state-root budget exists because the default is too small for this \
+     payload class; collapsing them re-creates ZEB-805"
+);
+
+/// ZEB-805 (r1): bounded fetch-retry budget for a state-root publish whose CAS
+/// fetch missed. Lives here, beside the budget it retries under, because the
+/// two are one policy: how this codebase fetches a state-root blob.
+///
+/// All three sync engines — `community_state_sync`, `fleet_sync`, `mint_sync` —
+/// read these. They were three copies of the same literals until a reviewer
+/// pointed out the obvious: cross-engine consistency was the stated deliverable
+/// of ZEB-805, and three private copies enforce it by good intentions rather
+/// than by construction. Tuning one engine in isolation is exactly the drift
+/// this prevents; if an engine ever genuinely needs a different budget, give it
+/// a distinct named constant here rather than editing this one.
+///
+/// Values are ZEB-705's, which survived review plus adversarial flood analysis.
+pub mod fetch_retry {
+    /// Attempts after the initial fetch, per inbound publish.
+    ///
+    /// The miss is usually transient: a fresh zenoh link delivers the root put
+    /// before the publisher's content-queryable declaration has propagated back
+    /// (~1 s). Without a retry the publish is dropped permanently — fatal for a
+    /// paired butler whose primary (the only blob holder) departs seconds later.
+    ///
+    /// Retries re-inject the ORIGINAL wire frame through the FULL inbound
+    /// pipeline, so the replay check naturally kills a retry that a newer root
+    /// has since superseded. That re-injection is admissible only because every
+    /// engine's replay check is read-only until a successful apply — community
+    /// via ZEB-750's `CommitTicket`, mint via its step-3/step-6 split. Breaking
+    /// that invariant would silently turn every retry into a rejected duplicate.
+    pub const ATTEMPTS: u8 = 3;
+
+    /// Delay between retries. Comfortably above declaration-propagation latency
+    /// on a fresh link, and small enough that the whole chain
+    /// (3 x (5 s budget + 2 s delay) ~= 21 s worst case) lands far inside the
+    /// 450 s relay-pull cadence, so retries can never overlap the next pass.
+    pub const DELAY_MS: u64 = 2000;
+
+    /// Max retry sleepers in flight per engine, and the re-injection channel's
+    /// capacity. Each pending retry is a detached task retaining its wire frame
+    /// for [`DELAY_MS`]; a burst of misses — or a hostile publish flood — must
+    /// not pile those up unbounded. A permit is acquired BEFORE the sleeper is
+    /// spawned and held for its whole lifetime, so concurrent retries (and thus
+    /// retained wire buffers) are hard-capped.
+    ///
+    /// Excess misses are dropped and COUNTED — at both drop sites, permit
+    /// exhaustion and a full re-injection channel. An uncounted drop on the
+    /// surface built to diagnose stalls is the ZEB-805 failure mode in
+    /// miniature.
+    pub const MAX_INFLIGHT: usize = 8;
+}
 
 /// Production `ContentStore` impl that delegates to the harmony-runtime
 /// event loop via `cas_op_tx`. Used at SyncEngine construction in
@@ -252,6 +382,28 @@ impl ContentStore for RuntimeContentStore {
             .send(CasOp::GetOrFetch {
                 cid: *cid,
                 timeout: self.fetch_timeout,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ContentStoreError::Io("event loop unavailable (send)".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ContentStoreError::Io("event loop unavailable (reply)".into()))?
+    }
+
+    async fn get_with_budget(
+        &self,
+        cid: &ContentId,
+        budget: std::time::Duration,
+    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        // Identical to `get` except the timeout source: the caller's budget
+        // rather than `self.fetch_timeout`. See the trait doc for why this is
+        // per-call and not a raised global (ZEB-805).
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cas_op_tx
+            .send(CasOp::GetOrFetch {
+                cid: *cid,
+                timeout: budget,
                 reply: reply_tx,
             })
             .await
@@ -384,6 +536,67 @@ mod tests {
         let got = store.get_local(&want_cid).await.expect("get_local ok");
         assert_eq!(got, Some(want_blob), "get_local returns the GetLocal reply");
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_with_budget_passes_the_caller_budget_not_the_store_default() {
+        // ZEB-805: the whole point of the per-call budget is that the op carries
+        // what the CALLER asked for. If this ever regresses to `self.fetch_timeout`
+        // the state-root fetches silently return to the 500 ms budget that caused
+        // the incident, and nothing else would notice.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<CasOp>(4);
+        let store = RuntimeContentStore::new(
+            tx,
+            std::time::Duration::from_millis(DEFAULT_FETCH_TIMEOUT_MS),
+        );
+        let want_cid = cid(0x11);
+        let budget = std::time::Duration::from_millis(STATE_ROOT_FETCH_TIMEOUT_MS);
+
+        let task = tokio::spawn(async move {
+            match rx.recv().await.expect("a CasOp was sent") {
+                CasOp::GetOrFetch {
+                    cid,
+                    timeout,
+                    reply,
+                } => {
+                    assert_eq!(cid, want_cid, "must request the asked CID");
+                    assert_eq!(
+                        timeout, budget,
+                        "op must carry the caller's budget, not the store default"
+                    );
+                    assert_ne!(
+                        timeout,
+                        std::time::Duration::from_millis(DEFAULT_FETCH_TIMEOUT_MS),
+                        "guard: the budget under test must differ from the default, \
+                         or this test proves nothing"
+                    );
+                    reply.send(Ok(None)).expect("reply receiver alive");
+                }
+                other => panic!("get_with_budget must send CasOp::GetOrFetch, got {other:?}"),
+            }
+        });
+
+        let got = store
+            .get_with_budget(&want_cid, budget)
+            .await
+            .expect("get_with_budget ok");
+        assert_eq!(got, None, "plumbs the op reply through unchanged");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_with_budget_default_body_delegates_to_get() {
+        // The trait's default body ignores the budget — correct for stores whose
+        // `get` is already local-only. Pins that `InMemoryStub` (and every other
+        // stub) keeps working without an override.
+        let store = InMemoryStub::default();
+        store.put(cid(2), vec![7, 8, 9]).await.unwrap();
+        let blob = store
+            .get_with_budget(&cid(2), std::time::Duration::from_millis(1))
+            .await
+            .unwrap()
+            .expect("blob present");
+        assert_eq!(blob, vec![7, 8, 9], "default body delegates to `get`");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

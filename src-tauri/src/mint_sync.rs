@@ -6,7 +6,7 @@ use crate::owner_state_crypto::FleetKeySet;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex as TokioMutex, Notify};
+use tokio::sync::{mpsc, Mutex as TokioMutex, Notify, Semaphore};
 
 /// Read the full ledger state into a [`MintSnapshot`].
 ///
@@ -583,11 +583,22 @@ impl EngineShared {
         &self,
         root_cid: crate::owner_state_types::ContentId,
     ) -> Result<(), MintSyncError> {
+        // ZEB-805: same state-root payload class as the zenoh path below, so it
+        // takes the same budget rather than the 500 ms small-read default.
         let blob = self
             .content_store
-            .get(&root_cid)
+            .get_with_budget(
+                &root_cid,
+                std::time::Duration::from_millis(crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS),
+            )
             .await
-            .map_err(|e| MintSyncError::Other(format!("content_store.get: {e}")))?
+            // ZEB-805 r2: classified like the zenoh path so the two agree on
+            // what a transient fetch failure is, even though this caller does
+            // not retry.
+            .map_err(|e| MintSyncError::BlobFetchFailed {
+                cid: root_cid,
+                detail: e.to_string(),
+            })?
             .ok_or(MintSyncError::MissingBlob(root_cid))?;
         // Task 9 test path: cleartext blob (matching Task 8's stubbed publish).
         // Real Zenoh path decrypts before calling handle_incoming_decoded.
@@ -715,6 +726,98 @@ async fn publish_root_now(
     Ok(())
 }
 
+/// ZEB-805 (r1): run one inbound mint frame through the pipeline and, on a
+/// transient CAS miss, schedule a bounded retry instead of dropping it.
+///
+/// Shared by the subscriber arm (fresh frames, full budget) and the fetch-retry
+/// arm (re-injected frames, decremented budget), mirroring the same split in
+/// `community_state_sync` and `fleet_sync`. Before this, mint was the last of
+/// the three engines to treat a transient miss as terminal — the review round
+/// on ZEB-805 caught that the PR claimed cross-engine consistency as its
+/// deliverable while leaving one engine inconsistent.
+///
+/// Re-injection is admissible for the same reason it is in the other two:
+/// `handle_incoming_publish_zenoh`'s step-3 replay check is READ-ONLY and the
+/// tracker only advances after a successful apply (step 6, CRITICAL 3), so the
+/// same frame is still acceptable on a later pass. If that ever changes, every
+/// retry here silently becomes a rejected duplicate.
+///
+/// Unlike the other two engines this keeps no counters: mint has no
+/// `network_health` consumer to read them. Both drop sites log at WARN.
+#[allow(clippy::too_many_arguments)]
+async fn process_inbound_zenoh(
+    wire: Vec<u8>,
+    shared: &EngineShared,
+    keys: &FleetKeySet,
+    device_id: &str,
+    sync_state_path: &std::path::Path,
+    attempts_left: u8,
+    retry_tx: &mpsc::Sender<(Vec<u8>, u8)>,
+    retry_sem: &Arc<Semaphore>,
+) {
+    let err = match handle_incoming_publish_zenoh(&wire, shared, keys, device_id, sync_state_path)
+        .await
+    {
+        Ok(()) => return,
+        Err(e) => e,
+    };
+
+    // ZEB-805 r2: the transient class is defined ON the error type, not
+    // re-derived here. Matching a variant list at the call site is what let the
+    // r1 retry silently exclude transport errors.
+    let Some(cid) = err.transient_fetch_cid() else {
+        // Deterministic failure (crypto, decode, apply): the same bytes would
+        // fail the same way, so a retry buys nothing.
+        tracing::warn!(target: "mint_sync", "incoming publish dropped: {err}");
+        return;
+    };
+
+    if attempts_left == 0 {
+        tracing::warn!(
+            target: "mint_sync",
+            root_cid = ?cid,
+            blob_bytes = cid.payload_size(),
+            budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+            attempts = crate::content_store::fetch_retry::ATTEMPTS,
+            "mint state-root fetch retry budget exhausted — publish dropped"
+        );
+        return;
+    }
+
+    // Permit BEFORE spawn, so what is capped is the number of retained wire
+    // buffers, not merely channel depth.
+    let Ok(permit) = Arc::clone(retry_sem).try_acquire_owned() else {
+        tracing::warn!(
+            target: "mint_sync",
+            root_cid = ?cid,
+            "mint fetch-retry in-flight cap saturated — retry dropped"
+        );
+        return;
+    };
+    tracing::info!(
+        target: "mint_sync",
+        root_cid = ?cid,
+        attempts_left,
+        delay_ms = crate::content_store::fetch_retry::DELAY_MS,
+        "mint state-root blob fetch failed — retry scheduled"
+    );
+    let tx = retry_tx.clone();
+    tokio::spawn(async move {
+        // Held for the sleeper's whole lifetime; released on task end.
+        let _permit = permit;
+        tokio::time::sleep(std::time::Duration::from_millis(
+            crate::content_store::fetch_retry::DELAY_MS,
+        ))
+        .await;
+        if tx.try_send((wire, attempts_left - 1)).is_err() {
+            tracing::warn!(
+                target: "mint_sync",
+                "mint fetch-retry re-injection channel unavailable — retry dropped"
+            );
+        }
+    });
+}
+
 // ── Real Zenoh engine internals ──────────────────────────────────────────────
 
 /// Internal task for the production Zenoh-backed engine. Mirrors
@@ -752,6 +855,14 @@ async fn internal_task_zenoh(
     // Mirrors owner_state_sync::internal_task's pinning idiom exactly.
     let notified = dirty.notified();
     tokio::pin!(notified);
+
+    // ZEB-805 (r1): bounded fetch-retry plumbing. Capacity == the in-flight cap
+    // so a full permit set can never overflow the channel.
+    let (fetch_retry_tx, mut fetch_retry_rx) =
+        mpsc::channel::<(Vec<u8>, u8)>(crate::content_store::fetch_retry::MAX_INFLIGHT);
+    let fetch_retry_sem = Arc::new(Semaphore::new(
+        crate::content_store::fetch_retry::MAX_INFLIGHT,
+    ));
 
     loop {
         let next_wake = scheduled
@@ -804,17 +915,34 @@ async fn internal_task_zenoh(
                     inbound_closed = true;
                     continue;
                 };
-                if let Err(e) = handle_incoming_publish_zenoh(
-                    &bytes,
+                // ZEB-805: a fresh inbound frame carries the full retry budget.
+                process_inbound_zenoh(
+                    bytes,
                     &shared,
                     &keys,
                     &device_id,
                     &sync_state_path,
+                    crate::content_store::fetch_retry::ATTEMPTS,
+                    &fetch_retry_tx,
+                    &fetch_retry_sem,
                 )
-                .await
-                {
-                    tracing::warn!(target: "mint_sync", "incoming publish dropped: {e}");
-                }
+                .await;
+            }
+            // ZEB-805: a fetch-retry sleeper handing its frame back after the
+            // delay. Re-enters the FULL inbound pipeline, so the read-only
+            // replay check kills a retry a newer root has already superseded.
+            Some((wire, attempts_left)) = fetch_retry_rx.recv() => {
+                process_inbound_zenoh(
+                    wire,
+                    &shared,
+                    &keys,
+                    &device_id,
+                    &sync_state_path,
+                    attempts_left,
+                    &fetch_retry_tx,
+                    &fetch_retry_sem,
+                )
+                .await;
             }
             _ = shutdown_rx.recv() => {
                 // Final flush on shutdown if there's pending dirty state.
@@ -1027,22 +1155,56 @@ async fn handle_incoming_publish_zenoh(
     }
 
     // 4. Fetch the encrypted blob from CAS using root_cid.
-    let blob_ciphertext = match content_store.get(&payload.root_cid).await {
+    let blob_ciphertext = match content_store
+        .get_with_budget(
+            &payload.root_cid,
+            std::time::Duration::from_millis(crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS),
+        )
+        .await
+    {
         Ok(Some(b)) => b,
         Ok(None) => {
-            // Blob missing — peer's CAS hasn't replicated yet, or fetch timed
-            // out. Drop this publish; CRDT eventual consistency recovers on
-            // next peer publish. Mirrors owner_state_sync's ErrPostMutation
-            // handling for missing blobs.
+            // Blob missing — peer's CAS hasn't replicated yet, or the fetch
+            // timed out.
+            //
+            // ZEB-805: this arm used to `return Ok(())`, which made a swallowed
+            // fetch failure indistinguishable from success at the call site —
+            // the worst of the three sync engines' handling of one condition.
+            // It now returns the same `MissingBlob` the sibling fetch site in
+            // this file (`handle_incoming_publish`) already returns, so the two
+            // paths agree. The engine loop logs it as "incoming publish
+            // dropped" and continues; nothing becomes fatal.
+            //
+            // `budget_ms` is logged beside the cid (whose Debug carries the
+            // payload size) so an oversized blob under an undersized budget is
+            // legible on sight.
             tracing::warn!(
                 target: "mint_sync",
                 root_cid = ?payload.root_cid,
+                budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
                 "missing mint blob (fetch timeout or not yet replicated)"
             );
-            return Ok(());
+            return Err(MintSyncError::MissingBlob(payload.root_cid));
         }
         Err(e) => {
-            return Err(MintSyncError::Other(format!("content_store.get: {e}")));
+            // ZEB-805 r2: a transport/event-loop failure is the SAME transient
+            // class as a miss and must retry identically. r1 keyed the new
+            // retry on `MissingBlob` alone, so this arm — reported as the
+            // catch-all `Other` — was treated as deterministic and dropped the
+            // publish. That is precisely the asymmetry r1 had just removed from
+            // `community_state_sync`, reintroduced here in the same commit.
+            tracing::warn!(
+                target: "mint_sync",
+                root_cid = ?payload.root_cid,
+                blob_bytes = payload.root_cid.payload_size(),
+                budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+                error = %e,
+                "mint state-root blob fetch error — will retry if budget remains"
+            );
+            return Err(MintSyncError::BlobFetchFailed {
+                cid: payload.root_cid,
+                detail: e.to_string(),
+            });
         }
     };
 
@@ -1529,6 +1691,277 @@ mod tests {
             })
             .unwrap();
         assert_eq!(name, "Chase Re-created");
+    }
+
+    /// ZEB-805: a CAS miss must be OBSERVABLE to the caller.
+    ///
+    /// Honest scope note: this drives `handle_incoming_envelope_for_test`, which
+    /// already returned `MissingBlob` before this ticket — so it characterises
+    /// the contract rather than pinning the change. The change was on the zenoh
+    /// path (`handle_incoming_publish_zenoh`), which used to `return Ok(())` and
+    /// so made a swallowed fetch failure indistinguishable from success. Both
+    /// paths now return this same variant; the zenoh one is covered by
+    /// inspection plus the shared error type rather than by its own harness,
+    /// because standing up a valid encrypted wire envelope for a three-line
+    /// return-value change would be disproportionate.
+    ///
+    /// What this test does buy: if anyone ever "simplifies" either path back to
+    /// swallowing the miss, the contract they would be breaking is written down
+    /// and enforced here.
+    #[tokio::test]
+    async fn cas_miss_is_observable_to_the_caller() {
+        let conn = Arc::new(std::sync::Mutex::new(fresh_db()));
+        let cs: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let sync_state = Arc::new(TokioMutex::new(MintSyncState::default()));
+        let (engine, handle) = MintSyncEngine::new_for_test(conn, cs, sync_state).await;
+
+        // A cid nothing ever put: the store misses.
+        let absent = crate::owner_state_types::ContentId::from_bytes([0xEE; 32]);
+        let err = engine
+            .handle_incoming_envelope_for_test(absent)
+            .await
+            .expect_err("a CAS miss must NOT report success");
+        assert!(
+            matches!(err, MintSyncError::MissingBlob(c) if c == absent),
+            "a miss must surface as MissingBlob naming the cid, got {err:?}"
+        );
+
+        engine.shutdown().await.unwrap();
+        handle.await.unwrap();
+    }
+
+    /// ZEB-805 r1: build a valid encrypted mint root-publish envelope whose
+    /// blob is NOT in the store — the incident condition, on the zenoh path.
+    fn absent_blob_wire(keys: &FleetKeySet) -> (Vec<u8>, crate::owner_state_types::ContentId) {
+        let absent = crate::owner_state_types::ContentId::from_bytes([0xEE; 32]);
+        let payload = crate::mint_sync_types::MintRootPublishPayload {
+            root_cid: absent,
+            at: crate::owner_state_types::Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                // NOT the receiving device, or echo-suppression eats it at step 2.
+                device_id: "remote-dev".into(),
+            },
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).expect("payload encode");
+        let wire = crate::owner_state_crypto::encrypt_root_publish(&keys.newest(), &payload_bytes)
+            .expect("encrypt");
+        (wire, absent)
+    }
+
+    /// ZEB-805 r2: every fetch fails with a transport ERROR rather than a miss.
+    struct ErroringStore;
+    #[async_trait::async_trait]
+    impl crate::content_store::ContentStore for ErroringStore {
+        async fn put(
+            &self,
+            _cid: crate::owner_state_types::ContentId,
+            _blob: Vec<u8>,
+        ) -> Result<(), crate::content_store::ContentStoreError> {
+            Ok(())
+        }
+        async fn get(
+            &self,
+            cid: &crate::owner_state_types::ContentId,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            self.get_with_budget(cid, std::time::Duration::from_millis(0))
+                .await
+        }
+        async fn get_with_budget(
+            &self,
+            _cid: &crate::owner_state_types::ContentId,
+            _budget: std::time::Duration,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            Err(crate::content_store::ContentStoreError::Io(
+                "injected zenoh transport failure".into(),
+            ))
+        }
+    }
+
+    fn retry_test_shared() -> (EngineShared, FleetKeySet) {
+        retry_test_shared_with(Arc::new(crate::content_store::InMemoryStub::default()))
+    }
+
+    fn retry_test_shared_with(
+        content_store: Arc<dyn crate::content_store::ContentStore>,
+    ) -> (EngineShared, FleetKeySet) {
+        let keys = FleetKeySet::new(Arc::new(
+            crate::owner_state_crypto::KeyTree::derive_at_epoch(&[7u8; 32], 0).expect("derive"),
+        ));
+        let shared = EngineShared {
+            mint_db: Arc::new(std::sync::Mutex::new(fresh_db())),
+            content_store,
+            sync_state: Arc::new(TokioMutex::new(MintSyncState::default())),
+            sync_state_path: None,
+            app_handle: None,
+        };
+        (shared, keys)
+    }
+
+    /// ZEB-805 r1: a transient CAS miss on the zenoh path must schedule a
+    /// bounded retry, not drop the publish.
+    ///
+    /// Before r1 this engine was the last of the three to treat a miss as
+    /// terminal — `community_state_sync` and `fleet_sync` both retried, while
+    /// mint logged and discarded the frame. The PR that fixed the other two
+    /// claimed cross-engine consistency as its deliverable, so leaving one
+    /// engine inconsistent was the gap a reviewer caught.
+    ///
+    /// The re-injected frame must be byte-identical (it re-enters the FULL
+    /// pipeline, replay check included) and must carry a DECREMENTED budget —
+    /// an off-by-one here is the difference between bounded and unbounded.
+    ///
+    /// `start_paused`: the 2 s delay costs no wall-clock.
+    ///
+    /// The re-injection is awaited by dropping this test's own sender and then
+    /// `recv()`-ing bare, rather than wrapping a `timeout` around it. The
+    /// spawned sleeper holds the only other sender, so the two outcomes are
+    /// distinguished without an arbitrary duration constant: `Some` means a
+    /// retry was scheduled and delivered, `None` means none was scheduled — the
+    /// regression this guards — and it reports immediately instead of after a
+    /// timeout that only ever fires on the failing path.
+    #[tokio::test(start_paused = true)]
+    async fn mint_zenoh_fetch_miss_schedules_a_bounded_retry() {
+        let (shared, keys) = retry_test_shared();
+        let (wire, _absent) = absent_blob_wire(&keys);
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u8)>(8);
+        let sem = Arc::new(Semaphore::new(8));
+
+        process_inbound_zenoh(
+            wire.clone(),
+            &shared,
+            &keys,
+            "local-dev",
+            std::path::Path::new("/nonexistent"),
+            crate::content_store::fetch_retry::ATTEMPTS,
+            &tx,
+            &sem,
+        )
+        .await;
+
+        drop(tx);
+        let (got_wire, got_attempts) = rx
+            .recv()
+            .await
+            .expect("a miss must schedule a retry, not drop the publish");
+        assert_eq!(got_wire, wire, "the ORIGINAL frame is re-injected verbatim");
+        assert_eq!(
+            got_attempts,
+            crate::content_store::fetch_retry::ATTEMPTS - 1,
+            "the retry must carry a decremented budget"
+        );
+    }
+
+    /// The budget is bounded: at zero remaining attempts the miss is terminal
+    /// and nothing is re-injected. Without this, the arm above would be an
+    /// unbounded retry loop under a publish flood.
+    #[tokio::test(start_paused = true)]
+    async fn mint_zenoh_fetch_miss_at_zero_budget_is_terminal() {
+        let (shared, keys) = retry_test_shared();
+        let (wire, _absent) = absent_blob_wire(&keys);
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u8)>(8);
+        let sem = Arc::new(Semaphore::new(8));
+
+        process_inbound_zenoh(
+            wire,
+            &shared,
+            &keys,
+            "local-dev",
+            std::path::Path::new("/nonexistent"),
+            0,
+            &tx,
+            &sem,
+        )
+        .await;
+        drop(tx);
+
+        assert!(
+            rx.recv().await.is_none(),
+            "an exhausted budget must NOT re-inject"
+        );
+    }
+
+    /// ZEB-805 r2: a transport ERROR on the fetch must retry exactly like a
+    /// miss. Found by review after r1 shipped.
+    ///
+    /// r1 fixed this same asymmetry in `community_state_sync` — where a
+    /// content-store error terminated while a miss retried — and introduced it
+    /// here in the same commit, by keying mint's new retry on `MissingBlob`
+    /// alone. A zenoh/event-loop failure surfaced as the catch-all `Other`,
+    /// which the retry treated as deterministic, so the publish was dropped and
+    /// the ledger stayed stale until someone published another root.
+    ///
+    /// The predicate now lives on `MintSyncError`, so this test also guards the
+    /// classification rather than one call site's match.
+    ///
+    /// See `mint_zenoh_fetch_miss_schedules_a_bounded_retry` for why the
+    /// re-injection is awaited without a `timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn mint_zenoh_fetch_transport_error_retries_like_a_miss() {
+        let (shared, keys) = retry_test_shared_with(Arc::new(ErroringStore));
+        let (wire, _absent) = absent_blob_wire(&keys);
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u8)>(8);
+        let sem = Arc::new(Semaphore::new(8));
+
+        process_inbound_zenoh(
+            wire.clone(),
+            &shared,
+            &keys,
+            "local-dev",
+            std::path::Path::new("/nonexistent"),
+            crate::content_store::fetch_retry::ATTEMPTS,
+            &tx,
+            &sem,
+        )
+        .await;
+
+        drop(tx);
+        let (got_wire, got_attempts) = rx
+            .recv()
+            .await
+            .expect("a transport error must schedule a retry, not drop the publish");
+        assert_eq!(got_wire, wire, "the ORIGINAL frame is re-injected verbatim");
+        assert_eq!(
+            got_attempts,
+            crate::content_store::fetch_retry::ATTEMPTS - 1,
+            "the retry must carry a decremented budget"
+        );
+    }
+
+    /// The classification predicate itself: transient variants yield their cid,
+    /// deterministic ones yield `None`. Pins the contract the retry depends on.
+    #[test]
+    fn transient_fetch_cid_separates_retryable_from_deterministic() {
+        let cid = crate::owner_state_types::ContentId::from_bytes([0x11; 32]);
+        assert_eq!(
+            MintSyncError::MissingBlob(cid).transient_fetch_cid(),
+            Some(cid)
+        );
+        assert_eq!(
+            MintSyncError::BlobFetchFailed {
+                cid,
+                detail: "transport".into()
+            }
+            .transient_fetch_cid(),
+            Some(cid)
+        );
+        for deterministic in [
+            MintSyncError::Crypto("bad key".into()),
+            MintSyncError::Cbor("bad decode".into()),
+            MintSyncError::SchemaTooNew {
+                remote: 9,
+                local_max: 1,
+            },
+            MintSyncError::Other("misc".into()),
+        ] {
+            assert_eq!(
+                deterministic.transient_fetch_cid(),
+                None,
+                "{deterministic:?} must NOT retry — the same bytes fail the same way"
+            );
+        }
     }
 
     #[tokio::test]

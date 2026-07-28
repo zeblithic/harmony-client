@@ -12774,6 +12774,16 @@ pub async fn start_node_inner(
                             nh.set_peer_traffic_source(std::sync::Arc::clone(
                                 &peer_traffic_registry,
                             ));
+                            // ZEB-805: per-community sync-advance counters. Wired
+                            // only when the community registry exists; absent
+                            // renders as an empty `communitySync` array, i.e. "no
+                            // engines", which is honest rather than a fault.
+                            if let Some(reg) = community_registry_arc.as_ref() {
+                                nh.set_community_sync_source(std::sync::Arc::clone(reg)
+                                    as std::sync::Arc<
+                                        dyn crate::network_health::CommunitySyncSource,
+                                    >);
+                            }
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks
