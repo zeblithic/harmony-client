@@ -75,6 +75,44 @@ impl BeaconResolver for ProdBeaconResolver {
     }
 }
 
+/// Production [`GatewayDialCtx`] over the community sync registry.
+pub struct ProdGatewayDialCtx {
+    pub registry: Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    pub self_owner: OwnerAddr,
+}
+
+#[async_trait::async_trait]
+impl GatewayDialCtx for ProdGatewayDialCtx {
+    async fn members_of(&self, community: &SpaceId) -> Vec<OwnerAddr> {
+        let Some(engine) = self.registry.engine_arc(community).await else {
+            return Vec::new();
+        };
+        let state_arc = engine.state();
+        let st = state_arc.lock().await;
+        let mat = st.materialized(engine.admin_addr());
+        mat.members
+            .iter()
+            .filter(|(addr, m)| {
+                // Self MUST be excluded: a self-inclusive member set makes a
+                // solo community read as "has members, none connected" and
+                // resolve pkarr on the ladder forever.
+                m.status == crate::community_membership::MemberStatus::Joined
+                    && **addr != self.self_owner
+            })
+            .map(|(addr, _)| *addr)
+            .collect()
+    }
+
+    async fn epoch_key_of(&self, community: &SpaceId) -> Option<EpochKey> {
+        // Spawn-time membership_key(), matching the key the rendezvous
+        // PUBLISHER slots under (start_node's `refresh_slot` loop passes
+        // `engine.membership_key()`) — deliberately NOT live_epoch_key
+        // (spec §5.3/§9). A mismatch derives a different slot keypair and
+        // silently resolves nothing, forever.
+        Some(self.registry.engine_arc(community).await?.membership_key())
+    }
+}
+
 /// Per-community resolve backoff while starved. Present only for communities
 /// currently on the ladder; removed on heal, so a re-starved community starts
 /// again at the base delay.

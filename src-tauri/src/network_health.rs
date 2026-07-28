@@ -1840,7 +1840,10 @@ impl NetworkHealthService {
     /// ZEB-824: install the gateway-dial DRIVER telemetry source (the same
     /// `Arc` the driver loop writes). Additive — when unset,
     /// `snapshot().gateway_bootstrap` reports `None`.
-    pub fn set_gateway_bootstrap_source(&mut self, src: std::sync::Arc<GatewayBootstrapTelemetry>) {
+    pub(crate) fn set_gateway_bootstrap_source(
+        &mut self,
+        src: std::sync::Arc<GatewayBootstrapTelemetry>,
+    ) {
         self.gateway_bootstrap = Some(src);
     }
 
