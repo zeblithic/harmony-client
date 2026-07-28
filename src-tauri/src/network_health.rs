@@ -532,10 +532,18 @@ impl DialTelemetry {
 }
 
 /// ZEB-804: the per-peer served-traffic stamps [`PeerTrafficRegistry`] holds.
-/// `last_any_served_ms` advances on EVERY served request from the peer;
-/// `last_relay_pull_served_ms` additionally pins the most recent
-/// community-relay pull specifically (the relay-pull cadence is the signal the
-/// staleness tier is derived from, spec §6).
+///
+/// `last_any_served_ms` — wall ms of the last COMPLETED iroh-authenticated
+/// exchange with this peer, regardless of application-level outcome:
+/// auth-failed / policy-rejected / rate-limit-shed responses count too (review
+/// r1 ruling). The peer demonstrably exchanged traffic with us — this is
+/// staleness evidence, not a trust or success signal.
+///
+/// `last_relay_pull_served_ms` — by contrast SUCCESS-ONLY by design: it
+/// additionally pins the most recent successfully served community-relay pull
+/// (the relay-pull cadence is the signal the staleness tier is derived from,
+/// spec §6, and it answers the ZEB-803 operator question "is this relay
+/// actually serving that peer?").
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PeerTrafficStamps {
     pub last_any_served_ms: u64,
@@ -549,13 +557,21 @@ pub struct PeerTrafficStamps {
 /// redaction rule governs what we log/persist; this map is in-memory only and
 /// feeds a surface that already shows full owner addrs. Call rate is one stamp
 /// per served request, so a mutex map is fine (no hot-path atomics).
+///
+/// Stamp semantics (review r1 ruling): "served" here means a COMPLETED
+/// iroh-authenticated bidirectional exchange, NOT application-level success —
+/// acceptors whose no-oracle designs answer bad requests with benign replies
+/// (pex, friend) stamp those replies too, because the peer's liveness is what
+/// [`PeerTrafficStamps::last_any_served_ms`] measures. Only the relay-pull
+/// stamp is success-only.
 #[derive(Debug, Default)]
 pub struct PeerTrafficRegistry {
     stamps: Mutex<HashMap<[u8; 32], PeerTrafficStamps>>,
 }
 
 impl PeerTrafficRegistry {
-    /// Record one served request from `peer` (any acceptor). `now_ms` is
+    /// Record one completed exchange with `peer` (any acceptor; any
+    /// application-level outcome — see the struct doc). `now_ms` is
     /// injected by the caller from its existing wall-clock source
     /// (injected-clock convention — the registry never samples time itself).
     pub fn record_served(&self, peer: [u8; 32], now_ms: u64) {

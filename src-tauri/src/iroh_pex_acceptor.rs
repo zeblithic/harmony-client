@@ -924,7 +924,13 @@ impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for IrohFriendPexAccep
             // IntroduceRequest, Introduction), each of which wrote a response.
             // Stamped HERE rather than at the per-arm rate-limiter sites so the
             // Catalog arm (which never touches `conn.remote_id()`) is covered
-            // too, and a failed serve (closed stream, nothing written) is not.
+            // too, and a transport-failed serve (closed stream, nothing
+            // written) is not. `Ok` deliberately includes the arms' benign-ack
+            // outcomes (auth-failed IntroduceRequests, policy-rejected
+            // Introductions, rate-limit sheds — the no-oracle design answers
+            // them all with `write_ack`): each is a completed exchange with an
+            // iroh-authenticated peer, which is exactly the traffic evidence
+            // `last_any_served_ms` measures (review r1 ruling).
             Ok(()) => {
                 if let Some(reg) = self.traffic.as_ref() {
                     reg.record_served(*conn.remote_id().as_bytes(), wall_now_ms());
