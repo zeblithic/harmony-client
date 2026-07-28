@@ -97,10 +97,42 @@ pub enum MintSyncError {
     Crypto(String),
     #[error("mint sync content store: blob {0:?} missing")]
     MissingBlob(crate::owner_state_types::ContentId),
+    /// ZEB-805 r2: the fetch itself FAILED — a zenoh/event-loop transport
+    /// error — as distinct from the blob being absent within the budget. Both
+    /// are the transient class; see [`MintSyncError::transient_fetch_cid`].
+    #[error("mint sync content store: fetch of blob {cid:?} failed: {detail}")]
+    BlobFetchFailed {
+        cid: crate::owner_state_types::ContentId,
+        detail: String,
+    },
     #[error("mint sync schema version too new: remote={remote}, local_max={local_max}")]
     SchemaTooNew { remote: u32, local_max: u32 },
     #[error("mint sync other: {0}")]
     Other(String),
+}
+
+impl MintSyncError {
+    /// ZEB-805 r2: the TRANSIENT state-root fetch-failure class, as a single
+    /// predicate rather than a match every caller has to get right.
+    ///
+    /// `Some(cid)` means "this failure may not recur — the same frame is worth
+    /// re-processing under a bounded budget". `None` means deterministic
+    /// (crypto, decode, schema, apply): the same bytes would fail the same way,
+    /// so a retry buys nothing but latency.
+    ///
+    /// This lives on the type rather than at the call site because of how it
+    /// was found. The r1 review round fixed exactly this asymmetry in
+    /// `community_state_sync` — where a content-store ERROR terminated while a
+    /// miss retried — and in the same commit introduced it here, by keying
+    /// mint's new retry on `MissingBlob` alone. A predicate on the error type
+    /// means the next transient variant is picked up by every caller for free,
+    /// instead of relying on each one being updated.
+    pub fn transient_fetch_cid(&self) -> Option<crate::owner_state_types::ContentId> {
+        match self {
+            Self::MissingBlob(cid) | Self::BlobFetchFailed { cid, .. } => Some(*cid),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

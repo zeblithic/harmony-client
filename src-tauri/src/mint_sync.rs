@@ -592,7 +592,13 @@ impl EngineShared {
                 std::time::Duration::from_millis(crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS),
             )
             .await
-            .map_err(|e| MintSyncError::Other(format!("content_store.get: {e}")))?
+            // ZEB-805 r2: classified like the zenoh path so the two agree on
+            // what a transient fetch failure is, even though this caller does
+            // not retry.
+            .map_err(|e| MintSyncError::BlobFetchFailed {
+                cid: root_cid,
+                detail: e.to_string(),
+            })?
             .ok_or(MintSyncError::MissingBlob(root_cid))?;
         // Task 9 test path: cleartext blob (matching Task 8's stubbed publish).
         // Real Zenoh path decrypts before calling handle_incoming_decoded.
@@ -756,7 +762,10 @@ async fn process_inbound_zenoh(
         Err(e) => e,
     };
 
-    let MintSyncError::MissingBlob(cid) = err else {
+    // ZEB-805 r2: the transient class is defined ON the error type, not
+    // re-derived here. Matching a variant list at the call site is what let the
+    // r1 retry silently exclude transport errors.
+    let Some(cid) = err.transient_fetch_cid() else {
         // Deterministic failure (crypto, decode, apply): the same bytes would
         // fail the same way, so a retry buys nothing.
         tracing::warn!(target: "mint_sync", "incoming publish dropped: {err}");
@@ -1178,7 +1187,24 @@ async fn handle_incoming_publish_zenoh(
             return Err(MintSyncError::MissingBlob(payload.root_cid));
         }
         Err(e) => {
-            return Err(MintSyncError::Other(format!("content_store.get: {e}")));
+            // ZEB-805 r2: a transport/event-loop failure is the SAME transient
+            // class as a miss and must retry identically. r1 keyed the new
+            // retry on `MissingBlob` alone, so this arm — reported as the
+            // catch-all `Other` — was treated as deterministic and dropped the
+            // publish. That is precisely the asymmetry r1 had just removed from
+            // `community_state_sync`, reintroduced here in the same commit.
+            tracing::warn!(
+                target: "mint_sync",
+                root_cid = ?payload.root_cid,
+                blob_bytes = payload.root_cid.payload_size(),
+                budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+                error = %e,
+                "mint state-root blob fetch error — will retry if budget remains"
+            );
+            return Err(MintSyncError::BlobFetchFailed {
+                cid: payload.root_cid,
+                detail: e.to_string(),
+            });
         }
     };
 
@@ -1725,14 +1751,48 @@ mod tests {
         (wire, absent)
     }
 
+    /// ZEB-805 r2: every fetch fails with a transport ERROR rather than a miss.
+    struct ErroringStore;
+    #[async_trait::async_trait]
+    impl crate::content_store::ContentStore for ErroringStore {
+        async fn put(
+            &self,
+            _cid: crate::owner_state_types::ContentId,
+            _blob: Vec<u8>,
+        ) -> Result<(), crate::content_store::ContentStoreError> {
+            Ok(())
+        }
+        async fn get(
+            &self,
+            cid: &crate::owner_state_types::ContentId,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            self.get_with_budget(cid, std::time::Duration::from_millis(0))
+                .await
+        }
+        async fn get_with_budget(
+            &self,
+            _cid: &crate::owner_state_types::ContentId,
+            _budget: std::time::Duration,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            Err(crate::content_store::ContentStoreError::Io(
+                "injected zenoh transport failure".into(),
+            ))
+        }
+    }
+
     fn retry_test_shared() -> (EngineShared, FleetKeySet) {
+        retry_test_shared_with(Arc::new(crate::content_store::InMemoryStub::default()))
+    }
+
+    fn retry_test_shared_with(
+        content_store: Arc<dyn crate::content_store::ContentStore>,
+    ) -> (EngineShared, FleetKeySet) {
         let keys = FleetKeySet::new(Arc::new(
             crate::owner_state_crypto::KeyTree::derive_at_epoch(&[7u8; 32], 0).expect("derive"),
         ));
         let shared = EngineShared {
             mint_db: Arc::new(std::sync::Mutex::new(fresh_db())),
-            // Empty stub: every fetch misses.
-            content_store: Arc::new(crate::content_store::InMemoryStub::default()),
+            content_store,
             sync_state: Arc::new(TokioMutex::new(MintSyncState::default())),
             sync_state_path: None,
             app_handle: None,
@@ -1754,6 +1814,14 @@ mod tests {
     /// an off-by-one here is the difference between bounded and unbounded.
     ///
     /// `start_paused`: the 2 s delay costs no wall-clock.
+    ///
+    /// The re-injection is awaited by dropping this test's own sender and then
+    /// `recv()`-ing bare, rather than wrapping a `timeout` around it. The
+    /// spawned sleeper holds the only other sender, so the two outcomes are
+    /// distinguished without an arbitrary duration constant: `Some` means a
+    /// retry was scheduled and delivered, `None` means none was scheduled — the
+    /// regression this guards — and it reports immediately instead of after a
+    /// timeout that only ever fires on the failing path.
     #[tokio::test(start_paused = true)]
     async fn mint_zenoh_fetch_miss_schedules_a_bounded_retry() {
         let (shared, keys) = retry_test_shared();
@@ -1773,11 +1841,11 @@ mod tests {
         )
         .await;
 
-        let (got_wire, got_attempts) =
-            tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
-                .await
-                .expect("a miss must schedule a retry, not drop the publish")
-                .expect("retry channel delivered");
+        drop(tx);
+        let (got_wire, got_attempts) = rx
+            .recv()
+            .await
+            .expect("a miss must schedule a retry, not drop the publish");
         assert_eq!(got_wire, wire, "the ORIGINAL frame is re-injected verbatim");
         assert_eq!(
             got_attempts,
@@ -1813,6 +1881,87 @@ mod tests {
             rx.recv().await.is_none(),
             "an exhausted budget must NOT re-inject"
         );
+    }
+
+    /// ZEB-805 r2: a transport ERROR on the fetch must retry exactly like a
+    /// miss. Found by review after r1 shipped.
+    ///
+    /// r1 fixed this same asymmetry in `community_state_sync` — where a
+    /// content-store error terminated while a miss retried — and introduced it
+    /// here in the same commit, by keying mint's new retry on `MissingBlob`
+    /// alone. A zenoh/event-loop failure surfaced as the catch-all `Other`,
+    /// which the retry treated as deterministic, so the publish was dropped and
+    /// the ledger stayed stale until someone published another root.
+    ///
+    /// The predicate now lives on `MintSyncError`, so this test also guards the
+    /// classification rather than one call site's match.
+    ///
+    /// See `mint_zenoh_fetch_miss_schedules_a_bounded_retry` for why the
+    /// re-injection is awaited without a `timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn mint_zenoh_fetch_transport_error_retries_like_a_miss() {
+        let (shared, keys) = retry_test_shared_with(Arc::new(ErroringStore));
+        let (wire, _absent) = absent_blob_wire(&keys);
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u8)>(8);
+        let sem = Arc::new(Semaphore::new(8));
+
+        process_inbound_zenoh(
+            wire.clone(),
+            &shared,
+            &keys,
+            "local-dev",
+            std::path::Path::new("/nonexistent"),
+            crate::content_store::fetch_retry::ATTEMPTS,
+            &tx,
+            &sem,
+        )
+        .await;
+
+        drop(tx);
+        let (got_wire, got_attempts) = rx
+            .recv()
+            .await
+            .expect("a transport error must schedule a retry, not drop the publish");
+        assert_eq!(got_wire, wire, "the ORIGINAL frame is re-injected verbatim");
+        assert_eq!(
+            got_attempts,
+            crate::content_store::fetch_retry::ATTEMPTS - 1,
+            "the retry must carry a decremented budget"
+        );
+    }
+
+    /// The classification predicate itself: transient variants yield their cid,
+    /// deterministic ones yield `None`. Pins the contract the retry depends on.
+    #[test]
+    fn transient_fetch_cid_separates_retryable_from_deterministic() {
+        let cid = crate::owner_state_types::ContentId::from_bytes([0x11; 32]);
+        assert_eq!(
+            MintSyncError::MissingBlob(cid).transient_fetch_cid(),
+            Some(cid)
+        );
+        assert_eq!(
+            MintSyncError::BlobFetchFailed {
+                cid,
+                detail: "transport".into()
+            }
+            .transient_fetch_cid(),
+            Some(cid)
+        );
+        for deterministic in [
+            MintSyncError::Crypto("bad key".into()),
+            MintSyncError::Cbor("bad decode".into()),
+            MintSyncError::SchemaTooNew {
+                remote: 9,
+                local_max: 1,
+            },
+            MintSyncError::Other("misc".into()),
+        ] {
+            assert_eq!(
+                deterministic.transient_fetch_cid(),
+                None,
+                "{deterministic:?} must NOT retry — the same bytes fail the same way"
+            );
+        }
     }
 
     #[tokio::test]
