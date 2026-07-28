@@ -1694,6 +1694,25 @@ pub fn derive_staleness(
 ///   healthy, regardless of how recently the last one arrived.
 /// - otherwise bucket `age = now_ms - last_advance_ms` against the shared
 ///   [`STALENESS_QUIET_MS`] / [`STALENESS_DARK_MS`] thresholds.
+///
+/// **The first rule is a PROXY, and reviewers have read it as more than it is.**
+/// "Nothing has ever arrived" stands in for "there is no peer to sync with";
+/// they are not the same predicate, and the engine has no per-community peer
+/// count to consult. Two known imprecisions follow, both deliberate:
+///
+/// - A community that had traffic and then lost every peer keeps a non-`None`
+///   `last_inbound_ms` and so renders `Dark` rather than `None`. A false alarm
+///   — but the row carries both timestamps, so an operator sees the cause.
+/// - A community with live peers that has never received anything renders
+///   `None`. True peer gating would call that `Dark`, which for a genuinely
+///   quiet freshly-joined community is a *worse* false alarm.
+///
+/// So the proxy errs toward over-reporting `Dark` and never toward reporting
+/// healthy while wedged — the direction ZEB-804 established as the safe one.
+/// Do not "fix" the first rule by gating on a global connection state either:
+/// that would suppress the tier for every community at once on a signal none of
+/// them is actually keyed to. Real per-community peer-presence gating is
+/// ZEB-829.
 pub fn derive_sync_staleness(
     last_inbound_ms: Option<u64>,
     last_advance_ms: Option<u64>,
@@ -4783,6 +4802,82 @@ mod tests {
             std::sync::Arc::new(EmptyRelaySnapshot),
         );
         assert!(svc2.snapshot().await.gateway_bootstrap.is_none());
+    }
+
+    /// ZEB-805 r1: the `communitySync` section must actually appear in
+    /// `snapshot()` once a source is installed, and be empty (not a panic, not
+    /// a missing key) when it is not.
+    ///
+    /// The r0 tests exercised `community_sync_row` / `derive_sync_staleness`
+    /// directly, so the wiring between them — the `match self.community_sync`
+    /// arm in `snapshot()` — was never executed by any test. That is precisely
+    /// the code whose failure mode is "the health surface silently reports
+    /// nothing", which is the ZEB-805 incident's own shape: an operator reading
+    /// a clean surface and concluding the node is fine. Every sibling source in
+    /// this file has this test; this one was missing.
+    #[tokio::test]
+    async fn snapshot_community_sync_section_present_iff_source_installed() {
+        struct FakeCommunitySync(Vec<(crate::owner_state_types::SpaceId, CommunitySyncRaw)>);
+        #[async_trait::async_trait]
+        impl CommunitySyncSource for FakeCommunitySync {
+            async fn per_community(
+                &self,
+            ) -> Vec<(crate::owner_state_types::SpaceId, CommunitySyncRaw)> {
+                self.0.clone()
+            }
+        }
+
+        let now = now_ms();
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_community_sync_source(std::sync::Arc::new(FakeCommunitySync(vec![(
+            crate::owner_state_types::SpaceId([0xAB; 16]),
+            CommunitySyncRaw {
+                // Arriving, never merging: the incident, end-to-end through the
+                // real assembly path rather than through the pure helper.
+                last_inbound_ms: now,
+                last_advance_ms: 0,
+                fetch_retries_scheduled: 4,
+                fetch_retries_dropped: 1,
+                fetch_retries_exhausted: 2,
+            },
+        )])));
+
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.community_sync.len(), 1, "section populated when wired");
+        let row = &snap.community_sync[0];
+        assert_eq!(row.staleness, Some(PeerStaleness::Dark));
+        assert_eq!(row.last_advance_ms, None, "the 0 sentinel maps to None");
+        assert_eq!(row.fetch_retries_exhausted, 2);
+
+        // camelCase over the wire, with no snake_case leak.
+        let v = serde_json::to_value(&snap).expect("snapshot serializes");
+        let cs = &v["communitySync"][0];
+        assert_eq!(cs["staleness"], serde_json::json!("dark"));
+        assert_eq!(cs["fetchRetriesExhausted"], serde_json::json!(2));
+        assert_eq!(cs["fetchRetriesDropped"], serde_json::json!(1));
+        assert!(cs.get("fetch_retries_exhausted").is_none());
+        assert!(cs.get("last_advance_ms").is_none());
+
+        // Unwired: an empty section, not a panic and not a missing key.
+        let svc2 = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        let snap2 = svc2.snapshot().await;
+        assert!(snap2.community_sync.is_empty());
+        let v2 = serde_json::to_value(&snap2).expect("serializes");
+        assert_eq!(v2["communitySync"], serde_json::json!([]));
     }
 
     // ── ZEB-710: drain-fence degraded-mode counters in the snapshot ────

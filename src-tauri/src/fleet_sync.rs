@@ -55,30 +55,15 @@ use tokio::task::JoinHandle;
 /// collapse keystroke-rate mutations.
 pub const DEFAULT_DEBOUNCE_MS: u64 = 250;
 
-/// ZEB-705: bounded retry budget for an inbound state-root publish whose
-/// content-blob fetch failed. A fresh zenoh link delivers the root put before
-/// the publisher's content queryable declaration has propagated back (~1 s),
-/// so the first fetch can complete with zero replies; without a retry the
-/// publish is dropped permanently — fatal for a paired butler whose primary
-/// (the only blob holder) departs seconds later. Retries re-inject the
-/// original wire frame through the FULL inbound pipeline, so the replay check
-/// naturally kills a retry that a newer root has since superseded.
-const FETCH_RETRY_ATTEMPTS: u8 = 3;
-
-/// Delay between fetch retries. Comfortably above declaration-propagation
-/// latency on a fresh link; small enough that all retries land inside the
-/// "publisher still alive" window the D3 scenario measures in seconds.
-const FETCH_RETRY_DELAY_MS: u64 = 2000;
-
-/// Max fetch-retry sleepers in flight per engine. Each pending retry is a
-/// detached task holding its wire frame for `FETCH_RETRY_DELAY_MS`; a burst
-/// of misses (or a hostile publish flood) must not pile those up unbounded.
-/// A permit is acquired BEFORE the sleeper is spawned and held for its whole
-/// lifetime, so concurrent retries — and thus retained wire buffers — are
-/// hard-capped. Excess misses are dropped (WARN); CRDT eventual consistency +
-/// the transport-epoch re-offer recover them. Sized to the re-injection
-/// channel capacity so a full permit set never overflows the channel.
-const FETCH_RETRY_MAX_INFLIGHT: usize = 8;
+/// ZEB-705 fetch-retry budget — the single definition shared with
+/// `community_state_sync` and `mint_sync` since ZEB-805 r1. Aliased to the
+/// historical local names so call sites read unchanged; see
+/// [`crate::content_store::fetch_retry`] for the rationale, the values, and the
+/// read-only-replay invariant that makes re-injection admissible.
+use crate::content_store::fetch_retry::{
+    ATTEMPTS as FETCH_RETRY_ATTEMPTS, DELAY_MS as FETCH_RETRY_DELAY_MS,
+    MAX_INFLIGHT as FETCH_RETRY_MAX_INFLIGHT,
+};
 
 /// Engine-local root-publish envelope. Superset of legacy RootPublishPayload:
 /// `seen` is skip-if-empty so an empty-seen envelope encodes byte-identically.
@@ -1269,6 +1254,7 @@ where
                 "ZEB-705: state-root blob fetch failed — retry scheduled"
             );
             let tx = ctx.fetch_retry_tx.clone();
+            let dropped = Arc::clone(&ctx.fetch_retries_dropped);
             tokio::spawn(async move {
                 // Hold the permit for the sleeper's whole lifetime; released
                 // on task end (after enqueue), bounding concurrent retries.
@@ -1277,7 +1263,14 @@ where
                 // `try_send`, never a blocking `send().await`: a full channel
                 // means the engine is already saturated — drop, don't pile up.
                 // A closed channel means the engine shut down — also moot.
+                //
+                // ZEB-805 (r1): count it. The permit-exhaustion path above
+                // increments `fetch_retries_dropped`; this one did not, so a
+                // retry that reached the channel and bounced vanished from the
+                // counters entirely — already counted as scheduled, never as
+                // dropped. Both drop sites now agree.
                 if tx.try_send((wire, attempts_left - 1)).is_err() {
+                    dropped.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         "ZEB-705: fetch-retry re-injection channel unavailable — retry dropped"
                     );
@@ -1381,6 +1374,7 @@ where
             // was measured against was invisible.
             tracing::warn!(
                 cid = ?payload.root_cid,
+                blob_bytes = payload.root_cid.payload_size(),
                 budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
                 "incoming publish fetch miss: missing root blob (fetch timeout or admit-rejected) — will retry if budget remains"
             );
@@ -1388,6 +1382,9 @@ where
         }
         Err(e) => {
             tracing::warn!(
+                cid = ?payload.root_cid,
+                blob_bytes = payload.root_cid.payload_size(),
+                budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
                 error = %e,
                 "incoming publish fetch error: content_store.get error — will retry if budget remains"
             );

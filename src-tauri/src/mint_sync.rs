@@ -6,7 +6,7 @@ use crate::owner_state_crypto::FleetKeySet;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex as TokioMutex, Notify};
+use tokio::sync::{mpsc, Mutex as TokioMutex, Notify, Semaphore};
 
 /// Read the full ledger state into a [`MintSnapshot`].
 ///
@@ -720,6 +720,95 @@ async fn publish_root_now(
     Ok(())
 }
 
+/// ZEB-805 (r1): run one inbound mint frame through the pipeline and, on a
+/// transient CAS miss, schedule a bounded retry instead of dropping it.
+///
+/// Shared by the subscriber arm (fresh frames, full budget) and the fetch-retry
+/// arm (re-injected frames, decremented budget), mirroring the same split in
+/// `community_state_sync` and `fleet_sync`. Before this, mint was the last of
+/// the three engines to treat a transient miss as terminal — the review round
+/// on ZEB-805 caught that the PR claimed cross-engine consistency as its
+/// deliverable while leaving one engine inconsistent.
+///
+/// Re-injection is admissible for the same reason it is in the other two:
+/// `handle_incoming_publish_zenoh`'s step-3 replay check is READ-ONLY and the
+/// tracker only advances after a successful apply (step 6, CRITICAL 3), so the
+/// same frame is still acceptable on a later pass. If that ever changes, every
+/// retry here silently becomes a rejected duplicate.
+///
+/// Unlike the other two engines this keeps no counters: mint has no
+/// `network_health` consumer to read them. Both drop sites log at WARN.
+#[allow(clippy::too_many_arguments)]
+async fn process_inbound_zenoh(
+    wire: Vec<u8>,
+    shared: &EngineShared,
+    keys: &FleetKeySet,
+    device_id: &str,
+    sync_state_path: &std::path::Path,
+    attempts_left: u8,
+    retry_tx: &mpsc::Sender<(Vec<u8>, u8)>,
+    retry_sem: &Arc<Semaphore>,
+) {
+    let err = match handle_incoming_publish_zenoh(&wire, shared, keys, device_id, sync_state_path)
+        .await
+    {
+        Ok(()) => return,
+        Err(e) => e,
+    };
+
+    let MintSyncError::MissingBlob(cid) = err else {
+        // Deterministic failure (crypto, decode, apply): the same bytes would
+        // fail the same way, so a retry buys nothing.
+        tracing::warn!(target: "mint_sync", "incoming publish dropped: {err}");
+        return;
+    };
+
+    if attempts_left == 0 {
+        tracing::warn!(
+            target: "mint_sync",
+            root_cid = ?cid,
+            blob_bytes = cid.payload_size(),
+            budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+            attempts = crate::content_store::fetch_retry::ATTEMPTS,
+            "mint state-root fetch retry budget exhausted — publish dropped"
+        );
+        return;
+    }
+
+    // Permit BEFORE spawn, so what is capped is the number of retained wire
+    // buffers, not merely channel depth.
+    let Ok(permit) = Arc::clone(retry_sem).try_acquire_owned() else {
+        tracing::warn!(
+            target: "mint_sync",
+            root_cid = ?cid,
+            "mint fetch-retry in-flight cap saturated — retry dropped"
+        );
+        return;
+    };
+    tracing::info!(
+        target: "mint_sync",
+        root_cid = ?cid,
+        attempts_left,
+        delay_ms = crate::content_store::fetch_retry::DELAY_MS,
+        "mint state-root blob fetch failed — retry scheduled"
+    );
+    let tx = retry_tx.clone();
+    tokio::spawn(async move {
+        // Held for the sleeper's whole lifetime; released on task end.
+        let _permit = permit;
+        tokio::time::sleep(std::time::Duration::from_millis(
+            crate::content_store::fetch_retry::DELAY_MS,
+        ))
+        .await;
+        if tx.try_send((wire, attempts_left - 1)).is_err() {
+            tracing::warn!(
+                target: "mint_sync",
+                "mint fetch-retry re-injection channel unavailable — retry dropped"
+            );
+        }
+    });
+}
+
 // ── Real Zenoh engine internals ──────────────────────────────────────────────
 
 /// Internal task for the production Zenoh-backed engine. Mirrors
@@ -757,6 +846,14 @@ async fn internal_task_zenoh(
     // Mirrors owner_state_sync::internal_task's pinning idiom exactly.
     let notified = dirty.notified();
     tokio::pin!(notified);
+
+    // ZEB-805 (r1): bounded fetch-retry plumbing. Capacity == the in-flight cap
+    // so a full permit set can never overflow the channel.
+    let (fetch_retry_tx, mut fetch_retry_rx) =
+        mpsc::channel::<(Vec<u8>, u8)>(crate::content_store::fetch_retry::MAX_INFLIGHT);
+    let fetch_retry_sem = Arc::new(Semaphore::new(
+        crate::content_store::fetch_retry::MAX_INFLIGHT,
+    ));
 
     loop {
         let next_wake = scheduled
@@ -809,17 +906,34 @@ async fn internal_task_zenoh(
                     inbound_closed = true;
                     continue;
                 };
-                if let Err(e) = handle_incoming_publish_zenoh(
-                    &bytes,
+                // ZEB-805: a fresh inbound frame carries the full retry budget.
+                process_inbound_zenoh(
+                    bytes,
                     &shared,
                     &keys,
                     &device_id,
                     &sync_state_path,
+                    crate::content_store::fetch_retry::ATTEMPTS,
+                    &fetch_retry_tx,
+                    &fetch_retry_sem,
                 )
-                .await
-                {
-                    tracing::warn!(target: "mint_sync", "incoming publish dropped: {e}");
-                }
+                .await;
+            }
+            // ZEB-805: a fetch-retry sleeper handing its frame back after the
+            // delay. Re-enters the FULL inbound pipeline, so the read-only
+            // replay check kills a retry a newer root has already superseded.
+            Some((wire, attempts_left)) = fetch_retry_rx.recv() => {
+                process_inbound_zenoh(
+                    wire,
+                    &shared,
+                    &keys,
+                    &device_id,
+                    &sync_state_path,
+                    attempts_left,
+                    &fetch_retry_tx,
+                    &fetch_retry_sem,
+                )
+                .await;
             }
             _ = shutdown_rx.recv() => {
                 // Final flush on shutdown if there's pending dirty state.
@@ -1589,6 +1703,116 @@ mod tests {
 
         engine.shutdown().await.unwrap();
         handle.await.unwrap();
+    }
+
+    /// ZEB-805 r1: build a valid encrypted mint root-publish envelope whose
+    /// blob is NOT in the store — the incident condition, on the zenoh path.
+    fn absent_blob_wire(keys: &FleetKeySet) -> (Vec<u8>, crate::owner_state_types::ContentId) {
+        let absent = crate::owner_state_types::ContentId::from_bytes([0xEE; 32]);
+        let payload = crate::mint_sync_types::MintRootPublishPayload {
+            root_cid: absent,
+            at: crate::owner_state_types::Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                // NOT the receiving device, or echo-suppression eats it at step 2.
+                device_id: "remote-dev".into(),
+            },
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).expect("payload encode");
+        let wire = crate::owner_state_crypto::encrypt_root_publish(&keys.newest(), &payload_bytes)
+            .expect("encrypt");
+        (wire, absent)
+    }
+
+    fn retry_test_shared() -> (EngineShared, FleetKeySet) {
+        let keys = FleetKeySet::new(Arc::new(
+            crate::owner_state_crypto::KeyTree::derive_at_epoch(&[7u8; 32], 0).expect("derive"),
+        ));
+        let shared = EngineShared {
+            mint_db: Arc::new(std::sync::Mutex::new(fresh_db())),
+            // Empty stub: every fetch misses.
+            content_store: Arc::new(crate::content_store::InMemoryStub::default()),
+            sync_state: Arc::new(TokioMutex::new(MintSyncState::default())),
+            sync_state_path: None,
+            app_handle: None,
+        };
+        (shared, keys)
+    }
+
+    /// ZEB-805 r1: a transient CAS miss on the zenoh path must schedule a
+    /// bounded retry, not drop the publish.
+    ///
+    /// Before r1 this engine was the last of the three to treat a miss as
+    /// terminal — `community_state_sync` and `fleet_sync` both retried, while
+    /// mint logged and discarded the frame. The PR that fixed the other two
+    /// claimed cross-engine consistency as its deliverable, so leaving one
+    /// engine inconsistent was the gap a reviewer caught.
+    ///
+    /// The re-injected frame must be byte-identical (it re-enters the FULL
+    /// pipeline, replay check included) and must carry a DECREMENTED budget —
+    /// an off-by-one here is the difference between bounded and unbounded.
+    ///
+    /// `start_paused`: the 2 s delay costs no wall-clock.
+    #[tokio::test(start_paused = true)]
+    async fn mint_zenoh_fetch_miss_schedules_a_bounded_retry() {
+        let (shared, keys) = retry_test_shared();
+        let (wire, _absent) = absent_blob_wire(&keys);
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u8)>(8);
+        let sem = Arc::new(Semaphore::new(8));
+
+        process_inbound_zenoh(
+            wire.clone(),
+            &shared,
+            &keys,
+            "local-dev",
+            std::path::Path::new("/nonexistent"),
+            crate::content_store::fetch_retry::ATTEMPTS,
+            &tx,
+            &sem,
+        )
+        .await;
+
+        let (got_wire, got_attempts) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+                .await
+                .expect("a miss must schedule a retry, not drop the publish")
+                .expect("retry channel delivered");
+        assert_eq!(got_wire, wire, "the ORIGINAL frame is re-injected verbatim");
+        assert_eq!(
+            got_attempts,
+            crate::content_store::fetch_retry::ATTEMPTS - 1,
+            "the retry must carry a decremented budget"
+        );
+    }
+
+    /// The budget is bounded: at zero remaining attempts the miss is terminal
+    /// and nothing is re-injected. Without this, the arm above would be an
+    /// unbounded retry loop under a publish flood.
+    #[tokio::test(start_paused = true)]
+    async fn mint_zenoh_fetch_miss_at_zero_budget_is_terminal() {
+        let (shared, keys) = retry_test_shared();
+        let (wire, _absent) = absent_blob_wire(&keys);
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, u8)>(8);
+        let sem = Arc::new(Semaphore::new(8));
+
+        process_inbound_zenoh(
+            wire,
+            &shared,
+            &keys,
+            "local-dev",
+            std::path::Path::new("/nonexistent"),
+            0,
+            &tx,
+            &sem,
+        )
+        .await;
+        drop(tx);
+
+        assert!(
+            rx.recv().await.is_none(),
+            "an exhausted budget must NOT re-inject"
+        );
     }
 
     #[tokio::test]

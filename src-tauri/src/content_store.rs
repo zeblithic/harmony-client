@@ -229,9 +229,11 @@ pub enum CasOp {
 ///
 /// ZEB-805 removed a claim that used to live here — that a miss was harmless
 /// because "CRDT eventual consistency carries recovery via the next state-root
-/// from any peer". It does not: the next state root is a LARGER blob fetched
-/// under the SAME budget, so each failure makes the next likelier. Do not
-/// reintroduce that reasoning to justify dropping on a miss.
+/// from any peer". It does not. Attempts are independent; what is not
+/// independent is their difficulty. State only grows, so the "recovery" blob is
+/// LARGER than the one that just failed and is fetched under the SAME budget:
+/// the named recovery path is anti-correlated with the failure it is supposed
+/// to repair. Do not reintroduce that reasoning to justify dropping on a miss.
 pub const DEFAULT_FETCH_TIMEOUT_MS: u64 = 500;
 
 /// Fetch budget for state-root blobs (community / fleet / mint). These are a
@@ -271,6 +273,55 @@ const _: () = assert!(
     "the state-root budget exists because the default is too small for this \
      payload class; collapsing them re-creates ZEB-805"
 );
+
+/// ZEB-805 (r1): bounded fetch-retry budget for a state-root publish whose CAS
+/// fetch missed. Lives here, beside the budget it retries under, because the
+/// two are one policy: how this codebase fetches a state-root blob.
+///
+/// All three sync engines — `community_state_sync`, `fleet_sync`, `mint_sync` —
+/// read these. They were three copies of the same literals until a reviewer
+/// pointed out the obvious: cross-engine consistency was the stated deliverable
+/// of ZEB-805, and three private copies enforce it by good intentions rather
+/// than by construction. Tuning one engine in isolation is exactly the drift
+/// this prevents; if an engine ever genuinely needs a different budget, give it
+/// a distinct named constant here rather than editing this one.
+///
+/// Values are ZEB-705's, which survived review plus adversarial flood analysis.
+pub mod fetch_retry {
+    /// Attempts after the initial fetch, per inbound publish.
+    ///
+    /// The miss is usually transient: a fresh zenoh link delivers the root put
+    /// before the publisher's content-queryable declaration has propagated back
+    /// (~1 s). Without a retry the publish is dropped permanently — fatal for a
+    /// paired butler whose primary (the only blob holder) departs seconds later.
+    ///
+    /// Retries re-inject the ORIGINAL wire frame through the FULL inbound
+    /// pipeline, so the replay check naturally kills a retry that a newer root
+    /// has since superseded. That re-injection is admissible only because every
+    /// engine's replay check is read-only until a successful apply — community
+    /// via ZEB-750's `CommitTicket`, mint via its step-3/step-6 split. Breaking
+    /// that invariant would silently turn every retry into a rejected duplicate.
+    pub const ATTEMPTS: u8 = 3;
+
+    /// Delay between retries. Comfortably above declaration-propagation latency
+    /// on a fresh link, and small enough that the whole chain
+    /// (3 x (5 s budget + 2 s delay) ~= 21 s worst case) lands far inside the
+    /// 450 s relay-pull cadence, so retries can never overlap the next pass.
+    pub const DELAY_MS: u64 = 2000;
+
+    /// Max retry sleepers in flight per engine, and the re-injection channel's
+    /// capacity. Each pending retry is a detached task retaining its wire frame
+    /// for [`DELAY_MS`]; a burst of misses — or a hostile publish flood — must
+    /// not pile those up unbounded. A permit is acquired BEFORE the sleeper is
+    /// spawned and held for its whole lifetime, so concurrent retries (and thus
+    /// retained wire buffers) are hard-capped.
+    ///
+    /// Excess misses are dropped and COUNTED — at both drop sites, permit
+    /// exhaustion and a full re-injection channel. An uncounted drop on the
+    /// surface built to diagnose stalls is the ZEB-805 failure mode in
+    /// miniature.
+    pub const MAX_INFLIGHT: usize = 8;
+}
 
 /// Production `ContentStore` impl that delegates to the harmony-runtime
 /// event loop via `cas_op_tx`. Used at SyncEngine construction in

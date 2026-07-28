@@ -151,7 +151,7 @@ budget_ms = STATE_ROOT_FETCH_TIMEOUT_MS,
 - [ ] **Step 6: Gates + commit**
 
 ```bash
-cd src-tauri && cargo fmt --all && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+cd src-tauri && cargo fmt --all -- --check && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 cd .. && scripts/test-select --context task
 git add -A && git commit -m "ZEB-805: per-call CAS fetch budget; state roots stop inheriting the 500ms default"
 ```
@@ -171,14 +171,12 @@ git add -A && git commit -m "ZEB-805: per-call CAS fetch budget; state roots sto
 
 - [ ] **Step 1: Write the failing tests**
 
-Three behaviours, mirroring `fleet_sync`'s at `:3083`, `:3146`, `:3353`:
+Four behaviours — three mirroring `fleet_sync`'s at `:3083`, `:3146`, `:3353`, plus the
+invariant pin that makes retry safe at all:
 
 1. `retry_succeeds_once_blob_becomes_fetchable` — first `get_with_budget` returns `Ok(None)`, a later one returns the bytes; assert the CRDT merged and `fetch_retries_scheduled == 1`.
 2. `retry_exhaustion_drops_and_reports_degraded` — always `Ok(None)`; assert exactly `1 + FETCH_RETRY_ATTEMPTS` fetch attempts, `fetch_retries_exhausted == 1`, and one `report_degraded` with class `blob_not_found`.
 3. `retry_flood_shield_caps_inflight_sleepers` — `FETCH_RETRY_MAX_INFLIGHT + 4` distinct publishers all missing; assert `fetch_retry_inflight_peak() <= FETCH_RETRY_MAX_INFLIGHT` and `fetch_retries_dropped >= 4`.
-
-Plus the invariant pin, which is the one that makes retry safe:
-
 4. `tracker_stays_unadvanced_across_miss_and_exhaustion` — after a CAS miss, and again after retry exhaustion, re-delivery of the *same* frame is still admitted (not `Duplicate`). This is currently incidental (`:3806-3810`, ZEB-750 — every early return drops the `CommitTicket`); make it explicit.
 
 - [ ] **Step 2: Run to verify they fail**
@@ -211,7 +209,7 @@ Temporarily change `try_acquire_owned()` to an unbounded spawn and confirm test 
 - [ ] **Step 6: Gates + commit**
 
 ```bash
-cd src-tauri && cargo fmt --all && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+cd src-tauri && cargo fmt --all -- --check && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 cd .. && scripts/test-select --context task
 git add -A && git commit -m "ZEB-805: bounded blob re-fetch in community_state_sync (adopts fleet_sync's ZEB-705 pattern)"
 ```
@@ -231,10 +229,15 @@ git add -A && git commit -m "ZEB-805: bounded blob re-fetch in community_state_s
 - [ ] **Step 1: Write the failing test** — a CAS miss must be observable to the caller (a distinct return/outcome, not `Ok(())`), and must schedule a bounded retry.
 - [ ] **Step 2: Run to verify it fails.**
 - [ ] **Step 3: Apply Task 2's pattern.** If `mint_sync`'s loop shape cannot host the same retry machinery without a disproportionate refactor, the minimum acceptable outcome is: stop returning bare `Ok(())`, surface the miss to the caller, and record why the retry was not adopted in the task record. Do not silently leave it swallowed.
+
+  **r1 outcome:** the escape hatch was NOT needed and should not have been taken. `internal_task_zenoh`'s loop is a `select!` of the same shape as the other two engines, and the re-injection invariant it needs is already established in-file (the step-3 replay check is read-only; the tracker advances at step 6). `mint_sync` now carries the full bounded retry.
 - [ ] **Step 4: Run tests to verify they pass.**
 - [ ] **Step 5: Gates + commit**
 
 ```bash
+cd src-tauri && cargo fmt --all -- --check && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(mint_zenoh_fetch_miss) or test(cas_miss_is_observable)'
+scripts/test-select --context task
 git commit -m "ZEB-805: mint_sync stops swallowing CAS fetch misses"
 ```
 
@@ -293,7 +296,7 @@ Plus: `quiet`/`fresh` boundaries; `staleness == None` when the community has no 
 - [ ] **Step 7: Gates + commit**
 
 ```bash
-cd src-tauri && cargo fmt --all && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
+cd src-tauri && cargo fmt --all -- --check && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 cd .. && npx tsc --noEmit && npx vitest run && scripts/test-select --context task
 git add -A && git commit -m "ZEB-805: per-community sync-advance staleness — lastInboundMs vs lastAdvanceMs"
 ```
@@ -309,7 +312,7 @@ git add -A && git commit -m "ZEB-805: per-community sync-advance staleness — l
 
 - [ ] **Step 2: Fix the unearned-reassurance log line** at `event_loop.rs:3663`:
 
-```
+```text
 "startup root query: no responder — retrying with backoff; live push also catches up on next gateway publish"
 ```
 

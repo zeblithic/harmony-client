@@ -243,7 +243,7 @@ from "dropping everything", and `lastAdvanceMs` alone cannot distinguish "wedged
 
 Extend `network_health_snapshot` with a `communitySync` array, one entry per active community:
 
-```
+```text
 communityId, lastInboundMs, lastAdvanceMs, staleness,
 fetchMisses, fetchRetriesScheduled, fetchRetriesExhausted, fetchRetriesDropped
 ```
@@ -251,8 +251,26 @@ fetchMisses, fetchRetriesScheduled, fetchRetriesExhausted, fetchRetriesDropped
 `staleness` reuses ZEB-804's tier vocabulary and constants (`fresh` / `quiet` / `dark`,
 5 min / 30 min, derived as-of snapshot) so operators read one staleness idiom across the
 whole surface rather than two. It is computed from `lastAdvanceMs` — the honest "is sync
-working" signal — with `null` when the community has no peers to sync with, mirroring
-ZEB-804's `null`-under-`noConnection` rule.
+working" signal — and suppressed to `null` when there is nothing to sync with, in the
+spirit of ZEB-804's `null`-under-`noConnection` rule.
+
+**r1 correction — what "nothing to sync with" actually means here.** This paragraph
+originally said `null` when the community "has no peers". The implementation uses a
+proxy: `null` iff no publish has *ever* arrived. The engine has no per-community peer
+count to consult, and adding one is a new data path, so the proxy shipped. It is not the
+same predicate, and the difference is worth writing down rather than leaving for the next
+reader to discover:
+
+- A community that had traffic and then lost every peer keeps a non-null
+  `lastInboundMs`, so it renders `dark` rather than `null` — a false alarm, though the
+  row's own timestamps make the cause legible at a glance.
+- A community with live peers that has never received anything renders `null`. Peer
+  gating would call that `dark`, which for a genuinely quiet freshly-joined community
+  would be a *worse* false alarm.
+
+The proxy therefore errs toward over-reporting `dark` and never toward reporting healthy
+while wedged, which is the direction ZEB-804 established as the safe one. True
+peer-presence gating is tracked as **ZEB-829**.
 
 All fields additive, camelCase, `Option` / `#[serde(default)]`, serde-pinned with the
 snake-leak sweep the ZEB-804 work established. TS types extended by hand (no `gen/`).

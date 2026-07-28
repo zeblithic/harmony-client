@@ -2822,13 +2822,13 @@ async fn internal_task(mut ctx: InternalCtx) {
                     continue;
                 };
                 // ZEB-805: a fresh inbound frame carries the full retry budget.
-                process_inbound(&ctx, bytes, FETCH_RETRY_ATTEMPTS).await;
+                process_inbound(&ctx, bytes, FETCH_RETRY_ATTEMPTS, FrameOrigin::Network).await;
             }
             // ZEB-805: a fetch-retry sleeper handing its wire frame back after
             // the delay. Re-enters the FULL inbound pipeline, so the replay
             // check naturally kills a retry that a newer root has superseded.
             Some((wire, attempts_left)) = fetch_retry_rx.recv() => {
-                process_inbound(&ctx, wire, attempts_left).await;
+                process_inbound(&ctx, wire, attempts_left, FrameOrigin::Retry).await;
             }
             serve_req = async {
                 match root_serve_rx.as_mut() {
@@ -3485,30 +3485,14 @@ impl IncomingOutcome {
     }
 }
 
-/// ZEB-805 fetch-retry budget. A CAS miss on a state-root blob is usually
-/// transient — the publisher's content-queryable declaration may not have
-/// propagated back yet — so the publish is retried before being dropped.
-///
-/// Reused verbatim from `fleet_sync`'s ZEB-705 implementation rather than
-/// re-derived: cross-engine consistency is the point, and those values already
-/// survived review plus adversarial flood analysis. Do not tune one engine's
-/// copy in isolation.
-const FETCH_RETRY_ATTEMPTS: u8 = 3;
-
-/// Delay between fetch retries. Comfortably above declaration-propagation
-/// latency on a fresh link, and small enough that the whole chain
-/// (3 x (5 s budget + 2 s delay) ≈ 21 s worst case) lands far inside the 450 s
-/// relay-pull cadence, so retries can never overlap the next pull pass.
-const FETCH_RETRY_DELAY_MS: u64 = 2000;
-
-/// Max fetch-retry sleepers in flight per engine. Each pending retry is a
-/// detached task retaining its wire frame for `FETCH_RETRY_DELAY_MS`; a burst
-/// of misses — or a hostile publish flood — must not pile those up unbounded.
-/// A permit is acquired BEFORE the sleeper is spawned and held for its whole
-/// lifetime, so concurrent retries (and thus retained wire buffers) are
-/// hard-capped. Excess misses are dropped and counted. Sized to the
-/// re-injection channel capacity so a full permit set never overflows it.
-const FETCH_RETRY_MAX_INFLIGHT: usize = 8;
+/// ZEB-805 fetch-retry budget — the single definition shared with `fleet_sync`
+/// and `mint_sync`. Aliased to the historical local names so call sites read
+/// unchanged; see [`crate::content_store::fetch_retry`] for the rationale and
+/// the invariant that makes re-injection admissible.
+use crate::content_store::fetch_retry::{
+    ATTEMPTS as FETCH_RETRY_ATTEMPTS, DELAY_MS as FETCH_RETRY_DELAY_MS,
+    MAX_INFLIGHT as FETCH_RETRY_MAX_INFLIGHT,
+};
 
 /// ZEB-805 per-engine sync observability. Shared (`Arc`) between the internal
 /// task, which writes, and the engine handle, which `network_health_snapshot`
@@ -3532,20 +3516,39 @@ pub(crate) struct CommunitySyncStats {
     pub(crate) fetch_retry_inflight_peak: AtomicU64,
 }
 
+/// ZEB-805 (r1): where an inbound frame came from. `last_inbound_ms` means "a
+/// publish arrived from the network", so only [`FrameOrigin::Network`] may
+/// stamp it — a re-injected retry is this engine talking to itself, and
+/// counting it would let a silent transport look like a live one for as long as
+/// the retry chain runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameOrigin {
+    /// Fresh from the zenoh subscriber.
+    Network,
+    /// Re-injected by this engine's own bounded fetch retry.
+    Retry,
+}
+
 /// ZEB-805: run one inbound frame through the pipeline and act on the outcome —
 /// persist, report, or schedule a bounded fetch retry.
 ///
 /// Shared by the subscriber arm (fresh frames, full budget) and the
 /// fetch-retry arm (re-injected frames, decremented budget) so the two can
 /// never drift apart. Mirrors `fleet_sync::process_inbound` (ZEB-705).
-async fn process_inbound(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u8) {
+async fn process_inbound(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u8, origin: FrameOrigin) {
     // Stamp "a publish arrived" BEFORE any outcome branch. This must count
     // frames we go on to discard — its whole purpose is to be comparable
     // against `last_advance_ms`, and the gap between them is the
     // receiving-and-discarding signature (ZEB-805 §7.1).
-    ctx.sync_stats
-        .last_inbound_ms
-        .store(crate::network_health::now_ms(), Ordering::Relaxed);
+    //
+    // It must NOT count retries: those are locally generated, so stamping them
+    // would report this engine's own re-injections as inbound network activity
+    // and blunt exactly the signal this field exists to provide.
+    if origin == FrameOrigin::Network {
+        ctx.sync_stats
+            .last_inbound_ms
+            .store(crate::network_health::now_ms(), Ordering::Relaxed);
+    }
 
     let outcome = handle_incoming_publish(ctx, wire).await;
 
@@ -3605,6 +3608,7 @@ async fn process_inbound(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u8) {
             "community state-root blob fetch failed — retry scheduled"
         );
         let tx = ctx.fetch_retry_tx.clone();
+        let stats = Arc::clone(&ctx.sync_stats);
         tokio::spawn(async move {
             // Hold the permit for the sleeper's whole lifetime; released on
             // task end (after enqueue), which is what bounds concurrency.
@@ -3613,7 +3617,19 @@ async fn process_inbound(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u8) {
             // `try_send`, never a blocking `send().await`: a full channel means
             // the engine is already saturated — drop rather than pile up. A
             // closed channel means the engine shut down, which is also moot.
+            //
+            // ZEB-805 (r1): count the drop. This path already incremented
+            // `fetch_retries_scheduled`, so leaving it uncounted made a retry
+            // vanish from the counters entirely — neither dropped nor exhausted
+            // — on the very surface this ticket added to diagnose stalls.
+            //
+            // It is reachable, not merely defensive: the permit is released at
+            // task end, right after enqueue, so up to MAX_INFLIGHT fresh
+            // sleepers can spawn while earlier messages sit undrained in the
+            // channel — and the engine can sit for seconds inside a 5 s-budget
+            // CAS fetch.
             if tx.try_send((wire, attempts_left - 1)).is_err() {
+                stats.fetch_retries_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("community fetch-retry re-injection channel unavailable — dropped");
             }
         });
@@ -4071,12 +4087,33 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             tracing::warn!(
                 community_id = ?ctx.community_id,
                 cid = ?payload.root_cid,
+                blob_bytes = payload.root_cid.payload_size(),
                 budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
                 "community state-root blob fetch miss — will retry if budget remains"
             );
             return IncomingOutcome::FetchMiss(wire);
         }
-        Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(e)),
+        Err(e) => {
+            // ZEB-805 (r1): a content-store error is the SAME transient class as
+            // a miss, and it is also pre-mutation — so it retries too. This arm
+            // used to terminate immediately while `fleet_sync`'s equivalent
+            // retried, which meant the engine this one is documented as
+            // mirroring behaved differently on the same condition. The only
+            // variant today is `ContentStoreError::Io`, raised for a zenoh
+            // open/transport failure: exactly what a bounded retry is for.
+            //
+            // On exhaustion this still reports degraded, just via the retry
+            // path's terminal branch rather than on the first occurrence.
+            tracing::warn!(
+                community_id = ?ctx.community_id,
+                cid = ?payload.root_cid,
+                blob_bytes = payload.root_cid.payload_size(),
+                budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+                error = %e,
+                "community state-root blob fetch error — will retry if budget remains"
+            );
+            return IncomingOutcome::FetchMiss(wire);
+        }
     };
 
     // 7. Decrypt blob (deterministic-nonce).
@@ -5351,6 +5388,16 @@ impl CommunitySyncRegistry {
     /// v1 doesn't deduplicate registrations because the caller pattern (one
     /// `redeem_invite` IPC = one fresh `event_id`) keeps the map naturally
     /// sparse.
+    pub async fn register_pending_redemption(
+        &self,
+        event_id: crate::community_membership::EventId,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let mut g = self.pending_redemptions.lock().await;
+        g.insert(event_id, sender);
+        // guard dropped at end of scope
+    }
+
     /// ZEB-805: snapshot every live engine's sync counters for
     /// `network_health_snapshot`. Cheap — one lock, then atomic loads.
     pub async fn community_sync_raw(
@@ -5374,16 +5421,6 @@ impl CommunitySyncRegistry {
                 )
             })
             .collect()
-    }
-
-    pub async fn register_pending_redemption(
-        &self,
-        event_id: crate::community_membership::EventId,
-        sender: tokio::sync::oneshot::Sender<()>,
-    ) {
-        let mut g = self.pending_redemptions.lock().await;
-        g.insert(event_id, sender);
-        // guard dropped at end of scope
     }
 
     /// Remove the oneshot for `event_id` without firing it. Called by
@@ -8060,12 +8097,17 @@ mod tests {
         misses_remaining: std::sync::atomic::AtomicU32,
         get_calls: Arc<AtomicU64>,
         last_budget_ms: Arc<AtomicU64>,
+        /// ZEB-805 (r1): deliver the injected failures as `Err(Io)` rather than
+        /// `Ok(None)`. Both are the transient class and both must retry — they
+        /// did not before r1, which is the asymmetry this flag pins.
+        fail_as_error: bool,
     }
 
     impl MissingUntilStore {
-        fn new(
+        fn new_with_mode(
             inner: Arc<dyn ContentStore>,
             misses: u32,
+            fail_as_error: bool,
         ) -> (Arc<Self>, Arc<AtomicU64>, Arc<AtomicU64>) {
             let get_calls = Arc::new(AtomicU64::new(0));
             let last_budget_ms = Arc::new(AtomicU64::new(0));
@@ -8074,6 +8116,7 @@ mod tests {
                 misses_remaining: std::sync::atomic::AtomicU32::new(misses),
                 get_calls: Arc::clone(&get_calls),
                 last_budget_ms: Arc::clone(&last_budget_ms),
+                fail_as_error,
             });
             (s, get_calls, last_budget_ms)
         }
@@ -8117,7 +8160,13 @@ mod tests {
                 })
                 .is_ok();
             if missed {
-                return Ok(None);
+                return if self.fail_as_error {
+                    Err(crate::content_store::ContentStoreError::Io(
+                        "injected transient transport failure".into(),
+                    ))
+                } else {
+                    Ok(None)
+                };
             }
             self.inner.get_with_budget(cid, budget).await
         }
@@ -8155,6 +8204,16 @@ mod tests {
 
     impl RetryFixture {
         async fn new(misses: u32) -> Self {
+            Self::new_with_mode(misses, false).await
+        }
+
+        /// Same fixture, but B's store reports its failures as content-store
+        /// ERRORS rather than misses.
+        async fn new_erroring(misses: u32) -> Self {
+            Self::new_with_mode(misses, true).await
+        }
+
+        async fn new_with_mode(misses: u32, fail_as_error: bool) -> Self {
             use crate::community_membership::{
                 mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload,
                 MembershipEventKind, SignedMembershipEvent,
@@ -8181,7 +8240,8 @@ mod tests {
                 cas_op_tx,
                 std::time::Duration::from_secs(2),
             ));
-            let (store, get_calls, last_budget_ms) = MissingUntilStore::new(cs_b_inner, misses);
+            let (store, get_calls, last_budget_ms) =
+                MissingUntilStore::new_with_mode(cs_b_inner, misses, fail_as_error);
             let cs_b: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
 
             let dir_a = tempfile::tempdir().expect("dir a");
@@ -8535,6 +8595,77 @@ mod tests {
         );
     }
 
+    /// ZEB-805 r1: a content-store ERROR is the same transient class as a miss
+    /// and must retry identically.
+    ///
+    /// This arm used to return `ErrPreMutation` and terminate on the first
+    /// occurrence, while `fleet_sync` — the engine this one's comments say it
+    /// mirrors — returned `FetchMiss` and retried. Two engines disagreeing on
+    /// one condition is the exact shape of the bug ZEB-805 was filed for; the
+    /// only variant today (`ContentStoreError::Io`) is raised for a zenoh
+    /// open/transport failure, which is precisely what a bounded retry is for.
+    #[tokio::test(start_paused = true)]
+    async fn content_store_error_retries_like_a_fetch_miss() {
+        let f = RetryFixture::new_erroring(1).await;
+        assert!(
+            f.await_channel_materialized().await,
+            "a transient content-store ERROR must retry and land, not drop"
+        );
+        assert_eq!(
+            f.stats.fetch_retries_scheduled.load(Ordering::SeqCst),
+            1,
+            "exactly one retry scheduled"
+        );
+        assert_eq!(
+            f.get_calls.load(Ordering::SeqCst),
+            2,
+            "one error plus one successful retry"
+        );
+    }
+
+    /// ZEB-805 r1: a re-injected retry must NOT stamp `last_inbound_ms`.
+    ///
+    /// That field means "a publish arrived from the network", and the whole
+    /// diagnostic value of the ZEB-805 health surface is the DIVERGENCE between
+    /// it and `last_advance_ms`. A retry is this engine talking to itself, so
+    /// counting it would let a silent transport keep looking live for as long
+    /// as the retry chain runs — blunting the one signal that distinguishes
+    /// "receiving and discarding" from "genuinely quiet".
+    ///
+    /// Method: let the first (genuine) arrival stamp, then overwrite with a
+    /// sentinel and run the rest of the retry chain to exhaustion. Any stamp
+    /// from a retry destroys the sentinel. A wall-clock comparison would not
+    /// work here — `now_ms()` reads `SystemTime`, which tokio's paused clock
+    /// does not advance, so two real stamps could be equal.
+    #[tokio::test(start_paused = true)]
+    async fn retry_reinjection_does_not_stamp_inbound_arrival() {
+        const SENTINEL: u64 = 424_242;
+        let f = RetryFixture::new(u32::MAX).await; // never fetchable: full chain
+
+        // Wait until the genuine arrival has been processed (a retry is
+        // scheduled synchronously on its miss), so the sentinel cannot race it.
+        for _ in 0..400 {
+            if f.stats.fetch_retries_scheduled.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            f.stats.fetch_retries_scheduled.load(Ordering::SeqCst) > 0,
+            "fixture never scheduled a retry — the test cannot pin anything"
+        );
+
+        f.stats.last_inbound_ms.store(SENTINEL, Ordering::SeqCst);
+        f.await_exhaustion().await;
+
+        assert_eq!(
+            f.stats.last_inbound_ms.load(Ordering::SeqCst),
+            SENTINEL,
+            "retries re-injected {} frames; none of them may report as inbound \
+             network activity",
+            crate::content_store::fetch_retry::ATTEMPTS
+        );
+    }
     /// ZEB-434 Task 10: end-to-end repro pin for the live bug — a
     /// channel created while a member was offline stayed invisible to
     /// them indefinitely (the root publish fired into the void; no

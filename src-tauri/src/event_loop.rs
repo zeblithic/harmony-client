@@ -5010,8 +5010,11 @@ pub async fn run(
                                     // recovery)". It does not. The recovery that
                                     // claim named — the next state-root from any
                                     // peer — is a LARGER blob fetched under the
-                                    // SAME budget, so each timeout makes the next
-                                    // likelier, and a transient miss became a
+                                    // SAME budget. Attempts are independent; their
+                                    // difficulty is not, because state only grows,
+                                    // so that recovery path is anti-correlated
+                                    // with the failure it is supposed to repair —
+                                    // and a transient miss became a
                                     // 90-minute silent partition. Ok(None) means
                                     // "not fetchable within the caller's budget";
                                     // deciding what to do about that belongs to
