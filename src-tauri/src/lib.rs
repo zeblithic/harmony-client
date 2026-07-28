@@ -13694,6 +13694,52 @@ pub async fn start_node_inner(
                     // freshly spawned handle by letting it fall out of scope.
                 }
             }
+            // ── ZEB-787: boot-eager voting reconcile ───────────────────
+            // Load each joined community's persisted voting log into
+            // `voting_logs` so read verbs (voting_get_tier2_proposal, the
+            // Tier-3 GET, list verbs) answer for persisted governance state
+            // immediately after a restart, instead of returning "not found"
+            // until a mutating voting IPC lazily reconciles the community.
+            // Reconcile-only — the voting engine still spawns lazily via
+            // ensure_voting_engine_for, which is idempotent with a pre-
+            // populated log. Runs before the tick below so the first
+            // threshold/finalize/archive sweep sees restored polls.
+            {
+                let boot_handles = {
+                    let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                    if guard.generation == our_gen {
+                        match (guard.community_registry.clone(), guard.crdt_state.clone()) {
+                            (Some(community_registry), Some(crdt_state)) => Some((
+                                std::sync::Arc::clone(&guard.voting_logs),
+                                community_registry,
+                                crdt_state,
+                            )),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some((voting_logs_boot, community_registry, crdt_state_boot)) = boot_handles
+                {
+                    let community_ids = community_registry.spawned_community_ids().await;
+                    let identity_dir = crate::owner_commands::resolve_identity_dir().ok();
+                    let resolver: std::sync::Arc<
+                        dyn crate::community_voting_log::MembershipSnapshotResolver,
+                    > = std::sync::Arc::new(NodeStateMembershipResolver {
+                        community_registry,
+                        crdt_state: crdt_state_boot,
+                    });
+                    reconcile_all_joined_communities_voting(
+                        &voting_logs_boot,
+                        identity_dir.as_deref(),
+                        &community_ids,
+                        &resolver,
+                    )
+                    .await;
+                }
+            }
+
             // ── ZEB-291 Phase 2 Task 20 — periodic voting tick ─────────
             // Spawn one tick task per start_node lifetime: walks the
             // (now-tokio-Mutex) voting_logs registry every 60s in prod,
