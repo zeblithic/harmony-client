@@ -127,6 +127,7 @@ pub mod community_dfrost_log;
 pub mod community_dfrost_log_engine;
 pub mod community_dfrost_types;
 pub mod community_fork;
+pub mod community_gateway_dial_driver;
 pub mod community_invite;
 pub mod community_membership;
 pub mod community_presence;
@@ -1423,6 +1424,11 @@ pub struct NodeState {
     /// for a read that's already cheap to lock.
     pub vine_pull_driver: Option<std::sync::Arc<crate::vine_pull_driver::VinePullDriver>>,
 
+    /// ZEB-824: join handle for the member session-bootstrap ("gateway dial")
+    /// driver task (`community_gateway_dial_driver::CommunityGatewayDialDriver::spawn`).
+    /// Held so stop_inner can abort it.
+    pub gateway_dial_driver_handle: Option<tokio::task::JoinHandle<()>>,
+
     /// ZEB-418 SP2 P2: dm-outhold dataset (sender-side outbound-hold blobs,
     /// spec D12). `Some` while the node is running and an owner identity is
     /// loaded; `None` before the FleetSyncEngine is wired at startup or
@@ -2069,6 +2075,9 @@ impl Default for NodeState {
             // ZEB-811 Task 9: the driver Arc itself stays None alongside the
             // handle + wake above until start_node wires it.
             vine_pull_driver: None,
+            // ZEB-824: gateway-dial driver handle stays None until start_node
+            // wires the driver (mirrors the two pull-driver handles above).
+            gateway_dial_driver_handle: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles stay
             // None until start_node wires the FleetSyncEngines (mirrors
             // dm-inbox).
@@ -2810,6 +2819,12 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // ZEB-811 Task 9: drop the driver Arc too — a restart rebuilds a
         // fresh one alongside the handle + wake above.
         guard.vine_pull_driver = None;
+        // ZEB-824: abort the gateway-dial driver task (None until the boot
+        // wiring's spawn site populates it, so this is a correct no-op
+        // pre-boot).
+        if let Some(h) = guard.gateway_dial_driver_handle.take() {
+            h.abort();
+        }
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -4193,6 +4208,11 @@ pub async fn start_node_inner(
         let mut vine_pull_driver_opt: Option<
             std::sync::Arc<crate::vine_pull_driver::VinePullDriver>,
         > = None;
+        // ZEB-824: carrier for the gateway-dial driver's JoinHandle (built in
+        // the same iroh-endpoint gate as the two pull drivers above). Same
+        // shape as `vine_pull_driver_handle_opt`: `.take()`n into NodeState on
+        // the success path, aborted by the failure-cleanup path otherwise.
+        let mut gateway_dial_driver_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut relay_sync_handles_opt: Option<crate::event_loop::RelaySyncHandles> = None;
         // ZEB-418 SP2 P2: dm-outhold + fleet-net fleet-sync engines + their
         // NodeState handles. Built alongside the dm-inbox engine when an
@@ -4402,6 +4422,14 @@ pub async fn start_node_inner(
         > = None;
         let mut vine_pull_telemetry_for_state: Option<
             std::sync::Arc<crate::network_health::VinePullTelemetry>,
+        > = None;
+        // ZEB-824: same outer-scope hand-out for the gateway-dial driver's
+        // bootstrap telemetry. Absent (no iroh endpoint / no owner ⇒ no driver)
+        // means "this node runs no gateway-dial wiring" — reported differently
+        // from a wired driver that is resolving nothing, which is the incident
+        // state.
+        let mut gateway_bootstrap_telemetry_for_state: Option<
+            std::sync::Arc<crate::network_health::GatewayBootstrapTelemetry>,
         > = None;
         // ZEB-217 Sub-C Phase 2 Task 13: per-community engine pool +
         // adapter requests handed to the event loop. Both stay None /
@@ -10996,6 +11024,62 @@ pub async fn start_node_inner(
                                         Some(std::sync::Arc::clone(&vine_pull_driver));
                                     vine_pull_driver_handle_opt = Some(vine_pull_driver.spawn());
 
+                                    // ZEB-824: member session-bootstrap driver
+                                    // ("gateway dial"). Spawned in this same
+                                    // iroh-endpoint gate; a feeder for the
+                                    // reconnect supervisor — resolves the
+                                    // community rendezvous beacon from pkarr
+                                    // when a community has no live member
+                                    // session and seeds it into the
+                                    // reachability resolver.
+                                    // `driver.spawn()` returns immediately
+                                    // (never inline-awaited here, per the
+                                    // start_node inline-await hazard).
+                                    let gateway_bootstrap_telemetry = std::sync::Arc::new(
+                                        crate::network_health::GatewayBootstrapTelemetry::new(),
+                                    );
+                                    gateway_bootstrap_telemetry_for_state =
+                                        Some(std::sync::Arc::clone(&gateway_bootstrap_telemetry));
+                                    // A second reader over the SAME snapshot the
+                                    // relay pull driver reads (and the refresher
+                                    // task above writes) — sync closure, no
+                                    // await.
+                                    let gateway_joined: crate::community_relay_pull_driver::JoinedCommunitiesFn = {
+                                        let s = std::sync::Arc::clone(&joined_snapshot);
+                                        std::sync::Arc::new(move || {
+                                            s.lock().unwrap_or_else(|p| p.into_inner()).clone()
+                                        })
+                                    };
+                                    let gateway_driver = std::sync::Arc::new(
+                                        crate::community_gateway_dial_driver::CommunityGatewayDialDriver::new(
+                                            std::sync::Arc::new(
+                                                crate::community_gateway_dial_driver::ProdGatewayDialCtx {
+                                                    registry: std::sync::Arc::clone(&registry),
+                                                    self_owner,
+                                                },
+                                            ),
+                                            std::sync::Arc::new(
+                                                crate::community_gateway_dial_driver::ProdBeaconResolver {
+                                                    pkarr: std::sync::Arc::clone(
+                                                        &pkarr_resolver_arc,
+                                                    ),
+                                                    // ZEB-806 shape: this
+                                                    // device's own iroh endpoint
+                                                    // id, so the resolve layer
+                                                    // filters our own slot
+                                                    // record.
+                                                    self_endpoint_id: *ep_arc
+                                                        .node_id()
+                                                        .as_bytes(),
+                                                },
+                                            ),
+                                            std::sync::Arc::new(reachability_resolver.clone()),
+                                            gateway_joined,
+                                        )
+                                        .with_telemetry(gateway_bootstrap_telemetry),
+                                    );
+                                    gateway_dial_driver_handle_opt = Some(gateway_driver.spawn());
+
                                     // D. Sender relay deposit client → inject into
                                     //    the DmOutbox (the drain's last-resort
                                     //    relay rung). Same identity material as
@@ -12320,6 +12404,10 @@ pub async fn start_node_inner(
                         // reads it repeatedly across the node's lifetime, so
                         // it is never `.take()`n).
                         guard.vine_pull_driver = vine_pull_driver_opt.clone();
+                        // ZEB-824: stash the gateway-dial driver's JoinHandle
+                        // (`.take()`n like the pull-driver handles above —
+                        // stop_inner aborts it).
+                        guard.gateway_dial_driver_handle = gateway_dial_driver_handle_opt.take();
                         // ZEB-418 SP2 P2: store the dm-outhold + fleet-net
                         // dataset handles (no IPC surface yet — stop_inner
                         // and the send_dm hold-write/apply-sweeper paths
@@ -12634,6 +12722,12 @@ pub async fn start_node_inner(
                             if let Some(t) = vine_pull_telemetry_for_state.as_ref() {
                                 nh.set_vine_pull_source(std::sync::Arc::clone(t));
                             }
+                            // ZEB-824: gateway-dial bootstrap health. Same
+                            // additive, independently-absent shape as the
+                            // pairs above.
+                            if let Some(t) = gateway_bootstrap_telemetry_for_state.as_ref() {
+                                nh.set_gateway_bootstrap_source(std::sync::Arc::clone(t));
+                            }
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks
@@ -12834,6 +12928,9 @@ pub async fn start_node_inner(
             // lock-poison rollback that skips the guard block would otherwise
             // leak the spawned task).
             vine_pull_driver_handle_opt,
+            // ZEB-824: carry the gateway-dial driver's JoinHandle out too —
+            // same rationale as the handles above.
+            gateway_dial_driver_handle_opt,
             community_relay_gc_handle_opt,
             community_relay_refresher_handle_opt,
             node_addr_for_response,
@@ -12864,6 +12961,7 @@ pub async fn start_node_inner(
         mut community_relay_publisher_handle_for_cleanup,
         mut community_relay_pull_driver_handle_for_cleanup,
         mut vine_pull_driver_handle_for_cleanup,
+        mut gateway_dial_driver_handle_for_cleanup,
         mut community_relay_gc_handle_for_cleanup,
         mut community_relay_refresher_handle_for_cleanup,
         node_addr_for_response,
@@ -13050,6 +13148,11 @@ pub async fn start_node_inner(
         // ZEB-811 Task 8: same abort-if-Some cleanup for the vine-pull
         // driver's task.
         if let Some(h) = vine_pull_driver_handle_for_cleanup.take() {
+            h.abort();
+        }
+        // ZEB-824: same abort-if-Some cleanup for the gateway-dial driver's
+        // task.
+        if let Some(h) = gateway_dial_driver_handle_for_cleanup.take() {
             h.abort();
         }
         if let Some(h) = community_relay_gc_handle_for_cleanup.take() {
@@ -76130,6 +76233,8 @@ mod start_node_race_tests {
             vine_pull_wake: None,
             // ZEB-811 Task 9: the driver Arc unused in race tests.
             vine_pull_driver: None,
+            // ZEB-824: gateway-dial driver handle unused in race tests.
+            gateway_dial_driver_handle: None,
             // ZEB-418 SP2 P2: dm-outhold + fleet-net dataset handles unused
             // in race tests.
             dm_outhold_doc: None,

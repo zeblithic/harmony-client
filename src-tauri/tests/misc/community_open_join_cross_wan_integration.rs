@@ -199,6 +199,12 @@ struct OpenJoinSetup {
     alice_comm_sk: Arc<SigningKey>,
     alice_addr: OwnerAddr,
     bob_addr: OwnerAddr,
+    /// The exact 64-byte composite identity pub (X25519 ‖ Ed25519) handed to
+    /// `CommunityRendezvousPublisher::new`, which writes it into every slot
+    /// record's `harmony_identity_pub`. Exposed so a resolve-side test can pin
+    /// the identity bytes it read against the ones the publisher signed with,
+    /// rather than merely asserting they are non-zero (ZEB-824).
+    alice_identity_pub: [u8; 64],
     epoch_key: EpochKey,
     community_id: SpaceId,
     bob_bootstrap_join: SignedMembershipEvent,
@@ -647,6 +653,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         alice_comm_sk,
         alice_addr,
         bob_addr,
+        alice_identity_pub: alice_pub,
         epoch_key,
         community_id,
         bob_bootstrap_join,
@@ -1284,6 +1291,295 @@ async fn bob_open_join_redeem_spawns_channel_log_engine_in_session() {
     })
     .await
     .expect("bob_open_join_redeem_spawns_channel_log_engine_in_session timed out at 60s");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// ZEB-824: the identity-preserving, self-filtering rendezvous resolve.
+//
+// A member-side gateway dial (unlike an open-join joiner) must know WHO the
+// beacon is before trusting it, and must never dial itself. Both properties are
+// resolve-layer concerns, so they are pinned here against the same live
+// mock-relay harness the open-join tests use.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// ZEB-824: the identified resolve returns the beacon's identity alongside the
+/// payload, so a member-side caller can derive the beacon's OwnerAddr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identified_resolve_returns_beacon_identity() {
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let setup = setup_two_party_open_join().await;
+        let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
+        assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
+        await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
+
+        let res = harmony_app::community_rendezvous::resolve_rendezvous_identified(
+            &setup.pkarr_resolver,
+            &setup.epoch_key,
+            [0xEE; 32], // NOT alice's endpoint id — no self-filtering here
+            wall_ms(),
+            &harmony_app::community_rendezvous::rendezvous_config_from_env(),
+        )
+        .await;
+
+        // Happy path against a live mock relay: no slot probe may error at
+        // the pkarr layer, or the ResolveError split (review r1 finding 2)
+        // would misreport this very scenario.
+        assert_eq!(
+            res.resolve_errors, 0,
+            "a clean resolve must report zero pkarr-layer probe errors"
+        );
+        // Slot 0 answers on the FIRST batch when we are not filtering ourselves.
+        // Paired with the `batches_tried == curve.len()` assertion in
+        // `identified_resolve_filters_own_endpoint`, this makes the widening
+        // claim a real differential: same curve, same published record, and the
+        // batch count moves 1 → full-curve purely because of the self-filter.
+        assert_eq!(
+            res.outcome.batches_tried, 1,
+            "an unfiltered live slot 0 must resolve on the first batch"
+        );
+        assert_eq!(
+            res.outcome.winning_slot,
+            Some(0),
+            "slot 0 is the live beacon"
+        );
+
+        let beacon = res
+            .outcome
+            .payload
+            .expect("alice's slot-0 beacon must resolve");
+        assert_eq!(
+            beacon.payload.iroh_node_id,
+            *setup.alice_ep.node_id().as_bytes(),
+            "payload must be alice's endpoint"
+        );
+        // The outer record's identity must ride along (this is what the plain
+        // resolve_rendezvous throws away) — pinned to the EXACT bytes the
+        // publisher signed the record with. A mere non-zero check would also
+        // pass if the resolver returned `rec.inner_sig`, which is likewise
+        // `[u8; 64]` and likewise non-zero.
+        //
+        // Since the membership gate was removed (spec §5c, epoch-envelope
+        // trust), this assertion matters MORE than it did when it was written.
+        // That wrong-field bug used to be caught downstream — the gate would
+        // reject every beacon, loudly and permanently. Now nothing downstream
+        // inspects these bytes: the driver derives the seed key straight from
+        // them, so a wrong field would silently seed every beacon under a
+        // garbage owner. Quieter, and worse. This is the only check standing
+        // between that bug and the dial view.
+        assert_eq!(
+            beacon.beacon_identity_pub, setup.alice_identity_pub,
+            "beacon_identity_pub must be the record's harmony_identity_pub — the composite \
+             X25519 ‖ Ed25519 pub the rendezvous publisher was constructed with — and not \
+             some other 64-byte field of the record"
+        );
+
+        setup.publisher_handle.abort();
+        setup.alice_ep.shutdown().await;
+        setup.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("identified_resolve_returns_beacon_identity timed out at 60s");
+}
+
+/// ZEB-824 self-dial hazard: a member that IS the beacon must see its own slot
+/// as empty (spec §5, decode-layer self-filter). With only slot 0 published,
+/// filtering self leaves nothing to resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identified_resolve_filters_own_endpoint() {
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let setup = setup_two_party_open_join().await;
+        let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
+        assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
+        await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
+
+        let cfg = harmony_app::community_rendezvous::rendezvous_config_from_env();
+        let res = harmony_app::community_rendezvous::resolve_rendezvous_identified(
+            &setup.pkarr_resolver,
+            &setup.epoch_key,
+            *setup.alice_ep.node_id().as_bytes(), // we ARE alice
+            wall_ms(),
+            &cfg,
+        )
+        .await;
+
+        // Happy path at the pkarr layer even though nothing resolves: the
+        // self-filter is a decode-layer decision, not a probe failure, so it
+        // must NOT count as a resolve error (review r1 finding 2 — this is
+        // exactly the "no beacon published" proof-shaped absence).
+        assert_eq!(
+            res.resolve_errors, 0,
+            "a self-filtered miss must report zero pkarr-layer probe errors"
+        );
+        assert!(
+            res.outcome.payload.is_none(),
+            "own beacon record must be filtered, not returned as a dial candidate"
+        );
+        assert_eq!(
+            res.outcome.winning_slot, None,
+            "a filtered slot must not be reported as a winner"
+        );
+        // The OTHER half of the spec §5 claim: filtering happens at the decode
+        // layer, so our own slot reads as EMPTY and the escalating driver keeps
+        // widening — it must exhaust the whole curve rather than stopping at the
+        // batch that contained our record. Had the filter instead short-circuited
+        // the driver (or had slot 0 answered), this would be 1, not the full
+        // curve length.
+        assert_eq!(
+            res.outcome.batches_tried,
+            cfg.batch_curve.len(),
+            "self-filtered slot 0 must read as empty so the driver widens through \
+             every batch in the curve"
+        );
+
+        setup.publisher_handle.abort();
+        setup.alice_ep.shutdown().await;
+        setup.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("identified_resolve_filters_own_endpoint timed out at 60s");
+}
+
+/// ZEB-824 headline scenario (spec §8): a member with an EMPTY reachability
+/// resolver — rebuilt node, no addrbook sidecar, LAN scouting off — bootstraps a
+/// dial candidate out of the rendezvous beacon in a single pass, against the
+/// live mock relay.
+///
+/// **Trust model (Jake's decision, spec §5c): epoch-envelope only**, the same
+/// trust open-join already places in this record family. The driver does NOT
+/// check the beacon identity against membership — that check compared the
+/// repo's two non-convergent 16-byte notions and so rejected every beacon,
+/// making the feature a no-op. ZEB-827 carries the principled binding.
+///
+/// The flavors here are therefore PRODUCTION-FAITHFUL and deliberately
+/// mismatched, which is the point:
+/// - the member set is keyed by Alice's MASTER addr (`alice_addr`), matching
+///   what `ProdGatewayDialCtx::members_of` really returns — verified
+///   experimentally on this harness — and it now only drives the STARVED
+///   predicate;
+/// - the seed lands under the COMPOSITE device-address owner derived from the
+///   record's identity bytes, so that is what the assertions read.
+///
+/// Kick coverage lives in the driver's own unit test
+/// (`community_gateway_dial_driver::tests::explicit_kick_fires_when_the_seed_raises_no_auto_kick`);
+/// the supervisor dirty-set accessor it asserts on is `cfg(test)`-gated and so
+/// invisible from an integration test. Here the seed is the assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let setup = setup_two_party_open_join().await;
+        let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
+        assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
+        await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
+        let alice_node_id = *setup.alice_ep.node_id().as_bytes();
+
+        // The owner the driver derives from the record's identity bytes — the
+        // composite device-address hash, and the key the seed lands under.
+        // Distinct from `alice_addr` (her master addr, used for the member set
+        // below); that split is the production reality, not a harness quirk.
+        let alice_beacon_owner = OwnerAddr(
+            harmony_identity::Identity::from_public_bytes(&setup.alice_identity_pub)
+                .expect("alice's published identity bytes must parse")
+                .address_hash,
+        );
+
+        // A local `GatewayDialCtx`: the traits are pub, but the lib's
+        // `cfg(test)` stubs are not visible from an integration test. Alice is
+        // this community's one Joined member (self excluded, as production's
+        // `ProdGatewayDialCtx::members_of` does), keyed by her MASTER addr —
+        // which is all `members_of` feeds now: the starved predicate.
+        struct ItCtx {
+            community: SpaceId,
+            alice: OwnerAddr,
+            key: EpochKey,
+        }
+        #[async_trait::async_trait]
+        impl harmony_app::community_gateway_dial_driver::GatewayDialCtx for ItCtx {
+            async fn members_of(&self, c: &SpaceId) -> Vec<OwnerAddr> {
+                if *c == self.community {
+                    vec![self.alice]
+                } else {
+                    vec![]
+                }
+            }
+            async fn epoch_key_of(&self, _c: &SpaceId) -> Option<EpochKey> {
+                Some(self.key.clone())
+            }
+        }
+
+        // Bob's dial view as it comes up from a rebuild: empty, so the community
+        // is starved on the very first pass and the beacon is his only candidate
+        // source.
+        let resolver = Arc::new(ReachabilityResolver::new());
+        assert!(
+            resolver.resolve_by_node_id(&alice_node_id).is_none(),
+            "precondition: bob's dial view must start empty, or the seed proves nothing"
+        );
+
+        let community = setup.community_id;
+        let telemetry = Arc::new(harmony_app::network_health::GatewayBootstrapTelemetry::new());
+        let driver = harmony_app::community_gateway_dial_driver::CommunityGatewayDialDriver::new(
+            Arc::new(ItCtx {
+                community,
+                alice: setup.alice_addr,
+                key: setup.epoch_key.clone(),
+            }),
+            Arc::new(
+                harmony_app::community_gateway_dial_driver::ProdBeaconResolver {
+                    pkarr: Arc::clone(&setup.pkarr_resolver),
+                    self_endpoint_id: *setup.bob_ep.node_id().as_bytes(),
+                },
+            ),
+            Arc::clone(&resolver),
+            Arc::new(move || vec![community]),
+        )
+        .with_telemetry(Arc::clone(&telemetry));
+
+        driver.run_one_pass().await;
+
+        let (owner, payload) = resolver
+            .resolve_by_node_id(&alice_node_id)
+            .expect("alice's beacon must be seeded from the mock relay in one pass");
+        assert_eq!(
+            owner, alice_beacon_owner,
+            "the seed must be keyed by the composite OwnerAddr derived from the record's \
+             identity, not by the epoch-key holder and not by her master addr"
+        );
+        assert_ne!(
+            alice_beacon_owner, setup.alice_addr,
+            "precondition: the two owner flavors really are distinct here, so the \
+             assertion above is pinning the composite one specifically"
+        );
+        assert_eq!(
+            payload.iroh_node_id, alice_node_id,
+            "the seeded routing blob must be alice's endpoint — the thing the reconnect \
+             supervisor's record gate needs before it will dial her"
+        );
+        // Review INFO-1: pin the verdict too, so a future regression reports
+        // WHICH outcome the pass reached rather than only "no seed".
+        let summary = telemetry.summary();
+        assert_eq!(
+            summary
+                .per_community
+                .iter()
+                .find(|row| row.community_short == hex::encode(&community.0[..4]))
+                .map(|row| row.outcome.as_str()),
+            Some("beaconSeeded"),
+            "the pass must record the seed verdict for this community"
+        );
+        assert_eq!(summary.beacons_seeded, 1);
+
+        setup.publisher_handle.abort();
+        setup.alice_ep.shutdown().await;
+        setup.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("gateway_dial_driver_bootstraps_from_rendezvous_beacon timed out at 60s");
 }
 
 // The escalating-batch failover test (Test 2) needs ≥2 slots to widen past a
