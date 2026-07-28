@@ -266,19 +266,49 @@ impl CommunityGatewayDialDriver {
             let Ok(identity) =
                 harmony_identity::Identity::from_public_bytes(&hit.beacon_identity_pub)
             else {
+                // Defensive only on the production path: `PkarrResolver::resolve`
+                // already parsed this same Ed25519 half to verify the record's
+                // inner signature, so a record that reaches here unparseable
+                // cannot have arrived through `ProdBeaconResolver`. Firing means
+                // a wire-format or publisher bug (or a non-prod `BeaconResolver`)
+                // — never an attacker — and it would otherwise present as an
+                // ordinary `rejectedNonMember` tick with no context at all.
+                tracing::warn!(
+                    community = ?community,
+                    node_id = %hex::encode(&hit.payload.iroh_node_id[..8]),
+                    "ZEB-824: beacon identity failed to decode — record passed inner-sig verification but its identity bytes are unparseable"
+                );
                 self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
                 continue;
             };
             let beacon_owner = OwnerAddr(identity.address_hash);
             // Secondary self-guard (primary is the resolve-layer endpoint-id
             // filter): a same-owner sibling record is the fleet seed path's
-            // job, not ours (spec §5.b). The membership gate is the security
-            // one: the record proves its writer holds the epoch key AND the
-            // claimed identity's signing key, but only membership stops a
-            // leaked epoch key from steering our dials at an attacker.
-            if beacon_owner == self.self_owner || !members.contains(&beacon_owner) {
+            // job, not ours (spec §5.b). Checked before the membership gate so
+            // a self-record is never reported as a stranger.
+            if beacon_owner == self.self_owner {
                 self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
-                tracing::info!(community = ?community, "ZEB-824: beacon rejected (self-owner or non-member identity)");
+                tracing::info!(
+                    community = ?community,
+                    beacon_owner = %hex::encode(&beacon_owner.0[..4]),
+                    node_id = %hex::encode(&hit.payload.iroh_node_id[..8]),
+                    "ZEB-824: beacon rejected — our own owner address; a sibling device is the fleet seed path's job"
+                );
+                continue;
+            }
+            // The security gate: the record proves its writer holds the epoch
+            // key AND the claimed identity's signing key, but only membership
+            // stops a LEAKED epoch key from steering our dials at an attacker
+            // endpoint. When this fires in the fleet the first two questions are
+            // "which identity" and "which endpoint" — so both are on the line.
+            if !members.contains(&beacon_owner) {
+                self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
+                tracing::info!(
+                    community = ?community,
+                    beacon_owner = %hex::encode(&beacon_owner.0[..4]),
+                    node_id = %hex::encode(&hit.payload.iroh_node_id[..8]),
+                    "ZEB-824: beacon rejected — identity is not a Joined member of this community"
+                );
                 continue;
             }
             let node_id = hit.payload.iroh_node_id;
@@ -566,6 +596,75 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // 1b. The EXPLICIT kick, isolated: when the seed changes nothing in the
+    //     resolver, the resolver's own auto-kick stays silent and the pass
+    //     must still raise the peer.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn explicit_kick_fires_when_the_seed_raises_no_auto_kick() {
+        // Review MAJOR-1: test 1 starts from an EMPTY resolver, so its kick
+        // assertion is satisfied by `update_with_source`'s first-learn
+        // auto-kick alone — deleting the driver's explicit kick leaves it
+        // green. This is the case the explicit kick exists for: a node whose
+        // supervisor slot was evicted (membership churn) while its resolver
+        // row survived. Nothing else would ever re-raise that peer.
+        let community = SpaceId([0x1C; 16]);
+        let (member_pub, member_owner) = test_member(14);
+        let beacon_node_id = [0xCC; 32];
+        let handle = SupervisorHandle::new();
+        let h = harness(
+            community,
+            vec![member_owner],
+            Some(beacon(member_pub, beacon_node_id)),
+            true,
+            Some(handle.clone()),
+        );
+
+        // Pre-seed the SAME record the beacon will carry, then clear the
+        // supervisor state that pre-seed raised.
+        h.resolver.update(
+            member_owner,
+            test_payload(beacon_node_id),
+            hlc(1_700_000_000_000),
+        );
+        handle.evict_peer(beacon_node_id);
+        assert!(
+            handle.pending_trigger(beacon_node_id).is_none(),
+            "control: the dirty set starts clear"
+        );
+
+        // Control for the whole test: replaying the driver's seed BY ITSELF
+        // raises nothing, because the effective dial addressing is unchanged
+        // (`was_present` && `before_view == after_view`). Without this the
+        // assertion below could not distinguish the two kick sources.
+        h.resolver
+            .seed_from_pkarr(
+                member_owner,
+                DeviceIdentityHash([0u8; 16]),
+                test_payload(beacon_node_id),
+            )
+            .await;
+        assert!(
+            handle.pending_trigger(beacon_node_id).is_none(),
+            "control: an addressing-identical seed must not auto-kick"
+        );
+
+        h.driver.run_one_pass().await;
+
+        // Only the driver's explicit kick can have produced this.
+        assert_eq!(
+            handle.pending_trigger(beacon_node_id),
+            Some(ReconnectTrigger::NewPeer),
+            "the explicit kick is the sole path that re-raises an evicted peer \
+             whose resolver row survived"
+        );
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("beaconSeeded")
+        );
+    }
+
+    // ------------------------------------------------------------------
     // 2. A Connected member ⇒ healthy ⇒ no resolve call.
     // ------------------------------------------------------------------
     #[tokio::test]
@@ -603,6 +702,59 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // 2b. A member with TWO devices, only one Connected, reads healthy.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn multi_device_member_reads_healthy_from_its_connected_device() {
+        // Review MAJOR-2: this is the falsifier for the deliberate deviation
+        // from the brief's `owner → node_id` HashMap. `list_dialable_peers`
+        // emits one row per (owner, DEVICE) out of a BTreeMap keyed by
+        // (owner, node_id), so collecting it into a per-owner map keeps
+        // whichever row sorts LAST — for a two-device member that is the idle
+        // device roughly half the time, and the community then reads as
+        // starved and burns a pkarr resolve it does not need. Both node-id
+        // orderings are exercised so the test bites regardless of iteration
+        // order (and would keep biting if the map ever stopped being sorted).
+        for (connected_node, idle_node) in [([0x11; 32], [0xEE; 32]), ([0xEE; 32], [0x11; 32])] {
+            let community = SpaceId([0x1D; 16]);
+            let (member_pub, member_owner) = test_member(15);
+            let handle = SupervisorHandle::new();
+            let h = harness(
+                community,
+                vec![member_owner],
+                Some(beacon(member_pub, [0x22; 32])),
+                true,
+                Some(handle.clone()),
+            );
+            // Two genuinely distinct devices for ONE owner: different node ids
+            // and different home relays.
+            let mut idle_payload = test_payload(idle_node);
+            idle_payload.home_relay_url = "https://idle.example/".into();
+            h.resolver
+                .update(member_owner, idle_payload, hlc(1_700_000_000_000));
+            h.resolver.update(
+                member_owner,
+                test_payload(connected_node),
+                hlc(1_700_000_000_000),
+            );
+            handle.mark_connected(connected_node);
+
+            h.driver.run_one_pass().await;
+
+            assert_eq!(
+                h.beacons.calls(),
+                0,
+                "one connected device is a live session for the member \
+                 (connected={connected_node:?} idle={idle_node:?})"
+            );
+            assert_eq!(
+                outcome_of(&h.telemetry, &community).as_deref(),
+                Some("healthy")
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 3. A Connected NON-member does not mask starvation.
     // ------------------------------------------------------------------
     #[tokio::test]
@@ -634,6 +786,13 @@ mod tests {
             h.beacons.calls(),
             1,
             "a non-member session must not read as community health"
+        );
+        // Review INFO-11: without this the test would also pass for a
+        // predicate that ignored connectivity entirely. The verdict row shows
+        // the pass ran to completion rather than merely reaching the resolver.
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("beaconSeeded")
         );
     }
 
