@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand::{Rng, SeedableRng};
@@ -205,9 +205,11 @@ struct PeerSlot {
     /// ZEB-622: set by `mark_connected` when an inbound connect lands on a peer
     /// that has connected before and is not currently `Connected` — a real
     /// (non-Connected)→Connected recovery edge. `mark_connected` has no
-    /// resolver/telemetry access, so it defers the `reconnected` marker; the
-    /// supervisor loop drains this flag on its next pass (owner via the resolver,
-    /// marker via telemetry) and clears it.
+    /// resolver access (the `reconnected` ring marker needs the peer's owner
+    /// addr), so it defers the marker; the supervisor loop drains this flag on
+    /// its next pass (owner via the resolver, marker via telemetry) and clears
+    /// it. (The ZEB-804 `connected_via_registry` counter needs no owner and is
+    /// stamped by `mark_connected` directly.)
     pending_reconnected_marker: bool,
 }
 
@@ -230,6 +232,16 @@ struct SupervisorInner {
     sweep_requested: AtomicBool,
     /// Wakes the loop on any kick / sweep / connect.
     notify: Notify,
+    /// ZEB-804 (spec §8): optional dial-telemetry sink for the
+    /// `connected_via_registry` counter. Installed once by
+    /// [`run_reconnect_supervisor`] (which already receives the shared
+    /// `DialTelemetry` Arc — no new wiring); absent on handles whose loop
+    /// never started (hermetic tests), where `mark_connected` simply doesn't
+    /// stamp. NOTE: because the install rides loop startup, a registry swap in
+    /// the narrow window between the transport's `set_reconnect_handle` and
+    /// the loop task's first poll goes uncounted — acceptable for a
+    /// legibility counter.
+    dial_telemetry: OnceLock<Arc<DialTelemetry>>,
 }
 
 /// Producer-facing handle. Cheap to clone (shared `Arc`); every method is
@@ -253,6 +265,7 @@ impl SupervisorHandle {
                 states: Mutex::new(HashMap::new()),
                 sweep_requested: AtomicBool::new(false),
                 notify: Notify::new(),
+                dial_telemetry: OnceLock::new(),
             }),
         }
     }
@@ -272,6 +285,15 @@ impl SupervisorHandle {
                 .or_insert(trigger);
         }
         self.inner.notify.notify_one();
+    }
+
+    /// ZEB-804 (spec §8): install the shared [`DialTelemetry`] so
+    /// [`mark_connected`](Self::mark_connected) can stamp the
+    /// `connected_via_registry` counter. Install-once; a later install is
+    /// ignored (all production paths share one Arc, so first-wins is
+    /// equivalent). Called by [`run_reconnect_supervisor`] at startup.
+    pub fn set_dial_telemetry(&self, telemetry: Arc<DialTelemetry>) {
+        let _ = self.inner.dial_telemetry.set(telemetry);
     }
 
     /// Request a presence sweep (re-arm all known non-connected peers). Subject
@@ -313,6 +335,15 @@ impl SupervisorHandle {
             // re-dial after a subsequent `Dropped` until that stale dial
             // finally resolved.
             slot.dial_in_flight = false;
+        }
+        // ZEB-804 (spec §8): every registry-swap Connected entry bumps the
+        // lifetime `connected_via_registry` counter (a superseding same-peer
+        // swap counts again — it is a new registry swap). This is what lets
+        // `dialStatus` read "healthy inbound-connected listener" instead of
+        // "attempts: 0, is dialing broken?". No-op until
+        // `run_reconnect_supervisor` installs the telemetry.
+        if let Some(telemetry) = self.inner.dial_telemetry.get() {
+            telemetry.record_connected_via_registry();
         }
         self.inner.notify.notify_one();
     }
@@ -460,6 +491,11 @@ pub async fn run_reconnect_supervisor(
     config: SupervisorConfig,
 ) {
     let inner = handle.inner.clone();
+    // ZEB-804: give `mark_connected` — the registry-swap seam — the telemetry
+    // so it can stamp `connected_via_registry`. Rides the Arc this loop
+    // already receives; install-once (a re-run on the same handle keeps the
+    // first, identical, Arc).
+    handle.set_dial_telemetry(Arc::clone(&telemetry));
     let mut rng = ChaCha8Rng::seed_from_u64(config.jitter_seed.unwrap_or_else(rand::random));
     let sem = Arc::new(Semaphore::new(config.max_concurrent_dials.max(1)));
     let (res_tx, mut res_rx) = mpsc::unbounded_channel::<DialResult>();
@@ -1566,6 +1602,31 @@ mod tests {
             rung_hi(1_000),
             "dial at base after Dropped",
         );
+    }
+
+    /// ZEB-804 (spec §8/§10): `mark_connected` — the registry-swap seam — with
+    /// a telemetry installed stamps `connected_via_registry` and NOTHING else:
+    /// not `succeeded` (no ladder dial happened), no ring marker. A
+    /// superseding same-peer swap counts again; a handle with no telemetry
+    /// installed (hermetic tests, pre-loop boot window) must not panic.
+    #[test]
+    fn mark_connected_stamps_connected_via_registry_only() {
+        let telemetry = Arc::new(DialTelemetry::new());
+        let handle = SupervisorHandle::new();
+        handle.set_dial_telemetry(Arc::clone(&telemetry));
+        handle.mark_connected([7u8; 32]);
+        handle.mark_connected([7u8; 32]); // superseding swap → counts again
+        let s = telemetry.summary();
+        assert_eq!(s.connected_via_registry, 2);
+        assert_eq!(
+            (s.attempts, s.succeeded, s.failed),
+            (0, 0, 0),
+            "registry-swap connects never move the ladder's dial-outcome counters"
+        );
+        assert!(s.recent.is_empty(), "counter-only: no ring marker");
+        // No telemetry installed → mark_connected is stamp-free and safe.
+        let bare = SupervisorHandle::new();
+        bare.mark_connected([8u8; 32]);
     }
 
     /// Chronological (oldest→newest) list of ring-marker/dial outcomes.
