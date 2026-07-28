@@ -500,7 +500,7 @@ mod tests {
     /// A deterministic identity: the public half plus its 64-byte
     /// `to_public_bytes()` form (the shape the beacon record carries). The
     /// derived `OwnerAddr` is `identity.address_hash`, exactly the derivation
-    /// the driver's membership gate performs.
+    /// the driver performs to pick the seed key.
     fn test_identity(seed: u8) -> (harmony_identity::Identity, [u8; 64]) {
         let private = harmony_identity::PrivateIdentity::from_seed(&[seed; 32]);
         let identity = private.identity.clone();

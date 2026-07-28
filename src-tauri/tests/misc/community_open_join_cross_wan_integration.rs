@@ -1344,8 +1344,16 @@ async fn identified_resolve_returns_beacon_identity() {
         // resolve_rendezvous throws away) — pinned to the EXACT bytes the
         // publisher signed the record with. A mere non-zero check would also
         // pass if the resolver returned `rec.inner_sig`, which is likewise
-        // `[u8; 64]` and likewise non-zero; that bug would then surface only as
-        // Task 3's membership gate rejecting every beacon forever.
+        // `[u8; 64]` and likewise non-zero.
+        //
+        // Since the membership gate was removed (spec §5c, epoch-envelope
+        // trust), this assertion matters MORE than it did when it was written.
+        // That wrong-field bug used to be caught downstream — the gate would
+        // reject every beacon, loudly and permanently. Now nothing downstream
+        // inspects these bytes: the driver derives the seed key straight from
+        // them, so a wrong field would silently seed every beacon under a
+        // garbage owner. Quieter, and worse. This is the only check standing
+        // between that bug and the dial view.
         assert_eq!(
             beacon.beacon_identity_pub, setup.alice_identity_pub,
             "beacon_identity_pub must be the record's harmony_identity_pub — the composite \

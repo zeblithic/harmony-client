@@ -146,12 +146,18 @@ For each joined community, in `run_one_pass(now_ms)`:
    the outcome, advance the ladder, done for this community.
 5. **Beacon found** `(payload, beacon_identity_pub)`:
    a. Derive the beacon's owner address:
-      `harmony_identity::Identity::from_public_bytes(beacon_identity_pub).address_hash`
-      (the `community_invite.rs:1934` pattern).
-   b. Secondary self-guard: if the derived owner addr equals our own actor, skip (the
-      iroh-node-id filter in the decode closure is primary; this catches a same-owner
-      sibling device record, which is a candidate the fleet-sibling seed path already
-      covers).
+      `harmony_identity::Identity::from_public_bytes(beacon_identity_pub).address_hash`.
+      This is the **composite** device-address hash, and post-fix-round-2 it is used as the
+      **seed key** — not as an admission input (see c).
+   b. **Self-defense: the resolve-layer endpoint-id filter, and only that.** The decode
+      closure drops any slot whose `iroh_node_id` is our own endpoint (§5's decode-closure
+      subsection), so a self-owned record reads as empty and the escalating driver widens
+      past it. There is deliberately **no** owner-level secondary self-guard: it would
+      compare the composite owner derived in (a) against our master-flavored actor — the
+      two non-convergent notions — and so could never fire. It was removed in fix round 2
+      along with the membership gate; see c. The endpoint-id filter is flavor-free and
+      authoritative, and a same-owner sibling device record remains the fleet-sibling seed
+      path's concern rather than this driver's.
    c. **Trust gate: epoch-envelope only (open-join parity).** *Decision of record
       (Jake, 2026-07-27, fix round 2, superseding this step's original membership
       gate.)* Accept the beacon on the strength of what the record's envelope
@@ -193,7 +199,7 @@ For each joined community, in `run_one_pass(now_ms)`:
       than by community membership, so its coverage for a never-connected member on
       a rebuilt node — precisely ZEB-824's target case — is not established.
 
-   d. **Seed:**   d. **Seed:** keyed by the **composite** device-address owner derived in (a). Note the
+   d. **Seed:** keyed by the **composite** device-address owner derived in (a). Note the
       consequence: the addrbook row for that same node arrives later under the member's
       **master** owner, so the resolver briefly holds two entries for one node id under two
       owners. ZEB-704's `freshest_across_owners` dial view already resolves that shape, so
