@@ -344,11 +344,14 @@ pub struct DialHealthSummary {
     /// Connected entries via registry swap" — one per
     /// `SupervisorHandle::mark_connected` from a successful inbound-accept /
     /// outbound `new_link` registry swap (a superseding same-peer swap counts
-    /// again), monotone since process start. The counter that makes an
-    /// inbound-only node's `dialStatus` legible: `attempts == 0` beside
-    /// `connectedViaRegistry > 0` reads "healthy listener", not "dialing is
-    /// broken". `#[serde(default)]` keeps a pre-field snapshot
-    /// forward-compatible.
+    /// again), monotone since process start. NOT disjoint from `succeeded`: a
+    /// connection a successful supervisor-ladder dial produced ALSO lands as a
+    /// `new_link` registry swap, so it bumps both — this counter is a superset
+    /// of ladder-produced connections, not the ladder's complement. The
+    /// counter that makes an inbound-only node's `dialStatus` legible:
+    /// `attempts == 0` beside `connectedViaRegistry > 0` reads "healthy
+    /// listener", not "dialing is broken". `#[serde(default)]` keeps a
+    /// pre-field snapshot forward-compatible.
     #[serde(default)]
     pub connected_via_registry: u64,
     pub recent: Vec<DynamicDialHit>,

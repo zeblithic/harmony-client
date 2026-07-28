@@ -146,9 +146,14 @@ forever.
 
 ## 8. `dialStatus` legibility
 
-- New additive counter `connectedViaRegistry` (monotonic, process-lifetime): stamped at
-  the `mark_supervisor_connected` site (`zenoh_iroh_transport.rs`), counting Connected
-  entries that bypass the supervisor's dial ladder (inbound accepts + zenoh `new_link`).
+- New additive counter `connectedViaRegistry` (monotonic, process-lifetime): as
+  implemented, stamped inside `SupervisorHandle::mark_connected` itself
+  (`reconnect_supervisor.rs`; chosen over the `zenoh_iroh_transport.rs` call site — fewer
+  files, one authoritative choke point), counting every Connected entry that arrives via
+  the registry swap: inbound accepts AND all zenoh `new_link` outcomes — including the
+  connection a successful ladder dial produces. It is therefore a SUPERSET of
+  ladder-success connections, not their complement; `succeeded` and `connectedViaRegistry`
+  can both move on one dial (final-review as-implemented correction).
 - DTO doc comments (and `docs/headless-install.md` surface list if it documents the
   block) pin the scopes: `attempts/succeeded/failed` = "supervisor-ladder outbound dial
   outcomes since process start"; `connected/retrying/dormant` = "live supervisor peer
