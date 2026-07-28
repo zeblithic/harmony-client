@@ -120,9 +120,11 @@ impl GatewayDialCtx for ProdGatewayDialCtx {
     }
 }
 
-/// Per-community resolve backoff while starved. Present only for communities
-/// currently on the ladder; removed on heal, so a re-starved community starts
-/// again at the base delay.
+/// Per-community resolve backoff while starved. INVARIANT: an entry exists
+/// ONLY while its community's current episode is starved — removed on heal, on
+/// solo, on engine-unregistered, and on un-join (the pass-top prune) — so the
+/// next starved episode always starts again at the base delay instead of
+/// inheriting a stale rung (up to 600s of avoidable dark time).
 struct LadderState {
     next_attempt_ms: u64,
     delay_ms: u64,
@@ -242,7 +244,17 @@ impl CommunityGatewayDialDriver {
             .map(|(owner, _)| owner)
             .collect();
 
-        for community in (self.joined_communities)() {
+        let joined = (self.joined_communities)();
+        {
+            // Prune un-joined communities' ladder entries before iterating:
+            // a community that left the joined set is never examined by the
+            // loop again, so nothing else could ever clean its entry up, and
+            // a leave/rejoin cycle would otherwise resume a stale rung. This
+            // also bounds the map by the joined-set size.
+            let mut ladders = self.ladders.lock().unwrap_or_else(|p| p.into_inner());
+            ladders.retain(|c, _| joined.contains(c));
+        }
+        for community in joined {
             // The epoch key comes first because it is the ONLY signal that
             // separates "no engine registered" from "no members": production's
             // `members_of` returns an empty Vec for a missing engine, so a
@@ -252,9 +264,20 @@ impl CommunityGatewayDialDriver {
             // taking it before the ladder also keeps a registration gap from
             // arming the backoff — an unregistered engine never attempted
             // anything, and arming for it would delay the first REAL attempt
-            // by a full rung on every boot race.
+            // by a full rung on every boot race. Registration gaps also CLEAR
+            // any armed backoff, so the first real attempt after
+            // re-registration is never delayed by a stale rung.
             let Some(epoch_key) = self.ctx.epoch_key_of(&community).await else {
                 tracing::debug!(community = ?community, "ZEB-824: no engine registered; skipping this pass");
+                let cleared = self
+                    .ladders
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&community)
+                    .is_some();
+                if cleared {
+                    tracing::debug!(community = ?community, "ZEB-824: engine unregistered — bootstrap ladder cleared");
+                }
                 self.record(&community, GatewayBootstrapOutcome::EngineUnregistered);
                 continue;
             };
@@ -262,7 +285,18 @@ impl CommunityGatewayDialDriver {
             if members.is_empty() {
                 // Solo community: nothing to dial, never starved (spec §4). It
                 // still gets a row — absence from `perCommunity` must keep
-                // meaning "never evaluated", never "fine".
+                // meaning "never evaluated", never "fine". Going solo ends the
+                // starved episode, so the ladder entry goes too (invariant on
+                // [`LadderState`]).
+                let cleared = self
+                    .ladders
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&community)
+                    .is_some();
+                if cleared {
+                    tracing::debug!(community = ?community, "ZEB-824: community went solo — bootstrap ladder cleared");
+                }
                 self.record(&community, GatewayBootstrapOutcome::SoloCommunity);
                 continue;
             }
@@ -1206,6 +1240,203 @@ mod tests {
         );
         assert_eq!(h.telemetry.summary().engine_unregistered, 1);
         assert_eq!(h.beacons.calls(), 0, "no key ⇒ nothing to resolve under");
+    }
+
+    // ------------------------------------------------------------------
+    // 10. Ladder invariant (review r1, finding 1): an entry exists only while
+    //     the community's CURRENT episode is starved. Solo, un-join, and
+    //     engine-unregistered all end the episode and must drop the entry, so
+    //     the next starved episode re-arms at base instead of inheriting a
+    //     stale rung.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn starved_then_solo_clears_ladder_and_restarve_rearms_at_base() {
+        let community = SpaceId([0x20; 16]);
+        let (_member_pub, member_owner) = test_member(18);
+        // No beacon ever resolves — the community stays starved while it has
+        // members.
+        let h = harness(
+            community,
+            vec![member_owner],
+            None,
+            true,
+            Some(SupervisorHandle::new()),
+        );
+        let t0 = 1_700_000_000_000u64;
+        let clock = Arc::new(AtomicU64::new(t0));
+        let clock_for_fn = Arc::clone(&clock);
+        let driver = h
+            .driver
+            .with_now_fn(Arc::new(move || clock_for_fn.load(Ordering::SeqCst)));
+
+        // Starved pass 1: resolve fires, ladder armed at base.
+        driver.run_one_pass().await;
+        assert_eq!(h.beacons.calls(), 1);
+        assert_eq!(
+            driver.ladder_delay_ms(&community),
+            Some(GATEWAY_DIAL_RETRY_BASE_MS)
+        );
+
+        // Due again: the rung advances PAST base, so a carried-over entry is
+        // distinguishable from a fresh one below.
+        clock.store(t0 + GATEWAY_DIAL_RETRY_BASE_MS, Ordering::SeqCst);
+        driver.run_one_pass().await;
+        assert_eq!(h.beacons.calls(), 2);
+        assert_eq!(driver.ladder_delay_ms(&community), Some(60_000));
+
+        // The last other member leaves: solo ends the starved episode and the
+        // ladder entry must go with it.
+        h.ctx.members.lock().unwrap().insert(community, Vec::new());
+        driver.run_one_pass().await;
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("soloCommunity")
+        );
+        assert!(
+            driver.ladder_delay_ms(&community).is_none(),
+            "going solo must drop the ladder entry"
+        );
+        assert_eq!(h.beacons.calls(), 2, "a solo community must not resolve");
+
+        // Members return; WITHOUT advancing time the fresh starved episode
+        // must attempt immediately and re-arm at exactly the base rung — a
+        // stale 60s rung carried across the solo window would leave the node
+        // dark for no reason.
+        h.ctx
+            .members
+            .lock()
+            .unwrap()
+            .insert(community, vec![member_owner]);
+        driver.run_one_pass().await;
+        assert_eq!(
+            h.beacons.calls(),
+            3,
+            "a re-starved community must resolve at once after the solo window"
+        );
+        assert_eq!(
+            driver.ladder_delay_ms(&community),
+            Some(GATEWAY_DIAL_RETRY_BASE_MS),
+            "the fresh episode must re-arm at base, not resume the stale rung"
+        );
+    }
+
+    #[tokio::test]
+    async fn unjoin_prunes_ladder_and_rejoin_rearms_at_base() {
+        let community = SpaceId([0x21; 16]);
+        let (_member_pub, member_owner) = test_member(19);
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let ctx = Arc::new(StubCtx::new(
+            HashMap::from([(community, vec![member_owner])]),
+            HashMap::from([(community, EpochKey::new([0x33; 32]))]),
+        ));
+        let beacons = Arc::new(StubBeacons::new(None));
+        let telemetry = Arc::new(GatewayBootstrapTelemetry::new());
+        // Mutable joined set: the harness closure returns a fixed Vec, but this
+        // test IS the leave/rejoin cycle.
+        let joined = Arc::new(Mutex::new(vec![community]));
+        let joined_for_fn = Arc::clone(&joined);
+        let t0 = 1_700_000_000_000u64;
+        let clock = Arc::new(AtomicU64::new(t0));
+        let clock_for_fn = Arc::clone(&clock);
+        let driver = CommunityGatewayDialDriver::new(
+            Arc::clone(&ctx) as Arc<dyn GatewayDialCtx>,
+            Arc::clone(&beacons) as Arc<dyn BeaconResolver>,
+            Arc::clone(&resolver),
+            Arc::new(move || joined_for_fn.lock().unwrap().clone()),
+        )
+        .with_telemetry(Arc::clone(&telemetry))
+        .with_now_fn(Arc::new(move || clock_for_fn.load(Ordering::SeqCst)));
+
+        // Starve and walk the rung past base.
+        driver.run_one_pass().await;
+        clock.store(t0 + GATEWAY_DIAL_RETRY_BASE_MS, Ordering::SeqCst);
+        driver.run_one_pass().await;
+        assert_eq!(beacons.calls(), 2);
+        assert_eq!(driver.ladder_delay_ms(&community), Some(60_000));
+
+        // Un-join: the loop never reaches the community again, so only the
+        // pass-top prune can drop the entry.
+        joined.lock().unwrap().clear();
+        driver.run_one_pass().await;
+        assert!(
+            driver.ladder_delay_ms(&community).is_none(),
+            "un-join must prune the ladder entry"
+        );
+        assert_eq!(beacons.calls(), 2, "an un-joined community must not resolve");
+
+        // Re-join without advancing time: a fresh episode, immediate attempt,
+        // armed at base.
+        joined.lock().unwrap().push(community);
+        driver.run_one_pass().await;
+        assert_eq!(
+            beacons.calls(),
+            3,
+            "a re-joined starved community must resolve at once"
+        );
+        assert_eq!(
+            driver.ladder_delay_ms(&community),
+            Some(GATEWAY_DIAL_RETRY_BASE_MS),
+            "the rejoin episode must arm at base, not resume the pre-leave rung"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_unregistered_clears_armed_ladder() {
+        let community = SpaceId([0x24; 16]);
+        let (_member_pub, member_owner) = test_member(20);
+        let h = harness(
+            community,
+            vec![member_owner],
+            None,
+            true,
+            Some(SupervisorHandle::new()),
+        );
+        let t0 = 1_700_000_000_000u64;
+        let clock = Arc::new(AtomicU64::new(t0));
+        let clock_for_fn = Arc::clone(&clock);
+        let driver = h
+            .driver
+            .with_now_fn(Arc::new(move || clock_for_fn.load(Ordering::SeqCst)));
+
+        // Starve and walk the rung past base.
+        driver.run_one_pass().await;
+        clock.store(t0 + GATEWAY_DIAL_RETRY_BASE_MS, Ordering::SeqCst);
+        driver.run_one_pass().await;
+        assert_eq!(h.beacons.calls(), 2);
+        assert_eq!(driver.ladder_delay_ms(&community), Some(60_000));
+
+        // The engine deregisters (restart race): the pass records the fault
+        // AND clears the armed backoff.
+        h.ctx.keys.lock().unwrap().remove(&community);
+        driver.run_one_pass().await;
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("engineUnregistered")
+        );
+        assert!(
+            driver.ladder_delay_ms(&community).is_none(),
+            "an engine-unregistered pass must clear the armed ladder"
+        );
+        assert_eq!(h.beacons.calls(), 2, "no key ⇒ nothing to resolve under");
+
+        // The engine re-registers, community still starved: immediate attempt
+        // at base — a stale rung here is dark time on every boot race.
+        h.ctx
+            .keys
+            .lock()
+            .unwrap()
+            .insert(community, EpochKey::new([0x33; 32]));
+        driver.run_one_pass().await;
+        assert_eq!(
+            h.beacons.calls(),
+            3,
+            "the first pass after re-registration must resolve immediately"
+        );
+        assert_eq!(
+            driver.ladder_delay_ms(&community),
+            Some(GATEWAY_DIAL_RETRY_BASE_MS),
+            "the post-re-registration episode must arm at base"
+        );
     }
 
     // ------------------------------------------------------------------
