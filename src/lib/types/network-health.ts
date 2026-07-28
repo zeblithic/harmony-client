@@ -198,6 +198,46 @@ export interface NetworkHealthSnapshot {
    * this field exists to surface, so the two must not be rendered alike.
    */
   communityRelay?: CommunityRelayHealth | null;
+  /**
+   * ZEB-805: per-community sync-advance health, one row per live community
+   * engine. Absent on pre-field snapshots (Rust `#[serde(default)]`); an empty
+   * array means no engines are running, which is honest rather than a fault.
+   */
+  communitySync?: CommunitySyncHealth[];
+}
+
+/**
+ * ZEB-805: per-community sync-advance health (camelCase mirror of Rust
+ * `CommunitySyncHealth`, network_health.rs).
+ *
+ * **Read `lastInboundMs` and `lastAdvanceMs` together.** Inbound advancing
+ * while advance stays frozen is the receiving-and-discarding signature: the
+ * node is taking state-root publishes and failing to apply any of them. That
+ * state reported `reachable`, both peers `direct`, all members `online`, and
+ * exchanged nothing for 90 minutes — indistinguishable, from its own vantage,
+ * from a quiet community until these two numbers sat side by side.
+ *
+ * Neither field alone can say it: inbound alone cannot separate "applying
+ * fine" from "dropping everything"; advance alone cannot separate "wedged"
+ * from "genuinely quiet".
+ */
+export interface CommunitySyncHealth {
+  /** First 8 hex chars of the community id. */
+  communityShort: string;
+  /** Wall ms of the last state-root publish RECEIVED, whatever became of it. */
+  lastInboundMs?: number | null;
+  /** Wall ms of the last publish that actually MERGED. */
+  lastAdvanceMs?: number | null;
+  /**
+   * Tier derived server-side from `lastAdvanceMs` — NOT from `lastInboundMs`.
+   * Shares the peer-row vocabulary and thresholds. `null` when nothing has ever
+   * arrived (a solo community has no evidence to age).
+   */
+  staleness?: PeerStaleness | null;
+  /** Bounded-retry counters. `exhausted` climbing means publishes are being lost. */
+  fetchRetriesScheduled: number;
+  fetchRetriesDropped: number;
+  fetchRetriesExhausted: number;
 }
 
 /** ZEB-702: process-lifetime butler-deposit decision counters (camelCase

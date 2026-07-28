@@ -1553,6 +1553,44 @@ mod tests {
         assert_eq!(name, "Chase Re-created");
     }
 
+    /// ZEB-805: a CAS miss must be OBSERVABLE to the caller.
+    ///
+    /// Honest scope note: this drives `handle_incoming_envelope_for_test`, which
+    /// already returned `MissingBlob` before this ticket — so it characterises
+    /// the contract rather than pinning the change. The change was on the zenoh
+    /// path (`handle_incoming_publish_zenoh`), which used to `return Ok(())` and
+    /// so made a swallowed fetch failure indistinguishable from success. Both
+    /// paths now return this same variant; the zenoh one is covered by
+    /// inspection plus the shared error type rather than by its own harness,
+    /// because standing up a valid encrypted wire envelope for a three-line
+    /// return-value change would be disproportionate.
+    ///
+    /// What this test does buy: if anyone ever "simplifies" either path back to
+    /// swallowing the miss, the contract they would be breaking is written down
+    /// and enforced here.
+    #[tokio::test]
+    async fn cas_miss_is_observable_to_the_caller() {
+        let conn = Arc::new(std::sync::Mutex::new(fresh_db()));
+        let cs: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let sync_state = Arc::new(TokioMutex::new(MintSyncState::default()));
+        let (engine, handle) = MintSyncEngine::new_for_test(conn, cs, sync_state).await;
+
+        // A cid nothing ever put: the store misses.
+        let absent = crate::owner_state_types::ContentId::from_bytes([0xEE; 32]);
+        let err = engine
+            .handle_incoming_envelope_for_test(absent)
+            .await
+            .expect_err("a CAS miss must NOT report success");
+        assert!(
+            matches!(err, MintSyncError::MissingBlob(c) if c == absent),
+            "a miss must surface as MissingBlob naming the cid, got {err:?}"
+        );
+
+        engine.shutdown().await.unwrap();
+        handle.await.unwrap();
+    }
+
     #[tokio::test]
     async fn subscriber_applies_remote_snapshot_to_local() {
         // Two DBs, one shared ContentStore. Engine A publishes; engine B's

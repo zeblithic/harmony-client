@@ -97,6 +97,72 @@ pub struct NetworkHealthSnapshot {
     /// pre-field snapshots forward-compatible.
     #[serde(default)]
     pub gateway_bootstrap: Option<GatewayBootstrapHealth>,
+    /// ZEB-805: per-community sync-advance health — one row per live community
+    /// engine. Empty when no engines are running.
+    ///
+    /// This is the surface whose absence made the incident cost three nodes and
+    /// a night: a node receiving state-root publishes and discarding every one
+    /// of them was indistinguishable, from its own vantage, from a node in a
+    /// quiet community. `last_inbound_ms` vs `last_advance_ms` names that
+    /// difference directly.
+    #[serde(default)]
+    pub community_sync: Vec<CommunitySyncHealth>,
+}
+
+/// ZEB-805: per-community sync-advance health.
+///
+/// **Read the two timestamps together.** `last_inbound_ms` advancing while
+/// `last_advance_ms` stays frozen is the receiving-and-discarding signature —
+/// the exact state that reported `reachable`, both peers `direct`, all members
+/// `online`, and zero messages for 90 minutes. Neither field alone can say it:
+/// inbound alone cannot separate "applying fine" from "dropping everything",
+/// and advance alone cannot separate "wedged" from "genuinely quiet".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunitySyncHealth {
+    /// First 8 hex chars of the community id — matches the `community_short`
+    /// convention used by the relay rows on this same snapshot.
+    pub community_short: String,
+    /// Wall ms of the last inbound state-root publish RECEIVED, whatever became
+    /// of it. `None` if none ever.
+    pub last_inbound_ms: Option<u64>,
+    /// Wall ms of the last inbound publish that actually MERGED. `None` if none
+    /// ever — which, when `last_inbound_ms` is `Some`, is the incident shape.
+    pub last_advance_ms: Option<u64>,
+    /// Tier derived from `last_advance_ms`, reusing the ZEB-804 vocabulary and
+    /// thresholds so operators read one staleness idiom across this whole
+    /// snapshot rather than two. `None` when nothing has ever arrived (a solo
+    /// community has no evidence to age — see [`derive_sync_staleness`]).
+    pub staleness: Option<PeerStaleness>,
+    /// ZEB-805 bounded-retry counters. `scheduled` climbing with `exhausted`
+    /// flat is a healthy transient-miss story; `exhausted` climbing is publishes
+    /// being lost. `dropped` climbing means the in-flight cap is shedding
+    /// retries — a flood, or a cap that wants raising.
+    pub fetch_retries_scheduled: u64,
+    pub fetch_retries_dropped: u64,
+    pub fetch_retries_exhausted: u64,
+}
+
+/// ZEB-805 raw per-community counters, read from the engine registry. Kept
+/// separate from the DTO so tier policy stays here in `network_health` rather
+/// than leaking into the sync engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommunitySyncRaw {
+    /// `0` means never.
+    pub last_inbound_ms: u64,
+    /// `0` means never.
+    pub last_advance_ms: u64,
+    pub fetch_retries_scheduled: u64,
+    pub fetch_retries_dropped: u64,
+    pub fetch_retries_exhausted: u64,
+}
+
+/// ZEB-805: source of per-community sync counters. Implemented by the community
+/// engine registry; `None` on the service (merge inert) until boot wires it,
+/// mirroring the ZEB-804 `PeerTrafficRegistry` seam.
+#[async_trait::async_trait]
+pub trait CommunitySyncSource: Send + Sync {
+    async fn per_community(&self) -> Vec<(crate::owner_state_types::SpaceId, CommunitySyncRaw)>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1507,6 +1573,7 @@ impl NetworkHealthSnapshot {
             vine_relay: None,
             // ZEB-824: no service ⇒ no gateway-dial driver telemetry wired.
             gateway_bootstrap: None,
+            community_sync: Vec::new(),
         }
     }
 }
@@ -1608,6 +1675,67 @@ pub fn derive_staleness(
     } else {
         PeerStaleness::Dark
     })
+}
+
+/// ZEB-805: derive a community's sync-staleness tier.
+///
+/// Deliberately keyed on `last_advance_ms` — the last publish that actually
+/// MERGED — not on `last_inbound_ms`. That choice is the whole point of the
+/// ticket: during the incident a node kept receiving publishes and discarding
+/// every one, so a tier derived from arrivals would have rendered it perfectly
+/// fresh while it sat fully partitioned for 90 minutes.
+///
+/// Shape mirrors [`derive_staleness`] so the two read alike:
+/// - nothing has EVER arrived → `None`. There is no evidence to age, and a
+///   solo community (or one that just spawned) is not a fault. This is the
+///   counterpart of `NoConnection` → `None`.
+/// - publishes have arrived but NONE ever merged → `Dark`. A community that
+///   receives and never advances is the incident shape and must not read
+///   healthy, regardless of how recently the last one arrived.
+/// - otherwise bucket `age = now_ms - last_advance_ms` against the shared
+///   [`STALENESS_QUIET_MS`] / [`STALENESS_DARK_MS`] thresholds.
+pub fn derive_sync_staleness(
+    last_inbound_ms: Option<u64>,
+    last_advance_ms: Option<u64>,
+    now_ms: u64,
+) -> Option<PeerStaleness> {
+    last_inbound_ms?;
+    let Some(advance_ms) = last_advance_ms else {
+        return Some(PeerStaleness::Dark);
+    };
+    let age = now_ms.saturating_sub(advance_ms);
+    Some(if age < STALENESS_QUIET_MS {
+        PeerStaleness::Fresh
+    } else if age <= STALENESS_DARK_MS {
+        PeerStaleness::Quiet
+    } else {
+        PeerStaleness::Dark
+    })
+}
+
+/// ZEB-805: assemble one `communitySync` row. Split out from `snapshot` so the
+/// incident replay can drive it directly.
+pub fn community_sync_row(
+    community_id: crate::owner_state_types::SpaceId,
+    raw: CommunitySyncRaw,
+    now_ms: u64,
+) -> CommunitySyncHealth {
+    // `0` is the engine's "never" sentinel — map it to `None` here rather than
+    // letting an epoch-0 timestamp render as a real, absurdly stale stamp.
+    let last_inbound_ms = (raw.last_inbound_ms != 0).then_some(raw.last_inbound_ms);
+    let last_advance_ms = (raw.last_advance_ms != 0).then_some(raw.last_advance_ms);
+    CommunitySyncHealth {
+        community_short: hex::encode(community_id.0)
+            .chars()
+            .take(8)
+            .collect::<String>(),
+        last_inbound_ms,
+        last_advance_ms,
+        staleness: derive_sync_staleness(last_inbound_ms, last_advance_ms, now_ms),
+        fetch_retries_scheduled: raw.fetch_retries_scheduled,
+        fetch_retries_dropped: raw.fetch_retries_dropped,
+        fetch_retries_exhausted: raw.fetch_retries_exhausted,
+    }
 }
 
 /// Iroh 0.98 may or may not expose NAT classification directly via
@@ -2032,6 +2160,10 @@ pub struct NetworkHealthService {
     /// [`set_peer_traffic_source`](Self::set_peer_traffic_source); read by
     /// `snapshot`'s traffic merge. `None` (merge inert) until boot wires it.
     peer_traffic: Option<std::sync::Arc<PeerTrafficRegistry>>,
+    /// ZEB-805: per-community sync counters, set by
+    /// [`set_community_sync_source`](Self::set_community_sync_source). `None`
+    /// (rows empty) until boot wires the engine registry.
+    community_sync: Option<std::sync::Arc<dyn CommunitySyncSource>>,
 }
 
 impl NetworkHealthService {
@@ -2067,6 +2199,7 @@ impl NetworkHealthService {
             vine_pull: None,
             gateway_bootstrap: None,
             peer_traffic: None,
+            community_sync: None,
         }
     }
 
@@ -2183,6 +2316,16 @@ impl NetworkHealthService {
     /// traffic merge is inert.
     pub(crate) fn set_peer_traffic_source(&mut self, src: std::sync::Arc<PeerTrafficRegistry>) {
         self.peer_traffic = Some(src);
+    }
+
+    /// ZEB-805: wire the community engine registry as the per-community sync
+    /// counter source. Until this is called the `community_sync` rows are
+    /// empty, which renders as "no engines" rather than as a fault.
+    pub(crate) fn set_community_sync_source(
+        &mut self,
+        src: std::sync::Arc<dyn CommunitySyncSource>,
+    ) {
+        self.community_sync = Some(src);
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -2534,6 +2677,15 @@ impl NetworkHealthService {
             // ZEB-824: present iff the driver is wired; a wired-but-idle driver
             // reports zeroed counters rather than suppressing the section.
             gateway_bootstrap: self.gateway_bootstrap.as_ref().map(|t| t.summary()),
+            community_sync: match self.community_sync.as_ref() {
+                Some(src) => src
+                    .per_community()
+                    .await
+                    .into_iter()
+                    .map(|(id, raw)| community_sync_row(id, raw, now))
+                    .collect(),
+                None => Vec::new(),
+            },
         }
     }
 
@@ -4215,6 +4367,7 @@ mod tests {
             community_relay: None,
             vine_relay: None,
             gateway_bootstrap: None,
+            community_sync: Vec::new(),
         }
     }
 
@@ -5747,6 +5900,137 @@ mod tests {
         let v = serde_json::to_value(&snap).expect("snapshot serializes");
         assert_eq!(v["peers"][0]["connectionMode"], "direct");
         assert_eq!(v["peers"][0]["staleness"], "dark");
+    }
+
+    // ── ZEB-805: community sync-advance staleness ────────────────────────────
+
+    fn sync_cid(b: u8) -> crate::owner_state_types::SpaceId {
+        crate::owner_state_types::SpaceId([b; 16])
+    }
+
+    /// THE ZEB-805 INCIDENT REPLAY, as a permanent regression pin.
+    ///
+    /// A node receiving state-root publishes and discarding every one of them
+    /// must render `dark`. This is the exact state that reported `reachable`,
+    /// both peers `direct`, all members `online` — and exchanged nothing for
+    /// 90 minutes. Deriving the tier from arrivals rather than merges would
+    /// render it `fresh`, which is the bug.
+    #[test]
+    fn receiving_and_discarding_renders_dark_not_fresh() {
+        let now = 100_000_000u64;
+        let row = community_sync_row(
+            sync_cid(0xA7),
+            CommunitySyncRaw {
+                // Publishes ARE arriving, seconds ago.
+                last_inbound_ms: now - 10_000,
+                // ...and not one has merged in 90 minutes.
+                last_advance_ms: now - 5_400_000,
+                fetch_retries_scheduled: 4,
+                fetch_retries_exhausted: 4,
+                ..Default::default()
+            },
+            now,
+        );
+        assert_eq!(
+            row.staleness,
+            Some(PeerStaleness::Dark),
+            "a community receiving publishes it cannot apply must read dark"
+        );
+        assert_eq!(
+            row.last_inbound_ms,
+            Some(now - 10_000),
+            "the arrival stamp must stay visible — the DIVERGENCE between the \
+             two stamps is the diagnostic, so hiding either defeats the surface"
+        );
+        assert_eq!(row.fetch_retries_exhausted, 4);
+        assert_eq!(row.community_short, "a7a7a7a7");
+    }
+
+    /// Arrivals with NO merge ever is the same fault, caught earlier: the
+    /// boot-time case, where the node never applied a single publish.
+    #[test]
+    fn arrivals_with_no_merge_ever_render_dark() {
+        let now = 100_000_000u64;
+        let row = community_sync_row(
+            sync_cid(0x01),
+            CommunitySyncRaw {
+                last_inbound_ms: now - 1_000, // arrived one second ago
+                last_advance_ms: 0,           // never merged
+                ..Default::default()
+            },
+            now,
+        );
+        assert_eq!(row.staleness, Some(PeerStaleness::Dark));
+        assert_eq!(
+            row.last_advance_ms, None,
+            "0 is the never sentinel, not a stamp"
+        );
+    }
+
+    /// Nothing has ever arrived → no tier. A solo or freshly-spawned community
+    /// has no evidence to age, and must not be reported as a fault. Counterpart
+    /// of `NoConnection` → `None` on the peer rows.
+    #[test]
+    fn community_with_no_inbound_ever_has_no_tier() {
+        let now = 100_000_000u64;
+        let row = community_sync_row(sync_cid(0x02), CommunitySyncRaw::default(), now);
+        assert_eq!(row.staleness, None);
+        assert_eq!(row.last_inbound_ms, None);
+        assert_eq!(row.last_advance_ms, None);
+    }
+
+    /// A healthy community: merges are current, so the tier tracks the merge
+    /// stamp across the same thresholds the peer rows use.
+    #[test]
+    fn sync_tier_boundaries_track_the_advance_stamp() {
+        let now = 100_000_000u64;
+        let tier =
+            |advance_age: u64| derive_sync_staleness(Some(now - 1), Some(now - advance_age), now);
+        assert_eq!(tier(0), Some(PeerStaleness::Fresh));
+        assert_eq!(tier(STALENESS_QUIET_MS - 1), Some(PeerStaleness::Fresh));
+        assert_eq!(tier(STALENESS_QUIET_MS), Some(PeerStaleness::Quiet));
+        assert_eq!(tier(STALENESS_DARK_MS), Some(PeerStaleness::Quiet));
+        assert_eq!(tier(STALENESS_DARK_MS + 1), Some(PeerStaleness::Dark));
+    }
+
+    /// The new fields must serialize camelCase, and no snake_case key may leak.
+    #[test]
+    fn community_sync_row_serde_is_camel_case() {
+        let row = community_sync_row(
+            sync_cid(0x0B),
+            CommunitySyncRaw {
+                last_inbound_ms: 7,
+                last_advance_ms: 5,
+                fetch_retries_scheduled: 1,
+                fetch_retries_dropped: 2,
+                fetch_retries_exhausted: 3,
+            },
+            9,
+        );
+        let json = serde_json::to_string(&row).expect("serialize");
+        for key in [
+            "communityShort",
+            "lastInboundMs",
+            "lastAdvanceMs",
+            "staleness",
+            "fetchRetriesScheduled",
+            "fetchRetriesDropped",
+            "fetchRetriesExhausted",
+        ] {
+            assert!(json.contains(key), "missing {key} in {json}");
+        }
+        for leak in [
+            "community_short",
+            "last_inbound_ms",
+            "last_advance_ms",
+            "fetch_retries_scheduled",
+            "fetch_retries_dropped",
+            "fetch_retries_exhausted",
+        ] {
+            assert!(!json.contains(leak), "snake_case leak {leak} in {json}");
+        }
+        let back: CommunitySyncHealth = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back, row);
     }
 
     /// Tier boundaries with an injected `now` (no wall clock): fresh below

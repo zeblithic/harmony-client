@@ -3632,8 +3632,22 @@ pub async fn run(
                     }
                 });
             }
-            // ZEB-443: the retry driver re-invokes this closure forever
-            // (600s cap). UI error spam is prevented inside
+            // ZEB-443: the retry driver re-invokes this closure with backoff
+            // (30s base, doubling to a 600s cap) for as long as it is running.
+            //
+            // ZEB-805: this comment used to say "forever". It is not forever,
+            // and the difference matters to whoever reads a log that stops. The
+            // driver exits on `shutdown_rx`, on its epoch/shutdown watch SENDER
+            // dropping, and on the adapter being permanently gone — see
+            // `run_root_fetch_driver`'s contract in channel_backfill.rs. During
+            // the ZEB-805 incident this driver made 11 attempts and then stopped
+            // while still unsatisfied, ~10s after zenoh logged "sending on a
+            // closed channel"; that is consistent with one of those exits, but
+            // the live state was destroyed by the restart, so WHICH is not
+            // established. Do not read "retrying with backoff" as a guarantee
+            // that retries are still happening.
+            //
+            // UI error spam is prevented inside
             // `report_query_error` itself — identical-message reports
             // while already in `Error` are suppressed, and ANY
             // transition away from `Error` (startup reply, successful
@@ -3659,9 +3673,15 @@ pub async fn run(
                                 .await;
                         }
                         Ok(None) => {
-                            tracing::info!(
-                                "startup root query: no responder — retrying with backoff; live push also catches up on next gateway publish"
-                            );
+                            // ZEB-805: this line used to append "live push also
+                            // catches up on next gateway publish". Both that
+                            // clause and the retry promise were false during the
+                            // incident — the retries stopped and live push did
+                            // not catch up — and an operator who read it stopped
+                            // investigating. State only what just happened; a
+                            // log line must not vouch for a fallback it cannot
+                            // observe.
+                            tracing::info!("startup root query: no responder");
                             sync.report_query_error(
                                 "no gateway responded to startup query".to_string(),
                             );
@@ -4928,8 +4948,16 @@ pub async fn run(
                                         // returning. On failure, do NOT admit and
                                         // reply Ok(None): treat a tampered reply as
                                         // a cache miss so the caller falls through
-                                        // exactly as it would on a timeout (the
-                                        // CRDT carries recovery).
+                                        // exactly as it would on a timeout.
+                                        //
+                                        // ZEB-805: "as it would on a timeout" is
+                                        // still the right shape, but that used to
+                                        // be justified with "the CRDT carries
+                                        // recovery" — which was false. What makes
+                                        // this safe is the caller's BOUNDED RETRY,
+                                        // not eventual consistency. A retry against
+                                        // a persistently tampering holder still
+                                        // exhausts and drops, which is correct.
                                         if !cid.verify_hash(&bytes) {
                                             tracing::warn!(
                                                 cid = %cid_hex,
@@ -4976,7 +5004,18 @@ pub async fn run(
                                             format!("fetch '{key}': {e}"),
                                         )));
                                     }
-                                    // Timeout → Ok(None) (CRDT carries recovery).
+                                    // Timeout → Ok(None).
+                                    //
+                                    // ZEB-805: this used to read "(CRDT carries
+                                    // recovery)". It does not. The recovery that
+                                    // claim named — the next state-root from any
+                                    // peer — is a LARGER blob fetched under the
+                                    // SAME budget, so each timeout makes the next
+                                    // likelier, and a transient miss became a
+                                    // 90-minute silent partition. Ok(None) means
+                                    // "not fetchable within the caller's budget";
+                                    // deciding what to do about that belongs to
+                                    // the caller, which now retries under bound.
                                     Err(_) => {
                                         let _ = reply.send(Ok(None));
                                     }

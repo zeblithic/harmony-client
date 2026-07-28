@@ -90,8 +90,8 @@ pub trait ContentStore: Send + Sync {
     ///
     /// INVARIANT: `budget` must stay below `fetch_via_zenoh`'s own internal
     /// deadline (`event_loop.rs`), which is the hard backstop — a larger budget
-    /// silently becomes that deadline instead. Pinned by
-    /// `state_root_budget_stays_under_the_zenoh_fetch_backstop`.
+    /// silently becomes that deadline instead. Enforced at compile time by the
+    /// `const _: () = assert!(...)` pair beside `STATE_ROOT_FETCH_TIMEOUT_MS`.
     ///
     /// The default body ignores the budget and delegates, which is correct for
     /// stores whose `get` is already local-only (e.g. `InMemoryStub`).
@@ -186,6 +186,12 @@ pub enum CasOp {
     /// admit via a second `CasOp::PutLocal` hop before replying
     /// `Ok(Some(bytes))`. On timeout: `Ok(None)`. On hard transport
     /// error (zenoh::open failure, malformed key_expr): `Err(...)`.
+    ///
+    /// `timeout` is the CALLER's budget and is the binding deadline —
+    /// `fetch_via_zenoh` has its own, larger internal backstop, so a caller
+    /// budget above that one silently becomes it. ZEB-805: `Ok(None)` means
+    /// "not fetchable in the time you allowed", NOT "does not exist"; callers
+    /// must treat it as retryable rather than terminal.
     GetOrFetch {
         cid: ContentId,
         timeout: std::time::Duration,
@@ -215,10 +221,17 @@ pub enum CasOp {
     },
 }
 
-/// Default fetch budget for `RuntimeContentStore::get`. Wraps the
-/// Zenoh GET in `tokio::time::timeout`; on miss the subscriber drops
-/// the publish and CRDT eventual consistency carries recovery via
-/// the next state-root from any peer.
+/// Default fetch budget for `RuntimeContentStore::get`. Wraps the Zenoh GET in
+/// `tokio::time::timeout`; on miss the caller sees `Ok(None)`.
+///
+/// Tuned for SMALL, latency-sensitive reads and nothing else. State-root blobs
+/// must use [`STATE_ROOT_FETCH_TIMEOUT_MS`] via `get_with_budget` instead.
+///
+/// ZEB-805 removed a claim that used to live here — that a miss was harmless
+/// because "CRDT eventual consistency carries recovery via the next state-root
+/// from any peer". It does not: the next state root is a LARGER blob fetched
+/// under the SAME budget, so each failure makes the next likelier. Do not
+/// reintroduce that reasoning to justify dropping on a miss.
 pub const DEFAULT_FETCH_TIMEOUT_MS: u64 = 500;
 
 /// Fetch budget for state-root blobs (community / fleet / mint). These are a
@@ -235,6 +248,29 @@ pub const DEFAULT_FETCH_TIMEOUT_MS: u64 = 500;
 /// both `fetch_via_zenoh`'s 30 s backstop and the 450 s relay-pull cadence — so
 /// a retry chain cannot overlap the next pull pass.
 pub const STATE_ROOT_FETCH_TIMEOUT_MS: u64 = 5_000;
+
+/// `fetch_via_zenoh` (`event_loop.rs`) wraps its reply loop in its own 30 s
+/// deadline, which is the hard backstop under every caller budget.
+const ZENOH_FETCH_BACKSTOP_MS: u64 = 30_000;
+
+// ZEB-805 budget invariants, enforced at COMPILE time rather than by a test —
+// these relate two constants, so there is no runtime state that could make them
+// true or false, and a build is a stronger gate than a test someone can skip.
+//
+// The first is the one that bit us: a caller budget at or above the backstop
+// silently BECOMES the backstop, so the caller's number stops meaning anything.
+// That is precisely the 60x nested-timeout confusion this ticket found — a
+// 500 ms outer under a 30 s inner, where the inner was unreachable dead code.
+const _: () = assert!(
+    STATE_ROOT_FETCH_TIMEOUT_MS < ZENOH_FETCH_BACKSTOP_MS,
+    "state-root budget must stay strictly under the fetch_via_zenoh backstop, \
+     or the caller's budget silently becomes that backstop"
+);
+const _: () = assert!(
+    STATE_ROOT_FETCH_TIMEOUT_MS > DEFAULT_FETCH_TIMEOUT_MS,
+    "the state-root budget exists because the default is too small for this \
+     payload class; collapsing them re-creates ZEB-805"
+);
 
 /// Production `ContentStore` impl that delegates to the harmony-runtime
 /// event loop via `cas_op_tx`. Used at SyncEngine construction in
@@ -510,26 +546,6 @@ mod tests {
             .unwrap()
             .expect("blob present");
         assert_eq!(blob, vec![7, 8, 9], "default body delegates to `get`");
-    }
-
-    #[test]
-    fn state_root_budget_stays_under_the_zenoh_fetch_backstop() {
-        // `fetch_via_zenoh` (event_loop.rs) wraps its reply loop in a 30 s
-        // deadline. A caller budget at or above that silently BECOMES the
-        // deadline — the caller's number would stop meaning anything, which is
-        // exactly the 60x nested-timeout confusion ZEB-805 found (500 ms outer
-        // under a 30 s inner). Keep the outer strictly the binding one.
-        const ZENOH_FETCH_BACKSTOP_MS: u64 = 30_000;
-        assert!(
-            STATE_ROOT_FETCH_TIMEOUT_MS < ZENOH_FETCH_BACKSTOP_MS,
-            "state-root budget {STATE_ROOT_FETCH_TIMEOUT_MS}ms must stay under the \
-             {ZENOH_FETCH_BACKSTOP_MS}ms fetch_via_zenoh backstop"
-        );
-        assert!(
-            STATE_ROOT_FETCH_TIMEOUT_MS > DEFAULT_FETCH_TIMEOUT_MS,
-            "the state-root budget exists because the default is too small for \
-             this payload class"
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

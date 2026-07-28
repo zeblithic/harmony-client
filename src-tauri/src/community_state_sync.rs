@@ -45,9 +45,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::community_membership::{SignedMembershipEvent, VerifyContext};
@@ -1104,6 +1104,10 @@ pub struct CommunitySyncEngineConfig {
 /// persistence flushes for one joined community. Construction spawns
 /// the task; `shutdown().await` stops it cleanly with one final flush.
 pub struct CommunitySyncEngine {
+    /// ZEB-805: per-engine sync observability, shared with the internal task.
+    /// Read by `network_health_snapshot` to distinguish a node that is
+    /// receiving-and-discarding from one that is merely quiet.
+    sync_stats: Arc<CommunitySyncStats>,
     notify_dirty: Arc<Notify>,
     /// Set by `notify_dirty()`; cleared by the task after each publish.
     /// Prevents the shutdown path from emitting a spurious publish when
@@ -1271,6 +1275,13 @@ impl CommunitySyncEngine {
         let nav_emitter_for_engine = cfg.nav_emitter.clone();
         let nav_emitter_for_task = cfg.nav_emitter;
 
+        // ZEB-805: fetch-retry plumbing. Channel capacity is sized to the
+        // semaphore cap so a full permit set can never overflow the channel.
+        let (fetch_retry_tx, fetch_retry_rx) = mpsc::channel(FETCH_RETRY_MAX_INFLIGHT);
+        let fetch_retry_sem = Arc::new(Semaphore::new(FETCH_RETRY_MAX_INFLIGHT));
+        let sync_stats = Arc::new(CommunitySyncStats::default());
+        let sync_stats_for_engine = Arc::clone(&sync_stats);
+
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
             membership_key: cfg.membership_key,
@@ -1300,9 +1311,14 @@ impl CommunitySyncEngine {
             crdt_state: crdt_state_for_task,
             nav_emitter: nav_emitter_for_task,
             root_serve_rx: cfg.root_serve_rx,
+            fetch_retry_tx,
+            fetch_retry_rx: Some(fetch_retry_rx),
+            fetch_retry_sem,
+            sync_stats,
         }));
 
         Self {
+            sync_stats: sync_stats_for_engine,
             notify_dirty,
             has_pending_dirty,
             closing,
@@ -1352,6 +1368,15 @@ impl CommunitySyncEngine {
     #[doc(hidden)]
     pub fn tracker_arc(&self) -> Arc<Mutex<CommunityReplayTracker>> {
         Arc::clone(&self.tracker)
+    }
+
+    /// ZEB-805: per-engine sync observability, for `network_health_snapshot`.
+    ///
+    /// Read `last_inbound_ms` and `last_advance_ms` together — inbound
+    /// advancing while advance stays frozen is the receiving-and-discarding
+    /// state that read as fully healthy for 90 minutes during the incident.
+    pub(crate) fn sync_stats(&self) -> Arc<CommunitySyncStats> {
+        Arc::clone(&self.sync_stats)
     }
 
     /// Returns the admin `OwnerAddr` this engine was configured with.
@@ -2030,6 +2055,18 @@ struct InternalCtx {
     /// it out of the ctx at start (`Option<Receiver>` can't be polled
     /// inside `select!` directly). `None` disables the serve arm.
     root_serve_rx: Option<mpsc::Receiver<RootServeRequest>>,
+
+    /// ZEB-805 fetch-retry re-injection channel. A `FetchMiss` sleeper sends
+    /// `(wire, attempts_left)` back here after its delay; `internal_task` takes
+    /// the receiver out of the ctx at start and polls it as a `select!` arm.
+    fetch_retry_tx: mpsc::Sender<(Vec<u8>, u8)>,
+    fetch_retry_rx: Option<mpsc::Receiver<(Vec<u8>, u8)>>,
+    /// Caps concurrent retry sleepers — each retains a wire frame for the whole
+    /// delay, so this bounds retained memory under a publish flood, not just
+    /// task count. See `FETCH_RETRY_MAX_INFLIGHT`.
+    fetch_retry_sem: Arc<Semaphore>,
+    /// ZEB-805 observability, shared with the engine handle.
+    sync_stats: Arc<CommunitySyncStats>,
 }
 
 // ── ZEB-254 Task 10: auto-counter-sign helper ────────────────────────────────
@@ -2634,6 +2671,12 @@ async fn internal_task(mut ctx: InternalCtx) {
     // yield `None` from `recv()` on every loop iteration and busy-spin
     // the task.
     let mut root_serve_rx = ctx.root_serve_rx.take();
+    // ZEB-805: same take-out-of-ctx idiom as `root_serve_rx` — an
+    // `Option<Receiver>` can't be polled inside `select!` directly.
+    let mut fetch_retry_rx = ctx
+        .fetch_retry_rx
+        .take()
+        .expect("fetch_retry_rx is always Some at internal_task start");
 
     let notify = Arc::clone(&ctx.notify_dirty);
     let notified = notify.notified();
@@ -2778,45 +2821,14 @@ async fn internal_task(mut ctx: InternalCtx) {
                     inbound_closed = true;
                     continue;
                 };
-                let outcome = handle_incoming_publish(&ctx, bytes).await;
-                if let Some(err) = outcome.error() {
-                    tracing::warn!(
-                        community_id = ?ctx.community_id,
-                        error = %err,
-                        "community incoming publish dropped"
-                    );
-                    // Surface the failure-class as a degraded-path
-                    // report so start_node's drain task can translate
-                    // it into a `community-state-sync-degraded`
-                    // Tauri event. Per the spec (§ "IPC surface →
-                    // Events"), the frontend uses these to surface
-                    // "this community's sync is degraded" banners.
-                    report_degraded(
-                        ctx.error_tx.as_ref(),
-                        ctx.community_id,
-                        classify_incoming_error(err),
-                        format!("{err}"),
-                    );
-                }
-                // Persist on Mutated | MutatedTrackerOnly |
-                // ErrPostMutation. `crdt_mutated()` lets the
-                // tracker-only branch skip the larger `crdt.cbor`
-                // fsync — the CRDT is byte-identical when every
-                // event in the remote blob was AlreadyKnown.
-                if outcome.needs_persist() {
-                    let persist_result = if outcome.crdt_mutated() {
-                        persist_both(&ctx).await
-                    } else {
-                        persist_replay_only(&ctx).await
-                    };
-                    if let Err(e) = persist_result {
-                        tracing::warn!(
-                            community_id = ?ctx.community_id,
-                            error = %e,
-                            "community persist after merge failed"
-                        );
-                    }
-                }
+                // ZEB-805: a fresh inbound frame carries the full retry budget.
+                process_inbound(&ctx, bytes, FETCH_RETRY_ATTEMPTS).await;
+            }
+            // ZEB-805: a fetch-retry sleeper handing its wire frame back after
+            // the delay. Re-enters the FULL inbound pipeline, so the replay
+            // check naturally kills a retry that a newer root has superseded.
+            Some((wire, attempts_left)) = fetch_retry_rx.recv() => {
+                process_inbound(&ctx, wire, attempts_left).await;
             }
             serve_req = async {
                 match root_serve_rx.as_mut() {
@@ -3397,6 +3409,24 @@ enum IncomingOutcome {
     /// payload decode, blob fetch, blob decrypt, blob decode,
     /// misrouted-blob check). No state change. Don't persist.
     ErrPreMutation(CommunitySyncError),
+    /// ZEB-805: the CAS blob for this publish's `root_cid` was not
+    /// fetchable within the state-root budget. Carries the ORIGINAL wire
+    /// frame so the engine loop can schedule a bounded retry, re-injecting
+    /// it through the full inbound pipeline.
+    ///
+    /// This variant exists because the previous behaviour — a terminal
+    /// `ErrPreMutation(BlobNotFound)` — made the stall permanent: the drop
+    /// was justified by "the next state-root from any peer recovers", but
+    /// the next state root is a LARGER blob under the SAME budget, so every
+    /// failure made the next one likelier. Live-observed as a 90-minute
+    /// silent partition.
+    ///
+    /// Safe to retry because the replay tracker is NOT advanced on this
+    /// path (step 5's `CommitTicket` is dropped by every early return —
+    /// ZEB-750), so re-delivery of the same frame is admitted again. That
+    /// invariant is pinned by
+    /// `tracker_stays_unadvanced_across_miss_and_exhaustion`.
+    FetchMiss(Vec<u8>),
     /// Failure occurred AFTER the tracker advanced. Tracker is in-
     /// memory dirty; persist defensively so a restart doesn't replay
     /// the same publish.
@@ -3447,7 +3477,194 @@ impl IncomingOutcome {
     fn error(&self) -> Option<&CommunitySyncError> {
         match self {
             Self::ErrPreMutation(e) | Self::ErrPostMutation(e) => Some(e),
-            Self::Duplicate | Self::Mutated | Self::MutatedTrackerOnly => None,
+            // ZEB-805: a FetchMiss is NOT an error at this point — it is a
+            // scheduled retry. It becomes an error only when the retry budget
+            // is exhausted, and the engine loop reports it then.
+            Self::Duplicate | Self::Mutated | Self::MutatedTrackerOnly | Self::FetchMiss(_) => None,
+        }
+    }
+}
+
+/// ZEB-805 fetch-retry budget. A CAS miss on a state-root blob is usually
+/// transient — the publisher's content-queryable declaration may not have
+/// propagated back yet — so the publish is retried before being dropped.
+///
+/// Reused verbatim from `fleet_sync`'s ZEB-705 implementation rather than
+/// re-derived: cross-engine consistency is the point, and those values already
+/// survived review plus adversarial flood analysis. Do not tune one engine's
+/// copy in isolation.
+const FETCH_RETRY_ATTEMPTS: u8 = 3;
+
+/// Delay between fetch retries. Comfortably above declaration-propagation
+/// latency on a fresh link, and small enough that the whole chain
+/// (3 x (5 s budget + 2 s delay) ≈ 21 s worst case) lands far inside the 450 s
+/// relay-pull cadence, so retries can never overlap the next pull pass.
+const FETCH_RETRY_DELAY_MS: u64 = 2000;
+
+/// Max fetch-retry sleepers in flight per engine. Each pending retry is a
+/// detached task retaining its wire frame for `FETCH_RETRY_DELAY_MS`; a burst
+/// of misses — or a hostile publish flood — must not pile those up unbounded.
+/// A permit is acquired BEFORE the sleeper is spawned and held for its whole
+/// lifetime, so concurrent retries (and thus retained wire buffers) are
+/// hard-capped. Excess misses are dropped and counted. Sized to the
+/// re-injection channel capacity so a full permit set never overflows it.
+const FETCH_RETRY_MAX_INFLIGHT: usize = 8;
+
+/// ZEB-805 per-engine sync observability. Shared (`Arc`) between the internal
+/// task, which writes, and the engine handle, which `network_health_snapshot`
+/// reads.
+///
+/// The two timestamps are the load-bearing pair, and neither is sufficient
+/// alone: `last_inbound_ms` advancing while `last_advance_ms` stays frozen IS
+/// the drop-loop signature — the node is receiving and discarding. Inbound
+/// alone cannot distinguish "applying fine" from "dropping everything";
+/// advance alone cannot distinguish "wedged" from "genuinely quiet, nobody is
+/// publishing". `0` means never.
+#[derive(Debug, Default)]
+pub(crate) struct CommunitySyncStats {
+    /// Wall ms of the last inbound publish RECEIVED, whatever became of it.
+    pub(crate) last_inbound_ms: AtomicU64,
+    /// Wall ms of the last inbound publish that actually MERGED into the CRDT.
+    pub(crate) last_advance_ms: AtomicU64,
+    pub(crate) fetch_retries_scheduled: AtomicU64,
+    pub(crate) fetch_retries_dropped: AtomicU64,
+    pub(crate) fetch_retries_exhausted: AtomicU64,
+    pub(crate) fetch_retry_inflight_peak: AtomicU64,
+}
+
+/// ZEB-805: run one inbound frame through the pipeline and act on the outcome —
+/// persist, report, or schedule a bounded fetch retry.
+///
+/// Shared by the subscriber arm (fresh frames, full budget) and the
+/// fetch-retry arm (re-injected frames, decremented budget) so the two can
+/// never drift apart. Mirrors `fleet_sync::process_inbound` (ZEB-705).
+async fn process_inbound(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u8) {
+    // Stamp "a publish arrived" BEFORE any outcome branch. This must count
+    // frames we go on to discard — its whole purpose is to be comparable
+    // against `last_advance_ms`, and the gap between them is the
+    // receiving-and-discarding signature (ZEB-805 §7.1).
+    ctx.sync_stats
+        .last_inbound_ms
+        .store(crate::network_health::now_ms(), Ordering::Relaxed);
+
+    let outcome = handle_incoming_publish(ctx, wire).await;
+
+    if let IncomingOutcome::FetchMiss(wire) = outcome {
+        if attempts_left == 0 {
+            // Budget spent. NOW it is a terminal drop, and reports as the
+            // BlobNotFound this path used to return on the very first miss.
+            ctx.sync_stats
+                .fetch_retries_exhausted
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                community_id = ?ctx.community_id,
+                budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+                attempts = FETCH_RETRY_ATTEMPTS + 1,
+                "community state-root blob fetch retries exhausted — publish dropped; \
+                 tracker un-advanced, so a peer's next publish or re-offer is still admissible"
+            );
+            report_degraded(
+                ctx.error_tx.as_ref(),
+                ctx.community_id,
+                "blob_not_found",
+                format!(
+                    "state-root blob not fetchable within {}ms after {} attempts",
+                    crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+                    FETCH_RETRY_ATTEMPTS + 1
+                ),
+            );
+            return;
+        }
+
+        // Acquire the permit BEFORE spawning, so the count of detached
+        // sleepers — each retaining its wire buffer for the whole delay — is
+        // hard-capped rather than merely the re-injection channel. On
+        // saturation, drop and count: piling up retries under a publish flood
+        // is the failure this shield exists to prevent.
+        let Ok(permit) = Arc::clone(&ctx.fetch_retry_sem).try_acquire_owned() else {
+            ctx.sync_stats
+                .fetch_retries_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                community_id = ?ctx.community_id,
+                "community fetch-retry in-flight cap saturated — dropping retry"
+            );
+            return;
+        };
+        ctx.sync_stats
+            .fetch_retries_scheduled
+            .fetch_add(1, Ordering::Relaxed);
+        let inflight = (FETCH_RETRY_MAX_INFLIGHT - ctx.fetch_retry_sem.available_permits()) as u64;
+        ctx.sync_stats
+            .fetch_retry_inflight_peak
+            .fetch_max(inflight, Ordering::Relaxed);
+        tracing::info!(
+            community_id = ?ctx.community_id,
+            attempts_left,
+            delay_ms = FETCH_RETRY_DELAY_MS,
+            "community state-root blob fetch failed — retry scheduled"
+        );
+        let tx = ctx.fetch_retry_tx.clone();
+        tokio::spawn(async move {
+            // Hold the permit for the sleeper's whole lifetime; released on
+            // task end (after enqueue), which is what bounds concurrency.
+            let _permit = permit;
+            tokio::time::sleep(std::time::Duration::from_millis(FETCH_RETRY_DELAY_MS)).await;
+            // `try_send`, never a blocking `send().await`: a full channel means
+            // the engine is already saturated — drop rather than pile up. A
+            // closed channel means the engine shut down, which is also moot.
+            if tx.try_send((wire, attempts_left - 1)).is_err() {
+                tracing::warn!("community fetch-retry re-injection channel unavailable — dropped");
+            }
+        });
+        return;
+    }
+
+    if let Some(err) = outcome.error() {
+        tracing::warn!(
+            community_id = ?ctx.community_id,
+            error = %err,
+            "community incoming publish dropped"
+        );
+        // Surface the failure-class as a degraded-path report so start_node's
+        // drain task can translate it into a `community-state-sync-degraded`
+        // Tauri event. Per the spec (§ "IPC surface → Events"), the frontend
+        // uses these to surface "this community's sync is degraded" banners.
+        report_degraded(
+            ctx.error_tx.as_ref(),
+            ctx.community_id,
+            classify_incoming_error(err),
+            format!("{err}"),
+        );
+    }
+
+    // ZEB-805: stamp "sync actually advanced" only where the CRDT or the
+    // tracker genuinely moved. This is the honest "is sync working" signal —
+    // deriving staleness from `last_inbound_ms` instead would have rendered
+    // the incident's receiving-and-discarding node as perfectly healthy, which
+    // is precisely the bug.
+    if outcome.needs_persist() {
+        ctx.sync_stats
+            .last_advance_ms
+            .store(crate::network_health::now_ms(), Ordering::Relaxed);
+    }
+
+    // Persist on Mutated | MutatedTrackerOnly | ErrPostMutation.
+    // `crdt_mutated()` lets the tracker-only branch skip the larger
+    // `crdt.cbor` fsync — the CRDT is byte-identical when every event in the
+    // remote blob was AlreadyKnown.
+    if outcome.needs_persist() {
+        let persist_result = if outcome.crdt_mutated() {
+            persist_both(ctx).await
+        } else {
+            persist_replay_only(ctx).await
+        };
+        if let Err(e) = persist_result {
+            tracing::warn!(
+                community_id = ?ctx.community_id,
+                error = %e,
+                "community persist after merge failed"
+            );
         }
     }
 }
@@ -3847,10 +4064,17 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     {
         Ok(Some(b)) => b,
         Ok(None) => {
-            return IncomingOutcome::ErrPreMutation(CommunitySyncError::BlobNotFound {
-                cid: payload.root_cid,
-                budget_ms: crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
-            });
+            // ZEB-805: hand the wire frame back for a bounded retry instead of
+            // dropping it. The engine loop decides whether budget remains; on
+            // exhaustion it produces the terminal BlobNotFound this used to
+            // return unconditionally.
+            tracing::warn!(
+                community_id = ?ctx.community_id,
+                cid = ?payload.root_cid,
+                budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+                "community state-root blob fetch miss — will retry if budget remains"
+            );
+            return IncomingOutcome::FetchMiss(wire);
         }
         Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::ContentStore(e)),
     };
@@ -4851,6 +5075,17 @@ impl Drop for CommunitySyncSpawnGuard {
     }
 }
 
+/// ZEB-805: the registry is the counter source for `network_health_snapshot`.
+/// The trait lives in `network_health` so staleness-tier policy stays there;
+/// this impl only reads atomics. It lives in this module because the engine map
+/// is private here.
+#[async_trait::async_trait]
+impl crate::network_health::CommunitySyncSource for CommunitySyncRegistry {
+    async fn per_community(&self) -> Vec<(SpaceId, crate::network_health::CommunitySyncRaw)> {
+        self.community_sync_raw().await
+    }
+}
+
 impl CommunitySyncRegistry {
     pub fn new(cfg: CommunityRegistryConfig) -> Self {
         let crdt_state = cfg.crdt_state.as_ref().map(Arc::clone);
@@ -5116,6 +5351,31 @@ impl CommunitySyncRegistry {
     /// v1 doesn't deduplicate registrations because the caller pattern (one
     /// `redeem_invite` IPC = one fresh `event_id`) keeps the map naturally
     /// sparse.
+    /// ZEB-805: snapshot every live engine's sync counters for
+    /// `network_health_snapshot`. Cheap — one lock, then atomic loads.
+    pub async fn community_sync_raw(
+        &self,
+    ) -> Vec<(SpaceId, crate::network_health::CommunitySyncRaw)> {
+        self.engines
+            .lock()
+            .await
+            .iter()
+            .map(|(id, e)| {
+                let s = e.sync_stats();
+                (
+                    *id,
+                    crate::network_health::CommunitySyncRaw {
+                        last_inbound_ms: s.last_inbound_ms.load(Ordering::Relaxed),
+                        last_advance_ms: s.last_advance_ms.load(Ordering::Relaxed),
+                        fetch_retries_scheduled: s.fetch_retries_scheduled.load(Ordering::Relaxed),
+                        fetch_retries_dropped: s.fetch_retries_dropped.load(Ordering::Relaxed),
+                        fetch_retries_exhausted: s.fetch_retries_exhausted.load(Ordering::Relaxed),
+                    },
+                )
+            })
+            .collect()
+    }
+
     pub async fn register_pending_redemption(
         &self,
         event_id: crate::community_membership::EventId,
@@ -7783,6 +8043,496 @@ mod tests {
             .await
             .expect("second serve request");
         assert!(reply_rx2.await.expect("engine replied again").is_err());
+    }
+
+    // ── ZEB-805: bounded state-root blob re-fetch ────────────────────────────
+
+    /// A `ContentStore` that misses a controllable number of times before
+    /// delegating to the real one — the receiver-side condition from the
+    /// ZEB-805 incident, where the ~100 KB state-root blob was not fetchable
+    /// within the budget while the publisher held it perfectly well.
+    ///
+    /// Counts calls so a test can assert the exact attempt count, and records
+    /// the budget each call was made under so the Task 1 plumbing stays pinned
+    /// end-to-end (not just at the unit seam).
+    struct MissingUntilStore {
+        inner: Arc<dyn ContentStore>,
+        misses_remaining: std::sync::atomic::AtomicU32,
+        get_calls: Arc<AtomicU64>,
+        last_budget_ms: Arc<AtomicU64>,
+    }
+
+    impl MissingUntilStore {
+        fn new(
+            inner: Arc<dyn ContentStore>,
+            misses: u32,
+        ) -> (Arc<Self>, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let get_calls = Arc::new(AtomicU64::new(0));
+            let last_budget_ms = Arc::new(AtomicU64::new(0));
+            let s = Arc::new(Self {
+                inner,
+                misses_remaining: std::sync::atomic::AtomicU32::new(misses),
+                get_calls: Arc::clone(&get_calls),
+                last_budget_ms: Arc::clone(&last_budget_ms),
+            });
+            (s, get_calls, last_budget_ms)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for MissingUntilStore {
+        async fn put(
+            &self,
+            cid: crate::owner_state_types::ContentId,
+            blob: Vec<u8>,
+        ) -> Result<(), crate::content_store::ContentStoreError> {
+            self.inner.put(cid, blob).await
+        }
+
+        async fn get(
+            &self,
+            cid: &crate::owner_state_types::ContentId,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            self.get_with_budget(cid, std::time::Duration::from_millis(0))
+                .await
+        }
+
+        async fn get_with_budget(
+            &self,
+            cid: &crate::owner_state_types::ContentId,
+            budget: std::time::Duration,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.last_budget_ms
+                .store(budget.as_millis() as u64, Ordering::SeqCst);
+            // fetch_update so the decrement saturates at 0 rather than wrapping.
+            let missed = self
+                .misses_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    if n > 0 {
+                        Some(n - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok();
+            if missed {
+                return Ok(None);
+            }
+            self.inner.get_with_budget(cid, budget).await
+        }
+
+        async fn put_serveable(
+            &self,
+            cid: crate::owner_state_types::ContentId,
+            blob: Vec<u8>,
+        ) -> Result<(), crate::content_store::ContentStoreError> {
+            self.inner.put_serveable(cid, blob).await
+        }
+    }
+
+    /// Two engines sharing one CAS, where the RECEIVER's store misses a
+    /// controllable number of times. Alice (A) creates a channel and serves a
+    /// state-root packet; Bob (B) must fetch the blob to apply it. Mirrors
+    /// `query_serve_arm_replies_packet_that_peer_engine_ingests`, which is the
+    /// established A-to-B ingest fixture in this module.
+    struct RetryFixture {
+        stats: Arc<CommunitySyncStats>,
+        store: Arc<MissingUntilStore>,
+        get_calls: Arc<AtomicU64>,
+        last_budget_ms: Arc<AtomicU64>,
+        sub_tx: mpsc::Sender<Vec<u8>>,
+        serve_tx: mpsc::Sender<RootServeRequest>,
+        packet: Vec<u8>,
+        b_state: Arc<Mutex<CommunityState>>,
+        ch_id: crate::community_membership::ChannelId,
+        alice_addr: OwnerAddr,
+        err_rx: Arc<Mutex<mpsc::Receiver<CommunityDegradedReport>>>,
+        // Held so the temp dirs and engines outlive the fixture.
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+        _engines: (CommunitySyncEngine, CommunitySyncEngine),
+    }
+
+    impl RetryFixture {
+        async fn new(misses: u32) -> Self {
+            use crate::community_membership::{
+                mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload,
+                MembershipEventKind, SignedMembershipEvent,
+            };
+            use crate::community_state_crdt::InsertOutcome;
+
+            let alice = mint_test_owner(0xAA);
+            let bob = mint_test_owner(0xBB);
+            let alice_addr = alice.owner;
+            let bob_addr = bob.owner;
+            let alice_sk = Arc::new(alice.device_key.clone());
+            let bob_sk = Arc::new(bob.device_key.clone());
+            let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+
+            let cas_op_tx = spawn_shared_cas();
+            let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+                cas_op_tx.clone(),
+                std::time::Duration::from_secs(2),
+            ));
+            // B's real store sits behind the miss-injecting wrapper, so a
+            // "miss" is exactly the incident condition: the publisher holds the
+            // blob, the receiver cannot get it inside the budget.
+            let cs_b_inner: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+                cas_op_tx,
+                std::time::Duration::from_secs(2),
+            ));
+            let (store, get_calls, last_budget_ms) = MissingUntilStore::new(cs_b_inner, misses);
+            let cs_b: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
+
+            let dir_a = tempfile::tempdir().expect("dir a");
+            let dir_b = tempfile::tempdir().expect("dir b");
+            let community_id = SpaceId([0x3C; 16]);
+            let membership_key = EpochKey::new([0x55; 32]);
+
+            let (serve_tx, serve_rx) = mpsc::channel::<RootServeRequest>(4);
+            let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+            let (_a_sub_tx_held, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+            tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
+            let a_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+
+            let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+                community_id,
+                membership_key: membership_key.clone(),
+                admin_addr: alice_addr,
+                is_invite_only: false,
+                device_id: "alice-dev".into(),
+                self_owner: alice_addr,
+                signing_key: Arc::clone(&alice_sk),
+                state: Arc::clone(&a_state),
+                tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                    alice_addr,
+                    "alice-dev".to_string(),
+                )))),
+                content_store: cs_a,
+                publisher_tx: a_pub_tx,
+                subscriber_rx: a_sub_rx,
+                paths: PersistPaths {
+                    crdt: dir_a.path().join("crdt.cbor"),
+                    replay: dir_a.path().join("replay.cbor"),
+                },
+                debounce_ms: DEFAULT_DEBOUNCE_MS,
+                identity_resolver: Some(Arc::clone(&resolver)),
+                error_tx: None,
+                delta_tx: None,
+                pending_redemptions: None,
+                crdt_state: None,
+                admin_identity_pub: None,
+                nav_emitter: None,
+                root_serve_rx: Some(serve_rx),
+            });
+
+            let (b_pub_tx, _b_pub_rx_held) = mpsc::channel::<Vec<u8>>(64);
+            let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+            let (err_tx, err_rx) = mpsc::channel::<CommunityDegradedReport>(32);
+            let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+
+            let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+                community_id,
+                membership_key,
+                admin_addr: alice_addr,
+                is_invite_only: false,
+                device_id: "bob-dev".into(),
+                self_owner: bob_addr,
+                signing_key: Arc::clone(&bob_sk),
+                state: Arc::clone(&b_state),
+                tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                    bob_addr,
+                    "bob-dev".to_string(),
+                )))),
+                content_store: cs_b,
+                publisher_tx: b_pub_tx,
+                subscriber_rx: b_sub_rx,
+                paths: PersistPaths {
+                    crdt: dir_b.path().join("crdt.cbor"),
+                    replay: dir_b.path().join("replay.cbor"),
+                },
+                debounce_ms: DEFAULT_DEBOUNCE_MS,
+                identity_resolver: Some(resolver),
+                error_tx: Some(err_tx),
+                delta_tx: None,
+                pending_redemptions: None,
+                crdt_state: None,
+                admin_identity_pub: None,
+                nav_emitter: None,
+                root_serve_rx: None,
+            });
+
+            // Alice's EnrollmentCert-bearing bootstrap Join, seeded into BOTH so
+            // B's membership-at-HLC gate admits her served packet.
+            let alice_join_at = Hlc {
+                wall_ms: 100_000,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            };
+            let alice_join_payload = EventPayload {
+                id: [0x10; 16],
+                community_id,
+                kind: MembershipEventKind::Join,
+                actor: alice_addr,
+                at: alice_join_at.clone(),
+            };
+            let alice_join = SignedMembershipEvent {
+                enrollment: Some(alice.cert.clone()),
+                ..sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign join")
+            };
+            assert_eq!(
+                engine_a
+                    .insert_local_event(alice_join.clone())
+                    .await
+                    .expect("alice bootstrap insert"),
+                InsertOutcome::Inserted
+            );
+            assert_eq!(
+                engine_b
+                    .insert_local_event(alice_join)
+                    .await
+                    .expect("bob OOB-seeds alice's bootstrap join"),
+                InsertOutcome::Inserted
+            );
+
+            // The mutation whose arrival on B is the observable under test.
+            let ch_id = ChannelId([0x42; 16]);
+            let create_payload = EventPayload {
+                id: [0x11; 16],
+                community_id,
+                kind: MembershipEventKind::ChannelCreate {
+                    channel_id: ch_id,
+                    name: "general".into(),
+                    write_power: 0,
+                    kind: ChannelKind::Text,
+                },
+                actor: alice_addr,
+                at: Hlc {
+                    wall_ms: alice_join_at.wall_ms,
+                    logical: alice_join_at.logical + 1,
+                    device_id: alice_join_at.device_id.clone(),
+                },
+            };
+            let create = sign_event(&create_payload, alice_sk.as_ref()).expect("sign create");
+            assert_eq!(
+                engine_a
+                    .insert_local_event(create)
+                    .await
+                    .expect("alice channel-create insert"),
+                InsertOutcome::Inserted
+            );
+
+            // Serve one fresh packet from A and inject it into B.
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            serve_tx.send(reply_tx).await.expect("send serve request");
+            let packet = reply_rx.await.expect("engine replied").expect("encode ok");
+
+            let stats = engine_b.sync_stats();
+            b_sub_tx
+                .send(packet.clone())
+                .await
+                .expect("inject packet into B");
+
+            Self {
+                stats,
+                store,
+                get_calls,
+                last_budget_ms,
+                sub_tx: b_sub_tx,
+                serve_tx,
+                packet,
+                b_state,
+                ch_id,
+                alice_addr,
+                err_rx: Arc::new(Mutex::new(err_rx)),
+                _dirs: (dir_a, dir_b),
+                _engines: (engine_a, engine_b),
+            }
+        }
+
+        /// Mint one more state-root packet from A. Each serve encodes fresh and
+        /// advances `next_hlc`, so successive packets carry strictly newer HLCs
+        /// and none is rejected as a replay.
+        async fn serve_fresh_packet(&self) -> Vec<u8> {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            self.serve_tx
+                .send(reply_tx)
+                .await
+                .expect("send serve request");
+            reply_rx.await.expect("engine replied").expect("encode ok")
+        }
+
+        /// Poll until Alice's channel materializes on B. Under `start_paused`
+        /// these sleeps auto-advance, so the whole retry chain costs no
+        /// wall-clock while still exercising the real delays.
+        async fn await_channel_materialized(&self) -> bool {
+            for _ in 0..200 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let mat = {
+                    let g = self.b_state.lock().await;
+                    g.materialize_now(self.alice_addr)
+                };
+                if mat.channels.contains_key(&self.ch_id) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        async fn await_exhaustion(&self) {
+            for _ in 0..400 {
+                if self.stats.fetch_retries_exhausted.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!(
+                "retry budget never exhausted (get_calls={}, scheduled={})",
+                self.get_calls.load(Ordering::SeqCst),
+                self.stats.fetch_retries_scheduled.load(Ordering::SeqCst)
+            );
+        }
+
+        async fn degraded_reports(&self) -> Vec<CommunityDegradedReport> {
+            let mut out = Vec::new();
+            let mut rx = self.err_rx.lock().await;
+            while let Ok(r) = rx.try_recv() {
+                out.push(r);
+            }
+            out
+        }
+    }
+
+    /// ZEB-805 core fix: a state-root publish whose blob is briefly unfetchable
+    /// must be RETRIED, not dropped. Before this, the first miss was terminal —
+    /// and because the next state root is a larger blob under the same budget,
+    /// every failure made the next likelier, which is how a transient miss
+    /// became a 90-minute silent partition.
+    ///
+    /// `start_paused` so the 2 s retry delay costs no wall-clock: tokio
+    /// auto-advances its clock when every task is idle.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_miss_retries_and_succeeds_once_blob_becomes_fetchable() {
+        let f = RetryFixture::new(1).await;
+        assert!(
+            f.await_channel_materialized().await,
+            "the retry must land the publish that the first fetch missed"
+        );
+        assert_eq!(
+            f.stats.fetch_retries_scheduled.load(Ordering::SeqCst),
+            1,
+            "exactly one retry scheduled"
+        );
+        assert_eq!(
+            f.stats.fetch_retries_exhausted.load(Ordering::SeqCst),
+            0,
+            "budget was not exhausted"
+        );
+        assert_eq!(
+            f.get_calls.load(Ordering::SeqCst),
+            2,
+            "one miss plus one successful retry"
+        );
+        assert_eq!(
+            f.last_budget_ms.load(Ordering::SeqCst),
+            crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+            "the state-root budget must reach the store — not the 500ms default \
+             (ZEB-805 Task 1 plumbing, pinned end-to-end)"
+        );
+    }
+
+    /// The budget is bounded: after `1 + FETCH_RETRY_ATTEMPTS` attempts the
+    /// publish is dropped and reported degraded. Pins the attempt count exactly
+    /// — an off-by-one here is the difference between a bounded retry and an
+    /// unbounded one under a publish flood.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_miss_retry_exhaustion_drops_and_reports_degraded() {
+        let f = RetryFixture::new(u32::MAX).await; // never fetchable
+        f.await_exhaustion().await;
+
+        assert_eq!(
+            f.get_calls.load(Ordering::SeqCst),
+            1 + FETCH_RETRY_ATTEMPTS as u64,
+            "initial attempt plus exactly FETCH_RETRY_ATTEMPTS retries"
+        );
+        assert_eq!(
+            f.stats.fetch_retries_scheduled.load(Ordering::SeqCst),
+            FETCH_RETRY_ATTEMPTS as u64
+        );
+        assert_eq!(f.stats.fetch_retries_exhausted.load(Ordering::SeqCst), 1);
+
+        let reports = f.degraded_reports().await;
+        assert!(
+            reports.iter().any(|r| r.reason_tag == "blob_not_found"),
+            "exhaustion must surface a degraded report, got {reports:?}"
+        );
+    }
+
+    /// Adversarial-flood backstop. Each pending retry is a detached task
+    /// RETAINING ITS WIRE FRAME for the delay, so an unbounded retry spawn is a
+    /// memory amplifier: a peer that floods unfetchable publishes would have us
+    /// hold one buffer per publish. The permit is acquired BEFORE the spawn, so
+    /// what is capped is the retained buffers, not merely the re-injection
+    /// channel depth.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_retry_flood_shield_caps_inflight_sleepers() {
+        let flood = FETCH_RETRY_MAX_INFLIGHT + 4;
+        let f = RetryFixture::new(u32::MAX).await; // nothing is ever fetchable
+
+        // Mint `flood - 1` further distinct packets (the fixture already
+        // injected one). Each serve advances next_hlc, so every frame carries a
+        // strictly newer HLC and all of them pass the replay check — without
+        // that, the tracker would dedupe them and there would be no flood.
+        for _ in 1..flood {
+            let packet = f.serve_fresh_packet().await;
+            f.sub_tx.send(packet).await.expect("inject flood packet");
+        }
+
+        // Let the engine drain the injected frames. Virtual time only advances
+        // once every task is idle, so the sleepers are all still holding their
+        // permits while these frames are processed.
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if f.stats.fetch_retries_dropped.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
+
+        let peak = f.stats.fetch_retry_inflight_peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= FETCH_RETRY_MAX_INFLIGHT as u64,
+            "concurrent retry sleepers must stay within the cap, peaked at {peak}"
+        );
+        assert!(
+            f.stats.fetch_retries_dropped.load(Ordering::SeqCst) > 0,
+            "excess retries beyond the cap must be dropped and counted, not queued \
+             (peak={peak}, scheduled={})",
+            f.stats.fetch_retries_scheduled.load(Ordering::SeqCst)
+        );
+    }
+
+    /// ZEB-750 invariant, made explicit because the retry now depends on it:
+    /// a fetch miss must leave the replay tracker UN-advanced, so the very same
+    /// frame is admissible again later. If a miss ever advanced the tracker,
+    /// every retry — and every peer re-delivery — would be rejected as a
+    /// duplicate, and the bounded retry above would be silently dead code.
+    #[tokio::test(start_paused = true)]
+    async fn tracker_stays_unadvanced_across_miss_and_exhaustion() {
+        let f = RetryFixture::new(u32::MAX).await;
+        f.await_exhaustion().await;
+
+        // The blob is now fetchable, and we re-deliver the IDENTICAL frame.
+        f.store.misses_remaining.store(0, Ordering::SeqCst);
+        f.sub_tx
+            .send(f.packet.clone())
+            .await
+            .expect("re-deliver the same frame");
+
+        assert!(
+            f.await_channel_materialized().await,
+            "after exhaustion the same frame must still be admissible — a miss \
+             must never advance the replay tracker"
+        );
     }
 
     /// ZEB-434 Task 10: end-to-end repro pin for the live bug — a
