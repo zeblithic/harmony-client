@@ -1413,11 +1413,24 @@ async fn identified_resolve_filters_own_endpoint() {
     .expect("identified_resolve_filters_own_endpoint timed out at 60s");
 }
 
-/// ZEB-824 headline scenario (spec §8): a member with an EMPTY reachability
-/// resolver — rebuilt node, no addrbook sidecar, LAN scouting off — bootstraps a
-/// dial candidate out of the rendezvous beacon in a single pass. This pins the
-/// pkarr publish → identified resolve → membership gate → seed chain against the
-/// real mock relay.
+/// ZEB-824 driver plumbing, end to end against the mock relay: with an EMPTY
+/// reachability resolver, one `run_one_pass` resolves the rendezvous beacon and
+/// seeds a dial candidate. It pins the pkarr publish → identified resolve →
+/// decode → seed chain.
+///
+/// **This is NOT the spec §8 headline proof, and must not be read as one.** The
+/// member set below is SYNTHETIC — it is keyed by the owner derived from the
+/// beacon record's identity bytes, which is the flavor the driver's membership
+/// gate computes but NOT the flavor production's `members_of` returns. Verified
+/// experimentally on this very harness: `ProdGatewayDialCtx::members_of` over
+/// `registry_bob` after a real open-join admit returns `[alice_addr]` — the
+/// *master* `PubKeyBundle::identity_hash()` — whereas the driver derives
+/// `Identity::address_hash` (the composite `X25519 ‖ Ed25519` device hash).
+/// Those are the documented "never converge" pair, so in production the gate
+/// admits nothing and this scenario records `rejectedNonMember` instead of
+/// seeding. Do NOT "fix" a future failure here by editing the member set — that
+/// is what hid the defect the first time. The gate needs a redesign (spec §5c);
+/// until it lands, this test covers the resolve/seed plumbing only.
 ///
 /// Kick coverage lives in the driver's own unit test
 /// (`community_gateway_dial_driver::tests::explicit_kick_fires_when_the_seed_raises_no_auto_kick`);
@@ -1434,13 +1447,9 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
         await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
         let alice_node_id = *setup.alice_ep.node_id().as_bytes();
 
-        // The membership gate compares against the owner derived from the
-        // record's OWN identity bytes, and this harness is dual-identity:
-        // `alice_addr` is her minted COMMUNITY owner, while the rendezvous
-        // publisher signs slot records with her TRANSPORT identity
-        // (`alice_identity_pub`). Those hash to different addresses, so the
-        // member set — and the seed assertion — must use the record-derived one,
-        // exactly as the driver computes it.
+        // The SYNTHETIC member key (see the header): the owner the driver
+        // derives from the record's own identity bytes. Production's member set
+        // is keyed by the master owner addr instead, which is the open defect.
         let alice_beacon_owner = OwnerAddr(
             harmony_identity::Identity::from_public_bytes(&setup.alice_identity_pub)
                 .expect("alice's published identity bytes must parse")
@@ -1480,6 +1489,7 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
         );
 
         let community = setup.community_id;
+        let telemetry = Arc::new(harmony_app::network_health::GatewayBootstrapTelemetry::new());
         let driver = harmony_app::community_gateway_dial_driver::CommunityGatewayDialDriver::new(
             Arc::new(ItCtx {
                 community,
@@ -1495,7 +1505,8 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
             Arc::clone(&resolver),
             Arc::new(move || vec![community]),
             setup.bob_addr,
-        );
+        )
+        .with_telemetry(Arc::clone(&telemetry));
 
         driver.run_one_pass().await;
 
@@ -1512,6 +1523,21 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
             "the seeded routing blob must be alice's endpoint — the thing the reconnect \
              supervisor's record gate needs before it will dial her"
         );
+        // Review INFO-1: pin the verdict too, so a future regression reports
+        // WHICH outcome the pass reached rather than only "no seed". If the §5c
+        // gate redesign lands and this member set is left synthetic, this row
+        // turns `rejectedNonMember` and names the reason.
+        let summary = telemetry.summary();
+        assert_eq!(
+            summary
+                .per_community
+                .iter()
+                .find(|row| row.community_short == hex::encode(&community.0[..4]))
+                .map(|row| row.outcome.as_str()),
+            Some("beaconSeeded"),
+            "the pass must record the seed verdict for this community"
+        );
+        assert_eq!(summary.beacons_seeded, 1);
 
         setup.publisher_handle.abort();
         setup.alice_ep.shutdown().await;

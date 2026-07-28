@@ -152,7 +152,27 @@ For each joined community, in `run_one_pass(now_ms)`:
       iroh-node-id filter in the decode closure is primary; this catches a same-owner
       sibling device record, which is a candidate the fleet-sibling seed path already
       covers).
-   c. **Membership gate:** require the derived owner to be a Joined member of X in the
+   c. > **DEFECT — this step as specified cannot work; redesign pending.** The derived
+      > owner and the materialized membership keys are **different kinds of 16 bytes**,
+      > the documented "never converge" pair. `Identity::address_hash` is
+      > `truncated_hash(X25519_pub ‖ Ed25519_pub)` — the composite *device* hash
+      > (`harmony-identity/src/identity.rs:66-69`), and it is exactly what production
+      > stamps as a node's signing-device hash (`lib.rs:3977`). The member map is keyed
+      > by `event.actor`, bound by the enrollment cert to `cert.owner_id` = the **master**
+      > `PubKeyBundle::identity_hash()`, a signing-only hash that excludes encryption keys
+      > (`harmony-owner/src/pubkey_bundle.rs:58-79`). Confirmed experimentally:
+      > `ProdGatewayDialCtx::members_of` over a real post-admit registry returns the master
+      > addr, which differs from the composite in every byte. So the gate rejects **every**
+      > beacon, `beaconSeeded` is unreachable in production, and the feature is a no-op.
+      > No choice of publisher signing identity fixes it — the two sides are different hash
+      > functions. The fix is to bridge the two notions explicitly (resolve the beacon's
+      > device hash to an owner, e.g. the DM receive path's
+      > `resolve_signed_origin_owner`, and gate on THAT owner) rather than to compare
+      > across flavors — but note the owner-device cache is populated by peer-interaction
+      > CRDT ops, so its coverage for a never-connected member on a rebuilt node is itself
+      > an open question that the redesign must settle. Its own ticket.
+
+   c. **Membership gate (as written, defective — see above):** require the derived owner to be a Joined member of X in the
       materialized membership. The record already proves its writer holds the epoch key
       (outer BEP44 sig) *and* the claimed identity's signing key (inner sig,
       `record.rs:92 verify_inner_sig` runs inside `PkarrResolver::resolve`); this gate

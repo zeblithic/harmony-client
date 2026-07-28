@@ -1066,8 +1066,10 @@ mod tests {
         let beacon_node_id = [0x99; 32];
         let h = harness(
             community,
-            // Non-empty deliberately: this is the pure epoch-key test, so the
-            // members check must not be able to produce the verdict.
+            // Non-empty deliberately: keeps this a pure epoch-key test even if
+            // the key-first ordering is ever revisited. (Under the shipped
+            // order the members check cannot produce the verdict for any member
+            // set — that is what test 9b pins.)
             vec![member_owner],
             Some(beacon(member_pub, beacon_node_id)),
             // No epoch key: the registry has not registered the engine yet.
