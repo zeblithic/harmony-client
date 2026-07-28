@@ -15,6 +15,13 @@ export type NatClass =
 // still-live conn). Mirrors Rust `ConnectionMode::Degraded` (wire `"degraded"`).
 export type ConnectionMode = 'direct' | 'relay' | 'noConnection' | 'degraded';
 
+// ZEB-804: per-peer staleness tier derived server-side at snapshot assembly
+// from the freshest traffic evidence (see Rust `PeerStaleness`,
+// network_health.rs; serde rename_all = "camelCase" wire values). The tier
+// says "no evidence", not "down" — thresholds are deliberately generous
+// (fresh < 5 min ≤ quiet ≤ 30 min < dark).
+export type PeerStaleness = 'fresh' | 'quiet' | 'dark';
+
 export interface MyNetworkSummary {
   irohNodeId: string;
   reachability: ReachabilityStatus;
@@ -37,6 +44,34 @@ export interface PeerHealth {
   // `null` when compatible. Rust serializes it unconditionally (present as
   // `null` when None), so it is always on the wire for a schema-v4 snapshot.
   protocolIncompatReason: string | null;
+  /**
+   * ZEB-804: freshest served-traffic evidence for this peer — max of the
+   * liveness machine's rx app-frame stamp (≤30s coarse) and the acceptor
+   * registry's served stamp. `null` when neither source has evidence.
+   * Optional for forward-compat with pre-field snapshots (Rust
+   * `#[serde(default)]`).
+   */
+  lastTrafficMs?: number | null;
+  /**
+   * ZEB-804: most recent successfully served community-relay pull from this
+   * peer (success-only by design — the relay-pull cadence is the
+   * staleness-tier signal). Optional for pre-field snapshots.
+   */
+  lastRelayPullServedMs?: number | null;
+  /**
+   * ZEB-804: when the current connection was established — the establishment
+   * stamp under its honest name (NOT traffic evidence). `null` when no source
+   * reports the peer connected. Optional for pre-field snapshots.
+   */
+  connectedSinceMs?: number | null;
+  /**
+   * ZEB-804: derived staleness tier, bucketed server-side from the final
+   * merged `lastTrafficMs`. `null` when `connectionMode` is `noConnection`
+   * (absence of a connection is already honest). A connected-looking peer
+   * with NO traffic evidence ever reads `'dark'` — the ZEB-804 incident
+   * shape. Optional for pre-field snapshots.
+   */
+  staleness?: PeerStaleness | null;
 }
 
 // ZEB-595: three-state so the panel can distinguish a clean "not published
@@ -111,6 +146,14 @@ export interface DialHealthSummary {
   retrying?: number;
   dormant?: number;
   connected?: number;
+  /**
+   * ZEB-804 (spec §8): lifetime count of Connected entries via registry swap
+   * (inbound accepts / zenoh-initiated links the supervisor ladder never
+   * dialed). Makes an inbound-only node's `dialStatus` legible: `attempts: 0`
+   * beside `connectedViaRegistry > 0` reads "healthy listener", not "dialing
+   * is broken". Optional for pre-field snapshots (Rust `#[serde(default)]`).
+   */
+  connectedViaRegistry?: number;
   recent: DynamicDialHit[];
 }
 

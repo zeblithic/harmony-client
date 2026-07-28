@@ -217,6 +217,9 @@ where
     /// `verify_and_admit_open_join` call, never across the engine apply
     /// or the response write.
     open_join_limiter: TokioMutex<OpenJoinRateLimiter>,
+    /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
+    /// iroh endpoint id. `None` (tests, pre-boot) — stamping is then a no-op.
+    traffic: Option<Arc<crate::network_health::PeerTrafficRegistry>>,
 }
 
 impl<H> IrohInviteHandshakeAcceptor<H>
@@ -262,7 +265,19 @@ where
             pkarr_invite_publisher,
             config,
             open_join_limiter: TokioMutex::new(OpenJoinRateLimiter::default()),
+            traffic: None,
         }
+    }
+
+    /// ZEB-804: install the per-peer served-traffic registry. Builder-style so
+    /// the boot wiring can attach it without a second constructor arity
+    /// (mirrors `IrohCommunityRelayPullAcceptor::with_traffic_registry`).
+    pub fn with_traffic_registry(
+        mut self,
+        traffic: Arc<crate::network_health::PeerTrafficRegistry>,
+    ) -> Self {
+        self.traffic = Some(traffic);
+        self
     }
 
     /// Inbound bi-stream handler shared by the trait dispatch and the
@@ -493,6 +508,29 @@ where
         Ok(())
     }
 
+    /// Write a typed `OpenJoinResponse::Rejected { reason }` and — once the
+    /// write+finish completes — stamp the ZEB-804 served-traffic registry: a
+    /// completed typed rejection is still a COMPLETED iroh-authenticated
+    /// exchange (review r1 ruling — staleness evidence, not a trust or
+    /// success signal). Transport failures propagate via `?` BEFORE the
+    /// stamp, so an exchange that never completed never stamps.
+    async fn write_open_join_rejection(
+        &self,
+        conn: &Connection,
+        send: &mut iroh::endpoint::SendStream,
+        reason: String,
+    ) -> Result<(), HandshakeAcceptError> {
+        let resp = OpenJoinResponse::Rejected { reason };
+        self.write_len_prefixed_cbor(send, &resp).await?;
+        if let Some(reg) = self.traffic.as_ref() {
+            reg.record_served(
+                *conn.remote_id().as_bytes(),
+                crate::network_health::now_ms(),
+            );
+        }
+        Ok(())
+    }
+
     /// Inbound handler for a tokenless open-join request (`0x11` packet).
     ///
     /// Snapshots the beacon engine's verification inputs (`epoch_key`,
@@ -543,10 +581,8 @@ where
                 remote_id = ?conn.remote_id(),
                 "open-join rejected: community is invite-only (countersign-gated)"
             );
-            let resp = OpenJoinResponse::Rejected {
-                reason: "community is invite-only".to_string(),
-            };
-            self.write_len_prefixed_cbor(&mut send, &resp).await?;
+            self.write_open_join_rejection(conn, &mut send, "community is invite-only".to_string())
+                .await?;
             return Err(HandshakeAcceptError::OpenJoinNotPermitted);
         }
 
@@ -592,10 +628,8 @@ where
                     "open-join rejected"
                 );
                 // Surface a typed rejection so the joiner can show a reason.
-                let resp = OpenJoinResponse::Rejected {
-                    reason: format!("{reject:?}"),
-                };
-                self.write_len_prefixed_cbor(&mut send, &resp).await?;
+                self.write_open_join_rejection(conn, &mut send, format!("{reject:?}"))
+                    .await?;
                 return Err(HandshakeAcceptError::OpenJoinRejected);
             }
         };
@@ -623,10 +657,12 @@ where
                     remote_id = ?conn.remote_id(),
                     "open-join: admitted Join rejected by engine verify_event; not reporting Admitted"
                 );
-                let resp = OpenJoinResponse::Rejected {
-                    reason: format!("join rejected on apply: {v:?}"),
-                };
-                self.write_len_prefixed_cbor(&mut send, &resp).await?;
+                self.write_open_join_rejection(
+                    conn,
+                    &mut send,
+                    format!("join rejected on apply: {v:?}"),
+                )
+                .await?;
                 return Err(HandshakeAcceptError::OpenJoinRejected);
             }
             Err(e) => {
@@ -683,6 +719,15 @@ where
     async fn handle_connection(&self, conn: Connection) {
         match self.handle_invite_handshake_inbound(&conn).await {
             Ok(bootstrap_join_id) => {
+                // ZEB-804: stamp the FULL-id served-traffic registry once per
+                // completed handshake (invite counter-sign or open-join admit —
+                // both wrote a response to an iroh-authenticated peer).
+                if let Some(reg) = self.traffic.as_ref() {
+                    reg.record_served(
+                        *conn.remote_id().as_bytes(),
+                        crate::network_health::now_ms(),
+                    );
+                }
                 tracing::info!(
                     bootstrap_join_id = %hex::encode(bootstrap_join_id),
                     remote_id = ?conn.remote_id(),

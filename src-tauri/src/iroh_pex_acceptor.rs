@@ -156,6 +156,9 @@ pub struct IrohFriendPexAcceptor {
     /// per introduction. `None` (tests / owner not loaded) carries none;
     /// production wires the real `NodeState` handle via [`Self::with_self_trust_doc`].
     self_trust_doc: Option<Arc<TokioMutex<harmony_owner::state::OwnerState>>>,
+    /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
+    /// iroh endpoint id. `None` (tests, pre-boot) — stamping is then a no-op.
+    traffic: Option<Arc<crate::network_health::PeerTrafficRegistry>>,
 }
 
 impl IrohFriendPexAcceptor {
@@ -215,7 +218,19 @@ impl IrohFriendPexAcceptor {
             // ZEB-680 §2: default to no trust doc → X's introduction link carries
             // no revocations; production wires the live handle.
             self_trust_doc: None,
+            traffic: None,
         }
+    }
+
+    /// ZEB-804: install the per-peer served-traffic registry. Builder-style so
+    /// the boot wiring can attach it without a second constructor arity
+    /// (mirrors `IrohCommunityRelayPullAcceptor::with_traffic_registry`).
+    pub fn with_traffic_registry(
+        mut self,
+        traffic: Arc<crate::network_health::PeerTrafficRegistry>,
+    ) -> Self {
+        self.traffic = Some(traffic);
+        self
     }
 
     /// ZEB-376 Task 9: wire the pkarr resolver F's `IntroduceRequest` arm uses to
@@ -903,8 +918,25 @@ impl IrohFriendPexAcceptor {
 #[async_trait::async_trait]
 impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for IrohFriendPexAcceptor {
     async fn handle_connection(&self, conn: Connection) {
-        if let Err(e) = self.serve(&conn).await {
-            tracing::debug!(error = %e, "friend-pex serve ended");
+        match self.serve(&conn).await {
+            // ZEB-804: stamp the FULL-id served-traffic registry once per
+            // completed serve — covers all three arms (Catalog browse,
+            // IntroduceRequest, Introduction), each of which wrote a response.
+            // Stamped HERE rather than at the per-arm rate-limiter sites so the
+            // Catalog arm (which never touches `conn.remote_id()`) is covered
+            // too, and a transport-failed serve (closed stream, nothing
+            // written) is not. `Ok` deliberately includes the arms' benign-ack
+            // outcomes (auth-failed IntroduceRequests, policy-rejected
+            // Introductions, rate-limit sheds — the no-oracle design answers
+            // them all with `write_ack`): each is a completed exchange with an
+            // iroh-authenticated peer, which is exactly the traffic evidence
+            // `last_any_served_ms` measures (review r1 ruling).
+            Ok(()) => {
+                if let Some(reg) = self.traffic.as_ref() {
+                    reg.record_served(*conn.remote_id().as_bytes(), wall_now_ms());
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "friend-pex serve ended"),
         }
         // Wait for the dialer to drive the close so the response bytes flush
         // before `conn` drops (same race-avoidance as the handshake acceptors).

@@ -28,7 +28,7 @@ use std::sync::Mutex;
 use crate::reconnect_supervisor::PeerStateWire;
 // ZEB-622: the peer-liveness state machine's per-peer transport projection is
 // joined into PeerHealth (live mode/rtt) and folds into the last-seen freshness.
-use crate::peer_liveness::{LivenessMode, LivenessStateWire};
+use crate::peer_liveness::{LivenessMode, LivenessStateWire, PeerLivenessView};
 
 // ── Public data types (wire shape for IPC) ──────────────────────────
 
@@ -129,7 +129,82 @@ pub struct PeerHealth {
     /// when `None`), so a pre-field cached snapshot still deserializes.
     #[serde(default)]
     pub protocol_incompat_reason: Option<String>,
+    /// ZEB-804: freshest served-traffic evidence for this peer — the max of
+    /// the liveness machine's rx app-frame stamp (≤30s coarse: sampled on the
+    /// RTT tick, which only widens staleness, never fakes freshness) and the
+    /// acceptor registry's `last_any_served_ms`. `None` when neither source
+    /// has evidence. Also max-absorbed into `last_seen_ms`, which may only
+    /// GAIN freshness from it. Additive wire field — `#[serde(default)]`.
+    #[serde(default)]
+    pub last_traffic_ms: Option<u64>,
+    /// ZEB-804: most recent successfully served community-relay pull from this
+    /// peer, copied verbatim from the acceptor registry (success-only by
+    /// design — the relay-pull cadence is the staleness-tier signal). Additive
+    /// wire field — `#[serde(default)]`.
+    #[serde(default)]
+    pub last_relay_pull_served_ms: Option<u64>,
+    /// ZEB-804: when the current connection to this peer was established —
+    /// liveness `Connected.since_ms` first, else the reconnect supervisor's
+    /// `Connected.since_ms`. The establishment stamp under its honest name (it
+    /// is NOT traffic evidence; the presence cache does not feed it). `None`
+    /// when neither source reports the peer connected. Additive wire field —
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub connected_since_ms: Option<u64>,
+    /// ZEB-804: derived staleness tier — the age of this peer's freshest
+    /// traffic evidence (`last_traffic_ms`) bucketed at snapshot assembly
+    /// against [`STALENESS_QUIET_MS`] / [`STALENESS_DARK_MS`], AFTER the
+    /// traffic merge so it reads the final merged value (see
+    /// [`derive_staleness`]). `None` when `connection_mode` is
+    /// `NoConnection` — absence of a connection is already honest, a tier on
+    /// top would be noise. Crucially, a connected-looking peer with NO
+    /// traffic evidence ever reads `Dark`: the tier is what finally makes the
+    /// ZEB-804 incident shape (liveness pinning `direct/14ms` while nothing
+    /// flows) visibly wrong. Additive wire field — `#[serde(default)]`.
+    #[serde(default)]
+    pub staleness: Option<PeerStaleness>,
 }
+
+/// ZEB-804 (spec §6): per-peer staleness tier derived server-side at snapshot
+/// assembly from the freshest traffic evidence. Wire values: `"fresh"` |
+/// `"quiet"` | `"dark"` (Task 5's TS DTO reads these). The tier says "no
+/// evidence", not "down" — thresholds are deliberately generous, so a
+/// false-`dark` on a genuinely idle-but-healthy peer is acceptable by design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PeerStaleness {
+    /// Traffic evidence younger than [`STALENESS_QUIET_MS`].
+    Fresh,
+    /// Traffic evidence aged in `[STALENESS_QUIET_MS, STALENESS_DARK_MS]`.
+    Quiet,
+    /// Traffic evidence older than [`STALENESS_DARK_MS`] — or none EVER while
+    /// a connection is claimed (the ZEB-804 incident shape).
+    Dark,
+}
+
+/// ZEB-804 (spec §6): traffic-evidence age below which a peer reads `fresh`
+/// (5 min). Any active link produces evidence far faster than this — the
+/// liveness rx stamp is sampled on the ≤30s RTT tick — so `fresh` means
+/// "traffic demonstrably flowed within the last few minutes". Generous by
+/// design: the tier says "no evidence", not "down".
+const STALENESS_QUIET_MS: u64 = 300_000;
+
+/// ZEB-804 (spec §6): traffic-evidence age beyond which a peer reads `dark`
+/// (30 min). Derived from the community-relay pull cadence
+/// (`COMMUNITY_RELAY_PULL_INTERVAL_MS`, ~7.5 min): 30 min of silence is
+/// roughly four missed pull cadences from a peer that shares a community with
+/// us — the live ZEB-803 incident (46 silent minutes reading green) sat well
+/// past it. Ages between the two thresholds read `quiet`.
+const STALENESS_DARK_MS: u64 = 1_800_000;
+
+/// ZEB-804 (spec §7): maximum age of a cached self-test report whose per-peer
+/// ping results may still dress a record's `connection_mode`/`rtt_ms` in the
+/// snapshot overlay (10 min — comfortably past a fresh test's relevance, well
+/// under the boot-era-forever failure mode). Expires ONLY that per-peer
+/// dressing: the dedicated self-test report surface is explicitly a "most
+/// recent test result" memo (see the module-level cache-vs-token note) and
+/// renders stale reports untouched.
+const SELF_TEST_OVERLAY_MAX_AGE_MS: u64 = 600_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -243,6 +318,12 @@ pub struct DynamicDialHit {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DialHealthSummary {
+    /// ZEB-804 (spec §8) scope pin: `attempts`/`succeeded`/`failed` =
+    /// "supervisor-ladder outbound dial outcomes since process start". They
+    /// count dials the reconnect ladder DROVE — an inbound accept or a
+    /// zenoh-initiated link never moves them (that's
+    /// `connected_via_registry`), which is why `attempts: 0` on a healthy
+    /// inbound-connected node is normal, not a dead dialer.
     pub attempts: u64,
     pub succeeded: u64,
     pub failed: u64,
@@ -250,12 +331,29 @@ pub struct DialHealthSummary {
     // ZEB-620: live per-peer-state counts from the reconnect supervisor's
     // `states_snapshot` (folded in by `NetworkHealthService::snapshot`, not the
     // dial ring). `#[serde(default)]` keeps a pre-field snapshot forward-compatible.
+    /// ZEB-804 (spec §8) scope pin: `connected`/`retrying`/`dormant` = "live
+    /// supervisor peer states at snapshot time" — point-in-time gauges, not
+    /// lifetime counters; they move in both directions between snapshots.
     #[serde(default)]
     pub retrying: u32,
     #[serde(default)]
     pub dormant: u32,
     #[serde(default)]
     pub connected: u32,
+    /// ZEB-804 (spec §8) scope pin: `connectedViaRegistry` = "lifetime
+    /// Connected entries via registry swap" — one per
+    /// `SupervisorHandle::mark_connected` from a successful inbound-accept /
+    /// outbound `new_link` registry swap (a superseding same-peer swap counts
+    /// again), monotone since process start. NOT disjoint from `succeeded`: a
+    /// connection a successful supervisor-ladder dial produced ALSO lands as a
+    /// `new_link` registry swap, so it bumps both — this counter is a superset
+    /// of ladder-produced connections, not the ladder's complement. The
+    /// counter that makes an inbound-only node's `dialStatus` legible:
+    /// `attempts == 0` beside `connectedViaRegistry > 0` reads "healthy
+    /// listener", not "dialing is broken". `#[serde(default)]` keeps a
+    /// pre-field snapshot forward-compatible.
+    #[serde(default)]
+    pub connected_via_registry: u64,
     pub recent: Vec<DynamicDialHit>,
 }
 
@@ -455,6 +553,10 @@ pub struct DialTelemetry {
     succeeded: AtomicU64,
     failed: AtomicU64,
     skipped_duplicate: AtomicU64,
+    /// ZEB-804 (spec §8): lifetime Connected entries via registry swap —
+    /// bumped only by
+    /// [`record_connected_via_registry`](Self::record_connected_via_registry).
+    connected_via_registry: AtomicU64,
     recent: Mutex<VecDeque<DynamicDialHit>>,
 }
 
@@ -495,6 +597,15 @@ impl DialTelemetry {
     pub fn record_dormant(&self, node_id: [u8; 32], owner: [u8; 16]) {
         self.push(node_id, owner, "dormant");
     }
+    /// ZEB-804 (spec §8): record one Connected entry established by a registry
+    /// swap (inbound accept / zenoh `new_link`) rather than by a
+    /// supervisor-ladder dial. Increments `connected_via_registry` and NOTHING
+    /// else — no dial-outcome counter (no ladder dial happened) and no ring
+    /// marker (the ring wants the peer's owner addr, which the registry-swap
+    /// seam doesn't have).
+    pub fn record_connected_via_registry(&self) {
+        self.connected_via_registry.fetch_add(1, Ordering::Relaxed);
+    }
     fn push(&self, node_id: [u8; 32], owner: [u8; 16], outcome: &str) {
         let hit = DynamicDialHit {
             node_id_short: hex::encode(&node_id[..4]),
@@ -520,6 +631,7 @@ impl DialTelemetry {
             retrying: 0,
             dormant: 0,
             connected: 0,
+            connected_via_registry: self.connected_via_registry.load(Ordering::Relaxed),
             recent: self
                 .recent
                 .lock()
@@ -528,6 +640,118 @@ impl DialTelemetry {
                 .cloned()
                 .collect(),
         }
+    }
+}
+
+/// ZEB-804: the per-peer served-traffic stamps [`PeerTrafficRegistry`] holds.
+///
+/// `last_any_served_ms` — wall ms of the last COMPLETED iroh-authenticated
+/// exchange with this peer, regardless of application-level outcome:
+/// auth-failed / policy-rejected / rate-limit-shed responses count too (review
+/// r1 ruling). The peer demonstrably exchanged traffic with us — this is
+/// staleness evidence, not a trust or success signal.
+///
+/// `last_relay_pull_served_ms` — by contrast SUCCESS-ONLY by design: it
+/// additionally pins the most recent successfully served community-relay pull
+/// (the relay-pull cadence is the signal the staleness tier is derived from,
+/// spec §6, and it answers the ZEB-803 operator question "is this relay
+/// actually serving that peer?").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeerTrafficStamps {
+    pub last_any_served_ms: u64,
+    pub last_relay_pull_served_ms: Option<u64>,
+}
+
+/// Entries retained in [`PeerTrafficRegistry`]. Generous relative to the
+/// `peers[]` population the snapshot joins against — entries only matter while
+/// a peer appears in the snapshot, so evicting the least-recently-stamped
+/// entry is lossless in practice. The bound guards identity-churn growth:
+/// rejected / rate-limit-shed strangers create entries by design of the
+/// any-exchange ruling, so an unbounded map would grow with every stranger
+/// that ever completed an exchange.
+const PEER_TRAFFIC_REGISTRY_CAP: usize = 256;
+
+/// ZEB-804: in-memory per-peer served-traffic stamps, written by the iroh
+/// acceptors at their served-a-request sites and read by `snapshot`. Keyed by
+/// the FULL 32-byte iroh endpoint id — deliberately not the 4-byte-truncated
+/// ZEB-329 relay-serving map, which cannot be joined back to `peers[]`. The
+/// redaction rule governs what we log/persist; this map is in-memory only and
+/// feeds a surface that already shows full owner addrs. Call rate is one stamp
+/// per served request, so a mutex map is fine (no hot-path atomics). Bounded —
+/// see [`PEER_TRAFFIC_REGISTRY_CAP`].
+///
+/// Stamp semantics (review r1 ruling): "served" here means a COMPLETED
+/// iroh-authenticated bidirectional exchange, NOT application-level success —
+/// acceptors whose no-oracle designs answer bad requests with benign replies
+/// (pex, friend) stamp those replies too, because the peer's liveness is what
+/// [`PeerTrafficStamps::last_any_served_ms`] measures. Only the relay-pull
+/// stamp is success-only.
+///
+/// Stamps are caller-clocked, so out-of-order arrival through the mutex or a
+/// backward wall-clock step must not replace newer evidence: both record
+/// methods max-merge and never regress a stamp.
+#[derive(Debug, Default)]
+pub struct PeerTrafficRegistry {
+    stamps: Mutex<HashMap<[u8; 32], PeerTrafficStamps>>,
+}
+
+impl PeerTrafficRegistry {
+    /// Record one completed exchange with `peer` (any acceptor; any
+    /// application-level outcome — see the struct doc). `now_ms` is
+    /// injected by the caller from its existing wall-clock source
+    /// (injected-clock convention — the registry never samples time itself).
+    /// Max-merged: a stamp older than the entry's current one is a no-op.
+    pub fn record_served(&self, peer: [u8; 32], now_ms: u64) {
+        let mut stamps = self.stamps.lock().expect("peer traffic registry lock");
+        let entry = stamps.entry(peer).or_insert(PeerTrafficStamps {
+            last_any_served_ms: 0,
+            last_relay_pull_served_ms: None,
+        });
+        entry.last_any_served_ms = entry.last_any_served_ms.max(now_ms);
+        Self::evict_beyond_cap(&mut stamps);
+    }
+
+    /// Record one served community-relay pull from `peer`. A relay pull is
+    /// also "any" traffic, so BOTH stamps advance — each max-merged
+    /// independently (an out-of-order pull must not regress either field).
+    pub fn record_relay_pull_served(&self, peer: [u8; 32], now_ms: u64) {
+        let mut stamps = self.stamps.lock().expect("peer traffic registry lock");
+        let entry = stamps.entry(peer).or_insert(PeerTrafficStamps {
+            last_any_served_ms: 0,
+            last_relay_pull_served_ms: None,
+        });
+        entry.last_any_served_ms = entry.last_any_served_ms.max(now_ms);
+        entry.last_relay_pull_served_ms = Some(
+            entry
+                .last_relay_pull_served_ms
+                .map_or(now_ms, |prev| prev.max(now_ms)),
+        );
+        Self::evict_beyond_cap(&mut stamps);
+    }
+
+    /// On growth beyond [`PEER_TRAFFIC_REGISTRY_CAP`], evict the entry with
+    /// the oldest `last_any_served_ms` (least-recently-stamped — the same
+    /// shape as [`CommunityRelayServingTelemetry::record_served`]'s eviction).
+    /// Cheap at this cap and only runs on growth.
+    fn evict_beyond_cap(stamps: &mut HashMap<[u8; 32], PeerTrafficStamps>) {
+        if stamps.len() > PEER_TRAFFIC_REGISTRY_CAP {
+            if let Some(oldest) = stamps
+                .iter()
+                .min_by_key(|(_, s)| s.last_any_served_ms)
+                .map(|(k, _)| *k)
+            {
+                stamps.remove(&oldest);
+            }
+        }
+    }
+
+    /// The peer's current stamps, `None` when this node has never served it.
+    pub fn stamps(&self, peer: &[u8; 32]) -> Option<PeerTrafficStamps> {
+        self.stamps
+            .lock()
+            .expect("peer traffic registry lock")
+            .get(peer)
+            .copied()
     }
 }
 
@@ -1287,7 +1511,12 @@ impl NetworkHealthSnapshot {
     }
 }
 
-fn now_ms() -> u64 {
+/// Wall-clock now in epoch-milliseconds (saturating to `0` before the epoch).
+/// `pub(crate)` since ZEB-804: the iroh acceptor stamp sites without a
+/// file-local wall-ms helper inject THIS clock into
+/// [`PeerTrafficRegistry`] — the same clock `snapshot` compares the stamps
+/// against.
+pub(crate) fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1345,6 +1574,42 @@ pub fn derive_reachability_status(
     }
 }
 
+/// ZEB-804 (spec §6): derive the peer's staleness tier from its FINAL merged
+/// traffic evidence. Pure — unit-tested directly with an injected `now_ms`
+/// (no wall clock). Invoked while assembling `PeerHealth` in
+/// [`filter_peers_by_shared_membership`], which `NetworkHealthService::
+/// snapshot` calls AFTER the ZEB-804 traffic merge — so the tier always reads
+/// the final `last_traffic_ms`, never a pre-merge intermediate.
+///
+/// - `NoConnection` → `None`: no tier — absence of a connection is already
+///   honest.
+/// - Any other mode with NO traffic evidence ever → `Dark`: a claimed
+///   connection that has never demonstrably moved traffic is exactly the
+///   ZEB-804 incident shape and must not read healthy.
+/// - Otherwise bucket `age = now_ms - last_traffic_ms` (saturating):
+///   `age < STALENESS_QUIET_MS` → `Fresh`;
+///   `age <= STALENESS_DARK_MS` → `Quiet`; older → `Dark`.
+pub fn derive_staleness(
+    connection_mode: ConnectionMode,
+    last_traffic_ms: Option<u64>,
+    now_ms: u64,
+) -> Option<PeerStaleness> {
+    if connection_mode == ConnectionMode::NoConnection {
+        return None;
+    }
+    let Some(traffic_ms) = last_traffic_ms else {
+        return Some(PeerStaleness::Dark);
+    };
+    let age = now_ms.saturating_sub(traffic_ms);
+    Some(if age < STALENESS_QUIET_MS {
+        PeerStaleness::Fresh
+    } else if age <= STALENESS_DARK_MS {
+        PeerStaleness::Quiet
+    } else {
+        PeerStaleness::Dark
+    })
+}
+
 /// Iroh 0.98 may or may not expose NAT classification directly via
 /// `ConnectionInfo`. This function wraps whatever iroh provides into
 /// our `NatClass` enum. If iroh exposes nothing useful, returns
@@ -1399,6 +1664,13 @@ pub fn filter_peers_by_shared_membership(
             last_seen_ms: r.last_seen_ms,
             reachability_record_age_ms: r.last_seen_ms.map(|ls| now_ms.saturating_sub(ls)),
             protocol_incompat_reason: r.protocol_incompat_reason,
+            last_traffic_ms: r.last_traffic_ms,
+            last_relay_pull_served_ms: r.last_relay_pull_served_ms,
+            connected_since_ms: r.connected_since_ms,
+            // ZEB-804: derived HERE — after the snapshot's traffic merge (this
+            // filter is the last assembly step), so the tier reads the final
+            // merged mode + last_traffic_ms. See `derive_staleness`.
+            staleness: derive_staleness(r.connection_mode, r.last_traffic_ms, now_ms),
         });
     }
     // Sort by last_seen_ms desc; None values last.
@@ -1432,6 +1704,17 @@ pub struct ResolverPeerRecord {
     /// `NetworkHealthService::snapshot`. `None` for a compatible (or
     /// never-dialed) peer. Copied straight onto the emitted `PeerHealth`.
     pub protocol_incompat_reason: Option<String>,
+    /// ZEB-804: freshest served-traffic evidence, filled by
+    /// `NetworkHealthService::snapshot`'s traffic merge (max of the liveness
+    /// rx stamp and the registry's `last_any_served_ms`). Copied onto
+    /// `PeerHealth::last_traffic_ms`.
+    pub last_traffic_ms: Option<u64>,
+    /// ZEB-804: most recent successfully served community-relay pull, copied
+    /// verbatim from the `PeerTrafficRegistry` by the snapshot merge.
+    pub last_relay_pull_served_ms: Option<u64>,
+    /// ZEB-804: connection-establishment stamp (liveness `Connected.since_ms`
+    /// first, else the supervisor's), filled by the snapshot merge.
+    pub connected_since_ms: Option<u64>,
 }
 
 impl ResolverPeerRecord {
@@ -1557,6 +1840,15 @@ impl SupervisorSnapshot for ProdSupervisorSnapshot {
 pub trait LivenessSnapshot: Send + Sync {
     fn peer_states(&self) -> Vec<([u8; 32], LivenessStateWire)>;
     fn min_relay_rtt_ms(&self) -> Option<u32>;
+    /// ZEB-804: per-peer liveness VIEWS — the state plus the state-independent
+    /// rx-traffic stamp. Default-bodied (empty) so sources that predate the
+    /// stamp (test fakes) compile unchanged; the assembly falls back to
+    /// [`peer_states`](Self::peer_states) for the state map when this is
+    /// empty, so such a source keeps its full pre-ZEB-804 behavior and merely
+    /// contributes no traffic stamps.
+    fn peer_views(&self) -> Vec<([u8; 32], PeerLivenessView)> {
+        Vec::new()
+    }
 }
 
 /// Production source: reads the live [`LivenessHandle`] the resolver holds
@@ -1584,6 +1876,12 @@ impl LivenessSnapshot for ProdLivenessSnapshot {
     }
     fn min_relay_rtt_ms(&self) -> Option<u32> {
         self.resolver.liveness().and_then(|h| h.min_relay_rtt_ms())
+    }
+    fn peer_views(&self) -> Vec<([u8; 32], PeerLivenessView)> {
+        self.resolver
+            .liveness()
+            .map(|h| h.views_snapshot())
+            .unwrap_or_default()
     }
 }
 
@@ -1729,6 +2027,11 @@ pub struct NetworkHealthService {
     /// no owner identity). Installed at boot via
     /// [`set_gateway_bootstrap_source`](Self::set_gateway_bootstrap_source).
     gateway_bootstrap: Option<std::sync::Arc<GatewayBootstrapTelemetry>>,
+    /// ZEB-804: per-peer served-traffic stamps — the SAME `Arc` every iroh
+    /// acceptor stamps at its served-a-request site. Installed at boot via
+    /// [`set_peer_traffic_source`](Self::set_peer_traffic_source); read by
+    /// `snapshot`'s traffic merge. `None` (merge inert) until boot wires it.
+    peer_traffic: Option<std::sync::Arc<PeerTrafficRegistry>>,
 }
 
 impl NetworkHealthService {
@@ -1763,6 +2066,7 @@ impl NetworkHealthService {
             vine_relay_serving: None,
             vine_pull: None,
             gateway_bootstrap: None,
+            peer_traffic: None,
         }
     }
 
@@ -1874,20 +2178,52 @@ impl NetworkHealthService {
         self.gateway_bootstrap = Some(src);
     }
 
+    /// ZEB-804: install the per-peer served-traffic registry (the same `Arc`
+    /// every iroh acceptor stamps). Additive — when unset, the snapshot's
+    /// traffic merge is inert.
+    pub(crate) fn set_peer_traffic_source(&mut self, src: std::sync::Arc<PeerTrafficRegistry>) {
+        self.peer_traffic = Some(src);
+    }
+
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
     /// fails — empty/None fields render gracefully in the UI.
     pub async fn snapshot(&self) -> NetworkHealthSnapshot {
         let now = now_ms();
 
         // ZEB-622: one read of the peer-liveness projection, reused for the
-        // per-peer connection-mode/rtt join, the last-seen freshness fold, and
-        // the `MyNetworkSummary.relay_rtt_ms` fallback. Empty when no liveness
-        // source is installed (unit tests, pre-boot) → every use is inert.
-        let liveness_states: std::collections::HashMap<[u8; 32], LivenessStateWire> = self
+        // per-peer connection-mode/rtt join, the last-seen freshness fold, the
+        // `MyNetworkSummary.relay_rtt_ms` fallback, and (ZEB-804) the traffic
+        // merge. Read as VIEWS (state + the state-independent rx-traffic
+        // stamp); the state map derives from `.state` so every existing join
+        // keeps working, and the parallel traffic map feeds the merge below. A
+        // source that predates `peer_views` (trait default: empty) falls back
+        // to `peer_states()` for the state map — full pre-ZEB-804 behavior, it
+        // merely contributes no traffic stamps. Empty when no liveness source
+        // is installed (unit tests, pre-boot) → every use is inert.
+        let liveness_views: Vec<([u8; 32], PeerLivenessView)> = self
             .liveness
             .as_ref()
-            .map(|s| s.peer_states().into_iter().collect())
+            .map(|s| s.peer_views())
             .unwrap_or_default();
+        // ZEB-804: per-peer rx-traffic stamps. The liveness stamp is ≤30s
+        // coarse (sampled on the RTT tick) — it can only lag, never lead, so
+        // the max-merges below can only GAIN freshness from it.
+        let liveness_traffic: std::collections::HashMap<[u8; 32], u64> = liveness_views
+            .iter()
+            .filter_map(|(p, v)| v.last_traffic_ms.map(|t| (*p, t)))
+            .collect();
+        let liveness_states: std::collections::HashMap<[u8; 32], LivenessStateWire> =
+            if liveness_views.is_empty() {
+                self.liveness
+                    .as_ref()
+                    .map(|s| s.peer_states().into_iter().collect())
+                    .unwrap_or_default()
+            } else {
+                liveness_views
+                    .into_iter()
+                    .map(|(p, v)| (p, v.state))
+                    .collect()
+            };
         let liveness_min_relay = self.liveness.as_ref().and_then(|s| s.min_relay_rtt_ms());
 
         // Build MyNetworkSummary with a placeholder reachability so we
@@ -1925,20 +2261,20 @@ impl NetworkHealthService {
         // supervisor last saw the peer connect (`Connected.since_ms`), joined by
         // iroh node id. Applied at the record level so the filter's sort and
         // record-age derivation both see the resolved value; never overrides a
-        // record that already has a `last_seen_ms`.
-        if !peer_states.is_empty() {
-            let connected_since: std::collections::HashMap<[u8; 32], u64> = peer_states
-                .iter()
-                .filter_map(|(node_id, state)| match state {
-                    PeerStateWire::Connected { since_ms } => Some((*node_id, *since_ms)),
-                    _ => None,
-                })
-                .collect();
-            for record in &mut records {
-                if record.last_seen_ms.is_none() {
-                    if let Some(&since_ms) = connected_since.get(&record.iroh_node_id) {
-                        record.last_seen_ms = Some(since_ms);
-                    }
+        // record that already has a `last_seen_ms`. The map is hoisted out of
+        // the fallback because the ZEB-804 merge below reuses it as the
+        // `connected_since_ms` fallback (liveness `Connected.since_ms` first).
+        let connected_since: std::collections::HashMap<[u8; 32], u64> = peer_states
+            .iter()
+            .filter_map(|(node_id, state)| match state {
+                PeerStateWire::Connected { since_ms } => Some((*node_id, *since_ms)),
+                _ => None,
+            })
+            .collect();
+        for record in &mut records {
+            if record.last_seen_ms.is_none() {
+                if let Some(&since_ms) = connected_since.get(&record.iroh_node_id) {
+                    record.last_seen_ms = Some(since_ms);
                 }
             }
         }
@@ -1952,9 +2288,20 @@ impl NetworkHealthService {
         // ZEB-622: this overlay runs at the RECORD level and BEFORE the liveness
         // join below, so live transport data (`liveness_states`) wins over a
         // stale cached self-test for the same peer.
+        //
+        // ZEB-804 (spec §7): the overlay additionally expires — a report older
+        // than SELF_TEST_OVERLAY_MAX_AGE_MS no longer dresses any record, so a
+        // liveness-absent peer falls back to honest NoConnection instead of
+        // wearing a boot-era `direct/14ms` forever. ONLY this per-peer
+        // dressing expires; the dedicated self-test report surface
+        // (`cached_last_self_test` / the export's self-test section) is a
+        // "most recent test result" memo and keeps rendering stale reports.
         {
             let last = self.last_self_test.read().await;
-            if let Some(report) = last.as_ref() {
+            if let Some(report) = last
+                .as_ref()
+                .filter(|r| now.saturating_sub(r.finished_at_ms) <= SELF_TEST_OVERLAY_MAX_AGE_MS)
+            {
                 let by_owner: std::collections::HashMap<&str, &PeerPingResult> = report
                     .peer_results
                     .iter()
@@ -2028,6 +2375,42 @@ impl NetworkHealthService {
                 }
             }
             record.last_seen_ms = best;
+        }
+
+        // ZEB-804: merge the two served-traffic evidence sources onto each
+        // record (joined by iroh node id).
+        //   `connected_since_ms` — the establishment stamp under its honest
+        //   name: liveness `Connected.since_ms` first (the live transport's
+        //   view), else the supervisor's `Connected.since_ms`. The presence
+        //   cache deliberately does NOT feed it — presence is heard-from
+        //   evidence, not connection establishment.
+        //   `last_traffic_ms` — max of the liveness rx stamp and the acceptor
+        //   registry's `last_any_served_ms`; either source alone surfaces.
+        //   `last_relay_pull_served_ms` — registry value verbatim
+        //   (success-only by design).
+        // Finally `last_seen_ms` max-absorbs `last_traffic_ms`: traffic
+        // evidence may only GAIN freshness for the peer, never regress it.
+        for record in &mut records {
+            record.connected_since_ms = match liveness_states.get(&record.iroh_node_id) {
+                Some(LivenessStateWire::Connected { since_ms, .. }) => Some(*since_ms),
+                _ => connected_since.get(&record.iroh_node_id).copied(),
+            };
+            let registry_stamps = self
+                .peer_traffic
+                .as_ref()
+                .and_then(|r| r.stamps(&record.iroh_node_id));
+            record.last_traffic_ms = match (
+                liveness_traffic.get(&record.iroh_node_id).copied(),
+                registry_stamps.map(|s| s.last_any_served_ms),
+            ) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            record.last_relay_pull_served_ms =
+                registry_stamps.and_then(|s| s.last_relay_pull_served_ms);
+            if let Some(traffic) = record.last_traffic_ms {
+                record.last_seen_ms = Some(record.last_seen_ms.map_or(traffic, |b| b.max(traffic)));
+            }
         }
 
         // ZEB-623: join the per-peer protocol-compat registry onto each record
@@ -3051,6 +3434,11 @@ impl ReachabilitySnapshot for ProdReachabilitySnapshot {
                 // ZEB-623: filled by `NetworkHealthService::snapshot`'s compat
                 // join (the resolver has no view of the registry).
                 protocol_incompat_reason: None,
+                // ZEB-804: filled by `NetworkHealthService::snapshot`'s traffic
+                // merge (the resolver has no view of liveness or the registry).
+                last_traffic_ms: None,
+                last_relay_pull_served_ms: None,
+                connected_since_ms: None,
             })
             .collect()
     }
@@ -3298,6 +3686,9 @@ mod tests {
             rtt_ms: None,
             last_seen_ms: last_seen,
             protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
         }
     }
 
@@ -3446,6 +3837,10 @@ mod tests {
             last_seen_ms: None,
             reachability_record_age_ms: None,
             protocol_incompat_reason: Some("tunnel hello v0 < min 1".into()),
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
+            staleness: None,
         };
         let v = serde_json::to_value(&ph).expect("serialize");
         assert_eq!(v["protocolIncompatReason"], "tunnel hello v0 < min 1");
@@ -3491,6 +3886,10 @@ mod tests {
             last_seen_ms: None,
             reachability_record_age_ms: None,
             protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
+            staleness: None,
         }];
         assert_eq!(
             derive_reachability_status(&my, &peers),
@@ -3517,6 +3916,10 @@ mod tests {
             last_seen_ms: None,
             reachability_record_age_ms: None,
             protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
+            staleness: None,
         }];
         assert_eq!(
             derive_reachability_status(&my, &peers),
@@ -3545,6 +3948,10 @@ mod tests {
             last_seen_ms: None,
             reachability_record_age_ms: None,
             protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
+            staleness: None,
         }];
         assert_eq!(
             derive_reachability_status(&my, &peers),
@@ -3571,6 +3978,10 @@ mod tests {
             last_seen_ms: None,
             reachability_record_age_ms: None,
             protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
+            staleness: None,
         }];
         assert_eq!(
             derive_reachability_status(&my, &peers),
@@ -3785,6 +4196,10 @@ mod tests {
                 last_seen_ms: Some(1_700_000_000_000 - 3_000),
                 reachability_record_age_ms: Some(3_000),
                 protocol_incompat_reason: None,
+                last_traffic_ms: None,
+                last_relay_pull_served_ms: None,
+                connected_since_ms: None,
+                staleness: None,
             }],
             pkarr_status: PkarrHealthSummary {
                 identity_published: true,
@@ -4664,7 +5079,9 @@ mod tests {
         );
         *svc.last_self_test.write().await = Some(SelfTestReport {
             started_at_ms: 0,
-            finished_at_ms: 100,
+            // ZEB-804: must be FRESH — the per-peer overlay now expires past
+            // SELF_TEST_OVERLAY_MAX_AGE_MS (see the TTL tests).
+            finished_at_ms: now_ms(),
             steps: vec![],
             peer_results: vec![PeerPingResult {
                 owner_addr: hex::encode([0xAA; 16]),
@@ -4696,6 +5113,9 @@ mod tests {
         assert_eq!(snap.peers.len(), 1);
         assert_eq!(snap.peers[0].rtt_ms, None);
         assert_eq!(snap.peers[0].connection_mode, ConnectionMode::NoConnection);
+        // ZEB-804: NoConnection carries no staleness tier — absence of a
+        // connection is already honest.
+        assert_eq!(snap.peers[0].staleness, None);
     }
 
     // ── ZEB-622 Task 5: liveness fusion + Degraded + presence last-seen ──
@@ -4845,7 +5265,9 @@ mod tests {
         );
         *svc.last_self_test.write().await = Some(SelfTestReport {
             started_at_ms: 0,
-            finished_at_ms: 100,
+            // ZEB-804: must be FRESH — the per-peer overlay now expires past
+            // SELF_TEST_OVERLAY_MAX_AGE_MS (see the TTL tests).
+            finished_at_ms: now_ms(),
             steps: vec![],
             peer_results: vec![PeerPingResult {
                 owner_addr: hex::encode([0xAA; 16]),
@@ -4892,7 +5314,9 @@ mod tests {
         // Self-test overlay set Direct + rtt (the stale value we must not trust).
         *svc.last_self_test.write().await = Some(SelfTestReport {
             started_at_ms: 0,
-            finished_at_ms: 100,
+            // ZEB-804: must be FRESH — the per-peer overlay now expires past
+            // SELF_TEST_OVERLAY_MAX_AGE_MS (see the TTL tests).
+            finished_at_ms: now_ms(),
             steps: vec![],
             peer_results: vec![PeerPingResult {
                 owner_addr: hex::encode([0xAA; 16]),
@@ -4939,7 +5363,9 @@ mod tests {
         // Self-test overlay set Direct + rtt (the stale value that must be cleared).
         *svc.last_self_test.write().await = Some(SelfTestReport {
             started_at_ms: 0,
-            finished_at_ms: 100,
+            // ZEB-804: must be FRESH — the per-peer overlay now expires past
+            // SELF_TEST_OVERLAY_MAX_AGE_MS (see the TTL tests).
+            finished_at_ms: now_ms(),
             steps: vec![],
             peer_results: vec![PeerPingResult {
                 owner_addr: hex::encode([0xAA; 16]),
@@ -5049,6 +5475,511 @@ mod tests {
             snap2.peers[0].last_seen_ms,
             Some(9_000),
             "liveness Connected.since_ms is freshest → since_ms wins"
+        );
+    }
+
+    // ── ZEB-804 Task 3: traffic-evidence merge into the snapshot ──
+
+    /// `LivenessSnapshot` double scripting full per-peer VIEWS (state +
+    /// rx-traffic stamp). `peer_states` derives from the same views so the two
+    /// projections can never disagree — mirroring the production impl, whose
+    /// `states_snapshot`/`views_snapshot` read the same slots.
+    struct FakeLivenessViews {
+        views: Vec<([u8; 32], PeerLivenessView)>,
+    }
+    impl LivenessSnapshot for FakeLivenessViews {
+        fn peer_states(&self) -> Vec<([u8; 32], LivenessStateWire)> {
+            self.views
+                .iter()
+                .map(|(p, v)| (*p, v.state.clone()))
+                .collect()
+        }
+        fn min_relay_rtt_ms(&self) -> Option<u32> {
+            None
+        }
+        fn peer_views(&self) -> Vec<([u8; 32], PeerLivenessView)> {
+            self.views.clone()
+        }
+    }
+
+    /// Both evidence sources present: `lastTrafficMs` is the MAX of the
+    /// liveness rx stamp and the registry's `last_any_served_ms` (either side
+    /// may be the fresher one — both directions covered via two peers),
+    /// `lastRelayPullServedMs` is the registry value verbatim,
+    /// `connectedSinceMs` carries the liveness `Connected.since_ms`, and
+    /// `lastSeenMs` max-absorbs the merged traffic stamp (gains freshness,
+    /// never regresses).
+    #[tokio::test]
+    async fn snapshot_merges_traffic_evidence_and_absorbs_into_last_seen() {
+        let mut table = std::collections::HashMap::new();
+        table.insert([0x9Au8; 16], vec!["c1".to_string()]);
+        table.insert([0x9Bu8; 16], vec!["c1".to_string()]);
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![
+                    make_record(0x9A, ConnectionMode::NoConnection, Some(1_000)),
+                    make_record(0x9B, ConnectionMode::NoConnection, Some(1_000)),
+                ],
+            }),
+            std::sync::Arc::new(FakeMembership { table }),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_liveness_source(std::sync::Arc::new(FakeLivenessViews {
+            views: vec![
+                (
+                    [0x9Au8; 32],
+                    PeerLivenessView {
+                        state: LivenessStateWire::Connected {
+                            mode: LivenessMode::Direct,
+                            rtt_ms: Some(5),
+                            since_ms: 2_000,
+                        },
+                        last_traffic_ms: Some(4_000),
+                    },
+                ),
+                (
+                    [0x9Bu8; 32],
+                    PeerLivenessView {
+                        state: LivenessStateWire::Connected {
+                            mode: LivenessMode::Direct,
+                            rtt_ms: Some(5),
+                            since_ms: 2_000,
+                        },
+                        last_traffic_ms: Some(8_000),
+                    },
+                ),
+            ],
+        }));
+        let reg = std::sync::Arc::new(PeerTrafficRegistry::default());
+        reg.record_relay_pull_served([0x9Au8; 32], 3_500);
+        reg.record_served([0x9Au8; 32], 6_000); // registry fresher than liveness
+        reg.record_served([0x9Bu8; 32], 6_500); // liveness fresher than registry
+        svc.set_peer_traffic_source(reg);
+        let snap = svc.snapshot().await;
+        let get = |b: u8| {
+            snap.peers
+                .iter()
+                .find(|p| p.owner_addr == hex::encode([b; 16]))
+                .expect("peer present")
+        };
+        let a = get(0x9A);
+        assert_eq!(
+            a.last_traffic_ms,
+            Some(6_000),
+            "registry side fresher → max"
+        );
+        assert_eq!(
+            a.last_relay_pull_served_ms,
+            Some(3_500),
+            "registry pull stamp verbatim"
+        );
+        assert_eq!(
+            a.connected_since_ms,
+            Some(2_000),
+            "liveness Connected.since_ms"
+        );
+        assert!(
+            a.last_seen_ms >= a.last_traffic_ms,
+            "absorption: lastSeenMs may only GAIN freshness from lastTrafficMs"
+        );
+        assert_eq!(a.last_seen_ms, Some(6_000));
+        let b = get(0x9B);
+        assert_eq!(
+            b.last_traffic_ms,
+            Some(8_000),
+            "liveness side fresher → max"
+        );
+        assert_eq!(b.last_relay_pull_served_ms, None, "no pull served → None");
+        assert_eq!(b.last_seen_ms, Some(8_000));
+    }
+
+    /// Registry-only traffic (no liveness source at all) still surfaces
+    /// `lastTrafficMs` and absorbs into `lastSeenMs`; `connectedSinceMs`
+    /// falls back to the supervisor's `Connected.since_ms` when liveness has
+    /// no opinion.
+    #[tokio::test]
+    async fn registry_only_traffic_surfaces_and_supervisor_feeds_connected_since() {
+        use crate::reconnect_supervisor::PeerStateWire;
+        let mut table = std::collections::HashMap::new();
+        table.insert([0xB1u8; 16], vec!["c1".to_string()]);
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![make_record(0xB1, ConnectionMode::NoConnection, Some(1_000))],
+            }),
+            std::sync::Arc::new(FakeMembership { table }),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_supervisor_source(std::sync::Arc::new(FakeSupervisor(vec![(
+            [0xB1u8; 32],
+            PeerStateWire::Connected { since_ms: 4_200 },
+        )])));
+        let reg = std::sync::Arc::new(PeerTrafficRegistry::default());
+        reg.record_served([0xB1u8; 32], 7_500);
+        svc.set_peer_traffic_source(reg);
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        let p = &snap.peers[0];
+        assert_eq!(
+            p.last_traffic_ms,
+            Some(7_500),
+            "registry-only traffic surfaces"
+        );
+        assert_eq!(p.last_relay_pull_served_ms, None);
+        assert_eq!(
+            p.connected_since_ms,
+            Some(4_200),
+            "supervisor Connected.since_ms fallback"
+        );
+        assert_eq!(p.last_seen_ms, Some(7_500), "absorbed traffic stamp");
+    }
+
+    /// Serde pin: the three ZEB-804 fields serialize under their exact
+    /// camelCase keys, stay PRESENT (null) when `None` (additive-with-default,
+    /// never skip_serializing_if), and leak no snake_case spelling.
+    #[test]
+    fn peer_health_traffic_fields_serialize_camel_case() {
+        let ph = PeerHealth {
+            owner_addr: "abcd".into(),
+            display_name: None,
+            shared_communities: vec![],
+            connection_mode: ConnectionMode::NoConnection,
+            rtt_ms: None,
+            last_seen_ms: Some(9_000),
+            reachability_record_age_ms: None,
+            protocol_incompat_reason: None,
+            last_traffic_ms: Some(9_000),
+            last_relay_pull_served_ms: Some(8_000),
+            connected_since_ms: Some(7_000),
+            staleness: None,
+        };
+        let v = serde_json::to_value(&ph).expect("serialize");
+        assert_eq!(v["lastTrafficMs"], 9_000);
+        assert_eq!(v["lastRelayPullServedMs"], 8_000);
+        assert_eq!(v["connectedSinceMs"], 7_000);
+        // A `None` keeps the key present as an explicit null (additive wire
+        // contract — same idiom as `protocolIncompatReason` above).
+        let none = PeerHealth {
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
+            ..ph
+        };
+        let v2 = serde_json::to_value(&none).expect("serialize");
+        for k in ["lastTrafficMs", "lastRelayPullServedMs", "connectedSinceMs"] {
+            assert!(
+                v2.get(k).is_some(),
+                "key {k} must be present even when None"
+            );
+            assert!(v2[k].is_null(), "key {k} must be null when None");
+        }
+        // No snake_case leakage past the camelCase rename.
+        for k in [
+            "last_traffic_ms",
+            "last_relay_pull_served_ms",
+            "connected_since_ms",
+        ] {
+            assert!(v.get(k).is_none(), "snake key {k} must not leak");
+            assert!(v2.get(k).is_none(), "snake key {k} must not leak");
+        }
+    }
+
+    // ── ZEB-804 Task 4: staleness tier + self-test overlay TTL ──
+
+    /// THE incident replay — **the test that would have caught ZEB-804**.
+    ///
+    /// Live incident shape (ZEB-803 → ZEB-804): the liveness machine pinned a
+    /// peer `Connected { mode: Direct, rtt_ms: Some(14) }` for 46+ minutes
+    /// while zero application traffic flowed in either direction — every
+    /// surface read green the whole time. With NO traffic evidence anywhere
+    /// (liveness rx stamp `None`, acceptor registry wired but silent), the
+    /// snapshot must now render the connection claim (`connectionMode:
+    /// direct`) AND the evidence verdict (`staleness: dark`) side by side,
+    /// so the contradiction is visible instead of laundered into "healthy".
+    #[tokio::test]
+    async fn incident_replay_connected_direct_no_traffic_reads_dark() {
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![make_record(0xAA, ConnectionMode::NoConnection, Some(1_000))],
+            }),
+            membership_sharing(&[0xAA]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        // Liveness claims a live Direct link at 14ms — but its rx-traffic
+        // stamp is None: no app frame was EVER observed on the RTT tick.
+        svc.set_liveness_source(std::sync::Arc::new(FakeLivenessViews {
+            views: vec![(
+                [0xAAu8; 32],
+                PeerLivenessView {
+                    state: LivenessStateWire::Connected {
+                        mode: LivenessMode::Direct,
+                        rtt_ms: Some(14),
+                        since_ms: 2_000,
+                    },
+                    last_traffic_ms: None,
+                },
+            )],
+        }));
+        // The acceptor registry is WIRED but has served nothing for this peer
+        // — exactly the incident: infrastructure present, traffic absent.
+        svc.set_peer_traffic_source(std::sync::Arc::new(PeerTrafficRegistry::default()));
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        let p = &snap.peers[0];
+        assert_eq!(p.connection_mode, ConnectionMode::Direct);
+        assert_eq!(p.rtt_ms, Some(14));
+        assert_eq!(p.last_traffic_ms, None, "zero traffic evidence anywhere");
+        assert_eq!(
+            p.staleness,
+            Some(PeerStaleness::Dark),
+            "a claimed connection with no traffic evidence ever must read dark"
+        );
+        // Pin the WIRE rendering too — the panel and e2e assertions read the
+        // serialized keys, and the incident was only ever visible on the wire.
+        let v = serde_json::to_value(&snap).expect("snapshot serializes");
+        assert_eq!(v["peers"][0]["connectionMode"], "direct");
+        assert_eq!(v["peers"][0]["staleness"], "dark");
+    }
+
+    /// Tier boundaries with an injected `now` (no wall clock): fresh below
+    /// 5 min, quiet in [5 min, 30 min], dark past 30 min; `NoConnection`
+    /// yields no tier; no-traffic-ever while any connection is claimed is
+    /// dark for every non-NoConnection mode.
+    #[test]
+    fn staleness_tier_boundaries_with_injected_now() {
+        let now = 100_000_000u64;
+        let at = |age: u64| Some(now - age);
+        // < STALENESS_QUIET_MS → fresh (both ends of the band).
+        assert_eq!(
+            derive_staleness(ConnectionMode::Direct, at(0), now),
+            Some(PeerStaleness::Fresh)
+        );
+        assert_eq!(
+            derive_staleness(ConnectionMode::Direct, at(STALENESS_QUIET_MS - 1), now),
+            Some(PeerStaleness::Fresh)
+        );
+        // [STALENESS_QUIET_MS, STALENESS_DARK_MS] → quiet (inclusive edges).
+        assert_eq!(
+            derive_staleness(ConnectionMode::Direct, at(STALENESS_QUIET_MS), now),
+            Some(PeerStaleness::Quiet)
+        );
+        assert_eq!(
+            derive_staleness(ConnectionMode::Relay, at(STALENESS_DARK_MS), now),
+            Some(PeerStaleness::Quiet)
+        );
+        // > STALENESS_DARK_MS → dark.
+        assert_eq!(
+            derive_staleness(ConnectionMode::Direct, at(STALENESS_DARK_MS + 1), now),
+            Some(PeerStaleness::Dark)
+        );
+        // No traffic evidence EVER while a connection is claimed → dark, for
+        // every non-NoConnection mode.
+        for mode in [
+            ConnectionMode::Direct,
+            ConnectionMode::Relay,
+            ConnectionMode::Degraded,
+        ] {
+            assert_eq!(
+                derive_staleness(mode, None, now),
+                Some(PeerStaleness::Dark),
+                "no-traffic-ever must be dark for {mode:?}"
+            );
+        }
+        // NoConnection → no tier, with or without (stale) evidence.
+        assert_eq!(
+            derive_staleness(ConnectionMode::NoConnection, at(0), now),
+            None
+        );
+        assert_eq!(
+            derive_staleness(ConnectionMode::NoConnection, None, now),
+            None
+        );
+        // Clock skew (traffic stamp ahead of now) saturates to age 0 → fresh.
+        assert_eq!(
+            derive_staleness(ConnectionMode::Direct, Some(now + 5_000), now),
+            Some(PeerStaleness::Fresh)
+        );
+    }
+
+    /// The tier derives AFTER the Task 3 traffic merge — liveness-sourced rx
+    /// evidence stamped "now" renders `fresh` through the FULL snapshot path,
+    /// proving the derivation reads the final merged `last_traffic_ms`, not a
+    /// pre-merge intermediate.
+    #[tokio::test]
+    async fn staleness_fresh_through_snapshot_with_live_traffic() {
+        let mut svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![make_record(0xAB, ConnectionMode::NoConnection, Some(1_000))],
+            }),
+            membership_sharing(&[0xAB]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc.set_liveness_source(std::sync::Arc::new(FakeLivenessViews {
+            views: vec![(
+                [0xABu8; 32],
+                PeerLivenessView {
+                    state: LivenessStateWire::Connected {
+                        mode: LivenessMode::Direct,
+                        rtt_ms: Some(5),
+                        since_ms: 1_000,
+                    },
+                    last_traffic_ms: Some(now_ms()),
+                },
+            )],
+        }));
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        assert_eq!(snap.peers[0].staleness, Some(PeerStaleness::Fresh));
+    }
+
+    /// Serde pin: `staleness` serializes the exact wire values
+    /// `"fresh" | "quiet" | "dark"`, stays PRESENT (null) when `None`
+    /// (additive-with-default, never skip_serializing_if), and a pre-field
+    /// snapshot (key absent) still deserializes (`#[serde(default)]`).
+    #[test]
+    fn peer_staleness_serde_pin() {
+        assert_eq!(
+            serde_json::to_value(PeerStaleness::Fresh).expect("serialize"),
+            serde_json::json!("fresh")
+        );
+        assert_eq!(
+            serde_json::to_value(PeerStaleness::Quiet).expect("serialize"),
+            serde_json::json!("quiet")
+        );
+        assert_eq!(
+            serde_json::to_value(PeerStaleness::Dark).expect("serialize"),
+            serde_json::json!("dark")
+        );
+        let ph = PeerHealth {
+            owner_addr: "abcd".into(),
+            display_name: None,
+            shared_communities: vec![],
+            connection_mode: ConnectionMode::Direct,
+            rtt_ms: None,
+            last_seen_ms: None,
+            reachability_record_age_ms: None,
+            protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
+            staleness: Some(PeerStaleness::Dark),
+        };
+        let v = serde_json::to_value(&ph).expect("serialize");
+        assert_eq!(v["staleness"], "dark");
+        let none = PeerHealth {
+            staleness: None,
+            ..ph
+        };
+        let v2 = serde_json::to_value(&none).expect("serialize");
+        assert!(
+            v2.get("staleness").is_some(),
+            "key must be present even when None"
+        );
+        assert!(v2["staleness"].is_null());
+        // A pre-field cached snapshot (no `staleness` key at all) still
+        // deserializes — the `#[serde(default)]` half of the additive contract.
+        let mut pre_field = v2.as_object().expect("object").clone();
+        pre_field.remove("staleness");
+        let back: PeerHealth = serde_json::from_value(serde_json::Value::Object(pre_field))
+            .expect("pre-field snapshot deserializes");
+        assert_eq!(back.staleness, None);
+    }
+
+    /// ZEB-804 (spec §7): a self-test report finished 11 minutes ago is past
+    /// SELF_TEST_OVERLAY_MAX_AGE_MS and must NOT dress a liveness-absent
+    /// peer's record — the peer reads honest `NoConnection`/`None`, not
+    /// boot-era `direct/14ms` forever. (This closes the liveness-miss arm of
+    /// the incident: liveness has no opinion on the peer AND the only mode
+    /// source is an ancient self-test.)
+    #[tokio::test]
+    async fn stale_self_test_overlay_expires_after_ttl() {
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![make_record(0xAA, ConnectionMode::NoConnection, Some(1_000))],
+            }),
+            membership_sharing(&[0xAA]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        *svc.last_self_test.write().await = Some(SelfTestReport {
+            started_at_ms: 0,
+            // 11 minutes old — one minute past the 10-minute TTL.
+            finished_at_ms: now_ms() - (SELF_TEST_OVERLAY_MAX_AGE_MS + 60_000),
+            steps: vec![],
+            peer_results: vec![PeerPingResult {
+                owner_addr: hex::encode([0xAA; 16]),
+                outcome: StepOutcome::Pass { duration_ms: 14 },
+                mode: Some(ConnectionMode::Direct),
+            }],
+        });
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        assert_eq!(
+            snap.peers[0].connection_mode,
+            ConnectionMode::NoConnection,
+            "an expired overlay must not dress the record with boot-era Direct"
+        );
+        assert_eq!(snap.peers[0].rtt_ms, None, "expired overlay leaves no rtt");
+        assert_eq!(
+            snap.peers[0].staleness, None,
+            "NoConnection carries no tier"
+        );
+        // The dedicated self-test report surface is UNTOUCHED by the TTL —
+        // it is explicitly a "most recent test result" memo.
+        assert!(
+            svc.cached_last_self_test().await.is_some(),
+            "stale report still cached for the report surface"
+        );
+    }
+
+    /// A 5-minute-old report is comfortably inside the 10-minute TTL and
+    /// still dresses the record (mode + rtt) — while the traffic-evidence
+    /// tier independently reads `dark` (a self-test pass is a connection
+    /// claim, not traffic evidence).
+    #[tokio::test]
+    async fn recent_self_test_overlay_still_applies_within_ttl() {
+        let svc = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver {
+                records: vec![make_record(0xAA, ConnectionMode::NoConnection, Some(1_000))],
+            }),
+            membership_sharing(&[0xAA]),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        *svc.last_self_test.write().await = Some(SelfTestReport {
+            started_at_ms: 0,
+            // 5 minutes old — half the TTL.
+            finished_at_ms: now_ms() - 300_000,
+            steps: vec![],
+            peer_results: vec![PeerPingResult {
+                owner_addr: hex::encode([0xAA; 16]),
+                outcome: StepOutcome::Pass { duration_ms: 37 },
+                mode: Some(ConnectionMode::Direct),
+            }],
+        });
+        let snap = svc.snapshot().await;
+        assert_eq!(snap.peers.len(), 1);
+        assert_eq!(snap.peers[0].connection_mode, ConnectionMode::Direct);
+        assert_eq!(snap.peers[0].rtt_ms, Some(37));
+        assert_eq!(
+            snap.peers[0].staleness,
+            Some(PeerStaleness::Dark),
+            "overlay dresses the mode, but with zero traffic evidence the tier stays dark"
         );
     }
 
@@ -5575,6 +6506,107 @@ mod tests {
         assert!(snap.dial_status.recent.is_empty());
     }
 
+    // ── ZEB-804: per-peer served-traffic registry ──
+
+    #[test]
+    fn peer_traffic_registry_stamps_and_relay_pull_specificity() {
+        let reg = PeerTrafficRegistry::default();
+        let p = [7u8; 32];
+        assert!(reg.stamps(&p).is_none());
+        reg.record_served(p, 1_000);
+        assert_eq!(
+            reg.stamps(&p),
+            Some(PeerTrafficStamps {
+                last_any_served_ms: 1_000,
+                last_relay_pull_served_ms: None
+            })
+        );
+        reg.record_relay_pull_served(p, 2_000);
+        assert_eq!(
+            reg.stamps(&p),
+            Some(PeerTrafficStamps {
+                last_any_served_ms: 2_000,
+                last_relay_pull_served_ms: Some(2_000)
+            }),
+            "a relay pull is also 'any' traffic"
+        );
+        reg.record_served(p, 3_000);
+        assert_eq!(
+            reg.stamps(&p).unwrap().last_relay_pull_served_ms,
+            Some(2_000),
+            "a non-relay serve must not advance the relay-pull stamp"
+        );
+    }
+
+    #[test]
+    fn peer_traffic_registry_is_bounded_and_evicts_oldest_stamped() {
+        // Rejected/shed strangers create entries by design of the any-exchange
+        // ruling, so identity churn would otherwise grow the map without
+        // bound. Mirrors `serving_peer_map_is_bounded_and_evicts_least_recently_served`.
+        let reg = PeerTrafficRegistry::default();
+        let peer_for = |i: usize| {
+            let mut peer = [0u8; 32];
+            peer[0] = (i / 256) as u8;
+            peer[1] = (i % 256) as u8;
+            peer[2] = 0xEE;
+            peer
+        };
+        for i in 0..(PEER_TRAFFIC_REGISTRY_CAP + 1) {
+            reg.record_served(peer_for(i), 1_000 + i as u64);
+        }
+        assert!(
+            reg.stamps(&peer_for(0)).is_none(),
+            "the oldest-stamped entry is the one evicted"
+        );
+        // Every other entry survives with its stamp intact.
+        for i in 1..(PEER_TRAFFIC_REGISTRY_CAP + 1) {
+            assert_eq!(
+                reg.stamps(&peer_for(i)).map(|s| s.last_any_served_ms),
+                Some(1_000 + i as u64),
+                "retained entry {i} intact"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_traffic_registry_stamps_never_regress() {
+        // Stamps are caller-clocked; out-of-order arrival through the mutex or
+        // a backward wall-clock step must not replace newer evidence.
+        let reg = PeerTrafficRegistry::default();
+        let p = [9u8; 32];
+        reg.record_served(p, 2_000);
+        reg.record_served(p, 1_000);
+        assert_eq!(
+            reg.stamps(&p).unwrap().last_any_served_ms,
+            2_000,
+            "decreasing any-stamp is a no-op"
+        );
+
+        reg.record_relay_pull_served(p, 3_000);
+        reg.record_relay_pull_served(p, 2_500);
+        let s = reg.stamps(&p).unwrap();
+        assert_eq!(
+            s.last_relay_pull_served_ms,
+            Some(3_000),
+            "decreasing relay-pull stamp is a no-op"
+        );
+        assert_eq!(
+            s.last_any_served_ms, 3_000,
+            "relay pull max-merged into any"
+        );
+
+        // A non-relay stamp OLDER than the newer relay stamp: the relay field
+        // must not move AND the any field must not regress.
+        reg.record_served(p, 2_800);
+        let s = reg.stamps(&p).unwrap();
+        assert_eq!(s.last_any_served_ms, 3_000, "any-stamp must not regress");
+        assert_eq!(
+            s.last_relay_pull_served_ms,
+            Some(3_000),
+            "relay stamp untouched by an older non-relay serve"
+        );
+    }
+
     // ── ZEB-803: community-relay serving / pulling telemetry ──
 
     #[test]
@@ -5937,6 +6969,7 @@ mod tests {
             retrying: 4,
             dormant: 2,
             connected: 5,
+            connected_via_registry: 6,
             recent: vec![],
         };
         let v = serde_json::to_value(&s).expect("serialize");
@@ -5952,6 +6985,20 @@ mod tests {
         assert_eq!(v["retrying"], 4);
         assert_eq!(v["dormant"], 2);
         assert_eq!(v["connected"], 5);
+        // ZEB-804: exact camelCase key for the registry-swap counter, no
+        // snake_case leak past the rename.
+        assert_eq!(v["connectedViaRegistry"], 6);
+        assert!(
+            obj.get("connected_via_registry").is_none(),
+            "snake key connected_via_registry must not leak"
+        );
+        // `#[serde(default)]` pin: a pre-field summary (key absent) still
+        // deserializes, reading 0.
+        let mut pre_field = obj.clone();
+        pre_field.remove("connectedViaRegistry");
+        let back: DialHealthSummary = serde_json::from_value(serde_json::Value::Object(pre_field))
+            .expect("pre-field summary deserializes");
+        assert_eq!(back.connected_via_registry, 0);
     }
 
     #[tokio::test]
@@ -6079,6 +7126,26 @@ mod tests {
         assert_eq!(s.attempts, 0);
         assert_eq!(s.succeeded, 0);
         assert_eq!(s.failed, 0);
+    }
+
+    /// ZEB-804 (spec §8/§10): `record_connected_via_registry` increments the
+    /// registry-swap counter and NOTHING else — dial-outcome counters, state
+    /// gauges, and the recent ring all stay untouched — and `summary()`
+    /// carries the count.
+    #[test]
+    fn record_connected_via_registry_increments_only_that_counter() {
+        let t = DialTelemetry::new();
+        t.record_connected_via_registry();
+        t.record_connected_via_registry();
+        let s = t.summary();
+        assert_eq!(s.connected_via_registry, 2);
+        assert_eq!(
+            (s.attempts, s.succeeded, s.failed, s.skipped_duplicate),
+            (0, 0, 0, 0),
+            "dial-outcome counters untouched (no ladder dial happened)"
+        );
+        assert_eq!((s.retrying, s.dormant, s.connected), (0, 0, 0));
+        assert!(s.recent.is_empty(), "counter-only: no ring marker");
     }
 
     // ── ZEB-595: PkarrFallbackTelemetry tests ───────────────────────

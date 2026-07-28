@@ -765,6 +765,12 @@ pub struct IrohCommunityRelayDepositAcceptor {
     /// reason; this is the "unlogged beyond a counter" sink, mirroring the
     /// butler acceptor's `rejected_deposits`).
     rejected_deposits: AtomicU64,
+    /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
+    /// endpoint id (PR #566 review round 2 — a peer whose only traffic is
+    /// relay deposits must not read quiet/dark). A rejected deposit closes the
+    /// stream WITHOUT writing a response, so it is not a completed exchange
+    /// and deliberately does not stamp.
+    traffic: Option<Arc<crate::network_health::PeerTrafficRegistry>>,
 }
 
 impl IrohCommunityRelayDepositAcceptor {
@@ -777,7 +783,18 @@ impl IrohCommunityRelayDepositAcceptor {
             ctx,
             config,
             rejected_deposits: AtomicU64::new(0),
+            traffic: None,
         }
+    }
+
+    /// ZEB-804: install the per-peer served-traffic registry. Builder-style,
+    /// matching [`IrohCommunityRelayAcceptor::with_traffic_registry`].
+    pub fn with_traffic_registry(
+        mut self,
+        traffic: Arc<crate::network_health::PeerTrafficRegistry>,
+    ) -> Self {
+        self.traffic = Some(traffic);
+        self
     }
 
     /// Total rejected deposits since construction.
@@ -794,6 +811,14 @@ impl IrohCommunityRelayDepositAcceptor {
                     remote_id = ?conn.remote_id(),
                     "ZEB-458: community relay deposit accepted (ack delivered)"
                 );
+                // ZEB-804 (review r2): an acked deposit is a completed
+                // iroh-authenticated exchange — traffic evidence.
+                if let Some(reg) = self.traffic.as_ref() {
+                    reg.record_served(
+                        *conn.remote_id().as_bytes(),
+                        crate::network_health::now_ms(),
+                    );
+                }
                 // Wait for the dialer to drive the close so the ack bytes flush
                 // before `conn` drops (same race-avoidance as the butler shell).
                 let _ = tokio::time::timeout(self.config.io_deadline, conn.closed()).await;
@@ -905,6 +930,11 @@ pub struct IrohCommunityRelayPullAcceptor {
     /// tests, pre-boot) — recording is then a no-op, so the shell's behaviour is
     /// identical whether or not health is wired.
     telemetry: Option<Arc<crate::network_health::CommunityRelayServingTelemetry>>,
+    /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
+    /// iroh endpoint id (unlike `telemetry`'s 4-byte ZEB-329 map, which cannot
+    /// be joined back to `peers[]`). Same `None`-is-a-no-op convention as
+    /// `telemetry`.
+    traffic: Option<Arc<crate::network_health::PeerTrafficRegistry>>,
 }
 
 impl IrohCommunityRelayPullAcceptor {
@@ -917,6 +947,7 @@ impl IrohCommunityRelayPullAcceptor {
             ctx,
             config,
             telemetry: None,
+            traffic: None,
         }
     }
 
@@ -930,6 +961,17 @@ impl IrohCommunityRelayPullAcceptor {
         self
     }
 
+    /// ZEB-804: install the per-peer served-traffic registry. Builder-style so
+    /// the boot wiring can attach it without a second constructor arity
+    /// (mirrors [`Self::with_telemetry`]).
+    pub fn with_traffic_registry(
+        mut self,
+        traffic: Arc<crate::network_health::PeerTrafficRegistry>,
+    ) -> Self {
+        self.traffic = Some(traffic);
+        self
+    }
+
     /// Handle one inbound relay-pull connection. On ANY failure the stream is
     /// closed uniformly with no detail. A missing ack is success, not failure.
     pub async fn handle_connection(&self, conn: Connection) {
@@ -939,6 +981,14 @@ impl IrohCommunityRelayPullAcceptor {
                 // peer cannot inflate or forge another peer's served-pull row.
                 if let Some(t) = self.telemetry.as_ref() {
                     t.record_served(conn.remote_id().as_bytes());
+                }
+                // ZEB-804: stamp the FULL-id served-traffic registry (relay-pull
+                // flavor — the staleness tier keys on this cadence).
+                if let Some(reg) = self.traffic.as_ref() {
+                    reg.record_relay_pull_served(
+                        *conn.remote_id().as_bytes(),
+                        crate::network_health::now_ms(),
+                    );
                 }
                 tracing::info!(
                     remote_id = ?conn.remote_id(),

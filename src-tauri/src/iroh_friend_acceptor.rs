@@ -1675,6 +1675,9 @@ where
     /// `intro_rate_limiter`. `with_config` seeds the production caps; tests
     /// override tiny/zero caps via [`Self::with_rate_limiter`].
     rate_limiter: Arc<crate::friend_intro::FriendRateLimiter>,
+    /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
+    /// iroh endpoint id. `None` (tests, pre-boot) — stamping is then a no-op.
+    traffic: Option<Arc<crate::network_health::PeerTrafficRegistry>>,
     config: FriendAcceptorConfig,
 }
 
@@ -1758,8 +1761,20 @@ where
             // ZEB-700: production caps by default; tests shrink them via
             // `with_rate_limiter`. Honest single-handshake peers never hit them.
             rate_limiter: Arc::new(crate::friend_intro::FriendRateLimiter::new()),
+            traffic: None,
             config,
         }
+    }
+
+    /// ZEB-804: install the per-peer served-traffic registry. Builder-style so
+    /// the boot wiring can attach it without a second constructor arity
+    /// (mirrors `IrohCommunityRelayPullAcceptor::with_traffic_registry`).
+    pub fn with_traffic_registry(
+        mut self,
+        traffic: Arc<crate::network_health::PeerTrafficRegistry>,
+    ) -> Self {
+        self.traffic = Some(traffic);
+        self
     }
 
     /// ZEB-700: override the friend-handshake rate limiter (tests use
@@ -2383,11 +2398,20 @@ where
             // delivered accepts, consent-`Pending` replies, AND rate-limit
             // sheds, so an unconditional "accept delivered" here would
             // misreport the latter two (the Pending mislabel predated ZEB-700).
-            Ok(outcome) => tracing::info!(
-                remote_id = ?conn.remote_id(),
-                outcome = ?outcome,
-                "ZEB-370: friend handshake completed"
-            ),
+            Ok(outcome) => {
+                // ZEB-804: stamp the FULL-id served-traffic registry — every
+                // `Ok` outcome (Accepted / Pending / Shed) wrote a response to
+                // an iroh-authenticated peer, which is genuine traffic
+                // evidence regardless of the consent verdict.
+                if let Some(reg) = self.traffic.as_ref() {
+                    reg.record_served(*conn.remote_id().as_bytes(), wall_now_ms());
+                }
+                tracing::info!(
+                    remote_id = ?conn.remote_id(),
+                    outcome = ?outcome,
+                    "ZEB-370: friend handshake completed"
+                );
+            }
             Err(e) => tracing::warn!(
                 error = %e,
                 remote_id = ?conn.remote_id(),
