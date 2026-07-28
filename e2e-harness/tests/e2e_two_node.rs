@@ -1175,35 +1175,38 @@ async fn s5c_clean_dial_only_card_propagation_probe() {
 // bug: `two_minted_nodes` mints (= RESTARTS) both nodes, which is the exact
 // restart-poisoning.
 //
-// ZEB-810 fix (2026-07-28): this test originally relied on LAN multicast to peer
-// the two mint-restarted nodes with no community. ZEB-809 turned multicast +
-// gossip scouting OFF by default, so two relationship-less nodes now have NO peer
-// path at all — the test could neither converge nor reproduce the bug, and
-// panicked with converged=false / remap=0 / accept_spin=0 (the ZEB-468 mechanism
-// absent ENTIRELY) purely because nothing peered. Verified on main @ 26315288:
-// s5c runs the identical card-convergence assertion over a dial peer-path and
-// passes. So s5d now establishes the peer path explicitly via a community join
-// (the ZEB-373 iroh dial), exactly as s5c does. The ONE difference from s5c's
-// passing control: s5c does a CLEAN relaunch first (discarding the mint-restart's
-// session), whereas s5d KEEPS the mint-restart — so a same-zid remap on the dial
-// peering is attributable to the leaked transport, which is what this guards.
+// ZEB-810 rework (2026-07-28): this test originally relied on LAN multicast to
+// peer two mint-restarted nodes with no community. ZEB-809 turned multicast +
+// gossip scouting OFF by default, so relationship-less nodes no longer peer at
+// all — the test could neither converge nor reproduce the bug. A first repair
+// (peer via a community-join dial, keep the mint-restart) converged but did NOT
+// guard ZEB-468: the join established the peer face only AFTER both mint-restarts,
+// so no peer ever held a PRE-restart face and remap=0 was vacuous (Qodo, PR #568).
+//
+// Correct structure: peer FIRST (community join → ZEB-373 dial → alice holds a
+// face for bob's deterministic, device-derived zid), THEN restart bob GRACEFULLY
+// in-process via stop_node → start_node. That reuses the same zid AND drives
+// `session.close()` — the exact path the fix touches — while alice still holds
+// bob's old face. A SIGKILL would not do (no graceful close). Pre-fix: alice
+// rejects bob's re-declarations ("Remapping unsupported") and the accept loop
+// spins ("being shutdown"), so cards never re-converge. Post-fix: the old
+// transport is closed, alice drops the stale face, cards re-converge 0/0.
 //
 // Root cause (see ZEB-468): `open_session_with_runtime` adopts an external zenoh
 // `Runtime` via `session::init(DynamicRuntime)`, so `static_runtime` is None and
 // `session.close()` only sends a face-close — it never calls the Runtime's
-// `manager.close()`. Across the mint-restart that leaks every transport/listener:
+// `manager.close()`. Across a graceful restart that leaks every transport/listener:
 //   • the peer keeps our old (deterministic) zid's face → the restarted session's
 //     re-declarations are rejected "Resource remapped. Remapping unsupported!";
 //   • the TCP accept loop spins on the shutting-down Tokio runtime
 //     ("…being shutdown…").
 // Both block the owner-card pub/sub mesh from re-forming, so cards never converge.
 //
-// The fix closes the adopted runtime on shutdown. AFTER it, this restarted mesh
-// behaves like s5b's clean one: cards converge, with 0 remap + 0 accept-spin.
+// The fix closes the adopted runtime on shutdown. AFTER it, bob's re-declarations
+// land cleanly: cards re-converge, with 0 remap + 0 accept-spin.
 //
-// BEFORE the fix this test FAILS (converged=false, dozens of remap + hundreds of
-// accept-spin lines); after it, it PASSES. The 0/0 baseline matches s5b's
-// measured clean-relaunch control.
+// BEFORE the fix this test FAILS (converged=false, remap + accept-spin lines on
+// bob's re-peer); after it, it PASSES 0/0. Verified passing on main @ 26315288.
 // ─────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s5d_restart_card_propagation_regression() {
@@ -1214,14 +1217,13 @@ async fn s5d_restart_card_propagation_regression() {
     let alice_owner = owner_id(&alice).await;
     let bob_owner = owner_id(&bob).await;
 
-    // ZEB-810: establish the peer path the mint-restarted nodes need. Post-ZEB-809
-    // (LAN scouting off by default) the ZEB-373 iroh dial is the only way two
-    // co-located nodes peer, and it is fired by a community join's reachability
-    // exchange. Without this the two nodes never peer, so card convergence is
-    // unreachable regardless of the restart behaviour under test (and the
-    // remap/accept_spin guard below is vacuous — there is no peer face to remap).
-    // NB: unlike s5c this deliberately does NOT do a clean relaunch first — the
-    // mint-restart's (possibly leaked) session is retained on purpose.
+    // Peer FIRST, before the restart. Post-ZEB-809 (LAN scouting off by default)
+    // the ZEB-373 iroh dial is the only way two co-located nodes peer, and a
+    // community join's reachability exchange fires it. Roster convergence proves
+    // the zenoh peer session — and hence alice's face for bob's deterministic zid —
+    // is up BEFORE bob restarts. Without a pre-restart face the remap guard is
+    // vacuous: there is nothing for the restarted session to be rejected against
+    // (Qodo, PR #568).
     let community = create_community(&alice, "s5d-community", true)
         .await
         .expect("create community");
@@ -1237,7 +1239,19 @@ async fn s5d_restart_card_propagation_regression() {
             .then_some(()))
     })
     .await
-    .expect("alice sees bob joined (peer path for the card mesh is up)");
+    .expect("alice sees bob joined — alice now holds a zenoh face for bob's zid");
+
+    // The ZEB-468 event: bob restarts GRACEFULLY in-process (stop_node → start_node),
+    // reusing its persisted device identity and therefore the SAME deterministic zid.
+    // Unlike a SIGKILL this drives `session.close()` — the exact path the fix touches
+    // — while alice still holds bob's PRE-restart face. If the old transport leaks,
+    // bob's re-declarations under the reused zid are rejected as a remap.
+    bob.rpc("stop_node", json!({}))
+        .await
+        .expect("bob stop_node (graceful session close)");
+    bob.rpc("start_node", json!({}))
+        .await
+        .expect("bob start_node (same persisted identity → same zid)");
 
     const ALICE_CARD: &str = "Alice-restart";
     const BOB_CARD: &str = "Bob-restart";
@@ -1247,7 +1261,7 @@ async fn s5d_restart_card_propagation_regression() {
         .expect("alice card publisher ready");
     publish_card_until_ok(&bob, BOB_CARD, "gm restart", Duration::from_secs(30))
         .await
-        .expect("bob card publisher ready");
+        .expect("bob card publisher ready after restart");
 
     let a_sub = subscribe_member_card(&alice, &bob_owner)
         .await
@@ -1256,11 +1270,11 @@ async fn s5d_restart_card_propagation_regression() {
         .await
         .expect("bob subscribes to alice's card");
 
-    // Convergence depends on the ZEB-373 dial peering the two mint-restarted
-    // sessions and the owner-card mesh forming over it — despite the retained
-    // mint-restart. Re-publish each tick (a Zenoh put is not retained for a late
-    // subscriber).
-    let converged = poll_until(Duration::from_secs(60), || async {
+    // After bob's graceful restart the reconnect supervisor (ZEB-373/620) must
+    // re-dial and re-peer under the reused zid, and the owner-card mesh must re-form
+    // WITHOUT a same-zid remap. Re-publish each tick (a Zenoh put is not retained for
+    // a late subscriber). 90s: re-peer + first-contact settle after a restart.
+    let converged = poll_until(Duration::from_secs(90), || async {
         let _ = republish_owner_card(&alice, ALICE_CARD, "gm restart").await;
         let _ = republish_owner_card(&bob, BOB_CARD, "gm restart").await;
         let a_sees = cached_card_display_name(&alice, a_sub).await?;
@@ -1312,9 +1326,10 @@ async fn s5d_restart_card_propagation_regression() {
 
     assert!(
         converged,
-        "ZEB-468 regression: owner cards must propagate between two co-located nodes \
-         after the mint-driven restart (got converged=false; remap={remap}, \
-         accept_spin={accept_spin}). The mint-restart is leaking the Zenoh transport."
+        "ZEB-468 regression: after bob's graceful in-process restart (same reused zid, \
+         alice holding bob's pre-restart face) owner cards must re-converge (got \
+         converged=false; remap={remap}, accept_spin={accept_spin}). The restart is \
+         leaking the Zenoh transport."
     );
     assert_eq!(
         remap, 0,
