@@ -12,7 +12,13 @@
    */
   import { onMount } from 'svelte';
   import { getVersion } from '@tauri-apps/api/app';
+  import { invoke } from '@tauri-apps/api/core';
   import { OwnerService, extractError, type MintIpcResult } from '../owner-service';
+  import {
+    identityKeyBackupNote,
+    normalizeIdentityStoreBackend,
+    type IdentityStoreBackend,
+  } from '../identity-backup-copy';
   import {
     MIN_RECOVERY_PASSPHRASE_LEN,
   } from '../recovery-policy';
@@ -49,6 +55,11 @@
   let backupError = $state<string | null>(null);
   let backupInFlight = $state(false);
   let appVersion = $state<string>('unknown');
+  // ZEB-768: which backend actually holds the identity key, so the backup
+  // note tells the truth instead of always asserting the OS keychain.
+  // Defaults to backend-neutral wording until the IPC getter resolves.
+  let identityBackend = $state<IdentityStoreBackend>('unknown');
+  const keychainNote = $derived(identityKeyBackupNote(identityBackend));
   // ZEB-338 / PR #169: defense-in-depth escape. App.svelte only opens this gate
   // when start_node reported NO owner identity, so mint hitting "already exists"
   // should be unreachable — but if owner_state.cbor exists yet start_node didn't
@@ -65,6 +76,15 @@
       appVersion = await getVersion();
     } catch (e) {
       console.debug('[zeb-338] WelcomeModal getVersion failed:', extractError(e));
+    }
+    try {
+      // ZEB-768: never leave this asserting the keychain — on failure the
+      // 'unknown' default keeps the backend-neutral wording.
+      identityBackend = normalizeIdentityStoreBackend(
+        await invoke<string>('identity_store_backend'),
+      );
+    } catch (e) {
+      console.debug('[zeb-768] WelcomeModal identity_store_backend failed:', extractError(e));
     }
   });
 
@@ -327,8 +347,7 @@
           <p class="error" data-testid="welcome-backup-error">{backupError}</p>
         {/if}
         <p class="keychain-note">
-          Your identity key is already stored in this device's secure keychain —
-          this file is your portable backup for a lost or replaced device.
+          {keychainNote}
         </p>
         <div class="actions">
           <button

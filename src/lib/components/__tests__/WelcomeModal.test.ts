@@ -311,10 +311,13 @@ describe('WelcomeModal owner phrase reveal (ZEB-650 slice 2)', () => {
     return utils;
   }
 
-  it('backup stage offers the write-it-down alternative without firing IPC', async () => {
+  it('backup stage offers the write-it-down alternative without fetching the mnemonic', async () => {
     const { getByTestId } = await advanceToBackupStage();
     expect(getByTestId('phrase-reveal-open')).toBeTruthy();
-    expect(mockCoreInvoke).not.toHaveBeenCalled();
+    // ZEB-768: the modal now queries identity_store_backend on mount, so IPC
+    // is no longer silent at this stage — but the mnemonic reveal must still
+    // not fire until the user explicitly opens it (hex-redaction invariant).
+    expect(mockCoreInvoke).not.toHaveBeenCalledWith('export_owner_mnemonic_words');
   });
 
   it('full reveal inside the modal keeps the hex-redaction invariant', async () => {

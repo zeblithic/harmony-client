@@ -563,6 +563,34 @@ pub async fn export_mnemonic_words() -> Result<Vec<String>, String> {
         .await
 }
 
+/// ZEB-768: the string contract for [`identity_store_backend`]. The GUI
+/// onboarding copy branches on these exact values, so pin them here.
+fn identity_store_backend_label(keychain_available: bool) -> &'static str {
+    if keychain_available {
+        "keychain"
+    } else {
+        "encrypted-file"
+    }
+}
+
+/// ZEB-768: report which backend actually holds the owner identity key, so
+/// onboarding copy can tell the truth instead of unconditionally asserting
+/// the OS keychain. Mirrors the mint-time decision exactly — the mint path
+/// stores the seed via `KeychainStore::new().ok()`, so a `KeychainStore`
+/// that constructs here means the key is in the OS keychain, and one that
+/// refuses means the mint fell back to the AEAD encrypted-file store
+/// (`HARMONY_DISABLE_KEYCHAIN`, a named profile, or a host with no keyring
+/// provider — e.g. a bare Linux desktop).
+///
+/// Returns `"keychain"` or `"encrypted-file"`; the frontend falls back to
+/// backend-neutral wording on any value it doesn't recognize or on error,
+/// never an unearned keychain claim.
+#[tauri::command]
+pub async fn identity_store_backend() -> Result<String, String> {
+    run_blocking(move || Ok(identity_store_backend_label(KeychainStore::new().is_ok()).to_string()))
+        .await
+}
+
 /// Return the identity hash that would result from restoring the given
 /// words, WITHOUT writing anything to disk.
 #[tauri::command]
@@ -755,6 +783,18 @@ mod tests {
     fn plant_seed(identity_path: &Path, seed: &[u8; 32]) {
         identity::write_seed_to_disk_with_keychain(identity_path, seed, /*force=*/ true, None)
             .expect("plant");
+    }
+
+    // ── identity_store_backend_label (ZEB-768) ───────────────────────────
+
+    #[test]
+    fn identity_store_backend_label_pins_the_frontend_string_contract() {
+        // The GUI branches on these exact literals; a keychain-available
+        // node reads "keychain", the file-store fallback reads
+        // "encrypted-file". Anything else would make WelcomeModal fall back
+        // to backend-neutral wording, so these two are the whole contract.
+        assert_eq!(identity_store_backend_label(true), "keychain");
+        assert_eq!(identity_store_backend_label(false), "encrypted-file");
     }
 
     // ── current_identity_hash_helper ─────────────────────────────────────
