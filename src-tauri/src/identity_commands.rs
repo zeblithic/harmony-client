@@ -573,14 +573,26 @@ fn identity_store_backend_label(keychain_available: bool) -> &'static str {
     }
 }
 
-/// ZEB-768: report which backend actually holds the owner identity key, so
-/// onboarding copy can tell the truth instead of unconditionally asserting
-/// the OS keychain. Mirrors the mint-time decision exactly — the mint path
-/// stores the seed via `KeychainStore::new().ok()`, so a `KeychainStore`
-/// that constructs here means the key is in the OS keychain, and one that
-/// refuses means the mint fell back to the AEAD encrypted-file store
-/// (`HARMONY_DISABLE_KEYCHAIN`, a named profile, or a host with no keyring
-/// provider — e.g. a bare Linux desktop).
+/// ZEB-768: report which identity-store backend onboarding copy should
+/// describe, so the backup step tells the truth instead of unconditionally
+/// asserting the OS keychain.
+///
+/// This reports keychain **availability** — whether a `KeychainStore`
+/// constructs here. `HARMONY_DISABLE_KEYCHAIN`, a named profile, and hosts
+/// with no keyring provider all make it refuse → `encrypted-file`. That is a
+/// strict improvement over the old unconditional keychain claim and covers
+/// ZEB-768's observed repro (kill-switch + passphrase file).
+///
+/// It is NOT proven persistence location, and callers must not read it as
+/// such: the mint (`owner_state::save_secret`) still falls through to the
+/// encrypted-file store when the keychain *write* fails even though the
+/// handle constructed (`vault_save_slot` → `Ok(false)`/`Err`), and this
+/// getter is queried before mint. Replacing it with a post-mint ground-truth
+/// probe (mirroring `load_secret`'s keychain→file precedence) + a re-query
+/// after mint is ZEB-830 — deferred because that probe's keychain branch is
+/// only verifiable against a real OS keychain (the ZEB-428 isolation gate
+/// blocks `KeychainStore::new()` in every test build, so CI cannot exercise
+/// it).
 ///
 /// Returns `"keychain"` or `"encrypted-file"`; the frontend falls back to
 /// backend-neutral wording on any value it doesn't recognize or on error,

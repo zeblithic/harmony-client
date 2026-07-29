@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent } from '@testing-library/svelte';
+import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import WelcomeModal from '../WelcomeModal.svelte';
+import { identityKeyBackupNote, type IdentityStoreBackend } from '../../identity-backup-copy';
 
 // vi.hoisted ensures these are available at mock-factory call time
 // (vi.mock is hoisted to the top of the file by Vitest, so module-level
@@ -397,5 +398,71 @@ describe('WelcomeModal ZEB-494 — join an existing device', () => {
     expect(await findByTestId('welcome-create-identity')).toBeTruthy();
     expect(getByTestId('welcome-modal-backdrop')).toBeTruthy();
     expect(queryByTestId('welcome-join-existing')).toBeTruthy();
+  });
+});
+
+// ZEB-768 (CodeRabbit, PR #570): the backup-stage note must reflect the
+// backend identity_store_backend reports — a keychain claim ONLY when the IPC
+// says 'keychain', and backend-neutral wording for an unrecognized value or a
+// failed call. These pin the wiring end-to-end (IPC string → normalize →
+// derived note → rendered DOM text); the copy strings themselves are pinned in
+// identity-backup-copy.test.ts.
+describe('WelcomeModal identity-store backend copy (ZEB-768)', () => {
+  const OWNER = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
+
+  // Drive the modal to the backup stage with identity_store_backend routed to
+  // `backendReply` — a string to resolve, or an Error to reject with — and
+  // wait until the derived note settles to the expected backend's copy. Every
+  // other invoke (e.g. the mnemonic reveal) resolves undefined and is never
+  // exercised here. Returns the actual rendered note text.
+  async function backupNoteFor(
+    backendReply: string | Error,
+    expectedBackend: IdentityStoreBackend,
+  ): Promise<string> {
+    mintMock.mockResolvedValue({
+      state: { ownerId: OWNER, ownerDisplayName: 'x', devices: [], canBackUp: true },
+      recoveryToken: 'deadbeefdeadbeefdeadbeefdeadbeef0123456789abcdef0123456789abcdef',
+    });
+    mockCoreInvoke.mockImplementation((cmd: string) =>
+      cmd === 'identity_store_backend'
+        ? backendReply instanceof Error
+          ? Promise.reject(backendReply)
+          : Promise.resolve(backendReply)
+        : Promise.resolve(undefined),
+    );
+    const { container, getByTestId } = render(WelcomeModal, {
+      props: { open: true, onMinted: vi.fn() },
+    });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    const expected = identityKeyBackupNote(expectedBackend);
+    let actual = '';
+    // waitFor settles both the mint transition (backup stage) AND the async
+    // onMount backend query flowing into the derived note.
+    await waitFor(() => {
+      actual = container.querySelector('.keychain-note')?.textContent?.trim() ?? '';
+      expect(actual).toBe(expected);
+    });
+    return actual;
+  }
+
+  it('shows the keychain note only when the backend reports keychain', async () => {
+    const note = await backupNoteFor('keychain', 'keychain');
+    expect(note.toLowerCase()).toContain('keychain');
+  });
+
+  it('shows the encrypted-file note — no keychain claim — when the backend reports encrypted-file', async () => {
+    const note = await backupNoteFor('encrypted-file', 'encrypted-file');
+    expect(note.toLowerCase()).toContain('encrypted file');
+    expect(note.toLowerCase()).not.toContain('keychain');
+  });
+
+  it('falls back to the backend-neutral note for an unrecognized backend string', async () => {
+    const note = await backupNoteFor('secret-service', 'unknown');
+    expect(note.toLowerCase()).not.toContain('keychain');
+  });
+
+  it('falls back to the backend-neutral note when the backend query rejects', async () => {
+    const note = await backupNoteFor(new Error('ipc down'), 'unknown');
+    expect(note.toLowerCase()).not.toContain('keychain');
   });
 });

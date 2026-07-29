@@ -33,9 +33,14 @@ export function identityKeyBackupNote(backend: IdentityStoreBackend): string {
       return "Your identity key is already stored in this device's secure keychain — " +
         'this recovery file is your portable backup for a lost or replaced device.';
     case 'encrypted-file':
+      // The file is protected only by the Harmony passphrase (Argon2id +
+      // XChaCha20-Poly1305) — no machine-derived key participates, so it is
+      // portable, NOT machine-bound: the file plus the passphrase open it on
+      // any device. Claiming otherwise would give a false durability/security
+      // expectation (Qodo, PR #570).
       return 'Your identity key is saved as an encrypted file on this device ' +
-        '(in ~/.harmony), tied to this machine — this recovery file is your portable ' +
-        'backup for a lost or replaced device.';
+        '(in ~/.harmony), protected by your Harmony passphrase — this recovery file ' +
+        'is your portable backup for a lost or replaced device.';
     case 'unknown':
       return 'Your identity key is stored on this device — this recovery file is your ' +
         'portable backup for a lost or replaced device.';

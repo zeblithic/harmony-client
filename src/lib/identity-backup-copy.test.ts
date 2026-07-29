@@ -21,12 +21,18 @@ describe('identityKeyBackupNote (ZEB-768)', () => {
     expect(identityKeyBackupNote('keychain').toLowerCase()).toContain('keychain');
   });
 
-  it('the encrypted-file note names the encrypted file and never claims a keychain', () => {
+  it('the encrypted-file note names the file and its passphrase protection, and claims neither a keychain nor a machine binding', () => {
     const note = identityKeyBackupNote('encrypted-file').toLowerCase();
     expect(note).toContain('encrypted file');
+    // The store is protected solely by the Harmony passphrase.
+    expect(note).toContain('passphrase');
     // The whole point of the ticket: a file-store user must not be told
     // their key is in a keychain it isn't in.
     expect(note).not.toContain('keychain');
+    // ...nor that the file is bound to this machine — it is passphrase-
+    // protected and portable (file + passphrase open it on any device), so
+    // "tied to this machine" would be a false security claim (Qodo, PR #570).
+    expect(note).not.toContain('tied to this machine');
   });
 
   it('the unknown fallback is backend-neutral and never claims a keychain', () => {
