@@ -113,15 +113,21 @@ impl ReplySpill {
             return AcceptOutcome::DroppedFull;
         }
         self.buf.push_back(bytes);
-        // Sample depth at the moment it is largest for this accept — right
-        // after the push, before try_flush drains it back down. flush() only
-        // ever drains, so accept() is the sole place the peak can rise.
-        self.peak = self.peak.max(self.buf.len());
-        if self.try_flush() {
-            AcceptOutcome::Accepted
-        } else {
-            AcceptOutcome::ConsumerGone
+        if !self.try_flush() {
+            return AcceptOutcome::ConsumerGone;
         }
+        // Sample AFTER try_flush, so peak reflects the backlog actually
+        // RETAINED under backpressure — not the transient +1 from a push that
+        // try_flush forwards in the same call. A run whose channel always had
+        // capacity leaves buf empty every accept, so peak stays 0: the "spill
+        // never exercised" signal peak()'s contract promises (sampling before
+        // the flush made peak==0 unreachable after the first accept — Qodo,
+        // PR #570). The overflow branch above is the one place we sample
+        // pre-flush, because sitting AT max_pending on entry is a sustained
+        // cap-full state (prior accepts' flushes couldn't drain it), a real
+        // high-water rather than a transient.
+        self.peak = self.peak.max(self.buf.len());
+        AcceptOutcome::Accepted
     }
 
     /// Forward buffered payloads until the channel is full or the buffer is
@@ -282,6 +288,30 @@ mod tests {
         assert_eq!(spill.accept(vec![9]), AcceptOutcome::DroppedFull);
         assert_eq!(spill.peak(), 3);
         assert_eq!(spill.dropped(), 1);
+    }
+
+    /// ZEB-816 (Qodo, PR #570): when `try_send` has capacity for every
+    /// payload, nothing is ever retained under backpressure, so `peak()`
+    /// stays 0 — the "spill path never exercised" signal the contract
+    /// promises. Sampling the buffer *before* `try_flush` (the pre-fix
+    /// ordering) reported peak 1 here after the very first accept, making the
+    /// zero signal unreachable and defeating the whole point of the metric.
+    #[tokio::test]
+    async fn peak_stays_zero_when_channel_always_has_capacity() {
+        // Channel roomier than the payload count and never full: every accept
+        // forwards immediately, buf returns to empty each time.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let mut spill = ReplySpill::new(tx, 64);
+        for i in 0..5u8 {
+            assert_eq!(spill.accept(vec![i]), AcceptOutcome::Accepted);
+        }
+        assert_eq!(spill.pending(), 0, "nothing retained under backpressure");
+        assert_eq!(spill.peak(), 0, "spill never had to buffer");
+        assert_eq!(spill.dropped(), 0);
+        // The payloads did flow through, in order.
+        for i in 0..5u8 {
+            assert_eq!(rx.recv().await.unwrap(), vec![i]);
+        }
     }
 
     #[tokio::test]
