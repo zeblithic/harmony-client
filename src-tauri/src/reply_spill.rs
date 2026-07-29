@@ -76,6 +76,7 @@ pub struct ReplySpill {
     buf: VecDeque<Vec<u8>>,
     max_pending: usize,
     dropped: usize,
+    peak: usize,
 }
 
 impl ReplySpill {
@@ -90,6 +91,7 @@ impl ReplySpill {
             buf: VecDeque::new(),
             max_pending,
             dropped: 0,
+            peak: 0,
         }
     }
 
@@ -99,7 +101,11 @@ impl ReplySpill {
     /// `max_pending`.
     pub fn accept(&mut self, bytes: Vec<u8>) -> AcceptOutcome {
         if self.buf.len() >= self.max_pending {
-            // Cap first, then still try to make room for the NEXT reply.
+            // At the cap: record the high-water (== max_pending) so peak()
+            // reflects that we hit the ceiling even on a run whose overflow
+            // was later re-fetched. Then drop, then still try to make room
+            // for the NEXT reply.
+            self.peak = self.peak.max(self.buf.len());
             self.dropped = self.dropped.saturating_add(1);
             if !self.try_flush() {
                 return AcceptOutcome::ConsumerGone;
@@ -107,11 +113,21 @@ impl ReplySpill {
             return AcceptOutcome::DroppedFull;
         }
         self.buf.push_back(bytes);
-        if self.try_flush() {
-            AcceptOutcome::Accepted
-        } else {
-            AcceptOutcome::ConsumerGone
+        if !self.try_flush() {
+            return AcceptOutcome::ConsumerGone;
         }
+        // Sample AFTER try_flush, so peak reflects the backlog actually
+        // RETAINED under backpressure — not the transient +1 from a push that
+        // try_flush forwards in the same call. A run whose channel always had
+        // capacity leaves buf empty every accept, so peak stays 0: the "spill
+        // never exercised" signal peak()'s contract promises (sampling before
+        // the flush made peak==0 unreachable after the first accept — Qodo,
+        // PR #570). The overflow branch above is the one place we sample
+        // pre-flush, because sitting AT max_pending on entry is a sustained
+        // cap-full state (prior accepts' flushes couldn't drain it), a real
+        // high-water rather than a transient.
+        self.peak = self.peak.max(self.buf.len());
+        AcceptOutcome::Accepted
     }
 
     /// Forward buffered payloads until the channel is full or the buffer is
@@ -140,6 +156,19 @@ impl ReplySpill {
     /// re-fetches) but should never be invisible.
     pub fn dropped(&self) -> usize {
         self.dropped
+    }
+
+    /// High-water mark of buffered payloads (`pending()` at its largest)
+    /// over this spill's lifetime. ZEB-816: `dropped() == 0` alone is
+    /// over-determined — it collapses "comfortable headroom" (peak well
+    /// under `max_pending`), "near-miss" (peak approaching it), and "the
+    /// spill was never exercised at all" (peak 0 — `try_send` always had
+    /// capacity, so a clean run proves nothing about the ZEB-812 stall
+    /// path). `peak()` separates them, so the cap can be sized from field
+    /// data rather than from the estimate in its doc comment. Sampled in
+    /// `accept()`; `flush()` only drains, so it never raises the peak.
+    pub fn peak(&self) -> usize {
+        self.peak
     }
 
     /// Post-drain delivery of everything still buffered, in order. Call this
@@ -224,6 +253,65 @@ mod tests {
         });
         assert_eq!(spill.flush(&closing).await, FlushOutcome::Flushed);
         assert_eq!(consumer.await.unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    /// ZEB-816: peak tracks the high-water buffer depth, so a clean run
+    /// (dropped == 0) can be told apart from one that never buffered.
+    #[tokio::test]
+    async fn peak_tracks_high_water_of_buffer_depth() {
+        // 1-slot channel, no consumer: the first accept forwards into the
+        // channel, every later one buffers, so pending() (and peak) climb.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let mut spill = ReplySpill::new(tx, 64);
+        assert_eq!(spill.peak(), 0, "nothing accepted yet");
+        for i in 0..5u8 {
+            assert_eq!(spill.accept(vec![i]), AcceptOutcome::Accepted);
+        }
+        // 1 forwarded + 4 buffered → peak buffer depth 4, no drops.
+        assert_eq!(spill.pending(), 4);
+        assert_eq!(spill.peak(), 4);
+        assert_eq!(spill.dropped(), 0);
+    }
+
+    /// ZEB-816: on overflow the peak pins to the cap and holds — a dropped
+    /// run reads as "peaked at the ceiling", not as ambiguous headroom.
+    #[tokio::test]
+    async fn peak_reaches_cap_on_overflow_and_holds() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let mut spill = ReplySpill::new(tx, 3);
+        // 1 forwarded + 3 buffered = at cap; peak == 3.
+        for i in 0..4u8 {
+            assert_eq!(spill.accept(vec![i]), AcceptOutcome::Accepted, "i={i}");
+        }
+        assert_eq!(spill.peak(), 3);
+        // Overflow drops, and peak stays pinned at the cap (does not grow).
+        assert_eq!(spill.accept(vec![9]), AcceptOutcome::DroppedFull);
+        assert_eq!(spill.peak(), 3);
+        assert_eq!(spill.dropped(), 1);
+    }
+
+    /// ZEB-816 (Qodo, PR #570): when `try_send` has capacity for every
+    /// payload, nothing is ever retained under backpressure, so `peak()`
+    /// stays 0 — the "spill path never exercised" signal the contract
+    /// promises. Sampling the buffer *before* `try_flush` (the pre-fix
+    /// ordering) reported peak 1 here after the very first accept, making the
+    /// zero signal unreachable and defeating the whole point of the metric.
+    #[tokio::test]
+    async fn peak_stays_zero_when_channel_always_has_capacity() {
+        // Channel roomier than the payload count and never full: every accept
+        // forwards immediately, buf returns to empty each time.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let mut spill = ReplySpill::new(tx, 64);
+        for i in 0..5u8 {
+            assert_eq!(spill.accept(vec![i]), AcceptOutcome::Accepted);
+        }
+        assert_eq!(spill.pending(), 0, "nothing retained under backpressure");
+        assert_eq!(spill.peak(), 0, "spill never had to buffer");
+        assert_eq!(spill.dropped(), 0);
+        // The payloads did flow through, in order.
+        for i in 0..5u8 {
+            assert_eq!(rx.recv().await.unwrap(), vec![i]);
+        }
     }
 
     #[tokio::test]

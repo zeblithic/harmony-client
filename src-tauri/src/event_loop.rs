@@ -1898,6 +1898,19 @@ pub async fn run(
                                         "owner-state root fetch: reply storm exceeded spill cap; \
                                          overflow dropped (next reconcile re-fetches)");
                                 }
+                                // ZEB-816: peak buffer depth against the cap,
+                                // so a clean drain (dropped == 0) still says
+                                // whether the spill ran near the ceiling or
+                                // was never exercised. Captured before flush()
+                                // consumes the spill.
+                                tracing::debug!(
+                                    target: "harmony_channel",
+                                    key = %key_rf,
+                                    replies,
+                                    spill_peak = spill.peak(),
+                                    spill_cap = ROOT_FETCH_SPILL_MAX,
+                                    "owner-state root fetch: reply drain complete"
+                                );
                                 // ZEB-812: post-drain delivery; report only
                                 // once the page has landed (or never, on
                                 // shutdown/teardown — matching the old
@@ -9846,6 +9859,16 @@ pub fn spawn_community_state_zenoh_adapter(
                                 "community state-root fetch: reply storm exceeded spill cap; \
                                  overflow dropped (next reconcile re-fetches)");
                         }
+                        // ZEB-816: peak buffer depth against the cap (see the
+                        // owner-state site above). Captured before flush().
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            key = %key_rf,
+                            replies,
+                            spill_peak = spill.peak(),
+                            spill_cap = ROOT_FETCH_SPILL_MAX,
+                            "community state-root fetch: reply drain complete"
+                        );
                         // ZEB-812: post-drain delivery; report only once
                         // the page has landed (or never, on shutdown/
                         // teardown — the old no-report semantics).
@@ -11052,6 +11075,20 @@ where
                                 "channel backfill: reply storm exceeded spill cap; \
                                  overflow dropped (RBSR / next backfill round re-fetches)");
                         }
+                        // ZEB-816: peak buffer depth against the cap, on the
+                        // same `harmony_channel` target as the "backfill page
+                        // completed" line — one grep now shows reply volume
+                        // AND buffer pressure, telling a real storm (peak near
+                        // cap) from a never-exercised spill (peak 0). Captured
+                        // before flush() consumes the spill.
+                        tracing::debug!(
+                            target: "harmony_channel",
+                            %key,
+                            replies = fetched,
+                            spill_peak = spill.peak(),
+                            spill_cap = CHANNEL_BACKFILL_SPILL_MAX,
+                            "channel backfill: reply drain complete"
+                        );
                         // ZEB-812: the zenoh stream is closed; deliver what
                         // the consumer hasn't absorbed yet. Blocking on the
                         // engine HERE is the intended request-level

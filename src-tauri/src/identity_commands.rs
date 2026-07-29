@@ -563,6 +563,46 @@ pub async fn export_mnemonic_words() -> Result<Vec<String>, String> {
         .await
 }
 
+/// ZEB-768: the string contract for [`identity_store_backend`]. The GUI
+/// onboarding copy branches on these exact values, so pin them here.
+fn identity_store_backend_label(keychain_available: bool) -> &'static str {
+    if keychain_available {
+        "keychain"
+    } else {
+        "encrypted-file"
+    }
+}
+
+/// ZEB-768: report which identity-store backend onboarding copy should
+/// describe, so the backup step tells the truth instead of unconditionally
+/// asserting the OS keychain.
+///
+/// This reports keychain **availability** — whether a `KeychainStore`
+/// constructs here. `HARMONY_DISABLE_KEYCHAIN`, a named profile, and hosts
+/// with no keyring provider all make it refuse → `encrypted-file`. That is a
+/// strict improvement over the old unconditional keychain claim and covers
+/// ZEB-768's observed repro (kill-switch + passphrase file).
+///
+/// It is NOT proven persistence location, and callers must not read it as
+/// such: the mint (`owner_state::save_secret`) still falls through to the
+/// encrypted-file store when the keychain *write* fails even though the
+/// handle constructed (`vault_save_slot` → `Ok(false)`/`Err`), and this
+/// getter is queried before mint. Replacing it with a post-mint ground-truth
+/// probe (mirroring `load_secret`'s keychain→file precedence) + a re-query
+/// after mint is ZEB-830 — deferred because that probe's keychain branch is
+/// only verifiable against a real OS keychain (the ZEB-428 isolation gate
+/// blocks `KeychainStore::new()` in every test build, so CI cannot exercise
+/// it).
+///
+/// Returns `"keychain"` or `"encrypted-file"`; the frontend falls back to
+/// backend-neutral wording on any value it doesn't recognize or on error,
+/// never an unearned keychain claim.
+#[tauri::command]
+pub async fn identity_store_backend() -> Result<String, String> {
+    run_blocking(move || Ok(identity_store_backend_label(KeychainStore::new().is_ok()).to_string()))
+        .await
+}
+
 /// Return the identity hash that would result from restoring the given
 /// words, WITHOUT writing anything to disk.
 #[tauri::command]
@@ -755,6 +795,18 @@ mod tests {
     fn plant_seed(identity_path: &Path, seed: &[u8; 32]) {
         identity::write_seed_to_disk_with_keychain(identity_path, seed, /*force=*/ true, None)
             .expect("plant");
+    }
+
+    // ── identity_store_backend_label (ZEB-768) ───────────────────────────
+
+    #[test]
+    fn identity_store_backend_label_pins_the_frontend_string_contract() {
+        // The GUI branches on these exact literals; a keychain-available
+        // node reads "keychain", the file-store fallback reads
+        // "encrypted-file". Anything else would make WelcomeModal fall back
+        // to backend-neutral wording, so these two are the whole contract.
+        assert_eq!(identity_store_backend_label(true), "keychain");
+        assert_eq!(identity_store_backend_label(false), "encrypted-file");
     }
 
     // ── current_identity_hash_helper ─────────────────────────────────────

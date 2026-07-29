@@ -69367,6 +69367,7 @@ pub fn run() {
             update_mail,
             get_mail_counts,
             identity_commands::current_identity_hash,
+            identity_commands::identity_store_backend,
             identity_commands::export_mnemonic_words,
             identity_commands::preview_mnemonic_identity,
             identity_commands::preview_recovery_file,
