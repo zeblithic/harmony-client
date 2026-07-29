@@ -11563,6 +11563,62 @@ pub async fn start_node_inner(
                 None
             };
 
+        // ── ZEB-787: boot-eager voting reconcile ───────────────────────
+        // Load each joined community's persisted voting log into `voting_logs`
+        // so read verbs (voting_get_tier2_proposal, the Tier-3 GET, list verbs)
+        // answer for persisted governance state immediately after a restart,
+        // instead of returning "not found" / [] until a mutating voting IPC
+        // lazily reconciles the community. Reconcile-only — engines still spawn
+        // lazily via ensure_voting_engine_for (idempotent with a pre-populated
+        // log).
+        //
+        // Ordering (deliberate): this runs BEFORE the install block below
+        // publishes `guard.thread` (the "running" signal) and
+        // `guard.community_registry` / `guard.crdt_state`. Every voting mutation
+        // funnels through VotingEngineNodeHandles::extract, which fails with
+        // OWNER_NOT_LOADED until those Arcs are installed, so no voting IPC can
+        // succeed — and thus none can race this reconcile's insert — before it
+        // completes. Sourcing from the pre-install locals (community_registry_arc,
+        // crdt_state_for_state) rather than the not-yet-installed NodeState
+        // fields; `voting_logs` is default-constructed on NodeState and present
+        // pre-install, so it is read under a short `state` lock.
+        if let (Some(community_registry), Some(crdt_state)) =
+            (community_registry_arc.clone(), crdt_state_for_state.clone())
+        {
+            let voting_logs_boot = {
+                let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                std::sync::Arc::clone(&guard.voting_logs)
+            };
+            let community_ids = community_registry.spawned_community_ids().await;
+            let identity_dir = match crate::owner_commands::resolve_identity_dir() {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    // Collapsing to None here would make the whole boot restore a
+                    // silent no-op indistinguishable from "nothing persisted", so
+                    // log it (the lazy path still reconciles on first mutation).
+                    tracing::warn!(
+                        err = %e,
+                        "boot voting reconcile: identity dir unresolved; persisted \
+                         voting state will load lazily on the first mutating voting IPC"
+                    );
+                    None
+                }
+            };
+            let resolver: std::sync::Arc<
+                dyn crate::community_voting_log::MembershipSnapshotResolver,
+            > = std::sync::Arc::new(NodeStateMembershipResolver {
+                community_registry,
+                crdt_state,
+            });
+            reconcile_all_joined_communities_voting(
+                &voting_logs_boot,
+                identity_dir.as_deref(),
+                &community_ids,
+                &resolver,
+            )
+            .await;
+        }
+
         let node_addr_for_state = node_addr.clone();
         // ZEB-669 S2: the engine tick's planner `me`.
         let own_owner_addr_for_loop = node_addr.clone();
@@ -53097,10 +53153,18 @@ async fn reconcile_voting_from_state(
         }
     }
     let path = crate::community_voting_persist::voting_path_for(identity_dir, &community_id);
-    let (events, policy, poll_restore) = match crate::community_voting_persist::load_voting_log(
-        &path,
-        &community_id,
-    ) {
+    // `load_voting_log` reads `voting.cbor` with blocking `std::fs::read`; run it
+    // on the blocking pool so a large log or slow disk never parks a Tokio worker
+    // (the persistence module documents `spawn_blocking` as the repo pattern, and
+    // the boot sweep calls this once per joined community). `community_id` is
+    // `Copy`, so the outer binding is still usable for the error log below.
+    let load_community_id = community_id;
+    let loaded = tokio::task::spawn_blocking(move || {
+        crate::community_voting_persist::load_voting_log(&path, &load_community_id)
+    })
+    .await
+    .map_err(|e| format!("voting reconcile load task join error: {e}"))?;
+    let (events, policy, poll_restore) = match loaded {
         Ok(v) => v,
         Err(e) => {
             // A transient I/O error (file present but unreadable — `load`
@@ -53185,6 +53249,49 @@ async fn reconcile_voting_from_state(
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(log)));
     }
     Ok(())
+}
+
+/// ZEB-787: boot-eager voting restore. Loads each joined community's persisted
+/// voting log into `voting_logs` so read verbs (`voting_get_tier2_proposal`,
+/// the Tier-3 GET, list verbs) answer for persisted governance state
+/// immediately after a restart, rather than returning "not found" / `[]` until
+/// a mutating voting IPC lazily reconciles the community.
+///
+/// Reconcile-only: this does NOT spawn engines. The lazy
+/// `ensure_voting_engine_for` path still owns engine/subscriber creation and is
+/// idempotent with a pre-populated log (it early-returns when events are
+/// already present, then attaches the engine to the reloaded log).
+///
+/// Infallible to the caller: a per-community failure (a present-but-unreadable
+/// `voting.cbor`, which `reconcile_voting_from_state` surfaces as `Err` to
+/// disarm persistence) is logged and skipped so one bad file never blocks the
+/// other communities or boot. A missing file is already a no-op inside
+/// `reconcile_voting_from_state`.
+async fn reconcile_all_joined_communities_voting(
+    voting_logs: &VotingLogsMap,
+    identity_dir: Option<&std::path::Path>,
+    community_ids: &[crate::owner_state_types::SpaceId],
+    membership_resolver: &std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    >,
+) {
+    for &community_id in community_ids {
+        if let Err(e) = reconcile_voting_from_state(
+            voting_logs,
+            identity_dir,
+            community_id,
+            membership_resolver,
+        )
+        .await
+        {
+            tracing::warn!(
+                ?community_id,
+                err = %e,
+                "boot voting reconcile failed for community; skipping (reads will lazily \
+                 reconcile on the first mutating voting IPC for it)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -53274,6 +53381,43 @@ mod zeb718_voting_reconcile_tests {
             tag: 'p',
             version: 1,
             tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: Hlc {
+                wall_ms: wall,
+                logical: 0,
+                device_id: "dev".into(),
+            },
+            actor,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    fn tier2_poll_create(actor: OwnerAddr, wall: u64) -> SignedVotingEvent {
+        let cfg = crate::community_voting_conviction::Tier2PollConfig {
+            proposal_text: "Ratify budget".into(),
+            // Non-zero half-life — apply rejects 0 (`half_life_seconds == 0`).
+            // The exact value is irrelevant here: this test stamps the
+            // threshold clock by hand rather than accumulating conviction.
+            half_life_seconds: 604_800,
+            // T_min <= T_max — apply rejects an inverted band.
+            threshold_min_q32: 0,
+            threshold_max_q32: 8_200_000,
+            beta: 2,
+            delegation_allowed: true,
+            auto_exec: crate::community_voting_conviction::AutoExecAction::None,
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+        };
+        let mut payload = Vec::new();
+        ciborium::into_writer(&cfg, &mut payload).expect("encode tier2 cfg");
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Conviction,
             kind: PollEventKindCode::PollCreate,
             hlc: Hlc {
                 wall_ms: wall,
@@ -53458,6 +53602,218 @@ mod zeb718_voting_reconcile_tests {
                 .map(|t3| t3.meta.community_epoch),
             Some(42),
             "Tier-3 community_epoch must survive restart, not reset to 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restores_tier2_threshold_reached_timing() {
+        // ZEB-787: a Tier-2 (Conviction) proposal that has crossed its
+        // threshold carries a tick-driven contestability clock —
+        // `threshold_reached_at_ms` / `last_unsignal_after_threshold_ms` in
+        // `Tier2ProposalState` — stamped by the tick, NOT by any signed event.
+        // Event replay alone rebuilds the poll (so it is queryable again by
+        // `voting_get_tier2_proposal`) but leaves that clock `None`, which
+        // would reset the 24h contestability window on restart. This exercises
+        // the Tier-2 arm of the `poll_restore` overlay (the Tier-1 lifecycle
+        // and Tier-3 epoch arms are covered above; the Tier-2 timing arm was
+        // not). Both the proposal's presence — the ticket's "lost across
+        // restart" claim — and its timing must survive.
+        use crate::community_voting_core::Lifecycle;
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x7a; 16]);
+        let actor = OwnerAddr([0xdd; 16]);
+
+        const THRESHOLD_REACHED_MS: i128 = 1_700_000_500_000;
+        const LAST_UNSIGNAL_MS: i128 = 1_700_000_900_000;
+
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+
+        // Materialize a Conviction poll, then simulate the tick crossing the
+        // threshold: flip lifecycle to ThresholdReached and stamp the
+        // contestability clock. Both are in-place mutations, NOT events —
+        // exactly what replay cannot reconstruct.
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply_with_snapshot(
+                tier2_poll_create(actor, 1_000),
+                &cid,
+                Some(snapshot.clone()),
+            )
+            .expect("apply tier2 create");
+        {
+            let state = log.polls.get_mut(&pid).expect("poll materialized");
+            assert_eq!(
+                state.meta.tier,
+                Tier::Conviction,
+                "fixture must seed a Conviction poll"
+            );
+            state.meta.lifecycle = Lifecycle::ThresholdReached;
+            let t2 = state
+                .tier_state
+                .as_tier2_mut()
+                .expect("Conviction poll seeds a Tier2 state");
+            assert_eq!(
+                t2.threshold_reached_at_ms, None,
+                "apply must leave the clock unset (tick-driven, not an event)"
+            );
+            t2.threshold_reached_at_ms = Some(THRESHOLD_REACHED_MS);
+            t2.last_unsignal_after_threshold_ms = Some(LAST_UNSIGNAL_MS);
+        }
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+
+        // Fresh empty registry — reconcile must load + replay + overlay.
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("reloaded");
+        let g = restored.lock().await;
+        // (1) The proposal itself survived — the ticket's core "lost across
+        //     restart" claim.
+        let state = g
+            .polls
+            .get(&pid)
+            .expect("ZEB-787: Conviction proposal must survive restart, not be lost");
+        // (2) It reloads as Conviction, so `voting_get_tier2_proposal_impl`
+        //     accepts it instead of rejecting on a tier mismatch.
+        assert_eq!(state.meta.tier, Tier::Conviction);
+        // (3) The tick-driven lifecycle survived (overlay restores `meta`).
+        assert_eq!(
+            state.meta.lifecycle,
+            Lifecycle::ThresholdReached,
+            "ThresholdReached lifecycle must survive restart, not resurrect as Open"
+        );
+        // (4) The contestability clock survived (the Tier-2 overlay arm).
+        let t2 = state
+            .tier_state
+            .as_tier2()
+            .expect("reloaded poll must still be Tier2");
+        assert_eq!(
+            t2.threshold_reached_at_ms,
+            Some(THRESHOLD_REACHED_MS),
+            "threshold_reached_at_ms must survive restart, not reset the 24h window"
+        );
+        assert_eq!(
+            t2.last_unsignal_after_threshold_ms,
+            Some(LAST_UNSIGNAL_MS),
+            "last_unsignal_after_threshold_ms must survive restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_all_joined_communities_voting_sweeps_and_isolates_failures() {
+        // ZEB-787: the boot sweep must (a) reconcile every joined community's
+        // persisted voting log into `voting_logs` and (b) isolate a per-
+        // community failure so one unreadable file never blocks the others.
+        use crate::community_voting_core::Lifecycle;
+        let dir = tempfile::tempdir().unwrap();
+        let cid_ok_tier2 = SpaceId([0x81; 16]);
+        let cid_ok_tier1 = SpaceId([0x82; 16]);
+        let cid_unreadable = SpaceId([0x83; 16]);
+        let actor = OwnerAddr([0xee; 16]);
+
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let snapshot = MembershipSnapshot { members };
+
+        // Community A: a Tier-2 proposal at ThresholdReached (the ZEB-787 case).
+        {
+            let mut log = VotingLog::new();
+            let pid = log
+                .apply_with_snapshot(
+                    tier2_poll_create(actor, 1_000),
+                    &cid_ok_tier2,
+                    Some(snapshot.clone()),
+                )
+                .expect("apply tier2");
+            {
+                let st = log.polls.get_mut(&pid).expect("materialized");
+                st.meta.lifecycle = Lifecycle::ThresholdReached;
+                st.tier_state
+                    .as_tier2_mut()
+                    .expect("tier2 state")
+                    .threshold_reached_at_ms = Some(1_700_000_000_000);
+            }
+            let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid_ok_tier2);
+            crate::community_voting_persist::save_voting_log(&path, &log, &cid_ok_tier2).unwrap();
+        }
+        // Community B: a plain Tier-1 poll.
+        {
+            let mut log = VotingLog::new();
+            log.apply_with_snapshot(
+                tier1_poll_create(actor, 1_000),
+                &cid_ok_tier1,
+                Some(snapshot.clone()),
+            )
+            .expect("apply tier1");
+            let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid_ok_tier1);
+            crate::community_voting_persist::save_voting_log(&path, &log, &cid_ok_tier1).unwrap();
+        }
+        // Community C: a present-but-unreadable voting.cbor. A directory at the
+        // file path makes std::fs::read return EISDIR (a non-NotFound io error),
+        // so load_voting_log returns Err (NOT quarantine) and
+        // reconcile_voting_from_state returns Err — exercising the helper's
+        // skip-and-continue.
+        {
+            let path =
+                crate::community_voting_persist::voting_path_for(dir.path(), &cid_unreadable);
+            std::fs::create_dir_all(&path).unwrap();
+        }
+
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Unreadable community FIRST — proves its Err does not abort the sweep
+        // before the healthy communities are reconciled.
+        reconcile_all_joined_communities_voting(
+            &voting_logs,
+            Some(dir.path()),
+            &[cid_unreadable, cid_ok_tier2, cid_ok_tier1],
+            &resolver,
+        )
+        .await;
+
+        let map = voting_logs.lock().await;
+        assert!(
+            map.contains_key(&cid_ok_tier2),
+            "Tier-2 community reconciled despite an earlier failure in the sweep"
+        );
+        assert!(
+            map.contains_key(&cid_ok_tier1),
+            "Tier-1 community reconciled"
+        );
+        assert!(
+            !map.contains_key(&cid_unreadable),
+            "unreadable community skipped, not inserted"
+        );
+        assert_eq!(
+            map.len(),
+            2,
+            "exactly the two healthy communities are present"
+        );
+        let g = map.get(&cid_ok_tier2).unwrap().lock().await;
+        assert_eq!(
+            g.polls.len(),
+            1,
+            "Tier-2 poll rematerialized through the sweep"
         );
     }
 
