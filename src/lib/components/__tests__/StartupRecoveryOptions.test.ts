@@ -101,4 +101,21 @@ describe('StartupRecoveryOptions (ZEB-835 / ZEB-836)', () => {
     // The wizard is now mounted (its recovery-phrase textarea resolves).
     expect(getByTestId('owner-restore-words')).toBeTruthy();
   });
+
+  it('a corrupt/unreadable identity marker steers restore to Reset, not the wizard', async () => {
+    // owner_id_on_disk now propagates a corrupt-marker error (it no longer
+    // swallows it to null). A force=false restore would be refused by the
+    // overwrite guard, so the UI must NOT open the wizard — it surfaces guidance
+    // to use Reset instead. (Qodo finding, PR #571.)
+    const invoke = makeInvoke({ owner_id_on_disk: new Error('owner_state.cbor is corrupt') });
+    const { getByTestId, queryByTestId } = render(StartupRecoveryOptions, {
+      props: { invoke, reload: vi.fn() },
+    });
+
+    await fireEvent.click(getByTestId('startup-still-stuck'));
+    await fireEvent.click(getByTestId('startup-restore'));
+
+    expect(queryByTestId('owner-restore-words')).toBeNull();
+    expect(getByTestId('startup-restore-blocked').textContent).toMatch(/Reset/i);
+  });
 });

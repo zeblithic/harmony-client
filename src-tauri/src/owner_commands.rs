@@ -1822,22 +1822,43 @@ pub async fn restore_owner_mnemonic_from_words(
 ///
 /// Deliberately NOT included: `identity.key` (the network/device address — a
 /// fresh mint re-adopts it harmlessly) and the `profiles/` subtree (other
-/// named identities are isolated and must never be touched). Kept as literals
-/// cross-referencing the owning constants so a rename there is a compile-visible
-/// prompt to update here: `owner_state.rs` `OWNER_STATE_FILENAME` /
-/// `FLEET_KEYTREE_FILENAME`, `fleet_net_persist.rs` `FLEET_NET_FILENAME` /
-/// `FLEET_NET_REPLAY_FILENAME`, and the owner-state CRDT/replay pair loaded in
-/// `lib.rs` (`owner_state_crdt.cbor` / `state_root_replay.cbor`).
+/// named identities are isolated and must never be touched).
+///
+/// Filenames that have a single canonical constant reference it, so a rename
+/// there breaks *this* build (real compile-time coupling, PR #571 review). The
+/// CRDT/replay pair (`owner_state_crdt.cbor` / `state_root_replay.cbor`, joined
+/// as literals in `lib.rs`) and the `*_secret` encrypted-file names
+/// (`device_sk.enc` / `master_seed.enc`, literal args to `load_secret`) have no
+/// single owning constant, so they stay literals here.
 const OWNER_RESET_FILES: &[&str] = &[
-    "owner_state.cbor",
+    crate::owner_state::OWNER_STATE_FILENAME,
     "owner_state_crdt.cbor",
     "state_root_replay.cbor",
     "device_sk.enc",
     "master_seed.enc",
-    "fleet_keytree.enc",
-    "fleet_net.cbor",
-    "fleet_net_replay.cbor",
+    crate::owner_state::FLEET_KEYTREE_FILENAME,
+    crate::fleet_net_persist::FLEET_NET_FILENAME,
+    crate::fleet_net_persist::FLEET_NET_REPLAY_FILENAME,
 ];
+
+/// Pick a backup dir that does not already exist, so two resets that land in the
+/// same wall-clock second never target the same directory and clobber each
+/// other's snapshot (PR #571 review). Race-free: the sole caller holds
+/// [`OWNER_STATE_WRITE_LOCK`] across the pick-then-create window.
+fn unique_reset_backup_dir(identity_dir: &Path) -> Result<PathBuf, String> {
+    let base = format!("_reset-backup-{}", now_unix());
+    let mut candidate = identity_dir.join(&base);
+    for n in 1..=1000 {
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+        candidate = identity_dir.join(format!("{base}-{n}"));
+    }
+    Err(format!(
+        "could not allocate a unique reset backup dir under {}",
+        identity_dir.display()
+    ))
+}
 
 /// Move `src` → `dst`. A plain rename within the same identity dir (the reset
 /// backup lives inside it) never crosses a filesystem, but fall back to
@@ -1860,8 +1881,10 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
 /// action behind that modal's "Still stuck?" disclosure: it snapshots this
 /// device's owner identity to a timestamped backup dir, moves it aside so the
 /// next boot onboards fresh (`load_owner_state` → `Ok(None)` → `missing`), and
-/// best-effort clears the OS keychain vault. Returns the backup dir path so the
-/// UI can tell the user where their old identity went.
+/// best-effort clears the OS keychain vault. Returns `Some(backup dir path)` so
+/// the UI can tell the user where their old identity went, or `None` when there
+/// was nothing to move (no owner files present — so no backup was created and
+/// the "backed up to a folder" copy would be untrue).
 ///
 /// Snapshot-then-wipe posture (approved 2026-07-30): a mistaken reset is
 /// dev-recoverable from the backup dir. Keychain-only secrets are NOT snapshotted
@@ -1871,7 +1894,7 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
 #[tauri::command]
 pub async fn reset_local_identity(
     state: tauri::State<'_, Mutex<crate::NodeState>>,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     let identity_dir = resolve_identity_dir()?;
     // Stop the node FIRST so the old identity's engines (the ZEB-342 liveness
     // refresher, fleet sync) cannot rewrite owner_state.cbor into the gap and
@@ -1880,24 +1903,25 @@ pub async fn reset_local_identity(
     crate::stop_inner(state.inner(), None);
     let backup =
         run_blocking(move || reset_local_identity_inner(&identity_dir, prod_keychain())).await?;
-    Ok(backup.to_string_lossy().into_owned())
+    Ok(backup.map(|p| p.to_string_lossy().into_owned()))
 }
 
 /// Core of [`reset_local_identity`], extracted for testability. `keychain` is
 /// injected (ZEB-428): production passes [`prod_keychain`], tests pass `None` or
 /// a mock. Held under [`OWNER_STATE_WRITE_LOCK`] so a straggler write can't race
 /// the wipe. Idempotent and safe on partial state — a missing file is skipped;
-/// an already-clean identity dir + empty keychain is a successful no-op (the
-/// backup dir is created lazily, only if there is something to move).
+/// an already-clean identity dir + empty keychain is a successful no-op that
+/// returns `Ok(None)` (the backup dir is created lazily, only if there is
+/// something to move, so no empty dir is left behind).
 pub(crate) fn reset_local_identity_inner(
     identity_dir: &Path,
     keychain: Option<KeychainStore>,
-) -> Result<PathBuf, String> {
+) -> Result<Option<PathBuf>, String> {
     let _guard = OWNER_STATE_WRITE_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
 
-    let backup_dir = identity_dir.join(format!("_reset-backup-{}", now_unix()));
+    let backup_dir = unique_reset_backup_dir(identity_dir)?;
     let mut created_backup = false;
     for name in OWNER_RESET_FILES {
         let src = identity_dir.join(name);
@@ -1909,7 +1933,15 @@ pub(crate) fn reset_local_identity_inner(
                 .map_err(|e| format!("create reset backup dir {}: {e}", backup_dir.display()))?;
             created_backup = true;
         }
-        move_file(&src, &backup_dir.join(name))?;
+        // On a mid-list failure, owner_state.cbor (first) may already be moved —
+        // the live dir is now "missing" — so surface the backup location, or the
+        // already-moved files are undiscoverable (this is a last-resort path).
+        move_file(&src, &backup_dir.join(name)).map_err(|e| {
+            format!(
+                "{e} (partial reset: files already moved are in {})",
+                backup_dir.display()
+            )
+        })?;
     }
 
     // Best-effort clear the OS keychain owner secrets. `prod_keychain` returns
@@ -1927,24 +1959,26 @@ pub(crate) fn reset_local_identity_inner(
         }
     }
 
-    Ok(backup_dir)
+    Ok(created_backup.then_some(backup_dir))
 }
 
-/// Best-effort read of this device's persisted owner-id (hex), or `null` if no
-/// `owner_state.cbor` exists. Read-only and key-free, so it works even when
-/// `start_node` failed to load the identity (ZEB-835/836). The startup-error
-/// "Still stuck?" restore path calls this to classify a pasted recovery phrase
-/// as a same-owner re-adoption (→ `force` overwrite of the broken state). A
-/// corrupt `owner_state.cbor` maps to `null` (the wizard then falls back to a
-/// fresh, non-destructive restore).
+/// Read this device's persisted owner-id (hex), or `null` if no `owner_state.cbor`
+/// exists. Read-only and key-free (delegates to the same
+/// [`crate::owner_state::read_persisted_owner_id`] the restore overwrite-guard
+/// uses), so it works even when `start_node` failed to load the identity
+/// (ZEB-835/836). The startup-error "Still stuck?" restore path calls this to
+/// classify a pasted recovery phrase as a same-owner re-adoption (→ `force`
+/// overwrite of the broken state).
+///
+/// A corrupt/unreadable marker returns `Err` (NOT `null`): the marker exists, so
+/// a fresh (`force=false`) restore would be *refused* by the overwrite guard.
+/// The UI catches the error and steers the user to Reset, which handles a corrupt
+/// marker. (Swallowing it to `null` would silently break the restore path.)
 #[tauri::command]
 pub async fn owner_id_on_disk() -> Result<Option<String>, String> {
     let identity_dir = resolve_identity_dir()?;
     run_blocking(move || {
-        Ok(crate::owner_state::peek_owner_id(&identity_dir)
-            .ok()
-            .flatten()
-            .map(hex::encode))
+        crate::owner_state::read_persisted_owner_id(&identity_dir).map(|id| id.map(hex::encode))
     })
     .await
 }
@@ -1997,7 +2031,10 @@ mod tests {
         )
         .unwrap();
 
-        let backup = reset_local_identity_inner(root, None).unwrap();
+        // Reset returns Some(backup_dir) because there were files to move.
+        let backup = reset_local_identity_inner(root, None)
+            .unwrap()
+            .expect("a reset that moved files must report its backup dir");
 
         // 1+2: every owner/fleet file moved out of the live dir into the backup,
         // contents preserved byte-for-byte.
@@ -2030,12 +2067,13 @@ mod tests {
             "another profile's identity must NOT be touched"
         );
 
-        // 4: idempotent — a second reset over the now-clean dir succeeds and is
-        // a safe no-op: no owner/fleet file reappears, and the survivors stay
-        // put. (The returned path may coincide with the first backup if both
-        // runs land in the same wall-clock second — harmless, since nothing was
-        // moved on this run.)
-        reset_local_identity_inner(root, None).expect("second reset must be Ok");
+        // 4: idempotent — a second reset over the now-clean dir succeeds, moves
+        // nothing (→ Ok(None), no backup dir created), and leaves the survivors.
+        assert_eq!(
+            reset_local_identity_inner(root, None).expect("second reset must be Ok"),
+            None,
+            "a no-op reset must report no backup dir"
+        );
         for name in OWNER_RESET_FILES {
             assert!(
                 !root.join(name).exists(),
@@ -2048,6 +2086,27 @@ mod tests {
             .join("other")
             .join("owner_state.cbor")
             .exists());
+    }
+
+    #[test]
+    fn unique_reset_backup_dir_never_collides_within_the_same_second() {
+        // PR #571 review (Qodo): two resets in the same wall-clock second must
+        // land in DIFFERENT backup dirs, or the second overwrites the first
+        // snapshot — defeating snapshot-then-wipe. The uniqueness check runs
+        // under OWNER_STATE_WRITE_LOCK, so simulating "the first dir already
+        // exists" is the exact race the lock serializes.
+        let dir = tempfile::tempdir().unwrap();
+        let first = unique_reset_backup_dir(dir.path()).unwrap();
+        std::fs::create_dir_all(&first).unwrap(); // first reset created its dir
+        let second = unique_reset_backup_dir(dir.path()).unwrap();
+        assert_ne!(
+            first, second,
+            "same-second backup dirs must differ so the earlier snapshot survives"
+        );
+        assert!(
+            !second.exists(),
+            "the fresh candidate must not already exist"
+        );
     }
 
     /// RAII guard: sets an env var on construction, removes it on drop (even on panic).

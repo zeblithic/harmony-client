@@ -456,11 +456,13 @@ use std::path::Path;
 const KEYCHAIN_OWNER_SERVICE: &str = "harmony.owner";
 const KEYCHAIN_DEVICE_SK: &str = "device_signing_key";
 const KEYCHAIN_MASTER_SEED: &str = "master_seed";
-const OWNER_STATE_FILENAME: &str = "owner_state.cbor";
+// pub(crate) so the reset manifest (`owner_commands::OWNER_RESET_FILES`, ZEB-835)
+// references the canonical name instead of a drift-prone literal.
+pub(crate) const OWNER_STATE_FILENAME: &str = "owner_state.cbor";
 /// Encrypted-file fallback for the distributed fleet KeyTree material on a
 /// cert-only enrolled device (ZEB-492). Variable-length HRMI `v0x02` envelope
 /// (NOT the 32-byte `EncryptedFileStore` format the `*_secret` helpers use).
-const FLEET_KEYTREE_FILENAME: &str = "fleet_keytree.enc";
+pub(crate) const FLEET_KEYTREE_FILENAME: &str = "fleet_keytree.enc";
 
 /// Returned by `load_owner_state` when a persisted identity is found.
 pub struct LoadedOwnerState {
@@ -768,30 +770,6 @@ pub fn load_owner_state_cbor(identity_dir: &Path) -> Result<OwnerState, String> 
 pub fn device_id_from_signing_key(device_sk: &SigningKey) -> [u8; 16] {
     harmony_owner::pubkey_bundle::PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes())
         .identity_hash()
-}
-
-/// Best-effort read of the persisted owner-id **without** loading any secret
-/// key. Parses `owner_state.cbor` and returns its `owner_id`, or `Ok(None)` if
-/// the file is absent (the natural un-minted state). A corrupt file returns
-/// `Err`.
-///
-/// Unlike [`load_owner_state`], this does not require the device signing key —
-/// so it works from a *terminal boot-failure* state (ZEB-835: device key in
-/// neither store; ZEB-836: loaded device key not in `enrollments`). The
-/// startup-error "Still stuck?" restore path uses it to hand the restore wizard
-/// a `currentOwnerId`, so a recovery phrase for the same owner classifies as a
-/// same-owner re-adoption (→ `force` overwrite of the broken `owner_state.cbor`)
-/// instead of a fresh restore that the overwrite-guard would refuse.
-pub fn peek_owner_id(identity_dir: &Path) -> Result<Option<[u8; 16]>, String> {
-    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
-    if !cbor_path.exists() {
-        return Ok(None);
-    }
-    let cbor_bytes = std::fs::read(&cbor_path)
-        .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
-    let state: OwnerState =
-        cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
-    Ok(Some(state.owner_id))
 }
 
 /// Re-adopt an existing owner identity from its 32-byte master `seed`
@@ -1433,26 +1411,33 @@ mod persistence_tests {
     }
 
     #[test]
-    fn peek_owner_id_reads_owner_id_without_any_key() {
-        // ZEB-835/836: the startup-error restore path must recover the owner-id
-        // from a terminal boot-failure state, where the device signing key is
-        // unavailable (in neither store, or mismatched). peek_owner_id parses
-        // owner_state.cbor directly — no keychain, no HARMONY_PASSPHRASE, no
-        // device key — so it works exactly where load_owner_state cannot.
+    fn read_persisted_owner_id_is_key_free_and_distinguishes_absent_vs_corrupt() {
+        // ZEB-835/836: the startup-error restore path recovers the owner-id from
+        // a terminal boot-failure state, where the device signing key is
+        // unavailable (in neither store, or mismatched). read_persisted_owner_id
+        // parses owner_state.cbor directly — no keychain, no HARMONY_PASSPHRASE,
+        // no device key — so it works exactly where load_owner_state cannot, and
+        // its three outcomes (absent / parseable / corrupt) drive the restore
+        // wizard's force decision. (peek_owner_id was a duplicate of this — see
+        // PR #571 review; the IPC uses this canonical function.)
         let dir = tempdir().unwrap();
 
         // Absent file → the natural un-minted None (not an error).
-        assert_eq!(peek_owner_id(dir.path()).unwrap(), None);
+        assert_eq!(read_persisted_owner_id(dir.path()).unwrap(), None);
 
         let MintResult { state, .. } = mint_owner(1_700_000_333).unwrap();
         let bytes = cbor::to_canonical(&state).expect("encode owner_state");
         std::fs::write(dir.path().join(OWNER_STATE_FILENAME), &bytes).unwrap();
-        assert_eq!(peek_owner_id(dir.path()).unwrap(), Some(state.owner_id));
+        assert_eq!(
+            read_persisted_owner_id(dir.path()).unwrap(),
+            Some(state.owner_id)
+        );
 
-        // A corrupt file surfaces an Err (best-effort None is the IPC's choice,
-        // not this primitive's — the primitive stays honest).
+        // A corrupt/unreadable marker surfaces an Err (NOT silent None) — the IPC
+        // propagates it so the UI steers to Reset instead of a restore the
+        // overwrite-guard would refuse.
         std::fs::write(dir.path().join(OWNER_STATE_FILENAME), b"not-cbor").unwrap();
-        assert!(peek_owner_id(dir.path()).is_err());
+        assert!(read_persisted_owner_id(dir.path()).is_err());
     }
 
     /// ZEB-189: `use_os_keychain = false` routes secret persistence entirely

@@ -39,16 +39,22 @@
   let currentOwnerId = $state<string | null>(null);
   let confirmChecked = $state(false);
   let resetError = $state<string | null>(null);
+  let restoreBlocked = $state<string | null>(null);
 
   async function openRestore() {
-    // Best-effort: a null/failed read just means the wizard runs as a fresh
-    // restore (force=false). The real terminal-failure cases have a parseable
-    // owner_state.cbor, so this resolves to the broken owner's id → same-owner
-    // re-adoption → force overwrite.
+    restoreBlocked = null;
     try {
+      // null → no marker on disk (a true fresh, non-destructive restore);
+      // hex → the broken owner's id, so a same-owner phrase force-overwrites it.
       currentOwnerId = await invoke<string | null>('owner_id_on_disk');
     } catch {
-      currentOwnerId = null;
+      // Present-but-corrupt/unreadable marker: a force=false restore would be
+      // refused by the overwrite guard, and we can't derive an owner-id to force
+      // it. Steer to Reset (which handles a corrupt marker) rather than open a
+      // wizard whose restore will fail.
+      restoreBlocked =
+        "This device's identity file couldn't be read, so restoring in place isn't possible here. Use “Reset this device & start fresh” below — your recovery phrase still works after a reset.";
+      return;
     }
     mode = 'restore';
   }
@@ -103,6 +109,9 @@
       >
         Restore from recovery phrase
       </button>
+      {#if restoreBlocked}
+        <p class="reset-error" data-testid="startup-restore-blocked">{restoreBlocked}</p>
+      {/if}
 
       {#if mode === 'reset-confirm' || mode === 'resetting'}
         <div class="reset-confirm-block">
