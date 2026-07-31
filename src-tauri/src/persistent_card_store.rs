@@ -234,17 +234,25 @@ impl PersistentCardStore {
         let _flush = self.flush_lock.lock().expect("card store flush poisoned");
         let bytes = {
             let inner = self.inner.lock().expect("card store poisoned");
-            encode_cards(inner.map.values().map(|e| &e.card))?
+            encode_cards(inner.map.values().map(|e| (&e.card, e.seq)))?
         };
         save_atomically(&self.path, &bytes)
     }
 }
 
-/// Encode an iterator of cards to the on-disk byte form (schema byte + CBOR).
+/// Encode an iterator of (card, seq) to the on-disk byte form (schema byte +
+/// CBOR). The snapshot is written in ascending `seq` order so the
+/// least-recently-updated → most-recently-updated ordering survives a
+/// persist→reload cycle: `from_cards` reassigns `seq` from the loaded Vec's
+/// position, so an arbitrary `HashMap` iteration order here would scramble the
+/// eviction recency across restarts (the §4.6 invariant). `seq` itself is not
+/// persisted — only the order it implies.
 fn encode_cards<'a>(
-    cards: impl Iterator<Item = &'a PersistedCard>,
+    entries: impl Iterator<Item = (&'a PersistedCard, u64)>,
 ) -> Result<Vec<u8>, PersistError> {
-    let snapshot: Vec<&PersistedCard> = cards.collect();
+    let mut ordered: Vec<(&PersistedCard, u64)> = entries.collect();
+    ordered.sort_by_key(|(_, seq)| *seq);
+    let snapshot: Vec<&PersistedCard> = ordered.into_iter().map(|(c, _)| c).collect();
     let mut bytes = vec![CARD_STORE_SCHEMA_V1];
     into_writer(&snapshot, &mut bytes).map_err(|e| PersistError::CborEncode(e.to_string()))?;
     Ok(bytes)
@@ -425,6 +433,59 @@ mod tests {
             "recently-refreshed owner 1 kept"
         );
         assert!(store.get(&[4; 16]).is_some(), "newest owner 4 kept");
+    }
+
+    #[test]
+    fn persist_writes_cards_in_ascending_update_order() {
+        // Deterministic regression for the seq-ordered encode (CodeRabbit): the
+        // on-disk order must be ascending by update recency, NOT arbitrary
+        // HashMap order — otherwise `from_cards` reassigns seq on reload from a
+        // scrambled order and the eviction invariant is lost across restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile_cards.owner.cbor");
+        let store = PersistentCardStore::from_cards(path.clone(), 10, vec![]);
+        store.upsert(&card(1, "a", 10)); // seq 0
+        store.upsert(&card(2, "b", 10)); // seq 1
+        store.upsert(&card(3, "c", 10)); // seq 2
+        store.upsert(&card(1, "a2", 20)); // seq 3 — owner 1 moves to most-recent
+        store.persist().unwrap();
+        // File order must be [owner2 (seq1), owner3 (seq2), owner1 (seq3)].
+        let on_disk = load_cards(&path).unwrap();
+        let order: Vec<u8> = on_disk.iter().map(|c| c.owner_id[0]).collect();
+        assert_eq!(
+            order,
+            vec![2, 3, 1],
+            "cards persisted in ascending-seq order"
+        );
+    }
+
+    #[test]
+    fn eviction_order_survives_persist_reload() {
+        // The §4.6 least-recently-updated eviction must hold across a
+        // persist→reload cycle: after reload, inserting past the cap must evict
+        // the same victim the pre-persist store would have.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile_cards.owner.cbor");
+        let store = PersistentCardStore::from_cards(path.clone(), 3, vec![]);
+        store.upsert(&card(1, "a", 10)); // seq 0
+        store.upsert(&card(2, "b", 10)); // seq 1
+        store.upsert(&card(3, "c", 10)); // seq 2
+        store.upsert(&card(1, "a2", 20)); // seq 3 — owner 1 refreshed (most recent)
+        store.persist().unwrap();
+
+        let reloaded = PersistentCardStore::from_cards(path.clone(), 3, load_cards(&path).unwrap());
+        assert_eq!(reloaded.len(), 3);
+        reloaded.upsert(&card(4, "d", 10)); // evicts least-recently-updated
+        assert_eq!(reloaded.len(), 3);
+        assert!(
+            reloaded.get(&[2; 16]).is_none(),
+            "owner 2 (oldest update) evicted after reload"
+        );
+        assert!(
+            reloaded.get(&[1; 16]).is_some(),
+            "recently-refreshed owner 1 survives reload+evict"
+        );
+        assert!(reloaded.get(&[4; 16]).is_some());
     }
 
     #[test]

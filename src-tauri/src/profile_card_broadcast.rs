@@ -273,6 +273,18 @@ struct CachedCard {
     shared_at: Hlc,
 }
 
+impl CachedCard {
+    fn to_discovered(&self) -> DiscoveredCardInfo {
+        DiscoveredCardInfo {
+            owner_id_hex: hex::encode(self.owner_id),
+            display_name: self.display_name.clone(),
+            status_text: self.status_text.clone(),
+            avatar_cid: self.avatar_cid.map(hex::encode),
+            profile_page_root: self.profile_page_root.map(hex::encode),
+        }
+    }
+}
+
 /// Per-slot state: (expected_owner, latest cached card).
 #[derive(Debug, Default, Clone)]
 struct CardSlot {
@@ -367,31 +379,34 @@ impl ProfileCardCache {
         }
     }
 
-    /// Snapshot the latest verified card for a subscription as the frontend DTO.
+    /// Snapshot the newest verified card for a subscription as the frontend DTO.
+    ///
+    /// Returns whichever of {live slot, durable store} is HLC-newer (live wins
+    /// ties). The store aggregates the newest verified card for this owner
+    /// across ALL subscriptions (write-through, newer-HLC-wins), so it covers:
+    /// a slot with no card yet (offline peer / fresh restart), AND a slot that
+    /// lost a best-effort Zenoh sample a *different* subscription received
+    /// (e.g. the two `MemberCardService` instances). A missing slot (never
+    /// subscribed) has no owner to key on, so it stays `None`.
     pub async fn get_cached(&self, sub: SubscriptionId) -> Option<DiscoveredCardInfo> {
-        // Live slot first; fall back to the durable store by the slot's
-        // expected owner when no card has arrived yet (offline peer / fresh
-        // restart). A missing slot (never subscribed) has no owner to key on,
-        // so it stays `None`.
-        let expected_owner = {
+        let (expected_owner, live) = {
             let g = self.slots.lock().await;
             let slot = g.get(&sub)?;
-            match slot.latest.as_ref() {
-                Some(c) => {
-                    return Some(DiscoveredCardInfo {
-                        owner_id_hex: hex::encode(c.owner_id),
-                        display_name: c.display_name.clone(),
-                        status_text: c.status_text.clone(),
-                        avatar_cid: c.avatar_cid.map(hex::encode),
-                        profile_page_root: c.profile_page_root.map(hex::encode),
-                    });
-                }
-                None => slot.expected_owner,
-            }
+            (slot.expected_owner, slot.latest.clone())
         };
-        // ZEB-839 fallback: last-known verified card for this owner from disk.
-        let store = self.store.get()?;
-        store.get(&expected_owner).map(|c| c.to_discovered())
+        let stored = self.store.get().and_then(|s| s.get(&expected_owner));
+        match (live, stored) {
+            (Some(live), Some(stored)) => Some(
+                if stored.shared_at.is_strictly_newer_than(&live.shared_at) {
+                    stored.to_discovered()
+                } else {
+                    live.to_discovered()
+                },
+            ),
+            (Some(live), None) => Some(live.to_discovered()),
+            (None, Some(stored)) => Some(stored.to_discovered()),
+            (None, None) => None,
+        }
     }
 
     /// Map of `owner_id` → newest verified card's display name, across all
@@ -1031,6 +1046,66 @@ mod tests {
         .unwrap();
         cache.insert_verified(1, &live).await;
         assert_eq!(cache.get_cached(1).await.unwrap().display_name, "Live Name");
+    }
+
+    #[tokio::test]
+    async fn get_cached_prefers_store_when_slot_lost_a_newer_sample() {
+        // Zenoh pub/sub is best-effort: this subscription's slot can hold an
+        // older card while the durable store — fed by ANOTHER subscription's
+        // write-through — holds a newer one for the same owner. get_cached must
+        // surface the newer (Qodo #1 on PR #574).
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::community_membership::mint_test_owner(0x86);
+        let store = std::sync::Arc::new(
+            crate::persistent_card_store::PersistentCardStore::load_for_owner(
+                dir.path(),
+                "owner86",
+            ),
+        );
+        let cache = ProfileCardCache::default();
+        cache.set_store(std::sync::Arc::clone(&store));
+        cache.register(1, owner.owner.0).await;
+        // This subscription receives only the older card.
+        let old = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Old".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        cache.insert_verified(1, &old).await;
+        // A different subscription's write-through lands a newer card this slot missed.
+        let newer = crate::persistent_card_store::PersistedCard::from_broadcast(
+            &sign_card(
+                &owner.device_key,
+                owner.owner.0,
+                "New".into(),
+                "".into(),
+                None,
+                None,
+                owner.cert.clone(),
+                Hlc {
+                    wall_ms: 20,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            )
+            .unwrap(),
+        );
+        store.upsert(&newer);
+        assert_eq!(
+            cache.get_cached(1).await.unwrap().display_name,
+            "New",
+            "store's newer card surfaces despite the older live slot"
+        );
     }
 
     #[tokio::test]

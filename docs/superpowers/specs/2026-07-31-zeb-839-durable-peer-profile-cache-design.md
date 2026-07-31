@@ -64,26 +64,26 @@ Three coordinated changes, with a new backend store as the foundation:
 
 ### 4.1 Data model
 
-Reuse the existing `CachedCard` snapshot (`profile_card_broadcast.rs:263-272`), which already carries exactly the right fields:
+A standalone `PersistedCard` type (in `persistent_card_store.rs`) mirrors the in-memory `CachedCard` snapshot (`profile_card_broadcast.rs:263-272`) field-for-field:
 
 ```rust
-struct CachedCard {
-    owner_id: [u8; 16],
-    display_name: String,
-    status_text: String,
-    avatar_cid: Option<[u8; 32]>,
-    profile_page_root: Option<[u8; 32]>,
-    shared_at: Hlc,
+pub struct PersistedCard {
+    pub owner_id: [u8; 16],
+    pub display_name: String,
+    pub status_text: String,
+    pub avatar_cid: Option<[u8; 32]>,
+    pub profile_page_root: Option<[u8; 32]>,
+    pub shared_at: Hlc,
 }
 ```
 
-The store is `owner_id → CachedCard` (keyed by owner, unlike the live cache's ephemeral `SubscriptionId` key). Add `Serialize`/`Deserialize` to `CachedCard` (and `Hlc` if not already), or define a parallel `PersistedCard` if we want to decouple the on-disk schema from the in-memory struct. **Recommendation:** reuse `CachedCard` with serde derives — it *is* the snapshot — and gate the on-disk format with a schema-version byte for future migration.
+The store is `owner_id → PersistedCard` (keyed by owner, unlike the live cache's ephemeral `SubscriptionId` key). **Decision (as built):** a *standalone* `PersistedCard` with serde derives + the bstr byte-field helpers, rather than adding `Serialize`/`Deserialize` to `CachedCard`. This keeps the on-disk schema decoupled from the private in-memory struct (`CachedCard` stays a module-private `profile_card_broadcast` detail with no serde surface), at the cost of one tiny `from_broadcast`/`to_discovered` conversion pair. The on-disk format is gated with a schema-version byte for future migration.
 
 ### 4.2 Storage
 
 Mirror `owner_state_persist.rs`: a single atomic CBOR file (write temp + rename), schema-versioned, under the **per-identity data dir**. Per-identity scoping is load-bearing — ZEB-586 was a real cross-identity leak from an owner-agnostic key; the profile data dir is already per-identity/profile, so a file under it is naturally scoped. `friend_nicknames.rs` (atomic JSON, `load_or_default`/`save`) is the alternative template; CBOR is preferred here for consistency with the card wire format and clean handling of the binary `owner_id`/CID fields.
 
-On-disk shape (conceptual): `{ schema: u8, cards: Vec<CachedCard> }` (a `Vec` for compact CBOR; loaded into a `HashMap<[u8;16], CachedCard>`).
+On-disk shape (as built): a schema-version byte followed by CBOR `Vec<PersistedCard>` (a `Vec` for compact CBOR; loaded into a `HashMap<[u8;16], _>`). The Vec is written in ascending update-recency order so the LRU eviction order survives a reload.
 
 ### 4.3 Write-through
 
