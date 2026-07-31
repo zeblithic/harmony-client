@@ -34,8 +34,8 @@ const POLL_INTERVAL_MS = 3000;
  *
  * Self (seeded via {@link seedSelf}) is authoritative and never subscribed
  * to nor overwritten by the network poll. Peers are resolved by subscribing
- * to each visible owner_id's card broadcast ({@link subscribeVisible}) and
- * draining the server-side cache on a poll loop.
+ * to each wanted owner_id's card broadcast (via named buckets, {@link
+ * setBucket}) and draining the server-side cache on a poll loop.
  *
  * Reactivity: this stays a plain class with a plain `Map` (no runes). After
  * any poll mutates the map, {@link onUpdate} fires so the owner (App.svelte)
@@ -47,8 +47,20 @@ const POLL_INTERVAL_MS = 3000;
  */
 export class MemberCardService {
   private cards: Map<string, ResolvedCard> = new Map();
-  /** ownerIdHex(lc) -> subscriptionId for each active peer subscription. */
+  /** ownerIdHex(lc) -> subscriptionId for each active peer subscription. The
+   *  set of keys here is always the UNION of every bucket (minus self). */
   private subs = new Map<string, number>();
+  /**
+   * Named subscription buckets: bucketName -> the owner hexes (lowercase) that
+   * source wants subscribed. Each driver (community roster, friends, voice,
+   * groupCall, dm) owns exactly one bucket and sets it independently; the
+   * backend subscription set is reconciled to the union of all buckets, so no
+   * driver can clobber another's subscriptions (ZEB-840). Replaces the old
+   * single-set `subscribeVisible` reconcile, whose "the argument is the whole
+   * desired set" contract forced a call-site merge funnel and a second service
+   * instance.
+   */
+  private buckets = new Map<string, Set<string>>();
   /** Set in seedSelf; excluded from subscriptions and never cached over. */
   private selfKey?: string;
   private pollHandle: ReturnType<typeof setInterval> | null = null;
@@ -92,6 +104,14 @@ export class MemberCardService {
   /** Wire the Tauri adapter after it becomes available (post-boot). */
   setAdapter(adapter: TauriAdapter): void {
     this.adapter = adapter;
+    // The adapter can arrive AFTER buckets were set — App wires Tauri
+    // asynchronously while drivers may set the community/dm buckets during boot.
+    // reconcileToUnion no-ops without an adapter, so replay the stored union now
+    // that the backend is reachable; otherwise those subscriptions would never
+    // start until the next bucket mutation happened to re-run reconciliation.
+    if (this.buckets.size > 0) {
+      void this.runExclusive(() => this.reconcileToUnion());
+    }
   }
 
   /** Attach the shared AvatarResolver. Does NOT touch resolver.onChange — the
@@ -150,6 +170,13 @@ export class MemberCardService {
       profilePageRoot: profile.profilePageRoot,
     });
     this.onUpdate?.();
+    // If a bucket already subscribed to this owner before we knew it was self
+    // (e.g. the community roster includes self, set before boot resolved the
+    // local identity), reconcile so the now-self owner is unsubscribed. No-op
+    // when no adapter/buckets exist yet (the common seedSelf-first path).
+    if (this.adapter && this.buckets.size > 0) {
+      void this.runExclusive(() => this.reconcileToUnion());
+    }
   }
 
   /** Resolve an owner_id to its card, or undefined if unresolved. */
@@ -192,26 +219,52 @@ export class MemberCardService {
   }
 
   /**
-   * Reconcile the set of visible members against active subscriptions.
-   * Subscribes to newly-visible owners, unsubscribes owners that left the
-   * view, and excludes self (kept authoritative via seedSelf). Idempotent.
+   * Set (or replace) the owner-id set for a named subscription bucket, then
+   * reconcile the backend subscription set to the UNION of all buckets.
+   * Independent buckets never clobber each other — each driver owns exactly one
+   * bucket (community / friends / voice / groupCall / dm). Passing an empty
+   * array clears this bucket's contribution to the union. Excludes self (kept
+   * authoritative via seedSelf). Idempotent; serialized via {@link opChain}.
    */
-  subscribeVisible(ownerIdHexes: string[]): Promise<void> {
-    return this.runExclusive(() => this.subscribeVisibleImpl(ownerIdHexes));
+  setBucket(name: string, ownerIdHexes: string[]): Promise<void> {
+    return this.runExclusive(() => this.setBucketImpl(name, ownerIdHexes));
   }
 
-  private async subscribeVisibleImpl(ownerIdHexes: string[]): Promise<void> {
+  /** Clear a named bucket's contribution to the union. Alias for
+   *  `setBucket(name, [])`. */
+  clearBucket(name: string): Promise<void> {
+    return this.setBucket(name, []);
+  }
+
+  private async setBucketImpl(name: string, ownerIdHexes: string[]): Promise<void> {
+    const set = new Set(ownerIdHexes.map((h) => h.toLowerCase()));
+    if (set.size === 0) {
+      this.buckets.delete(name);
+    } else {
+      this.buckets.set(name, set);
+    }
+    await this.reconcileToUnion();
+  }
+
+  /**
+   * Reconcile `this.subs` to the union of every bucket (minus self): subscribe
+   * newly-wanted owners, unsubscribe owners no bucket wants anymore. Self is
+   * filtered here (not at bucket-store time) so a later {@link seedSelf} still
+   * excludes it. Caller MUST hold the opChain (via {@link runExclusive}).
+   */
+  private async reconcileToUnion(): Promise<void> {
     if (!this.adapter) {
-      console.warn('MemberCardService.subscribeVisible: no adapter; skipping');
+      console.warn('MemberCardService.setBucket: no adapter; skipping');
       return;
     }
-    const wanted = new Set(
-      ownerIdHexes
-        .map((h) => h.toLowerCase())
-        .filter((h) => h !== this.selfKey),
-    );
+    const wanted = new Set<string>();
+    for (const bucket of this.buckets.values()) {
+      for (const owner of bucket) {
+        if (owner !== this.selfKey) wanted.add(owner);
+      }
+    }
 
-    // Unsubscribe owners no longer visible.
+    // Unsubscribe owners no bucket wants anymore.
     for (const [owner, subscriptionId] of [...this.subs]) {
       if (!wanted.has(owner)) {
         try {
@@ -226,7 +279,7 @@ export class MemberCardService {
       }
     }
 
-    // Subscribe newly-visible owners.
+    // Subscribe newly-wanted owners.
     for (const ownerIdHex of wanted) {
       if (this.subs.has(ownerIdHex)) continue;
       try {
@@ -243,8 +296,8 @@ export class MemberCardService {
     }
 
     // Start the poll loop only while at least one subscription is active; stop
-    // it when reconciliation has drained the set to empty (all visible members
-    // departed or were filtered as self). Without the else-branch the 3s
+    // it when reconciliation has drained the union to empty (every bucket
+    // cleared, or all owners filtered as self). Without the else-branch the 3s
     // interval would keep firing over an empty `subs` map until `unsubscribeAll`
     // is explicitly called — wasted IPC-free ticks for the life of the view.
     if (this.subs.size > 0) {
@@ -334,6 +387,7 @@ export class MemberCardService {
 
   private async unsubscribeAllImpl(): Promise<void> {
     this.stopPolling();
+    this.buckets.clear();
     if (this.adapter) {
       for (const subscriptionId of this.subs.values()) {
         try {

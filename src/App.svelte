@@ -268,6 +268,21 @@
   const groupCallState = $derived(groupCall?.state);
   const voiceState = $derived(voiceSession?.state);
   const callSessionState = $derived(callSession?.state);
+  // ZEB-840: the voice / group-call card buckets are populated only while a call
+  // is live (onRosterOwners fires from the presence stream). Those presence
+  // listeners tear down on leave with NO final empty-roster emit, so clear each
+  // bucket whenever its call is not in its roster-bearing phase — otherwise the
+  // ex-participants' card subscriptions would linger after the call ends. During
+  // the live phase onRosterOwners owns the bucket; these effects only fire on the
+  // transition out (a memoized $derived, so no churn on mid-call roster patches).
+  const voiceCallPhase = $derived($voiceState?.phase);
+  const groupCallPhase = $derived($groupCallState?.phase);
+  $effect(() => {
+    if (voiceCallPhase !== 'connected') void memberCardService.setBucket('voice', []);
+  });
+  $effect(() => {
+    if (groupCallPhase !== 'active') void memberCardService.setBucket('groupCall', []);
+  });
   // Incoming-call banner model. Set when an `incoming-call` event lands AND the
   // session actually entered the 'incoming' phase (not busy-auto-declined);
   // cleared whenever the call leaves that phase (accepted / declined / canceled).
@@ -480,9 +495,10 @@
           };
         },
         onRosterOwners: (ownerHexes: string[]) => {
-          // ZEB-839: through the shared funnel so an open DM peer's pinned card
-          // subscription survives a call roster reconcile (see subscribeVisibleCards).
-          subscribeVisibleCards(ownerHexes);
+          // ZEB-840: the 1:1 voice-call roster is its own bucket, unioned with
+          // the community / dm / friends buckets — a call-roster reconcile no
+          // longer clobbers the community roster's card subscriptions.
+          void memberCardService.setBucket('voice', ownerHexes);
         },
       });
       // ZEB-352: build the DM-call session from the same identity + adapter deps
@@ -528,9 +544,9 @@
         },
         resolveMembers: (spaceId: string) => getCachedGroupMembers(spaceId),
         onRosterOwners: (ownerHexes: string[]) => {
-          // ZEB-839: through the shared funnel so an open DM peer's pinned card
-          // subscription survives a call roster reconcile (see subscribeVisibleCards).
-          subscribeVisibleCards(ownerHexes);
+          // ZEB-840: the group-call roster is its own bucket, unioned with the
+          // other buckets — a call-roster reconcile no longer clobbers them.
+          void memberCardService.setBucket('groupCall', ownerHexes);
         },
       });
       // Clear the incoming-call banner whenever the call leaves the 'incoming'
@@ -687,43 +703,32 @@
     return presenceService.isOnline(ownerIdHex);
   }
 
-  // ZEB-341 Task 8: lifecycle hooks threaded down to CommunityMembersPanel,
-  // which knows the visible-member set. No-ops until the adapter wires up.
-  //
-  // ZEB-839: an open DM's peer belongs to no community roster, yet the DM
-  // bubbles + header resolve through the same card ladder — so that peer has to
-  // be merged into every reconcile here. `subscribeVisible` IS a reconciliation
-  // (it drops any owner absent from the list) and the members panel
-  // mounts/unmounts as the user moves between a community and a DM, so calling
-  // it with just the DM peer, or letting the panel's teardown run afterwards,
-  // would silently drop one or the other. Keeping the merge at this single
-  // call-site leaves MemberCardService's one-owner-of-the-sub-set contract intact.
-  let visibleCardOwners: string[] = [];
-  let dmCardOwner: string | null = null;
-  function reconcileCardSubscriptions() {
-    const owners =
-      dmCardOwner !== null && !visibleCardOwners.includes(dmCardOwner)
-        ? [...visibleCardOwners, dmCardOwner]
-        : visibleCardOwners;
-    void memberCardService.subscribeVisible(owners);
-  }
+  // ZEB-341 Task 8 / ZEB-840: each subscription driver owns a NAMED bucket on
+  // the single MemberCardService; the service subscribes to the UNION of all
+  // buckets, so no driver ever clobbers another's card subscriptions. The
+  // community roster, the open DM peer, the voice roster, the group-call roster,
+  // and the Friends panel are all independent buckets — replacing the old
+  // single-slot merge funnel (which forced a hand-rolled DM pin and let a
+  // call-roster reconcile silently drop the community roster's cards).
   function subscribeVisibleCards(ownerIdHexes: string[]) {
-    visibleCardOwners = ownerIdHexes;
-    reconcileCardSubscriptions();
+    void memberCardService.setBucket('community', ownerIdHexes);
   }
   function unsubscribeCards() {
-    // Reconciling to the empty set unsubscribes everything and stops the poll
-    // loop (subscribeVisibleImpl's else-branch) — same effect as the previous
-    // unsubscribeAll(), except a pinned DM peer survives the panel unmount.
-    visibleCardOwners = [];
-    reconcileCardSubscriptions();
+    // Clear ONLY the community bucket; the dm / voice / groupCall / friends
+    // buckets survive the members-panel unmount.
+    void memberCardService.setBucket('community', []);
   }
-  /** ZEB-839: pin (or release) the open 1:1 DM peer's card subscription. */
+  /** ZEB-839/840: pin (or release) the open 1:1 DM peer's card subscription as
+   *  the `dm` bucket — independent of the community roster, so it survives a
+   *  community switch. */
   function setDmCardOwner(ownerIdHex: string | null) {
-    const next = ownerIdHex?.toLowerCase() ?? null;
-    if (next === dmCardOwner) return;
-    dmCardOwner = next;
-    reconcileCardSubscriptions();
+    void memberCardService.setBucket('dm', ownerIdHex ? [ownerIdHex] : []);
+  }
+  /** ZEB-840: the Friends panel drives the `friends` bucket (friend + pending
+   *  owners). Passing `[]` on panel unmount clears only this bucket, leaving the
+   *  community / dm / voice buckets intact. */
+  function setFriendsBucket(ownerIdHexes: string[]) {
+    void memberCardService.setBucket('friends', ownerIdHexes);
   }
 
   // ZEB-341: one-shot guard so the boot-time card re-publish fires at most
@@ -1755,13 +1760,11 @@
       toastStore.show(`DM invite decline failed: ${msg}`);
     }
   }
-  // ZEB-419: a SECOND MemberCardService dedicated to the Friends panel. It must
-  // NOT share the roster instance: subscribeVisible(ids) reconciles to EXACTLY
-  // the passed set, so friends + roster would unsubscribe each other. The panel
-  // drives its subscriptions and owns its onUpdate; App only wires the adapter +
-  // avatar resolver (below).
-  const friendCardService = new MemberCardService();
-  $effect(() => () => void friendCardService.unsubscribeAll());
+  // ZEB-840: the Friends panel no longer needs its own MemberCardService — the
+  // single instance's `friends` bucket (set via setFriendsBucket, below) unions
+  // with the community/dm/voice buckets, so friends and roster no longer
+  // unsubscribe each other. The panel reads via resolveCard/resolveNickname and
+  // drives only its own bucket.
   const channelMessageService = new ChannelMessageService();
   $effect(() => () => channelMessageService.destroy());
   // ZEB-600: on app teardown, drop ALL presence subscriptions (subscribe-all
@@ -1820,8 +1823,6 @@
   // nav nodes. Task 11's setAvatarResolver does NOT touch resolver.onChange, so
   // setting the combined onChange immediately below is safe regardless of order.
   memberCardService.setAvatarResolver(avatarResolver);
-  // ZEB-419: same shared resolver for the friends-panel card service.
-  friendCardService.setAvatarResolver(avatarResolver);
 
   // When avatar CIDs finish resolving, push blob URLs into BOTH stored
   // nav profiles/nodes AND peer member cards so every avatar surface
@@ -1829,9 +1830,6 @@
   avatarResolver.onChange = () => {
     navService.refreshAvatars();
     memberCardService.onAvatarsRefreshed();
-    // ZEB-419: the friends panel's card service shares this resolver — refresh it
-    // too so resolved friend avatars repaint immediately, not only on its poll.
-    friendCardService.onAvatarsRefreshed();
   };
   navService.onChange = () => {
     navNodes = [...navService.nodes];
@@ -2147,8 +2145,6 @@
       // ZEB-537: wire the same adapter into the community-presence service so
       // subscribe/get/unsubscribe can reach the backend IPCs.
       presenceService.setAdapter(adapter);
-      // ZEB-419: wire the same adapter into the friends-panel card service.
-      friendCardService.setAdapter(adapter);
 
       // ZEB-298 PR 2 Task 10 — wire the voting adapter so the
       // delegate-on-behalf Tauri event can fire toast notifications.
@@ -2715,10 +2711,9 @@
           // this owner re-resolves once a fresh card lands.
           profilePageRoot: event.payload.profilePageRoot,
         };
+        // ZEB-840: one instance now backs every surface (community, friends,
+        // DM, calls), so a single applyCard updates them all.
         memberCardService.applyCard(event.payload.ownerIdHex, card);
-        // ZEB-419: also feed the friends-panel card service so friend/request
-        // rows update instantly on a pushed card, not only via its 3s poll.
-        friendCardService.applyCard(event.payload.ownerIdHex, card);
       });
       fileManagerService.addUnlisten(unlistenMemberCard);
 
@@ -4217,7 +4212,8 @@
       onClose={() => { showSettings = false; }}
       onTrustChange={handleTrustChange}
       {friendService}
-      {friendCardService}
+      {resolveCard}
+      {setFriendsBucket}
       {dmInviteService}
       {communityService}
       audioDevices={audioDevicePrefs}

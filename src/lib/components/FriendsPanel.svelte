@@ -36,20 +36,26 @@
   } from '../connectivity-adapter';
   import { relativeTime } from '../file-utils';
   import Avatar from './Avatar.svelte';
-  import type { MemberCardService } from '../member-card-service';
+  import type { ResolvedCard } from '../member-card-service';
   import type { OpenCardPayload } from './MemberRow.svelte';
 
   let {
     service,
-    cardService,
+    resolveCard,
+    setFriendsBucket,
     onOpenCard,
     dmInviteService,
   }: {
     service: FriendService;
-    /** ZEB-419: dedicated MemberCardService for live friend/request names +
-     *  avatars (App injects it). Optional so unit tests can omit it; when
-     *  absent, names fall back to the frozen hint / short-hex. */
-    cardService?: MemberCardService;
+    /** ZEB-840: resolve an owner_id to its live card (name + avatar) via the
+     *  app's single MemberCardService; reactive through App's cardVersion (read
+     *  transitively when called in the template). Optional so unit tests can omit
+     *  it; when absent, names fall back to the frozen hint / short-hex. */
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-840: set the `friends` subscription bucket (friend + pending owners)
+     *  on the shared service. Passing [] on unmount clears only this bucket,
+     *  leaving the community / dm / voice buckets intact. Optional for tests. */
+    setFriendsBucket?: (ownerIdHexes: string[]) => void;
     /** ZEB-419: open the owner-card drill-down popover (App's openMemberCard). */
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
     /** ZEB-236 T7: shared DM-invite service (App injects its single instance).
@@ -62,10 +68,6 @@
   let friends = $state<FriendDto[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
-
-  // ZEB-419: bumped by the dedicated card service's onUpdate (poll/event) so the
-  // name/avatar helpers re-read resolve() and the rows repaint.
-  let cardVersion = $state(0);
 
   // Generate-link state.
   let generatedUrl = $state<string | null>(null);
@@ -194,8 +196,8 @@
     try {
       const next = await service.listFriends();
       // Don't assign list state after teardown — it would also re-trigger the
-      // card-subscription $effect on the App-owned friendCardService while the
-      // panel is closed (ZEB-415 liveness discipline).
+      // friends-bucket $effect (setFriendsBucket) while the panel is closed
+      // (ZEB-415 liveness discipline).
       if (destroyed) return;
       friends = next;
       error = null;
@@ -327,13 +329,9 @@
   }
 
   onMount(() => {
-    // ZEB-419: repaint names/avatars when the dedicated card service resolves a
-    // card (poll or member-card-received event). Guard post-teardown writes.
-    if (cardService) {
-      cardService.onUpdate = () => {
-        if (!destroyed) cardVersion += 1;
-      };
-    }
+    // ZEB-840: name/avatar repaint is driven by App's shared cardVersion via the
+    // resolveCard closure (read transitively in the template) — no local onUpdate
+    // wiring needed now that there's a single MemberCardService instance.
     // Re-fetch friends whenever the backend signals a change.
     unsubscribeChanged = service.onFriendsChanged(() => {
       void refresh();
@@ -383,11 +381,10 @@
     // Cancel any in-flight `loadDiscoverable` read so its late resolve can't
     // write `identityDiscoverable` after we've unmounted (CodeRabbit).
     discoverableGen += 1;
-    // ZEB-419: stop card updates + drop all friend/request card subscriptions.
-    if (cardService) {
-      cardService.onUpdate = undefined;
-      void cardService.unsubscribeAll();
-    }
+    // ZEB-840: clear ONLY the friends bucket on unmount — the shared instance's
+    // community / dm / voice buckets must survive (unlike the old dedicated
+    // instance's unsubscribeAll).
+    setFriendsBucket?.([]);
     if (myKeyCopiedTimer) clearTimeout(myKeyCopiedTimer);
     myKeyCopiedTimer = null;
   });
@@ -785,17 +782,15 @@
     return hex.length > 12 ? `${hex.slice(0, 12)}…` : hex;
   }
 
-  // ── ZEB-419: live owner-card resolution (name + avatar) ───────────────────
-  // Reading `cardVersion` inside these helpers makes the template re-render when
-  // a poll/event fills a card. Empty strings fall through (`||` not `??`) so a
-  // blank card name never masks a usable hint.
+  // ── ZEB-419 / ZEB-840: live owner-card resolution (name + avatar) ─────────
+  // resolveCard reads App's shared cardVersion internally, so calling it in the
+  // template makes the rows repaint when a poll/event fills a card. Empty strings
+  // fall through (`||` not `??`) so a blank card name never masks a usable hint.
   function cardName(ownerIdHex: string): string | undefined {
-    cardVersion;
-    return cardService?.resolve(ownerIdHex)?.displayName || undefined;
+    return resolveCard?.(ownerIdHex)?.displayName || undefined;
   }
   function cardAvatarUrl(ownerIdHex: string): string | undefined {
-    cardVersion;
-    return cardService?.resolve(ownerIdHex)?.avatarUrl;
+    return resolveCard?.(ownerIdHex)?.avatarUrl;
   }
   // Label ladder: personal nickname ► live card name ► frozen link hint ►
   // short owner_id. The short-hex line under the name stays the verifiable id.
@@ -811,7 +806,7 @@
   // mode). The popover shows the peer's REAL signed card name + full owner_id —
   // never the local nickname — so a misleading nickname can't mask identity.
   function openIdentity(ownerIdHex: string, ev: MouseEvent): void {
-    const resolved = cardService?.resolve(ownerIdHex);
+    const resolved = resolveCard?.(ownerIdHex);
     onOpenCard?.(
       {
         ownerIdHex,
@@ -823,19 +818,20 @@
     );
   }
 
-  // Reconcile the dedicated card service's subscriptions to the current friend +
-  // pending owner_id set whenever those lists change. subscribeVisible is
-  // idempotent and reconciles (unsubscribes owners that left the lists).
+  // ZEB-840: drive the shared service's `friends` bucket from the current friend
+  // + pending owner_id set whenever those lists change. setBucket is idempotent
+  // and reconciles the union (dropping owners that left the lists), and — unlike
+  // the old subscribeVisible — cannot unsubscribe the community/dm/voice buckets.
   $effect(() => {
     // Belt-and-suspenders: never (re)subscribe after teardown. The refresh
     // guards above stop list state changing post-unmount, and Svelte disposes
     // this effect on destroy — this check makes a stray re-run a no-op too.
-    if (destroyed || !cardService) return;
+    if (destroyed) return;
     const ids = [
       ...friends.map((f) => f.ownerIdHex),
       ...pendingRequests.map((r) => r.ownerIdHex),
     ];
-    void cardService.subscribeVisible(ids);
+    setFriendsBucket?.(ids);
   });
 </script>
 
