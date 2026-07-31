@@ -1,5 +1,6 @@
 import { render, screen, fireEvent } from '@testing-library/svelte';
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { tick } from 'svelte';
 
 vi.mock('@tauri-apps/api/webviewWindow', () => ({
   WebviewWindow: class {
@@ -609,5 +610,146 @@ describe('Network Viz dev-flag gate (ZEB-659)', () => {
   it('shows the Network Viz button when showNetworkViz is true', () => {
     render(NavPanel, { props: { nodes: testNodes, collapsed: false, showNetworkViz: true } });
     expect(screen.getByRole('button', { name: /open network visualization/i })).toBeTruthy();
+  });
+});
+
+describe('NavPanel — collapse persistence (ZEB-838)', () => {
+  const community: NavNode = {
+    id: 'c1',
+    parentId: null,
+    type: 'community',
+    name: 'Alpha',
+    expanded: true,
+    unreadCount: 0,
+    mentionCount: 0,
+    unreadLevel: 'none',
+  };
+  const channel: NavNode = {
+    id: 'c1-general',
+    parentId: 'c1',
+    type: 'channel',
+    channelKind: 'text',
+    name: 'chatroom',
+    expanded: false,
+    unreadCount: 0,
+    mentionCount: 0,
+    unreadLevel: 'none',
+  };
+
+  it('keeps a community collapsed after the nodes prop is rebuilt by a backend update', async () => {
+    // Regression: collapsing a community then receiving ANY backend update
+    // (e.g. a message from another client bumps unreadCount → navService
+    // rebuilds the nodes prop) used to re-expand every community, because the
+    // collapse lived only on NavPanel's local mirror, which `$effect.pre`
+    // re-hydrated from the service — where a community defaults to
+    // expanded:true — on the next `nodes` prop change.
+    const { rerender } = render(NavPanel, {
+      props: { nodes: [community, channel], collapsed: false },
+    });
+
+    // Community starts expanded → its channel child renders.
+    expect(screen.getByText('chatroom')).toBeTruthy();
+
+    // User collapses the community.
+    await fireEvent.click(screen.getByLabelText('Collapse community'));
+    expect(screen.queryByText('chatroom')).toBeNull();
+    expect(screen.getByLabelText('Expand community')).toBeTruthy();
+
+    // A backend update rebuilds the nodes prop: fresh node objects, the
+    // community still expanded:true (the service default it never learned to
+    // change), unread bumped as if a message just arrived on another client.
+    await rerender({
+      nodes: [
+        { ...community, unreadCount: 3, unreadLevel: 'quiet' },
+        { ...channel },
+      ],
+      collapsed: false,
+    });
+
+    // The user's collapse must survive the re-sync.
+    expect(screen.queryByText('chatroom')).toBeNull();
+    expect(screen.getByLabelText('Expand community')).toBeTruthy();
+  });
+
+  it('prunes a stale override when its node is removed, so a re-add uses the service default', async () => {
+    // Qodo (#573): the override Map must not retain ids that leave the tree —
+    // otherwise it grows unbounded, and rejoining a community (same id) would
+    // inherit the old collapse instead of the fresh default.
+    const { rerender } = render(NavPanel, {
+      props: { nodes: [community, channel], collapsed: false },
+    });
+
+    // Collapse it, then the community is removed (user left it).
+    await fireEvent.click(screen.getByLabelText('Collapse community'));
+    expect(screen.getByLabelText('Expand community')).toBeTruthy();
+    await rerender({ nodes: [], collapsed: false });
+    await tick(); // let the prune effect run against the now-empty node set
+    expect(screen.queryByLabelText('Expand community')).toBeNull();
+
+    // Re-added later (rejoined): the stale collapse override must be gone, so it
+    // honors the service default (expanded) — chevron reads "Collapse", child shows.
+    await rerender({ nodes: [community, channel], collapsed: false });
+    expect(screen.getByLabelText('Collapse community')).toBeTruthy();
+    expect(screen.getByText('chatroom')).toBeTruthy();
+  });
+
+  it('keeps a folder display-mode change after a nodes-prop rebuild', async () => {
+    // CodeRabbit (#573): display-mode rides the same override path as expand —
+    // it must survive a backend re-sync too.
+    const folder: NavNode = {
+      id: 'f1',
+      parentId: null,
+      type: 'folder',
+      name: 'Projects',
+      expanded: true,
+      unreadCount: 0,
+      mentionCount: 0,
+      unreadLevel: 'none',
+    };
+    const { container, rerender } = render(NavPanel, {
+      props: { nodes: [folder], collapsed: false },
+    });
+    const modeToggle = () => container.querySelector('.mode-toggle') as HTMLButtonElement;
+    const before = modeToggle().textContent;
+
+    await fireEvent.click(modeToggle()); // cycle the display mode to a new value
+    const after = modeToggle().textContent;
+    expect(after).not.toBe(before);
+
+    // A backend update rebuilds the prop (folder carries no display-mode of its own).
+    await rerender({ nodes: [{ ...folder }], collapsed: false });
+    expect(modeToggle().textContent).toBe(after);
+  });
+
+  it('keeps a folder sort-order change after a nodes-prop rebuild', async () => {
+    // CodeRabbit (#573): sort-order too.
+    const folder: NavNode = {
+      id: 'f2',
+      parentId: null,
+      type: 'folder',
+      name: 'Teams',
+      expanded: true,
+      unreadCount: 0,
+      mentionCount: 0,
+      unreadLevel: 'none',
+    };
+    const { container, rerender } = render(NavPanel, {
+      props: { nodes: [folder], collapsed: false },
+    });
+    const sortTrigger = () => container.querySelector('.sort-trigger') as HTMLButtonElement;
+
+    await fireEvent.click(sortTrigger()); // open the sort menu
+    const alpha = Array.from(container.querySelectorAll('.sort-option')).find((o) =>
+      /A-Z/.test(o.textContent ?? ''),
+    ) as HTMLButtonElement;
+    await fireEvent.click(alpha); // select alphabetical (a non-default) → menu closes
+
+    // Rebuild the prop (folder carries no sort-order of its own).
+    await rerender({ nodes: [{ ...folder }], collapsed: false });
+
+    // Reopen the menu; the alphabetical option must still be the active one.
+    await fireEvent.click(sortTrigger());
+    const active = container.querySelector('.sort-option.active') as HTMLButtonElement;
+    expect(active?.textContent).toMatch(/A-Z/);
   });
 });
