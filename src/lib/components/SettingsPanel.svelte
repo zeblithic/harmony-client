@@ -17,7 +17,7 @@
   import type { TrustService } from '../trust-service';
   import type { FriendService } from '../friend-service';
   import type { DmInviteService } from '../dm-invite-service';
-  import type { MemberCardService } from '../member-card-service';
+  import type { ResolvedCard } from '../member-card-service';
   import type { CommunityService } from '../community-service';
   import type { OpenCardPayload } from './MemberRow.svelte';
 
@@ -54,7 +54,8 @@
     onClose,
     onTrustChange,
     friendService,
-    friendCardService,
+    resolveCard,
+    setFriendsBucket,
     dmInviteService,
     communityService,
     audioDevices,
@@ -72,7 +73,13 @@
     onClose?: () => void;
     onTrustChange?: () => void;
     friendService: FriendService;
-    friendCardService?: MemberCardService;
+    /** ZEB-840: resolve an owner_id to its live card via the app's single
+     *  MemberCardService (reactive through App's cardVersion). Forwarded to
+     *  FriendsPanel. Optional (existing mounts/tests). */
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-840: set the Friends panel's `friends` subscription bucket.
+     *  Forwarded to FriendsPanel. Optional (existing mounts/tests). */
+    setFriendsBucket?: (ownerIdHexes: string[]) => void;
     /** ZEB-236 T7: shared DM-invite service, forwarded straight to FriendsPanel
      *  for its "DM invites" pending section. Optional (existing mounts/tests). */
     dmInviteService?: DmInviteService;
@@ -243,7 +250,7 @@
     aria-labelledby="settings-tab-friends"
     hidden={activeTab !== 'friends'}
   >
-    <FriendsPanel service={friendService} cardService={friendCardService} {dmInviteService} {onOpenCard} />
+    <FriendsPanel service={friendService} {resolveCard} {setFriendsBucket} {dmInviteService} {onOpenCard} />
   </div>
 </div>
 

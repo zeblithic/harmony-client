@@ -36,17 +36,16 @@ function mockService(overrides: Partial<FriendService> = {}): FriendService {
   } as unknown as FriendService;
 }
 
-// ZEB-419: a stand-in for the dedicated MemberCardService the panel runs. Only
-// the surface the panel touches (resolve / subscribeVisible / unsubscribeAll /
-// onUpdate) is implemented.
-function mockCardService(
+// ZEB-840: stand-ins for the two card props the panel now consumes (the shared
+// MemberCardService is injected as closures by App, not a whole instance):
+//   resolveCard(id)     -> the card map (name/avatar/status)
+//   setFriendsBucket(ids) -> the `friends` subscription bucket driver
+function mockCards(
   cards: Record<string, { displayName: string; avatarUrl?: string; statusText?: string }> = {},
 ) {
   return {
-    onUpdate: undefined as (() => void) | undefined,
-    resolve: vi.fn((id: string) => cards[id.toLowerCase()]),
-    subscribeVisible: vi.fn().mockResolvedValue(undefined),
-    unsubscribeAll: vi.fn().mockResolvedValue(undefined),
+    resolveCard: vi.fn((id: string) => cards[id.toLowerCase()]),
+    setFriendsBucket: vi.fn(),
   };
 }
 
@@ -425,9 +424,9 @@ describe('FriendsPanel — owner names + nicknames (ZEB-419)', () => {
       { ownerIdHex: ID('d'), display: null, nickname: null, status: 'active', establishedVia: 'mutual_key', referrable: false },
     ];
     const service = mockService({ listFriends: vi.fn().mockResolvedValue(friends) });
-    const cardService = mockCardService({ [ID('c')]: { displayName: 'CardName' } });
+    const cards = mockCards({ [ID('c')]: { displayName: 'CardName' } });
     const { findByTestId, getByTestId } = render(FriendsPanel, {
-      props: { service, cardService },
+      props: { service, resolveCard: cards.resolveCard },
     });
     await findByTestId('friend-list');
 
@@ -437,7 +436,7 @@ describe('FriendsPanel — owner names + nicknames (ZEB-419)', () => {
     expect(getByTestId(`friend-name-${ID('d')}`).textContent).toContain('dddddddddddd'); // short-hex
   });
 
-  it('subscribes to friend + pending owner_ids and unsubscribes on unmount', async () => {
+  it('drives the friends bucket with friend + pending owner_ids and clears it on unmount', async () => {
     const friends = [
       { ownerIdHex: ID('a'), display: null, nickname: null, status: 'active', establishedVia: 'mutual_key', referrable: false },
     ];
@@ -446,20 +445,21 @@ describe('FriendsPanel — owner names + nicknames (ZEB-419)', () => {
       listFriends: vi.fn().mockResolvedValue(friends),
       listPendingRequests: vi.fn().mockResolvedValue(pending),
     });
-    const cardService = mockCardService();
+    const cards = mockCards();
     const { findByTestId, unmount } = render(FriendsPanel, {
-      props: { service, cardService },
+      props: { service, resolveCard: cards.resolveCard, setFriendsBucket: cards.setFriendsBucket },
     });
     await findByTestId('friend-list');
 
     await vi.waitFor(() =>
-      expect(cardService.subscribeVisible).toHaveBeenCalledWith(
+      expect(cards.setFriendsBucket).toHaveBeenCalledWith(
         expect.arrayContaining([ID('a'), ID('b')]),
       ),
     );
 
+    // ZEB-840: unmount clears ONLY the friends bucket (not unsubscribeAll).
     unmount();
-    expect(cardService.unsubscribeAll).toHaveBeenCalled();
+    expect(cards.setFriendsBucket).toHaveBeenLastCalledWith([]);
   });
 
   it('sets a nickname via the inline editor', async () => {
@@ -470,7 +470,7 @@ describe('FriendsPanel — owner names + nicknames (ZEB-419)', () => {
     const setNickname = vi.fn().mockResolvedValue(undefined);
     const service = mockService({ listFriends: vi.fn().mockResolvedValue(friends), setNickname });
     const { findByTestId, getByTestId } = render(FriendsPanel, {
-      props: { service, cardService: mockCardService() },
+      props: { service },
     });
     await findByTestId('friend-list');
 
@@ -488,7 +488,7 @@ describe('FriendsPanel — owner names + nicknames (ZEB-419)', () => {
     const setNickname = vi.fn().mockResolvedValue(undefined);
     const service = mockService({ listFriends: vi.fn().mockResolvedValue(friends), setNickname });
     const { findByTestId, getByTestId } = render(FriendsPanel, {
-      props: { service, cardService: mockCardService() },
+      props: { service },
     });
     await findByTestId('friend-list');
 
@@ -504,10 +504,10 @@ describe('FriendsPanel — owner names + nicknames (ZEB-419)', () => {
       { ownerIdHex: id, display: null, nickname: 'Nick', status: 'active', establishedVia: 'mutual_key', referrable: false },
     ];
     const service = mockService({ listFriends: vi.fn().mockResolvedValue(friends) });
-    const cardService = mockCardService({ [id]: { displayName: 'RealCardName', statusText: 'hi' } });
+    const cards = mockCards({ [id]: { displayName: 'RealCardName', statusText: 'hi' } });
     const onOpenCard = vi.fn();
     const { findByTestId, getByTestId } = render(FriendsPanel, {
-      props: { service, cardService, onOpenCard },
+      props: { service, resolveCard: cards.resolveCard, onOpenCard },
     });
     await findByTestId('friend-list');
 

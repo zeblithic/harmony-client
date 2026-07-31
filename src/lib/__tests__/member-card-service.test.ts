@@ -81,7 +81,7 @@ describe('MemberCardService cross-peer resolution', () => {
   it('subscribes to a visible peer and resolves its card after a poll', async () => {
     const { adapter, subscribed } = makeAdapter();
     const svc = makeService(adapter);
-    await svc.subscribeVisible([ownerA]);
+    await svc.setBucket('community',[ownerA]);
     expect(subscribed).toEqual([ownerA]);
     expect(svc.resolve(ownerA)).toBeUndefined(); // not yet drained
     await svc.pollOnce();
@@ -109,7 +109,7 @@ describe('MemberCardService cross-peer resolution', () => {
     });
     const adapter = { invoke, listen: vi.fn(async () => () => {}) } as unknown as TauriAdapter;
     const svc = makeService(adapter);
-    await svc.subscribeVisible([ownerA]);
+    await svc.setBucket('community',[ownerA]);
     await svc.pollOnce();
     expect(svc.resolve(ownerA)?.profilePageRoot).toBe('cid-polled-page');
   });
@@ -119,7 +119,7 @@ describe('MemberCardService cross-peer resolution', () => {
     const svc = makeService(adapter);
     const onUpdate = vi.fn();
     svc.onUpdate = onUpdate;
-    await svc.subscribeVisible([ownerA]);
+    await svc.setBucket('community',[ownerA]);
     onUpdate.mockClear();
     await svc.pollOnce();
     expect(onUpdate).toHaveBeenCalledTimes(1);
@@ -132,7 +132,7 @@ describe('MemberCardService cross-peer resolution', () => {
     const { adapter, subscribed } = makeAdapter();
     const svc = makeService(adapter);
     svc.seedSelf(selfKey, { displayName: 'Me', statusText: '' });
-    await svc.subscribeVisible([selfKey, ownerA]);
+    await svc.setBucket('community',[selfKey, ownerA]);
     expect(subscribed).toEqual([ownerA]);
     expect(subscribed).not.toContain(selfKey);
   });
@@ -141,8 +141,8 @@ describe('MemberCardService cross-peer resolution', () => {
     const { adapter } = makeAdapter();
     const svc = makeService(adapter);
     svc.seedSelf(ownerA, { displayName: 'MySelf', statusText: 'local' });
-    // ownerA is self here; subscribeVisible filters it, so no network card lands.
-    await svc.subscribeVisible([ownerA]);
+    // ownerA is self here; the union reconcile filters it, so no network card lands.
+    await svc.setBucket('community',[ownerA]);
     await svc.pollOnce();
     expect(svc.resolve(ownerA)).toEqual({ displayName: 'MySelf', statusText: 'local' });
   });
@@ -150,8 +150,8 @@ describe('MemberCardService cross-peer resolution', () => {
   it('unsubscribes departed owners on a narrowed visible set', async () => {
     const { adapter, unsubscribed } = makeAdapter();
     const svc = makeService(adapter);
-    await svc.subscribeVisible([ownerA]); // id 1
-    await svc.subscribeVisible([]); // ownerA departed
+    await svc.setBucket('community',[ownerA]); // id 1
+    await svc.setBucket('community',[]); // ownerA departed
     expect(unsubscribed).toEqual([1]);
   });
 
@@ -161,19 +161,19 @@ describe('MemberCardService cross-peer resolution', () => {
     const handle = () =>
       (svc as unknown as { pollHandle: ReturnType<typeof setInterval> | null })
         .pollHandle;
-    await svc.subscribeVisible([ownerA]);
+    await svc.setBucket('community',[ownerA]);
     expect(handle()).not.toBeNull(); // loop running while a sub is active
     // Narrow the visible set to empty (the member departed / was filtered) —
     // the diff-reconcile path, NOT unsubscribeAll. The 3s interval must stop
     // rather than keep firing over an empty subs map.
-    await svc.subscribeVisible([]);
+    await svc.setBucket('community',[]);
     expect(handle()).toBeNull();
   });
 
   it('unsubscribeAll cancels the poll loop and unsubscribes every active sub', async () => {
     const { adapter, unsubscribed } = makeAdapter();
     const svc = makeService(adapter);
-    await svc.subscribeVisible([ownerA, 'cc'.repeat(16)]); // ids 1, 2
+    await svc.setBucket('community',[ownerA, 'cc'.repeat(16)]); // ids 1, 2
     await svc.unsubscribeAll();
     expect(unsubscribed.sort()).toEqual([1, 2]);
   });
@@ -183,7 +183,7 @@ describe('MemberCardService cross-peer resolution', () => {
     try {
       const { adapter } = makeAdapter();
       const svc = makeService(adapter);
-      await svc.subscribeVisible([ownerA]);
+      await svc.setBucket('community',[ownerA]);
       // Advance past POLL_INTERVAL_MS (3000ms) and flush the async tick.
       await vi.advanceTimersByTimeAsync(3000);
       expect(svc.resolve(ownerA)).toEqual({ displayName: 'Alice', statusText: 'hi' });
@@ -219,7 +219,7 @@ describe('MemberCardService cross-peer resolution', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const svc = makeService(); // no adapter
-      await expect(svc.subscribeVisible([ownerA])).resolves.toBeUndefined();
+      await expect(svc.setBucket('community',[ownerA])).resolves.toBeUndefined();
       await expect(svc.pollOnce()).resolves.toBeUndefined();
       expect(svc.resolve(ownerA)).toBeUndefined();
     } finally {
@@ -227,14 +227,14 @@ describe('MemberCardService cross-peer resolution', () => {
     }
   });
 
-  it('serializes subscribeVisible / unsubscribeAll so a race orphans no backend subscription', async () => {
+  it('serializes setBucket / unsubscribeAll so a race orphans no backend subscription', async () => {
     const { adapter, createdIds, unsubscribed } = makeAdapter();
     const svc = makeService(adapter);
     // Simulate a community switch: a teardown (unsubscribeAll) and a
     // (re)subscribe fired concurrently — both are void/fire-and-forget at the
     // App.svelte call sites, so without serialization unsubscribeAll's
-    // subs.clear() could wipe an entry subscribeVisible just added.
-    await Promise.all([svc.subscribeVisible([ownerA]), svc.unsubscribeAll()]);
+    // subs.clear() could wipe an entry setBucket just added.
+    await Promise.all([svc.setBucket('community',[ownerA]), svc.unsubscribeAll()]);
     const tracked = new Set(
       (svc as unknown as { subs: Map<string, number> }).subs.values(),
     );
@@ -244,5 +244,77 @@ describe('MemberCardService cross-peer resolution', () => {
     for (const id of createdIds) {
       expect(tracked.has(id) || unsubscribed.includes(id)).toBe(true);
     }
+  });
+
+  // ---- ZEB-840: multi-source bucket union ----
+
+  const ownerB = 'cc'.repeat(16);
+  const ownerC = 'dd'.repeat(16);
+
+  /** The frontend-tracked subscription owner set (== union of all buckets). */
+  function subscribedOwners(svc: MemberCardService): Set<string> {
+    return new Set((svc as unknown as { subs: Map<string, number> }).subs.keys());
+  }
+
+  it('subscribes to the UNION of independent buckets', async () => {
+    const { adapter, subscribed } = makeAdapter();
+    const svc = makeService(adapter);
+    await svc.setBucket('community', [ownerA]);
+    await svc.setBucket('friends', [ownerB]);
+    expect(subscribedOwners(svc)).toEqual(new Set([ownerA, ownerB]));
+    expect([...subscribed].sort()).toEqual([ownerA, ownerB].sort());
+  });
+
+  it('setting one bucket never unsubscribes another bucket (the ZEB-840 clobber fix)', async () => {
+    const { adapter, unsubscribed } = makeAdapter();
+    const svc = makeService(adapter);
+    await svc.setBucket('community', [ownerA]);
+    // A voice-call roster reconcile arrives — under the OLD single-set model
+    // this replaced the whole set and unsubscribed ownerA. Buckets union instead.
+    await svc.setBucket('voice', [ownerB]);
+    expect(unsubscribed).toEqual([]); // ownerA still subscribed
+    expect(subscribedOwners(svc)).toEqual(new Set([ownerA, ownerB]));
+  });
+
+  it('clearing a bucket drains only its owners, keeping owners another bucket still wants', async () => {
+    const { adapter, unsubscribed } = makeAdapter();
+    const svc = makeService(adapter);
+    await svc.setBucket('community', [ownerA, ownerB]); // ids 1,2
+    await svc.setBucket('friends', [ownerB, ownerC]); // ownerB shared; ownerC new (id 3)
+    await svc.setBucket('community', []); // drop the community bucket entirely
+    // ownerA (community-only) unsubscribed; ownerB survives (friends still wants
+    // it); ownerC untouched.
+    expect(subscribedOwners(svc)).toEqual(new Set([ownerB, ownerC]));
+    expect(unsubscribed).toEqual([1]); // exactly ownerA's subscription id
+  });
+
+  it('an owner in two buckets holds one subscription and survives one bucket dropping it', async () => {
+    const { adapter, subscribed, unsubscribed } = makeAdapter();
+    const svc = makeService(adapter);
+    await svc.setBucket('community', [ownerA]);
+    await svc.setBucket('dm', [ownerA]); // same owner pinned via a second bucket
+    expect(subscribed).toEqual([ownerA]); // only ONE backend subscription created
+    await svc.setBucket('community', []); // dm still wants ownerA
+    expect(unsubscribed).toEqual([]);
+    expect(subscribedOwners(svc)).toEqual(new Set([ownerA]));
+  });
+
+  it('excludes self from the union across every bucket', async () => {
+    const { adapter, subscribed } = makeAdapter();
+    const svc = makeService(adapter);
+    svc.seedSelf(selfKey, { displayName: 'Me', statusText: '' });
+    await svc.setBucket('community', [ownerA, selfKey]);
+    await svc.setBucket('friends', [selfKey]);
+    expect(subscribed).toEqual([ownerA]);
+    expect(subscribedOwners(svc)).toEqual(new Set([ownerA]));
+  });
+
+  it('clearBucket is equivalent to setBucket(name, [])', async () => {
+    const { adapter, unsubscribed } = makeAdapter();
+    const svc = makeService(adapter);
+    await svc.setBucket('community', [ownerA]); // id 1
+    await svc.clearBucket('community');
+    expect(unsubscribed).toEqual([1]);
+    expect(subscribedOwners(svc).size).toBe(0);
   });
 });
