@@ -611,3 +611,62 @@ describe('Network Viz dev-flag gate (ZEB-659)', () => {
     expect(screen.getByRole('button', { name: /open network visualization/i })).toBeTruthy();
   });
 });
+
+describe('NavPanel — collapse persistence (ZEB-838)', () => {
+  const community: NavNode = {
+    id: 'c1',
+    parentId: null,
+    type: 'community',
+    name: 'Alpha',
+    expanded: true,
+    unreadCount: 0,
+    mentionCount: 0,
+    unreadLevel: 'none',
+  };
+  const channel: NavNode = {
+    id: 'c1-general',
+    parentId: 'c1',
+    type: 'channel',
+    channelKind: 'text',
+    name: 'chatroom',
+    expanded: false,
+    unreadCount: 0,
+    mentionCount: 0,
+    unreadLevel: 'none',
+  };
+
+  it('keeps a community collapsed after the nodes prop is rebuilt by a backend update', async () => {
+    // Regression: collapsing a community then receiving ANY backend update
+    // (e.g. a message from another client bumps unreadCount → navService
+    // rebuilds the nodes prop) used to re-expand every community, because the
+    // collapse lived only on NavPanel's local mirror, which `$effect.pre`
+    // re-hydrated from the service — where a community defaults to
+    // expanded:true — on the next `nodes` prop change.
+    const { rerender } = render(NavPanel, {
+      props: { nodes: [community, channel], collapsed: false },
+    });
+
+    // Community starts expanded → its channel child renders.
+    expect(screen.getByText('chatroom')).toBeTruthy();
+
+    // User collapses the community.
+    await fireEvent.click(screen.getByLabelText('Collapse community'));
+    expect(screen.queryByText('chatroom')).toBeNull();
+    expect(screen.getByLabelText('Expand community')).toBeTruthy();
+
+    // A backend update rebuilds the nodes prop: fresh node objects, the
+    // community still expanded:true (the service default it never learned to
+    // change), unread bumped as if a message just arrived on another client.
+    await rerender({
+      nodes: [
+        { ...community, unreadCount: 3, unreadLevel: 'quiet' },
+        { ...channel },
+      ],
+      collapsed: false,
+    });
+
+    // The user's collapse must survive the re-sync.
+    expect(screen.queryByText('chatroom')).toBeNull();
+    expect(screen.getByLabelText('Expand community')).toBeTruthy();
+  });
+});

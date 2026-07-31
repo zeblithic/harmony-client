@@ -178,36 +178,52 @@
     closeMenu();
   }
 
-  // Local mirror of the nodes prop: user interactions (toggle/display/sort)
-  // mutate navNodes directly, so we can't use $derived here. $effect.pre runs
-  // synchronously before the DOM commit, so navNodes is populated on first
-  // render and re-synced whenever the prop changes.
-  let navNodes = $state<NavNode[]>([]);
   let searchQuery = $state('');
 
-  $effect.pre(() => {
-    navNodes = [...nodes];
-  });
+  // ZEB-838: expand/collapse, display-mode, and sort-order are per-view UI state
+  // the user sets by clicking in the nav. The `nodes` prop is rebuilt from
+  // navService on EVERY backend update (a new message, unread bump, mention,
+  // channel sync, profile change…). The previous implementation held this state
+  // on a local `$state` mirror of the prop and re-synced it (`navNodes = [...nodes]`)
+  // on every prop change — which discarded the user's changes on the next update:
+  // every collapsed community sprang back open the instant any message arrived,
+  // because navService always re-seeds a community's `expanded` to its `true`
+  // default. Instead we keep the user's deviations as overrides keyed by node id
+  // and re-apply them after each re-sync, so they survive prop rebuilds. A
+  // brand-new node (no override) still shows the service-provided default.
+  type NavUiOverride = Partial<Pick<NavNode, 'expanded' | 'displayMode' | 'sortOrder'>>;
+  let uiOverrides = $state<Map<string, NavUiOverride>>(new Map());
 
-  /** Toggle a folder's expanded state. */
+  let navNodes = $derived(
+    uiOverrides.size === 0
+      ? nodes
+      : nodes.map((n) => {
+          const override = uiOverrides.get(n.id);
+          return override ? { ...n, ...override } : n;
+        }),
+  );
+
+  /** Record a per-view UI override (immutable reassign so `navNodes` re-derives). */
+  function setUiOverride(id: string, patch: NavUiOverride) {
+    const next = new Map(uiOverrides);
+    next.set(id, { ...next.get(id), ...patch });
+    uiOverrides = next;
+  }
+
+  /** Toggle a folder/community's expanded state. */
   function toggleFolder(id: string) {
-    navNodes = navNodes.map((n) =>
-      n.id === id ? { ...n, expanded: !n.expanded } : n
-    );
+    const current = navNodes.find((n) => n.id === id);
+    setUiOverride(id, { expanded: !(current?.expanded ?? false) });
   }
 
   /** Change a folder's display mode. */
   function changeDisplayMode(nodeId: string, mode: DisplayMode) {
-    navNodes = navNodes.map((n) =>
-      n.id === nodeId ? { ...n, displayMode: mode } : n
-    );
+    setUiOverride(nodeId, { displayMode: mode });
   }
 
   /** Change a folder's sort order. */
   function changeSortOrder(nodeId: string, order: SortOrder) {
-    navNodes = navNodes.map((n) =>
-      n.id === nodeId ? { ...n, sortOrder: order } : n
-    );
+    setUiOverride(nodeId, { sortOrder: order });
   }
 
   /** Open the network visualization in a second Tauri window. */
