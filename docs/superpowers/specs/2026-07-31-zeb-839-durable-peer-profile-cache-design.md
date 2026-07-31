@@ -93,7 +93,12 @@ Disk I/O: cards are infrequent (publish cadence is 600s + a boot burst, ZEB-568)
 
 ### 4.4 Boot load
 
-At `start_node` (`lib.rs:~4598-4620`), after constructing the fresh `ProfileCardCache`, construct the `PersistentCardStore` by loading the file (`load_or_default`) and wire it as the cache's write-through handle. The store is now populated with every previously-known peer *before any subscription exists*.
+At `start_node` (`lib.rs:~4598-4620`), after constructing the fresh `ProfileCardCache`, construct the `PersistentCardStore` by loading the file (`load_for_owner`) and wire it as the cache's write-through handle. The store is now populated with every previously-known peer *before any subscription exists*.
+
+**Load-failure taxonomy (self-heal vs preserve).** `load_for_owner` never fails node start, but it distinguishes *why* a load failed, because the two cases warrant opposite disk policies:
+
+- **Content corruption** (missing file is fine; bad CBOR / unknown schema byte / truncation) → the on-disk bytes are already unusable, so start empty and let the next flush **overwrite** them (self-heal).
+- **Read I/O error** (file present but its bytes could not be read this boot — a transient sharing violation, fd exhaustion, bad block) → those bytes may still be good last-known cards, so start empty for the session but **freeze disk writes** (`disk_write_frozen`): `persist` becomes a successful no-op so the existing file is preserved and re-read on the next clean start. Overwriting it with this session's empty-started, partial snapshot would permanently drop every offline peer's cached name — the exact regression this store exists to prevent (Greptile P1).
 
 ### 4.5 Fallback reads (owner-keyed)
 
@@ -139,7 +144,8 @@ Durably caching avatar **image bytes** so a known peer's picture renders while o
 ## 9. Testing strategy
 
 Backend (`cargo nextest`, `--features test-fixtures`):
-- `PersistentCardStore` unit: upsert newer-HLC-wins, older-ignored, load_or_default on missing/corrupt file, atomic-write survives a simulated crash mid-write, schema-version round-trip, LRU cap eviction.
+- `PersistentCardStore` unit: upsert newer-HLC-wins, older-ignored, `load_for_owner` starts empty on missing/corrupt file, atomic-write survives a simulated crash mid-write, schema-version round-trip, LRU cap eviction.
+- Load-failure taxonomy: a read I/O error at start freezes writes so a later flush preserves the existing file (Greptile P1), while content corruption self-heals (the next flush overwrites the junk).
 - Cache fallback: `get_cached` returns stored card when `slot.latest` is `None`; `display_names_by_owner` unions store for owners with no live slot; live sample overwrites store (write-through).
 - Per-identity isolation: two identities → two stores, no bleed (pins the ZEB-586 fix).
 - Boot: `start_node` loads a pre-seeded file; an offline peer's name is served with no subscription sample.

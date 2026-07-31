@@ -119,6 +119,17 @@ pub struct PersistentCardStore {
     /// current map under `inner` *after* taking this lock, so the last writer
     /// writes the newest snapshot — no regress.
     flush_lock: Mutex<()>,
+    /// When the on-disk file existed but could not be *read* at start (a
+    /// transient I/O error — sharing violation, fd exhaustion, bad block — not a
+    /// missing or content-corrupt file), we begin with an empty in-memory map
+    /// but must NOT overwrite the file: it may still hold last-known cards for
+    /// offline peers. Persisting a partial snapshot over it would permanently
+    /// drop them (ZEB-839 / Greptile P1). While set, `persist` is a no-op so the
+    /// existing bytes survive to be re-read on the next clean start. Set once at
+    /// construction, never mutated — content-corrupt files (bad CBOR / schema /
+    /// truncation) deliberately do NOT set this: their bytes are already
+    /// unusable, so a self-healing overwrite is correct.
+    disk_write_frozen: bool,
 }
 
 impl PersistentCardStore {
@@ -133,21 +144,45 @@ impl PersistentCardStore {
     /// refills from live broadcasts), so it must never fail node start.
     pub fn load_for_owner(app_data_dir: &Path, owner_id_hex: &str) -> Self {
         let path = Self::path_for_owner(app_data_dir, owner_id_hex);
-        let cards = match load_cards(&path) {
-            Ok(c) => c,
+        let (cards, disk_write_frozen) = match load_cards(&path) {
+            Ok(c) => (c, false),
             Err(e) => {
+                // Distinguish a *read* failure from *content* corruption. Within
+                // `load_cards`, `PersistError::Io` is produced only by the
+                // `std::fs::read` call — the file is (probably) present but its
+                // bytes could not be read this boot (a transient sharing
+                // violation, fd exhaustion, bad block, …). Those bytes may still
+                // be good last-known cards, so we start empty for the session but
+                // FREEZE writes to avoid clobbering them; they are re-read on the
+                // next clean start. Content errors (Corrupt / CborDecode /
+                // UnknownSchemaVersion) mean the on-disk bytes are already
+                // unusable → do NOT freeze, so the next flush self-heals the file.
+                let disk_write_frozen = matches!(e, PersistError::Io(_));
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
-                    "ZEB-839: profile-card store unreadable; starting empty (will refill from broadcasts)"
+                    preserve_existing_file = disk_write_frozen,
+                    "ZEB-839: profile-card store unreadable at start; starting empty (will refill from broadcasts)"
                 );
-                Vec::new()
+                (Vec::new(), disk_write_frozen)
             }
         };
-        Self::from_cards(path, DEFAULT_MAX_ENTRIES, cards)
+        Self::from_cards_with_freeze(path, DEFAULT_MAX_ENTRIES, cards, disk_write_frozen)
     }
 
+    /// Test-only convenience wrapper: construct an unfrozen store (production
+    /// callers go through `load_for_owner`, which decides the freeze flag).
+    #[cfg(test)]
     fn from_cards(path: PathBuf, max_entries: usize, cards: Vec<PersistedCard>) -> Self {
+        Self::from_cards_with_freeze(path, max_entries, cards, false)
+    }
+
+    fn from_cards_with_freeze(
+        path: PathBuf,
+        max_entries: usize,
+        cards: Vec<PersistedCard>,
+        disk_write_frozen: bool,
+    ) -> Self {
         let mut map = HashMap::with_capacity(cards.len());
         let mut next_seq = 0u64;
         for card in cards {
@@ -165,6 +200,7 @@ impl PersistentCardStore {
             max_entries,
             inner: Mutex::new(Inner { map, next_seq }),
             flush_lock: Mutex::new(()),
+            disk_write_frozen,
         }
     }
 
@@ -231,6 +267,17 @@ impl PersistentCardStore {
     /// I/O — call from a blocking context (`spawn_blocking`), never inline on
     /// the async executor.
     pub fn persist(&self) -> Result<(), PersistError> {
+        // If the file was unreadable at start it may still hold last-known cards
+        // (see `disk_write_frozen`). Overwriting it now with this session's
+        // (empty-started, partial) snapshot would permanently drop them, so a
+        // flush is a successful no-op: preserve the file for the next clean start.
+        if self.disk_write_frozen {
+            tracing::warn!(
+                path = %self.path.display(),
+                "ZEB-839: profile-card store flush skipped — file was unreadable at start; preserving existing cards for the next clean start rather than overwriting with a partial snapshot"
+            );
+            return Ok(());
+        }
         let _flush = self.flush_lock.lock().expect("card store flush poisoned");
         let bytes = {
             let inner = self.inner.lock().expect("card store poisoned");
@@ -409,6 +456,82 @@ mod tests {
         std::fs::write(&path, [CARD_STORE_SCHEMA_V1, 0xDE, 0xAD]).unwrap();
         let loaded = PersistentCardStore::load_for_owner(dir.path(), "owner");
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn frozen_store_preserves_existing_file_on_flush() {
+        // Greptile P1: when the store froze writes because the file was
+        // unreadable at start, a later flush must NOT overwrite the good on-disk
+        // cards with this session's partial in-memory snapshot. The existing
+        // entries survive intact for the next clean start.
+        let dir = tempfile::tempdir().unwrap();
+        let path = PersistentCardStore::path_for_owner(dir.path(), "owner");
+        // Seed a good file with three known peers.
+        let seed = PersistentCardStore::from_cards(path.clone(), DEFAULT_MAX_ENTRIES, vec![]);
+        seed.upsert(&card(1, "Alice", 10));
+        seed.upsert(&card(2, "Bob", 10));
+        seed.upsert(&card(3, "Carol", 10));
+        seed.persist().unwrap();
+
+        // A store that froze writes (as `load_for_owner` does on a read I/O
+        // error): empty in memory, pointed at the good file.
+        let frozen = PersistentCardStore::from_cards_with_freeze(
+            path.clone(),
+            DEFAULT_MAX_ENTRIES,
+            vec![],
+            true,
+        );
+        frozen.upsert(&card(9, "Mallory", 99)); // a fresh, partial sample this session
+        frozen.persist().unwrap(); // must be a successful no-op
+
+        // The good file is intact — all three original peers, none dropped, and
+        // the partial sample was NOT written over them.
+        let on_disk = load_cards(&path).unwrap();
+        let mut owners: Vec<u8> = on_disk.iter().map(|c| c.owner_id[0]).collect();
+        owners.sort_unstable();
+        assert_eq!(
+            owners,
+            vec![1, 2, 3],
+            "existing cards preserved; partial snapshot not written over them"
+        );
+    }
+
+    #[test]
+    fn read_io_error_freezes_but_content_corruption_self_heals() {
+        // The freeze applies ONLY to read I/O errors (file present, unreadable),
+        // never to content corruption (bad bytes → safe to self-heal/overwrite).
+        let dir = tempfile::tempdir().unwrap();
+
+        // (1) Read I/O error: a directory at the path makes std::fs::read fail
+        // with a non-NotFound error. `load_for_owner` must freeze — a subsequent
+        // flush is a successful no-op that leaves the path untouched. (Without
+        // the freeze, persist would call save_atomically and Err trying to
+        // rename a file over the directory, so `.unwrap()` here is load-bearing.)
+        let io_path = PersistentCardStore::path_for_owner(dir.path(), "ioerr");
+        std::fs::create_dir(&io_path).unwrap();
+        assert!(
+            matches!(load_cards(&io_path), Err(PersistError::Io(_))),
+            "a directory read must surface as a read I/O error, not NotFound"
+        );
+        let frozen = PersistentCardStore::load_for_owner(dir.path(), "ioerr");
+        assert!(frozen.is_empty(), "unreadable start begins empty");
+        frozen.upsert(&card(1, "Alice", 10));
+        frozen.persist().unwrap(); // no-op; would Err if it tried to write
+        assert!(io_path.is_dir(), "frozen flush left the path untouched");
+
+        // (2) Content corruption: `load_for_owner` must NOT freeze — the next
+        // flush overwrites the junk and durably records new cards (self-heal).
+        let ok_path = PersistentCardStore::path_for_owner(dir.path(), "corrupt");
+        std::fs::write(&ok_path, [CARD_STORE_SCHEMA_V1, 0xDE, 0xAD]).unwrap();
+        let healed = PersistentCardStore::load_for_owner(dir.path(), "corrupt");
+        healed.upsert(&card(2, "Bob", 10));
+        healed.persist().unwrap();
+        let on_disk = load_cards(&ok_path).unwrap();
+        assert_eq!(
+            on_disk.iter().map(|c| c.owner_id[0]).collect::<Vec<_>>(),
+            vec![2],
+            "corrupt file self-heals: the new card is durably written"
+        );
     }
 
     #[test]
