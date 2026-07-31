@@ -92,6 +92,7 @@
   import { ProfilePageResolver } from './lib/profile-page-resolver';
   import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation, FileGrant, ReceivedFile } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
+  import { resolveAuthorLabel } from './lib/mention-render';
   import { findNode, findNearestFolder, resolveChannelSelection } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
   import { onMount } from 'svelte';
@@ -479,7 +480,9 @@
           };
         },
         onRosterOwners: (ownerHexes: string[]) => {
-          void memberCardService.subscribeVisible(ownerHexes);
+          // ZEB-839: through the shared funnel so an open DM peer's pinned card
+          // subscription survives a call roster reconcile (see subscribeVisibleCards).
+          subscribeVisibleCards(ownerHexes);
         },
       });
       // ZEB-352: build the DM-call session from the same identity + adapter deps
@@ -525,7 +528,9 @@
         },
         resolveMembers: (spaceId: string) => getCachedGroupMembers(spaceId),
         onRosterOwners: (ownerHexes: string[]) => {
-          void memberCardService.subscribeVisible(ownerHexes);
+          // ZEB-839: through the shared funnel so an open DM peer's pinned card
+          // subscription survives a call roster reconcile (see subscribeVisibleCards).
+          subscribeVisibleCards(ownerHexes);
         },
       });
       // Clear the incoming-call banner whenever the call leaves the 'incoming'
@@ -684,11 +689,41 @@
 
   // ZEB-341 Task 8: lifecycle hooks threaded down to CommunityMembersPanel,
   // which knows the visible-member set. No-ops until the adapter wires up.
+  //
+  // ZEB-839: an open DM's peer belongs to no community roster, yet the DM
+  // bubbles + header resolve through the same card ladder — so that peer has to
+  // be merged into every reconcile here. `subscribeVisible` IS a reconciliation
+  // (it drops any owner absent from the list) and the members panel
+  // mounts/unmounts as the user moves between a community and a DM, so calling
+  // it with just the DM peer, or letting the panel's teardown run afterwards,
+  // would silently drop one or the other. Keeping the merge at this single
+  // call-site leaves MemberCardService's one-owner-of-the-sub-set contract intact.
+  let visibleCardOwners: string[] = [];
+  let dmCardOwner: string | null = null;
+  function reconcileCardSubscriptions() {
+    const owners =
+      dmCardOwner !== null && !visibleCardOwners.includes(dmCardOwner)
+        ? [...visibleCardOwners, dmCardOwner]
+        : visibleCardOwners;
+    void memberCardService.subscribeVisible(owners);
+  }
   function subscribeVisibleCards(ownerIdHexes: string[]) {
-    void memberCardService.subscribeVisible(ownerIdHexes);
+    visibleCardOwners = ownerIdHexes;
+    reconcileCardSubscriptions();
   }
   function unsubscribeCards() {
-    void memberCardService.unsubscribeAll();
+    // Reconciling to the empty set unsubscribes everything and stops the poll
+    // loop (subscribeVisibleImpl's else-branch) — same effect as the previous
+    // unsubscribeAll(), except a pinned DM peer survives the panel unmount.
+    visibleCardOwners = [];
+    reconcileCardSubscriptions();
+  }
+  /** ZEB-839: pin (or release) the open 1:1 DM peer's card subscription. */
+  function setDmCardOwner(ownerIdHex: string | null) {
+    const next = ownerIdHex?.toLowerCase() ?? null;
+    if (next === dmCardOwner) return;
+    dmCardOwner = next;
+    reconcileCardSubscriptions();
   }
 
   // ZEB-341: one-shot guard so the boot-time card re-publish fires at most
@@ -3775,12 +3810,33 @@
       : null
   );
 
+  // ZEB-839: the peer of the open 1:1 DM. Their profile card is what turns the
+  // DM bubbles + header from a hex prefix into a name, and nothing else
+  // subscribes them (community rosters cover community members only). Derived
+  // rather than set inside handleNodeClick so it also self-corrects when the
+  // nav node's `peer` attaches after the click (boot-race), and releases on
+  // every route away — community select, channel open, Notes, group DM.
+  let activeDmPeerOwner = $derived(
+    activeChannelType === 'dm' && !selectedCommunityId && !notesSelected
+      ? findNode(navNodes, activeChannel)?.peer?.address ?? null
+      : null,
+  );
+  $effect(() => {
+    setDmCardOwner(activeDmPeerOwner);
+  });
+
   // Collect known peers from messages and nav nodes (DMs)
   let knownPeers = $derived.by(() => {
     const peerMap = new Map(
       allMessages
         .filter((m) => m.sender.address !== 'self')
-        .map((m) => [m.sender.address, m.sender])
+        // ZEB-839: DM senders carry no baked name (message-service leaves the
+        // label to render time), so run the same ladder here — otherwise the
+        // Settings per-peer trust list shows a blank row for every DM peer.
+        .map((m) => [
+          m.sender.address,
+          { ...m.sender, displayName: resolveAuthorLabel(m.sender, resolveNickname, resolveCard) },
+        ])
     );
     for (const node of navNodes) {
       if (node.peer && !peerMap.has(node.peer.address)) {
@@ -4128,6 +4184,8 @@
         {pinnedThreadIds}
         onMessageDelete={requestDeleteMessage}
         ownAddress={messageService.ownAddress ?? ''}
+        {resolveCard}
+        {resolveNickname}
       />
     {/if}
   {/snippet}

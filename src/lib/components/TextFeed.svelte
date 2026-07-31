@@ -2,7 +2,9 @@
   import type { Message, MessagePriority } from '../types';
   import type { TrustService } from '../trust-service';
   import type { ThreadMetaEntry } from '../feed-utils';
+  import type { ResolvedCard } from '../member-card-service';
   import { groupMessages } from '../feed-utils';
+  import { resolveAuthorLabel } from '../mention-render';
   import TextMessage from './TextMessage.svelte';
   import CallEventLine from './CallEventLine.svelte';
   import QuietMessageGroup from './QuietMessageGroup.svelte';
@@ -43,6 +45,8 @@
     pinnedThreadIds = new Set(),
     onMessageDelete,
     ownAddress = '',
+    resolveNickname,
+    resolveCard,
   }: {
     messages: Message[];
     collapsed?: boolean;
@@ -94,6 +98,13 @@
      *  `isSelf` for each rendered TextMessage so the delete button is
      *  only shown on outgoing messages. */
     ownAddress?: string;
+    /** ZEB-839: local friend nickname for an owner_id — top rung of the author
+     *  ladder, threaded down to every TextMessage. DM senders carry no baked
+     *  name, so without these the feed can only render a truncated hex. */
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    /** ZEB-839: broadcast profile card for an owner_id — second rung of the
+     *  author ladder. Same pure-consumer contract as `resolveNickname`. */
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
 
   // Fallback invoke for the group-call banner when the parent doesn't thread one
@@ -150,7 +161,12 @@
     for (const [id, _meta] of threadMeta) {
       const rootMsg = messages.find(m => m.id === id);
       if (rootMsg) {
-        map.set(id, { sender: rootMsg.sender.displayName, text: rootMsg.text });
+        // ZEB-839: same render-time ladder as the bubbles — a baked
+        // `sender.displayName` is absent on DM authors.
+        map.set(id, {
+          sender: resolveAuthorLabel(rootMsg.sender, resolveNickname, resolveCard),
+          text: rootMsg.text,
+        });
       }
     }
     return map;
@@ -263,6 +279,8 @@
             {onScrollToMessage}
             isSelf={item.message.sender.address === 'self' || (ownAddress !== '' && item.message.sender.address === ownAddress)}
             onDelete={onMessageDelete}
+            {resolveNickname}
+            {resolveCard}
           />
           {/if}
           {#if threadMeta.has(item.message.id)}

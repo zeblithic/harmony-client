@@ -7,10 +7,12 @@ use crate::owner_state_crypto::{
     canonical_cbor_encode, sealed::CanonicalPayloadSealed, CanonicalPayload, CryptoError,
 };
 use crate::owner_state_types::Hlc;
+use crate::persistent_card_store::{PersistedCard, PersistentCardStore};
 use ed25519_dalek::{Signer, SigningKey};
 use harmony_owner::certs::EnrollmentCert;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Mutex;
 
 pub use crate::profile_broadcast::SubscriptionId;
@@ -285,9 +287,21 @@ struct CardSlot {
 #[derive(Default)]
 pub struct ProfileCardCache {
     slots: Mutex<HashMap<SubscriptionId, CardSlot>>,
+    /// ZEB-839: durable last-known-card store. Written through on every
+    /// verified newer card and consulted as a fallback when a live slot has
+    /// no card yet (offline peer / fresh restart). `None`/unset until
+    /// `set_store` runs at `start_node` (the cache is constructed before the
+    /// owner identity is guaranteed loaded).
+    store: OnceLock<Arc<PersistentCardStore>>,
 }
 
 impl ProfileCardCache {
+    /// ZEB-839: attach the durable card store. Idempotent — a second call is a
+    /// no-op (the store is owner-scoped and set once per node start).
+    pub fn set_store(&self, store: Arc<PersistentCardStore>) {
+        let _ = self.store.set(store);
+    }
+
     /// Register a subscription. Idempotent — a pre-existing entry for the
     /// same `sub` is left untouched (avoids evicting a cached card on re-register).
     pub async fn register(&self, sub: SubscriptionId, expected_owner: [u8; 16]) {
@@ -309,12 +323,16 @@ impl ProfileCardCache {
     /// - `card.owner_id` != the slot's expected owner (defense-in-depth), or
     /// - the card is not strictly newer than the cached entry (replay guard).
     pub async fn insert_verified(&self, sub: SubscriptionId, card: &ProfileCardBroadcast) {
-        let mut g = self.slots.lock().await;
-        if let Some(slot) = g.get_mut(&sub) {
+        let is_newer;
+        {
+            let mut g = self.slots.lock().await;
+            let Some(slot) = g.get_mut(&sub) else {
+                return;
+            };
             if card.owner_id != slot.expected_owner {
                 return;
             }
-            let is_newer = match &slot.latest {
+            is_newer = match &slot.latest {
                 Some(e) => card.shared_at.is_strictly_newer_than(&e.shared_at),
                 None => true,
             };
@@ -329,20 +347,51 @@ impl ProfileCardCache {
                 });
             }
         }
+        // ZEB-839 write-through: mirror the verified newer card into the durable
+        // store (owner-keyed, newer-HLC-wins) and flush off the async hot path.
+        // The store applies its own newer-wins check across ALL slots for this
+        // owner, so a stale sample from one slot can't clobber a newer one held
+        // under another slot.
+        if is_newer {
+            if let Some(store) = self.store.get() {
+                let persisted = PersistedCard::from_broadcast(card);
+                if store.upsert(&persisted) {
+                    let store = Arc::clone(store);
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = store.persist() {
+                            tracing::warn!(error = %e, "ZEB-839: profile-card store flush failed");
+                        }
+                    });
+                }
+            }
+        }
     }
 
     /// Snapshot the latest verified card for a subscription as the frontend DTO.
     pub async fn get_cached(&self, sub: SubscriptionId) -> Option<DiscoveredCardInfo> {
-        let g = self.slots.lock().await;
-        let slot = g.get(&sub)?;
-        let c = slot.latest.as_ref()?;
-        Some(DiscoveredCardInfo {
-            owner_id_hex: hex::encode(c.owner_id),
-            display_name: c.display_name.clone(),
-            status_text: c.status_text.clone(),
-            avatar_cid: c.avatar_cid.map(hex::encode),
-            profile_page_root: c.profile_page_root.map(hex::encode),
-        })
+        // Live slot first; fall back to the durable store by the slot's
+        // expected owner when no card has arrived yet (offline peer / fresh
+        // restart). A missing slot (never subscribed) has no owner to key on,
+        // so it stays `None`.
+        let expected_owner = {
+            let g = self.slots.lock().await;
+            let slot = g.get(&sub)?;
+            match slot.latest.as_ref() {
+                Some(c) => {
+                    return Some(DiscoveredCardInfo {
+                        owner_id_hex: hex::encode(c.owner_id),
+                        display_name: c.display_name.clone(),
+                        status_text: c.status_text.clone(),
+                        avatar_cid: c.avatar_cid.map(hex::encode),
+                        profile_page_root: c.profile_page_root.map(hex::encode),
+                    });
+                }
+                None => slot.expected_owner,
+            }
+        };
+        // ZEB-839 fallback: last-known verified card for this owner from disk.
+        let store = self.store.get()?;
+        store.get(&expected_owner).map(|c| c.to_discovered())
     }
 
     /// Map of `owner_id` → newest verified card's display name, across all
@@ -365,9 +414,18 @@ impl ProfileCardCache {
                 }
             }
         }
-        best.into_iter()
+        let mut result: std::collections::HashMap<[u8; 16], String> = best
+            .into_iter()
             .map(|(owner, c)| (owner, c.display_name.clone()))
-            .collect()
+            .collect();
+        // ZEB-839: union last-known names from the durable store for any owner
+        // not covered by a live slot (offline peers / fresh restart). Live wins.
+        if let Some(store) = self.store.get() {
+            for (owner, name) in store.display_names_by_owner() {
+                result.entry(owner).or_insert(name);
+            }
+        }
+        result
     }
 }
 
@@ -856,6 +914,215 @@ mod tests {
         // Unknown owner → absent from the map.
         let b = crate::community_membership::mint_test_owner(0x72);
         assert_eq!(names.get(&b.owner.0), None);
+    }
+
+    // ---- ZEB-839: durable-store fallback + write-through ----
+
+    fn seeded_store(
+        dir: &std::path::Path,
+        owner_hex: &str,
+        card: &ProfileCardBroadcast,
+    ) -> std::sync::Arc<crate::persistent_card_store::PersistentCardStore> {
+        let store = std::sync::Arc::new(
+            crate::persistent_card_store::PersistentCardStore::load_for_owner(dir, owner_hex),
+        );
+        store.upsert(&crate::persistent_card_store::PersistedCard::from_broadcast(card));
+        store
+    }
+
+    #[tokio::test]
+    async fn store_fallback_serves_last_known_when_slot_has_no_live_card() {
+        // The core offline/restart fix: a registered subscription with no live
+        // card resolves to the last-known card from the durable store.
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::community_membership::mint_test_owner(0x80);
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Offline Olly".into(),
+            "brb".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        let store = seeded_store(dir.path(), "owner80", &card);
+
+        let cache = ProfileCardCache::default();
+        cache.set_store(store);
+        cache.register(1, owner.owner.0).await; // subscribed, but peer is offline (no live card)
+        let got = cache
+            .get_cached(1)
+            .await
+            .expect("store fallback serves last-known");
+        assert_eq!(got.display_name, "Offline Olly");
+        assert_eq!(got.status_text, "brb");
+        assert_eq!(got.owner_id_hex, hex::encode(owner.owner.0));
+    }
+
+    #[tokio::test]
+    async fn store_fallback_absent_without_registered_slot() {
+        // No slot → no owner to key on → None even though the store has a card.
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::community_membership::mint_test_owner(0x81);
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Ghost".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        let store = seeded_store(dir.path(), "owner81", &card);
+        let cache = ProfileCardCache::default();
+        cache.set_store(store);
+        assert_eq!(cache.get_cached(999).await, None, "no slot -> no fallback");
+    }
+
+    #[tokio::test]
+    async fn live_card_wins_over_store_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::community_membership::mint_test_owner(0x82);
+        let stale = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Stale Name".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 5,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        let store = seeded_store(dir.path(), "owner82", &stale);
+        let cache = ProfileCardCache::default();
+        cache.set_store(store);
+        cache.register(1, owner.owner.0).await;
+        let live = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Live Name".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 10,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        cache.insert_verified(1, &live).await;
+        assert_eq!(cache.get_cached(1).await.unwrap().display_name, "Live Name");
+    }
+
+    #[tokio::test]
+    async fn insert_verified_writes_through_to_store() {
+        // A verified newer card is mirrored into the durable store's in-memory
+        // map synchronously (the disk flush is offloaded and not asserted here).
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::community_membership::mint_test_owner(0x83);
+        let store = std::sync::Arc::new(
+            crate::persistent_card_store::PersistentCardStore::load_for_owner(
+                dir.path(),
+                "owner83",
+            ),
+        );
+        let cache = ProfileCardCache::default();
+        cache.set_store(std::sync::Arc::clone(&store));
+        cache.register(1, owner.owner.0).await;
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Written".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 7,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        cache.insert_verified(1, &card).await;
+        assert_eq!(
+            store.get(&owner.owner.0).unwrap().display_name,
+            "Written",
+            "write-through populated the durable store"
+        );
+    }
+
+    #[tokio::test]
+    async fn display_names_by_owner_unions_store_for_offline_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let offline = crate::community_membership::mint_test_owner(0x84);
+        let offcard = sign_card(
+            &offline.device_key,
+            offline.owner.0,
+            "Offline".into(),
+            "".into(),
+            None,
+            None,
+            offline.cert.clone(),
+            Hlc {
+                wall_ms: 3,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        let store = seeded_store(dir.path(), "ownerX", &offcard);
+        let cache = ProfileCardCache::default();
+        cache.set_store(store);
+        // A different owner known live.
+        let live = crate::community_membership::mint_test_owner(0x85);
+        cache.register(1, live.owner.0).await;
+        let livecard = sign_card(
+            &live.device_key,
+            live.owner.0,
+            "LiveOne".into(),
+            "".into(),
+            None,
+            None,
+            live.cert.clone(),
+            Hlc {
+                wall_ms: 3,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        cache.insert_verified(1, &livecard).await;
+        let names = cache.display_names_by_owner().await;
+        assert_eq!(
+            names.get(&live.owner.0),
+            Some(&"LiveOne".to_string()),
+            "live owner present"
+        );
+        assert_eq!(
+            names.get(&offline.owner.0),
+            Some(&"Offline".to_string()),
+            "offline owner unioned from the durable store"
+        );
     }
 
     #[test]

@@ -31,6 +31,50 @@ export interface NavUpdatedPayload {
 }
 
 /**
+ * ZEB-839 — does `name` look like a raw-address placeholder rather than a name
+ * a human would recognise?
+ *
+ * The backend has no profile for a DM peer when it mints the Space, so every
+ * DM-kind `nav-updated` / `list_owner_dm_spaces` row carries a stand-in built
+ * from the raw owner hex (`"DM with <ownerHex>"` — `lib.rs:64329`,
+ * `dm_outbox.rs:2556`), and the comment at the emit site says outright that
+ * "the frontend replaces it with the resolved peer profile name". Cold-replay
+ * of those rows must therefore not overwrite a name we already resolved.
+ *
+ * Matches: empty/whitespace; the address itself; any name CONTAINING the
+ * address (the `"DM with <hex>"` shape); and any name containing a hex run of
+ * ≥6 chars that prefixes the address (the truncated-hex idiom used across the
+ * UI). A real display name reaching those last two would have to be a long hex
+ * prefix of this specific peer's owner_id.
+ */
+function isAddressPlaceholder(name: string, address?: string): boolean {
+  const trimmed = name.trim();
+  if (trimmed === '') return true;
+  if (!address) return false;
+  const lower = trimmed.toLowerCase();
+  const addr = address.toLowerCase();
+  if (lower.includes(addr)) return true;
+  return (lower.match(/[0-9a-f]{6,}/g) ?? []).some((run) => addr.startsWith(run));
+}
+
+/** ZEB-839 — the name to render for a dm/group-dm node. Live peer profile wins;
+ *  then the incoming payload name, unless it is a raw-address placeholder and
+ *  we already hold a resolved one; hex placeholder only as the last resort. */
+function resolveSpaceName(
+  payloadName: string,
+  existingName: string | undefined,
+  profileName: string | undefined,
+  peerAddress: string | undefined,
+): string {
+  if (profileName !== undefined && profileName.trim() !== '') return profileName;
+  if (!isAddressPlaceholder(payloadName, peerAddress)) return payloadName;
+  if (existingName !== undefined && !isAddressPlaceholder(existingName, peerAddress)) {
+    return existingName;
+  }
+  return payloadName;
+}
+
+/**
  * Manages navigation tree state and peer profile lookups.
  *
  * Seeds with mock data on construction. When connected via Tauri adapter,
@@ -307,18 +351,37 @@ export class NavService {
         peerAddress = members[0];
       }
     }
-    const peerProfile = peerAddress ? this.profiles.get(peerAddress) : undefined;
+    // ZEB-839: the laddered name goes on `node.name` — the field the sidebar row
+    // (NavNodeRow) and the DM header (via App.svelte's activeChannelName)
+    // actually render. It used to land only on `node.peer.displayName`, which
+    // only the Avatar reads, so the row kept showing the backend's raw-hex
+    // placeholder even with a resolved profile in hand. `existing` is resolved
+    // up front because the ladder's third rung is the name we already hold.
+    const existing = this.nodes.find((n) => n.id === spaceId);
+    // A name-only re-emit carries no `members`, so `peerAddress` is undefined on
+    // that path — fall back to the peer we already hold so both the profile rung
+    // and the placeholder guard still apply. (`peer` below is deliberately NOT
+    // built from this: whether to keep the cached peer is the modified/Fix-G
+    // contract, unchanged here.)
+    const namePeerAddress = peerAddress ?? existing?.peer?.address;
+    const peerProfile = namePeerAddress ? this.profiles.get(namePeerAddress) : undefined;
+    const resolvedName = resolveSpaceName(
+      name,
+      existing?.name,
+      peerProfile?.displayName,
+      namePeerAddress,
+    );
     const peer = peerAddress
       ? {
           address: peerAddress,
-          displayName: peerProfile?.displayName ?? name,
+          displayName: resolvedName,
           avatarUrl: peerProfile?.avatarUrl,
         }
       : undefined;
     const newNode: NavNode = {
       id: spaceId,
       type: navType,
-      name,
+      name: resolvedName,
       parentId: parentId ?? null,
       expanded: false,
       unreadCount: 0,
@@ -335,7 +398,6 @@ export class NavService {
       // the replayed payload omits members (mirrors what the modified
       // path already does — without this, a name-only re-emit would
       // drop displayName/avatarUrl back to undefined).
-      const existing = this.nodes.find((n) => n.id === spaceId);
       if (existing) {
         const peerWasDerivedFromPayload = members !== undefined;
         const merged: NavNode = {
@@ -358,12 +420,16 @@ export class NavService {
       // payload omits `members` (name-only update); only overwrite peer
       // when the new payload actually carried member info we could
       // derive a fresh peer from.
+      //
+      // ZEB-839: `resolvedName` (not the raw payload `name`) — a re-sync
+      // carrying the backend's raw-address placeholder must not clobber a name
+      // the `profile-update` handler already resolved.
       const peerWasDerivedFromPayload = members !== undefined;
       let found = false;
       this.nodes = this.nodes.map((n) => {
         if (n.id !== spaceId) return n;
         found = true;
-        return { ...n, name, peer: peerWasDerivedFromPayload ? peer : n.peer };
+        return { ...n, name: resolvedName, peer: peerWasDerivedFromPayload ? peer : n.peer };
       });
       if (!found) {
         // Modified for an unknown spaceId — treat as added to stay

@@ -1,10 +1,12 @@
 <script lang="ts">
   import type { Message } from '../types';
+  import type { ResolvedCard } from '../member-card-service';
   import { TrustService } from '../trust-service';
+  import { resolveAuthorLabel } from '../mention-render';
   import { sanitizeHref } from '../url-sanitize';
   import Avatar from './Avatar.svelte';
 
-  let { message, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0, allMessages = [], onScrollToMessage, isSelf = false, onDelete }: {
+  let { message, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0, allMessages = [], onScrollToMessage, isSelf = false, onDelete, resolveNickname, resolveCard }: {
     message: Message;
     collapsed?: boolean;
     onMediaClick?: (mediaId: string) => void;
@@ -21,6 +23,13 @@
      *  parent is responsible for the ConfirmDialog + delete_outbox_entry
      *  IPC call; this component only surfaces the request. */
     onDelete?: (messageId: string) => void;
+    /** ZEB-839: local friend nickname for an owner_id — top rung of the author
+     *  ladder. Pure consumer; the parent owns the reactivity seam (App.svelte
+     *  bumps a $state version so these reads re-run when a nickname changes). */
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    /** ZEB-839: broadcast profile card for an owner_id — second rung of the
+     *  author ladder. Same pure-consumer contract as `resolveNickname`. */
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
 
   // ZEB-228 Phase 4: re-evaluate `canDelete` every 5s so the button
@@ -67,6 +76,17 @@
     parentMessage ? parentMessage.text.slice(0, 50) + (parentMessage.text.length > 50 ? '...' : '') : ''
   );
 
+  // ZEB-839: resolve the author at RENDER time through the shared ladder
+  // (nickname ► profile card ► wire name ► short hex), mirroring
+  // ChannelMessageFeed.authorLabel. DM senders carry no baked name, so this is
+  // the only thing standing between a DM bubble and a raw hex prefix — and
+  // because it reads the resolvers on every render, the label fills in live
+  // the moment the peer's card arrives.
+  let authorLabel = $derived(resolveAuthorLabel(message.sender, resolveNickname, resolveCard));
+  let parentAuthorLabel = $derived(
+    parentMessage ? resolveAuthorLabel(parentMessage.sender, resolveNickname, resolveCard) : ''
+  );
+
   function isBlocked(attachment: import('../types').MediaAttachment): boolean {
     void trustVersion;
     if (!TrustService.isGated(attachment)) return false;
@@ -80,14 +100,14 @@
 <div class="text-message" class:loud={message.priority === 'loud'} id="msg-{message.id}">
   <Avatar
     address={message.sender.address}
-    displayName={message.sender.displayName}
+    displayName={authorLabel}
     avatarUrl={message.sender.avatarUrl}
     size={24}
     onclick={onAvatarClick ? (e) => onAvatarClick(message.sender.address, e) : undefined}
   />
   <div class="message-content">
     <div class="message-header">
-      <span class="sender-name">{message.sender.displayName}</span>
+      <span class="sender-name">{authorLabel}</span>
       <span class="timestamp">{timeStr}</span>
       {#if canDelete}
         <button
@@ -104,10 +124,10 @@
       <button
         class="reply-to-header"
         onclick={() => onScrollToMessage?.(parentMessage.id)}
-        aria-label="In reply to {parentMessage.sender.displayName}: {parentPreview}"
+        aria-label="In reply to {parentAuthorLabel}: {parentPreview}"
       >
         <span class="reply-to-icon">↩</span>
-        <span class="reply-to-sender">{parentMessage.sender.displayName}</span>
+        <span class="reply-to-sender">{parentAuthorLabel}</span>
         <span class="reply-to-text">{parentPreview}</span>
       </button>
     {/if}

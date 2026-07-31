@@ -240,6 +240,7 @@ pub mod owner_trust_sync;
 pub mod pairing;
 pub mod pairing_commands;
 pub mod pending_dm_invites;
+pub mod persistent_card_store;
 pub mod pkarr_community_publisher;
 pub mod pkarr_friend_publisher;
 pub mod pkarr_identity_publisher;
@@ -11651,6 +11652,21 @@ pub async fn start_node_inner(
         let node_addr_for_state = node_addr.clone();
         // ZEB-669 S2: the engine tick's planner `me`.
         let own_owner_addr_for_loop = node_addr.clone();
+        // ZEB-839: attach the durable last-known peer-card store to the profile
+        // card cache, scoped to THIS owner's id so a later identity on the same
+        // profile can't inherit it (the ZEB-586 cross-identity lesson). The
+        // cache was built earlier (before the owner identity was guaranteed
+        // loaded), so we set the store here now that `node_addr` is known.
+        // Best-effort: a corrupt/missing file starts empty and refills from
+        // live broadcasts — never blocks node start.
+        if !node_addr.is_empty() {
+            profile_card_cache_arc.set_store(std::sync::Arc::new(
+                crate::persistent_card_store::PersistentCardStore::load_for_owner(
+                    &app_data_dir,
+                    &node_addr,
+                ),
+            ));
+        }
         // ZEB-679: storage-record v2 admission consults the same revoked-
         // device projection the DM/friend/PEX cutoffs use.
         let revoked_projection_for_loop = revoked_device_projection.clone();
