@@ -4,14 +4,21 @@ Common issues testers may hit on `harmony-client`. If your problem isn't covered
 
 ## Install + first-launch
 
-### Gatekeeper warns "Harmony cannot be opened" (macOS)
+### Gatekeeper blocks Harmony on first launch (macOS)
 
-The binary is unsigned (a deliberate, permanent choice — see [`install-macos.md`](install-macos.md)). macOS Gatekeeper blocks unsigned `.app` bundles on first launch:
+The binary is unsigned (a deliberate, permanent choice — see [`install-macos.md`](install-macos.md)). On first launch macOS Gatekeeper shows **one of two messages**:
 
-1. Open **System Settings → Privacy & Security**.
-2. Scroll to the **Security** section.
-3. Find the "Harmony was blocked..." message.
-4. Click **Open Anyway** and confirm with your password.
+**"Harmony is damaged and can't be opened. You should move it to the Trash."**
+The app is **not** damaged — this is just how recent macOS (especially Apple Silicon) labels an unsigned, freshly-downloaded app. **Don't trash it.** Clear the quarantine flag in Terminal, then launch normally:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Harmony.app
+```
+
+Right-click → **Open** does *not* clear this one — only the command above does.
+
+**"Harmony can't be opened because Apple cannot check it for malicious software."**
+Open **System Settings → Privacy & Security**, scroll to the "Harmony was blocked…" message, and click **Open Anyway** (or right-click the app in Applications → **Open**).
 
 Subsequent launches don't re-prompt. See [`install-macos.md`](install-macos.md) for the full Gatekeeper walkthrough.
 
