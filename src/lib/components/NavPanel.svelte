@@ -11,6 +11,7 @@
   import IdentityChip from './IdentityChip.svelte';
   import ConnectionStatusChip from './ConnectionStatusChip.svelte';
   import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
+  import { untrack } from 'svelte';
 
   let {
     nodes,
@@ -209,6 +210,32 @@
     next.set(id, { ...next.get(id), ...patch });
     uiOverrides = next;
   }
+
+  // ZEB-838 (Qodo #573): prune overrides for nodes that no longer exist — a
+  // community the user left, a removed DM. Without this the Map would grow
+  // unbounded over a long session, and re-adding the same id (rejoining a
+  // community) would inherit a stale override instead of the service default.
+  // `untrack` keeps this effect keyed on `nodes` only, so its own write to
+  // `uiOverrides` can't re-trigger it.
+  $effect(() => {
+    const liveIds = new Set(nodes.map((n) => n.id));
+    untrack(() => {
+      if (uiOverrides.size === 0) return;
+      let hasStale = false;
+      for (const id of uiOverrides.keys()) {
+        if (!liveIds.has(id)) {
+          hasStale = true;
+          break;
+        }
+      }
+      if (!hasStale) return;
+      const pruned = new Map<string, NavUiOverride>();
+      for (const [id, override] of uiOverrides) {
+        if (liveIds.has(id)) pruned.set(id, override);
+      }
+      uiOverrides = pruned;
+    });
+  });
 
   /** Toggle a folder/community's expanded state. */
   function toggleFolder(id: string) {
