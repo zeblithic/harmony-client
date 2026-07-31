@@ -51,3 +51,36 @@ export function resolveMentionLabel(
     ownerId.slice(0, 8)
   );
 }
+
+/** Sentinel `Peer.address` for locally-authored messages (`message-service`
+ *  maps the self echo onto it). It is NOT an owner_id, so it must never enter
+ *  the resolution ladder — `'self'.slice(0, 8)` would render as "self". */
+const SELF_ADDRESS = 'self';
+
+/**
+ * ZEB-839 — the author-label ladder for a feed `Message.sender`.
+ *
+ * Same ordering as {@link resolveMentionLabel} (nickname ► broadcast
+ * profile-card name ► short hex) with two message-specific rungs: the `self`
+ * sentinel short-circuits to the locally-known label, and a wire-supplied
+ * `senderName` (channel messages carry one; DMs do not) sits just above the
+ * hex fallback.
+ *
+ * Call this at RENDER time, never at message-arrival time — that is what lets
+ * the label fill in as cards and nicknames arrive. DM authors deliberately
+ * carry no baked name (`message-service.ts`), so an unresolved DM peer lands
+ * on the hex rung here rather than being frozen there at ingest.
+ */
+export function resolveAuthorLabel(
+  sender: { address: string; displayName: string },
+  resolveNickname?: (id: string) => string | undefined,
+  resolveCard?: (id: string) => { displayName: string } | undefined,
+): string {
+  if (sender.address === SELF_ADDRESS) return sender.displayName;
+  return (
+    nonEmpty(resolveNickname?.(sender.address)) ??
+    nonEmpty(resolveCard?.(sender.address)?.displayName) ??
+    nonEmpty(sender.displayName) ??
+    sender.address.slice(0, 8)
+  );
+}

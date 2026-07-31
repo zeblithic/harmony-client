@@ -1110,3 +1110,53 @@ describe('MessageService call-event ingestion (ZEB-357)', () => {
     expect(self.text).toBe('Call — no answer');
   });
 });
+
+// ── ZEB-839: DM authors carry the RAW owner_id and no baked name ─────
+//
+// The DM ingest paths used to stamp `from.slice(0, 8)` into the sender's
+// displayName once, at arrival, and never revisit it — so a DM bubble showed
+// raw hex forever, even when the peer's name was known everywhere else in the
+// app. Both paths now leave the label to render time (`resolveAuthorLabel`,
+// which falls back to the same short hex when nothing resolves).
+describe('MessageService — ZEB-839: DM sender carries no baked name', () => {
+  let svc: MessageService;
+
+  beforeEach(() => {
+    svc = new MessageService();
+  });
+
+  function hexEncode(s: string): string {
+    return Array.from(new TextEncoder().encode(s))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  const PEER = '2e9a2151'.repeat(4);
+
+  it('dm-received: raw owner_id on `address`, empty displayName', async () => {
+    const { adapter, emit } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    emit('dm-received', {
+      spaceId: 'space-1', messageCid: 'dm-1', from: PEER,
+      sentAt: 1, receivedAt: 2, body: hexEncode('hi'), mimeType: 'text/plain',
+    });
+    const msg = svc.messages.find((m) => m.id === 'dm-1')!;
+    expect(msg.sender.address).toBe(PEER);
+    expect(msg.sender.displayName).toBe('');
+  });
+
+  it('loadDmThread scrollback: raw owner_id on `address`, empty displayName', async () => {
+    const { adapter } = createMockAdapter();
+    await svc.connectAdapter(adapter);
+    (adapter.invoke as ReturnType<typeof vi.fn>).mockResolvedValue([
+      {
+        messageCid: 'sb-1', from: PEER, sentAt: 1, receivedAt: 2, cursor: 'c1',
+        body: hexEncode('history'), mimeType: 'text/plain', isSelfOutbound: false,
+      },
+    ]);
+    await svc.loadDmThread('space-1');
+    const msg = svc.messages.find((m) => m.id === 'sb-1')!;
+    expect(msg.sender.address).toBe(PEER);
+    expect(msg.sender.displayName).toBe('');
+  });
+});

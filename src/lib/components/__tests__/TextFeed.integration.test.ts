@@ -378,3 +378,130 @@ describe('TextFeed Integration', () => {
     expect(screen.getByTestId('call-event-line').textContent).toContain('Call — no answer');
   });
 });
+
+// ── 10. DM author resolution (ZEB-839) ──────────────────────────────
+//
+// `message-service` used to bake `from.slice(0, 8)` into a DM sender's
+// displayName once, at message-arrival time, so a DM bubble showed raw hex
+// forever — even when the peer's name was already known in the community view.
+// DM senders now carry the RAW owner_id and an empty name, and the feed runs
+// the shared ladder (friend nickname ► profile card ► wire name ► short hex)
+// on every render. Mirrors ChannelMessageFeed's ZEB-432 author tests.
+describe('TextFeed DM author resolution (ZEB-839)', () => {
+  const PEER = '2e9a2151'.repeat(4); // 32-char lowercase owner_id hex
+
+  /** A DM as message-service now produces it: raw owner_id, no baked name. */
+  const dmFromPeer = msg({
+    id: 'dm-1',
+    sender: { address: PEER, displayName: '' },
+    text: 'hey there',
+    timestamp: base,
+  });
+
+  function renderDm(overrides: Record<string, unknown> = {}) {
+    return renderFeed({
+      channelType: 'dm',
+      channelName: 'DM',
+      messages: [dmFromPeer],
+      threadMeta: new Map(),
+      ...overrides,
+    });
+  }
+
+  it('renders the profile-card name for a DM author', () => {
+    renderDm({
+      resolveCard: (id: string) =>
+        id === PEER ? { displayName: 'Alice', statusText: '' } : undefined,
+    });
+    expect(screen.getByText('Alice')).toBeTruthy();
+    expect(screen.queryByText(PEER.slice(0, 8))).toBeNull();
+  });
+
+  it('prefers the local friend nickname over the profile-card name', () => {
+    renderDm({
+      resolveCard: (id: string) =>
+        id === PEER ? { displayName: 'Alice', statusText: '' } : undefined,
+      resolveNickname: (id: string) => (id === PEER ? 'Ali' : undefined),
+    });
+    expect(screen.getByText('Ali')).toBeTruthy();
+    expect(screen.queryByText('Alice')).toBeNull();
+  });
+
+  it('falls back to truncated hex only when nothing resolves', () => {
+    renderDm({ resolveCard: () => undefined, resolveNickname: () => undefined });
+    expect(screen.getByText(PEER.slice(0, 8))).toBeTruthy();
+  });
+
+  it('falls back to truncated hex when the card resolves to a blank name', () => {
+    renderDm({
+      resolveCard: (id: string) =>
+        id === PEER ? { displayName: '   ', statusText: '' } : undefined,
+    });
+    expect(screen.getByText(PEER.slice(0, 8))).toBeTruthy();
+  });
+
+  // The regression this ticket exists for: resolution must happen at RENDER
+  // time, so a card arriving after the message repaints the label. With the
+  // old baked name the bubble stayed hex no matter what arrived later.
+  it('repaints the author label when the peer card arrives later', async () => {
+    const { rerender } = renderDm({ resolveCard: () => undefined });
+    expect(screen.getByText(PEER.slice(0, 8))).toBeTruthy();
+
+    await rerender({
+      resolveCard: (id: string) =>
+        id === PEER ? { displayName: 'Alice', statusText: '' } : undefined,
+    });
+
+    expect(screen.getByText('Alice')).toBeTruthy();
+    expect(screen.queryByText(PEER.slice(0, 8))).toBeNull();
+  });
+
+  it('leaves a self-authored DM on the locally-known label', () => {
+    renderDm({
+      messages: [
+        msg({
+          id: 'dm-self',
+          sender: { address: 'self', displayName: 'Jake Englund' },
+          text: 'mine',
+          timestamp: base,
+        }),
+      ],
+      resolveCard: () => ({ displayName: 'should-not-be-used', statusText: '' }),
+      resolveNickname: () => 'nope',
+    });
+    expect(screen.getByText('Jake Englund')).toBeTruthy();
+  });
+
+  // A channel message carries a self-declared `senderName` on the wire; it sits
+  // BELOW the card so a verified card name wins, but above the hex fallback.
+  it('uses the wire senderName when no nickname or card resolves', () => {
+    renderDm({
+      messages: [
+        msg({
+          id: 'wire-1',
+          sender: { address: PEER, displayName: 'WireName' },
+          text: 'from a channel',
+          timestamp: base,
+        }),
+      ],
+    });
+    expect(screen.getByText('WireName')).toBeTruthy();
+  });
+
+  it('a verified card name outranks the wire senderName', () => {
+    renderDm({
+      messages: [
+        msg({
+          id: 'wire-2',
+          sender: { address: PEER, displayName: 'WireName' },
+          text: 'from a channel',
+          timestamp: base,
+        }),
+      ],
+      resolveCard: (id: string) =>
+        id === PEER ? { displayName: 'Carded', statusText: '' } : undefined,
+    });
+    expect(screen.getByText('Carded')).toBeTruthy();
+    expect(screen.queryByText('WireName')).toBeNull();
+  });
+});

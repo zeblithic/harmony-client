@@ -1203,3 +1203,180 @@ describe('NavService — DM unread + space-change hook (ZEB-666)', () => {
     expect(events).toEqual([]);
   });
 });
+
+// ── ZEB-839: DM nav-row name resolution ─────────────────────────────
+//
+// Two defects, one symptom (a DM row / DM header showing raw hex):
+//   1. the laddered peer name was computed but stored ONLY on
+//      `node.peer.displayName` — a field only the Avatar reads — while the
+//      rendered field (`node.name`, NavNodeRow + the DM header) kept the
+//      backend's placeholder;
+//   2. every `nav-updated` re-sync overwrote `node.name` unconditionally, so a
+//      cold-replay of `list_owner_dm_spaces` discarded a name `profile-update`
+//      had already resolved.
+//
+// The backend has no profile for a DM peer when it mints the Space, so its
+// payload name is a stand-in built from the raw owner hex — `"DM with <hex>"`
+// (lib.rs:64329 / dm_outbox.rs:2556, whose own comment says "the frontend
+// replaces it with the resolved peer profile name").
+describe('NavService DM name resolution (ZEB-839)', () => {
+  const PEER = '2e9a2151'.repeat(4); // 32-char lowercase owner_id hex
+  const SELF = 'ff'.repeat(16);
+  const PLACEHOLDER = `DM with ${PEER}`;
+
+  let nav: NavService;
+
+  beforeEach(() => {
+    nav = new NavService({ seedMockData: false });
+    nav.ownAddress = SELF;
+  });
+
+  afterEach(() => {
+    nav.destroy();
+  });
+
+  function addDm(name: string, action: 'added' | 'modified' = 'added') {
+    nav.addOrUpdateNavSpace({
+      action,
+      spaceId: 'dm-space',
+      kind: 'dm',
+      name,
+      members: [PEER, SELF],
+      parentId: null,
+    });
+  }
+
+  function node() {
+    return nav.nodes.find((n) => n.id === 'dm-space');
+  }
+
+  it('routes the laddered peer name to node.name, not only to peer.displayName', () => {
+    nav.profiles.set(PEER, { address: PEER, displayName: 'Alice' });
+    addDm(PLACEHOLDER);
+    expect(node()?.name).toBe('Alice');
+    expect(node()?.peer?.displayName).toBe('Alice');
+  });
+
+  it('keeps the payload placeholder when the peer is truly unknown', () => {
+    addDm(PLACEHOLDER);
+    expect(node()?.name).toBe(PLACEHOLDER);
+  });
+
+  it('profile-update remains the live-refresh path for node.name', async () => {
+    const mock = createMockAdapter();
+    await nav.connectAdapter(mock.adapter);
+    addDm(PLACEHOLDER);
+    expect(node()?.name).toBe(PLACEHOLDER);
+
+    mock.emit('profile-update', { address: PEER, displayName: 'Alice', statusText: '' });
+
+    expect(node()?.name).toBe('Alice');
+    expect(node()?.peer?.displayName).toBe('Alice');
+  });
+
+  it('a duplicate added carrying the raw-address placeholder does NOT clobber a resolved name', async () => {
+    const mock = createMockAdapter();
+    await nav.connectAdapter(mock.adapter);
+    addDm(PLACEHOLDER);
+    mock.emit('profile-update', { address: PEER, displayName: 'Alice', statusText: '' });
+    expect(node()?.name).toBe('Alice');
+
+    // Cold replay of list_owner_dm_spaces re-emits the backend placeholder.
+    addDm(PLACEHOLDER);
+
+    expect(node()?.name).toBe('Alice');
+    expect(node()?.peer?.displayName).toBe('Alice');
+  });
+
+  it('a modified carrying the raw-address placeholder does NOT clobber a resolved name', async () => {
+    const mock = createMockAdapter();
+    await nav.connectAdapter(mock.adapter);
+    addDm(PLACEHOLDER);
+    mock.emit('profile-update', { address: PEER, displayName: 'Alice', statusText: '' });
+
+    addDm(PLACEHOLDER, 'modified');
+
+    expect(node()?.name).toBe('Alice');
+  });
+
+  // The guard must also hold on a name-only re-emit, where the payload carries
+  // no `members` and the peer address is only reachable through the cached node.
+  it('a members-less modified with a placeholder name does NOT clobber a resolved name', async () => {
+    const mock = createMockAdapter();
+    await nav.connectAdapter(mock.adapter);
+    addDm(PLACEHOLDER);
+    mock.emit('profile-update', { address: PEER, displayName: 'Alice', statusText: '' });
+
+    nav.addOrUpdateNavSpace({
+      action: 'modified',
+      spaceId: 'dm-space',
+      kind: 'dm',
+      name: PLACEHOLDER,
+    });
+
+    expect(node()?.name).toBe('Alice');
+  });
+
+  it('recognises a truncated-hex placeholder, not just the full address', () => {
+    nav.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'dm-space',
+      kind: 'dm',
+      name: 'Alice',
+      members: [PEER, SELF],
+      parentId: null,
+    });
+    expect(node()?.name).toBe('Alice');
+
+    // The truncated-hex idiom used elsewhere in the UI (`ownerId.slice(0, 8)`).
+    addDm(PEER.slice(0, 8), 'modified');
+
+    expect(node()?.name).toBe('Alice');
+  });
+
+  it('a real rename still applies (the guard only blocks placeholders)', () => {
+    addDm(PLACEHOLDER);
+    addDm('Alice (work)', 'modified');
+    expect(node()?.name).toBe('Alice (work)');
+  });
+
+  it('an empty name does not clobber a group-DM name', () => {
+    nav.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'g-space',
+      kind: 'group-dm',
+      name: 'Weekend crew',
+      members: [PEER, SELF],
+      parentId: null,
+    });
+    nav.addOrUpdateNavSpace({
+      action: 'modified',
+      spaceId: 'g-space',
+      kind: 'group-dm',
+      name: '',
+      members: [PEER, SELF],
+      parentId: null,
+    });
+    expect(nav.nodes.find((n) => n.id === 'g-space')?.name).toBe('Weekend crew');
+  });
+
+  it('a group-DM rename still applies', () => {
+    nav.addOrUpdateNavSpace({
+      action: 'added',
+      spaceId: 'g-space',
+      kind: 'group-dm',
+      name: 'Weekend crew',
+      members: [PEER, SELF],
+      parentId: null,
+    });
+    nav.addOrUpdateNavSpace({
+      action: 'modified',
+      spaceId: 'g-space',
+      kind: 'group-dm',
+      name: 'Weekday crew',
+      members: [PEER, SELF],
+      parentId: null,
+    });
+    expect(nav.nodes.find((n) => n.id === 'g-space')?.name).toBe('Weekday crew');
+  });
+});

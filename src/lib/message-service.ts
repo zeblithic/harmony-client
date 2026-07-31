@@ -208,8 +208,15 @@ export class MessageService {
         const sender = (this.ownAddress && payload.from === this.ownAddress)
           ? { address: 'self', displayName: this.selfDisplayName() }
           : {
+              // ZEB-839: carry the RAW owner_id and no baked name. A name
+              // stamped here (it used to be `from.slice(0, 8)`) freezes at
+              // message-arrival time and never revisits the friend-nickname /
+              // profile-card ladder, so a DM author rendered hex forever even
+              // once the peer's card was known elsewhere in the app. The
+              // render side resolves through `resolveAuthorLabel`, which
+              // falls back to the same short hex when nothing is known.
               address: payload.from,
-              displayName: payload.from.slice(0, 8),
+              displayName: '',
             };
         const msg: Message = {
           id: payload.messageCid,
@@ -478,9 +485,11 @@ export class MessageService {
     const newMessages: Message[] = results
       .map((r) => {
         const text = hexToUtf8(r.body);
+        // ZEB-839: raw owner_id, no baked name — resolved at render time
+        // through the shared ladder (see the `dm-received` handler).
         const sender = r.isSelfOutbound
           ? { address: 'self', displayName: this.selfDisplayName() }
-          : { address: r.from, displayName: r.from.slice(0, 8) };
+          : { address: r.from, displayName: '' };
         const msg: Message = {
           id: r.messageCid,
           sender,
