@@ -104,6 +104,14 @@ export class MemberCardService {
   /** Wire the Tauri adapter after it becomes available (post-boot). */
   setAdapter(adapter: TauriAdapter): void {
     this.adapter = adapter;
+    // The adapter can arrive AFTER buckets were set — App wires Tauri
+    // asynchronously while drivers may set the community/dm buckets during boot.
+    // reconcileToUnion no-ops without an adapter, so replay the stored union now
+    // that the backend is reachable; otherwise those subscriptions would never
+    // start until the next bucket mutation happened to re-run reconciliation.
+    if (this.buckets.size > 0) {
+      void this.runExclusive(() => this.reconcileToUnion());
+    }
   }
 
   /** Attach the shared AvatarResolver. Does NOT touch resolver.onChange — the
@@ -162,6 +170,13 @@ export class MemberCardService {
       profilePageRoot: profile.profilePageRoot,
     });
     this.onUpdate?.();
+    // If a bucket already subscribed to this owner before we knew it was self
+    // (e.g. the community roster includes self, set before boot resolved the
+    // local identity), reconcile so the now-self owner is unsubscribed. No-op
+    // when no adapter/buckets exist yet (the common seedSelf-first path).
+    if (this.adapter && this.buckets.size > 0) {
+      void this.runExclusive(() => this.reconcileToUnion());
+    }
   }
 
   /** Resolve an owner_id to its card, or undefined if unresolved. */

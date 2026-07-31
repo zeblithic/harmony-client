@@ -317,4 +317,36 @@ describe('MemberCardService cross-peer resolution', () => {
     expect(unsubscribed).toEqual([1]);
     expect(subscribedOwners(svc).size).toBe(0);
   });
+
+  it('replays stored buckets when the adapter arrives after setBucket (Qodo)', async () => {
+    // App wires the Tauri adapter asynchronously, so a bucket can be set before
+    // it lands. reconcileToUnion no-ops without an adapter, so setAdapter must
+    // replay the stored union — otherwise the subscription never starts.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { adapter, subscribed } = makeAdapter();
+      const svc = makeService(); // no adapter yet
+      await svc.setBucket('community', [ownerA]); // stored; reconcile is a no-op
+      expect(subscribed).toEqual([]); // nothing subscribed without an adapter
+      svc.setAdapter(adapter); // must replay the stored union
+      await (svc as unknown as { opChain: Promise<void> }).opChain;
+      expect(subscribed).toEqual([ownerA]);
+      expect(subscribedOwners(svc)).toEqual(new Set([ownerA]));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('drops a now-self owner when seedSelf arrives after a bucket subscribed it', async () => {
+    const { adapter, subscribed, unsubscribed } = makeAdapter();
+    const svc = makeService(adapter);
+    await svc.setBucket('community', [ownerA]); // ownerA subscribed (id 1)
+    expect(subscribed).toEqual([ownerA]);
+    // We only now learn ownerA is self — seedSelf must reconcile it away so the
+    // service never holds a live subscription to its own card.
+    svc.seedSelf(ownerA, { displayName: 'Me', statusText: '' });
+    await (svc as unknown as { opChain: Promise<void> }).opChain;
+    expect(unsubscribed).toEqual([1]);
+    expect(subscribedOwners(svc).size).toBe(0);
+  });
 });
