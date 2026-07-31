@@ -2196,6 +2196,14 @@ pub struct StartNodeResponse {
     /// gate (mint refuses while owner_state.cbor exists). The frontend
     /// checks this FIRST and renders the terminal "removed" screen.
     pub self_revoked: bool,
+    /// ZEB-836: true when the device key loaded from the vault is NOT enrolled in
+    /// the persisted `owner_state.cbor` (a keychain/on-disk desync). Like
+    /// `self_revoked`, `has_owner_identity` is false (boot degrades to no-owner),
+    /// so WITHOUT this flag it would misclassify as first-run `missing` and trap
+    /// the user in the mint gate. The frontend checks this after `self_revoked`
+    /// and renders a recovery screen ("your other devices are safe") with
+    /// restore/reset actions — not the generic startup-error dead-end.
+    pub self_enrollment_missing: bool,
 }
 
 /// Profile published to/received from the network.
@@ -4092,6 +4100,27 @@ pub async fn start_node_inner(
                 &*app,
                 "device-revoked-self",
                 &serde_json::Value::Null,
+            );
+            owner_loaded = None;
+        }
+        // ZEB-836: a self-inconsistent owner state — the device key loaded from
+        // the vault is NOT the one enrolled in the persisted owner_state.cbor (a
+        // keychain/on-disk desync). The enrollment lookup further down would
+        // otherwise abort start_node with a fatal `?`, dead-ending the whole app
+        // on the generic "Couldn't start Harmony" modal. Instead, mirror the
+        // self_revoked path: degrade to a no-owner boot (identity stays on disk,
+        // no fleet wiring) and latch it so the UI shows a *specific* recovery
+        // screen ("your other devices are safe") with restore/reset actions,
+        // rather than the mint gate (which refuses while owner_state.cbor exists)
+        // or the generic error. Computed from the pre-drop `owner_loaded`, and
+        // mutually exclusive with revoked (a revoked device already dropped it).
+        let self_enrollment_missing_at_boot = owner_loaded.as_ref().is_some_and(|l| {
+            !crate::owner_state::is_device_self_enrolled(&l.state, &l.device_signing_key)
+        });
+        if self_enrollment_missing_at_boot {
+            tracing::warn!(
+                "this device's loaded key is not enrolled in owner_state — degrading to \
+                 enrollment-missing recovery mode (no fleet wiring)"
             );
             owner_loaded = None;
         }
@@ -13049,6 +13078,7 @@ pub async fn start_node_inner(
             freshly_created,
             has_owner_identity,
             self_revoked_at_boot,
+            self_enrollment_missing_at_boot,
         )
     };
     let (
@@ -13080,6 +13110,7 @@ pub async fn start_node_inner(
         freshly_created,
         has_owner_identity,
         self_revoked_at_boot,
+        self_enrollment_missing_at_boot,
     ) = our_gen;
 
     // ZEB-221 + thread-spawn-failure cleanup + lock-poison cleanup: all
@@ -13882,6 +13913,7 @@ pub async fn start_node_inner(
                 freshly_created,
                 has_owner_identity,
                 self_revoked: self_revoked_at_boot,
+                self_enrollment_missing: self_enrollment_missing_at_boot,
             })
         }
         Ok(Err(e)) => Err(e),
@@ -79326,6 +79358,7 @@ mod start_node_response_tests {
             freshly_created: true,
             has_owner_identity: false,
             self_revoked: false,
+            self_enrollment_missing: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(
@@ -79347,6 +79380,7 @@ mod start_node_response_tests {
             freshly_created: false,
             has_owner_identity: false,
             self_revoked: false,
+            self_enrollment_missing: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"freshlyCreated\":false"));
@@ -79364,14 +79398,17 @@ mod start_node_response_wire_tests {
             freshly_created: true,
             has_owner_identity: false,
             self_revoked: false,
+            self_enrollment_missing: false,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["nodeAddr"], "iroh:abc");
         assert_eq!(json["freshlyCreated"], true);
         assert_eq!(json["hasOwnerIdentity"], false);
         assert_eq!(json["selfRevoked"], false);
-        // Exactly four keys — no snake_case leakage, no extra fields.
-        assert_eq!(json.as_object().unwrap().len(), 4);
+        assert_eq!(json["selfEnrollmentMissing"], false);
+        // Exactly five keys — no snake_case leakage, no extra fields (ZEB-836
+        // added selfEnrollmentMissing).
+        assert_eq!(json.as_object().unwrap().len(), 5);
     }
 
     #[test]
@@ -79381,6 +79418,7 @@ mod start_node_response_wire_tests {
             freshly_created: false,
             has_owner_identity: true,
             self_revoked: false,
+            self_enrollment_missing: false,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["hasOwnerIdentity"], true);
@@ -79397,9 +79435,28 @@ mod start_node_response_wire_tests {
             freshly_created: false,
             has_owner_identity: false,
             self_revoked: true,
+            self_enrollment_missing: false,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["selfRevoked"], true);
+        assert_eq!(json["hasOwnerIdentity"], false);
+    }
+
+    #[test]
+    fn start_node_response_self_enrollment_missing_shape() {
+        // ZEB-836: the degrade latch serializes as camelCase `selfEnrollmentMissing`
+        // with `hasOwnerIdentity=false`, so the frontend classifies it as its own
+        // recovery state (before `missing`) and never shows the mint gate.
+        let r = StartNodeResponse {
+            node_addr: "iroh:xyz".to_string(),
+            freshly_created: false,
+            has_owner_identity: false,
+            self_revoked: false,
+            self_enrollment_missing: true,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["selfEnrollmentMissing"], true);
+        assert_eq!(json["selfRevoked"], false);
         assert_eq!(json["hasOwnerIdentity"], false);
     }
 }

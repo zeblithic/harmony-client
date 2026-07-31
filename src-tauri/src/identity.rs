@@ -3235,6 +3235,27 @@ fn with_identity_write_guards<T>(
     critical_section()
 }
 
+/// Run `critical_section` holding the same in-process + cross-process identity
+/// write serialization the identity writers use ([`with_identity_write_guards`]),
+/// keyed off the identity dir's `identity.enc.lock`.
+///
+/// ZEB-835/836 (Greptile #571): `reset_local_identity` must not race another
+/// harmony process that shares this identity dir. Stopping only the local node
+/// is not enough — a concurrent writer (e.g. a headless `serve`/`api` process
+/// sharing `~/.harmony`) could re-persist owner state as the reset moves it. The
+/// GUI itself is single-instance (`tauri_plugin_single_instance`), so this
+/// guards the mixed-process case: the reset serializes against identity writers
+/// and, if one is mid-write, fails fast with the standard "another harmony-app
+/// process is writing the identity store" message instead of racing it.
+pub(crate) fn with_identity_dir_write_guard<T>(
+    identity_dir: &Path,
+    critical_section: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    // The lock file is `<dir>/identity.enc.lock`; pass a same-dir path so the
+    // `with_file_name` derivation lands on it (the file itself need not exist).
+    with_identity_write_guards(&identity_dir.join("identity.enc"), critical_section)
+}
+
 /// **Cross-process + in-process write serialization.** Runs the entire
 /// probe-and-write below inside [`with_identity_write_guards`], so the
 /// check-then-act between the `!force` existence probes (keychain `load()`,

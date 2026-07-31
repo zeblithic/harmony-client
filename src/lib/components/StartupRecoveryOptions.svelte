@@ -29,12 +29,23 @@
   let {
     invoke = tauriInvoke,
     reload = () => window.location.reload(),
+    startExpanded = false,
   }: {
     invoke?: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
     reload?: () => void;
+    /**
+     * Skip the "Still stuck?" disclosure and show the remedies directly. Used by
+     * the ZEB-836 enrollment-missing screen, where recovery *is* the point (no
+     * transient Retry to prefer first) — unlike the startup-error modal, where
+     * Retry stays primary and this stays collapsed.
+     */
+    startExpanded?: boolean;
   } = $props();
 
   type Mode = 'collapsed' | 'options' | 'restore' | 'reset-confirm' | 'resetting';
+  // Starts 'collapsed'; when `startExpanded` the template shows the options panel
+  // directly (see the `collapsed && !startExpanded` gate below) without needing
+  // the prop in this initializer.
   let mode = $state<Mode>('collapsed');
   let currentOwnerId = $state<string | null>(null);
   let confirmChecked = $state(false);
@@ -85,7 +96,7 @@
 {/if}
 
 {#if mode !== 'restore'}
-  {#if mode === 'collapsed'}
+  {#if mode === 'collapsed' && !startExpanded}
     <button
       type="button"
       class="still-stuck-link"
@@ -96,10 +107,12 @@
     </button>
   {:else}
     <div class="recovery-options" data-testid="startup-recovery-options">
-      <p class="recovery-lead">
-        If retrying keeps failing, this identity can't be opened on this device.
-        You can recover it:
-      </p>
+      {#if !startExpanded}
+        <p class="recovery-lead">
+          If retrying keeps failing, this identity can't be opened on this device.
+          You can recover it:
+        </p>
+      {/if}
 
       <button
         type="button"

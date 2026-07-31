@@ -38,6 +38,15 @@ export interface StartNodeResponse {
    * Forward-compat: treat missing/undefined as `false`.
    */
   selfRevoked?: boolean;
+  /**
+   * ZEB-836: true when the device key loaded from the vault is not enrolled in
+   * the persisted `owner_state.cbor` (a keychain/on-disk desync). Like
+   * `selfRevoked`, `hasOwnerIdentity` is false, so this MUST be checked before
+   * `missing` or the user hits the mint gate. Renders a recovery screen ("your
+   * other devices are safe") with restore/reset actions rather than the generic
+   * startup-error dead-end. Forward-compat: treat missing/undefined as `false`.
+   */
+  selfEnrollmentMissing?: boolean;
 }
 
 /** Non-identifying environment info attached to feedback submissions. */

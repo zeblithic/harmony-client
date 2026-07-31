@@ -39,6 +39,18 @@ describe('StartupRecoveryOptions (ZEB-835 / ZEB-836)', () => {
     expect(getByTestId('startup-reset')).toBeTruthy();
   });
 
+  it('startExpanded shows the remedies directly, skipping the "Still stuck?" gate', async () => {
+    // ZEB-836 enrollment-missing screen: recovery IS the point (no Retry to
+    // prefer), so the options render immediately.
+    const { getByTestId, queryByTestId } = render(StartupRecoveryOptions, {
+      props: { invoke: makeInvoke(), reload: vi.fn(), startExpanded: true },
+    });
+    expect(queryByTestId('startup-still-stuck')).toBeNull();
+    expect(getByTestId('startup-recovery-options')).toBeTruthy();
+    expect(getByTestId('startup-restore')).toBeTruthy();
+    expect(getByTestId('startup-reset')).toBeTruthy();
+  });
+
   it('reset is gated: no invoke until the confirm checkbox is checked', async () => {
     const invoke = makeInvoke();
     const reload = vi.fn();

@@ -1921,28 +1921,37 @@ pub(crate) fn reset_local_identity_inner(
         .lock()
         .unwrap_or_else(|p| p.into_inner());
 
-    let backup_dir = unique_reset_backup_dir(identity_dir)?;
-    let mut created_backup = false;
-    for name in OWNER_RESET_FILES {
-        let src = identity_dir.join(name);
-        if !src.exists() {
-            continue;
+    // Cross-process exclusion (Greptile #571): hold the same identity write-lock
+    // the identity writers take, so a reset does not race another harmony process
+    // sharing this identity dir. If one is mid-write, this fails fast with
+    // "another harmony-app process is writing…" rather than moving files out from
+    // under it. (The GUI is single-instance; this covers a mixed headless case.)
+    let backup_dir = crate::identity::with_identity_dir_write_guard(identity_dir, || {
+        let backup_dir = unique_reset_backup_dir(identity_dir)?;
+        let mut created_backup = false;
+        for name in OWNER_RESET_FILES {
+            let src = identity_dir.join(name);
+            if !src.exists() {
+                continue;
+            }
+            if !created_backup {
+                std::fs::create_dir_all(&backup_dir).map_err(|e| {
+                    format!("create reset backup dir {}: {e}", backup_dir.display())
+                })?;
+                created_backup = true;
+            }
+            // On a mid-list failure, owner_state.cbor (first) may already be moved
+            // — the live dir is now "missing" — so surface the backup location, or
+            // the already-moved files are undiscoverable (this is a last resort).
+            move_file(&src, &backup_dir.join(name)).map_err(|e| {
+                format!(
+                    "{e} (partial reset: files already moved are in {})",
+                    backup_dir.display()
+                )
+            })?;
         }
-        if !created_backup {
-            std::fs::create_dir_all(&backup_dir)
-                .map_err(|e| format!("create reset backup dir {}: {e}", backup_dir.display()))?;
-            created_backup = true;
-        }
-        // On a mid-list failure, owner_state.cbor (first) may already be moved —
-        // the live dir is now "missing" — so surface the backup location, or the
-        // already-moved files are undiscoverable (this is a last-resort path).
-        move_file(&src, &backup_dir.join(name)).map_err(|e| {
-            format!(
-                "{e} (partial reset: files already moved are in {})",
-                backup_dir.display()
-            )
-        })?;
-    }
+        Ok(created_backup.then_some(backup_dir))
+    })?;
 
     // Best-effort clear the OS keychain owner secrets. `prod_keychain` returns
     // `None` for named profiles (file-vault, no keychain) and in test builds, so
@@ -1959,7 +1968,7 @@ pub(crate) fn reset_local_identity_inner(
         }
     }
 
-    Ok(created_backup.then_some(backup_dir))
+    Ok(backup_dir)
 }
 
 /// Read this device's persisted owner-id (hex), or `null` if no `owner_state.cbor`

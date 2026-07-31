@@ -772,6 +772,20 @@ pub fn device_id_from_signing_key(device_sk: &SigningKey) -> [u8; 16] {
         .identity_hash()
 }
 
+/// True iff `device_sk`'s derived id-hash is enrolled in `state`.
+///
+/// ZEB-836: the boot gate uses the negation to detect a self-inconsistent owner
+/// state — the device key loaded from the vault is NOT the one enrolled in the
+/// persisted `owner_state.cbor` (a keychain/on-disk desync). Rather than let the
+/// `start_node` enrollment lookup abort with a fatal `?`, the boot degrades to a
+/// no-owner recovery mode and the UI offers restore/reset. Single source of
+/// truth for the same `enrollments` membership check `start_node` does.
+pub fn is_device_self_enrolled(state: &OwnerState, device_sk: &SigningKey) -> bool {
+    state
+        .enrollments
+        .contains_key(&device_id_from_signing_key(device_sk))
+}
+
 /// Re-adopt an existing owner identity from its 32-byte master `seed`
 /// (ZEB-439 restore). A constrained variant of
 /// [`harmony_owner::lifecycle::mint_owner`] that takes the seed as input
@@ -1438,6 +1452,23 @@ mod persistence_tests {
         // overwrite-guard would refuse.
         std::fs::write(dir.path().join(OWNER_STATE_FILENAME), b"not-cbor").unwrap();
         assert!(read_persisted_owner_id(dir.path()).is_err());
+    }
+
+    #[test]
+    fn is_device_self_enrolled_matches_only_the_enrolled_device() {
+        // ZEB-836: the boot gate degrades when the loaded device key is NOT
+        // enrolled in the persisted owner_state (a keychain/on-disk desync).
+        let MintResult {
+            state,
+            device_signing_key,
+            ..
+        } = mint_owner(1_700_000_444).unwrap();
+        // The minted device IS enrolled → healthy boot.
+        assert!(is_device_self_enrolled(&state, &device_signing_key));
+        // A different device key is NOT enrolled → the ZEB-836 desync signature
+        // that must degrade to recovery instead of aborting start_node.
+        let other = SigningKey::generate(&mut rand::rngs::OsRng);
+        assert!(!is_device_self_enrolled(&state, &other));
     }
 
     /// ZEB-189: `use_os_keychain = false` routes secret persistence entirely

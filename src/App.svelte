@@ -4801,6 +4801,38 @@
   </div>
 {/if}
 
+<!-- ZEB-836: the device key loaded from the vault isn't the one enrolled in
+     this device's saved owner state (a keychain/on-disk desync). start_node
+     degrades to no-owner rather than aborting, so instead of the generic
+     "Couldn't start Harmony" dead-end we show a specific, honest recovery
+     screen — the identity elsewhere is intact — with the same self-serve
+     restore/reset actions as the startup-error hatch. -->
+{#if ownerIdentityState === 'enrollment-missing'}
+  <div class="modal-overlay" data-testid="enrollment-missing-backdrop" role="presentation">
+    <div
+      class="modal-content startup-error-modal"
+      data-testid="enrollment-missing-modal"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="enrollment-missing-title"
+      tabindex="-1"
+    >
+      <h2 id="enrollment-missing-title">This device's saved identity couldn't be loaded</h2>
+      <p>
+        The identity key this device loaded no longer matches the one enrolled in
+        your saved account on this device — usually a sign its stored keys got out
+        of sync. <strong>Your data on your other devices is safe</strong>, and
+        nothing here has been deleted.
+      </p>
+      <p>
+        Restore your identity from its recovery phrase to re-adopt it on this
+        device, or reset this device to start fresh.
+      </p>
+      <StartupRecoveryOptions startExpanded />
+    </div>
+  </div>
+{/if}
+
 
 <FeedbackModal
   open={feedbackModalOpen}
