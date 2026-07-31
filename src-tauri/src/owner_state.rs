@@ -456,11 +456,13 @@ use std::path::Path;
 const KEYCHAIN_OWNER_SERVICE: &str = "harmony.owner";
 const KEYCHAIN_DEVICE_SK: &str = "device_signing_key";
 const KEYCHAIN_MASTER_SEED: &str = "master_seed";
-const OWNER_STATE_FILENAME: &str = "owner_state.cbor";
+// pub(crate) so the reset manifest (`owner_commands::OWNER_RESET_FILES`, ZEB-835)
+// references the canonical name instead of a drift-prone literal.
+pub(crate) const OWNER_STATE_FILENAME: &str = "owner_state.cbor";
 /// Encrypted-file fallback for the distributed fleet KeyTree material on a
 /// cert-only enrolled device (ZEB-492). Variable-length HRMI `v0x02` envelope
 /// (NOT the 32-byte `EncryptedFileStore` format the `*_secret` helpers use).
-const FLEET_KEYTREE_FILENAME: &str = "fleet_keytree.enc";
+pub(crate) const FLEET_KEYTREE_FILENAME: &str = "fleet_keytree.enc";
 
 /// Returned by `load_owner_state` when a persisted identity is found.
 pub struct LoadedOwnerState {
@@ -768,6 +770,20 @@ pub fn load_owner_state_cbor(identity_dir: &Path) -> Result<OwnerState, String> 
 pub fn device_id_from_signing_key(device_sk: &SigningKey) -> [u8; 16] {
     harmony_owner::pubkey_bundle::PubKeyBundle::classical_only(device_sk.verifying_key().to_bytes())
         .identity_hash()
+}
+
+/// True iff `device_sk`'s derived id-hash is enrolled in `state`.
+///
+/// ZEB-836: the boot gate uses the negation to detect a self-inconsistent owner
+/// state — the device key loaded from the vault is NOT the one enrolled in the
+/// persisted `owner_state.cbor` (a keychain/on-disk desync). Rather than let the
+/// `start_node` enrollment lookup abort with a fatal `?`, the boot degrades to a
+/// no-owner recovery mode and the UI offers restore/reset. Single source of
+/// truth for the same `enrollments` membership check `start_node` does.
+pub fn is_device_self_enrolled(state: &OwnerState, device_sk: &SigningKey) -> bool {
+    state
+        .enrollments
+        .contains_key(&device_id_from_signing_key(device_sk))
 }
 
 /// Re-adopt an existing owner identity from its 32-byte master `seed`
@@ -1406,6 +1422,53 @@ mod persistence_tests {
         assert!(load_fleet_keytree(&None, dir.path())
             .expect("load")
             .is_none());
+    }
+
+    #[test]
+    fn read_persisted_owner_id_is_key_free_and_distinguishes_absent_vs_corrupt() {
+        // ZEB-835/836: the startup-error restore path recovers the owner-id from
+        // a terminal boot-failure state, where the device signing key is
+        // unavailable (in neither store, or mismatched). read_persisted_owner_id
+        // parses owner_state.cbor directly — no keychain, no HARMONY_PASSPHRASE,
+        // no device key — so it works exactly where load_owner_state cannot, and
+        // its three outcomes (absent / parseable / corrupt) drive the restore
+        // wizard's force decision. (peek_owner_id was a duplicate of this — see
+        // PR #571 review; the IPC uses this canonical function.)
+        let dir = tempdir().unwrap();
+
+        // Absent file → the natural un-minted None (not an error).
+        assert_eq!(read_persisted_owner_id(dir.path()).unwrap(), None);
+
+        let MintResult { state, .. } = mint_owner(1_700_000_333).unwrap();
+        let bytes = cbor::to_canonical(&state).expect("encode owner_state");
+        std::fs::write(dir.path().join(OWNER_STATE_FILENAME), &bytes).unwrap();
+        assert_eq!(
+            read_persisted_owner_id(dir.path()).unwrap(),
+            Some(state.owner_id)
+        );
+
+        // A corrupt/unreadable marker surfaces an Err (NOT silent None) — the IPC
+        // propagates it so the UI steers to Reset instead of a restore the
+        // overwrite-guard would refuse.
+        std::fs::write(dir.path().join(OWNER_STATE_FILENAME), b"not-cbor").unwrap();
+        assert!(read_persisted_owner_id(dir.path()).is_err());
+    }
+
+    #[test]
+    fn is_device_self_enrolled_matches_only_the_enrolled_device() {
+        // ZEB-836: the boot gate degrades when the loaded device key is NOT
+        // enrolled in the persisted owner_state (a keychain/on-disk desync).
+        let MintResult {
+            state,
+            device_signing_key,
+            ..
+        } = mint_owner(1_700_000_444).unwrap();
+        // The minted device IS enrolled → healthy boot.
+        assert!(is_device_self_enrolled(&state, &device_signing_key));
+        // A different device key is NOT enrolled → the ZEB-836 desync signature
+        // that must degrade to recovery instead of aborting start_node.
+        let other = SigningKey::generate(&mut rand::rngs::OsRng);
+        assert!(!is_device_self_enrolled(&state, &other));
     }
 
     /// ZEB-189: `use_os_keychain = false` routes secret persistence entirely

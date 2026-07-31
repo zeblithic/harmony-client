@@ -29,3 +29,33 @@ describe('classifyOwnerIdentity (ZEB-668 S2 revoked state)', () => {
     );
   });
 });
+
+describe('classifyOwnerIdentity (ZEB-836 enrollment-missing state)', () => {
+  it('classifies selfEnrollmentMissing before missing (avoids the mint-gate trap)', () => {
+    expect(
+      classifyOwnerIdentity(
+        resp({ hasOwnerIdentity: false, selfEnrollmentMissing: true }),
+        false,
+      ),
+    ).toBe('enrollment-missing');
+  });
+
+  it('selfRevoked outranks selfEnrollmentMissing', () => {
+    expect(
+      classifyOwnerIdentity(
+        resp({ hasOwnerIdentity: false, selfRevoked: true, selfEnrollmentMissing: true }),
+        false,
+      ),
+    ).toBe('revoked');
+  });
+
+  it('error still wins over selfEnrollmentMissing when start_node failed', () => {
+    expect(classifyOwnerIdentity(null, true)).toBe('error');
+  });
+
+  it('missing selfEnrollmentMissing field (older backend) never classifies as enrollment-missing', () => {
+    expect(
+      classifyOwnerIdentity(resp({ hasOwnerIdentity: false, selfEnrollmentMissing: undefined }), false),
+    ).toBe('missing');
+  });
+});

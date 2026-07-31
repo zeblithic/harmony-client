@@ -1027,6 +1027,39 @@ mod vault_tests {
         assert!(!fresh2);
     }
 
+    #[test]
+    fn delete_all_clears_the_vault_and_is_a_clean_noop_when_absent() {
+        // ZEB-835/836: reset_local_identity relies on delete_all to clear the
+        // OS keychain owner secrets. It must (a) actually remove the vault item
+        // and (b) treat an already-absent item as success (idempotent), since
+        // the on-disk gate — not the keychain — is authoritative.
+        let store = KeychainStore::new_mock();
+        store
+            .save_vault(&SecretVault::from_seed([7u8; BLOB_LEN]))
+            .unwrap();
+        assert!(
+            store.load_vault().unwrap().is_some(),
+            "vault must exist before delete_all"
+        );
+
+        let errors = store.delete_all();
+        assert!(
+            errors.is_empty(),
+            "delete_all should report no errors: {errors:?}"
+        );
+        assert!(
+            store.load_vault().unwrap().is_none(),
+            "vault must be gone after delete_all"
+        );
+
+        // A second delete over now-absent items (both main + backup) is a clean
+        // no-op — NoEntry is not an error.
+        assert!(
+            store.delete_all().is_empty(),
+            "delete_all over absent items must be a clean no-op"
+        );
+    }
+
     // ── ZEB-449: encrypted-file fallback for app-local (iroh) keys ──────────
     //
     // The fallback is supplied as a lazy factory closure: it must run ONLY when
@@ -2312,6 +2345,32 @@ impl KeychainStore {
     pub fn delete(&self) -> Result<(), keyring::Error> {
         self.entry.delete_credential()
     }
+
+    /// Best-effort delete of BOTH owner-secret keychain items — the main
+    /// consolidated vault (`identity.harmony`) and the ZEB-429 pre-363 backup
+    /// (`identity.pre363-backup.harmony`). Used by `reset_local_identity`
+    /// (ZEB-835/836) to clear this device's owner secrets so a fresh mint can't
+    /// collide with a stale vault slot; mirrors the manual `cmdkey /delete` of
+    /// both items in the operator workaround.
+    ///
+    /// `NoEntry` counts as success (nothing to clear). Any other error is
+    /// collected and returned (labeled) rather than propagated — the caller
+    /// logs it but does NOT fail the reset: the on-disk `owner_state.cbor`
+    /// removal is the authoritative onboarding gate, so a keychain hiccup must
+    /// not block the escape hatch.
+    pub fn delete_all(&self) -> Vec<(&'static str, keyring::Error)> {
+        let mut errors = Vec::new();
+        for (label, entry) in [
+            (KEYCHAIN_ACCOUNT, &self.entry),
+            (KEYCHAIN_BACKUP_ACCOUNT, &self.backup),
+        ] {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => errors.push((label, e)),
+            }
+        }
+        errors
+    }
 }
 
 impl KeyStore for KeychainStore {
@@ -3174,6 +3233,27 @@ fn with_identity_write_guards<T>(
     })?;
 
     critical_section()
+}
+
+/// Run `critical_section` holding the same in-process + cross-process identity
+/// write serialization the identity writers use ([`with_identity_write_guards`]),
+/// keyed off the identity dir's `identity.enc.lock`.
+///
+/// ZEB-835/836 (Greptile #571): `reset_local_identity` must not race another
+/// harmony process that shares this identity dir. Stopping only the local node
+/// is not enough — a concurrent writer (e.g. a headless `serve`/`api` process
+/// sharing `~/.harmony`) could re-persist owner state as the reset moves it. The
+/// GUI itself is single-instance (`tauri_plugin_single_instance`), so this
+/// guards the mixed-process case: the reset serializes against identity writers
+/// and, if one is mid-write, fails fast with the standard "another harmony-app
+/// process is writing the identity store" message instead of racing it.
+pub(crate) fn with_identity_dir_write_guard<T>(
+    identity_dir: &Path,
+    critical_section: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    // The lock file is `<dir>/identity.enc.lock`; pass a same-dir path so the
+    // `with_file_name` derivation lands on it (the file itself need not exist).
+    with_identity_write_guards(&identity_dir.join("identity.enc"), critical_section)
 }
 
 /// **Cross-process + in-process write serialization.** Runs the entire

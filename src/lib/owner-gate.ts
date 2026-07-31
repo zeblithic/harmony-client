@@ -22,8 +22,20 @@ import type { StartNodeResponse } from './types/onboarding';
  *               this MUST be classified before `missing` — the mint gate
  *               refuses while owner_state.cbor exists, which would trap the
  *               user. Renders the terminal "removed from your account" screen.
+ * - `enrollment-missing` — `start_node` succeeded but the loaded device key is
+ *               not enrolled in the persisted owner_state (ZEB-836 desync).
+ *               `hasOwnerIdentity` is false; like `revoked` it MUST be
+ *               classified before `missing` to avoid the mint-gate trap.
+ *               Renders a recovery screen ("your other devices are safe") with
+ *               restore/reset actions.
  */
-export type OwnerIdentityState = 'unknown' | 'present' | 'missing' | 'error' | 'revoked';
+export type OwnerIdentityState =
+  | 'unknown'
+  | 'present'
+  | 'missing'
+  | 'error'
+  | 'revoked'
+  | 'enrollment-missing';
 
 /**
  * Classify the owner-identity gate from a `start_node` outcome.
@@ -41,5 +53,6 @@ export function classifyOwnerIdentity(
 ): OwnerIdentityState {
   if (failed || resp == null) return 'error';
   if (resp.selfRevoked === true) return 'revoked';
+  if (resp.selfEnrollmentMissing === true) return 'enrollment-missing';
   return resp.hasOwnerIdentity === true ? 'present' : 'missing';
 }
