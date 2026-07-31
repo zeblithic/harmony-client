@@ -13,7 +13,7 @@ Click the Apple menu (top-left corner) → **About This Mac**.
 - If you see **Chip: Apple M1 / M2 / M3 / M4 / M5** (or any M-series) → download `Harmony_X.Y.Z_aarch64.dmg`
 - If you see **Processor: Intel Core …** → download `Harmony_X.Y.Z_x64.dmg`
 
-If you pick the wrong one, Harmony won't launch (you'll see an error about the app not being compatible with your Mac).
+Pick the build that matches your chip for the best speed. (The Intel `x64` build *will* also run on Apple Silicon through Rosetta 2 — just slower — but the Apple Silicon `aarch64` build will **not** run on an Intel Mac.)
 
 > Download the **`.dmg`** — not the `.app.tar.gz`. That tarball is the auto-updater's internal payload, not a manual installer.
 
@@ -30,7 +30,7 @@ If you pick the wrong one, Harmony won't launch (you'll see an error about the a
 
 ## 3. First launch — getting past Gatekeeper
 
-Because Harmony ships unsigned (no Apple Developer certificate — a deliberate choice, see the end of this section), macOS Gatekeeper blocks the **first** launch and shows **one of two messages**. Both mean the same thing — "this app isn't signed by a certificate Apple recognizes" — and both are expected. Find the message you're seeing below.
+Harmony isn't signed with an Apple Developer certificate (a deliberate, permanent choice — see the end of this section), so macOS can't confirm who published it. Gatekeeper blocks the **first** launch and shows **one of two messages**. Both mean the same thing — "this app isn't signed by a certificate Apple recognizes" — and both are expected. Find the message you're seeing below.
 
 ### "Harmony is damaged and can't be opened. You should move it to the Trash."
 
@@ -62,7 +62,7 @@ The `xattr -dr com.apple.quarantine /Applications/Harmony.app` command from abov
 
 After you get past Gatekeeper once, macOS trusts the app — future launches work normally with a double-click.
 
-> **Why does this happen?** Signing and notarizing an app so macOS can verify its origin requires an **Apple Developer Program** membership — a recurring annual fee that bundles the Developer ID certificate and notarization. Harmony is a small, self-funded project and **deliberately ships unsigned** rather than carry that ongoing cost. The app is fully functional without it, and the one-time approval above is all you'll ever need.
+> **Why does this happen?** Signing and notarizing an app so macOS can verify its origin requires an **Apple Developer Program** membership — a recurring annual fee that bundles the Developer ID certificate and notarization. Harmony is a small, self-funded project and **deliberately ships without one** rather than carry that ongoing cost. The app is fully functional without it, and the one-time approval above is all you'll ever need.
 
 ---
 
