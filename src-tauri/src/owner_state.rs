@@ -770,6 +770,30 @@ pub fn device_id_from_signing_key(device_sk: &SigningKey) -> [u8; 16] {
         .identity_hash()
 }
 
+/// Best-effort read of the persisted owner-id **without** loading any secret
+/// key. Parses `owner_state.cbor` and returns its `owner_id`, or `Ok(None)` if
+/// the file is absent (the natural un-minted state). A corrupt file returns
+/// `Err`.
+///
+/// Unlike [`load_owner_state`], this does not require the device signing key —
+/// so it works from a *terminal boot-failure* state (ZEB-835: device key in
+/// neither store; ZEB-836: loaded device key not in `enrollments`). The
+/// startup-error "Still stuck?" restore path uses it to hand the restore wizard
+/// a `currentOwnerId`, so a recovery phrase for the same owner classifies as a
+/// same-owner re-adoption (→ `force` overwrite of the broken `owner_state.cbor`)
+/// instead of a fresh restore that the overwrite-guard would refuse.
+pub fn peek_owner_id(identity_dir: &Path) -> Result<Option<[u8; 16]>, String> {
+    let cbor_path = identity_dir.join(OWNER_STATE_FILENAME);
+    if !cbor_path.exists() {
+        return Ok(None);
+    }
+    let cbor_bytes = std::fs::read(&cbor_path)
+        .map_err(|e| format!("failed to read {}: {e}", cbor_path.display()))?;
+    let state: OwnerState =
+        cbor::from_bytes(&cbor_bytes).map_err(|e| format!("owner_state.cbor is corrupt: {e}"))?;
+    Ok(Some(state.owner_id))
+}
+
 /// Re-adopt an existing owner identity from its 32-byte master `seed`
 /// (ZEB-439 restore). A constrained variant of
 /// [`harmony_owner::lifecycle::mint_owner`] that takes the seed as input
@@ -1406,6 +1430,29 @@ mod persistence_tests {
         assert!(load_fleet_keytree(&None, dir.path())
             .expect("load")
             .is_none());
+    }
+
+    #[test]
+    fn peek_owner_id_reads_owner_id_without_any_key() {
+        // ZEB-835/836: the startup-error restore path must recover the owner-id
+        // from a terminal boot-failure state, where the device signing key is
+        // unavailable (in neither store, or mismatched). peek_owner_id parses
+        // owner_state.cbor directly — no keychain, no HARMONY_PASSPHRASE, no
+        // device key — so it works exactly where load_owner_state cannot.
+        let dir = tempdir().unwrap();
+
+        // Absent file → the natural un-minted None (not an error).
+        assert_eq!(peek_owner_id(dir.path()).unwrap(), None);
+
+        let MintResult { state, .. } = mint_owner(1_700_000_333).unwrap();
+        let bytes = cbor::to_canonical(&state).expect("encode owner_state");
+        std::fs::write(dir.path().join(OWNER_STATE_FILENAME), &bytes).unwrap();
+        assert_eq!(peek_owner_id(dir.path()).unwrap(), Some(state.owner_id));
+
+        // A corrupt file surfaces an Err (best-effort None is the IPC's choice,
+        // not this primitive's — the primitive stays honest).
+        std::fs::write(dir.path().join(OWNER_STATE_FILENAME), b"not-cbor").unwrap();
+        assert!(peek_owner_id(dir.path()).is_err());
     }
 
     /// ZEB-189: `use_os_keychain = false` routes secret persistence entirely

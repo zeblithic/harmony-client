@@ -21,6 +21,7 @@
   import FileDetailPanel from './lib/components/FileDetailPanel.svelte';
   import SettingsPanel from './lib/components/SettingsPanel.svelte';
   import BackupStalenessWarning from './lib/components/BackupStalenessWarning.svelte';
+  import StartupRecoveryOptions from './lib/components/StartupRecoveryOptions.svelte';
   import { backupExportRequest } from './lib/backup-export-request.svelte';
   import SpellbookMode from './lib/components/SpellbookMode.svelte';
   import FlashcardStats from './lib/components/FlashcardStats.svelte';
@@ -4760,6 +4761,12 @@
           Retry
         </button>
       </div>
+      <!-- ZEB-835 / ZEB-836: Retry stays primary (most error-state causes are
+           transient). Behind a quiet "Still stuck?" disclosure, offer the two
+           remedies that recover a *permanent* boot failure — restore from
+           recovery phrase, or reset this device — so a terminal failure is no
+           longer an in-app dead-end. -->
+      <StartupRecoveryOptions />
     </div>
   </div>
 {/if}
