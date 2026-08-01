@@ -21623,15 +21623,30 @@ pub(crate) async fn list_grants_impl(
 pub(crate) async fn list_received_grants_impl(
     state: &Mutex<NodeState>,
 ) -> Result<Vec<crate::file_sharing::ReceivedGrantDto>, String> {
-    let crdt_state = {
+    let (crdt_state, profile_card_cache) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
-            .crdt_state
-            .clone()
-            .ok_or_else(|| "no owner loaded".to_string())?
+        (
+            guard
+                .crdt_state
+                .clone()
+                .ok_or_else(|| "no owner loaded".to_string())?,
+            // ZEB-785. Optional on purpose: an unnamed granter is strictly
+            // better than an error, since the card overlay is an enrichment.
+            guard.profile_card_cache.clone(),
+        )
     };
-    let st = crdt_state.lock().await;
-    Ok(crate::file_sharing::list_received_grants_inner(&st))
+    let mut rows = {
+        let st = crdt_state.lock().await;
+        crate::file_sharing::list_received_grants_inner(&st)
+    };
+    // ZEB-785: overlay profile-card names onto rows the friend graph could not
+    // name — the same source the mention/roster path reads (ZEB-777 parity).
+    // Local lookup only, no network; the CRDT lock is already dropped above.
+    if let Some(cache) = profile_card_cache.as_ref() {
+        let names = cache.display_names_by_owner().await;
+        crate::file_sharing::enrich_received_grant_names(&mut rows, &names);
+    }
+    Ok(rows)
 }
 
 /// `grant_read(cid, granteeAddress)` core: share read access to an encrypted
