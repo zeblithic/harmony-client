@@ -21,12 +21,11 @@
 //!   matches the vine discovery default
 //!   ([`crate::vine_pull_driver::VINE_PULL_INVALID_FORWARD_SKEW_SECS`]).
 //!
-//! `community_membership::ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS` is *also* 30 min,
-//! but it is a **governance control** budget, not a display-tier consumer — it
-//! shares the magnitude only coincidentally. Governance ordering is a control
-//! and belongs on [`MAX_FORWARD_SKEW_MS`]; migrating it there is deferred to
-//! T-GOV (ZEB-846). Do **not** point a new *control* consumer at the display
-//! tier — controls take [`MAX_FORWARD_SKEW_MS`].
+//! `community_membership::ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS` was *also* 30 min,
+//! but it is a **governance control** budget, not a display-tier consumer — the
+//! shared magnitude was coincidental. ZEB-846 (T-GOV) completed the migration:
+//! it is now a 5-min alias of [`MAX_FORWARD_SKEW_MS`]. Do **not** point a new
+//! *control* consumer at the display tier — controls take [`MAX_FORWARD_SKEW_MS`].
 //!
 //! The helpers are unit-agnostic: [`reject_future`] / [`clamp_future`] operate
 //! on raw `u64`, and the caller supplies `stamp`, `now`, and `tolerance` in one
@@ -54,8 +53,8 @@ pub const DISPLAY_SKEW_TOLERANCE_SECS: u64 = DISPLAY_SKEW_TOLERANCE_MS / 1000;
 /// unit (all ms, or all secs).
 ///
 /// The boundary is inclusive: `stamp == now + tolerance` is accepted, matching
-/// the existing `<= ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS` convention
-/// (`community_membership.rs:5932`).
+/// the existing `<= MAX_FORWARD_SKEW_MS` convention in the admin-proposal
+/// planner filter (`community_membership::plan_admin_proposal_auto_exec`).
 #[inline]
 pub fn reject_future(stamp: u64, now: u64, tolerance: u64) -> bool {
     stamp.saturating_sub(now) > tolerance
