@@ -457,26 +457,23 @@ impl VineFeedCache {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let age_cutoff = now_secs.saturating_sub(MAX_AGE_SECS);
+        // Backward age bound ONLY. The ZEB-831/VF forward-skew bound is
+        // deliberately NOT applied here: load must never delete a persisted
+        // descriptor on a clock reading (Greptile PR #580 P1). `save()` rewrites
+        // `vine_feed.json` from the in-memory set, so a load-time drop is made
+        // permanent by the next mutation — and a local clock set *behind* real
+        // time makes every honest descriptor look future-dated, which would purge
+        // the entire feed irreversibly (the `now_secs == 0` guard only catches an
+        // epoch-zero clock, not a slow one). Unlike the ingest gate in
+        // `on_descriptor_sample`, whose rejection is recoverable via re-gossip, a
+        // load-delete is not. The forward gate instead lives in `list_descriptors`
+        // as a non-destructive, live-re-evaluated display filter: a future-dated
+        // descriptor is hidden from the feed but retained on disk, and reappears
+        // once the clock is corrected.
         let mut descriptors: Vec<DescriptorOnDisk> = file
             .descriptors
             .into_iter()
-            .filter(|d| {
-                // Backward age bound AND the ZEB-831/VF forward-skew bound that
-                // `on_descriptor_sample` applies at runtime. Without the forward
-                // bound here, a future-dated descriptor persisted by a pre-gate
-                // build survives reload and squats the feed head / evades the
-                // capacity-trim on every restart, and load/runtime would diverge
-                // (the symmetry the trim below documents). Skipped on a broken
-                // clock (now_secs == 0), matching the age filter's "keep data
-                // over losing it" fallback.
-                d.created_at >= age_cutoff
-                    && (now_secs == 0
-                        || !crate::clock_trust::reject_future(
-                            d.created_at,
-                            now_secs,
-                            crate::clock_trust::DISPLAY_SKEW_TOLERANCE_SECS,
-                        ))
-            })
+            .filter(|d| d.created_at >= age_cutoff)
             .collect();
 
         // Capacity-trim (defensive — production write path enforces cap
@@ -794,9 +791,31 @@ impl VineFeedCache {
     /// `created_at` DESC. `viewed` is populated by joining with the
     /// `self.viewed` HashSet (local-only viewed-state).
     pub fn list_descriptors(&self) -> Vec<VineVideoDto> {
+        // ZEB-831/VF: forward-skew display gate, re-evaluated against the LIVE
+        // clock on every call. A descriptor dated further ahead than the display
+        // tolerance must not squat the feed head (`created_at` DESC) or displace
+        // honest entries — but this is the *non-destructive* counterpart to the
+        // ingest gate in `on_descriptor_sample`: hiding a future-dated descriptor
+        // from the view never removes it from the store, so a corrected clock (or
+        // a since-elapsed `created_at`) restores it (Greptile PR #580 P1 — a load-
+        // time drop would let `save()` purge it permanently). Broken clock
+        // (now_secs == 0) shows everything, matching the load path's age-filter
+        // fallback ("keep data over hiding it").
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let mut out: Vec<VineVideoDto> = self
             .descriptors
             .values()
+            .filter(|cv| {
+                now_secs == 0
+                    || !crate::clock_trust::reject_future(
+                        cv.descriptor.created_at,
+                        now_secs,
+                        crate::clock_trust::DISPLAY_SKEW_TOLERANCE_SECS,
+                    )
+            })
             .map(|cv| VineVideoDto {
                 id: cv.descriptor.id.clone(),
                 creator_address: cv.descriptor.creator_address.clone(),
@@ -2153,12 +2172,15 @@ mod tests {
     }
 
     #[test]
-    fn load_drops_persisted_future_dated_descriptor() {
-        // ZEB-831/VF (whole-branch review Finding 1): the forward-skew bound must
-        // ALSO apply on the disk-load path, or a future-dated descriptor persisted
-        // by a pre-gate build survives reload and squats the feed head / evades the
-        // capacity-trim on every restart. `load()` reads the real wall clock (not
-        // injectable), so the future descriptor is dated well beyond the window.
+    fn load_retains_future_dated_descriptor_and_display_excludes_it() {
+        // ZEB-831/VF (Greptile PR #580 P1): a future-dated descriptor persisted by
+        // a pre-gate build — or by this build under a since-corrected clock — must
+        // be RETAINED across reload and write-back, never deleted on a clock
+        // reading. It is hidden from the displayed feed (`list_descriptors`) while
+        // it looks future-dated and reappears once the clock is corrected. The old
+        // load-time drop let the next `save()` rewrite `vine_feed.json` from the
+        // filtered state, permanently purging it (and, on a clock set *behind* real
+        // time, the entire honest feed).
         let dir = tempfile::tempdir().expect("tempdir");
         let now_real = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2218,18 +2240,37 @@ mod tests {
             assert_eq!(cache.len_descriptors(), 2);
         }
 
-        // Reload uses the REAL wall clock: the future-dated descriptor is beyond
-        // the display-skew window and must be dropped; the legit one is kept.
+        // Reload uses the REAL wall clock. The future-dated descriptor is NOT
+        // deleted — it stays in the store — but is excluded from the display feed;
+        // the legit one is both retained and shown.
         let cache2 = VineFeedCache::load(dir.path());
         assert!(
             cache2.has_descriptor("vine-legit"),
             "legit descriptor survives reload"
         );
         assert!(
-            !cache2.has_descriptor("vine-future"),
-            "future-dated descriptor must be dropped on load, not squat the feed"
+            cache2.has_descriptor("vine-future"),
+            "future-dated descriptor is RETAINED on load, not deleted"
         );
-        assert_eq!(cache2.len_descriptors(), 1);
+        assert_eq!(cache2.len_descriptors(), 2);
+
+        let listed = cache2.list_descriptors();
+        assert_eq!(
+            listed.len(),
+            1,
+            "display feed excludes the future-dated row"
+        );
+        assert_eq!(listed[0].id, "vine-legit");
+
+        // The P1 regression guard: a write-back (the path any later mutation
+        // takes) must NOT purge the future-dated descriptor from disk.
+        cache2.save_for_test();
+        let cache3 = VineFeedCache::load(dir.path());
+        assert!(
+            cache3.has_descriptor("vine-future"),
+            "future-dated descriptor survives write-back — no permanent deletion (P1)"
+        );
+        assert_eq!(cache3.len_descriptors(), 2);
     }
 
     #[test]
