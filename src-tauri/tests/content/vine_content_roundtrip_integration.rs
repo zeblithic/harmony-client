@@ -86,7 +86,9 @@ fn make_vine_descriptor(vine_id: &str, creator: &str, video_cid_hex: &str) -> Ve
         id: vine_id.to_string(),
         creator_address: crate::vine_signing_testutil::addr(creator),
         creator_name: "Test Creator".to_string(),
-        created_at: 1_700_000_000_000,
+        // created_at is SECONDS (compared against now_ms/1000). The now_ms args
+        // below are ms (~2023); this is the matching seconds value.
+        created_at: 1_700_000_000,
         video_cid: video_cid_hex.to_string(),
         title: Some("Test Vine".to_string()),
         reshare_of: None,
@@ -557,7 +559,8 @@ async fn vine_full_round_trip_publish_feed_view_fetch_reshare() {
         id: reshare_id.to_string(),
         creator_address: resharer_addr.clone(),
         creator_name: "Resharer".to_string(),
-        created_at: 1_700_000_002_000,
+        // Seconds (see the descriptor above); 2 s after the first descriptor.
+        created_at: 1_700_000_002,
         video_cid: cid_hex.clone(), // a reshare points at the same video CID
         title: None,
         reshare_of: Some(vine_id.to_string()),

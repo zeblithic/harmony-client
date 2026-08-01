@@ -9323,7 +9323,7 @@ mod vine_tombstone_routing_tests {
             &format!("harmony/vines/{addr}"),
             &serde_json::to_vec(&d).unwrap(),
             &HashSet::new(),
-            1_000,
+            1_700_000_000_000, // ms; now_secs matches the descriptor's created_at (1_700_000_000)
         );
         assert!(matches!(
             outcome,

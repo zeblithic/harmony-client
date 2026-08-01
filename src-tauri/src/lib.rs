@@ -116,6 +116,7 @@ pub mod butler_deposit;
 pub mod channel_backfill;
 pub mod channel_chunk_index;
 pub mod channel_rbsr;
+pub mod clock_trust;
 pub mod community_address_book;
 pub mod community_channel_log;
 pub mod community_channel_log_engine;
@@ -17584,7 +17585,7 @@ mod delete_vine_tests {
             &format!("harmony/vines/{creator}"),
             &serde_json::to_vec(&descriptor).unwrap(),
             &std::collections::HashSet::new(),
-            1_000,
+            1_700_000_000_000, // ms; now_secs matches the descriptor's created_at (1_700_000_000)
         );
         assert!(matches!(
             outcome,
@@ -17646,7 +17647,7 @@ mod delete_vine_tests {
             &format!("harmony/vines/{creator}"),
             &serde_json::to_vec(&descriptor).unwrap(),
             &std::collections::HashSet::new(),
-            1_000,
+            1_700_000_000_000, // ms; now_secs matches the descriptor's created_at (1_700_000_000)
         );
         let (publish_tx, _rx) = tokio::sync::mpsc::channel(4);
         let state = Mutex::new(NodeState {
@@ -17687,7 +17688,7 @@ mod delete_vine_tests {
             &format!("harmony/vines/{node_addr}"),
             &serde_json::to_vec(&descriptor).unwrap(),
             &std::collections::HashSet::new(),
-            1_000,
+            1_700_000_000_000, // ms; now_secs matches the descriptor's created_at (1_700_000_000)
         );
         let (publish_tx, mut publish_rx) = tokio::sync::mpsc::channel(4);
         let state = Mutex::new(NodeState {

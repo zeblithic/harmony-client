@@ -457,6 +457,19 @@ impl VineFeedCache {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let age_cutoff = now_secs.saturating_sub(MAX_AGE_SECS);
+        // Backward age bound ONLY. The ZEB-831/VF forward-skew bound is
+        // deliberately NOT applied here: load must never delete a persisted
+        // descriptor on a clock reading (Greptile PR #580 P1). `save()` rewrites
+        // `vine_feed.json` from the in-memory set, so a load-time drop is made
+        // permanent by the next mutation — and a local clock set *behind* real
+        // time makes every honest descriptor look future-dated, which would purge
+        // the entire feed irreversibly (the `now_secs == 0` guard only catches an
+        // epoch-zero clock, not a slow one). Unlike the ingest gate in
+        // `on_descriptor_sample`, whose rejection is recoverable via re-gossip, a
+        // load-delete is not. The forward gate instead lives in `list_descriptors`
+        // as a non-destructive, live-re-evaluated display filter: a future-dated
+        // descriptor is hidden from the feed but retained on disk, and reappears
+        // once the clock is corrected.
         let mut descriptors: Vec<DescriptorOnDisk> = file
             .descriptors
             .into_iter()
@@ -705,6 +718,25 @@ impl VineFeedCache {
             )));
         }
 
+        // ZEB-831 / VF (ZEB-818): forward-skew gate. The age gate above is a
+        // BACKWARD bound only; without a forward bound a future-dated
+        // `created_at` survives ingest, is immune to the capacity-trim below
+        // (which drops the *oldest* `created_at`, so honest entries are evicted
+        // instead), and pins the top of the feed forever (`list_descriptors`
+        // sorts `created_at` DESC). Reject anything dated further ahead than the
+        // display-tier tolerance, mirroring the sibling pull-cursor bound
+        // (`vine_pull_driver::VINE_PULL_INVALID_FORWARD_SKEW_SECS`). Seconds domain.
+        if crate::clock_trust::reject_future(
+            descriptor.created_at,
+            now_secs,
+            crate::clock_trust::DISPLAY_SKEW_TOLERANCE_SECS,
+        ) {
+            return Some(DescriptorOutcome::Rejected(format!(
+                "descriptor {} is dated further ahead than the plausible clock window",
+                descriptor.id
+            )));
+        }
+
         let source = if followed_set.contains(&descriptor.creator_address) {
             VineSource::Followed
         } else {
@@ -759,9 +791,31 @@ impl VineFeedCache {
     /// `created_at` DESC. `viewed` is populated by joining with the
     /// `self.viewed` HashSet (local-only viewed-state).
     pub fn list_descriptors(&self) -> Vec<VineVideoDto> {
+        // ZEB-831/VF: forward-skew display gate, re-evaluated against the LIVE
+        // clock on every call. A descriptor dated further ahead than the display
+        // tolerance must not squat the feed head (`created_at` DESC) or displace
+        // honest entries — but this is the *non-destructive* counterpart to the
+        // ingest gate in `on_descriptor_sample`: hiding a future-dated descriptor
+        // from the view never removes it from the store, so a corrected clock (or
+        // a since-elapsed `created_at`) restores it (Greptile PR #580 P1 — a load-
+        // time drop would let `save()` purge it permanently). Broken clock
+        // (now_secs == 0) shows everything, matching the load path's age-filter
+        // fallback ("keep data over hiding it").
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let mut out: Vec<VineVideoDto> = self
             .descriptors
             .values()
+            .filter(|cv| {
+                now_secs == 0
+                    || !crate::clock_trust::reject_future(
+                        cv.descriptor.created_at,
+                        now_secs,
+                        crate::clock_trust::DISPLAY_SKEW_TOLERANCE_SECS,
+                    )
+            })
             .map(|cv| VineVideoDto {
                 id: cv.descriptor.id.clone(),
                 creator_address: cv.descriptor.creator_address.clone(),
@@ -1771,7 +1825,8 @@ mod tests {
                 None,
                 None,
             );
-            let out = cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
+            let out =
+                cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, now_secs * 1000);
             assert!(
                 matches!(out, Some(DescriptorOutcome::Inserted { .. })),
                 "got {out:?}"
@@ -2030,7 +2085,12 @@ mod tests {
         );
         let followed = followed_set_with(&["alice-addr"]);
 
-        let outcome = cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 1_000);
+        let outcome = cache.on_descriptor_sample(
+            &topic("alice-addr"),
+            &payload,
+            &followed,
+            1_700_000_000_000,
+        );
 
         match outcome {
             Some(DescriptorOutcome::Inserted { dto }) => {
@@ -2045,6 +2105,175 @@ mod tests {
     }
 
     #[test]
+    fn future_dated_descriptor_beyond_display_skew_is_rejected() {
+        // ZEB-831 / VF (ZEB-818): a descriptor whose created_at is further ahead
+        // than the display-tier tolerance must be rejected at ingest — otherwise
+        // it pins the top of the feed forever and is immune to capacity-trim.
+        let mut cache = VineFeedCache::new();
+        let now_secs: u64 = 1_700_000_000;
+        let now_ms = now_secs * 1000;
+        let followed = followed_set_with(&["alice-addr"]);
+
+        // A legit, recent descriptor inserts.
+        let legit = canonical_descriptor_bytes(
+            "vine-legit",
+            "alice-addr",
+            "Alice",
+            "cid-legit",
+            None,
+            None,
+            now_secs,
+            None,
+            None,
+        );
+        assert!(matches!(
+            cache.on_descriptor_sample(&topic("alice-addr"), &legit, &followed, now_ms),
+            Some(DescriptorOutcome::Inserted { .. })
+        ));
+
+        // A poisoned descriptor dated one second past the display tolerance is rejected.
+        let poisoned = canonical_descriptor_bytes(
+            "vine-poison",
+            "alice-addr",
+            "Alice",
+            "cid-poison",
+            None,
+            None,
+            now_secs + crate::clock_trust::DISPLAY_SKEW_TOLERANCE_SECS + 1,
+            None,
+            None,
+        );
+        match cache.on_descriptor_sample(&topic("alice-addr"), &poisoned, &followed, now_ms) {
+            Some(DescriptorOutcome::Rejected(_)) => {}
+            other => panic!("expected Rejected for future-dated descriptor, got {other:?}"),
+        }
+
+        // The poisoned descriptor never entered the cache; the legit one still leads.
+        let listed = cache.list_descriptors();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "vine-legit");
+
+        // Boundary: exactly at the tolerance ceiling is accepted.
+        let edge = canonical_descriptor_bytes(
+            "vine-edge",
+            "alice-addr",
+            "Alice",
+            "cid-edge",
+            None,
+            None,
+            now_secs + crate::clock_trust::DISPLAY_SKEW_TOLERANCE_SECS,
+            None,
+            None,
+        );
+        assert!(matches!(
+            cache.on_descriptor_sample(&topic("alice-addr"), &edge, &followed, now_ms),
+            Some(DescriptorOutcome::Inserted { .. })
+        ));
+    }
+
+    #[test]
+    fn load_retains_future_dated_descriptor_and_display_excludes_it() {
+        // ZEB-831/VF (Greptile PR #580 P1): a future-dated descriptor persisted by
+        // a pre-gate build — or by this build under a since-corrected clock — must
+        // be RETAINED across reload and write-back, never deleted on a clock
+        // reading. It is hidden from the displayed feed (`list_descriptors`) while
+        // it looks future-dated and reappears once the clock is corrected. The old
+        // load-time drop let the next `save()` rewrite `vine_feed.json` from the
+        // filtered state, permanently purging it (and, on a clock set *behind* real
+        // time, the entire honest feed).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now_real = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let followed = followed_set_with(&["alice-addr"]);
+
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+
+            // A far-future descriptor (400 days ahead). It only reaches disk
+            // because at insert time we feed a matching future `now_ms`, so the
+            // runtime gate passes it — modeling state a pre-gate build persisted.
+            let future_secs = now_real + 400 * 86_400;
+            let future = canonical_descriptor_bytes(
+                "vine-future",
+                "alice-addr",
+                "Alice",
+                "cid-fut",
+                None,
+                None,
+                future_secs,
+                None,
+                None,
+            );
+            assert!(matches!(
+                cache.on_descriptor_sample(
+                    &topic("alice-addr"),
+                    &future,
+                    &followed,
+                    future_secs * 1000
+                ),
+                Some(DescriptorOutcome::Inserted { .. })
+            ));
+
+            // A legit, current descriptor.
+            let legit = canonical_descriptor_bytes(
+                "vine-legit",
+                "alice-addr",
+                "Alice",
+                "cid-legit",
+                None,
+                None,
+                now_real,
+                None,
+                None,
+            );
+            assert!(matches!(
+                cache.on_descriptor_sample(
+                    &topic("alice-addr"),
+                    &legit,
+                    &followed,
+                    now_real * 1000
+                ),
+                Some(DescriptorOutcome::Inserted { .. })
+            ));
+            assert_eq!(cache.len_descriptors(), 2);
+        }
+
+        // Reload uses the REAL wall clock. The future-dated descriptor is NOT
+        // deleted — it stays in the store — but is excluded from the display feed;
+        // the legit one is both retained and shown.
+        let cache2 = VineFeedCache::load(dir.path());
+        assert!(
+            cache2.has_descriptor("vine-legit"),
+            "legit descriptor survives reload"
+        );
+        assert!(
+            cache2.has_descriptor("vine-future"),
+            "future-dated descriptor is RETAINED on load, not deleted"
+        );
+        assert_eq!(cache2.len_descriptors(), 2);
+
+        let listed = cache2.list_descriptors();
+        assert_eq!(
+            listed.len(),
+            1,
+            "display feed excludes the future-dated row"
+        );
+        assert_eq!(listed[0].id, "vine-legit");
+
+        // The P1 regression guard: a write-back (the path any later mutation
+        // takes) must NOT purge the future-dated descriptor from disk.
+        cache2.save_for_test();
+        let cache3 = VineFeedCache::load(dir.path());
+        assert!(
+            cache3.has_descriptor("vine-future"),
+            "future-dated descriptor survives write-back — no permanent deletion (P1)"
+        );
+        assert_eq!(cache3.len_descriptors(), 2);
+    }
+
+    #[test]
     fn on_descriptor_sample_unfollowed_creator_inserts_with_discover_source() {
         let mut cache = VineFeedCache::new();
         let payload = canonical_descriptor_bytes(
@@ -2052,7 +2281,8 @@ mod tests {
         );
         let followed = followed_set_with(&["someone-else"]);
 
-        let outcome = cache.on_descriptor_sample(&topic("bob-addr"), &payload, &followed, 2_000);
+        let outcome =
+            cache.on_descriptor_sample(&topic("bob-addr"), &payload, &followed, 1_700_000_100_000);
 
         match outcome {
             Some(DescriptorOutcome::Inserted { dto }) => {
@@ -2079,12 +2309,22 @@ mod tests {
         let followed = followed_set_with(&["alice-addr"]);
 
         // First arrival
-        let first = cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 3_000);
+        let first = cache.on_descriptor_sample(
+            &topic("alice-addr"),
+            &payload,
+            &followed,
+            1_700_000_200_000,
+        );
         assert!(matches!(first, Some(DescriptorOutcome::Inserted { .. })));
 
         // Same vine_id arrives again — even if followed_set changed
         let followed2 = followed_set_with(&[]); // empty
-        let second = cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed2, 4_000);
+        let second = cache.on_descriptor_sample(
+            &topic("alice-addr"),
+            &payload,
+            &followed2,
+            1_700_000_201_000,
+        );
         assert_eq!(second, Some(DescriptorOutcome::AlreadyPresent));
         assert_eq!(cache.len_descriptors(), 1);
 
@@ -2095,7 +2335,12 @@ mod tests {
         // to re-insert based on a "now followed" signal, this third call
         // would return Inserted{Followed}.
         let followed3 = followed_set_with(&["alice-addr"]);
-        let third = cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed3, 5_000);
+        let third = cache.on_descriptor_sample(
+            &topic("alice-addr"),
+            &payload,
+            &followed3,
+            1_700_000_202_000,
+        );
         assert_eq!(third, Some(DescriptorOutcome::AlreadyPresent));
         assert_eq!(cache.len_descriptors(), 1);
     }
@@ -2585,7 +2830,8 @@ mod tests {
                 None,
                 None,
             );
-            let out = cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
+            let out =
+                cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, now_secs * 1000);
             assert!(matches!(out, Some(DescriptorOutcome::Inserted { .. })));
 
             let react =
@@ -2747,7 +2993,8 @@ mod tests {
                 None,
                 None,
             );
-            let out = cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
+            let out =
+                cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, now_secs * 1000);
             assert!(matches!(out, Some(DescriptorOutcome::Inserted { .. })));
             // No explicit save_for_test() call — Task 4 wires save() into
             // on_descriptor_sample, so the disk must already reflect this.
@@ -2781,7 +3028,7 @@ mod tests {
                 None,
                 None,
             );
-            cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
+            cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, now_secs * 1000);
 
             // Insert reaction
             let react = canonical_reaction_bytes("vine-r1", "bob-addr", "Bob", true, recent + 10);
@@ -2835,7 +3082,7 @@ mod tests {
                 None,
                 None,
             );
-            cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
+            cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, now_secs * 1000);
             let react = canonical_reaction_bytes("vine-ri", "bob-addr", "Bob", true, recent + 10);
             let out = cache.on_reaction_sample(
                 &reaction_topic("alice-addr", "vine-ri", "bob-addr"),
@@ -2878,7 +3125,7 @@ mod tests {
                 None,
                 None,
             );
-            cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 1_000);
+            cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, now_secs * 1000);
             let r1 = canonical_reaction_bytes("vine-lr", "bob-addr", "Bob", true, recent + 10);
             cache.on_reaction_sample(&reaction_topic("alice-addr", "vine-lr", "bob-addr"), &r1, 0);
             let r2 = canonical_reaction_bytes("vine-lr", "ann-addr", "Ann", false, recent + 11);
@@ -2977,8 +3224,12 @@ mod tests {
                 Some("Original"),
             );
             let followed = followed_set_with(&["addr-resharer"]);
-            let outcome =
-                cache.on_descriptor_sample(&topic("addr-resharer"), &payload, &followed, 1_000);
+            let outcome = cache.on_descriptor_sample(
+                &topic("addr-resharer"),
+                &payload,
+                &followed,
+                now_secs * 1000,
+            );
             assert!(
                 matches!(outcome, Some(DescriptorOutcome::Inserted { .. })),
                 "expected Inserted, got {outcome:?}"
@@ -3068,7 +3319,14 @@ mod tests {
                 None,
                 None,
             );
-            cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 0);
+            // Clock consistent with the largest created_at so the forward-skew
+            // gate rejects none of these inserts (all still within the window).
+            cache.on_descriptor_sample(
+                &topic("alice-addr"),
+                &payload,
+                &followed,
+                (total as u64) * 1_000,
+            );
         }
         assert_eq!(cache.len_descriptors(), MAX_DESCRIPTORS);
 
@@ -3116,7 +3374,16 @@ mod tests {
                 None,
                 None,
             );
-            cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 0);
+            // Clock large enough that every inserted created_at is in-window for
+            // the forward-skew gate, yet still well under MAX_AGE_SECS so the
+            // deliberately-ancient v-ancient below reaches the capacity-trim
+            // (not the backward age gate).
+            cache.on_descriptor_sample(
+                &topic("alice-addr"),
+                &payload,
+                &followed,
+                (MAX_DESCRIPTORS as u64 + 1_000) * 1_000,
+            );
         }
         assert_eq!(cache.len_descriptors(), MAX_DESCRIPTORS);
 
@@ -3132,7 +3399,12 @@ mod tests {
             None,
             None,
         );
-        let outcome = cache.on_descriptor_sample(&topic("alice-addr"), &old_payload, &followed, 0);
+        let outcome = cache.on_descriptor_sample(
+            &topic("alice-addr"),
+            &old_payload,
+            &followed,
+            (MAX_DESCRIPTORS as u64 + 1_000) * 1_000,
+        );
 
         // Must NOT be Inserted — the vine was trimmed away before
         // persistence. Must be Rejected so the event loop does not emit.
@@ -3261,7 +3533,12 @@ mod tests {
                 None,
                 None,
             );
-            runtime_cache.on_descriptor_sample(&topic("alice-addr"), &payload, &followed, 0);
+            runtime_cache.on_descriptor_sample(
+                &topic("alice-addr"),
+                &payload,
+                &followed,
+                shared_ts * 1_000,
+            );
         }
         // The runtime trim should have dropped exactly one descriptor.
         assert_eq!(runtime_cache.len_descriptors(), MAX_DESCRIPTORS);
@@ -3377,8 +3654,12 @@ mod tests {
             None,
             None,
         );
-        let outcome =
-            cache.on_descriptor_sample(&topic(addr), &payload, &followed_set_with(&[]), 1_000);
+        let outcome = cache.on_descriptor_sample(
+            &topic(addr),
+            &payload,
+            &followed_set_with(&[]),
+            1_700_000_000_000,
+        );
         assert!(
             matches!(outcome, Some(DescriptorOutcome::Inserted { .. })),
             "fixture insert failed: {outcome:?}"
@@ -3404,8 +3685,12 @@ mod tests {
             Some(origin_addr),
             Some("Creator"),
         );
-        let outcome =
-            cache.on_descriptor_sample(&topic(resharer), &payload, &followed_set_with(&[]), 1_000);
+        let outcome = cache.on_descriptor_sample(
+            &topic(resharer),
+            &payload,
+            &followed_set_with(&[]),
+            1_700_000_100_000,
+        );
         assert!(
             matches!(outcome, Some(DescriptorOutcome::Inserted { .. })),
             "fixture reshare insert failed: {outcome:?}"
@@ -3734,7 +4019,7 @@ mod tests {
             &topic("victim-addr"),
             &payload,
             &followed_set_with(&[]),
-            1_000,
+            1_700_000_000_000,
         );
         assert!(
             matches!(outcome, Some(DescriptorOutcome::Inserted { .. })),
