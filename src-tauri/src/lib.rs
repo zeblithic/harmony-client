@@ -110,6 +110,7 @@ mod zeb398_content_policy_tests {
 pub mod address_book_sync;
 pub mod api;
 mod app_tracing;
+pub mod avatar_blob_store;
 pub mod backup_state;
 pub mod butler_deposit;
 pub mod channel_backfill;
@@ -817,6 +818,10 @@ pub struct NodeState {
     /// owner Ed25519 identity). Command-path signer for vine tombstones
     /// (`delete_vine`). Cleared on stop alongside `dm_identity_pub_64`.
     owner_private_identity: Option<std::sync::Arc<harmony_identity::PrivateIdentity>>,
+    /// ZEB-841: durable content-addressed avatar-byte cache (`{data_dir}/avatars/`).
+    /// `fetch_avatar` reads it disk-first and writes through, so a known peer's
+    /// picture renders offline / after restart. `None` until a node is started.
+    avatar_blob_store: Option<std::sync::Arc<avatar_blob_store::AvatarBlobStore>>,
     /// Shared mail manager (read/written by event loop on receive, by commands for queries).
     mail_mgr: Option<std::sync::Arc<std::sync::Mutex<mail::MailManager>>>,
     /// Shared mail sync (walker + lazy body fetch). Stored here so Tauri
@@ -1909,6 +1914,7 @@ impl Default for NodeState {
             followed_set: None,
             vine_feed_cache: None,
             owner_private_identity: None,
+            avatar_blob_store: None,
             mail_mgr: None,
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
@@ -3623,6 +3629,9 @@ pub async fn start_node_inner(
     // MailManager will be initialized after identity loading (needs owner address).
     // Placeholder — set below once we have our_addr_bytes.
     let mail_mgr: std::sync::Arc<std::sync::Mutex<mail::MailManager>>;
+    // ZEB-841: avatar-byte cache, constructed alongside mail below. Placeholder
+    // at the outer scope so it survives to the `guard.*` write-back far below.
+    let avatar_blob_store: std::sync::Arc<avatar_blob_store::AvatarBlobStore>;
 
     // Stop existing node — extract handles under the lock in a tight
     // inner scope so the std `MutexGuard` (which is `!Send`) is fully
@@ -4049,6 +4058,14 @@ pub async fn start_node_inner(
             &app_data_dir.join("mail"),
             our_addr_bytes,
         )));
+
+        // ZEB-841: durable avatar-byte cache under the per-identity data dir
+        // (wiped on identity reset with `mail/`). Content-addressed, so it needs
+        // no owner address — just a directory and a byte budget.
+        avatar_blob_store = std::sync::Arc::new(crate::avatar_blob_store::AvatarBlobStore::load(
+            &app_data_dir.join("avatars"),
+            crate::avatar_blob_store::DEFAULT_MAX_BYTES,
+        ));
 
         // Construct MailSync now that identity, mail_mgr, and the refresh
         // channel are all available. Owns a clone of fetch_tx (so commands
@@ -12292,6 +12309,7 @@ pub async fn start_node_inner(
                         // ZEB-670: tombstone signer for delete_vine.
                         guard.owner_private_identity =
                             Some(std::sync::Arc::clone(&private_identity_arc));
+                        guard.avatar_blob_store = Some(avatar_blob_store);
                         guard.mail_mgr = Some(mail_mgr);
                         guard.mail_sync = Some(mail_sync);
                         guard.node_addr = node_addr_for_state;
@@ -25802,18 +25820,30 @@ async fn fetch_avatar(
         return Err(format!("invalid CID hex: {cid}"));
     }
 
-    let fetch_tx = {
+    let (fetch_tx, avatar_store) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
-        guard
+        let fetch_tx = guard
             .fetch_tx
             .clone()
-            .ok_or_else(|| "not connected".to_string())?
+            .ok_or_else(|| "not connected".to_string())?;
+        // ZEB-841: clone the Arc so all disk I/O happens with the NodeState
+        // lock released (same shape as the fetch_tx clone above).
+        (fetch_tx, guard.avatar_blob_store.clone())
     };
+
+    // ZEB-841 disk-first: a CID is an immutable content-address, so a cached
+    // blob is always exactly the requested content — this serves the avatar with
+    // no network and works while the source peer is offline / after a restart.
+    if let Some(store) = &avatar_store {
+        if let Some(bytes) = store.get(&cid) {
+            return Ok(bytes);
+        }
+    }
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     fetch_tx
         .send(event_loop::FetchRequest {
-            cid_hex: cid,
+            cid_hex: cid.clone(),
             reply: reply_tx,
             max_bytes: Some(AVATAR_MAX_BYTES),
             serveable: false,
@@ -25821,9 +25851,18 @@ async fn fetch_avatar(
         .await
         .map_err(|_| "event loop not running".to_string())?;
 
-    reply_rx
+    let bytes = reply_rx
         .await
-        .map_err(|_| "event loop dropped fetch request".to_string())?
+        .map_err(|_| "event loop dropped fetch request".to_string())??;
+
+    // ZEB-841 write-through: persist so the next fetch (this session or after a
+    // restart) is served from disk. Best-effort — the store swallows its own
+    // errors and re-verifies hash==cid before writing.
+    if let Some(store) = &avatar_store {
+        store.put(&cid, &bytes);
+    }
+
+    Ok(bytes)
 }
 
 // =====================================================================
@@ -76566,6 +76605,7 @@ mod start_node_race_tests {
             followed_set: None,
             vine_feed_cache: None,
             owner_private_identity: None,
+            avatar_blob_store: None,
             mail_mgr: None,
             mail_sync: None,
             content_index: std::sync::Arc::new(std::sync::Mutex::new(
