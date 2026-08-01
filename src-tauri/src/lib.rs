@@ -198,6 +198,7 @@ pub mod friend_nicknames;
 pub mod friend_rendezvous;
 pub mod friend_requests;
 pub mod friend_token;
+pub mod hlc_adopt_floor;
 pub mod identity;
 pub mod identity_commands;
 pub mod invite_mint;
