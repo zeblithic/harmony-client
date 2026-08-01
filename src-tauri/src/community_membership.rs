@@ -808,6 +808,12 @@ pub enum VerifyError {
     /// power lookups and invite-only countersigning would credit the
     /// wrong community's state.
     WrongCommunity,
+    /// ZEB-846 (Layer 1): event `at.wall_ms` is implausibly far ahead of the
+    /// receiver's clock (beyond `clock_trust::MAX_FORWARD_SKEW_MS`). Fires
+    /// only when `VerifyContext.now_ms` is `Some` (a trusted receiver clock
+    /// is available) — defense-in-depth so a future-dated membership event
+    /// never enters the persisted log or gets re-gossiped.
+    FutureSkew,
     SignatureInvalid,
     CounterSigRequired,
     /// A countersig is present on an event where it shouldn't be —
@@ -1182,6 +1188,10 @@ impl std::fmt::Display for VerifyError {
             VerifyError::WrongCommunity => write!(
                 f,
                 "event.community_id does not match the verifier's expected community"
+            ),
+            VerifyError::FutureSkew => write!(
+                f,
+                "ZEB-846: event.at.wall_ms is beyond the receiver's clock_trust::MAX_FORWARD_SKEW_MS tolerance"
             ),
             VerifyError::SignatureInvalid => write!(f, "signature invalid"),
             VerifyError::CounterSigRequired => write!(f, "invite-only Join requires countersig"),
@@ -3984,6 +3994,16 @@ pub struct VerifyContext {
     pub expected_community_id: SpaceId,
     pub admin_addr: OwnerAddr,
     pub is_invite_only: bool,
+    /// ZEB-846 (Layer 1): the receiver's own trusted wall clock (ms),
+    /// `SystemTime::now()` — never a peer-supplied or `HlcAdoptFloor`
+    /// value; a forward bound is only sound when measured against a clock
+    /// the attacker cannot move. `Some(now)` ⇒ `verify_event` rejects an
+    /// event whose `at.wall_ms` is more than `clock_trust::MAX_FORWARD_SKEW_MS`
+    /// beyond `now`. `None` ⇒ no forward reject (apply-all) — a bad local
+    /// clock must never drop honest governance. Only the live network-merge
+    /// site threads `Some`; all other constructors (local inserts,
+    /// pre-flight bootstrap-admit helpers, and every test) pass `None`.
+    pub now_ms: Option<u64>,
 }
 
 /// Full membership-event verification per ZEB-217 spec §"Verification".
@@ -4037,6 +4057,25 @@ pub fn verify_event(
     //    real cause).
     if event.community_id != ctx.expected_community_id {
         return Err(VerifyError::WrongCommunity);
+    }
+
+    // 0a. ZEB-846 (Layer 1): reject an implausibly-future wall before any
+    //     further work, so poison never enters the persisted log or gets
+    //     re-gossiped. Only when a trusted receiver clock is supplied
+    //     (`ctx.now_ms: Some`) — otherwise apply-all, since a bad local
+    //     clock must never drop honest governance. Defense-in-depth: the
+    //     insert-time prior-state materialize is NOT given this ceiling
+    //     (it reconstructs state to verify THIS new event, and the
+    //     authorization reads carry their own receiver ceiling separately)
+    //     — only admission of the new event itself is gated here.
+    if let Some(now) = ctx.now_ms {
+        if crate::clock_trust::reject_future(
+            event.at.wall_ms,
+            now,
+            crate::clock_trust::MAX_FORWARD_SKEW_MS,
+        ) {
+            return Err(VerifyError::FutureSkew);
+        }
     }
 
     // 0b. Countersig presence rule: a countersig is allowed ONLY on
@@ -5078,6 +5117,7 @@ pub fn bootstrap_admit_open_publisher(
     publisher_at: &Hlc,
 ) -> Option<MemberState> {
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id,
         admin_addr,
         is_invite_only: false,
@@ -5189,6 +5229,7 @@ pub fn bootstrap_admit_invite_only_publisher(
     publisher_at: &Hlc,
 ) -> Option<MemberState> {
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id,
         admin_addr,
         is_invite_only: true,
@@ -7911,6 +7952,7 @@ mod tests {
         };
         let prior = MaterializedMembership::default();
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: cid,
             admin_addr: admin.owner,
             is_invite_only: false,
@@ -7965,6 +8007,7 @@ mod tests {
         let rotation_event = sign_with_identity(rotation_payload, &attacker_priv);
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -7977,6 +8020,81 @@ mod tests {
         assert!(
             matches!(result, Err(VerifyError::SignerNotEnrolledForActor)),
             "EpochRotation from never-member must be rejected with SignerNotEnrolledForActor; got {result:?}"
+        );
+    }
+
+    /// ZEB-846 (Layer 1): verify_event rejects a Join whose wall clock is
+    /// implausibly far ahead of the receiver's own clock, before any
+    /// signature/power work runs — so poison never enters the persisted
+    /// log or gets re-gossiped. The boundary is inclusive (`now +
+    /// MAX_FORWARD_SKEW_MS` itself is accepted). `now_ms: None` must NOT
+    /// reject — a bad local clock must never drop honest governance.
+    #[test]
+    fn verify_event_rejects_far_future_wall_when_receiver_now_present() {
+        let community_id = SpaceId([0xc0; 16]);
+        let (admin_owner, _pk, admin_addr) = make_identity(1);
+        let (_o, _p, joiner) = make_identity(2);
+
+        // Admin-mint setup mirrored from
+        // `verify_event_rejects_unauthorized_epoch_rotation_from_never_member`
+        // above: an admin Join materialized into `prior` so the admin's
+        // power/enrolled key are established.
+        let admin_join_payload = EventPayload {
+            id: [0x01; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin_addr,
+            at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "t".into(),
+            },
+        };
+        let admin_join = sign_with_identity(admin_join_payload, &admin_owner);
+        let prior = materialize(std::slice::from_ref(&admin_join), admin_addr);
+
+        let now = 1_000_000u64;
+        let future_join = make_join_event(
+            10,
+            joiner,
+            now + crate::clock_trust::MAX_FORWARD_SKEW_MS + 1,
+        );
+
+        let ctx_bounded = VerifyContext {
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: false,
+            now_ms: Some(now),
+        };
+        assert!(
+            matches!(
+                verify_event(&future_join, &prior, &ctx_bounded),
+                Err(VerifyError::FutureSkew)
+            ),
+            "a wall beyond now+5min must be rejected at admission when a receiver clock is present"
+        );
+
+        // Boundary: exactly now+5min is accepted (reject_future is inclusive).
+        let edge_join = make_join_event(11, joiner, now + crate::clock_trust::MAX_FORWARD_SKEW_MS);
+        assert!(
+            !matches!(
+                verify_event(&edge_join, &prior, &ctx_bounded),
+                Err(VerifyError::FutureSkew)
+            ),
+            "exactly now+5min is within the inclusive bound"
+        );
+
+        // None ⇒ no forward reject (bad local clock must not drop honest events).
+        let ctx_unbounded = VerifyContext {
+            now_ms: None,
+            ..ctx_bounded
+        };
+        assert!(
+            !matches!(
+                verify_event(&future_join, &prior, &ctx_unbounded),
+                Err(VerifyError::FutureSkew)
+            ),
+            "None receiver clock disables the forward reject"
         );
     }
 
@@ -8039,6 +8157,7 @@ mod tests {
         let catchup_event = sign_with_identity(catchup_payload, &bob_priv);
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -8338,6 +8457,7 @@ mod tests {
         let unban = sign_with_identity(unban_payload, &admin_priv);
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -8409,6 +8529,7 @@ mod tests {
         };
         let unban = sign_with_identity(unban_payload, &mod_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -8450,6 +8571,7 @@ mod tests {
         };
         let unban = sign_with_identity(unban_payload, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -8491,6 +8613,7 @@ mod tests {
         };
         let unban = sign_with_identity(unban_payload, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -8533,6 +8656,7 @@ mod tests {
         };
         let kick = sign_with_identity(kick_payload, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -8576,6 +8700,7 @@ mod tests {
         };
         let unban = sign_with_identity(unban_payload, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -8930,6 +9055,7 @@ mod tests {
             &regular_priv,
         );
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -9050,6 +9176,7 @@ mod tests {
         );
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -9079,6 +9206,7 @@ mod tests {
             &admin_priv,
         );
         let admin_ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -9133,6 +9261,7 @@ mod tests {
             &outsider_priv,
         );
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -9732,6 +9861,7 @@ mod tests {
         let ev = sign_event(&invite_payload, &low.device_key).expect("sign invite");
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: admin.owner,
             is_invite_only: false,
@@ -9863,6 +9993,7 @@ mod zeb_254_pending_join_verify_tests {
         );
         let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
@@ -9886,6 +10017,7 @@ mod zeb_254_pending_join_verify_tests {
         );
         let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
@@ -9914,6 +10046,7 @@ mod zeb_254_pending_join_verify_tests {
         );
         let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
@@ -9944,6 +10077,7 @@ mod zeb_254_pending_join_verify_tests {
         let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
         // ctx uses admin2 as admin — rogue != admin2, so P2 (inviter != admin) fires.
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: admin2_addr,
             is_invite_only: true,
@@ -9985,6 +10119,7 @@ mod zeb_254_pending_join_verify_tests {
             },
         );
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
@@ -10026,6 +10161,7 @@ mod zeb_254_pending_join_verify_tests {
             },
         );
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
@@ -10069,6 +10205,7 @@ mod zeb_254_pending_join_verify_tests {
             },
         );
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
@@ -10114,6 +10251,7 @@ mod zeb_254_pending_join_verify_tests {
             },
         );
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
@@ -10146,6 +10284,7 @@ mod zeb_254_pending_join_verify_tests {
         let mut event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
         event.enrollment = Some(other.cert.clone());
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
@@ -10493,6 +10632,7 @@ mod zeb_254_join_countersign_verify_tests {
             .insert(admin_addr, joined_with_enrolled(&admin_priv));
         mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
@@ -10509,6 +10649,7 @@ mod zeb_254_join_countersign_verify_tests {
         let event = make_join_countersign_event(&admin_priv, admin_addr, community_id, target);
         let mat = MaterializedMembership::default(); // actor not in members map
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
@@ -10539,6 +10680,7 @@ mod zeb_254_join_countersign_verify_tests {
             .insert(admin_addr, joined_with_enrolled(&admin_priv));
         mat.power_levels.insert(admin_addr, POWER_THRESHOLDS.invite);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: true,
@@ -11659,6 +11801,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -11682,6 +11825,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &actor_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: actor_addr,
             is_invite_only: false,
@@ -11742,6 +11886,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &actor_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: actor_addr,
             is_invite_only: false,
@@ -11784,6 +11929,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -11841,6 +11987,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -11898,6 +12045,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -11955,6 +12103,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -11993,6 +12142,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -12032,6 +12182,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -12086,6 +12237,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &admin1_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: admin1_addr,
             is_invite_only: false,
@@ -12142,6 +12294,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &admin1_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: admin1_addr,
             is_invite_only: false,
@@ -12212,6 +12365,7 @@ mod zeb_250_admin_proposal_verify_tests {
         );
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -12280,6 +12434,7 @@ mod zeb_250_admin_countersign_verify_tests {
             make_admin_countersign_event([0x10; 16], &admin_priv, admin_addr, [0x55; 16], 1_000);
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -12295,6 +12450,7 @@ mod zeb_250_admin_countersign_verify_tests {
             make_admin_countersign_event([0x10; 16], &actor_priv, actor_addr, [0x55; 16], 1_000);
         test_enroll_member(&mut prior, &actor_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: actor_addr,
             is_invite_only: false,
@@ -12330,6 +12486,7 @@ mod zeb_250_admin_countersign_verify_tests {
         let evt = make_admin_countersign_event([0x10; 16], &mod_priv, mod_addr, [0x55; 16], 1_000);
         test_enroll_member(&mut prior, &mod_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: mod_addr,
             is_invite_only: false,
@@ -12371,6 +12528,7 @@ mod zeb_250_admin_countersign_verify_tests {
         );
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -12507,6 +12665,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let evt = make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 100, 1_000);
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -12538,6 +12697,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let evt = make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 50, 1_000);
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -12559,6 +12719,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let evt = make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 50, 1_000);
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -12629,6 +12790,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let evt = make_setpower_event([0x10; 16], &mod_priv, mod_addr, target_addr, 100, 1_000);
         test_enroll_member(&mut prior, &mod_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: owner_addr,
             is_invite_only: false,
@@ -12652,6 +12814,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let evt = make_setpower_event([0x11; 16], &mod_priv, mod_addr, target_addr, 20, 1_000);
         test_enroll_member(&mut prior, &mod_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: owner_addr,
             is_invite_only: false,
@@ -12674,6 +12837,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let evt = make_setpower_event([0x12; 16], &mod_priv, mod_addr, target_addr, 40, 1_000);
         test_enroll_member(&mut prior, &mod_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: owner_addr,
             is_invite_only: false,
@@ -12692,6 +12856,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let evt = make_setpower_event([0x13; 16], &owner_priv, owner_addr, target_addr, 100, 1_000);
         test_enroll_member(&mut prior, &owner_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr: owner_addr,
             is_invite_only: false,
@@ -12784,6 +12949,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let evt = make_kick_event_signed([0x10; 16], &admin_priv, admin_addr, target_addr, 1_000);
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -12805,6 +12971,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
         let evt = make_kick_event_signed([0x10; 16], &admin_priv, admin_addr, target_addr, 1_000);
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -12827,6 +12994,7 @@ mod zeb_250_direct_event_quorum_gate_tests {
             make_setpower_event([0x10; 16], &admin_priv, admin_addr, target_addr, 100, 1_000);
         test_enroll_member(&mut prior, &admin_priv);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -14692,6 +14860,7 @@ mod zeb_713_recovery_verify_tests {
         let digest = recovery_config_digest(&config).expect("digest");
         prior.recovery_designates = Some(config);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: COM,
             admin_addr: admin.owner,
             is_invite_only: false,
@@ -15195,6 +15364,7 @@ mod zeb_251_change_thresholds_verify_tests {
             1_000,
         );
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -15223,6 +15393,7 @@ mod zeb_251_change_thresholds_verify_tests {
             1_000,
         );
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -15254,6 +15425,7 @@ mod zeb_251_change_thresholds_verify_tests {
             1_000,
         );
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -15286,6 +15458,7 @@ mod zeb_251_change_thresholds_verify_tests {
             1_000,
         );
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: SpaceId([0xc0; 16]),
             admin_addr,
             is_invite_only: false,
@@ -15415,6 +15588,7 @@ mod zeb_251_change_thresholds_materialize_tests {
         let invite_ev = sign_event(&invite_payload, &low.device_key).expect("sign invite");
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: admin.owner,
             is_invite_only: false,
@@ -15621,6 +15795,7 @@ mod zeb_251_change_thresholds_materialize_tests {
         let after_ev = make_invite([0xbb; 16], 20_000); // after the raise
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: admin.owner,
             is_invite_only: false,
@@ -15748,6 +15923,7 @@ mod zeb_321_reachability_verify_tests {
             make_reachability_event(community_id, &admin_priv, admin_addr, 1_000_000, 1_000_000);
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -15790,6 +15966,7 @@ mod zeb_321_reachability_verify_tests {
             sign_event(&resigned_payload, &admin_priv.device_key).expect("re-sign envelope");
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -15823,6 +16000,7 @@ mod zeb_321_reachability_verify_tests {
         );
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -15853,6 +16031,7 @@ mod zeb_321_reachability_verify_tests {
             make_reachability_event(community_id, &bob_priv, bob_addr, 1_000_000, 1_000_000);
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -15903,6 +16082,7 @@ mod zeb_321_reachability_verify_tests {
         let event = sign_event(&payload, &admin_priv.device_key).expect("sign envelope");
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr,
             is_invite_only: false,
@@ -16039,6 +16219,7 @@ mod zeb_458_community_relay_announce_verify_tests {
             make_relay_announce_event(community_id, &member, member.owner, 1_000_000, 1_000_000);
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: admin.owner,
             is_invite_only: false,
@@ -16075,6 +16256,7 @@ mod zeb_458_community_relay_announce_verify_tests {
         let resigned = sign_event(&resigned_payload, &member.device_key).expect("re-sign envelope");
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: member.owner,
             is_invite_only: false,
@@ -16100,6 +16282,7 @@ mod zeb_458_community_relay_announce_verify_tests {
         let event = make_relay_announce_event(community_id, &member, member.owner, ad_at, wall_ms);
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: member.owner,
             is_invite_only: false,
@@ -16125,6 +16308,7 @@ mod zeb_458_community_relay_announce_verify_tests {
         let event = make_relay_announce_event(community_id, &bob, bob.owner, 1_000_000, 1_000_000);
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: admin.owner,
             is_invite_only: false,
@@ -16171,6 +16355,7 @@ mod zeb_339_cross_owner_e2e_tests {
         let joiner = mint_test_owner(0x20);
         let community_id = SpaceId([0xCC; 16]);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: creator.owner,
             is_invite_only: true,
@@ -16398,6 +16583,7 @@ mod zeb_339_signing_regression_guard {
         // ── (b) Cert is load-bearing: verify_event passes with cert, fails without ─
         let community_id = SpaceId([0xBB; 16]);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: o.owner,
             is_invite_only: false,
@@ -17082,6 +17268,7 @@ mod zeb_339_signer_verify_tests {
         let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 1_000);
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: owner.owner,
             is_invite_only: false,
@@ -17093,6 +17280,7 @@ mod zeb_339_signer_verify_tests {
         // DeviceAnnounce is not a Join/PendingJoin, so the countersign gate
         // does not apply (it adds a key for an already-admitted owner).
         let ctx_invite = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: owner.owner,
             is_invite_only: true,
@@ -17296,6 +17484,7 @@ mod zeb_339_signer_verify_tests {
         let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 1_000);
 
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: OwnerAddr([0xaa; 16]),
             is_invite_only: false,
@@ -17535,6 +17724,7 @@ mod zeb_339_signer_verify_tests {
 
     fn retire_ctx(community_id: SpaceId, admin: OwnerAddr) -> VerifyContext {
         VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: admin,
             is_invite_only: false,
@@ -18320,6 +18510,7 @@ mod zeb_339_signer_verify_tests {
 
         let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 1_000);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: owner.owner,
             is_invite_only: false,
@@ -18363,6 +18554,7 @@ mod zeb_339_signer_verify_tests {
 
         let announce = make_device_announce(owner.owner, community_id, &device2_sk, &cert2, 1_000);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: owner.owner,
             is_invite_only: false,
@@ -18731,6 +18923,7 @@ mod zeb_813_supersession_tests {
 
         let older = announce(CID, &a, [0xAB; 32], [0x10; 16], 1_000);
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: CID,
             admin_addr: a.owner,
             is_invite_only: false,

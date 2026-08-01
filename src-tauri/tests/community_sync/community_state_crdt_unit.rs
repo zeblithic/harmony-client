@@ -73,6 +73,7 @@ fn insert_rejects_event_with_wrong_community() {
     let outcome = state.insert_event(
         event,
         &VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: addr,
             is_invite_only: false,
@@ -108,6 +109,7 @@ fn insert_accepts_admin_self_join_in_open_community() {
     let outcome = state.insert_event(
         event,
         &VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: addr,
             is_invite_only: false,
@@ -135,6 +137,7 @@ fn insert_is_idempotent_on_duplicate_event_id() {
 
     let mut state = CommunityState::new(community_id);
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr: addr,
         is_invite_only: false,
@@ -164,6 +167,7 @@ fn state_with_admin_self_join(seed: u8, community_id: SpaceId) -> (CommunityStat
     let outcome = state.insert_event(
         event,
         &VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: addr,
             is_invite_only: false,
@@ -213,6 +217,7 @@ fn materialized_cache_returns_same_object_until_insert() {
     state.insert_event(
         event,
         &VerifyContext {
+            now_ms: None,
             expected_community_id: community_id,
             admin_addr: addr,
             is_invite_only: false,

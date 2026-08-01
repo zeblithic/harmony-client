@@ -1632,6 +1632,7 @@ impl CommunitySyncEngine {
         // (Join/PendingJoin) or the actor's materialized
         // enrolled_device_keys (steady-state).
         let ctx = crate::community_membership::VerifyContext {
+            now_ms: None,
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
             is_invite_only: self.is_invite_only,
@@ -1815,11 +1816,13 @@ impl CommunitySyncEngine {
         // EnrollmentCert / materialized membership — the resolver's
         // owner_id miss no longer rejects valid remote events.
         let first_ctx = crate::community_membership::VerifyContext {
+            now_ms: None,
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
             is_invite_only: self.is_invite_only,
         };
         let second_ctx = crate::community_membership::VerifyContext {
+            now_ms: None,
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
             is_invite_only: self.is_invite_only,
@@ -2191,6 +2194,7 @@ async fn spawn_auto_counter_sign_task(
     // cert-bearing Join events); the identity_resolver is not consulted because
     // it caches Reticulum-keyed pubs and misses for owner_id actors.
     let ctx_v = crate::community_membership::VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only,
@@ -4360,7 +4364,22 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             // ZEB-339 Task 9: VerifyContext carries no caller-resolved
             // pubs; verify_event derives signer keys from the carried
             // cert / materialized membership.
+            //
+            // ZEB-846 (Layer 1): this is the live network-merge site — the
+            // receiver's OWN trusted wall clock (never a peer-supplied or
+            // HlcAdoptFloor value) is threaded through so verify_event can
+            // reject an implausibly-future membership wall before it ever
+            // reaches `state.insert_event`. Pre-epoch clock (never in
+            // practice) degrades to `now_ms: Some(0)`, which only rejects
+            // walls beyond `MAX_FORWARD_SKEW_MS` — never drops honest
+            // present-day events. Matches the `.unwrap_or_default()` idiom
+            // used elsewhere in this file (e.g. `:2151`).
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
             let ctx_v = VerifyContext {
+                now_ms: Some(now_ms),
                 expected_community_id: ctx.community_id,
                 admin_addr: ctx.admin_addr,
                 is_invite_only: ctx.is_invite_only,

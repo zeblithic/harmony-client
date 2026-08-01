@@ -798,6 +798,7 @@ mod policy_tests {
         // as Task 7's per-insert ctx will thread it.
         let ctx = MembershipInsertCtx {
             verify: VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: addr,
                 is_invite_only: false,
