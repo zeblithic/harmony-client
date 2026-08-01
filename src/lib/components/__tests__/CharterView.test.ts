@@ -226,6 +226,25 @@ describe('CharterView', () => {
     expect(container.textContent).not.toContain('Ratified: <status quo>');
   });
 
+  it('orders same-ms finalized polls by logical then deviceId (ZEB-790)', async () => {
+    const a = poll({
+      pollId: 'p-a', proposalText: 'second-by-logical',
+      pollCreateHlcMs: 1_700_000_020_000, pollCreateHlcLogical: 2, pollCreateHlcDeviceId: 'dev-a',
+    });
+    const b = poll({
+      pollId: 'p-b', proposalText: 'first-by-logical',
+      pollCreateHlcMs: 1_700_000_020_000, pollCreateHlcLogical: 1, pollCreateHlcDeviceId: 'dev-z',
+    });
+    const adapter = makeAdapter([a, b]);
+    const { container } = render(CharterView, { props: { ...baseProps, adapter } });
+    await waitFor(() => {
+      expect(container.querySelector('.on-record')).toBeTruthy();
+    });
+    const text = container.textContent ?? '';
+    expect(text.indexOf('first-by-logical')).toBeGreaterThan(-1);
+    expect(text.indexOf('first-by-logical')).toBeLessThan(text.indexOf('second-by-logical'));
+  });
+
   it('a community whose only finalized poll upheld the status quo shows no ratified amendments', async () => {
     const adapter = makeAdapter([
       poll({ pollId: 'upheld-only', proposalText: 'Adopt term limits', winnerText: '<status quo>' }),

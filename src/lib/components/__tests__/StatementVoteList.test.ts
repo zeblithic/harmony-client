@@ -133,6 +133,29 @@ describe('StatementVoteList', () => {
     expect(getByLabelText('Statement votes: 3 agree, 1 disagree, 0 pass')).toBeTruthy();
   });
 
+  it('orders same-ms statements by logical then deviceId (ZEB-790)', () => {
+    const a: DeliberationStatementExport = {
+      ...stmt, statementEventHash: 'cc'.repeat(32),
+      text: 'second-by-logical', createdAtHlcMs: 1_700_000_020_000,
+      createdAtHlcLogical: 2, createdAtHlcDeviceId: 'dev-a',
+    };
+    const b: DeliberationStatementExport = {
+      ...stmt, statementEventHash: 'dd'.repeat(32),
+      text: 'first-by-logical', createdAtHlcMs: 1_700_000_020_000,
+      createdAtHlcLogical: 1, createdAtHlcDeviceId: 'dev-z',
+    };
+    const adapter = new VotingAdapter();
+    const { container } = render(StatementVoteList, {
+      props: {
+        detail: { ...baseDetail, deliberationStatements: [a, b] },
+        adapter, myAddr: otherAddr, onChange: () => {},
+      },
+    });
+    const text = container.textContent ?? '';
+    expect(text.indexOf('first-by-logical')).toBeGreaterThan(-1);
+    expect(text.indexOf('first-by-logical')).toBeLessThan(text.indexOf('second-by-logical'));
+  });
+
   it('hides tri-button on own statement and shows "yours" chip', () => {
     const adapter = new VotingAdapter();
     // myAddr === stmt.author → self-vote case (Greptile bot-pass 2 P2).

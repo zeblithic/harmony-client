@@ -12,6 +12,7 @@
   } from '../types/voting';
   import type { VotingAdapter } from '../voting-adapter';
   import { shortId } from '../short-addr';
+  import { compareHlc } from '../hlc';
   import TallyBar from './governance/TallyBar.svelte';
 
   let {
@@ -37,7 +38,12 @@
   let isWritable = $derived(isMiniPublic && detail.stage === 'de');
 
   let sortedStatements = $derived(
-    [...detail.deliberationStatements].sort((a, b) => a.createdAtHlcMs - b.createdAtHlcMs),
+    [...detail.deliberationStatements].sort((a, b) =>
+      compareHlc(
+        { wallMs: a.createdAtHlcMs, logical: a.createdAtHlcLogical ?? 0, deviceId: a.createdAtHlcDeviceId ?? '' },
+        { wallMs: b.createdAtHlcMs, logical: b.createdAtHlcLogical ?? 0, deviceId: b.createdAtHlcDeviceId ?? '' },
+      ),
+    ),
   );
 
   let visibleStatements = $derived(

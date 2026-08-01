@@ -12,6 +12,7 @@
   import type { CommunityMember } from '../types';
   import { POWER_THRESHOLDS } from '../types';
   import { shortAddr } from '../short-addr';
+  import { compareHlc } from '../hlc';
   import PipMeter from './governance/PipMeter.svelte';
   import RoleBadge from './governance/RoleBadge.svelte';
 
@@ -84,7 +85,12 @@
     (polls ?? [])
       .filter((p) => p.stage === 'fi')
       .slice()
-      .sort((a, b) => a.pollCreateHlcMs - b.pollCreateHlcMs),
+      .sort((a, b) =>
+        compareHlc(
+          { wallMs: a.pollCreateHlcMs, logical: a.pollCreateHlcLogical ?? 0, deviceId: a.pollCreateHlcDeviceId ?? '' },
+          { wallMs: b.pollCreateHlcMs, logical: b.pollCreateHlcLogical ?? 0, deviceId: b.pollCreateHlcDeviceId ?? '' },
+        ),
+      ),
   );
   function isUpheld(p: Tier3PollSummary): boolean {
     return p.winnerText === STATUS_QUO_TEXT;
