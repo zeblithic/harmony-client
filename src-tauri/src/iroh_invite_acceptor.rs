@@ -264,7 +264,7 @@ where
             app,
             pkarr_invite_publisher,
             config,
-            open_join_limiter: TokioMutex::new(OpenJoinRateLimiter::default()),
+            open_join_limiter: TokioMutex::new(OpenJoinRateLimiter::new()),
             traffic: None,
         }
     }
@@ -604,6 +604,11 @@ where
         // the engine apply / response write so a slow peer can't pin it.
         let admit = {
             let mut limiter = self.open_join_limiter.lock().await;
+            // ZEB-711: the rate-limit window + nonce horizon key on the limiter's
+            // OWN monotonic clock, never the beacon wall clock `now_ms` (which
+            // stays for the `created_at` freshness bound only). Bind the
+            // immutable borrow before the `&mut limiter` below.
+            let limiter_now_ms = limiter.monotonic_now_ms();
             crate::open_join_admit::verify_and_admit_open_join(
                 &req,
                 &signature,
@@ -614,6 +619,7 @@ where
                 &current_events,
                 now_ms,
                 OPEN_JOIN_FRESHNESS_WINDOW_MS,
+                limiter_now_ms,
                 &mut limiter,
             )
         };

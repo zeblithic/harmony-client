@@ -78,20 +78,49 @@ pub struct OpenJoinAdmitOk {
 /// Per-window admission limiter + nonce-replay cache. The window is coarse
 /// (a count per rolling window); the nonce cache rejects exact-replay within
 /// the retention horizon and is bounded by eviction.
-#[derive(Default)]
 pub struct OpenJoinRateLimiter {
     window_start_ms: u64,
     count_in_window: usize,
     seen_nonces: HashSet<[u8; 16]>,
     nonce_seen_at: HashMap<[u8; 16], u64>,
+    /// ZEB-711: monotonic epoch for the production limiter timeline. `allow` /
+    /// `is_replay` / `record_nonce` keep taking an explicit `limiter_now_ms`
+    /// (the unit-test seam), but the acceptor derives it from
+    /// [`Self::monotonic_now_ms`] instead of the beacon wall clock — a wall step
+    /// would otherwise distort enforcement (forward: a flood gets a fresh
+    /// budget; backward: an honest shed peer stays shed longer, and the nonce
+    /// horizon is corrupted). `tokio::time::Instant` also honors the paused test
+    /// clock. Wall time stays for the freshness arm only (`created_at.wall_ms`).
+    epoch: tokio::time::Instant,
 }
 
 impl OpenJoinRateLimiter {
+    /// Fresh limiter with its monotonic epoch anchored now. (`tokio::time::Instant`
+    /// has no `Default`, so this replaces a derived `Default`.)
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self {
+            window_start_ms: 0,
+            count_in_window: 0,
+            seen_nonces: HashSet::new(),
+            nonce_seen_at: HashMap::new(),
+            epoch: tokio::time::Instant::now(),
+        }
+    }
+
+    /// ZEB-711: the production timeline for admits on this limiter —
+    /// milliseconds since it was constructed, from the monotonic (and
+    /// test-pausable) tokio clock. Window state and epoch live and die with the
+    /// limiter instance, so the timeline is internally consistent by construction.
+    pub fn monotonic_now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
     /// Returns true if a request is allowed; rolls the window over when it has
     /// elapsed. Mutates the in-window counter only when allowing.
-    fn allow(&mut self, now_ms: u64) -> bool {
-        if now_ms.saturating_sub(self.window_start_ms) >= OPEN_JOIN_RATE_LIMIT_WINDOW_MS {
-            self.window_start_ms = now_ms;
+    fn allow(&mut self, limiter_now_ms: u64) -> bool {
+        if limiter_now_ms.saturating_sub(self.window_start_ms) >= OPEN_JOIN_RATE_LIMIT_WINDOW_MS {
+            self.window_start_ms = limiter_now_ms;
             self.count_in_window = 0;
         }
         if self.count_in_window >= OPEN_JOIN_RATE_LIMIT_PER_WINDOW {
@@ -107,8 +136,9 @@ impl OpenJoinRateLimiter {
     /// that is shed by the rate limiter (which is checked AFTER replay) does not
     /// leave its nonce persisted, which would wrongly reject a legitimate retry
     /// as a replay.
-    fn is_replay(&mut self, nonce: &[u8; 16], now_ms: u64) -> bool {
-        let horizon = now_ms.saturating_sub(OPEN_JOIN_RATE_LIMIT_WINDOW_MS.saturating_mul(4));
+    fn is_replay(&mut self, nonce: &[u8; 16], limiter_now_ms: u64) -> bool {
+        let horizon =
+            limiter_now_ms.saturating_sub(OPEN_JOIN_RATE_LIMIT_WINDOW_MS.saturating_mul(4));
         let seen = &mut self.seen_nonces;
         self.nonce_seen_at.retain(|n, t| {
             let keep = *t >= horizon;
@@ -124,9 +154,9 @@ impl OpenJoinRateLimiter {
     /// passed both the replay check and the rate-limit check, so a `RateLimited`
     /// rejection never persists a nonce (a later legitimate retry must not be
     /// rejected as a replay).
-    fn record_nonce(&mut self, nonce: &[u8; 16], now_ms: u64) {
+    fn record_nonce(&mut self, nonce: &[u8; 16], limiter_now_ms: u64) {
         self.seen_nonces.insert(*nonce);
-        self.nonce_seen_at.insert(*nonce, now_ms);
+        self.nonce_seen_at.insert(*nonce, limiter_now_ms);
     }
 }
 
@@ -138,10 +168,13 @@ impl OpenJoinRateLimiter {
 /// rather than re-encoding `req` here, so encoder drift can never desync the
 /// verify preimage from the mint preimage.
 ///
-/// `now_ms` is the beacon's wall clock; `freshness_window_ms` bounds how old
-/// `created_at` may be. `current_events` is the beacon engine's signed
-/// membership log (assumed already verified — `prior_state_at_hlc`/`materialize`
-/// do not re-verify signatures).
+/// `wall_now_ms` is the beacon's wall clock (bounds `created_at` freshness);
+/// `limiter_now_ms` is the limiter's OWN monotonic clock (rate-limit window +
+/// nonce horizon, ZEB-711 — never the wall clock, so a wall step cannot reset
+/// the rate limit); `freshness_window_ms` bounds how old `created_at` may be.
+/// `current_events` is the beacon engine's signed membership log (assumed
+/// already verified — `prior_state_at_hlc`/`materialize` do not re-verify
+/// signatures).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_admit_open_join(
     req: &OpenJoinRequest,
@@ -151,8 +184,9 @@ pub fn verify_and_admit_open_join(
     community_id: SpaceId,
     admin_addr: OwnerAddr,
     current_events: &[SignedMembershipEvent],
-    now_ms: u64,
+    wall_now_ms: u64,
     freshness_window_ms: u64,
+    limiter_now_ms: u64,
     limiter: &mut OpenJoinRateLimiter,
 ) -> Result<OpenJoinAdmitOk, OpenJoinReject> {
     // 1. Community scope.
@@ -162,8 +196,8 @@ pub fn verify_and_admit_open_join(
 
     // 2. Freshness (bounded window; reject future-dated beyond a small skew).
     let created = req.created_at.wall_ms;
-    if now_ms.saturating_sub(created) > freshness_window_ms
-        || created > now_ms.saturating_add(60_000)
+    if wall_now_ms.saturating_sub(created) > freshness_window_ms
+        || created > wall_now_ms.saturating_add(60_000)
     {
         return Err(OpenJoinReject::Stale);
     }
@@ -211,13 +245,13 @@ pub fn verify_and_admit_open_join(
     //    coincident rate-limit shed. The nonce is RECORDED only AFTER the rate
     //    limit also passes — otherwise a `RateLimited` rejection would persist
     //    the nonce and a legitimate retry would be wrongly rejected as a replay.
-    if limiter.is_replay(&req.nonce, now_ms) {
+    if limiter.is_replay(&req.nonce, limiter_now_ms) {
         return Err(OpenJoinReject::Replay);
     }
-    if !limiter.allow(now_ms) {
+    if !limiter.allow(limiter_now_ms) {
         return Err(OpenJoinReject::RateLimited);
     }
-    limiter.record_nonce(&req.nonce, now_ms);
+    limiter.record_nonce(&req.nonce, limiter_now_ms);
 
     // 8. Ban-check against the materialized state strictly before the joiner's
     //    Join HLC. A Banned owner is rejected even if their fresh Join would
@@ -478,7 +512,7 @@ mod tests {
     fn admits_a_valid_open_join() {
         let f = Fixture::new();
         let (req, sig, signed_bytes) = f.valid_request();
-        let mut lim = OpenJoinRateLimiter::default();
+        let mut lim = OpenJoinRateLimiter::new();
         let ok = verify_and_admit_open_join(
             &req,
             &sig,
@@ -489,6 +523,7 @@ mod tests {
             &f.current_events,
             f.now_ms,
             FRESHNESS,
+            f.now_ms,
             &mut lim,
         )
         .expect("valid open join should be admitted");
@@ -504,7 +539,7 @@ mod tests {
         let f = Fixture::new();
         let (mut req, sig, signed_bytes) = f.valid_request();
         req.epoch_auth = [0u8; 32]; // not a valid MAC
-        let mut lim = OpenJoinRateLimiter::default();
+        let mut lim = OpenJoinRateLimiter::new();
         assert_eq!(
             verify_and_admit_open_join(
                 &req,
@@ -516,6 +551,7 @@ mod tests {
                 &f.current_events,
                 f.now_ms,
                 FRESHNESS,
+                f.now_ms,
                 &mut lim,
             )
             .unwrap_err(),
@@ -531,7 +567,7 @@ mod tests {
         // identity pub. epoch_auth still validates (it doesn't cover the hash),
         // so this exercises the dedicated DeviceHashMismatch reject.
         req.signing_device_hash = DeviceIdentityHash([0xFF; 16]);
-        let mut lim = OpenJoinRateLimiter::default();
+        let mut lim = OpenJoinRateLimiter::new();
         assert_eq!(
             verify_and_admit_open_join(
                 &req,
@@ -543,6 +579,7 @@ mod tests {
                 &f.current_events,
                 f.now_ms,
                 FRESHNESS,
+                f.now_ms,
                 &mut lim,
             )
             .unwrap_err(),
@@ -554,7 +591,7 @@ mod tests {
     fn rejects_banned_identity() {
         let f = Fixture::with_banned_joiner();
         let (req, sig, signed_bytes) = f.valid_request();
-        let mut lim = OpenJoinRateLimiter::default();
+        let mut lim = OpenJoinRateLimiter::new();
         assert_eq!(
             verify_and_admit_open_join(
                 &req,
@@ -566,6 +603,7 @@ mod tests {
                 &f.current_events,
                 f.now_ms,
                 FRESHNESS,
+                f.now_ms,
                 &mut lim,
             )
             .unwrap_err(),
@@ -577,7 +615,7 @@ mod tests {
     fn rejects_stale_timestamp() {
         let f = Fixture::new();
         let (req, sig, signed_bytes) = f.valid_request();
-        let mut lim = OpenJoinRateLimiter::default();
+        let mut lim = OpenJoinRateLimiter::new();
         // now far beyond created_at + window.
         assert_eq!(
             verify_and_admit_open_join(
@@ -590,6 +628,7 @@ mod tests {
                 &f.current_events,
                 f.now_ms + 10_000_000,
                 FRESHNESS,
+                f.now_ms + 10_000_000,
                 &mut lim,
             )
             .unwrap_err(),
@@ -601,7 +640,7 @@ mod tests {
     fn rejects_replayed_nonce() {
         let f = Fixture::new();
         let (req, sig, signed_bytes) = f.valid_request();
-        let mut lim = OpenJoinRateLimiter::default();
+        let mut lim = OpenJoinRateLimiter::new();
         verify_and_admit_open_join(
             &req,
             &sig,
@@ -612,6 +651,7 @@ mod tests {
             &f.current_events,
             f.now_ms,
             FRESHNESS,
+            f.now_ms,
             &mut lim,
         )
         .expect("first ok");
@@ -626,6 +666,7 @@ mod tests {
                 &f.current_events,
                 f.now_ms,
                 FRESHNESS,
+                f.now_ms,
                 &mut lim,
             )
             .unwrap_err(),
@@ -636,7 +677,7 @@ mod tests {
     #[test]
     fn rate_limit_sheds_excess() {
         let f = Fixture::new();
-        let mut lim = OpenJoinRateLimiter::default();
+        let mut lim = OpenJoinRateLimiter::new();
         let mut last: Result<(), OpenJoinReject> = Ok(());
         for _ in 0..(OPEN_JOIN_RATE_LIMIT_PER_WINDOW + 1) {
             let (req, sig, signed_bytes) = f.fresh_request(); // unique nonce each time
@@ -650,6 +691,7 @@ mod tests {
                 &f.current_events,
                 f.now_ms,
                 FRESHNESS,
+                f.now_ms,
                 &mut lim,
             )
             .map(|_| ());
@@ -663,7 +705,7 @@ mod tests {
     #[test]
     fn rate_limited_request_nonce_is_retryable_after_window() {
         let f = Fixture::new();
-        let mut lim = OpenJoinRateLimiter::default();
+        let mut lim = OpenJoinRateLimiter::new();
         // Saturate the window with unique nonces so the next request is shed.
         for _ in 0..OPEN_JOIN_RATE_LIMIT_PER_WINDOW {
             let (req, sig, sb) = f.fresh_request();
@@ -677,6 +719,7 @@ mod tests {
                 &f.current_events,
                 f.now_ms,
                 FRESHNESS,
+                f.now_ms,
                 &mut lim,
             )
             .expect("in-window requests admit");
@@ -694,6 +737,7 @@ mod tests {
                 &f.current_events,
                 f.now_ms,
                 FRESHNESS,
+                f.now_ms,
                 &mut lim,
             )
             .unwrap_err(),
@@ -714,8 +758,80 @@ mod tests {
             // Widen freshness so the request's created_at is still in-window at
             // the later wall clock (the rate-limit window > default freshness).
             OPEN_JOIN_RATE_LIMIT_WINDOW_MS * 4,
+            later,
             &mut lim,
         )
         .expect("a previously rate-limited nonce is admissible after the window");
+    }
+
+    #[test]
+    fn limiter_window_keys_on_monotonic_clock_not_wall() {
+        // ZEB-711 / B1: the rate-limit window rolls on the limiter's OWN monotonic
+        // clock (`limiter_now_ms`), never the beacon wall clock (`wall_now_ms`).
+        // Hold wall FIXED (freshness constant) and advance only the limiter clock:
+        // the window must roll on the limiter clock alone. If the limiter (wrongly)
+        // keyed on wall, the post-roll request would still be shed (wall never moved).
+        let f = Fixture::new();
+        let mut lim = OpenJoinRateLimiter::new();
+        let wall = f.now_ms; // fixed, in-freshness of created_at (= 1000)
+
+        // Fill the window at limiter t = 0.
+        for _ in 0..OPEN_JOIN_RATE_LIMIT_PER_WINDOW {
+            let (req, sig, sb) = f.fresh_request();
+            verify_and_admit_open_join(
+                &req,
+                &sig,
+                &sb,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                wall,
+                FRESHNESS,
+                0,
+                &mut lim,
+            )
+            .expect("in-window requests admit");
+        }
+
+        // Same limiter time, wall unchanged → window is full → shed.
+        let (shed_req, shed_sig, shed_sb) = f.fresh_request();
+        assert_eq!(
+            verify_and_admit_open_join(
+                &shed_req,
+                &shed_sig,
+                &shed_sb,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                wall,
+                FRESHNESS,
+                0,
+                &mut lim,
+            )
+            .unwrap_err(),
+            OpenJoinReject::RateLimited,
+            "window is full at the same limiter time"
+        );
+
+        // Advance ONLY the limiter clock past the window; wall stays fixed. The
+        // window rolls on the monotonic limiter clock → admits. A wall-keyed
+        // window would still be full here (wall never moved) — the discriminator.
+        let (next_req, next_sig, next_sb) = f.fresh_request();
+        verify_and_admit_open_join(
+            &next_req,
+            &next_sig,
+            &next_sb,
+            &f.epoch_key,
+            f.community_id,
+            f.admin_addr,
+            &f.current_events,
+            wall,
+            FRESHNESS,
+            OPEN_JOIN_RATE_LIMIT_WINDOW_MS + 1,
+            &mut lim,
+        )
+        .expect("window rolled on the monotonic limiter clock, so this admits");
     }
 }
