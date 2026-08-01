@@ -171,6 +171,10 @@ struct Built {
     engine: Arc<FleetSyncEngine<RelayHoldDoc>>,
     doc: Arc<Mutex<RelayHoldDoc>>,
     tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
+    /// ZEB-790: the relay node's single adoption floor, shared into the engine
+    /// and the deposit ctx (TestRelayCtx / ProdRelayDepositCtx) so mint_hlc
+    /// reads the same floor the engine feeds.
+    adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor,
     /// Keep the outbound receiver alive so the `publisher_tx` channel
     /// remains open — dropping it would close the publish channel and cause
     /// `flush_now` to return `TransportClosed`.
@@ -186,6 +190,10 @@ fn build_relay_engine(device_id: &str, persist: Arc<dyn FleetPersist<RelayHoldDo
     )));
     let kt = Arc::new(KeyTree::derive(&[0xAA; 32]).expect("kt"));
     let merger: Merger<RelayHoldDoc> = Arc::new(|l: &mut RelayHoldDoc, r| l.merge_from(r));
+    // ZEB-790: one floor per relay node — shared by the engine and the deposit
+    // ctx's mint_hlc (stored on `Built`, threaded into TestRelayCtx /
+    // ProdRelayDepositCtx).
+    let adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
         keys: harmony_app::owner_state_crypto::FleetKeySet::new(kt),
         device_id: device_id.to_string(),
@@ -201,12 +209,13 @@ fn build_relay_engine(device_id: &str, persist: Arc<dyn FleetPersist<RelayHoldDo
         publish_seen: false,
         on_applied: None,
         sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
-        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        adopt_floor: adopt_floor.clone(),
     }));
     Built {
         engine,
         doc,
         tracker,
+        adopt_floor,
         _out_rx: out_rx,
     }
 }
@@ -226,6 +235,10 @@ fn build_relay_engine_from_doc(
     )));
     let kt = Arc::new(KeyTree::derive(&[0xAA; 32]).expect("kt"));
     let merger: Merger<RelayHoldDoc> = Arc::new(|l: &mut RelayHoldDoc, r| l.merge_from(r));
+    // ZEB-790: one floor per relay node — shared by the engine and the deposit
+    // ctx's mint_hlc (stored on `Built`, threaded into TestRelayCtx /
+    // ProdRelayDepositCtx).
+    let adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
         keys: harmony_app::owner_state_crypto::FleetKeySet::new(kt),
         device_id: device_id.to_string(),
@@ -241,12 +254,13 @@ fn build_relay_engine_from_doc(
         publish_seen: false,
         on_applied: None,
         sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
-        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        adopt_floor: adopt_floor.clone(),
     }));
     Built {
         engine,
         doc,
         tracker,
+        adopt_floor,
         _out_rx: out_rx,
     }
 }
@@ -282,6 +296,9 @@ struct TestRelayCtx {
     tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     /// Engine handle for notify_dirty + flush_now.
     engine: Arc<FleetSyncEngine<RelayHoldDoc>>,
+    /// ZEB-790: same floor the engine holds (from `Built`), so `mint_hlc`
+    /// bound-adopts against the floor this node feeds.
+    adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor,
 }
 
 impl TestRelayCtx {
@@ -321,12 +338,7 @@ impl RelayDepositCtx for TestRelayCtx {
     }
 
     async fn mint_hlc(&self) -> Hlc {
-        mint_next_hlc(
-            &self.tracker,
-            &harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
-            &self.relay_device_id,
-        )
-        .await
+        mint_next_hlc(&self.tracker, &self.adopt_floor, &self.relay_device_id).await
     }
 
     /// Atomic persist-with-caps under the doc lock (mirrors
@@ -571,6 +583,7 @@ fn build_relay_ctx(built: &Built, relay_device_id: String) -> TestRelayCtx {
         doc: Arc::clone(&built.doc),
         tracker: Arc::clone(&built.tracker),
         engine: Arc::clone(&built.engine),
+        adopt_floor: built.adopt_floor.clone(),
     }
 }
 
@@ -764,6 +777,7 @@ async fn relay_non_member_sender_deposit_rejected_doc_empty() {
         doc: Arc::clone(&built.doc),
         tracker: Arc::clone(&built.tracker),
         engine: Arc::clone(&built.engine),
+        adopt_floor: built.adopt_floor.clone(),
     };
 
     let err = handle_relay_deposit_core(&fx.frame, &relay_ctx)
@@ -1102,7 +1116,7 @@ fn build_prod_ctxs(
         flush: Arc::new(EngineRelayHoldFlush(Arc::clone(&built.engine))),
         optin: Arc::clone(&optin),
         membership: Arc::clone(&membership),
-        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        adopt_floor: built.adopt_floor.clone(),
     };
     let pull = ProdRelayPullCtx {
         self_owner: relay.owner.0,

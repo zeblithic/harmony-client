@@ -224,8 +224,12 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         nav_emitter: None,
         presence_resync_rx: None,
     }));
+    // ZEB-790: Bob's single adoption floor — Bob's registry, channel-log
+    // registry, and redeem_invite_inner all model ONE node (Bob) and share it.
+    // (Alice's registry_a above holds its own floor — a separate node.)
+    let bob_adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
-        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        adopt_floor: bob_adopt_floor.clone(),
         device_id: "bob-dev".into(),
         content_store: Arc::clone(&cs_b),
         identity_resolver: Arc::clone(&resolver),
@@ -496,7 +500,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         self_owner: bob_addr,
         self_device_id: "bob-dev".into(),
         signing_key: Arc::clone(&bob_sk),
-        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        adopt_floor: bob_adopt_floor.clone(),
         engine_config: ChannelLogEngineConfig::default(),
         transport_epoch_rx: None,
         // ZEB-599 Direction 1: no presence watch in this integration harness.
@@ -513,7 +517,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         invite_url,
         Arc::clone(&crdt_b),
         Arc::clone(&tracker_b),
-        harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        bob_adopt_floor.clone(),
         "bob-dev".into(),
         bob_addr,
         Arc::clone(&bob_sk),

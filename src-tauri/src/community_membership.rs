@@ -5503,10 +5503,12 @@ pub const ADMIN_PROPOSAL_EXPIRY_MS: u64 = 30 * 86_400_000;
 /// `friend_intro`); this constant closes the one gap.
 ///
 /// ZEB-790 (bounded adoption): the `now_ms` side is peer-influenced by at
-/// most `hlc_adopt_floor::HLC_ADOPT_FORWARD_CAP_MS + 1` ms — verified
-/// peers can pull this device's minted wall forward up to the cap, never
-/// further (see hlc_adopt_floor.rs). The effective forward bound is
-/// therefore 30 min + CAP (~0.3% weakening), which the
+/// most `hlc_adopt_floor::HLC_ADOPT_FORWARD_CAP_MS` ms — verified peers can
+/// pull this device's minted wall forward up to the cap, never further
+/// (`merged_now = max(now, min(floor, now + CAP)) ≤ now + CAP`; the `+1` in
+/// the stored floor is absorbed by the clamp, so the effective forward pull
+/// is exactly CAP, not CAP + 1 — see hlc_adopt_floor.rs). The effective
+/// forward bound is therefore 30 min + CAP (~0.3% weakening), which the
 /// `adopt_cap_stays_far_below_consumer_budgets` test pins.
 pub const ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS: u64 = 30 * 60 * 1000;
 

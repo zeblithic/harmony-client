@@ -230,6 +230,10 @@ struct OpenJoinSetup {
     /// boot reconcile threads into `register_channel_log_engine` /
     /// `reconcile_from_state`.
     bob_hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
+    /// ZEB-790: Bob's single adoption floor — shared by registry_bob (which
+    /// feeds bob_engine), Bob's channel-log registry, and the redeem call.
+    /// (Alice's registry_alice holds its own floor — a separate node.)
+    bob_adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor,
 
     // ── pkarr ───────────────────────────────────────────────────────────
     pkarr_resolver: Arc<harmony_pkarr::PkarrResolver>,
@@ -446,8 +450,10 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         nav_emitter: None,
         presence_resync_rx: None,
     }));
+    // ZEB-790: Bob's single adoption floor (see OpenJoinSetup.bob_adopt_floor).
+    let bob_adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let registry_bob = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
-        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        adopt_floor: bob_adopt_floor.clone(),
         device_id: "bob-dev".into(),
         content_store: Arc::clone(&cs_bob),
         identity_resolver: Arc::clone(&resolver),
@@ -642,7 +648,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
             self_owner: bob_addr,
             self_device_id: "bob-dev".into(),
             signing_key: Arc::clone(&bob_comm_sk),
-            adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+            adopt_floor: bob_adopt_floor.clone(),
             engine_config: ChannelLogEngineConfig::default(),
             transport_epoch_rx: None,
             // ZEB-599 Direction 1: no presence watch in this integration harness.
@@ -667,6 +673,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         bob_engine,
         bob_channel_log_registry,
         bob_hlc_tracker,
+        bob_adopt_floor,
         pkarr_resolver,
         relay_client: client,
         alice_rendezvous_publisher,
@@ -1230,7 +1237,7 @@ async fn bob_open_join_redeem_spawns_channel_log_engine_in_session() {
             invite_url,
             Arc::clone(&bob_crdt_state),
             Arc::clone(&s.bob_hlc_tracker),
-            harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+            s.bob_adopt_floor.clone(),
             "bob-dev".to_string(),
             s.bob_addr,
             Arc::clone(&s.bob_comm_sk),

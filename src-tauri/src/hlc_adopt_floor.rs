@@ -39,15 +39,28 @@ impl HlcAdoptFloor {
 
     /// Feed: record a VERIFIED remote stamp's wall. Callers must sit
     /// strictly after the accept path's commit/record success.
+    ///
+    /// Ordering: this is a standalone monotonic max-register guarding no
+    /// other memory, so per-location *coherence* alone already forbids a
+    /// reader from ever seeing the floor regress — `Relaxed` would suffice
+    /// for correctness. We use `AcqRel`/`Acquire` (here and in `merged_now`)
+    /// to make the release→acquire synchronization explicit: a mint that
+    /// reads a value written by `observe` has a happens-before edge to it.
+    /// What no ordering can provide — and what this floor deliberately does
+    /// NOT claim — is *real-time* cross-task visibility: a mint on another
+    /// task that races an in-flight `observe` may read the pre-`observe`
+    /// value. That is by design; the floor is a best-effort session hint
+    /// (see the visibility note in the module docs and spec §4), and the
+    /// clamp against current `now` keeps even a stale read bounded.
     pub fn observe(&self, remote_wall_ms: u64) {
         self.0
-            .fetch_max(remote_wall_ms.saturating_add(1), Ordering::Relaxed);
+            .fetch_max(remote_wall_ms.saturating_add(1), Ordering::AcqRel);
     }
 
     /// Read: the wall the mint should use instead of `wall_now_ms`.
     /// max(now, min(floor, now + CAP)) — see the case table in the spec §3.
     pub fn merged_now(&self, wall_now_ms: u64) -> u64 {
-        let floor = self.0.load(Ordering::Relaxed);
+        let floor = self.0.load(Ordering::Acquire);
         wall_now_ms.max(floor.min(wall_now_ms.saturating_add(HLC_ADOPT_FORWARD_CAP_MS)))
     }
 }

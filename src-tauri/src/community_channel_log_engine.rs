@@ -5102,6 +5102,82 @@ mod tests {
         );
     }
 
+    /// ZEB-790 Task 6 (discriminating variant, CodeRabbit #4): a purely-
+    /// rejected replay must leave the floor UNTOUCHED. `observe`'s `fetch_max`
+    /// is idempotent against a duplicate `wall_ms`, so a test that first lands
+    /// the event and then delivers a duplicate cannot tell "rejected BEFORE
+    /// observe" apart from "observed AGAIN" — both leave the floor at
+    /// `wall_ms + 1`. This test removes that ambiguity: it pre-seeds the engine's
+    /// replay tracker with the event's ticket so the SOLE delivery is dropped at
+    /// the fast-path replay gate (step 2a) BEFORE `observe` is reached, then
+    /// asserts the floor is still EMPTY — `merged_now` returns the identity
+    /// (`wall_ms`, NOT `wall_ms + 1`). Had the rejected frame leaked to
+    /// `observe`, the floor would read `wall_ms + 1`, so `== wall_ms` positively
+    /// proves rejection-before-observe.
+    #[tokio::test]
+    async fn rejected_replay_does_not_feed_floor() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+
+        let at = Hlc {
+            wall_ms: 8_000,
+            logical: 0,
+            device_id: "remote".to_string(),
+        };
+        let event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            at.clone(),
+            "rejected",
+            &fix.signing_key,
+        );
+        let packet = encrypt_channel_packet(&fix.channel_key, &event).expect("encrypt");
+
+        // Pre-seed the engine's replay tracker with this event's ticket so the
+        // single delivery below is recognized as a duplicate and dropped at the
+        // fast-path gate (2a) — BEFORE the floor's `observe`. `mod tests` is a
+        // child module, so the private `replay_tracker` field is reachable here.
+        // The floor starts empty (`HlcAdoptFloor::new()`); if the drop path is
+        // correct it stays empty.
+        {
+            let mut tracker = fix.engine.replay_tracker.lock().await;
+            tracker.record(&event);
+        }
+
+        fix.subscriber_tx.send(packet).await.expect("send");
+
+        // Wait for the drop itself so the "floor stays empty" assertion is
+        // non-vacuous — we KNOW the packet reached the drop path before
+        // asserting (mirrors the wait in the sibling test above).
+        wait_for(
+            || async { (fix.engine.replay_drop_count() >= 1).then_some(()) },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the pre-seeded packet must be observed dropping");
+
+        assert_eq!(
+            fix.engine.adopt_floor.merged_now(at.wall_ms),
+            at.wall_ms,
+            "a purely-rejected replay must leave the floor EMPTY (identity): a \
+             non-identity `wall_ms + 1` here would mean the rejected frame \
+             leaked to `observe` before being dropped"
+        );
+
+        // The rejected frame must not have appended, either.
+        let listed = fix.engine.list_messages(None, 100).await.expect("list");
+        assert!(
+            listed.is_empty(),
+            "a purely-rejected replay must not append (got {})",
+            listed.len()
+        );
+
+        // Shut the engine down so its parked receive/flush loops don't outlive
+        // the test — the sole packet was dropped, so nothing else wakes the
+        // flush loop to let it exit on its own (avoids a nextest LEAK flag).
+        fix.engine.shutdown().await.expect("shutdown");
+    }
+
     #[tokio::test]
     async fn closing_engine_drops_inbound_without_appending() {
         // ZEB-288 durability guard (CodeAnt Critical): once `shutdown()`

@@ -201,7 +201,7 @@ git commit -m "ZEB-790: HlcAdoptFloor — session-only bounded adoption floor (+
     hlc_adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
 ```
 
-Run `cargo check --locked --features test-fixtures` — the compiler flags every `NodeState { .. }` construction site; initialize each with `hlc_adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),` (if `NodeState` has a `Default`/constructor fn, add it there once instead).
+Run `cd src-tauri && cargo check --locked --all-targets --features test-fixtures` — `--all-targets` is load-bearing here: without it Cargo skips the `#[cfg(test)]` code that holds most `NodeState { .. }` construction sites, so they wouldn't be flagged. The compiler then flags every construction site; initialize each with `hlc_adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),` (if `NodeState` has a `Default`/constructor fn, add it there once instead).
 
 - [ ] **Step 2: Construct a fresh floor in `start_node`**
 

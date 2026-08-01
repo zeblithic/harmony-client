@@ -67,7 +67,10 @@ pub const HLC_ADOPT_FORWARD_CAP_MS: u64 = 5_000;
 drift) — 5 s covers it with 5× headroom. The tightest wall-time-coupled consumer budget
 is **60 s** (invite/open-join forward windows, `open_join_admit.rs:164-169`,
 `community_invite.rs:1836-1846`) — 5 s leaves 12× margin. The 30-min peer-stamp bounds
-(`ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS` et al.) are weakened by ≤ CAP + 1 ms ≈ 0.3%.
+(`ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS` et al.) are weakened by ≤ CAP ms ≈ 0.3%: the
+maximum forward pull of a mint above true `now` is exactly `CAP` (not `CAP + 1`) —
+`merged_now(now) = max(now, min(floor, now + CAP)) ≤ now + CAP`, so the `+1` in the
+stored floor never survives the `now + CAP` clamp as extra forward skew.
 
 ## 3. The floor — `HlcAdoptFloor`
 
@@ -77,9 +80,9 @@ A session-only high-water: `Arc<AtomicU64>` holding **max verified remote `wall_
 pub struct HlcAdoptFloor(Arc<AtomicU64>);   // 0 = nothing observed
 
 impl HlcAdoptFloor {
-    /// Feed: relaxed fetch_max of remote_wall.saturating_add(1).
+    /// Feed: AcqRel fetch_max of remote_wall.saturating_add(1).
     pub fn observe(&self, remote_wall_ms: u64);
-    /// Read: max(now, min(floor, now + HLC_ADOPT_FORWARD_CAP_MS)).
+    /// Read: max(now, min(floor, now + HLC_ADOPT_FORWARD_CAP_MS)) (Acquire load).
     pub fn merged_now(&self, wall_now_ms: u64) -> u64;
 }
 ```
@@ -120,6 +123,21 @@ already owned by the persisted replay trackers, not the floor.
 `community_state_sync.rs:3743-3752`): a rejected or unverified frame never moves the
 floor.** The feed lives structurally *after* the commit/record on each path — a rejection
 returns before reaching it, exactly as rejections cannot advance the replay watermark.
+This rejection-safety is **structural and unconditional** — it holds regardless of
+threading, because a rejected frame never reaches the `observe` call at all.
+
+**Visibility is a separate, weaker property.** `observe` and the mint seams run on
+different tasks (inbound sync applies events; IPC handlers mint). The floor is a single
+atomic (`AcqRel` feed / `Acquire` read), so per-location coherence guarantees a mint
+never reads a floor value *older* than one it already saw, and a mint that observes a
+given floor value strictly exceeds every remote wall folded into it. What the floor does
+**not** promise is *real-time* cross-task visibility: a mint that races an in-flight
+`observe` on another task may still read the pre-`observe` value and produce the very
+inversion this feature reduces — now confined to a sub-microsecond window and
+self-correcting as the atomic propagates. That is acceptable by construction: the floor
+is a best-effort session hint (re-learned from live traffic, clamped against current
+`now`), not a lock-synchronized happens-before edge. Per-device structural monotonicity —
+the guarantee callers actually depend on — is owned by the replay trackers, not the floor.
 
 **Deliberately excluded in v1:**
 
@@ -204,9 +222,13 @@ only and ties fall back to content-hash order (the `BTreeMap<[u8;32], _>` iterat
 order) — the exact bug class `community_voting_conviction.rs:673-678` (`HlcOrdinal`,
 "CR R3 Major") already fixed once elsewhere.
 
-- DTOs gain the full tuple alongside the kept `*HlcMs` fields (compat):
-  `pollCreateHlc: {wallMs, logical, deviceId}` on `Tier3PollSummary`/`Export`,
-  `createdAtHlc` on `DeliberationStatementExport` (`src/lib/types/voting.ts`).
+- DTOs gain the full tuple alongside the kept `*HlcMs` fields (compat), as **flat
+  scalar fields** (not a nested object — chosen so the additive serde change needs no
+  new struct and the existing `*HlcMs` wall stays the primary field): `pollCreateHlcLogical:
+  u32` + `pollCreateHlcDeviceId: String` on `Tier3PollSummary`/`Tier3PollExport`,
+  `createdAtHlcLogical` + `createdAtHlcDeviceId` on `DeliberationStatementExport`
+  (`src/lib/types/voting.ts`; TS fields optional with `?? 0` / `?? ''` fallbacks so
+  existing fixtures need no churn). The FE reassembles the tuple at the sort call.
 - `CharterView.svelte:87`, `StatementVoteList.svelte:40` sort via the existing
   `src/lib/hlc.ts:14 compareHlc`; the backend pre-sort at `lib.rs:55776` moves to the
   same full-tuple key.
