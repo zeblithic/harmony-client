@@ -14600,6 +14600,7 @@ pub(crate) async fn send_dm_impl(
         _dm_transport,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         _self_owner,
         cas,
@@ -14615,6 +14616,7 @@ pub(crate) async fn send_dm_impl(
             g.dm_transport.clone().ok_or("dm_transport missing")?,
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.content_store.clone().ok_or("content_store missing")?,
@@ -14659,6 +14661,10 @@ pub(crate) async fn send_dm_impl(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    // ZEB-790: bounded causal adoption — merge the highest verified remote
+    // wall this session has observed before it reaches the pure `next_hlc`
+    // inside `send_dm`. An empty floor is the identity (unchanged behavior).
+    let wall_now_ms = adopt_floor.merged_now(wall_now_ms);
 
     // Lock order: dm_outbox → crdt_state → hlc_tracker.
     // Mirror this order in event_loop drain (T7) to avoid deadlock.
@@ -15296,6 +15302,7 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
         dm_outbox,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         dm_send_inflight,
         dm_send_stopping,
@@ -15308,6 +15315,7 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             // ZEB-234: snapshot the fence handles so delete_outbox_entry
             // holds a permit for the duration of its outbox mutation,
@@ -15349,6 +15357,9 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    // ZEB-790: bounded causal adoption — merge before the wall reaches the
+    // pure `next_hlc` inside `delete_dm_outbox_entry`. Mirrors send_dm_impl.
+    let wall_now_ms = adopt_floor.merged_now(wall_now_ms);
 
     // Lock order: dm_outbox → crdt_state → hlc_tracker. Mirrors send_dm to
     // avoid deadlock against any concurrent send/drain.
