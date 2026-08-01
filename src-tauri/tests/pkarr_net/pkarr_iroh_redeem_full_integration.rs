@@ -400,6 +400,7 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
     // (sourced from registry.cfg), so alice's JoinCountersign will be
     // signed by alice_comm_sk and bear actor == alice_comm.owner.
     let registry_alice = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "alice-dev".into(),
         content_store: Arc::clone(&cs_alice),
         identity_resolver: Arc::clone(&resolver),
@@ -414,6 +415,7 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
         presence_resync_rx: None,
     }));
     let registry_bob = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "bob-dev".into(),
         content_store: Arc::clone(&cs_bob),
         identity_resolver: Arc::clone(&resolver),

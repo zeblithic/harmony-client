@@ -830,6 +830,7 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
     ));
     let dir = tempfile::tempdir().expect("tempdir");
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "admin-dev".into(),
         content_store: cs,
         identity_resolver: Arc::clone(&resolver),
@@ -1222,6 +1223,7 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
     ));
     let dir = tempfile::tempdir().expect("tempdir");
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         device_id: "admin-dev".into(),
         content_store: cs,
         identity_resolver: Arc::clone(&resolver),

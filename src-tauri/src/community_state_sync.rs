@@ -1027,6 +1027,9 @@ pub struct CommunitySyncEngineConfig {
     pub signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     pub state: Arc<Mutex<CommunityState>>,
     pub tracker: Arc<Mutex<CommunityReplayTracker>>,
+    /// ZEB-790: node-wide bounded causal-adoption floor (shared, not
+    /// per-community). Fed at step 14 (Task 5); read in next_hlc.
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     pub content_store: Arc<dyn ContentStore>,
     pub publisher_tx: mpsc::Sender<Vec<u8>>,
     pub subscriber_rx: mpsc::Receiver<Vec<u8>>,
@@ -1292,6 +1295,7 @@ impl CommunitySyncEngine {
             signing_key: cfg.signing_key,
             state: cfg.state,
             tracker: cfg.tracker,
+            adopt_floor: cfg.adopt_floor,
             content_store: cfg.content_store,
             publisher_tx: cfg.publisher_tx,
             subscriber_rx: cfg.subscriber_rx,
@@ -2013,6 +2017,9 @@ struct InternalCtx {
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     state: Arc<Mutex<CommunityState>>,
     tracker: Arc<Mutex<CommunityReplayTracker>>,
+    /// ZEB-790: node-wide bounded causal-adoption floor (shared, not
+    /// per-community). Fed at step 14 (Task 5); read in next_hlc.
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     content_store: Arc<dyn ContentStore>,
     publisher_tx: mpsc::Sender<Vec<u8>>,
     subscriber_rx: mpsc::Receiver<Vec<u8>>,
@@ -3355,10 +3362,12 @@ fn community_hlc_tick(prev: Option<&Hlc>, wall_ms: u64, device_id: &str) -> Hlc 
 
 async fn next_hlc(ctx: &InternalCtx) -> Hlc {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let wall_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let wall_ms = ctx.adopt_floor.merged_now(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    );
 
     let mut tracker = ctx.tracker.lock().await;
     let local = (ctx.self_owner, ctx.device_id.clone());
@@ -4875,6 +4884,11 @@ pub struct CommunityRegistryConfig {
     /// `enrolled_device_keys`.
     pub signing_key: Arc<ed25519_dalek::SigningKey>,
 
+    /// ZEB-790: node-wide bounded causal-adoption floor (shared, not
+    /// per-community). Cloned into every spawned engine's
+    /// `CommunitySyncEngineConfig.adopt_floor`; read in `next_hlc`.
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
+
     /// ZEB-249 §10.6 (Phase A): optional reference to the owner-state
     /// CRDT. When `Some`, every spawned engine receives a clone of this
     /// Arc so `publish_root_now` / `handle_incoming_publish` can read
@@ -5702,6 +5716,7 @@ impl CommunitySyncRegistry {
             signing_key: Arc::clone(&self.cfg.signing_key),
             state,
             tracker,
+            adopt_floor: self.cfg.adopt_floor.clone(),
             content_store: Arc::clone(&self.cfg.content_store),
             publisher_tx,
             subscriber_rx,
@@ -6628,6 +6643,7 @@ mod tests {
         let identity_dir = tempdir.path().to_path_buf();
 
         let registry = std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "dev".into(),
             content_store: cs,
             identity_resolver: std::sync::Arc::new(NopResolver),
@@ -7839,6 +7855,7 @@ mod tests {
         tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
 
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
             admin_addr: alice_addr,
@@ -7877,6 +7894,7 @@ mod tests {
         let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key,
             admin_addr: alice_addr,
@@ -8033,6 +8051,7 @@ mod tests {
         tokio::spawn(async move { while pub_rx.recv().await.is_some() {} });
 
         let _engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: EpochKey::new([0x66; 32]),
             admin_addr: alice_addr,
@@ -8256,6 +8275,7 @@ mod tests {
             let a_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
             let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 community_id,
                 membership_key: membership_key.clone(),
                 admin_addr: alice_addr,
@@ -8292,6 +8312,7 @@ mod tests {
             let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
             let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 community_id,
                 membership_key,
                 admin_addr: alice_addr,
@@ -8736,6 +8757,7 @@ mod tests {
         tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
 
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
             admin_addr: alice_addr,
@@ -8778,6 +8800,7 @@ mod tests {
         ))));
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key,
             admin_addr: alice_addr,
@@ -9070,6 +9093,7 @@ mod tests {
             std::time::Duration::from_secs(2),
         ));
         let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: EpochKey::new([0x55; 32]),
             admin_addr: alice.owner,

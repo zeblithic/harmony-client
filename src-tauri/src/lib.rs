@@ -6898,6 +6898,11 @@ pub async fn start_node_inner(
                             // by device #2. (No transport use of this key in
                             // the engine — it is only the two signing sites.)
                             signing_key: std::sync::Arc::clone(&community_signing_key_arc),
+                            // ZEB-790: node-wide bounded causal-adoption floor
+                            // (the same `adopt_floor` created once per node
+                            // session above; every spawned community engine
+                            // clones into its own InternalCtx).
+                            adopt_floor: adopt_floor.clone(),
                             // ZEB-249 §10.6 (Phase A): pass the live owner-state CRDT
                             // so every spawned engine reads the current epoch key
                             // dynamically rather than using its spawn-time capture.
@@ -34996,6 +35001,7 @@ mod create_community_inner_tests {
 
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "test-dev".into(),
                 content_store: cs,
                 identity_resolver: std::sync::Arc::new(SingleOwnerResolver {
@@ -37730,6 +37736,7 @@ mod zeb_315_membership_at_event_hlc_tests {
             Duration::from_millis(1000),
         ));
         let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "test-dev".into(),
             content_store: cs,
             identity_resolver: Arc::new(NopResolver),
@@ -37957,6 +37964,7 @@ mod list_bootstrap_hint_tests {
         ));
 
         let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "test-dev".into(),
             content_store: cs,
             identity_resolver: Arc::new(NopResolver),
@@ -40715,6 +40723,7 @@ mod redeem_invite_inner_tests {
         ));
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "joiner-dev".into(),
                 content_store: cs,
                 identity_resolver: std::sync::Arc::new(TwoOwnerResolver {
@@ -42149,6 +42158,7 @@ mod zeb436_orphan_adoption_tests {
         ));
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "joiner-dev".into(),
                 content_store: cs,
                 identity_resolver: std::sync::Arc::new(TwoOwnerResolver {
@@ -45210,6 +45220,7 @@ mod zeb268_leave_detach_fence_tests {
         ));
         let self_owner = OwnerAddr([0xAA; 16]);
         let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "leaver-dev".into(),
             content_store,
             identity_resolver: Arc::new(NopResolver),
@@ -79872,6 +79883,7 @@ mod owner_loaded_tests {
 
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "owner-loaded-test".into(),
                 content_store: cs,
                 identity_resolver: std::sync::Arc::new(SelfOnlyResolver {

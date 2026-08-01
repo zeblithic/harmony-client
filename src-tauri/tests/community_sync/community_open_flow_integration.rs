@@ -182,6 +182,7 @@ async fn open_community_create_redeem_leave_round_trip() {
     let tmp_b = tempfile::tempdir().expect("tmp b");
 
     let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: minted_a.membership_key.clone(),
         admin_addr: owner_a,
@@ -209,6 +210,7 @@ async fn open_community_create_redeem_leave_round_trip() {
         root_serve_rx: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: minted_a.membership_key.clone(),
         admin_addr: owner_a,
@@ -547,6 +549,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
     let tmp_b = tempfile::tempdir().expect("tmp b");
 
     let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: minted_a.membership_key.clone(),
         admin_addr: owner_a,
@@ -574,6 +577,7 @@ async fn redeem_invite_twice_does_not_corrupt_state() {
         root_serve_rx: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: minted_a.membership_key.clone(),
         admin_addr: owner_a,
@@ -1053,6 +1057,7 @@ async fn open_community_two_node_wire_convergence_no_preseed() {
     let tmp_b = tempfile::tempdir().expect("tmp b");
 
     let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: minted_a.membership_key.clone(),
         admin_addr: owner_a,
@@ -1080,6 +1085,7 @@ async fn open_community_two_node_wire_convergence_no_preseed() {
         root_serve_rx: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: minted_a.membership_key.clone(),
         admin_addr: owner_a,
@@ -1349,6 +1355,7 @@ async fn invite_only_admin_admits_joiner_pending_join_over_wire() {
     let tmp_b = tempfile::tempdir().expect("tmp b");
 
     let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: minted_a.membership_key.clone(),
         admin_addr: owner_a,
@@ -1376,6 +1383,7 @@ async fn invite_only_admin_admits_joiner_pending_join_over_wire() {
         root_serve_rx: None,
     });
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: minted_a.membership_key.clone(),
         admin_addr: owner_a,

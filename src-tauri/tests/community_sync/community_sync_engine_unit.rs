@@ -81,6 +81,7 @@ async fn engine_constructs_and_shuts_down_cleanly() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
         admin_addr: admin,
@@ -151,6 +152,7 @@ async fn flush_now_publishes_one_root_publish() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
         admin_addr: admin,
@@ -346,6 +348,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
     let tmp_b = tempfile::tempdir().expect("tempdir b");
 
     let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk.clone(),
         admin_addr: admin,
@@ -383,6 +386,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         });
 
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
         admin_addr: admin,
@@ -636,6 +640,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
     let tmp_b = tempfile::tempdir().expect("tempdir b");
 
     let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk.clone(),
         admin_addr: admin,
@@ -684,6 +689,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         });
 
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
         admin_addr: admin,
@@ -795,6 +801,7 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
         });
 
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
         admin_addr: admin,
@@ -947,6 +954,7 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: EpochKey::new([0x42; 32]),
         admin_addr: self_owner,
@@ -1026,6 +1034,7 @@ async fn publish_carries_valid_publisher_sig() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk.clone(),
         admin_addr: admin,
@@ -1247,6 +1256,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
     let tmp_b = tempfile::tempdir().expect("tempdir b");
 
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
         admin_addr: alice_addr,
@@ -1481,6 +1491,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
     let tmp_b = tempfile::tempdir().expect("tempdir b");
 
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
         admin_addr,
@@ -1693,6 +1704,7 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
     let tmp_b = tempfile::tempdir().expect("tempdir b");
 
     let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
         admin_addr: alice_addr,
@@ -1838,6 +1850,7 @@ async fn a_failed_community_publish_retries_itself_on_a_quiescent_community_zeb7
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
         admin_addr: admin,
@@ -1943,6 +1956,7 @@ async fn a_persistently_failing_community_publish_paces_its_retries_zeb761() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
         admin_addr: admin,
@@ -2081,6 +2095,7 @@ async fn a_burst_of_mutations_collapses_into_one_publish_zeb750() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: mk,
         admin_addr: admin,

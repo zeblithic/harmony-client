@@ -166,6 +166,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
     ))));
     let tmp = tempfile::tempdir().expect("tmp");
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: minted.membership_key.clone(),
         admin_addr: alice_addr,
