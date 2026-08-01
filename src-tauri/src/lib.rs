@@ -4065,6 +4065,7 @@ pub async fn start_node_inner(
         avatar_blob_store = std::sync::Arc::new(crate::avatar_blob_store::AvatarBlobStore::load(
             &app_data_dir.join("avatars"),
             crate::avatar_blob_store::DEFAULT_MAX_BYTES,
+            AVATAR_MAX_BYTES as u64,
         ));
 
         // Construct MailSync now that identity, mail_mgr, and the refresh
@@ -25834,8 +25835,12 @@ async fn fetch_avatar(
     // ZEB-841 disk-first: a CID is an immutable content-address, so a cached
     // blob is always exactly the requested content — this serves the avatar with
     // no network and works while the source peer is offline / after a restart.
+    // The store does blocking std::fs I/O (incl. a prune dir-scan), so run it on
+    // a blocking thread rather than the async worker.
     if let Some(store) = &avatar_store {
-        if let Some(bytes) = store.get(&cid) {
+        let store = std::sync::Arc::clone(store);
+        let cid_read = cid.clone();
+        if let Ok(Some(bytes)) = tokio::task::spawn_blocking(move || store.get(&cid_read)).await {
             return Ok(bytes);
         }
     }
@@ -25857,9 +25862,13 @@ async fn fetch_avatar(
 
     // ZEB-841 write-through: persist so the next fetch (this session or after a
     // restart) is served from disk. Best-effort — the store swallows its own
-    // errors and re-verifies hash==cid before writing.
+    // errors and re-verifies hash==cid before writing. Runs on a blocking thread
+    // (write + prune dir-scan) and its result is intentionally ignored.
     if let Some(store) = &avatar_store {
-        store.put(&cid, &bytes);
+        let store = std::sync::Arc::clone(store);
+        let cid_write = cid.clone();
+        let bytes_write = bytes.clone();
+        let _ = tokio::task::spawn_blocking(move || store.put(&cid_write, &bytes_write)).await;
     }
 
     Ok(bytes)

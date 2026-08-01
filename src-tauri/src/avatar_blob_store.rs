@@ -16,33 +16,49 @@
 //! ZEB-586 per-identity-isolation invariant). The cache is a pure optimization:
 //! every method is best-effort and never surfaces an error to the caller — a
 //! failure just degrades to a network re-fetch.
+//!
+//! The blocking `std::fs` calls here are meant to run off the async runtime;
+//! `fetch_avatar` invokes `get`/`put` inside `tokio::task::spawn_blocking`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use harmony_content::cid::ContentId;
 
-/// Default cap on total avatar-cache bytes. At the `AVATAR_MAX_BYTES` = 512 KiB
-/// per-avatar ceiling this holds ~64 max-size avatars, and in practice many
+/// Default cap on total avatar-cache bytes. At the 512 KiB per-avatar ceiling
+/// (`max_blob_bytes`) this holds ~64 max-size avatars, and in practice many
 /// hundreds (most avatars are far smaller). Eviction is oldest-write-first.
 pub const DEFAULT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Content-addressed on-disk avatar cache. Cheap to share via `Arc`.
 pub struct AvatarBlobStore {
     dir: PathBuf,
+    /// Cap on the *total* cache size; `put` prunes down to this.
     max_bytes: u64,
+    /// Cap on a *single* blob. Mirrors the network fetch's `AVATAR_MAX_BYTES`
+    /// ceiling so a disk hit can't bypass it: `get` rejects an over-cap file
+    /// *before* reading it into memory, and `put` refuses to write one.
+    max_blob_bytes: u64,
     /// Serializes prune scans so two concurrent `put`s can't both decide to
     /// evict the same files. Reads and writes of distinct CID files need no
     /// lock — the filesystem is the source of truth.
     prune_lock: Mutex<()>,
 }
 
+/// Process-wide counter making each in-flight temp file name unique, so
+/// concurrent writes to the same CID never collide on one `.tmp` path.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl AvatarBlobStore {
-    /// Open (creating the directory) an avatar cache under `dir` with the given
-    /// byte budget. Never fails: a dir-creation error is logged and the store
-    /// still returns — every `get` then misses and every `put` no-ops, so the
-    /// caller silently falls back to network fetches.
-    pub fn load(dir: &Path, max_bytes: u64) -> Self {
+    /// Open (creating the directory) an avatar cache under `dir` with a total
+    /// byte budget and a per-blob ceiling. Never fails: a dir-creation error is
+    /// logged and the store still returns — every `get` then misses and every
+    /// `put` no-ops, so the caller silently falls back to network fetches.
+    ///
+    /// Also sweeps any stale `*.tmp` left by a crash mid-write (they are never
+    /// counted toward the budget nor evicted, so without this they would leak).
+    pub fn load(dir: &Path, max_bytes: u64, max_blob_bytes: u64) -> Self {
         if let Err(e) = std::fs::create_dir_all(dir) {
             tracing::warn!(
                 path = %dir.display(),
@@ -50,9 +66,11 @@ impl AvatarBlobStore {
                 "avatar cache: create_dir_all failed; cache effectively disabled"
             );
         }
+        sweep_stale_temp_files(dir);
         Self {
             dir: dir.to_path_buf(),
             max_bytes,
+            max_blob_bytes,
             prune_lock: Mutex::new(()),
         }
     }
@@ -74,13 +92,27 @@ impl AvatarBlobStore {
 
     /// Read cached avatar bytes for `cid_hex`, verifying `hash == cid`.
     ///
-    /// Returns `None` on a miss, a malformed CID, an I/O error, or bytes that
-    /// fail verification — in the last case the corrupt/tampered file is removed
-    /// so the next fetch re-populates it (self-heal). A `Some` result is
+    /// Returns `None` on a miss, a malformed CID, an I/O error, an
+    /// **over-`max_blob_bytes`** file, or bytes that fail verification — in the
+    /// last two cases the offending file is removed so the next fetch
+    /// re-populates it (self-heal). The size check happens **before** reading,
+    /// so a corrupt/oversized on-disk blob can't force a large allocation or
+    /// bypass the ceiling the network path enforces. A `Some` result is
     /// guaranteed to be exactly the content the CID names.
     pub fn get(&self, cid_hex: &str) -> Option<Vec<u8>> {
         let cid = Self::parse_cid(cid_hex)?;
         let path = self.blob_path(cid_hex);
+        let meta = std::fs::metadata(&path).ok()?;
+        if meta.len() > self.max_blob_bytes {
+            tracing::warn!(
+                cid = %cid_hex,
+                size = meta.len(),
+                cap = self.max_blob_bytes,
+                "avatar cache: on-disk blob exceeds per-blob cap; removing (self-heal)"
+            );
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
         let bytes = std::fs::read(&path).ok()?;
         if cid.verify_hash(&bytes) {
             Some(bytes)
@@ -96,22 +128,30 @@ impl AvatarBlobStore {
 
     /// Write `bytes` for `cid_hex` (best-effort), then prune to the byte budget.
     ///
-    /// Only bytes that pass `hash == cid` are written. The caller
-    /// ([`crate::fetch_avatar`]) already returns verified bytes, but re-checking
-    /// keeps the store's on-disk invariant local and total — a `get` can then
-    /// trust any file it finds. A malformed CID or write error is logged and
-    /// swallowed.
+    /// Rejects a malformed CID, bytes over `max_blob_bytes`, or bytes that fail
+    /// `hash == cid`. The caller ([`crate::fetch_avatar`]) already returns
+    /// size-capped, verified bytes, but re-checking keeps the store's on-disk
+    /// invariant local and total — a `get` can then trust any file it finds. A
+    /// rejection or write error is logged and swallowed.
     pub fn put(&self, cid_hex: &str, bytes: &[u8]) {
         let Some(cid) = Self::parse_cid(cid_hex) else {
             tracing::warn!(cid = %cid_hex, "avatar cache: refusing put for malformed CID");
             return;
         };
+        if bytes.len() as u64 > self.max_blob_bytes {
+            tracing::warn!(
+                cid = %cid_hex,
+                size = bytes.len(),
+                cap = self.max_blob_bytes,
+                "avatar cache: refusing put; blob exceeds per-blob cap"
+            );
+            return;
+        }
         if !cid.verify_hash(bytes) {
             tracing::warn!(cid = %cid_hex, "avatar cache: refusing put; bytes fail hash==cid");
             return;
         }
-        let path = self.blob_path(cid_hex);
-        if let Err(e) = atomic_write(&path, bytes) {
+        if let Err(e) = atomic_write(&self.dir, cid_hex, bytes) {
             tracing::warn!(cid = %cid_hex, error = %e, "avatar cache: write failed");
             return;
         }
@@ -120,10 +160,12 @@ impl AvatarBlobStore {
 
     /// Evict oldest-written blobs until total size is within `max_bytes`.
     ///
-    /// Eviction keys on filesystem mtime, so recency survives restart with no
-    /// separate index. Since avatar content is immutable, a wrong eviction only
-    /// costs a cheap network re-fetch — write-time ordering is an adequate proxy
-    /// for a true access-ordered LRU without a metadata write on every read.
+    /// Recomputes the total by scanning the directory each call (the cache is
+    /// small — hundreds of files at most). Eviction keys on filesystem mtime, so
+    /// recency survives restart with no separate index. Since avatar content is
+    /// immutable, a wrong eviction only costs a cheap network re-fetch —
+    /// write-time ordering is an adequate proxy for a true access-ordered LRU
+    /// without a metadata write on every read.
     fn prune(&self) {
         let _g = self
             .prune_lock
@@ -136,7 +178,7 @@ impl AvatarBlobStore {
         let mut total: u64 = 0;
         for ent in rd.flatten() {
             let path = ent.path();
-            // Count only committed blobs; skip in-flight `*.bin.tmp` writes.
+            // Count only committed blobs; skip in-flight `*.tmp` writes.
             if path.extension().and_then(|e| e.to_str()) != Some("bin") {
                 continue;
             }
@@ -165,13 +207,37 @@ impl AvatarBlobStore {
     }
 }
 
-/// Atomically write `bytes` to `path` via a sibling temp file + rename, so a
-/// crash mid-write never leaves a partially-written `{cid}.bin` that a later
-/// `get` would read and then reject.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("bin.tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+/// Atomically write `bytes` to `{dir}/{cid_hex}.bin` via a **uniquely-named**
+/// sibling temp file + rename, so a crash mid-write never leaves a
+/// partially-written `{cid}.bin`, and two concurrent writes to the same CID
+/// never collide on one temp path. The temp file is removed on any failure so a
+/// partial write never lingers (a leftover would not be counted or evicted).
+fn atomic_write(dir: &Path, cid_hex: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!("{cid_hex}.{}.{seq}.tmp", std::process::id()));
+    let final_path = dir.join(format!("{cid_hex}.bin"));
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &final_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Delete any `*.tmp` files under `dir` (orphans from a crash mid-write).
+fn sweep_stale_temp_files(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +245,13 @@ mod tests {
     use super::*;
     use harmony_content::cid::ContentFlags;
     use std::time::{Duration, SystemTime};
+
+    // Generous per-blob cap for tests not exercising the size limit.
+    const BIG_BLOB_CAP: u64 = 1024 * 1024;
+
+    fn store(dir: &Path, max_bytes: u64) -> AvatarBlobStore {
+        AvatarBlobStore::load(dir, max_bytes, BIG_BLOB_CAP)
+    }
 
     /// Mint the real CID for `data` (PublicDurable, non-inline) — the same
     /// shape `verify_hash` checks against.
@@ -200,44 +273,74 @@ mod tests {
     #[test]
     fn put_then_get_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let store = AvatarBlobStore::load(dir.path(), DEFAULT_MAX_BYTES);
+        let s = store(dir.path(), DEFAULT_MAX_BYTES);
         let data = b"avatar-bytes-here".to_vec();
         let cid = cid_hex_for(&data);
 
-        store.put(&cid, &data);
-        assert_eq!(store.get(&cid).as_deref(), Some(data.as_slice()));
+        s.put(&cid, &data);
+        assert_eq!(s.get(&cid).as_deref(), Some(data.as_slice()));
+        // No temp files linger after a successful write.
+        let tmp_left = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"));
+        assert!(!tmp_left, "no .tmp should remain after put");
     }
 
     #[test]
     fn get_absent_is_none() {
         let dir = tempfile::tempdir().unwrap();
-        let store = AvatarBlobStore::load(dir.path(), DEFAULT_MAX_BYTES);
-        // Well-formed CID, nothing on disk.
+        let s = store(dir.path(), DEFAULT_MAX_BYTES);
         let cid = cid_hex_for(b"never-stored");
-        assert!(store.get(&cid).is_none());
-        // Malformed CID is also a clean miss, not a panic.
-        assert!(store.get("not-hex").is_none());
-        assert!(store.get("ab").is_none()); // valid hex, wrong length
+        assert!(s.get(&cid).is_none());
+        // Malformed CIDs are clean misses, not panics.
+        assert!(s.get("not-hex").is_none());
+        assert!(s.get("ab").is_none()); // valid hex, wrong length
     }
 
     #[test]
     fn get_rejects_and_removes_tampered_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let store = AvatarBlobStore::load(dir.path(), DEFAULT_MAX_BYTES);
+        let s = store(dir.path(), DEFAULT_MAX_BYTES);
         // CID names "real" content, but the file on disk holds different bytes.
         let cid = cid_hex_for(b"the-real-avatar");
         let path = dir.path().join(format!("{cid}.bin"));
         std::fs::write(&path, b"TAMPERED-DIFFERENT-BYTES").unwrap();
 
-        assert!(store.get(&cid).is_none(), "tampered bytes must not verify");
+        assert!(s.get(&cid).is_none(), "tampered bytes must not verify");
         assert!(!path.exists(), "self-heal must remove the bad file");
+    }
+
+    #[test]
+    fn get_rejects_and_removes_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny per-blob cap; the on-disk file blows past it.
+        let s = AvatarBlobStore::load(dir.path(), DEFAULT_MAX_BYTES, 64);
+        let cid = cid_hex_for(b"whatever");
+        let path = dir.path().join(format!("{cid}.bin"));
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+
+        assert!(s.get(&cid).is_none(), "over-cap file must not be served");
+        assert!(!path.exists(), "self-heal must remove the oversized file");
+    }
+
+    #[test]
+    fn put_refuses_oversized_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = AvatarBlobStore::load(dir.path(), DEFAULT_MAX_BYTES, 64);
+        let data = vec![7u8; 4096];
+        let cid = cid_hex_for(&data);
+
+        s.put(&cid, &data);
+        assert!(s.get(&cid).is_none(), "over-cap blob must not be written");
+        assert!(!dir.path().join(format!("{cid}.bin")).exists());
     }
 
     #[test]
     fn eviction_drops_lru_over_budget() {
         let dir = tempfile::tempdir().unwrap();
         // Budget holds two 1000-byte blobs but not three.
-        let store = AvatarBlobStore::load(dir.path(), 2500);
+        let s = store(dir.path(), 2500);
 
         let a = vec![0u8; 1000];
         let b = vec![1u8; 1000];
@@ -245,12 +348,12 @@ mod tests {
         let (ca, cb, cc) = (cid_hex_for(&a), cid_hex_for(&b), cid_hex_for(&c));
 
         let now = SystemTime::now();
-        store.put(&ca, &a);
+        s.put(&ca, &a);
         set_mtime(
             &dir.path().join(format!("{ca}.bin")),
             now - Duration::from_secs(100),
         );
-        store.put(&cb, &b);
+        s.put(&cb, &b);
         set_mtime(
             &dir.path().join(format!("{cb}.bin")),
             now - Duration::from_secs(50),
@@ -258,11 +361,11 @@ mod tests {
 
         // Putting the third blob pushes total to 3000 > 2500; prune must evict
         // the oldest (A), leaving the two most recent.
-        store.put(&cc, &c);
+        s.put(&cc, &c);
 
-        assert!(store.get(&ca).is_none(), "oldest blob A should be evicted");
-        assert_eq!(store.get(&cb).as_deref(), Some(b.as_slice()), "B retained");
-        assert_eq!(store.get(&cc).as_deref(), Some(c.as_slice()), "C retained");
+        assert!(s.get(&ca).is_none(), "oldest blob A should be evicted");
+        assert_eq!(s.get(&cb).as_deref(), Some(b.as_slice()), "B retained");
+        assert_eq!(s.get(&cc).as_deref(), Some(c.as_slice()), "C retained");
     }
 
     #[test]
@@ -272,12 +375,32 @@ mod tests {
         let cid = cid_hex_for(&data);
 
         {
-            let store = AvatarBlobStore::load(dir.path(), DEFAULT_MAX_BYTES);
-            store.put(&cid, &data);
+            let s = store(dir.path(), DEFAULT_MAX_BYTES);
+            s.put(&cid, &data);
         } // drop — simulate process exit
 
         // A fresh store over the same dir serves the previously-written blob.
-        let reopened = AvatarBlobStore::load(dir.path(), DEFAULT_MAX_BYTES);
+        let reopened = store(dir.path(), DEFAULT_MAX_BYTES);
         assert_eq!(reopened.get(&cid).as_deref(), Some(data.as_slice()));
+    }
+
+    #[test]
+    fn load_sweeps_stale_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // A committed blob and an orphaned temp file (crash mid-write).
+        let data = b"kept".to_vec();
+        let cid = cid_hex_for(&data);
+        std::fs::write(dir.path().join(format!("{cid}.bin")), &data).unwrap();
+        let orphan = dir.path().join("deadbeef.12345.7.tmp");
+        std::fs::write(&orphan, b"partial").unwrap();
+
+        let reopened = store(dir.path(), DEFAULT_MAX_BYTES);
+
+        assert!(!orphan.exists(), "load must sweep stale .tmp files");
+        assert_eq!(
+            reopened.get(&cid).as_deref(),
+            Some(data.as_slice()),
+            "committed blob is untouched by the sweep"
+        );
     }
 }

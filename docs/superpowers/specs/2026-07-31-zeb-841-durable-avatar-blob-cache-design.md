@@ -40,7 +40,7 @@ store ever lands.
 
 ### 2.1 New module `src-tauri/src/avatar_blob_store.rs`
 
-```
+```text
 {app_data_dir}/avatars/{cid_hex}.bin
 ```
 
@@ -51,44 +51,55 @@ Mirrors the proven `mail.rs` blob pattern (`mail.rs:160-196, 271-321`).
 ```rust
 pub struct AvatarBlobStore {
     dir: PathBuf,
-    // byte-budget LRU accounting; mtime on disk is the source of truth for recency,
-    // so this is only a cheap in-memory total-bytes tracker rebuilt at construction.
-    inner: Mutex<Budget>,
-    max_bytes: u64,
+    max_bytes: u64,       // total-cache budget; `put` prunes down to this
+    max_blob_bytes: u64,  // per-blob ceiling (mirrors AVATAR_MAX_BYTES)
+    prune_lock: Mutex<()>, // serializes concurrent prune scans
 }
 ```
 
-- **`get(cid: &str) -> Option<Vec<u8>>`** — read `{dir}/{cid}.bin`; recompute the
-  `ContentId` over the bytes and compare to `cid`. Match → touch mtime (LRU access) and
-  return `Some(bytes)`. Mismatch / decode error / I/O error → remove the file, return
-  `None` (self-heal → caller falls through to network). Absent → `None`.
-- **`put(cid: &str, bytes: &[u8])`** — write atomically (`{cid}.bin.tmp` + rename); then
-  prune to `max_bytes` by evicting oldest-mtime files first. Best-effort: a write failure
-  logs and is swallowed (the cache is an optimization, never a correctness dependency).
-- **`load(dir, max_bytes) -> Self`** — `create_dir_all`, scan existing `*.bin` for the
-  initial byte total. Never fails the caller (warn-and-continue on dir errors, like
-  `MailManager::load`).
+There is no in-memory byte tracker: `prune` recomputes the total by scanning the directory
+(`read_dir`) each call — the cache is small (hundreds of files at most).
+
+- **`get(cid: &str) -> Option<Vec<u8>>`** — `stat` `{dir}/{cid}.bin`; if it exceeds
+  `max_blob_bytes`, remove it and return `None` (self-heal) — the size check is **before**
+  the read, so a corrupt/oversized on-disk blob can't force a large allocation or bypass the
+  ceiling the network path enforces. Otherwise read the bytes, recompute the `ContentId` and
+  compare to `cid`: match → `Some(bytes)`; mismatch / I/O error → remove the file, return
+  `None` (self-heal → caller falls through to network). A read hit does **not** touch mtime
+  (eviction is write-time-ordered, not access-ordered).
+- **`put(cid: &str, bytes: &[u8])`** — reject a malformed CID, over-`max_blob_bytes` bytes,
+  or bytes failing `hash == cid`; else write atomically (a **uniquely-named** temp file —
+  `{cid}.{pid}.{seq}.tmp`, removed on failure — then rename) and prune to `max_bytes`,
+  evicting oldest-**mtime** (write-time) files first. Best-effort: any error logs and is
+  swallowed (the cache is an optimization, never a correctness dependency).
+- **`load(dir, max_bytes, max_blob_bytes) -> Self`** — `create_dir_all`, then sweep any
+  stale `*.tmp` orphaned by a crash mid-write. Never fails the caller (warn-and-continue on
+  dir errors, like `MailManager::load`).
 
 **Concurrency:** held as `Arc<AvatarBlobStore>` on `NodeState`. `get`/`put` take `&self`;
-all filesystem I/O runs **outside** any lock (distinct CID files never collide); the
-`Mutex<Budget>` is held only for the O(1) byte-total update and the prune scan.
+all filesystem I/O runs **outside** any lock (distinct CID files never collide, and unique
+temp names make concurrent same-CID writes safe); `prune_lock` is held only for the prune
+directory scan so two `put`s can't race on eviction. `fetch_avatar` calls `get`/`put` inside
+`tokio::task::spawn_blocking` so the blocking `std::fs` work stays off the async runtime.
 
-**Cap:** `AVATAR_CACHE_MAX_BYTES = 32 * 1024 * 1024` (32 MiB ≈ hundreds of avatars at the
-`AVATAR_MAX_BYTES = 512 KiB` ceiling). mtime is the LRU key, so recency survives restart
-with no separate index file.
+**Cap:** `DEFAULT_MAX_BYTES = 32 * 1024 * 1024` (32 MiB ≈ hundreds of avatars at the
+`AVATAR_MAX_BYTES = 512 KiB` per-blob ceiling). mtime is the LRU key, so recency survives
+restart with no separate index file.
 
 ### 2.2 Wire into `fetch_avatar` (`lib.rs:25797`)
 
-```
+```text
 1. clone Arc<AvatarBlobStore> out of the NodeState guard (alongside fetch_tx)
-2. if let Some(bytes) = store.get(&cid) { return Ok(bytes) }   // disk-first, offline-capable
+2. disk-first: spawn_blocking(|| store.get(&cid)) — Some(bytes) → return Ok(bytes)
 3. <existing network FetchRequest path, unchanged>
-4. on Ok(bytes): store.put(&cid, &bytes); return Ok(bytes)
+4. on Ok(bytes): spawn_blocking(|| store.put(&cid, &bytes)); return Ok(bytes)
 ```
 
 Disk-first is safe because a CID is an immutable content-address: a disk hit is *always*
 the exact bytes the caller asked for (guaranteed by verify-on-load), so there is no
-staleness window. The disk read/write happen with the `NodeState` lock **not** held.
+staleness window. The disk read/write happen with the `NodeState` lock **not** held, and on
+a `spawn_blocking` thread so the blocking `std::fs` work (read + prune scan) stays off the
+async worker.
 
 ### 2.3 No frontend change
 
@@ -106,10 +117,14 @@ isolation over a `tempfile::tempdir()`):
 - `get_absent_is_none`.
 - `get_rejects_and_removes_tampered_bytes` — write junk under a CID whose hash ≠ contents;
   `get` returns `None` and the file is gone (self-heal).
+- `get_rejects_and_removes_oversized_file` / `put_refuses_oversized_blob` — a blob over
+  `max_blob_bytes` is neither served (removed before read, self-heal) nor written.
 - `eviction_drops_lru_over_budget` — small `max_bytes`; putting past budget evicts the
   oldest-mtime blob, keeps the newest.
 - `fresh_instance_reads_existing_blobs` — a second `AvatarBlobStore::load` over the same
   dir serves blobs the first one wrote ("survives restart").
+- `load_sweeps_stale_temp_files` — a `*.tmp` orphan is removed at load; committed blobs
+  survive.
 
 Handler wiring stays thin over the tested store. Manual/e2e (not in CI): restart a node
 while a previously-seen peer is offline → avatar still renders (direct repro of the report).
