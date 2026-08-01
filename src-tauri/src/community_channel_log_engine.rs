@@ -1730,6 +1730,13 @@ impl ChannelLogEngine {
             }
         }
 
+        // ZEB-790: feed the adoption floor ONLY after 2c — decrypt,
+        // sig-verify (2b) and the authoritative replay advance (2c) all
+        // succeeded. Every earlier `return` (garbage, replay, invalid)
+        // leaves the floor untouched. Use the same event accessor
+        // `would_accept` reads the stamp through.
+        self.adopt_floor.observe(event.at().wall_ms);
+
         // 3. Append. The `closing` check MUST sit under the `log` lock —
         // the same lock `flush_now()` takes — so it is atomic w.r.t.
         // shutdown's synchronous flush (ZEB-288, CodeAnt Critical).
@@ -4903,6 +4910,196 @@ mod tests {
 
         let listed = fix.engine.list_messages(None, 100).await.expect("list");
         assert_eq!(listed.len(), 1, "replay must be dropped");
+    }
+
+    /// ZEB-790 Task 6: a channel-log inbound packet that clears the FULL
+    /// accept pipeline (decrypt + sig-verify (2b) + the authoritative
+    /// replay-tracker advance (2c)) feeds the engine's `HlcAdoptFloor`
+    /// with the event's `at.wall_ms` — the invariant lives at the single
+    /// `self.adopt_floor.observe(...)` call site immediately after 2c.
+    #[tokio::test]
+    async fn verified_inbound_feeds_adopt_floor() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+
+        let at = Hlc {
+            wall_ms: 7_000,
+            logical: 0,
+            device_id: "remote".to_string(),
+        };
+        let event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            at.clone(),
+            "feeds-the-floor",
+            &fix.signing_key,
+        );
+        let packet = encrypt_channel_packet(&fix.channel_key, &event).expect("encrypt");
+
+        fix.subscriber_tx.send(packet).await.expect("send");
+
+        wait_for(
+            || async {
+                let v = fix.engine.list_messages(None, 100).await.unwrap();
+                (v.len() == 1).then_some(())
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("event appeared");
+
+        // NOTE: read with `merged_now(at.wall_ms)`, NOT `merged_now(0)` —
+        // merged_now clamps against `now + CAP`, so a tiny `now` would cap
+        // the answer well below the actual floor value (see Task 5's note).
+        assert_eq!(
+            fix.engine.adopt_floor.merged_now(at.wall_ms),
+            at.wall_ms + 1,
+            "accepted inbound event feeds the floor (+1 rule)"
+        );
+    }
+
+    /// ZEB-790 Task 6: the mirror-image invariant — an inbound packet that
+    /// FAILS sig-verify (2b) must never reach the post-2c `observe` call.
+    ///
+    /// Per the Task 5 review bar, a bare "floor still zero" assertion is
+    /// indistinguishable from "nothing ran yet" (zero is ALSO the floor's
+    /// untouched initial state). So after the corrupted-signature packet,
+    /// this test injects a second, genuinely-accepted event through the
+    /// SAME engine/subscriber_tx and waits for the floor to move for THAT
+    /// event. The bad packet's `wall_ms` is chosen far past the legit
+    /// event's (well beyond the adoption cap) so that if it HAD fed the
+    /// floor, the final read would clamp to `legit_at.wall_ms + CAP`
+    /// instead of the expected `+ 1` — the assertion does double duty:
+    /// it proves the engine's receive loop stayed live through the
+    /// rejection, and that the corrupted frame contributed nothing.
+    #[tokio::test]
+    async fn sig_failed_inbound_does_not_feed_adopt_floor() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+
+        // Corrupted-signature event, deliberately stamped far beyond the
+        // legit event below (and beyond the adoption cap) — see the note
+        // above for why.
+        let bad_at = Hlc {
+            wall_ms: 900_000,
+            logical: 0,
+            device_id: "remote-bad-sig".to_string(),
+        };
+        let mut bad_event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            bad_at,
+            "corrupted-sig",
+            &fix.signing_key,
+        );
+        if let SignedChannelEvent::Post { sig, .. } = &mut bad_event {
+            sig[0] ^= 0xff;
+        }
+        let bad_packet = encrypt_channel_packet(&fix.channel_key, &bad_event).expect("encrypt");
+        fix.subscriber_tx.send(bad_packet).await.expect("send bad");
+
+        // Positive liveness signal: a second, genuinely-accepted event
+        // through the same engine/subscriber_tx.
+        let legit_at = Hlc {
+            wall_ms: 7_500,
+            logical: 0,
+            device_id: "remote-legit".to_string(),
+        };
+        let legit_event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            legit_at.clone(),
+            "legit-after-bad-sig",
+            &fix.signing_key,
+        );
+        let legit_packet = encrypt_channel_packet(&fix.channel_key, &legit_event).expect("encrypt");
+        fix.subscriber_tx
+            .send(legit_packet)
+            .await
+            .expect("send legit");
+
+        wait_for(
+            || async {
+                let v = fix.engine.list_messages(None, 100).await.unwrap();
+                (v.len() == 1).then_some(())
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("legit event must land");
+
+        assert_eq!(
+            fix.engine.adopt_floor.merged_now(legit_at.wall_ms),
+            legit_at.wall_ms + 1,
+            "sig-failed event must not feed the floor: reading merged_now \
+             at the legit event's wall must show ONLY the legit +1, not \
+             the corrupted event's far-future wall clamped to +CAP"
+        );
+    }
+
+    /// ZEB-790 Task 6: a replayed (duplicate) inbound event must feed the
+    /// floor at most once — `observe`'s `fetch_max` is naturally idempotent
+    /// against a duplicate `wall_ms`, but this pins the invariant at the
+    /// engine level: the floor after a duplicate delivery must equal the
+    /// floor after the first delivery, AND the replay-tracker's drop
+    /// counter (`replay_drop_count`, ZEB-688) must show the duplicate was
+    /// actually observed and dropped — not silently lost in the channel.
+    #[tokio::test]
+    async fn replayed_inbound_does_not_feed_floor_twice() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+
+        let at = Hlc {
+            wall_ms: 8_000,
+            logical: 0,
+            device_id: "remote".to_string(),
+        };
+        let event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            at.clone(),
+            "once",
+            &fix.signing_key,
+        );
+        let packet = encrypt_channel_packet(&fix.channel_key, &event).expect("encrypt");
+
+        fix.subscriber_tx
+            .send(packet.clone())
+            .await
+            .expect("send 1");
+        fix.subscriber_tx.send(packet).await.expect("send 2");
+
+        // Wait for first to land.
+        wait_for(
+            || async {
+                let v = fix.engine.list_messages(None, 100).await.unwrap();
+                (v.len() == 1).then_some(())
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("first event must land");
+
+        // ZEB-688: wait for the replay drop itself instead of sleeping —
+        // makes the "still just +1" assertion below non-vacuous (we KNOW
+        // the duplicate reached the drop path before asserting).
+        wait_for(
+            || async { (fix.engine.replay_drop_count() >= 1).then_some(()) },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the replayed packet must be observed dropping");
+
+        assert_eq!(
+            fix.engine.adopt_floor.merged_now(at.wall_ms),
+            at.wall_ms + 1,
+            "duplicate delivery must not advance the floor a second time"
+        );
+        assert!(
+            fix.engine.replay_drop_count() >= 1,
+            "replay drop counter must have advanced"
+        );
     }
 
     #[tokio::test]
