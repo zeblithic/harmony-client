@@ -133,7 +133,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn adopt_cap_stays_far_below_consumer_budgets() {
+        // The whole point IS asserting on constants: a compile-visible pin that
+        // widening HLC_ADOPT_FORWARD_CAP_MS must consciously re-derive (spec §6.2).
         // ZEB-790 spec §6.2. Widening CAP past these relations invalidates
         // the blast-radius analysis — re-run it before touching this test.
         // 60_000 = the invite/open-join forward windows
