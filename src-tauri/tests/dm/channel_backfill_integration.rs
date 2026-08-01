@@ -218,6 +218,7 @@ fn build_registry(session: &Arc<zenoh::Session>, seed: u8, device_id: &str) -> R
         self_owner: owner,
         self_device_id: device_id.to_string(),
         signing_key: Arc::clone(&signing),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         engine_config: ChannelLogEngineConfig {
             log_config: ChannelLogConfig {
                 seal_threshold_events: TEST_SEAL_THRESHOLD,

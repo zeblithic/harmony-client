@@ -446,6 +446,9 @@ pub struct ChannelLogEngineParams {
     pub self_device_id: String,
     pub signing_key: Arc<SigningKey>,
     pub hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs). One per node — the same clone every other mint seam uses.
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     pub sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
     pub config: ChannelLogEngineConfig,
 
@@ -481,6 +484,7 @@ pub struct ChannelLogEngine {
     self_device_id: String,
     signing_key: Arc<SigningKey>,
     hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
     config: ChannelLogEngineConfig,
 
@@ -572,6 +576,7 @@ impl ChannelLogEngine {
             self_device_id: params.self_device_id,
             signing_key: params.signing_key,
             hlc_tracker: params.hlc_tracker,
+            adopt_floor: params.adopt_floor,
             sink: params.sink,
             config: params.config,
             publisher_tx: params.publisher_tx,
@@ -1060,6 +1065,7 @@ impl ChannelLogEngine {
             .unwrap_or(0);
         let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
             &self.hlc_tracker,
+            &self.adopt_floor,
             &self.self_device_id,
             wall_now_ms,
         )
@@ -1272,6 +1278,7 @@ impl ChannelLogEngine {
             .unwrap_or(0);
         let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
             &self.hlc_tracker,
+            &self.adopt_floor,
             &self.self_device_id,
             wall_now_ms,
         )
@@ -2075,6 +2082,10 @@ pub struct ChannelLogRegistryConfig {
     /// at `start_node` time. `Arc` so per-engine spawns are cheap (no
     /// secret-byte copy).
     pub signing_key: Arc<SigningKey>,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs). Bound at registry construction — every spawned engine shares the
+    /// same node-wide clone (mirrors `self_owner`/`self_device_id` above).
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     /// Per-engine tunables. Cloned into each engine; tests override
     /// `log_config.seal_threshold_events` to exercise seal/reload
     /// paths in reasonable time.
@@ -2534,6 +2545,7 @@ impl ChannelLogRegistry {
             self_device_id: self.config.self_device_id.clone(),
             signing_key: Arc::clone(&self.config.signing_key),
             hlc_tracker: ds.hlc_tracker,
+            adopt_floor: self.config.adopt_floor.clone(),
             sink: self.config.sink.clone(),
             config: self.config.engine_config.clone(),
             publisher_tx,
@@ -3260,6 +3272,7 @@ mod tests {
             self_device_id: "test-device".to_string(),
             signing_key: Arc::clone(&signing_key),
             hlc_tracker,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             sink,
             config,
             publisher_tx,
@@ -5192,6 +5205,7 @@ mod tests {
             self_device_id: "test-device".to_string(),
             signing_key: Arc::clone(&signing_key),
             hlc_tracker,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             sink,
             config,
             publisher_tx,
@@ -5566,6 +5580,7 @@ mod tests {
             self_owner,
             self_device_id: "registry-test-device".to_string(),
             signing_key,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             engine_config: ChannelLogEngineConfig {
                 log_config: ChannelLogConfig {
                     seal_threshold_events: 8,
@@ -5676,6 +5691,7 @@ mod tests {
             self_owner,
             self_device_id: "backfill-test-device".to_string(),
             signing_key,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             engine_config: ChannelLogEngineConfig {
                 log_config: ChannelLogConfig {
                     seal_threshold_events: 8,
@@ -7317,6 +7333,7 @@ mod tests {
             self_device_id: "device-b".to_string(),
             signing_key: Arc::clone(&fix_a.signing_key),
             hlc_tracker: hlc_tracker_b,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             sink: sink_b,
             config: ChannelLogEngineConfig {
                 log_config: ChannelLogConfig {
@@ -7577,6 +7594,7 @@ mod tests {
             self_device_id: "device-b".to_string(),
             signing_key: Arc::clone(&fix_a.signing_key),
             hlc_tracker: hlc_tracker_b,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             sink: sink_b,
             config: ChannelLogEngineConfig {
                 log_config: ChannelLogConfig {

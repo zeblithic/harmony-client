@@ -2045,6 +2045,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         self_owner,
         self_device_id: "test-dev".into(),
         signing_key: Arc::clone(&signing_key),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         engine_config: ChannelLogEngineConfig::default(),
         transport_epoch_rx: None,
         // ZEB-599 Direction 1: no presence watch in this integration harness.
@@ -2085,6 +2086,7 @@ async fn create_community_atomic_rollback_on_adapter_dispatch_failure() {
         false,
         Arc::clone(&crdt_state),
         Arc::clone(&hlc_tracker),
+        harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         "test-dev".into(),
         self_owner,
         Arc::clone(&signing_key),
@@ -2492,7 +2494,13 @@ mod task3_kick_setpower_round_trip {
             m.insert("a-dev".to_string(), f.minted_a_join_hlc.clone());
             m
         }));
-        let kick_hlc = reserve_next_hlc_for_device(&kick_tracker, "a-dev", 300_000).await;
+        let kick_hlc = reserve_next_hlc_for_device(
+            &kick_tracker,
+            &harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+            "a-dev",
+            300_000,
+        )
+        .await;
         let kick = mint_kick_event(
             f.community_id,
             f.owner_a,
@@ -2551,7 +2559,13 @@ mod task3_kick_setpower_round_trip {
             m.insert("a-dev".to_string(), f.minted_a_join_hlc.clone());
             m
         }));
-        let promo_hlc = reserve_next_hlc_for_device(&promo_tracker, "a-dev", 300_000).await;
+        let promo_hlc = reserve_next_hlc_for_device(
+            &promo_tracker,
+            &harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+            "a-dev",
+            300_000,
+        )
+        .await;
         let promo = mint_set_power_event(
             f.community_id,
             f.owner_a,
@@ -2926,6 +2940,7 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
         self_owner: bob_addr,
         self_device_id: "bob-dev".into(),
         signing_key: Arc::clone(&bob_signing_key),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         engine_config: ChannelLogEngineConfig::default(),
         transport_epoch_rx: None,
         // ZEB-599 Direction 1: no presence watch in this integration harness.
@@ -2979,6 +2994,7 @@ async fn redeem_invite_only_commits_pending_join_when_inviter_unreachable() {
         fx.url,
         Arc::clone(&fx.crdt_state),
         Arc::clone(&fx.hlc_tracker),
+        harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         "bob-dev".into(),
         fx.bob_owner.owner,
         Arc::clone(&fx.bob_signing_key),
@@ -3058,6 +3074,7 @@ async fn redeem_invite_only_rolls_back_owner_state_on_fence_failure() {
         fx.url,
         Arc::clone(&fx.crdt_state),
         Arc::clone(&fx.hlc_tracker),
+        harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         "bob-dev".into(),
         fx.bob_owner.owner,
         Arc::clone(&fx.bob_signing_key),

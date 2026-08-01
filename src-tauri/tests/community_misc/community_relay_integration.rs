@@ -201,6 +201,7 @@ fn build_relay_engine(device_id: &str, persist: Arc<dyn FleetPersist<RelayHoldDo
         publish_seen: false,
         on_applied: None,
         sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
     }));
     Built {
         engine,
@@ -240,6 +241,7 @@ fn build_relay_engine_from_doc(
         publish_seen: false,
         on_applied: None,
         sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
     }));
     Built {
         engine,
@@ -319,7 +321,12 @@ impl RelayDepositCtx for TestRelayCtx {
     }
 
     async fn mint_hlc(&self) -> Hlc {
-        mint_next_hlc(&self.tracker, &self.relay_device_id).await
+        mint_next_hlc(
+            &self.tracker,
+            &harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+            &self.relay_device_id,
+        )
+        .await
     }
 
     /// Atomic persist-with-caps under the doc lock (mirrors
@@ -1095,6 +1102,7 @@ fn build_prod_ctxs(
         flush: Arc::new(EngineRelayHoldFlush(Arc::clone(&built.engine))),
         optin: Arc::clone(&optin),
         membership: Arc::clone(&membership),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
     };
     let pull = ProdRelayPullCtx {
         self_owner: relay.owner.0,

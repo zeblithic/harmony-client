@@ -864,6 +864,7 @@ async fn click_to_join_redeem_invite_smoke() {
         self_owner: joiner_owner,
         self_device_id: "joiner-dev".into(),
         signing_key: Arc::clone(&joiner_signing_key),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         engine_config: ChannelLogEngineConfig::default(),
         transport_epoch_rx: None,
         // ZEB-599 Direction 1: no presence watch in this integration harness.
@@ -889,6 +890,7 @@ async fn click_to_join_redeem_invite_smoke() {
         click_to_join_url,
         Arc::clone(&crdt_state),
         Arc::clone(&hlc_tracker),
+        harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         "joiner-dev".into(),
         joiner_owner,
         Arc::clone(&joiner_signing_key),

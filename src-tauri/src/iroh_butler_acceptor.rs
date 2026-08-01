@@ -283,6 +283,9 @@ pub struct ProdButlerDepositCtx {
     pub dm_inbox_tracker: Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs).
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     pub dm_inbox_engine: Arc<crate::fleet_sync::FleetSyncEngine<DmInboxDoc>>,
     /// Weak nudge sender into the dm-inbox ingest sweeper. Weak so the
     /// acceptor (whose lifetime is tied to the iroh link manager, not the
@@ -361,7 +364,8 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
     }
 
     async fn mint_hlc(&self) -> Hlc {
-        crate::fleet_sync::mint_next_hlc(&self.dm_inbox_tracker, &self.device_id).await
+        crate::fleet_sync::mint_next_hlc(&self.dm_inbox_tracker, &self.adopt_floor, &self.device_id)
+            .await
     }
 
     async fn persist_entry(

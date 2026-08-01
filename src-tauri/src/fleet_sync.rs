@@ -190,6 +190,10 @@ pub struct FleetSyncConfig<S> {
     /// Per-sibling record of "their latest seen-of-me" HLC, populated
     /// from inbound `seen` digests when `publish_seen` is set.
     pub sibling_acks: Arc<Mutex<MonotoneMap<String, Hlc>>>,
+    /// ZEB-790: node-wide bounded-adoption floor. One per node (NOT
+    /// per-engine) — callers pass a clone of the same `HlcAdoptFloor`
+    /// every other mint seam on this node uses.
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
 }
 
 /// Generic per-owner sync engine. Construction spawns the internal task;
@@ -386,6 +390,7 @@ where
             fetch_retries_dropped: Arc::clone(&fetch_retries_dropped),
             fetch_retry_inflight_peak: Arc::clone(&fetch_retry_inflight_peak),
             root_serve_rx,
+            adopt_floor: config.adopt_floor,
         }));
 
         FleetSyncEngine {
@@ -645,6 +650,8 @@ struct Ctx<S> {
     /// busy-loop on `None` (no keep-open self-clone needed, unlike fetch-retry
     /// whose senders live only in transient sleep tasks).
     root_serve_rx: mpsc::Receiver<RootServeReq>,
+    /// ZEB-790: node-wide bounded-adoption floor (see `FleetSyncConfig::adopt_floor`).
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
 }
 
 /// Map a publish result onto the latch's outcome vocabulary.
@@ -1075,7 +1082,7 @@ where
         .await?;
 
     // 5. Mint a strictly-newer HLC and assemble the publish envelope.
-    let at = mint_next_hlc(&ctx.replay_tracker, &ctx.device_id).await;
+    let at = mint_next_hlc(&ctx.replay_tracker, &ctx.adopt_floor, &ctx.device_id).await;
     let seen = if ctx.publish_seen {
         // Snapshot the tracker into the `seen` digest, capped at
         // MAX_DEVICES_PER_OWNER so a pathological roster can't unbound
@@ -1110,11 +1117,16 @@ where
 /// Extracted as a free function (reused by later tasks). Mirrors the
 /// donor `owner_state_sync::next_hlc` wall-ms / logical-saturation logic
 /// exactly.
+///
+/// ZEB-790: `floor` bounds the mint to at most `HLC_ADOPT_FORWARD_CAP_MS`
+/// ahead of the wall clock, adopting the highest verified remote wall this
+/// session has observed. An empty floor is the identity.
 pub async fn mint_next_hlc(
     tracker: &Arc<Mutex<ReplayTracker<String, Hlc>>>,
+    floor: &crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: &str,
 ) -> Hlc {
-    let wall_ms = now_wall_ms();
+    let wall_ms = floor.merged_now(now_wall_ms());
     let mut tracker = tracker.lock().await;
     let now = compute_next_hlc(tracker.accepted(), device_id, wall_ms);
     // `observe_local` rather than `commit`: the local entry is unreachable
@@ -1136,8 +1148,15 @@ pub async fn mint_next_hlc(
 /// have advanced, so the minted HLC is always `>=` this peek. That direction
 /// is the safe one — if this peek is strictly-newer-than some value, the real
 /// mint is too.
-pub fn peek_next_hlc(tracker_snapshot: &BTreeMap<String, Hlc>, device_id: &str) -> Hlc {
-    compute_next_hlc(tracker_snapshot, device_id, now_wall_ms())
+///
+/// ZEB-790: takes the same `floor` as `mint_next_hlc` so a peek and the mint
+/// it previews agree on adoption.
+pub fn peek_next_hlc(
+    tracker_snapshot: &BTreeMap<String, Hlc>,
+    floor: &crate::hlc_adopt_floor::HlcAdoptFloor,
+    device_id: &str,
+) -> Hlc {
+    compute_next_hlc(tracker_snapshot, device_id, floor.merged_now(now_wall_ms()))
 }
 
 fn now_wall_ms() -> u64 {
@@ -1611,6 +1630,7 @@ mod engine_tests {
             publish_seen,
             on_applied: None,
             sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         });
         Built {
             engine,
@@ -1702,6 +1722,7 @@ mod engine_tests {
             publish_seen: false,
             on_applied: None,
             sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         });
         BuiltInspectable {
             engine,
@@ -2168,6 +2189,7 @@ mod engine_tests {
             publish_seen: false,
             on_applied: None,
             sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         });
 
         // V1: cancelled mid-write (the slow first write outlives the 50ms

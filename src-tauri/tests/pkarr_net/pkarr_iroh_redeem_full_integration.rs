@@ -601,6 +601,7 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
         self_owner: bob_addr,
         self_device_id: "bob-dev".into(),
         signing_key: Arc::clone(&bob_comm_sk),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         engine_config: ChannelLogEngineConfig::default(),
         transport_epoch_rx: None,
         // ZEB-599 Direction 1: no presence watch in this integration harness.
@@ -847,6 +848,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             Some(Arc::clone(&s.bob_ep)),
             Arc::clone(&s.bob_crdt_state),
             Arc::clone(&s.bob_hlc_tracker),
+            harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             "bob-dev".to_string(),
             s.bob_addr,
             Arc::clone(&s.bob_comm_sk),
@@ -1139,6 +1141,7 @@ async fn targeted_invite_only_generate_then_redeem_roundtrip() {
             Some(Arc::clone(&s.bob_ep)),
             Arc::clone(&s.bob_crdt_state),
             Arc::clone(&s.bob_hlc_tracker),
+            harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             "bob-dev".to_string(),
             s.bob_addr,
             Arc::clone(&s.bob_comm_sk),
@@ -1305,6 +1308,7 @@ async fn targeted_invite_only_multi_device_redeem_opens_correct_envelope() {
             Some(Arc::clone(&s.bob_ep)),
             Arc::clone(&s.bob_crdt_state),
             Arc::clone(&s.bob_hlc_tracker),
+            harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             "bob-dev".to_string(),
             s.bob_addr,
             Arc::clone(&s.bob_comm_sk),
@@ -1489,6 +1493,7 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
             Some(Arc::clone(&s.bob_ep)),
             Arc::clone(&s.bob_crdt_state),
             Arc::clone(&s.bob_hlc_tracker),
+            harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             "bob-dev".to_string(),
             s.bob_addr,
             Arc::clone(&s.bob_comm_sk),
@@ -1755,6 +1760,7 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
             persist_paths.clone(),
             // Debounce >> test budget: only the explicit fence can write.
             600_000,
+            harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
 
         let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
@@ -1764,6 +1770,7 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
             Some(Arc::clone(&s.bob_ep)),
             Arc::clone(&s.bob_crdt_state),
             Arc::clone(&s.bob_hlc_tracker),
+            harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             "bob-dev".to_string(),
             s.bob_addr,
             Arc::clone(&s.bob_comm_sk),

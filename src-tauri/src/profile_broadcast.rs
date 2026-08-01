@@ -410,6 +410,9 @@ pub struct OwnerStateBroadcastSource {
     pub crdt_state: Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     pub hlc_tracker: Arc<tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     pub device_id: String,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs). Applied at `next_hlc`.
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
 }
 
 #[async_trait::async_trait]
@@ -447,10 +450,12 @@ impl ProfileBroadcastSource for OwnerStateBroadcastSource {
         // and other community-related publishes (SystemTime-based wall
         // clock + saturating logical counter).
         use std::time::{SystemTime, UNIX_EPOCH};
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_ms = self.adopt_floor.merged_now(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        );
         let mut tracker = self.hlc_tracker.lock().await;
         // Was a fourth open-coded copy of the same tick rule (bump logical
         // unless the wall reading advanced). It now delegates to the core
@@ -922,6 +927,7 @@ mod tests {
             crdt_state,
             hlc_tracker,
             device_id: "test".into(),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         };
 
         let got = src.current_shared_set().await;
@@ -1023,6 +1029,7 @@ mod tests {
             crdt_state,
             hlc_tracker,
             device_id: "test".into(),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         };
 
         let got = src.current_shared_set().await;

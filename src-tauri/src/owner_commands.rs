@@ -3495,6 +3495,7 @@ mod revoke_tests {
                 publish_seen: false,
                 on_applied: None,
                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             },
         ));
         let trust_doc_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state.clone()));
@@ -3526,6 +3527,7 @@ mod revoke_tests {
                 publish_seen: true,
                 on_applied: None,
                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             },
         ));
         let node = std::sync::Mutex::new(crate::NodeState {

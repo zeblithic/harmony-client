@@ -1412,6 +1412,7 @@ mod tests {
             publish_seen: true,
             on_applied: None,
             sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         });
 
         // A local self-row upsert (what start_node's post-bind upsert

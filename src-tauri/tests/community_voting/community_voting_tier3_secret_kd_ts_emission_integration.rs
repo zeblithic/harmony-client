@@ -214,6 +214,7 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
     )));
 
     let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         voting_log: Arc::clone(&voting_log),
         publisher_tx,
@@ -368,7 +369,13 @@ async fn engine_orchestration_emits_kd_ts_after_kd_cl_se_mode() {
     // Reserve at least one HLC on the device's lane so subsequent
     // `reserve_next_local_hlc` calls inside the hook don't collide
     // with wall_now_ms=0.
-    let _ = reserve_next_hlc_for_device(&hlc_tracker, &device_id, 1_000_000).await;
+    let _ = reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        &device_id,
+        1_000_000,
+    )
+    .await;
 
     // (5) Drive the kd=ts emission hook directly via the test seam.
     engine
@@ -524,6 +531,7 @@ async fn no_kd_ts_emission_when_not_committee_member() {
     )));
 
     let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         voting_log: Arc::clone(&voting_log),
         publisher_tx,
@@ -621,7 +629,13 @@ async fn no_kd_ts_emission_when_not_committee_member() {
             },
         );
     }
-    let _ = reserve_next_hlc_for_device(&hlc_tracker, &device_id, 1_000_000).await;
+    let _ = reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        &device_id,
+        1_000_000,
+    )
+    .await;
 
     engine
         .test_invoke_maybe_emit_tally_share(&poll_id, &signing_key, non_committee_owner)

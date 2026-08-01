@@ -124,6 +124,7 @@ impl SyncEngine {
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
         paths: PersistPaths,
         debounce_ms: u64,
+        adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     ) -> Self {
         // The OwnerState merge function. `merge_remote_into_local` folds
         // every sub-CRDT from a decoded remote snapshot into local in the
@@ -162,6 +163,7 @@ impl SyncEngine {
             // Unused while `publish_seen == false`, but the config field is
             // mandatory; a fresh empty map keeps the engine self-contained.
             sibling_acks: Arc::new(Mutex::new(MonotoneMap::new())),
+            adopt_floor,
         });
 
         SyncEngine { inner }
@@ -620,6 +622,7 @@ mod debounce_tests {
             sub_rx,
             paths,
             50, // shorter debounce for tests
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         engine.notify_dirty();
@@ -651,6 +654,7 @@ mod debounce_tests {
             sub_rx,
             paths,
             100, // 100ms debounce
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         for _ in 0..50 {
@@ -686,6 +690,7 @@ mod debounce_tests {
             sub_rx,
             paths,
             5000, // very long debounce — flush_now must beat it
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         engine.flush_now().await.unwrap();
@@ -726,6 +731,7 @@ mod debounce_tests {
             sub_rx,
             paths,
             5000, // long debounce — only flush_now can persist within the test
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         // Mutate owner-state in memory: insert a Community Space.
@@ -791,6 +797,7 @@ mod debounce_tests {
             sub_rx,
             paths,
             200,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         engine.notify_dirty();
@@ -824,6 +831,7 @@ mod debounce_tests {
             sub_rx,
             paths,
             5000, // long debounce — shutdown must short-circuit it
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         engine.notify_dirty();
@@ -850,6 +858,7 @@ mod debounce_tests {
             sub_rx,
             paths,
             5000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         let _ = engine.shutdown().await;
@@ -888,6 +897,7 @@ mod skeleton_tests {
             sub_rx,
             paths,
             DEFAULT_DEBOUNCE_MS,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
         let _ = engine.shutdown().await;
         // No assertions beyond "didn't hang or panic."
@@ -981,6 +991,7 @@ mod wire_identity_tests {
             sub_rx,
             paths,
             5000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         engine.flush_now().await.unwrap();
@@ -1119,6 +1130,7 @@ mod subscriber_tests {
             sub_rx,
             paths,
             5000, // long debounce — keep self-publishes out of the way
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         let wire = make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 1000, 0).await;
@@ -1168,6 +1180,7 @@ mod subscriber_tests {
             sub_rx,
             paths,
             5000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         // First publish: at=2000.
@@ -1272,6 +1285,7 @@ mod subscriber_tests {
             sub_rx,
             paths,
             5000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         // Build a remote OwnerState containing a folder id=42.
@@ -1321,6 +1335,7 @@ mod subscriber_tests {
             sub_rx,
             paths,
             5000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         // Build a remote OwnerState that has befriended a peer. The friend's
@@ -1401,6 +1416,7 @@ mod subscriber_tests {
             sub_rx,
             paths,
             5000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         let mut remote = OwnerState::default();
@@ -1493,6 +1509,7 @@ mod subscriber_tests {
             sub_rx,
             paths,
             5000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         let mut remote = OwnerState::default();
@@ -1560,6 +1577,7 @@ mod subscriber_tests {
                 sub_rx,
                 paths.clone(),
                 5000,
+                crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             );
             sub_tx
                 .send(make_wire(&kt, &store, &OwnerState::default(), "peer-bob", 5000, 0).await)
@@ -1605,6 +1623,7 @@ mod subscriber_tests {
             sub_rx2,
             paths.clone(),
             5000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
         // Send an older publish: at=2000 < 5000.
         sub_tx2
@@ -1674,6 +1693,7 @@ mod publisher_tests {
             sub_rx,
             paths,
             50,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         engine.notify_dirty();
@@ -1829,6 +1849,7 @@ mod integration_tests {
             a_sub_rx,
             paths("a", &dir),
             50,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
         let b_engine = SyncEngine::new(
             FleetKeySet::new(Arc::clone(&kt)),
@@ -1840,6 +1861,7 @@ mod integration_tests {
             b_sub_rx,
             paths("b", &dir),
             50,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         TwoDevices {
@@ -3265,6 +3287,7 @@ mod cas_op_protocol_tests {
                 replay: dir.path().join("replay.cbor"),
             },
             50,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         // Forge a state-root publish for a CID the stub doesn't have. The

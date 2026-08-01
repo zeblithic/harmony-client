@@ -6018,7 +6018,7 @@ pub async fn apply_auto_exec_set_power(
     // Snapshot the handles we need under the std::sync::Mutex, then drop
     // the lock before any await (no awaits while holding a std mutex —
     // existing project convention; see set_power_level IPC).
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox) = {
+    let (hlc_tracker, adopt_floor, device_id, self_owner, community_registry, dm_outbox) = {
         let g = node_state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -6026,6 +6026,7 @@ pub async fn apply_auto_exec_set_power(
             g.hlc_tracker
                 .clone()
                 .ok_or("hlc_tracker missing (node not running?)")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id
                 .clone()
                 .ok_or("dm_device_id missing (node not running?)")?,
@@ -6147,8 +6148,13 @@ pub async fn apply_auto_exec_set_power(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     let event = {
         let outbox_g = dm_outbox.lock().await;
@@ -6215,7 +6221,7 @@ pub async fn apply_auto_exec_admin_proposal_set_power(
 ) -> Result<AutoExecOutcome, String> {
     // Snapshot the handles we need under the std::sync::Mutex, then drop
     // the lock before any await (no awaits while holding a std mutex).
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox) = {
+    let (hlc_tracker, adopt_floor, device_id, self_owner, community_registry, dm_outbox) = {
         let g = node_state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -6223,6 +6229,7 @@ pub async fn apply_auto_exec_admin_proposal_set_power(
             g.hlc_tracker
                 .clone()
                 .ok_or("hlc_tracker missing (node not running?)")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id
                 .clone()
                 .ok_or("dm_device_id missing (node not running?)")?,
@@ -6255,8 +6262,13 @@ pub async fn apply_auto_exec_admin_proposal_set_power(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let now_ms = event_hlc.wall_ms;
 
     // Decide mint-vs-countersign-vs-already-applied-vs-pending from the

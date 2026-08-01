@@ -281,6 +281,7 @@ fn build_outhold_engine(
         publish_seen: true,
         on_applied: None, // sweeps driven explicitly in this test
         sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
     }));
     Built {
         engine,
@@ -324,6 +325,7 @@ fn build_inbox_engine(
         publish_seen: true,
         on_applied: None,
         sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
     }));
     Built {
         engine,
@@ -443,7 +445,12 @@ impl ButlerDepositCtx for TestButlerCtx {
     }
 
     async fn mint_hlc(&self) -> Hlc {
-        mint_next_hlc(&self.tracker, &self.device_id).await
+        mint_next_hlc(
+            &self.tracker,
+            &harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+            &self.device_id,
+        )
+        .await
     }
 
     /// ProdButlerDepositCtx::persist_entry verbatim: atomic

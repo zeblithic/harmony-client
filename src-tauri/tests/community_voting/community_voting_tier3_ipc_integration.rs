@@ -242,6 +242,7 @@ async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingEngin
         Arc::clone(&resolvers) as Arc<dyn MembershipSnapshotResolver>;
 
     let engine_a = VotingLogEngine::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         voting_log: Arc::clone(&log_a),
         publisher_tx: a_pub_tx,
@@ -255,6 +256,7 @@ async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingEngin
     .await;
 
     let engine_b = VotingLogEngine::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         voting_log: Arc::clone(&log_b),
         publisher_tx: b_pub_tx,

@@ -640,6 +640,7 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
             self_owner: bob_addr,
             self_device_id: "bob-dev".into(),
             signing_key: Arc::clone(&bob_comm_sk),
+            adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             engine_config: ChannelLogEngineConfig::default(),
             transport_epoch_rx: None,
             // ZEB-599 Direction 1: no presence watch in this integration harness.
@@ -1227,6 +1228,7 @@ async fn bob_open_join_redeem_spawns_channel_log_engine_in_session() {
             invite_url,
             Arc::clone(&bob_crdt_state),
             Arc::clone(&s.bob_hlc_tracker),
+            harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             "bob-dev".to_string(),
             s.bob_addr,
             Arc::clone(&s.bob_comm_sk),

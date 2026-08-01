@@ -80,6 +80,10 @@ pub struct IrohFriendPexAcceptor {
     /// Shared HLC tracker (`device_id → last Hlc`), bumped per served catalog to
     /// stamp `ReferralCatalog.at`. Same map the handshake acceptor uses.
     hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs). Applied at `next_hlc` and threaded into `complete_introduction`'s
+    /// own mint.
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     self_owner: OwnerAddr,
     self_enrollment: EnrollmentCert,
@@ -219,6 +223,9 @@ impl IrohFriendPexAcceptor {
             // no revocations; production wires the live handle.
             self_trust_doc: None,
             traffic: None,
+            // ZEB-790: default to the EMPTY (identity) floor — production wires
+            // the real node-wide handle via `with_adopt_floor`.
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         }
     }
 
@@ -354,10 +361,20 @@ impl IrohFriendPexAcceptor {
         self
     }
 
+    /// ZEB-790: wire the node-wide bounded-adoption floor (see `hlc_adopt_floor`
+    /// module docs). Fluent setter (default: the EMPTY floor from `with_config`,
+    /// which is the identity — same posture as `with_revoked`). PRODUCTION
+    /// SHOULD call this with the real node-wide handle so this acceptor's mints
+    /// stay causally consistent with the rest of the node.
+    pub fn with_adopt_floor(mut self, adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor) -> Self {
+        self.adopt_floor = adopt_floor;
+        self
+    }
+
     /// Bump-and-return a fresh HLC stamped with this device's id. Mirrors
     /// `iroh_friend_acceptor::IrohFriendHandshakeAcceptor::next_hlc`.
     async fn next_hlc(&self) -> Hlc {
-        let now_ms = wall_now_ms();
+        let now_ms = self.adopt_floor.merged_now(wall_now_ms());
         let mut tracker = self.hlc_tracker.lock().await;
         // Delegates to the core tick kernel like every other minting path
         // (ZEB-759); this was an open-coded copy of the same rule.
@@ -409,6 +426,7 @@ impl IrohFriendPexAcceptor {
         let self_device2 = Arc::clone(&self.device2_signing_key);
         let crdt_state = Arc::clone(&self.crdt_state);
         let hlc_tracker = Arc::clone(&self.hlc_tracker);
+        let adopt_floor = self.adopt_floor.clone();
         let device_id = self.device_id.clone();
         // ZEB-376 Task 10 (durability fix): the post-`Linked` handles so the
         // introduced friend is persisted + replicated + surfaced (skipped
@@ -438,6 +456,7 @@ impl IrohFriendPexAcceptor {
                 keytree,
                 crdt_state,
                 hlc_tracker,
+                adopt_floor,
                 device_id,
                 sync_engine,
                 friend_publisher,

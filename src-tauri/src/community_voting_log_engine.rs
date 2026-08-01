@@ -295,6 +295,11 @@ pub struct VotingLogEngineParams<R: tauri::Runtime = tauri::Wry> {
     /// monotone with the IPC layer's mints on the same lane.
     /// Optional so tests that never trigger engine-auto can pass `None`.
     pub hlc_tracker: Option<Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>>,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs). Not gated with `hlc_tracker`/`device_id` above — an empty floor
+    /// (`Default`) is the identity, so tests that never install a tracker are
+    /// unaffected either way.
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     /// Local device_id string, paired with `hlc_tracker` above.
     /// Optional for the same reason as `hlc_tracker`.
     pub device_id: Option<String>,
@@ -359,6 +364,9 @@ pub struct VotingLogEngine<R: tauri::Runtime> {
     /// IPC layer's tracker so engine-auto HLCs are monotone with IPC
     /// mints on the local device's lane.
     hlc_tracker: Option<Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>>,
+    /// ZEB-790: node-wide bounded-adoption floor — see
+    /// `VotingLogEngineParams::adopt_floor`.
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     /// ZEB-310 Task 9: local device_id paired with `hlc_tracker`.
     /// `None` follows the same gating as `hlc_tracker`.
     device_id: Option<String>,
@@ -521,6 +529,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             dfrost_registry: Mutex::new(None),
             beacon_requester: Mutex::new(None),
             hlc_tracker: params.hlc_tracker,
+            adopt_floor: params.adopt_floor,
             device_id: params.device_id,
             app_handle: params.app_handle,
             local_signing: RwLock::new(None),
@@ -597,7 +606,13 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             .device_id
             .as_deref()
             .expect("reserve_next_local_hlc called without device_id installed");
-        crate::dm_outbox::reserve_next_hlc_for_device(tracker, device_id, wall_now_ms).await
+        crate::dm_outbox::reserve_next_hlc_for_device(
+            tracker,
+            &self.adopt_floor,
+            device_id,
+            wall_now_ms,
+        )
+        .await
     }
 
     /// ZEB-310 Task 10: read-only "now" HLC estimate.
@@ -3523,6 +3538,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: Some(app.handle().clone()),
             identity_resolver: Some(id_resolver),
@@ -3811,6 +3827,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: None,
             identity_resolver: None,
@@ -3915,6 +3932,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: None,
             identity_resolver: Some(id_resolver),
@@ -3969,6 +3987,7 @@ mod tests {
                 publisher_tx: pub_tx_a,
                 subscriber_rx: sub_rx_a,
                 hlc_tracker: None,
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: None,
                 app_handle: None,
                 identity_resolver: None,
@@ -3985,6 +4004,7 @@ mod tests {
                 publisher_tx: pub_tx_b,
                 subscriber_rx: sub_rx_b,
                 hlc_tracker: None,
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: None,
                 app_handle: None,
                 identity_resolver: None,
@@ -4109,6 +4129,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: None,
             identity_resolver: None,
@@ -4208,6 +4229,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: None,
             identity_resolver: None,
@@ -4295,6 +4317,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: None,
             identity_resolver: None,
@@ -4425,6 +4448,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: None,
             identity_resolver: None,
@@ -4523,6 +4547,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: None,
             identity_resolver: None,
@@ -4630,6 +4655,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: None,
             identity_resolver: None,
@@ -4730,6 +4756,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: None,
             identity_resolver: None,
@@ -5115,6 +5142,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: Some(app_handle.clone()),
             identity_resolver: None,
@@ -5472,6 +5500,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: Some(app_handle.clone()),
             identity_resolver: Some(id_resolver),
@@ -5712,6 +5741,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: None,
             app_handle: Some(app_handle.clone()),
             identity_resolver: None,
@@ -6133,6 +6163,7 @@ mod tests {
             hlc_tracker: Some(Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
                 device_id.to_string(),
             )))),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: Some(device_id.to_string()),
             app_handle: Some(app.handle().clone()),
             identity_resolver: None,
