@@ -432,29 +432,44 @@ pub fn list_received_grants_inner(state: &OwnerState) -> Vec<ReceivedGrantDto> {
 /// component away. This fills the gap from the profile-card cache, the same
 /// enrichment ZEB-777 applies to `list_community_members`.
 ///
-/// Precedence: the friend nickname WINS — it is the grantee's own deliberate
-/// local label, so only rows still `None` are touched, and only from a
-/// non-empty card name (a peer may publish `display_name = ""`; see
-/// `display-label.ts::nonEmpty`). `names` is keyed by 16-byte `owner_id`, matching
+/// Precedence: a present, **non-blank** friend nickname WINS — it is the
+/// grantee's own deliberate local label. A blank/whitespace friend label is
+/// treated as ABSENT, exactly as the frontend's `nonEmpty()` label ladder
+/// (`display-label.ts`) treats it: it is normalized to `None` (so the DTO never
+/// carries a blank) and the card overlay is allowed to fill it. The card name
+/// itself is likewise only applied when non-blank (a peer may publish
+/// `display_name = ""`). `names` is keyed by 16-byte `owner_id`, matching
 /// `ProfileCardCache::display_names_by_owner`. Pure and local — no network, no
 /// lock — so it is unit-testable without a live node.
 pub fn enrich_received_grant_names(
     rows: &mut [ReceivedGrantDto],
     names: &std::collections::HashMap<[u8; 16], String>,
 ) {
-    if names.is_empty() {
-        return;
-    }
     for row in rows.iter_mut() {
-        if row.display_name.is_some() {
+        // A present, non-blank name wins (nonEmpty() parity). Normalize a
+        // blank/whitespace label to None so a real card name can still fill it.
+        if row
+            .display_name
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
             continue;
         }
-        let Ok(bytes) = hex::decode(&row.granter_address) else {
+        row.display_name = None;
+
+        if names.is_empty() {
             continue;
-        };
-        let Ok(owner) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+        }
+        // `granter_address` is a 16-byte owner id, hex-encoded (32 chars). Decode
+        // into a fixed stack buffer to avoid a per-row `Vec` allocation the
+        // caller only just produced from `[u8; 16]` (PR #463/#530 convention).
+        if row.granter_address.len() != 32 {
             continue;
-        };
+        }
+        let mut owner = [0u8; 16];
+        if hex::decode_to_slice(&row.granter_address, &mut owner).is_err() {
+            continue;
+        }
         if let Some(name) = names.get(&owner) {
             if !name.trim().is_empty() {
                 row.display_name = Some(name.clone());
@@ -1072,6 +1087,8 @@ mod tests {
         let peer = [0x22u8; 16]; // stranger the card cache can name
         let blank = [0x33u8; 16]; // card cache holds only a whitespace name
         let unknown = [0x44u8; 16]; // in nobody's map
+        let blank_friend = [0x55u8; 16]; // BLANK friend label + a real card name
+        let blank_friend_no_card = [0x66u8; 16]; // blank friend label, no card name
 
         let mk = |owner: [u8; 16], name: Option<&str>| ReceivedGrantDto {
             cid: hex::encode([0xCC; 32]),
@@ -1088,12 +1105,15 @@ mod tests {
             mk(peer, None),
             mk(blank, None),
             mk(unknown, None),
+            mk(blank_friend, Some("   ")),
+            mk(blank_friend_no_card, Some("  ")),
         ];
 
         let mut names = HashMap::new();
         names.insert(friended, "Alice Card".to_string()); // must NOT override the nickname
         names.insert(peer, "UI Probe".to_string());
         names.insert(blank, "   ".to_string()); // whitespace-only → treated as absent
+        names.insert(blank_friend, "Filled From Card".to_string());
 
         enrich_received_grant_names(&mut rows, &names);
 
@@ -1115,13 +1135,27 @@ mod tests {
             rows[3].display_name, None,
             "an owner absent from the card cache stays unnamed"
         );
+        assert_eq!(
+            rows[4].display_name.as_deref(),
+            Some("Filled From Card"),
+            "a BLANK friend label is treated as absent and overlaid from the card cache (Qodo Q1)"
+        );
+        assert_eq!(
+            rows[5].display_name, None,
+            "a blank friend label with no card name is normalized to None"
+        );
 
-        // An empty names map is a no-op — nothing is cleared or changed.
-        let mut rows2 = vec![mk(peer, None)];
+        // An empty names map performs no overlay, but a blank label is still
+        // normalized to None — the nonEmpty() parity is cache-independent.
+        let mut rows2 = vec![mk(peer, None), mk(blank_friend_no_card, Some("   "))];
         enrich_received_grant_names(&mut rows2, &HashMap::new());
         assert_eq!(
             rows2[0].display_name, None,
-            "empty card cache changes nothing"
+            "a None row is unchanged by an empty cache"
+        );
+        assert_eq!(
+            rows2[1].display_name, None,
+            "a blank label is normalized to None even with an empty cache"
         );
     }
 
