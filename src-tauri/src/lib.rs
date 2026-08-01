@@ -5460,6 +5460,7 @@ pub async fn start_node_inner(
                             mint_in_rx,
                             crate::mint_sync::DEFAULT_DEBOUNCE_MS,
                             app.clone(),
+                            adopt_floor.clone(), // ZEB-845: node-wide bounded-adoption floor
                         )
                         .await;
                         // Boot-hook flush: emit the local snapshot shortly

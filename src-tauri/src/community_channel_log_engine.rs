@@ -1735,6 +1735,12 @@ impl ChannelLogEngine {
         // succeeded. Every earlier `return` (garbage, replay, invalid)
         // leaves the floor untouched. Use the same event accessor
         // `would_accept` reads the stamp through.
+        // ZEB-843 minor #2: this fires BEFORE step 3's `closing` check below,
+        // same as the 2c replay-tracker advance above — an event whose append
+        // is later skipped on a shutdown race still bumps the floor. Harmless
+        // by design: the floor is session-only/non-persisted and re-derived
+        // from live traffic, so a feed outliving a dropped append is not an
+        // observable inconsistency.
         self.adopt_floor.observe(event.at().wall_ms);
 
         // 3. Append. The `closing` check MUST sit under the `log` lock —
