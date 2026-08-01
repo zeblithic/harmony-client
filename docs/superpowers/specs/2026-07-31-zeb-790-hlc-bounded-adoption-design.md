@@ -115,9 +115,11 @@ already owned by the persisted replay trackers, not the floor.
 
 | # | Source | Where | Trust binding |
 |---|---|---|---|
-| 1 | Community state | after `tracker.commit(replay_ticket)` at `community_state_sync.rs:4457-4460` | Ed25519 `verify_publisher_sig`, member Joined-at-HLC, TOCTOU re-check |
-| 2 | Channel log | in `ChannelLogEngine::process_inbound_packet`, after `verify_channel_event` returns Ok — i.e. its step-8 `record` (`community_channel_log.rs:1569-1574`) has committed, so replay check **and** signature verify both passed | Ed25519 `verify_strict` against enrolled author device keys |
-| 3 | Owner-state fleet | after `ctx.replay_tracker.lock().await.commit(ticket)` at `fleet_sync.rs:1422` | fleet AEAD (own sibling devices only) |
+| 1 | Community state | after `tracker.commit(replay_ticket)` at `community_state_sync.rs:4466-4474` | Ed25519 `verify_publisher_sig`, member Joined-at-HLC, TOCTOU re-check |
+| 2 | Channel log | in `ChannelLogEngine::process_inbound_packet`, after step 2c's atomic `check_and_advance` succeeds — i.e. `community_channel_log_engine.rs:1715-1738` — so replay check **and** signature verify (step 2b) both passed | Ed25519 `verify_strict` against enrolled author device keys |
+| 3 | Owner-state fleet | after `ctx.replay_tracker.lock().await.commit(ticket)` at `fleet_sync.rs:1442-1445` | fleet AEAD (own sibling devices only) |
+| 4 | Community voting inbound (ZEB-843) | after V6-membership + Ed25519 verify + apply + record all succeed, in `VotingLogEngine::process_inbound` (`community_voting_log_engine.rs:2810-2815`) and its backfill twin `apply_backfilled_event` (`:2884-2887`) | Ed25519 `verify_voting_event` (V6 membership-at-HLC), same trust class as channel-log |
+| 5 | Mint-state-root sync inbound (ZEB-845) | after the replay-tracker advance in `MintSyncEngine`'s verified-apply path, `mint_sync.rs:1260-1265` | fleet AEAD (own sibling devices only), same trust class as owner-state fleet |
 
 **Invariant (mirrors the tracker's censorship-defence discipline,
 `community_state_sync.rs:3743-3752`): a rejected or unverified frame never moves the
@@ -145,12 +147,10 @@ the guarantee callers actually depend on — is owned by the replay trackers, no
   nudge surface from "community members + own fleet" to *any friend*, and DM thread
   ordering is driven by locally-minted `received_at`, so the causal payoff is small.
   Revisit if cross-participant DM ordering becomes a surface.
-- **Tier-3 voting inbound** (`community_voting_log_engine.rs`'s `process_inbound_packet`) —
-  a verified accept path of the same trust class as the channel-log feed, NOT fed in
-  v1 (surfaced by the final branch review). Consequence: the §6 lockout side-benefit
-  engages only when the skewed peer's clock is learned via a fed path; a voting-only
-  interaction retains today's `HlcNotMonotonic` behavior. Follow-up: ZEB-843.
 - Unverified/synthetic stamps of any kind (pkarr-derived, payload-claimed).
+
+(Tier-3 voting inbound and mint-sync inbound were both excluded here in v1; both are now
+fed — see rows 4-5 above, ZEB-843 and ZEB-845.)
 
 ## 5. Mint seams (read side)
 
@@ -167,6 +167,9 @@ Same widening for the sibling mint seams:
   floor is read inside the already-held tracker lock; `community_hlc_tick` stays a pure
   `(prev, wall_ms, device_id)` function so the ZEB-750 non-vacuity test still binds.
 - `fleet_sync.rs:1113 mint_next_hlc` / `:1139 peek_next_hlc` / `:1153 compute_next_hlc`.
+- `mint_sync.rs:983 next_hlc_mint` (ZEB-845) — reads `floor.merged_now` at line 991 before
+  computing the tick; the verified-inbound apply feeds the floor back at `mint_sync.rs:1265`
+  (§4 row 5).
 - The three open-coded acceptor mints: `profile_broadcast.rs:445`,
   `iroh_friend_acceptor.rs:1991`, `iroh_pex_acceptor.rs:359` (ctx structs gain the field).
 - The `send_dm` split mint (`lib.rs:14596` caller-supplied `prev` + pure `next_hlc` at
@@ -182,10 +185,12 @@ the real one; there is no `None` to silently forget on a production path.
 (no new field — adding one would change the signature preimage of every signed event
 type and break ~50 hex fixture pins; mint *values* are pinned nowhere).
 
-**Known bypasses, out of scope (see §10):** the hand-rolled mints at `mint_sync.rs:976`,
-`lib.rs:8402/:44072`, `owner_quorum_sync.rs:455`, `fleet_net.rs:479`, and
-`community_state_sync.rs:2443` do not adopt in v1. They are LWW bump paths deriving from
-`prev`; leaving them per-device costs ordering only on their own narrow surfaces.
+**Known bypasses, out of scope (see §10):** the hand-rolled mints at `lib.rs:8402/:44072`,
+`owner_quorum_sync.rs:455`, `fleet_net.rs:479`, and `community_state_sync.rs:2443` do not
+adopt in v1. They are LWW bump paths deriving from `prev`; leaving them per-device costs
+ordering only on their own narrow surfaces. (`mint_sync.rs:976`'s hand-rolled mint was
+listed here at v1 time — ZEB-845 wired it; it is no longer a bypass, see the sibling
+mint-seam list above and §4 row 5.)
 
 ## 6. Consumers updated in tandem
 
@@ -206,13 +211,24 @@ type and break ~50 hex fixture pins; mint *values* are pinned nowhere).
    pending-join 30-day aging floor (`community_membership.rs:2593`), RCH4 payload-vs-HLC
    skew checks (`community_membership.rs:4938/:4983` — budget 30 min, our own announces
    stay ≤ CAP divergent).
+4. **Deliberately non-adopting** (ZEB-843 minor #3): `current_hlc_estimate`
+   (`community_voting_log_engine.rs:626`) — the tier-3 deadline/expiry comparator — reads
+   raw `SystemTime::now()`, never `floor.merged_now`. This is intentional, not an
+   oversight: it produces a ≤ `HLC_ADOPT_FORWARD_CAP_MS` (5 s) same-instant asymmetry
+   against `reserve_next_local_hlc` (which does adopt), but the asymmetry is conservative
+   in direction — a deadline is never judged *past* earlier than the local clock honestly
+   says, only (at most) later — so it stays safely inside the analyzed consumer-budget
+   envelope above.
 
 **Side benefit (state in code comments where relevant):** the tier-3 lockout window
 shrinks from `skew` to `max(0, skew − CAP)` — for ordinary skew it vanishes — and the
 clamp converts the previously **unbounded** accepted-future-stamp clock-drag
-(`community_voting_log_engine.rs:1249` acknowledges the hazard) into a ≤ CAP nudge.
-Caveat (ZEB-843): this engages only when the skewed peer's clock was learned via a
-fed path (§4) — the voting inbound path itself does not feed the floor in v1.
+(`community_voting_log_engine.rs:1249` acknowledges the hazard) into a ≤ CAP nudge. ZEB-843
+wired the voting-inbound accept path itself as a feed site (§4 row 4: `process_inbound`
+at `community_voting_log_engine.rs:2815`, and its backfill twin `apply_backfilled_event`
+at `:2887`), so this now applies unconditionally to any verified voting-inbound accept —
+not only when the skewed peer's clock happened to be learned via a different fed path
+first.
 
 ## 7. UI layer — deterministic ties
 
@@ -294,10 +310,12 @@ Client-only — the upstream 10-crate lockstep rev does not move.
 ## 11. Security summary
 
 - **Nudge surface:** community members with valid enrolment (Ed25519-bound), channel
-  authors (same), and own fleet siblings (AEAD; the `fleet_sync.rs` feed fires from every fleet-doc
+  authors (same), community voting members (same — ZEB-843, `process_inbound` /
+  `apply_backfilled_event`), and own fleet siblings (AEAD; the `fleet_sync.rs` feed fires from every fleet-doc
   engine — owner-state, notes, relay-hold, trust, quorum, etc. — all the same
-  own-fleet trust class). No anonymous or unverified path feeds
-  the floor.
+  own-fleet trust class), plus own-fleet mint-state siblings (AEAD — ZEB-845,
+  `MintSyncEngine`; same own-fleet trust class, just a distinct fleet doc). No anonymous
+  or unverified path feeds the floor.
 - **Worst-case malicious influence:** a verified member stamping far-future drags every
   adopter's mints forward by **at most CAP against each device's own clock**,
   non-compounding (each device clamps against its own `now`). Compare today: the same

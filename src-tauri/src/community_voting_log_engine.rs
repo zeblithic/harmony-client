@@ -623,6 +623,14 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// window expired?). Compare directly against stored HLC `wall_ms` fields;
     /// the `logical` and `device_id` placeholders are sentinels for comparison
     /// only and must NOT be used as a real event HLC.
+    ///
+    /// ZEB-843 minor #3: deliberately reads raw wall-clock, NOT
+    /// `self.adopt_floor.merged_now` — this is a deadline/expiry comparator, not
+    /// a mint, so it produces a ≤ `HLC_ADOPT_FORWARD_CAP_MS` same-instant
+    /// asymmetry against `reserve_next_local_hlc` (which does adopt). That
+    /// asymmetry is conservative by direction: a deadline is never judged
+    /// *past* earlier than the local clock honestly says, only (at most)
+    /// later. See ZEB-790 spec §6.
     pub async fn current_hlc_estimate(&self) -> Hlc {
         let wall_now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
