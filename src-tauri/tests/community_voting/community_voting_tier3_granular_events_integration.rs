@@ -266,6 +266,7 @@ async fn two_engine_fixture(
     let app_handle_a = app_a.handle().clone();
 
     let engine_a = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         voting_log: Arc::clone(&voting_log_a),
         publisher_tx: pub_tx_a,
@@ -310,6 +311,7 @@ async fn two_engine_fixture(
     let app_handle_b = app_b.handle().clone();
 
     let engine_b = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         voting_log: Arc::clone(&voting_log_b),
         publisher_tx: _pub_tx_b,

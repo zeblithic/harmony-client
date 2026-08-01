@@ -50,6 +50,7 @@ pub(crate) async fn notes_list_core(doc: &Arc<Mutex<NotesDoc>>) -> Vec<NoteView>
 pub(crate) async fn notes_upsert_core(
     doc: &Arc<Mutex<NotesDoc>>,
     tracker: &Arc<Mutex<ReplayTracker<String, Hlc>>>,
+    adopt_floor: &crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: &str,
     id: Option<String>,
     text: String,
@@ -75,7 +76,7 @@ pub(crate) async fn notes_upsert_core(
     // the opposite order.
     let at = if let Some(existing) = d.notes.get(&id) {
         let mut t = tracker.lock().await;
-        let candidate = crate::fleet_sync::peek_next_hlc(t.accepted(), device_id);
+        let candidate = crate::fleet_sync::peek_next_hlc(t.accepted(), adopt_floor, device_id);
         if !candidate.is_strictly_newer_than(&existing.updated_at) {
             return Err(
                 "note upsert was superseded (a newer edit or delete already won)".to_string(),
@@ -84,7 +85,7 @@ pub(crate) async fn notes_upsert_core(
         t.observe_local(candidate.clone());
         candidate
     } else {
-        crate::fleet_sync::mint_next_hlc(tracker, device_id).await
+        crate::fleet_sync::mint_next_hlc(tracker, adopt_floor, device_id).await
     };
     d.upsert(id.clone(), trimmed, at);
     // Defensive: even after the peek, a concurrent tombstone with a newer HLC
@@ -105,6 +106,7 @@ pub(crate) async fn notes_upsert_core(
 pub(crate) async fn notes_delete_core(
     doc: &Arc<Mutex<NotesDoc>>,
     tracker: &Arc<Mutex<ReplayTracker<String, Hlc>>>,
+    adopt_floor: &crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: &str,
     id: String,
 ) -> Result<bool, String> {
@@ -132,7 +134,7 @@ pub(crate) async fn notes_delete_core(
     // `updated_at`; otherwise commit it under the same lock and apply.
     let at = {
         let mut t = tracker.lock().await;
-        let candidate = crate::fleet_sync::peek_next_hlc(t.accepted(), device_id);
+        let candidate = crate::fleet_sync::peek_next_hlc(t.accepted(), adopt_floor, device_id);
         if !candidate.is_strictly_newer_than(&current_updated_at) {
             return Err("note delete was superseded (a newer edit already won)".to_string());
         }
@@ -173,18 +175,19 @@ pub async fn notes_upsert(
     id: Option<String>,
     text: String,
 ) -> Result<NoteView, String> {
-    let (doc, tracker, device_id, sync) = {
+    let (doc, tracker, adopt_floor, device_id, sync) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.notes_doc.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
             g.notes_tracker.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.notes_device_id.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
             g.notes_sync.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
         )
     };
-    let view = notes_upsert_core(&doc, &tracker, &device_id, id, text).await?;
+    let view = notes_upsert_core(&doc, &tracker, &adopt_floor, &device_id, id, text).await?;
     sync.notify_dirty();
     Ok(view)
 }
@@ -195,18 +198,19 @@ pub async fn notes_delete(
     state: tauri::State<'_, std::sync::Mutex<crate::NodeState>>,
     id: String,
 ) -> Result<(), String> {
-    let (doc, tracker, device_id, sync) = {
+    let (doc, tracker, adopt_floor, device_id, sync) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.notes_doc.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
             g.notes_tracker.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.notes_device_id.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
             g.notes_sync.clone().ok_or(NOTES_NOT_LOADED_MSG)?,
         )
     };
-    let changed = notes_delete_core(&doc, &tracker, &device_id, id).await?;
+    let changed = notes_delete_core(&doc, &tracker, &adopt_floor, &device_id, id).await?;
     if changed {
         sync.notify_dirty();
     }
@@ -223,13 +227,14 @@ mod tests {
         let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
             "dev-A".into(),
         )));
-        let v = notes_upsert_core(&doc, &tracker, "dev-A", None, "  hi  ".into())
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let v = notes_upsert_core(&doc, &tracker, &floor, "dev-A", None, "  hi  ".into())
             .await
             .unwrap();
         assert_eq!(v.text, "hi");
         let listed = notes_list_core(&doc).await;
         assert_eq!(listed.len(), 1);
-        let deleted = notes_delete_core(&doc, &tracker, "dev-A", v.id.clone())
+        let deleted = notes_delete_core(&doc, &tracker, &floor, "dev-A", v.id.clone())
             .await
             .unwrap();
         assert!(deleted, "deleting a live note returns Ok(true)");
@@ -245,12 +250,13 @@ mod tests {
         let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
             "dev-A".into(),
         )));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
 
         // Tracker has no entry for the device before the delete.
         let before = tracker.lock().await.accepted().get("dev-A").cloned();
         assert!(before.is_none(), "no HLC minted yet");
 
-        let changed = notes_delete_core(&doc, &tracker, "dev-A", "does-not-exist".into())
+        let changed = notes_delete_core(&doc, &tracker, &floor, "dev-A", "does-not-exist".into())
             .await
             .unwrap();
         assert!(!changed, "deleting an unknown id returns Ok(false)");
@@ -273,9 +279,10 @@ mod tests {
         let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
             "dev-A".into(),
         )));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
 
         // 1. Create the note locally (low HLC via the real mint path).
-        let v = notes_upsert_core(&doc, &tracker, "dev-A", None, "keep".into())
+        let v = notes_upsert_core(&doc, &tracker, &floor, "dev-A", None, "keep".into())
             .await
             .unwrap();
         let id = v.id.clone();
@@ -302,7 +309,9 @@ mod tests {
         let fresh_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
             "dev-A".into(),
         )));
-        let result = notes_delete_core(&doc, &fresh_tracker, "dev-B", id.clone()).await;
+        let fresh_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let result =
+            notes_delete_core(&doc, &fresh_tracker, &fresh_floor, "dev-B", id.clone()).await;
         assert!(
             result.is_err(),
             "a delete that would lose LWW must return Err, never Ok(true)"
@@ -327,8 +336,9 @@ mod tests {
         let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
             "dev-A".into(),
         )));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
         assert!(
-            notes_upsert_core(&doc, &tracker, "dev-A", None, "   ".into())
+            notes_upsert_core(&doc, &tracker, &floor, "dev-A", None, "   ".into())
                 .await
                 .is_err()
         );
@@ -345,9 +355,10 @@ mod tests {
         let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
             "dev-A".into(),
         )));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
 
         // 1. Create the note (low HLC via the real mint path).
-        let v = notes_upsert_core(&doc, &tracker, "dev-A", None, "original".into())
+        let v = notes_upsert_core(&doc, &tracker, &floor, "dev-A", None, "original".into())
             .await
             .unwrap();
         let id = v.id.clone();
@@ -374,9 +385,11 @@ mod tests {
         let stale_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
             "dev-A".to_string(),
         )));
+        let stale_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
         let result = notes_upsert_core(
             &doc,
             &stale_tracker,
+            &stale_floor,
             "dev-B",
             Some(id.clone()),
             "edit".into(),
@@ -405,10 +418,11 @@ mod tests {
         let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
             "dev-A".to_string(),
         )));
-        let a = notes_upsert_core(&doc, &tracker, "dev-A", None, "one".into())
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let a = notes_upsert_core(&doc, &tracker, &floor, "dev-A", None, "one".into())
             .await
             .unwrap();
-        let b = notes_upsert_core(&doc, &tracker, "dev-A", None, "two".into())
+        let b = notes_upsert_core(&doc, &tracker, &floor, "dev-A", None, "two".into())
             .await
             .unwrap();
         assert!(b.timestamp >= a.timestamp); // wall_ms monotone (logical bumps within same ms)
@@ -439,6 +453,7 @@ mod tests {
         let (_in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
         let merger: Merger<NotesDoc> = Arc::new(|local, remote| local.merge_from(remote));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
 
         let engine = FleetSyncEngine::<NotesDoc>::new(FleetSyncConfig {
             keys: crate::owner_state_crypto::FleetKeySet::new(kt),
@@ -458,11 +473,12 @@ mod tests {
             publish_seen: true,
             on_applied: None,
             sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+            adopt_floor: floor.clone(),
         });
 
         // A local note write through the production IPC core, then force the
         // engine to publish.
-        notes_upsert_core(&doc, &tracker, "dev-A", None, "hello".into())
+        notes_upsert_core(&doc, &tracker, &floor, "dev-A", None, "hello".into())
             .await
             .unwrap();
         engine.notify_dirty();
@@ -532,6 +548,7 @@ mod tests {
             engine: FleetSyncEngine<NotesDoc>,
             doc: Arc<Mutex<NotesDoc>>,
             tracker: Arc<Mutex<ReplayTracker<String, Hlc>>>,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
             out_rx: mpsc::Receiver<Vec<u8>>,
             in_tx: mpsc::Sender<Vec<u8>>,
         }
@@ -546,6 +563,7 @@ mod tests {
                 device_id.to_string(),
             )));
             let merger: Merger<NotesDoc> = Arc::new(|local, remote| local.merge_from(remote));
+            let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
             let engine = FleetSyncEngine::<NotesDoc>::new(FleetSyncConfig {
                 keys: crate::owner_state_crypto::FleetKeySet::new(kt),
                 device_id: device_id.to_string(),
@@ -561,11 +579,13 @@ mod tests {
                 publish_seen: true,
                 on_applied: None,
                 sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+                adopt_floor: adopt_floor.clone(),
             });
             NotesEngine {
                 engine,
                 doc,
                 tracker,
+                adopt_floor,
                 out_rx,
                 in_tx,
             }
@@ -648,9 +668,16 @@ mod tests {
             let b = build("dev-B", Arc::clone(&kt), Arc::clone(&cas));
             let fwd = spawn_forwarder(a.out_rx, b.in_tx, b.out_rx, a.in_tx);
 
-            let note = notes_upsert_core(&a.doc, &a.tracker, "dev-A", None, "buy milk".into())
-                .await
-                .expect("local upsert on A");
+            let note = notes_upsert_core(
+                &a.doc,
+                &a.tracker,
+                &a.adopt_floor,
+                "dev-A",
+                None,
+                "buy milk".into(),
+            )
+            .await
+            .expect("local upsert on A");
             a.engine.flush_now().await.expect("flush A");
 
             let b_doc = Arc::clone(&b.doc);
@@ -684,12 +711,26 @@ mod tests {
 
             // Each device adds its own note while the other is "offline" (the
             // frames cross only once both flush) — accumulate, no key collision.
-            let na = notes_upsert_core(&a.doc, &a.tracker, "dev-A", None, "from-A".into())
-                .await
-                .unwrap();
-            let nb = notes_upsert_core(&b.doc, &b.tracker, "dev-B", None, "from-B".into())
-                .await
-                .unwrap();
+            let na = notes_upsert_core(
+                &a.doc,
+                &a.tracker,
+                &a.adopt_floor,
+                "dev-A",
+                None,
+                "from-A".into(),
+            )
+            .await
+            .unwrap();
+            let nb = notes_upsert_core(
+                &b.doc,
+                &b.tracker,
+                &b.adopt_floor,
+                "dev-B",
+                None,
+                "from-B".into(),
+            )
+            .await
+            .unwrap();
             a.engine.flush_now().await.unwrap();
             b.engine.flush_now().await.unwrap();
 
@@ -729,9 +770,16 @@ mod tests {
             let fwd = spawn_forwarder(a.out_rx, b.in_tx, b.out_rx, a.in_tx);
 
             // Seed a shared note on A and let it replicate to B.
-            let seed = notes_upsert_core(&a.doc, &a.tracker, "dev-A", None, "v1".into())
-                .await
-                .unwrap();
+            let seed = notes_upsert_core(
+                &a.doc,
+                &a.tracker,
+                &a.adopt_floor,
+                "dev-A",
+                None,
+                "v1".into(),
+            )
+            .await
+            .unwrap();
             a.engine.flush_now().await.unwrap();
             let id = seed.id.clone();
             {
@@ -761,6 +809,7 @@ mod tests {
                 notes_upsert_core(
                     &a.doc,
                     &a.tracker,
+                    &a.adopt_floor,
                     "dev-A",
                     Some(id.clone()),
                     "edited-by-A".into(),
@@ -768,6 +817,7 @@ mod tests {
                 notes_upsert_core(
                     &b.doc,
                     &b.tracker,
+                    &b.adopt_floor,
                     "dev-B",
                     Some(id.clone()),
                     "edited-by-B".into(),
@@ -822,9 +872,16 @@ mod tests {
             let b = build("dev-B", Arc::clone(&kt), Arc::clone(&cas));
             let fwd = spawn_forwarder(a.out_rx, b.in_tx, b.out_rx, a.in_tx);
 
-            let note = notes_upsert_core(&a.doc, &a.tracker, "dev-A", None, "ephemeral".into())
-                .await
-                .unwrap();
+            let note = notes_upsert_core(
+                &a.doc,
+                &a.tracker,
+                &a.adopt_floor,
+                "dev-A",
+                None,
+                "ephemeral".into(),
+            )
+            .await
+            .unwrap();
             a.engine.flush_now().await.unwrap();
             let id = note.id.clone();
 
@@ -847,9 +904,10 @@ mod tests {
             }
 
             // Delete on A; B must converge to NOT listing it (tombstone wins).
-            let deleted = notes_delete_core(&a.doc, &a.tracker, "dev-A", id.clone())
-                .await
-                .unwrap();
+            let deleted =
+                notes_delete_core(&a.doc, &a.tracker, &a.adopt_floor, "dev-A", id.clone())
+                    .await
+                    .unwrap();
             assert!(deleted, "deleting a live note returns Ok(true)");
             a.engine.flush_now().await.unwrap();
 

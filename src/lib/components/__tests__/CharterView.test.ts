@@ -226,6 +226,50 @@ describe('CharterView', () => {
     expect(container.textContent).not.toContain('Ratified: <status quo>');
   });
 
+  it('orders same-ms finalized polls newest-first by logical then deviceId (ZEB-790)', async () => {
+    // Newest-first (descending), matching the backend list order and
+    // Tier3ProposalPanel: same wall, higher logical is newer → sorts first.
+    const higher = poll({
+      pollId: 'p-hi', proposalText: 'higher-logical',
+      pollCreateHlcMs: 1_700_000_020_000, pollCreateHlcLogical: 2, pollCreateHlcDeviceId: 'dev-a',
+    });
+    const lower = poll({
+      pollId: 'p-lo', proposalText: 'lower-logical',
+      pollCreateHlcMs: 1_700_000_020_000, pollCreateHlcLogical: 1, pollCreateHlcDeviceId: 'dev-z',
+    });
+    const adapter = makeAdapter([lower, higher]);
+    const { container } = render(CharterView, { props: { ...baseProps, adapter } });
+    await waitFor(() => {
+      expect(container.querySelector('.on-record')).toBeTruthy();
+    });
+    const text = container.textContent ?? '';
+    expect(text.indexOf('higher-logical')).toBeGreaterThan(-1);
+    expect(text.indexOf('higher-logical')).toBeLessThan(text.indexOf('lower-logical'));
+  });
+
+  it('breaks same-ms same-logical finalized polls by deviceId, newest-first (ZEB-790)', async () => {
+    // Identical wall AND logical: only the final tuple component (deviceId)
+    // can order these — exercises the compareHlc tie-break wall-only sorting
+    // would leave to nondeterministic content-hash order. Descending, so the
+    // lexically-greater deviceId sorts first.
+    const zeta = poll({
+      pollId: 'p-z', proposalText: 'device-zeta',
+      pollCreateHlcMs: 1_700_000_030_000, pollCreateHlcLogical: 5, pollCreateHlcDeviceId: 'dev-z',
+    });
+    const alpha = poll({
+      pollId: 'p-a', proposalText: 'device-alpha',
+      pollCreateHlcMs: 1_700_000_030_000, pollCreateHlcLogical: 5, pollCreateHlcDeviceId: 'dev-a',
+    });
+    const adapter = makeAdapter([alpha, zeta]);
+    const { container } = render(CharterView, { props: { ...baseProps, adapter } });
+    await waitFor(() => {
+      expect(container.querySelector('.on-record')).toBeTruthy();
+    });
+    const text = container.textContent ?? '';
+    expect(text.indexOf('device-zeta')).toBeGreaterThan(-1);
+    expect(text.indexOf('device-zeta')).toBeLessThan(text.indexOf('device-alpha'));
+  });
+
   it('a community whose only finalized poll upheld the status quo shows no ratified amendments', async () => {
     const adapter = makeAdapter([
       poll({ pollId: 'upheld-only', proposalText: 'Adopt term limits', winnerText: '<status quo>' }),

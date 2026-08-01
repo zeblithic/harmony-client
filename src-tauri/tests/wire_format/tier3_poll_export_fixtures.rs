@@ -31,6 +31,46 @@ fn cbor_top_level_keys(buf: &[u8]) -> Vec<String> {
     keys
 }
 
+/// Decode a CBOR buffer and return the sorted keys of the FIRST element of the
+/// array under top-level key `array_key` (each element a CBOR map). Pins the
+/// camelCase field names of a nested export struct (e.g.
+/// `DeliberationStatementExport`) that the top-level key check never reaches.
+fn cbor_first_element_keys(buf: &[u8], array_key: &str) -> Vec<String> {
+    let v: ciborium::value::Value = ciborium::from_reader(buf).expect("decode as Value");
+    let map = match v {
+        ciborium::value::Value::Map(m) => m,
+        other => panic!("expected CBOR map at root, got {other:?}"),
+    };
+    let arr = map
+        .into_iter()
+        .find_map(|(k, val)| match k {
+            ciborium::value::Value::Text(s) if s == array_key => Some(val),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("top-level key {array_key:?} not found"));
+    let elems = match arr {
+        ciborium::value::Value::Array(a) => a,
+        other => panic!("expected array under {array_key:?}, got {other:?}"),
+    };
+    let first = elems
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("array under {array_key:?} is empty"));
+    let inner = match first {
+        ciborium::value::Value::Map(m) => m,
+        other => panic!("expected map element under {array_key:?}, got {other:?}"),
+    };
+    let mut keys: Vec<String> = inner
+        .into_iter()
+        .map(|(k, _)| match k {
+            ciborium::value::Value::Text(s) => s,
+            other => panic!("expected text key, got {other:?}"),
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
 #[test]
 fn tier3_poll_export_round_trips_through_cbor() {
     let export = Tier3PollExport {
@@ -40,6 +80,11 @@ fn tier3_poll_export_round_trips_through_cbor() {
         proposer: "22".repeat(32),
         stage: Tier3StageTag::Drafting,
         poll_create_hlc_ms: 1_700_000_000_000,
+        // ZEB-790 (CodeRabbit #10): non-default HLC tuple so the round-trip
+        // actually exercises the logical + device_id fields (all-zero could
+        // pass even if the fields were silently dropped).
+        poll_create_hlc_logical: 7,
+        poll_create_hlc_device_id: "dev-fixture".to_string(),
         sortition_size: 100,
         deliberation_window_seconds: 1_209_600,
         drafting_window_seconds: 604_800,
@@ -58,6 +103,9 @@ fn tier3_poll_export_round_trips_through_cbor() {
             author: "cd".repeat(16),
             text: "Test statement".to_string(),
             created_at_hlc_ms: 1_700_000_100_000,
+            // ZEB-790 (CodeRabbit #10): non-default nested HLC tuple.
+            created_at_hlc_logical: 5,
+            created_at_hlc_device_id: "stmt-dev".to_string(),
             agree_count: 3,
             disagree_count: 1,
             pass_count: 0,
@@ -81,6 +129,16 @@ fn tier3_poll_export_round_trips_through_cbor() {
     assert_eq!(decoded.poll_id, export.poll_id);
     assert_eq!(decoded.stage, Tier3StageTag::Drafting);
     assert_eq!(decoded.my_role, Tier3MyRole::MiniPublic);
+    // ZEB-790 (CodeRabbit #10): the non-default HLC tuple must round-trip —
+    // guards against the logical/device_id fields silently dropping.
+    assert_eq!(decoded.poll_create_hlc_logical, 7);
+    assert_eq!(decoded.poll_create_hlc_device_id, "dev-fixture");
+    assert_eq!(decoded.deliberation_statements.len(), 1);
+    assert_eq!(decoded.deliberation_statements[0].created_at_hlc_logical, 5);
+    assert_eq!(
+        decoded.deliberation_statements[0].created_at_hlc_device_id,
+        "stmt-dev"
+    );
 
     // Pin the exact camelCase keys the frontend expects. Adding a field
     // requires updating this list; renaming a field via serde will fail
@@ -104,6 +162,8 @@ fn tier3_poll_export_round_trips_through_cbor() {
         "myDraftingApprovals",
         "myRatificationScores",
         "myRole",
+        "pollCreateHlcDeviceId",
+        "pollCreateHlcLogical",
         "pollCreateHlcMs",
         "pollId",
         "privacyMode",
@@ -122,6 +182,32 @@ fn tier3_poll_export_round_trips_through_cbor() {
         expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         "Tier3PollExport CBOR key drift — update TS Tier3PollExport in lockstep",
     );
+
+    // ZEB-790 (CodeRabbit #10): pin the NESTED DeliberationStatementExport
+    // camelCase keys too — the top-level check never descends into the
+    // `deliberationStatements` array, so a rename of the nested HLC fields
+    // (createdAtHlcLogical / createdAtHlcDeviceId) would otherwise slip through
+    // and silently break the TS DTO.
+    let statement_keys = cbor_first_element_keys(&buf, "deliberationStatements");
+    let expected_statement: Vec<&str> = vec![
+        "agreeCount",
+        "author",
+        "createdAtHlcDeviceId",
+        "createdAtHlcLogical",
+        "createdAtHlcMs",
+        "disagreeCount",
+        "passCount",
+        "statementEventHash",
+        "text",
+    ];
+    assert_eq!(
+        statement_keys,
+        expected_statement
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        "DeliberationStatementExport CBOR key drift — update TS in lockstep",
+    );
 }
 
 #[test]
@@ -133,6 +219,9 @@ fn tier3_poll_summary_round_trips_through_cbor() {
         proposer: "22".repeat(32),
         stage: Tier3StageTag::Ratification,
         poll_create_hlc_ms: 1_700_000_000_000,
+        // ZEB-790 (CodeRabbit #10): non-default HLC tuple (see export test).
+        poll_create_hlc_logical: 7,
+        poll_create_hlc_device_id: "dev-fixture".to_string(),
         sortition_size: 100,
         winner_text: None,
         privacy_mode: "pu".to_string(),
@@ -142,9 +231,14 @@ fn tier3_poll_summary_round_trips_through_cbor() {
     let decoded: Tier3PollSummary = ciborium::from_reader(&buf[..]).expect("decode");
     assert_eq!(decoded.stage, Tier3StageTag::Ratification);
     assert_eq!(decoded.winner_text, None);
+    // ZEB-790 (CodeRabbit #10): non-default HLC tuple must round-trip.
+    assert_eq!(decoded.poll_create_hlc_logical, 7);
+    assert_eq!(decoded.poll_create_hlc_device_id, "dev-fixture");
 
     let expected: Vec<&str> = vec![
         "communityId",
+        "pollCreateHlcDeviceId",
+        "pollCreateHlcLogical",
         "pollCreateHlcMs",
         "pollId",
         "privacyMode",

@@ -12,6 +12,7 @@
   import type { CommunityMember } from '../types';
   import { POWER_THRESHOLDS } from '../types';
   import { shortAddr } from '../short-addr';
+  import { compareHlc } from '../hlc';
   import PipMeter from './governance/PipMeter.svelte';
   import RoleBadge from './governance/RoleBadge.svelte';
 
@@ -84,7 +85,18 @@
     (polls ?? [])
       .filter((p) => p.stage === 'fi')
       .slice()
-      .sort((a, b) => a.pollCreateHlcMs - b.pollCreateHlcMs),
+      // Newest-first (descending), matching the backend list order
+      // (`voting_list_tier3_polls` sorts `Reverse(poll_create_hlc)`) and the
+      // Tier3ProposalPanel, which renders that backend order un-re-sorted. The
+      // full (wall, logical, deviceId) tuple makes the tie-break deterministic
+      // (ZEB-790); the direction is aligned so the same polls never render in
+      // opposite orders across panels. `compareHlc(b, a)` = descending.
+      .sort((a, b) =>
+        compareHlc(
+          { wallMs: b.pollCreateHlcMs, logical: b.pollCreateHlcLogical ?? 0, deviceId: b.pollCreateHlcDeviceId ?? '' },
+          { wallMs: a.pollCreateHlcMs, logical: a.pollCreateHlcLogical ?? 0, deviceId: a.pollCreateHlcDeviceId ?? '' },
+        ),
+      ),
   );
   function isUpheld(p: Tier3PollSummary): boolean {
     return p.winnerText === STATUS_QUO_TEXT;

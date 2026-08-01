@@ -829,7 +829,12 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
         std::time::Duration::from_millis(1000),
     ));
     let dir = tempfile::tempdir().expect("tempdir");
+    // ZEB-790: one adoption floor per simulated node — this test models a
+    // single node ("admin-dev"), so the registry and the self_heal observer
+    // that mint/feed HLC share ONE floor.
+    let adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        adopt_floor: adopt_floor.clone(),
         device_id: "admin-dev".into(),
         content_store: cs,
         identity_resolver: Arc::clone(&resolver),
@@ -1009,6 +1014,7 @@ async fn stale_invite_catchup_unlocks_decryption_end_to_end() {
         Arc::clone(&registry),
         Arc::clone(&admin_signing_key),
         Arc::clone(&hlc_tracker),
+        adopt_floor.clone(),
         "admin-dev".into(),
         admin_addr,
         Arc::clone(&crdt_state),
@@ -1220,7 +1226,12 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
         std::time::Duration::from_millis(1000),
     ));
     let dir = tempfile::tempdir().expect("tempdir");
+    // ZEB-790: one adoption floor per simulated node — this test models a
+    // single node ("admin-dev"), so the registry and the self_heal observer
+    // that mint/feed HLC share ONE floor.
+    let adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        adopt_floor: adopt_floor.clone(),
         device_id: "admin-dev".into(),
         content_store: cs,
         identity_resolver: Arc::clone(&resolver),
@@ -1450,6 +1461,7 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
         Arc::clone(&registry),
         Arc::clone(&admin_signing_key),
         Arc::clone(&hlc_tracker),
+        adopt_floor.clone(),
         "admin-dev".into(),
         admin_addr,
         Arc::clone(&crdt_state),

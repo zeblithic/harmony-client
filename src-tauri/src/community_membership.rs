@@ -5502,10 +5502,14 @@ pub const ADMIN_PROPOSAL_EXPIRY_MS: u64 = 30 * 86_400_000;
 /// directions (`community_relay_announce::fresh_relay_entry`,
 /// `friend_intro`); this constant closes the one gap.
 ///
-/// Safe because the `now_ms` side is NOT peer-influenced: callers pass this
-/// device's own minted HLC wall, and `reserve_next_hlc_for_device` derives it
-/// from this device's previous stamp alone (ZEB-790). Should that ever change
-/// to merge remote walls, this bound must gain a clamp or it weakens.
+/// ZEB-790 (bounded adoption): the `now_ms` side is peer-influenced by at
+/// most `hlc_adopt_floor::HLC_ADOPT_FORWARD_CAP_MS` ms — verified peers can
+/// pull this device's minted wall forward up to the cap, never further
+/// (`merged_now = max(now, min(floor, now + CAP)) ≤ now + CAP`; the `+1` in
+/// the stored floor is absorbed by the clamp, so the effective forward pull
+/// is exactly CAP, not CAP + 1 — see hlc_adopt_floor.rs). The effective
+/// forward bound is therefore 30 min + CAP (~0.3% weakening), which the
+/// `adopt_cap_stays_far_below_consumer_budgets` test pins.
 pub const ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS: u64 = 30 * 60 * 1000;
 
 /// ZEB-321 RCH4: maximum allowed skew (ms) between a
@@ -6018,7 +6022,7 @@ pub async fn apply_auto_exec_set_power(
     // Snapshot the handles we need under the std::sync::Mutex, then drop
     // the lock before any await (no awaits while holding a std mutex —
     // existing project convention; see set_power_level IPC).
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox) = {
+    let (hlc_tracker, adopt_floor, device_id, self_owner, community_registry, dm_outbox) = {
         let g = node_state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -6026,6 +6030,7 @@ pub async fn apply_auto_exec_set_power(
             g.hlc_tracker
                 .clone()
                 .ok_or("hlc_tracker missing (node not running?)")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id
                 .clone()
                 .ok_or("dm_device_id missing (node not running?)")?,
@@ -6147,8 +6152,13 @@ pub async fn apply_auto_exec_set_power(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     let event = {
         let outbox_g = dm_outbox.lock().await;
@@ -6215,7 +6225,7 @@ pub async fn apply_auto_exec_admin_proposal_set_power(
 ) -> Result<AutoExecOutcome, String> {
     // Snapshot the handles we need under the std::sync::Mutex, then drop
     // the lock before any await (no awaits while holding a std mutex).
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox) = {
+    let (hlc_tracker, adopt_floor, device_id, self_owner, community_registry, dm_outbox) = {
         let g = node_state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -6223,6 +6233,7 @@ pub async fn apply_auto_exec_admin_proposal_set_power(
             g.hlc_tracker
                 .clone()
                 .ok_or("hlc_tracker missing (node not running?)")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id
                 .clone()
                 .ok_or("dm_device_id missing (node not running?)")?,
@@ -6255,8 +6266,13 @@ pub async fn apply_auto_exec_admin_proposal_set_power(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let now_ms = event_hlc.wall_ms;
 
     // Decide mint-vs-countersign-vs-already-applied-vs-pending from the

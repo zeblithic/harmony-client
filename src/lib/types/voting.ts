@@ -498,6 +498,9 @@ export interface DeliberationStatementExport {
   author: string;
   text: string;
   createdAtHlcMs: number;
+  /** ZEB-790: full-tuple tiebreak (optional — absent in older fixtures). */
+  createdAtHlcLogical?: number;
+  createdAtHlcDeviceId?: string;
   agreeCount: number;
   disagreeCount: number;
   passCount: number;
@@ -585,6 +588,9 @@ export interface Tier3PollExport {
   stage: Tier3Stage;
   /** HLC wall_ms projection. */
   pollCreateHlcMs: number;
+  /** ZEB-790: full-tuple tiebreak (optional — absent in older fixtures). */
+  pollCreateHlcLogical?: number;
+  pollCreateHlcDeviceId?: string;
   sortitionSize: number;
   deliberationWindowSeconds: number;
   draftingWindowSeconds: number;
@@ -636,6 +642,9 @@ export interface Tier3PollSummary {
   proposer: string;
   stage: Tier3Stage;
   pollCreateHlcMs: number;
+  /** ZEB-790: full-tuple tiebreak (optional — absent in older fixtures). */
+  pollCreateHlcLogical?: number;
+  pollCreateHlcDeviceId?: string;
   sortitionSize: number;
   winnerText: string | null;
   /** ZEB-295: privacy mode tag — lets the list view render the 🔒 chip

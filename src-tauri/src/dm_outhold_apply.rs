@@ -941,6 +941,7 @@ mod tests {
             publish_seen: true,
             on_applied: Some(outhold_nudge_on_applied(nudge_tx)),
             sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         });
 
         // A local hold write (what send_dm's Task-3 hold path does under

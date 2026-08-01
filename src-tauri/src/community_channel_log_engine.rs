@@ -446,6 +446,9 @@ pub struct ChannelLogEngineParams {
     pub self_device_id: String,
     pub signing_key: Arc<SigningKey>,
     pub hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs). One per node — the same clone every other mint seam uses.
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     pub sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
     pub config: ChannelLogEngineConfig,
 
@@ -481,6 +484,7 @@ pub struct ChannelLogEngine {
     self_device_id: String,
     signing_key: Arc<SigningKey>,
     hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     sink: Arc<dyn crate::node_event_sink::NodeEventSink>,
     config: ChannelLogEngineConfig,
 
@@ -572,6 +576,7 @@ impl ChannelLogEngine {
             self_device_id: params.self_device_id,
             signing_key: params.signing_key,
             hlc_tracker: params.hlc_tracker,
+            adopt_floor: params.adopt_floor,
             sink: params.sink,
             config: params.config,
             publisher_tx: params.publisher_tx,
@@ -1060,6 +1065,7 @@ impl ChannelLogEngine {
             .unwrap_or(0);
         let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
             &self.hlc_tracker,
+            &self.adopt_floor,
             &self.self_device_id,
             wall_now_ms,
         )
@@ -1272,6 +1278,7 @@ impl ChannelLogEngine {
             .unwrap_or(0);
         let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
             &self.hlc_tracker,
+            &self.adopt_floor,
             &self.self_device_id,
             wall_now_ms,
         )
@@ -1723,6 +1730,13 @@ impl ChannelLogEngine {
             }
         }
 
+        // ZEB-790: feed the adoption floor ONLY after 2c — decrypt,
+        // sig-verify (2b) and the authoritative replay advance (2c) all
+        // succeeded. Every earlier `return` (garbage, replay, invalid)
+        // leaves the floor untouched. Use the same event accessor
+        // `would_accept` reads the stamp through.
+        self.adopt_floor.observe(event.at().wall_ms);
+
         // 3. Append. The `closing` check MUST sit under the `log` lock —
         // the same lock `flush_now()` takes — so it is atomic w.r.t.
         // shutdown's synchronous flush (ZEB-288, CodeAnt Critical).
@@ -2075,6 +2089,10 @@ pub struct ChannelLogRegistryConfig {
     /// at `start_node` time. `Arc` so per-engine spawns are cheap (no
     /// secret-byte copy).
     pub signing_key: Arc<SigningKey>,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs). Bound at registry construction — every spawned engine shares the
+    /// same node-wide clone (mirrors `self_owner`/`self_device_id` above).
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     /// Per-engine tunables. Cloned into each engine; tests override
     /// `log_config.seal_threshold_events` to exercise seal/reload
     /// paths in reasonable time.
@@ -2534,6 +2552,7 @@ impl ChannelLogRegistry {
             self_device_id: self.config.self_device_id.clone(),
             signing_key: Arc::clone(&self.config.signing_key),
             hlc_tracker: ds.hlc_tracker,
+            adopt_floor: self.config.adopt_floor.clone(),
             sink: self.config.sink.clone(),
             config: self.config.engine_config.clone(),
             publisher_tx,
@@ -3260,6 +3279,7 @@ mod tests {
             self_device_id: "test-device".to_string(),
             signing_key: Arc::clone(&signing_key),
             hlc_tracker,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             sink,
             config,
             publisher_tx,
@@ -4892,6 +4912,272 @@ mod tests {
         assert_eq!(listed.len(), 1, "replay must be dropped");
     }
 
+    /// ZEB-790 Task 6: a channel-log inbound packet that clears the FULL
+    /// accept pipeline (decrypt + sig-verify (2b) + the authoritative
+    /// replay-tracker advance (2c)) feeds the engine's `HlcAdoptFloor`
+    /// with the event's `at.wall_ms` — the invariant lives at the single
+    /// `self.adopt_floor.observe(...)` call site immediately after 2c.
+    #[tokio::test]
+    async fn verified_inbound_feeds_adopt_floor() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+
+        let at = Hlc {
+            wall_ms: 7_000,
+            logical: 0,
+            device_id: "remote".to_string(),
+        };
+        let event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            at.clone(),
+            "feeds-the-floor",
+            &fix.signing_key,
+        );
+        let packet = encrypt_channel_packet(&fix.channel_key, &event).expect("encrypt");
+
+        fix.subscriber_tx.send(packet).await.expect("send");
+
+        wait_for(
+            || async {
+                let v = fix.engine.list_messages(None, 100).await.unwrap();
+                (v.len() == 1).then_some(())
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("event appeared");
+
+        // NOTE: read with `merged_now(at.wall_ms)`, NOT `merged_now(0)` —
+        // merged_now clamps against `now + CAP`, so a tiny `now` would cap
+        // the answer well below the actual floor value (see Task 5's note).
+        assert_eq!(
+            fix.engine.adopt_floor.merged_now(at.wall_ms),
+            at.wall_ms + 1,
+            "accepted inbound event feeds the floor (+1 rule)"
+        );
+    }
+
+    /// ZEB-790 Task 6: the mirror-image invariant — an inbound packet that
+    /// FAILS sig-verify (2b) must never reach the post-2c `observe` call.
+    ///
+    /// Per the Task 5 review bar, a bare "floor still zero" assertion is
+    /// indistinguishable from "nothing ran yet" (zero is ALSO the floor's
+    /// untouched initial state). So after the corrupted-signature packet,
+    /// this test injects a second, genuinely-accepted event through the
+    /// SAME engine/subscriber_tx and waits for the floor to move for THAT
+    /// event. The bad packet's `wall_ms` is chosen far past the legit
+    /// event's (well beyond the adoption cap) so that if it HAD fed the
+    /// floor, the final read would clamp to `legit_at.wall_ms + CAP`
+    /// instead of the expected `+ 1` — the assertion does double duty:
+    /// it proves the engine's receive loop stayed live through the
+    /// rejection, and that the corrupted frame contributed nothing.
+    #[tokio::test]
+    async fn sig_failed_inbound_does_not_feed_adopt_floor() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+
+        // Corrupted-signature event, deliberately stamped far beyond the
+        // legit event below (and beyond the adoption cap) — see the note
+        // above for why.
+        let bad_at = Hlc {
+            wall_ms: 900_000,
+            logical: 0,
+            device_id: "remote-bad-sig".to_string(),
+        };
+        let mut bad_event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            bad_at,
+            "corrupted-sig",
+            &fix.signing_key,
+        );
+        if let SignedChannelEvent::Post { sig, .. } = &mut bad_event {
+            sig[0] ^= 0xff;
+        }
+        let bad_packet = encrypt_channel_packet(&fix.channel_key, &bad_event).expect("encrypt");
+        fix.subscriber_tx.send(bad_packet).await.expect("send bad");
+
+        // Positive liveness signal: a second, genuinely-accepted event
+        // through the same engine/subscriber_tx.
+        let legit_at = Hlc {
+            wall_ms: 7_500,
+            logical: 0,
+            device_id: "remote-legit".to_string(),
+        };
+        let legit_event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            legit_at.clone(),
+            "legit-after-bad-sig",
+            &fix.signing_key,
+        );
+        let legit_packet = encrypt_channel_packet(&fix.channel_key, &legit_event).expect("encrypt");
+        fix.subscriber_tx
+            .send(legit_packet)
+            .await
+            .expect("send legit");
+
+        wait_for(
+            || async {
+                let v = fix.engine.list_messages(None, 100).await.unwrap();
+                (v.len() == 1).then_some(())
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("legit event must land");
+
+        assert_eq!(
+            fix.engine.adopt_floor.merged_now(legit_at.wall_ms),
+            legit_at.wall_ms + 1,
+            "sig-failed event must not feed the floor: reading merged_now \
+             at the legit event's wall must show ONLY the legit +1, not \
+             the corrupted event's far-future wall clamped to +CAP"
+        );
+    }
+
+    /// ZEB-790 Task 6: a replayed (duplicate) inbound event must feed the
+    /// floor at most once — `observe`'s `fetch_max` is naturally idempotent
+    /// against a duplicate `wall_ms`, but this pins the invariant at the
+    /// engine level: the floor after a duplicate delivery must equal the
+    /// floor after the first delivery, AND the replay-tracker's drop
+    /// counter (`replay_drop_count`, ZEB-688) must show the duplicate was
+    /// actually observed and dropped — not silently lost in the channel.
+    #[tokio::test]
+    async fn replayed_inbound_does_not_feed_floor_twice() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+
+        let at = Hlc {
+            wall_ms: 8_000,
+            logical: 0,
+            device_id: "remote".to_string(),
+        };
+        let event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            at.clone(),
+            "once",
+            &fix.signing_key,
+        );
+        let packet = encrypt_channel_packet(&fix.channel_key, &event).expect("encrypt");
+
+        fix.subscriber_tx
+            .send(packet.clone())
+            .await
+            .expect("send 1");
+        fix.subscriber_tx.send(packet).await.expect("send 2");
+
+        // Wait for first to land.
+        wait_for(
+            || async {
+                let v = fix.engine.list_messages(None, 100).await.unwrap();
+                (v.len() == 1).then_some(())
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("first event must land");
+
+        // ZEB-688: wait for the replay drop itself instead of sleeping —
+        // makes the "still just +1" assertion below non-vacuous (we KNOW
+        // the duplicate reached the drop path before asserting).
+        wait_for(
+            || async { (fix.engine.replay_drop_count() >= 1).then_some(()) },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the replayed packet must be observed dropping");
+
+        assert_eq!(
+            fix.engine.adopt_floor.merged_now(at.wall_ms),
+            at.wall_ms + 1,
+            "duplicate delivery must not advance the floor a second time"
+        );
+        assert!(
+            fix.engine.replay_drop_count() >= 1,
+            "replay drop counter must have advanced"
+        );
+    }
+
+    /// ZEB-790 Task 6 (discriminating variant, CodeRabbit #4): a purely-
+    /// rejected replay must leave the floor UNTOUCHED. `observe`'s `fetch_max`
+    /// is idempotent against a duplicate `wall_ms`, so a test that first lands
+    /// the event and then delivers a duplicate cannot tell "rejected BEFORE
+    /// observe" apart from "observed AGAIN" — both leave the floor at
+    /// `wall_ms + 1`. This test removes that ambiguity: it pre-seeds the engine's
+    /// replay tracker with the event's ticket so the SOLE delivery is dropped at
+    /// the fast-path replay gate (step 2a) BEFORE `observe` is reached, then
+    /// asserts the floor is still EMPTY — `merged_now` returns the identity
+    /// (`wall_ms`, NOT `wall_ms + 1`). Had the rejected frame leaked to
+    /// `observe`, the floor would read `wall_ms + 1`, so `== wall_ms` positively
+    /// proves rejection-before-observe.
+    #[tokio::test]
+    async fn rejected_replay_does_not_feed_floor() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+
+        let at = Hlc {
+            wall_ms: 8_000,
+            logical: 0,
+            device_id: "remote".to_string(),
+        };
+        let event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            at.clone(),
+            "rejected",
+            &fix.signing_key,
+        );
+        let packet = encrypt_channel_packet(&fix.channel_key, &event).expect("encrypt");
+
+        // Pre-seed the engine's replay tracker with this event's ticket so the
+        // single delivery below is recognized as a duplicate and dropped at the
+        // fast-path gate (2a) — BEFORE the floor's `observe`. `mod tests` is a
+        // child module, so the private `replay_tracker` field is reachable here.
+        // The floor starts empty (`HlcAdoptFloor::new()`); if the drop path is
+        // correct it stays empty.
+        {
+            let mut tracker = fix.engine.replay_tracker.lock().await;
+            tracker.record(&event);
+        }
+
+        fix.subscriber_tx.send(packet).await.expect("send");
+
+        // Wait for the drop itself so the "floor stays empty" assertion is
+        // non-vacuous — we KNOW the packet reached the drop path before
+        // asserting (mirrors the wait in the sibling test above).
+        wait_for(
+            || async { (fix.engine.replay_drop_count() >= 1).then_some(()) },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the pre-seeded packet must be observed dropping");
+
+        assert_eq!(
+            fix.engine.adopt_floor.merged_now(at.wall_ms),
+            at.wall_ms,
+            "a purely-rejected replay must leave the floor EMPTY (identity): a \
+             non-identity `wall_ms + 1` here would mean the rejected frame \
+             leaked to `observe` before being dropped"
+        );
+
+        // The rejected frame must not have appended, either.
+        let listed = fix.engine.list_messages(None, 100).await.expect("list");
+        assert!(
+            listed.is_empty(),
+            "a purely-rejected replay must not append (got {})",
+            listed.len()
+        );
+
+        // Shut the engine down so its parked receive/flush loops don't outlive
+        // the test — the sole packet was dropped, so nothing else wakes the
+        // flush loop to let it exit on its own (avoids a nextest LEAK flag).
+        fix.engine.shutdown().await.expect("shutdown");
+    }
+
     #[tokio::test]
     async fn closing_engine_drops_inbound_without_appending() {
         // ZEB-288 durability guard (CodeAnt Critical): once `shutdown()`
@@ -5192,6 +5478,7 @@ mod tests {
             self_device_id: "test-device".to_string(),
             signing_key: Arc::clone(&signing_key),
             hlc_tracker,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             sink,
             config,
             publisher_tx,
@@ -5566,6 +5853,7 @@ mod tests {
             self_owner,
             self_device_id: "registry-test-device".to_string(),
             signing_key,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             engine_config: ChannelLogEngineConfig {
                 log_config: ChannelLogConfig {
                     seal_threshold_events: 8,
@@ -5676,6 +5964,7 @@ mod tests {
             self_owner,
             self_device_id: "backfill-test-device".to_string(),
             signing_key,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             engine_config: ChannelLogEngineConfig {
                 log_config: ChannelLogConfig {
                     seal_threshold_events: 8,
@@ -7317,6 +7606,7 @@ mod tests {
             self_device_id: "device-b".to_string(),
             signing_key: Arc::clone(&fix_a.signing_key),
             hlc_tracker: hlc_tracker_b,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             sink: sink_b,
             config: ChannelLogEngineConfig {
                 log_config: ChannelLogConfig {
@@ -7577,6 +7867,7 @@ mod tests {
             self_device_id: "device-b".to_string(),
             signing_key: Arc::clone(&fix_a.signing_key),
             hlc_tracker: hlc_tracker_b,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             sink: sink_b,
             config: ChannelLogEngineConfig {
                 log_config: ChannelLogConfig {

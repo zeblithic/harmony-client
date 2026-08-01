@@ -1027,6 +1027,9 @@ pub struct CommunitySyncEngineConfig {
     pub signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     pub state: Arc<Mutex<CommunityState>>,
     pub tracker: Arc<Mutex<CommunityReplayTracker>>,
+    /// ZEB-790: node-wide bounded causal-adoption floor (shared, not
+    /// per-community). Fed at step 14 (Task 5); read in next_hlc.
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     pub content_store: Arc<dyn ContentStore>,
     pub publisher_tx: mpsc::Sender<Vec<u8>>,
     pub subscriber_rx: mpsc::Receiver<Vec<u8>>,
@@ -1292,6 +1295,7 @@ impl CommunitySyncEngine {
             signing_key: cfg.signing_key,
             state: cfg.state,
             tracker: cfg.tracker,
+            adopt_floor: cfg.adopt_floor,
             content_store: cfg.content_store,
             publisher_tx: cfg.publisher_tx,
             subscriber_rx: cfg.subscriber_rx,
@@ -2013,6 +2017,9 @@ struct InternalCtx {
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     state: Arc<Mutex<CommunityState>>,
     tracker: Arc<Mutex<CommunityReplayTracker>>,
+    /// ZEB-790: node-wide bounded causal-adoption floor (shared, not
+    /// per-community). Fed at step 14 (Task 5); read in next_hlc.
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     content_store: Arc<dyn ContentStore>,
     publisher_tx: mpsc::Sender<Vec<u8>>,
     subscriber_rx: mpsc::Receiver<Vec<u8>>,
@@ -3355,10 +3362,12 @@ fn community_hlc_tick(prev: Option<&Hlc>, wall_ms: u64, device_id: &str) -> Hlc 
 
 async fn next_hlc(ctx: &InternalCtx) -> Hlc {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let wall_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let wall_ms = ctx.adopt_floor.merged_now(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    );
 
     let mut tracker = ctx.tracker.lock().await;
     let local = (ctx.self_owner, ctx.device_id.clone());
@@ -4458,6 +4467,11 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         let mut tracker = ctx.tracker.lock().await;
         tracker.commit(replay_ticket);
     }
+    // ZEB-790: feed the adoption floor ONLY here — after commit, i.e.
+    // after sig-verify + membership-at-HLC + merge all succeeded. A
+    // rejection path returns before this line, so a rejected frame can
+    // never move the floor (same invariant as the tracker itself).
+    ctx.adopt_floor.observe(payload.at.wall_ms);
 
     // ZEB-501: wake the joiner's redeem oneshot ONLY on a real
     // JoinCountersign's `target_event_id` (see the matching note at the
@@ -4874,6 +4888,11 @@ pub struct CommunityRegistryConfig {
     /// which are verified against the signer's materialized
     /// `enrolled_device_keys`.
     pub signing_key: Arc<ed25519_dalek::SigningKey>,
+
+    /// ZEB-790: node-wide bounded causal-adoption floor (shared, not
+    /// per-community). Cloned into every spawned engine's
+    /// `CommunitySyncEngineConfig.adopt_floor`; read in `next_hlc`.
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
 
     /// ZEB-249 §10.6 (Phase A): optional reference to the owner-state
     /// CRDT. When `Some`, every spawned engine receives a clone of this
@@ -5702,6 +5721,7 @@ impl CommunitySyncRegistry {
             signing_key: Arc::clone(&self.cfg.signing_key),
             state,
             tracker,
+            adopt_floor: self.cfg.adopt_floor.clone(),
             content_store: Arc::clone(&self.cfg.content_store),
             publisher_tx,
             subscriber_rx,
@@ -6399,6 +6419,457 @@ mod tests {
         ));
     }
 
+    /// ZEB-790 Task 5: a community-state publish that clears the FULL
+    /// accept pipeline (decrypt + membership-at-HLC gate + sig-verify +
+    /// replay-tracker commit) feeds the node's `HlcAdoptFloor` with the
+    /// publisher's observed wall — the invariant lives at the single
+    /// `ctx.adopt_floor.observe(...)` call site immediately after step
+    /// 14's `tracker.commit(replay_ticket)`.
+    ///
+    /// Mirrors `query_serve_arm_replies_packet_that_peer_engine_ingests`'s
+    /// two-engine setup (real `CommunitySyncEngine::new`, real signing,
+    /// real AEAD) but pulls the packet via the query-serve arm instead of
+    /// waiting on the publish debounce — deterministic, no timing race —
+    /// and skips that donor's `ChannelCreate` step entirely: the
+    /// bootstrap Join alone is enough to reach engine B's step-14 commit.
+    #[tokio::test]
+    async fn accepted_publish_feeds_adopt_floor() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        };
+
+        let alice = mint_test_owner(0xA5);
+        let alice_addr = alice.owner;
+        let alice_sk = Arc::new(alice.device_key.clone());
+
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+        let cas_op_tx = spawn_shared_cas();
+        let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_secs(2),
+        ));
+        let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+
+        let community_id = SpaceId([0x5F; 16]);
+        let membership_key = EpochKey::new([0x77; 32]);
+
+        // Engine A (admin): query-serve channel wired so we can pull a
+        // fresh, genuinely-signed packet on demand instead of racing the
+        // publish debounce. A's publisher_tx traffic is drained and
+        // discarded — the packet reaching B travels exclusively through
+        // the query-serve reply below.
+        let (serve_tx, serve_rx) = mpsc::channel::<RootServeRequest>(4);
+        let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_a_sub_tx_held, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
+
+        let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice_addr,
+            signing_key: Arc::clone(&alice_sk),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice_addr,
+                "alice-dev".to_string(),
+            )))),
+            content_store: cs_a,
+            publisher_tx: a_pub_tx,
+            subscriber_rx: a_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_a.path().join("crdt.cbor"),
+                replay: dir_a.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: Some(serve_rx),
+        });
+
+        // Engine B: the receiver under test. Retain a clone of its
+        // `HlcAdoptFloor` — clones share the underlying Arc<AtomicU64>
+        // (see hlc_adopt_floor.rs's `clones_share_state` test), so reading
+        // this handle after injection observes whatever B's InternalCtx
+        // fed via step 14's `observe` call.
+        let bob_addr = OwnerAddr([0xB0; 16]);
+        let bob_adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let (b_pub_tx, _b_pub_rx_held) = mpsc::channel::<Vec<u8>>(64);
+        let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        // Retained for local decode of the served packet below (moved
+        // into engine_b's config otherwise).
+        let membership_key_for_decode = membership_key.clone();
+
+        let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: bob_adopt_floor.clone(),
+            community_id,
+            membership_key,
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "bob-dev".into(),
+            self_owner: bob_addr,
+            signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0xB0; 32])),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                bob_addr,
+                "bob-dev".to_string(),
+            )))),
+            content_store: cs_b,
+            publisher_tx: b_pub_tx,
+            subscriber_rx: b_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_b.path().join("crdt.cbor"),
+                replay: dir_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+
+        // Alice's EnrollmentCert-bearing bootstrap Join: inserted into A
+        // locally, then OOB-seeded into B (ZEB-256 cold-cache pattern —
+        // production wires this via the invite URL) so B's membership-at-
+        // HLC gate admits Alice's publish below.
+        let alice_join_at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let alice_join_payload = EventPayload {
+            id: [0x10; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice_addr,
+            at: alice_join_at,
+        };
+        let alice_join = SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign alice join")
+        };
+        let outcome = engine_a
+            .insert_local_event(alice_join.clone())
+            .await
+            .expect("alice bootstrap insert");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+        let outcome = engine_b
+            .insert_local_event(alice_join)
+            .await
+            .expect("bob OOB-seeds alice bootstrap");
+        assert_eq!(outcome, InsertOutcome::Inserted);
+
+        // Pull a fresh, genuinely-signed packet from A via the
+        // query-serve arm — deterministic, no debounce wait.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        serve_tx.send(reply_tx).await.expect("send serve request");
+        let packet = reply_rx.await.expect("engine replied").expect("encode ok");
+
+        // Decode the packet exactly like `handle_incoming_publish` step 1
+        // does, so the test knows the exact `at.wall_ms` the accept path
+        // will stamp into B's floor.
+        let decrypted =
+            decrypt_root_publish(&membership_key_for_decode, &packet).expect("decrypt packet");
+        let decoded: CommunityRootPublishPayload =
+            canonical_cbor_decode(&decrypted).expect("decode payload");
+        let at_wall_ms = decoded.at.wall_ms;
+
+        // Feed the served packet into B's inbound pipeline — full
+        // verification (decrypt, membership-at-HLC, sig-verify, replay
+        // commit) must pass for step 14's observe to fire.
+        b_sub_tx.send(packet).await.expect("inject packet into B");
+
+        // NOTE: read with `merged_now(at_wall_ms)`, NOT `merged_now(0)` —
+        // merged_now clamps against `now + CAP`, so a tiny `now` would
+        // cap the answer well below the actual floor value.
+        let mut fed = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if bob_adopt_floor.merged_now(at_wall_ms) == at_wall_ms + 1 {
+                fed = true;
+                break;
+            }
+        }
+        assert!(
+            fed,
+            "accepted publish must feed the floor within the poll window"
+        );
+        assert_eq!(
+            bob_adopt_floor.merged_now(at_wall_ms),
+            at_wall_ms + 1,
+            "accepted publish feeds the floor (+1 rule)"
+        );
+    }
+
+    /// ZEB-790 Task 5: the mirror-image invariant — a publish that FAILS
+    /// the accept pipeline must never reach step 14's `observe` call.
+    /// Uses a `PublisherNotJoined` rejection (membership-at-HLC gate,
+    /// step 2 of `handle_incoming_publish` — runs before sig-verify and
+    /// long before the tracker commit): a member who Joined then Left
+    /// gets a forged publish claiming their address, stamped after their
+    /// Leave. Seeds membership directly via `insert_verified_for_test`
+    /// (test-only trusted-write seam) rather than a real Join/Leave
+    /// signing dance — the membership gate runs on the unauthenticated
+    /// `publisher_addr` before any signature is checked, so the forged
+    /// publish's `publisher_sig` is deliberately garbage.
+    ///
+    /// Review round 1 fix: a bare sleep-then-assert-zero has no positive
+    /// confirmation the forged frame was ever processed — that assertion
+    /// is indistinguishable from "nothing happened yet," since zero is
+    /// ALSO the floor's untouched initial state. So after the forged
+    /// frame, this test injects a second, genuinely-accepted publish
+    /// from a real member ("dave") through the SAME engine and SAME
+    /// subscriber_rx, and polls (bounded, like the accepted-path test)
+    /// until the floor moves for THAT publish. The final assertion then
+    /// does double duty: it proves the engine loop was live and still
+    /// accepting during/after the rejection window, AND that the forged
+    /// frame contributed nothing — the forged wall_ms is chosen so far
+    /// past dave's (well beyond the adoption cap) that if it had fed the
+    /// floor, the read below would clamp to `legit_at.wall_ms + CAP`
+    /// instead of the expected `+ 1`.
+    #[tokio::test]
+    async fn rejected_publish_does_not_feed_adopt_floor() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, EventPayload, MembershipEventKind,
+        };
+        use crate::owner_state_crypto::canonical_cbor_encode;
+        use ed25519_dalek::Signer;
+
+        let admin_addr = OwnerAddr([0xC1; 16]);
+        let carol_addr = OwnerAddr([0xC2; 16]);
+        let community_id = SpaceId([0x5C; 16]);
+        let membership_key = EpochKey::new([0x66; 32]);
+
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+        let cas_op_tx = spawn_shared_cas();
+        let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+        let dir = tempfile::tempdir().expect("dir");
+
+        let (pub_tx, mut pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while pub_rx.recv().await.is_some() {} });
+        let (sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(64);
+
+        let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        // Retained for the liveness publish's CAS put below — `cs` itself
+        // is moved into the engine's config.
+        let cs_for_put = Arc::clone(&cs);
+
+        let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: adopt_floor.clone(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr,
+            is_invite_only: false,
+            device_id: "admin-dev".into(),
+            self_owner: admin_addr,
+            signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0xC1; 32])),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                admin_addr,
+                "admin-dev".to_string(),
+            )))),
+            content_store: cs,
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            paths: PersistPaths {
+                crdt: dir.path().join("crdt.cbor"),
+                replay: dir.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+
+        // Seed a Joined-then-Left member ("carol") directly via the
+        // trusted test-only insert (bypasses verify_event — admin power
+        // is implicit per `materialize_with_now`, so no admin bootstrap
+        // Join is needed either). `sig` is a dummy: the membership gate
+        // that rejects the forged publish below runs BEFORE sig-verify.
+        let carol_join = SignedMembershipEvent {
+            id: [0x02; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: carol_addr,
+            at: Hlc {
+                wall_ms: 100_100,
+                logical: 0,
+                device_id: "carol-dev".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+            signer_certs: Vec::new(),
+        };
+        let carol_leave = SignedMembershipEvent {
+            id: [0x03; 16],
+            community_id,
+            kind: MembershipEventKind::Leave,
+            actor: carol_addr,
+            at: Hlc {
+                wall_ms: 100_200,
+                logical: 0,
+                device_id: "carol-dev".into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+            signer_certs: Vec::new(),
+        };
+
+        // Seed a genuinely-Joined member ("dave") with a REAL enrolled
+        // device key — this is who the liveness publish below claims to
+        // be from, so its sig-verify (step 3/4) must genuinely pass.
+        let dave = mint_test_owner(0xD4);
+        let dave_addr = dave.owner;
+        let dave_join_payload = EventPayload {
+            id: [0x04; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: dave_addr,
+            at: Hlc {
+                wall_ms: 100_150,
+                logical: 0,
+                device_id: "dave-dev".into(),
+            },
+        };
+        let dave_join = SignedMembershipEvent {
+            enrollment: Some(dave.cert.clone()),
+            ..sign_event(&dave_join_payload, &dave.device_key).expect("sign dave join")
+        };
+        {
+            let state = engine.state();
+            let mut g = state.lock().await;
+            g.insert_verified_for_test(carol_join);
+            g.insert_verified_for_test(carol_leave);
+            g.insert_verified_for_test(dave_join);
+        }
+
+        // Forge a root publish claiming carol as publisher, stamped
+        // strictly AFTER her Leave — `prior_state_at_hlc` sees her as
+        // `Left`, so the membership-at-HLC gate returns
+        // `PublisherNotJoined` before sig-verify, merge, or the tracker
+        // commit are ever reached. wall_ms is deliberately far beyond
+        // dave's forthcoming legit publish (see the final assertion).
+        let forged_at = Hlc {
+            wall_ms: 50_000_000,
+            logical: 0,
+            device_id: "carol-dev".into(),
+        };
+        let forged_signed = CommunityRootSignedPayload {
+            root_cid: harmony_content::cid::ContentId::for_book(
+                b"zeb-790-forged-rejected-publish",
+                harmony_content::cid::ContentFlags {
+                    encrypted: true,
+                    ..Default::default()
+                },
+            )
+            .expect("cid"),
+            publisher_addr: carol_addr,
+            at: forged_at,
+        };
+        let forged_payload = forged_signed.into_wire([0u8; 64], None);
+        let forged_payload_bytes =
+            canonical_cbor_encode(&forged_payload).expect("encode forged payload");
+        let forged_wire =
+            encrypt_root_publish(&membership_key, &forged_payload_bytes).expect("encrypt forged");
+
+        sub_tx
+            .send(forged_wire)
+            .await
+            .expect("inject forged publish");
+
+        // Positive liveness signal (review round 1): a second, genuinely-
+        // accepted publish from dave through the SAME engine/subscriber_rx.
+        // Its root_cid must resolve in the SAME content store the engine
+        // reads from — an empty CommunityState blob is enough, since
+        // dave's Join is already merged into the engine's local state
+        // above and the merge phase treats it as AlreadyKnown.
+        let empty_remote = CommunityState::new(community_id);
+        let blob_cleartext = canonical_cbor_encode(&empty_remote).expect("encode empty snapshot");
+        let blob_ciphertext = encrypt_blob(&membership_key, &blob_cleartext).expect("encrypt blob");
+        let legit_root_cid = harmony_content::cid::ContentId::for_book(
+            &blob_ciphertext,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid");
+        cs_for_put
+            .put_serveable(legit_root_cid, blob_ciphertext)
+            .await
+            .expect("put empty blob");
+
+        let legit_at = Hlc {
+            wall_ms: 100_500,
+            logical: 0,
+            device_id: "dave-dev".into(),
+        };
+        let legit_signed = CommunityRootSignedPayload {
+            root_cid: legit_root_cid,
+            publisher_addr: dave_addr,
+            at: legit_at.clone(),
+        };
+        let legit_signed_bytes = canonical_cbor_encode(&legit_signed).expect("encode legit signed");
+        let legit_sig = dave.device_key.sign(&legit_signed_bytes).to_bytes();
+        let legit_payload = legit_signed.into_wire(legit_sig, None);
+        let legit_payload_bytes =
+            canonical_cbor_encode(&legit_payload).expect("encode legit payload");
+        let legit_wire =
+            encrypt_root_publish(&membership_key, &legit_payload_bytes).expect("encrypt legit");
+
+        sub_tx.send(legit_wire).await.expect("inject legit publish");
+
+        let mut fed = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if adopt_floor.merged_now(legit_at.wall_ms) == legit_at.wall_ms + 1 {
+                fed = true;
+                break;
+            }
+        }
+        assert!(
+            fed,
+            "the engine loop must still be live and accepting after the \
+             rejected frame — the legit publish must feed the floor \
+             within the poll window"
+        );
+        assert_eq!(
+            adopt_floor.merged_now(legit_at.wall_ms),
+            legit_at.wall_ms + 1,
+            "rejected publish must NOT move the floor — if the forged \
+             wall_ms (50_000_000) had fed it, this read would clamp to \
+             legit_at.wall_ms + CAP instead of + 1"
+        );
+    }
+
     /// NopResolver: minimal `IdentityResolver` for fixture builds. None
     /// of the spawn-rollback-guard tests exercise verify-on-receive, so
     /// the resolver never resolves anything.
@@ -6628,6 +7099,7 @@ mod tests {
         let identity_dir = tempdir.path().to_path_buf();
 
         let registry = std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "dev".into(),
             content_store: cs,
             identity_resolver: std::sync::Arc::new(NopResolver),
@@ -7839,6 +8311,7 @@ mod tests {
         tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
 
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
             admin_addr: alice_addr,
@@ -7877,6 +8350,7 @@ mod tests {
         let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key,
             admin_addr: alice_addr,
@@ -8033,6 +8507,7 @@ mod tests {
         tokio::spawn(async move { while pub_rx.recv().await.is_some() {} });
 
         let _engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: EpochKey::new([0x66; 32]),
             admin_addr: alice_addr,
@@ -8256,6 +8731,7 @@ mod tests {
             let a_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
             let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 community_id,
                 membership_key: membership_key.clone(),
                 admin_addr: alice_addr,
@@ -8292,6 +8768,7 @@ mod tests {
             let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
 
             let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 community_id,
                 membership_key,
                 admin_addr: alice_addr,
@@ -8736,6 +9213,7 @@ mod tests {
         tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
 
         let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: membership_key.clone(),
             admin_addr: alice_addr,
@@ -8778,6 +9256,7 @@ mod tests {
         ))));
 
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key,
             admin_addr: alice_addr,
@@ -9070,6 +9549,7 @@ mod tests {
             std::time::Duration::from_secs(2),
         ));
         let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
             membership_key: EpochKey::new([0x55; 32]),
             admin_addr: alice.owner,

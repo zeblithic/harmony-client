@@ -200,6 +200,7 @@ async fn voting_event_flows_through_two_zenoh_sessions() {
     // verify_voting_event, and applies on success.
     let log_b = Arc::new(Mutex::new(VotingLog::default()));
     let _engine_b = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         voting_log: Arc::clone(&log_b),
         publisher_tx: b_pub_tx,
@@ -376,6 +377,7 @@ async fn kicked_then_rotated_member_injection_is_dropped() {
 
     let log_b = Arc::new(Mutex::new(VotingLog::default()));
     let _engine_b = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         voting_log: Arc::clone(&log_b),
         publisher_tx: b_pub_tx,
@@ -542,6 +544,7 @@ async fn spawn_real_voting_node(
     let id_resolver: Arc<dyn VotingIdentityResolver> = resolvers.clone();
     let mem_resolver: Arc<dyn MembershipSnapshotResolver> = resolvers.clone();
     let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         voting_log: Arc::clone(&log),
         publisher_tx: pub_tx,

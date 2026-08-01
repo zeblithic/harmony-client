@@ -3292,11 +3292,21 @@ impl DeviceHlcStore for harmony_crdt_sync::ReplayTracker<String, Hlc> {
 /// ZEB-267 — replaces the snapshot-then-release pattern that had a
 /// race window between the `prev_hlc` read and the post-`Inserted`
 /// advance. See `docs/specs/2026-05-09-zeb-267-atomic-hlc-reservation-design.md`.
+///
+/// ZEB-790: `floor` bounds the mint to at most `HLC_ADOPT_FORWARD_CAP_MS`
+/// ahead of `wall_now_ms`, adopting the highest verified remote wall this
+/// session has observed (via `HlcAdoptFloor::observe`). An empty floor is
+/// the identity — `floor.merged_now(wall_now_ms) == wall_now_ms` — so this
+/// is a strict superset of pre-ZEB-790 behavior.
 pub async fn reserve_next_hlc_for_device<T: DeviceHlcStore>(
     tracker: &std::sync::Arc<tokio::sync::Mutex<T>>,
+    floor: &crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: &str,
     wall_now_ms: u64,
 ) -> Hlc {
+    // ZEB-790: bounded causal adoption — the floor read is a lock-free
+    // atomic, so the ZEB-267 single-lock atomicity is unchanged.
+    let wall_now_ms = floor.merged_now(wall_now_ms);
     let mut t = tracker.lock().await;
     let prev = t.last_for(device_id).cloned();
     let next = next_hlc(prev.as_ref(), wall_now_ms, device_id);
@@ -8757,10 +8767,11 @@ mod tests {
         let tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
             Mutex::new(harmony_crdt_sync::ReplayTracker::new(device_id.to_string())),
         );
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
         let wall_now_ms = 1_700_000_000_000u64;
 
-        let first = reserve_next_hlc_for_device(&tracker, device_id, wall_now_ms).await;
-        let second = reserve_next_hlc_for_device(&tracker, device_id, wall_now_ms).await;
+        let first = reserve_next_hlc_for_device(&tracker, &floor, device_id, wall_now_ms).await;
+        let second = reserve_next_hlc_for_device(&tracker, &floor, device_id, wall_now_ms).await;
 
         // Sort key is (wall_ms, logical, device_id) — strictly-greater
         // ordering is what the receive side expects for per-device events.
@@ -8784,6 +8795,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserve_adopts_verified_future_stamp_within_cap() {
+        // ZEB-790: the ZEB-788 621ms inversion, made impossible. A mint
+        // that follows a verified-and-applied remote stamp W (W < now+CAP)
+        // must exceed W — even when the remote carried logical > 0.
+        let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::<
+            String,
+            Hlc,
+        >::new()));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let now = 1_785_021_611_000u64; // "Ildwyn's clock"
+        let remote_wall = now + 600; // "AVALON's stamp", 600ms ahead
+        floor.observe(remote_wall); // what the engines do post-verify
+        let minted = reserve_next_hlc_for_device(&tracker, &floor, "ildwyn-dev", now).await;
+        assert_eq!(minted.wall_ms, remote_wall + 1, "wall strictly exceeds W");
+        assert_eq!(minted.logical, 0);
+        // Strictly after the remote stamp for ANY remote logical (the +1 rule):
+        let remote = Hlc {
+            wall_ms: remote_wall,
+            logical: u32::MAX,
+            device_id: "avalon-dev".into(),
+        };
+        assert!(minted.is_strictly_newer_than(&remote));
+    }
+
+    #[tokio::test]
+    async fn reserve_clamps_beyond_cap_and_stays_device_monotone() {
+        let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::<
+            String,
+            Hlc,
+        >::new()));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let now = 1_000_000u64;
+        floor.observe(now + 3_600_000); // hostile: one hour ahead
+        let a = reserve_next_hlc_for_device(&tracker, &floor, "dev", now).await;
+        assert_eq!(
+            a.wall_ms,
+            now + crate::hlc_adopt_floor::HLC_ADOPT_FORWARD_CAP_MS,
+            "clamped to CAP"
+        );
+        // Per-device strict monotonicity survives adoption:
+        let b = reserve_next_hlc_for_device(&tracker, &floor, "dev", now).await;
+        assert!(
+            b.is_strictly_newer_than(&a),
+            "wall tied at clamp -> logical bumps"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_with_empty_floor_is_todays_behavior() {
+        let tracker = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::<
+            String,
+            Hlc,
+        >::new()));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let minted = reserve_next_hlc_for_device(&tracker, &floor, "dev", 42_000).await;
+        assert_eq!(minted.wall_ms, 42_000, "identity: no observed remote");
+        assert_eq!(minted.logical, 0);
+    }
+
+    #[tokio::test]
     async fn reserve_next_hlc_for_device_concurrent_reservations_distinct() {
         use std::collections::BTreeSet;
         use std::sync::Arc;
@@ -8794,6 +8865,7 @@ mod tests {
         let tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
             Mutex::new(harmony_crdt_sync::ReplayTracker::new(device_id.to_string())),
         );
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
         let wall_now_ms = 1_700_000_111_222u64;
 
         // Spawn 64 concurrent reservations. Without the atomic helper,
@@ -8802,9 +8874,10 @@ mod tests {
         let mut set: JoinSet<Hlc> = JoinSet::new();
         for _ in 0..64 {
             let tracker = Arc::clone(&tracker);
+            let floor = floor.clone();
             let device_id = device_id.to_string();
             set.spawn(async move {
-                reserve_next_hlc_for_device(&tracker, &device_id, wall_now_ms).await
+                reserve_next_hlc_for_device(&tracker, &floor, &device_id, wall_now_ms).await
             });
         }
 
@@ -8893,7 +8966,8 @@ mod tests {
 
         // Reserve with wall_now_ms=500 — strictly less than the prior
         // wall_ms. next_hlc clamps to prev.wall_ms and bumps logical.
-        let reserved = reserve_next_hlc_for_device(&tracker, device_id, 500).await;
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let reserved = reserve_next_hlc_for_device(&tracker, &floor, device_id, 500).await;
         assert_eq!(
             reserved.wall_ms, 1000,
             "wall_ms must clamp to prev.wall_ms under regression"

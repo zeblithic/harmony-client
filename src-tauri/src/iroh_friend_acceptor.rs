@@ -1596,6 +1596,9 @@ where
     /// Shared HLC tracker (`device_id → last Hlc`), bumped per accepted request
     /// to stamp `FriendEntry.learned_at`. Same map the profile broadcaster uses.
     hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs). Applied at `next_hlc`.
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     self_owner: OwnerAddr,
     self_display: Option<String>,
@@ -1730,6 +1733,9 @@ where
         Self {
             crdt_state,
             hlc_tracker,
+            // ZEB-790: default to the EMPTY (identity) floor — production wires
+            // the real node-wide handle via `with_adopt_floor`.
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id,
             self_owner,
             self_display,
@@ -1798,6 +1804,17 @@ where
         revoked: crate::revoked_device_projection::RevokedDeviceProjection,
     ) -> Self {
         self.revoked = revoked;
+        self
+    }
+
+    /// ZEB-790: wire the node-wide bounded-adoption floor (see
+    /// `hlc_adopt_floor` module docs). Fluent setter (default: the EMPTY floor
+    /// from `with_config`, which is the identity — same posture as
+    /// `with_revoked`). PRODUCTION SHOULD call this with the real node-wide
+    /// handle so this acceptor's mints stay causally consistent with the rest
+    /// of the node.
+    pub fn with_adopt_floor(mut self, adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor) -> Self {
+        self.adopt_floor = adopt_floor;
         self
     }
 
@@ -1989,7 +2006,7 @@ where
     /// Bump-and-return a fresh HLC stamped with this device's id. Mirrors
     /// `profile_broadcast::OwnerStateBroadcastSource::next_hlc`.
     async fn next_hlc(&self) -> Hlc {
-        let now_ms = wall_now_ms();
+        let now_ms = self.adopt_floor.merged_now(wall_now_ms());
         let mut tracker = self.hlc_tracker.lock().await;
         // Delegates to the core tick kernel like every other minting path
         // (ZEB-759); this was an open-coded copy of the same rule.
@@ -4229,6 +4246,7 @@ mod tests {
                 replay: dir.path().join("replay.cbor"),
             },
             50, // short debounce for the test
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
 
         let me = mint_test_owner(0x71);

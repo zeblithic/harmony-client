@@ -259,6 +259,7 @@ pub async fn fork_community(
     let (
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_registry,
@@ -277,6 +278,7 @@ pub async fn fork_community(
                 .clone()
                 .ok_or("crdt_state missing — node not running?")?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry
@@ -471,8 +473,13 @@ pub async fn fork_community(
     };
 
     // Reserve HLC for the fork creation (used as `forked_at` timestamp).
-    let fork_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let fork_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Step 4: Mint the fork community (bootstrap Join + #general).
     // Uses create_community_inner with is_invite_only=false (fork can set
@@ -512,8 +519,13 @@ pub async fn fork_community(
     // the create_community_inner steps using the pre-minted result. This is
     // what we do below.
 
-    let fork_hlc_for_create =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let fork_hlc_for_create = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     let minted = crate::mint_community_creation(
         &opts.name,
@@ -687,8 +699,13 @@ pub async fn fork_community(
         rand::thread_rng().fill_bytes(&mut buf);
         buf
     };
-    let default_channel_at =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let default_channel_at = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let default_channel_payload = crate::community_membership::EventPayload {
         id: default_channel_event_id,
         community_id: fork_space_id,
@@ -814,9 +831,13 @@ pub async fn fork_community(
     // visible=false; the fork is already durably on disk.
     let mut visible = !opts.silent;
     if visible {
-        let fork_event_hlc =
-            crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
-                .await;
+        let fork_event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+            &hlc_tracker,
+            &adopt_floor,
+            &device_id,
+            wall_now_ms,
+        )
+        .await;
         // RELIABILITY: wrap mint_fork_event in a match so a signing failure
         // after the fork is durably committed does not propagate via `?` and
         // surface as an IPC error (which would mislead the caller into thinking
@@ -967,6 +988,7 @@ pub async fn fork_community(
         if leave_generation_ok {
             let leave_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
                 &hlc_tracker,
+                &adopt_floor,
                 &device_id,
                 wall_now_ms,
             )

@@ -525,6 +525,7 @@ async fn revoked_device2_dm_is_dropped_after_community_revocation() {
             Some("bob".to_string()),
             Arc::clone(&bob_crdt_state),
             Arc::clone(&bob_hlc_tracker),
+            harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             "bob-dev".to_string(),
             Arc::clone(&bob_keytree),
             harmony_app::revoked_device_projection::RevokedDeviceProjection::new(),

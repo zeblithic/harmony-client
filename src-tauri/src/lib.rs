@@ -198,6 +198,7 @@ pub mod friend_nicknames;
 pub mod friend_rendezvous;
 pub mod friend_requests;
 pub mod friend_token;
+pub mod hlc_adopt_floor;
 pub mod identity;
 pub mod identity_commands;
 pub mod invite_mint;
@@ -945,6 +946,10 @@ pub struct NodeState {
             >,
         >,
     >,
+    /// ZEB-790: bounded causal-adoption floor. Fed by the verified accept
+    /// paths, read by every mint seam. Reset to a fresh floor per
+    /// start_node (session-only — see hlc_adopt_floor.rs module docs).
+    hlc_adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     /// Local device_id string + self OwnerAddr — captured at start_node
     /// time, snapshot for IPC handlers that mint OutboxEntry / HLC stamps.
     dm_device_id: Option<String>,
@@ -1952,6 +1957,7 @@ impl Default for NodeState {
             butler_deposit_client: None,
             crdt_state: None,
             hlc_tracker: None,
+            hlc_adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             dm_device_id: None,
             dm_self_owner: None,
             owner_keytree: None,
@@ -4422,6 +4428,10 @@ pub async fn start_node_inner(
                 >,
             >,
         > = None;
+        // ZEB-790: fresh adoption floor per node session. Not `Option` —
+        // always a valid (initially empty) floor even if the block below
+        // never runs, matching NodeState.hlc_adopt_floor's non-Option field.
+        let mut adopt_floor_for_state = crate::hlc_adopt_floor::HlcAdoptFloor::new();
         let mut content_store_for_state: Option<
             std::sync::Arc<dyn crate::content_store::ContentStore>,
         > = None;
@@ -5169,6 +5179,8 @@ pub async fn start_node_inner(
                             initial_replay,
                         ),
                     ));
+                    // ZEB-790: fresh adoption floor per node session.
+                    let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
                     // Phase 3b: real harmony-content CAS via RuntimeContentStore.
                     // Sends CasOp messages over cas_op_tx into the harmony-
                     // runtime event loop, which admits/queries through the
@@ -5298,6 +5310,7 @@ pub async fn start_node_inner(
                             replay: replay_path,
                         },
                         crate::owner_state_sync::DEFAULT_DEBOUNCE_MS,
+                        adopt_floor.clone(),
                     ));
 
                     // ZEB-685 (S3): a stable, uniquely-named handle to the
@@ -5511,6 +5524,7 @@ pub async fn start_node_inner(
                             keys: keys.clone(),
                             device_id: device_id.clone(),
                             state: std::sync::Arc::clone(&notes_doc),
+                            adopt_floor: adopt_floor.clone(),
                             merger: notes_merger,
                             replay_tracker: std::sync::Arc::clone(&notes_tracker),
                             content_store: std::sync::Arc::clone(&content_store),
@@ -5591,6 +5605,7 @@ pub async fn start_node_inner(
                                 keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&dm_inbox_doc),
+                                adopt_floor: adopt_floor.clone(),
                                 merger: dm_inbox_merger,
                                 replay_tracker: std::sync::Arc::clone(&dm_inbox_tracker),
                                 content_store: std::sync::Arc::clone(&content_store),
@@ -5744,6 +5759,7 @@ pub async fn start_node_inner(
                                 keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&community_device_intro_doc),
+                                adopt_floor: adopt_floor.clone(),
                                 merger: community_device_intro_merger,
                                 replay_tracker: std::sync::Arc::clone(
                                     &community_device_intro_tracker,
@@ -5841,6 +5857,7 @@ pub async fn start_node_inner(
                                 keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&relay_hold_doc),
+                                adopt_floor: adopt_floor.clone(),
                                 merger: relay_hold_merger,
                                 replay_tracker: std::sync::Arc::clone(&relay_hold_tracker),
                                 content_store: std::sync::Arc::clone(&content_store),
@@ -5891,6 +5908,7 @@ pub async fn start_node_inner(
                                 keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&relay_optin_doc),
+                                adopt_floor: adopt_floor.clone(),
                                 merger: relay_optin_merger,
                                 replay_tracker: std::sync::Arc::clone(&relay_optin_tracker),
                                 content_store: std::sync::Arc::clone(&content_store),
@@ -5982,6 +6000,7 @@ pub async fn start_node_inner(
                                 keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&dm_outhold_doc),
+                                adopt_floor: adopt_floor.clone(),
                                 merger: dm_outhold_merger,
                                 replay_tracker: std::sync::Arc::clone(&dm_outhold_tracker),
                                 content_store: std::sync::Arc::clone(&content_store),
@@ -6093,6 +6112,7 @@ pub async fn start_node_inner(
                                 keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&fleet_net_doc),
+                                adopt_floor: adopt_floor.clone(),
                                 merger: fleet_net_merger,
                                 replay_tracker: std::sync::Arc::clone(&fleet_net_tracker),
                                 content_store: std::sync::Arc::clone(&content_store),
@@ -6141,7 +6161,10 @@ pub async fn start_node_inner(
                             .unwrap_or_default()
                             .as_millis() as u64;
                         let seen_at = crate::dm_outbox::reserve_next_hlc_for_device(
-                            &tracker, &device_id, now_ms,
+                            &tracker,
+                            &adopt_floor,
+                            &device_id,
+                            now_ms,
                         )
                         .await;
                         {
@@ -6336,6 +6359,7 @@ pub async fn start_node_inner(
                                 keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&owner_trust_doc),
+                                adopt_floor: adopt_floor.clone(),
                                 merger: crate::owner_trust_sync::trust_merger(),
                                 replay_tracker: owner_trust_tracker,
                                 content_store: std::sync::Arc::clone(&content_store),
@@ -6415,6 +6439,7 @@ pub async fn start_node_inner(
                                 keys: keys.clone(),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&owner_quorum_doc),
+                                adopt_floor: adopt_floor.clone(),
                                 merger: crate::owner_quorum_sync::quorum_merger(),
                                 replay_tracker: owner_quorum_tracker,
                                 content_store: std::sync::Arc::clone(&content_store),
@@ -6567,6 +6592,7 @@ pub async fn start_node_inner(
                                 ),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&fleet_keys_doc),
+                                adopt_floor: adopt_floor.clone(),
                                 merger: std::sync::Arc::new(
                                     move |local: &mut crate::fleet_key_epoch::FleetKeyEpochDoc,
                                           remote| {
@@ -6872,6 +6898,11 @@ pub async fn start_node_inner(
                             // by device #2. (No transport use of this key in
                             // the engine — it is only the two signing sites.)
                             signing_key: std::sync::Arc::clone(&community_signing_key_arc),
+                            // ZEB-790: node-wide bounded causal-adoption floor
+                            // (the same `adopt_floor` created once per node
+                            // session above; every spawned community engine
+                            // clones into its own InternalCtx).
+                            adopt_floor: adopt_floor.clone(),
                             // ZEB-249 §10.6 (Phase A): pass the live owner-state CRDT
                             // so every spawned engine reads the current epoch key
                             // dynamically rather than using its spawn-time capture.
@@ -6965,6 +6996,7 @@ pub async fn start_node_inner(
                                 self_owner,
                                 device_id: device_id.clone(),
                                 hlc_tracker: std::sync::Arc::clone(&tracker),
+                                adopt_floor: adopt_floor.clone(),
                             },
                         );
                         let retire_engine = std::sync::Arc::clone(&community_device_intro_sync);
@@ -7016,6 +7048,7 @@ pub async fn start_node_inner(
                             // same trust root as root-publish auth), which
                             // contains device #2 from the EnrollmentCert.
                             signing_key: std::sync::Arc::clone(&community_signing_key_arc),
+                            adopt_floor: adopt_floor.clone(),
                             engine_config:
                                 crate::community_channel_log_engine::ChannelLogEngineConfig::default(
                                 ),
@@ -7271,6 +7304,7 @@ pub async fn start_node_inner(
                                 let signing_key_for_heal =
                                     std::sync::Arc::clone(&community_signing_key_arc);
                                 let hlc_tracker_for_heal = std::sync::Arc::clone(&tracker);
+                                let adopt_floor_for_heal = adopt_floor.clone();
                                 let device_id_for_heal = device_id.clone();
                                 let self_owner_for_heal = self_owner;
                                 let crdt_state_for_heal = std::sync::Arc::clone(&crdt_state);
@@ -7391,6 +7425,7 @@ pub async fn start_node_inner(
                                 let device_intro_cert =
                                     own_enrollment_cert_for_device_intro.clone();
                                 let device_intro_hlc_tracker = std::sync::Arc::clone(&tracker);
+                                let device_intro_adopt_floor = adopt_floor.clone();
                                 let device_intro_device_id = device_id.clone();
                                 let device_intro_self_owner = self_owner;
                                 let device_intro_registry = std::sync::Arc::clone(&registry);
@@ -7429,6 +7464,7 @@ pub async fn start_node_inner(
                                     let registry = std::sync::Arc::clone(&community_registry_for_heal);
                                     let community_signing_key = std::sync::Arc::clone(&signing_key_for_heal);
                                     let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_heal);
+                                    let adopt_floor = adopt_floor_for_heal.clone();
                                     let device_id = device_id_for_heal.clone();
                                     let self_owner = self_owner_for_heal;
                                     let crdt_state = std::sync::Arc::clone(&crdt_state_for_heal);
@@ -7492,6 +7528,7 @@ pub async fn start_node_inner(
                                     let device_intro_cert = device_intro_cert.clone();
                                     let device_intro_hlc_tracker =
                                         std::sync::Arc::clone(&device_intro_hlc_tracker);
+                                    let device_intro_adopt_floor = device_intro_adopt_floor.clone();
                                     let device_intro_device_id = device_intro_device_id.clone();
                                     let device_intro_registry =
                                         std::sync::Arc::clone(&device_intro_registry);
@@ -7753,6 +7790,7 @@ pub async fn start_node_inner(
                                             registry,
                                             community_signing_key,
                                             hlc_tracker,
+                                            adopt_floor,
                                             device_id,
                                             self_owner,
                                             crdt_state,
@@ -7908,6 +7946,7 @@ pub async fn start_node_inner(
                                                     let hlc =
                                                         crate::dm_outbox::reserve_next_hlc_for_device(
                                                             &device_intro_hlc_tracker,
+                                                            &device_intro_adopt_floor,
                                                             &device_intro_device_id,
                                                             announced_at_ms,
                                                         )
@@ -8068,6 +8107,7 @@ pub async fn start_node_inner(
                         let signing_key_for_tick =
                             std::sync::Arc::clone(&community_signing_key_arc);
                         let hlc_tracker_for_tick = std::sync::Arc::clone(&tracker);
+                        let adopt_floor_for_tick = adopt_floor.clone();
                         let device_id_for_tick = device_id.clone();
                         let self_owner_for_tick = self_owner;
                         let crdt_state_for_tick = std::sync::Arc::clone(&crdt_state);
@@ -8095,6 +8135,7 @@ pub async fn start_node_inner(
                                         std::sync::Arc::clone(&registry),
                                         std::sync::Arc::clone(&signing_key_for_tick),
                                         std::sync::Arc::clone(&hlc_tracker_for_tick),
+                                        adopt_floor_for_tick.clone(),
                                         device_id_for_tick.clone(),
                                         self_owner_for_tick,
                                         std::sync::Arc::clone(&crdt_state_for_tick),
@@ -8703,6 +8744,7 @@ pub async fn start_node_inner(
                             std::sync::Arc::clone(&community_signing_key_arc);
                         let self_owner_for_cb = self_owner;
                         let hlc_tracker_for_cb = std::sync::Arc::clone(&tracker);
+                        let adopt_floor_for_cb = adopt_floor.clone();
                         let device_id_for_cb = device_id.clone();
                         // ZEB-418/durable-seal-targets Task 2: butler-set inputs
                         // captured for the CRDT publisher. Unlike the sync pkarr
@@ -8744,6 +8786,7 @@ pub async fn start_node_inner(
                                     std::sync::Arc::clone(&community_signing_key_for_cb);
                                 let actor = self_owner_for_cb;
                                 let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_cb);
+                                let adopt_floor = adopt_floor_for_cb.clone();
                                 let device_id = device_id_for_cb.clone();
                                 // ZEB-371 per-invocation clones for the friend reconcile.
                                 let friend_pub_cell =
@@ -8893,6 +8936,7 @@ pub async fn start_node_inner(
                                         //     across the fan-out.
                                         let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
                                             &hlc_tracker,
+                                            &adopt_floor,
                                             &device_id,
                                             announced_at_ms,
                                         )
@@ -9672,6 +9716,7 @@ pub async fn start_node_inner(
                         let fleet_engine = std::sync::Arc::clone(&fleet_net_sync);
                         let fleet_snapshot = std::sync::Arc::clone(&fleet_net_snapshot);
                         let hlc_tracker = std::sync::Arc::clone(&tracker);
+                        let republish_adopt_floor = adopt_floor.clone();
                         let republish_device_id = device_id.clone();
                         let ep_opt = iroh_endpoint_arc.clone();
                         // ZEB-668 S5: window-close check handles.
@@ -9697,6 +9742,7 @@ pub async fn start_node_inner(
                             let fleet_engine = std::sync::Arc::clone(&fleet_engine);
                             let fleet_snapshot = std::sync::Arc::clone(&fleet_snapshot);
                             let hlc_tracker = std::sync::Arc::clone(&hlc_tracker);
+                            let adopt_floor = republish_adopt_floor.clone();
                             let device_id = republish_device_id.clone();
                             let ep_opt = ep_opt.clone();
                             let connectivity_settings_path = connectivity_settings_path.clone();
@@ -9720,6 +9766,7 @@ pub async fn start_node_inner(
                                         as u64;
                                     let seen_at = crate::dm_outbox::reserve_next_hlc_for_device(
                                         &hlc_tracker,
+                                        &adopt_floor,
                                         &device_id,
                                         now_ms,
                                     )
@@ -10103,6 +10150,7 @@ pub async fn start_node_inner(
                                     crdt_state: std::sync::Arc::clone(&crdt_state),
                                     hlc_tracker: std::sync::Arc::clone(&tracker),
                                     device_id: device_id.clone(),
+                                    adopt_floor: adopt_floor.clone(),
                                 },
                             ),
                             std::sync::Arc::new(crate::profile_broadcast::EventLoopPublishSink {
@@ -10330,7 +10378,9 @@ pub async fn start_node_inner(
                             .with_self_trust_doc(Some(std::sync::Arc::clone(&owner_trust_doc)))
                             // ZEB-804: stamp served friend handshakes into the
                             // shared per-peer traffic registry.
-                            .with_traffic_registry(std::sync::Arc::clone(&peer_traffic_registry)),
+                            .with_traffic_registry(std::sync::Arc::clone(&peer_traffic_registry))
+                            // ZEB-790: node-wide bounded-adoption floor.
+                            .with_adopt_floor(adopt_floor.clone()),
                         );
 
                         // ZEB-375 (Friends Phase 2a): build the friend-PEX
@@ -10402,7 +10452,9 @@ pub async fn start_node_inner(
                             .with_self_trust_doc(Some(std::sync::Arc::clone(&owner_trust_doc)))
                             // ZEB-804: stamp served PEX requests into the shared
                             // per-peer traffic registry.
-                            .with_traffic_registry(std::sync::Arc::clone(&peer_traffic_registry)),
+                            .with_traffic_registry(std::sync::Arc::clone(&peer_traffic_registry))
+                            // ZEB-790: node-wide bounded-adoption floor.
+                            .with_adopt_floor(adopt_floor.clone()),
                         );
 
                         // Multiplex all three acceptors behind the single
@@ -10463,6 +10515,7 @@ pub async fn start_node_inner(
                                 ),
                                 dm_inbox_doc: std::sync::Arc::clone(&dm_inbox_doc),
                                 dm_inbox_tracker: std::sync::Arc::clone(&dm_inbox_tracker),
+                                adopt_floor: adopt_floor.clone(),
                                 dm_inbox_engine: std::sync::Arc::clone(&dm_inbox_sync),
                                 ingest_nudge: dm_inbox_nudge_weak.clone(),
                             },
@@ -10729,6 +10782,7 @@ pub async fn start_node_inner(
                             relay_device_id: device_id.clone(),
                             relay_hold_doc: std::sync::Arc::clone(&relay_hold_doc),
                             relay_hold_tracker: std::sync::Arc::clone(&relay_hold_tracker),
+                            adopt_floor: adopt_floor.clone(),
                             flush: std::sync::Arc::new(
                                 crate::community_relay_prod::EngineRelayHoldFlush(
                                     std::sync::Arc::clone(&relay_hold_sync),
@@ -11236,6 +11290,7 @@ pub async fn start_node_inner(
                                             std::sync::Arc::clone(&community_signing_key_arc);
                                         let actor = self_owner;
                                         let hlc_tracker = std::sync::Arc::clone(&tracker);
+                                        let relay_adopt_floor = adopt_floor.clone();
                                         let device_id = device_id.clone();
                                         let optin = std::sync::Arc::clone(&relay_optin_doc);
                                         let membership = std::sync::Arc::clone(&relay_membership);
@@ -11280,6 +11335,7 @@ pub async fn start_node_inner(
                                             let registry = std::sync::Arc::clone(&registry);
                                             let signing_key = std::sync::Arc::clone(&signing_key);
                                             let hlc_tracker = std::sync::Arc::clone(&hlc_tracker);
+                                            let adopt_floor = relay_adopt_floor.clone();
                                             let device_id = device_id.clone();
                                             let optin = std::sync::Arc::clone(&optin);
                                             let membership = std::sync::Arc::clone(&membership);
@@ -11343,6 +11399,7 @@ pub async fn start_node_inner(
                                                     let hlc =
                                                         crate::dm_outbox::reserve_next_hlc_for_device(
                                                             &hlc_tracker,
+                                                            &adopt_floor,
                                                             &device_id,
                                                             now_ms,
                                                         )
@@ -11601,6 +11658,7 @@ pub async fn start_node_inner(
                     keytree_for_state = Some(std::sync::Arc::clone(&kt));
                     crdt_state_for_state = Some(crdt_state);
                     tracker_for_state = Some(tracker);
+                    adopt_floor_for_state = adopt_floor.clone();
                     content_store_for_state = Some(content_store);
                     dm_outbox_arc = Some(outbox);
                     dm_transport_arc = Some(transport);
@@ -12343,6 +12401,7 @@ pub async fn start_node_inner(
                         guard.butler_deposit_client = butler_deposit_client_for_state.clone();
                         guard.crdt_state = crdt_state_for_state.clone();
                         guard.hlc_tracker = tracker_for_state.clone();
+                        guard.hlc_adopt_floor = adopt_floor_for_state.clone();
                         guard.dm_device_id = device_id_for_state.clone();
                         guard.dm_self_owner = self_owner_for_state;
                         guard.owner_keytree = keytree_for_state.clone();
@@ -14055,7 +14114,15 @@ async fn publish_profile(
     // The card-publish inputs are all `Option` — when any is None the node
     // lacks a fully-initialised owner runtime, so we skip the card publish
     // (the Reticulum profile still publishes) rather than failing the IPC.
-    let (publish_tx, dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, profile_card_publisher) = {
+    let (
+        publish_tx,
+        dm_outbox,
+        dm_self_owner,
+        dm_device_id,
+        hlc_tracker,
+        adopt_floor,
+        profile_card_publisher,
+    ) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let tx = guard
             .publish_tx
@@ -14067,6 +14134,7 @@ async fn publish_profile(
             guard.dm_self_owner,
             guard.dm_device_id.clone(),
             guard.hlc_tracker.clone(),
+            guard.hlc_adopt_floor.clone(),
             guard.profile_card_publisher.clone(),
         )
     };
@@ -14136,6 +14204,7 @@ async fn publish_profile(
         dm_self_owner,
         dm_device_id,
         hlc_tracker,
+        adopt_floor,
         profile_card_publisher,
         profile.display_name.clone(),
         profile.status_text.clone().unwrap_or_default(),
@@ -14170,6 +14239,7 @@ async fn publish_owner_card(
             >,
         >,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     profile_card_publisher: Option<
         std::sync::Arc<crate::profile_card_broadcast::ProfileCardPublisher>,
     >,
@@ -14199,8 +14269,13 @@ async fn publish_owner_card(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let (signing_key, enrollment_cert) = {
         let outbox_g = dm_outbox.lock().await;
         (
@@ -14300,13 +14375,14 @@ pub(crate) async fn republish_owner_card_impl(
             Some(root_arr)
         }
     };
-    let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, profile_card_publisher) = {
+    let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, adopt_floor, profile_card_publisher) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         (
             guard.dm_outbox.clone(),
             guard.dm_self_owner,
             guard.dm_device_id.clone(),
             guard.hlc_tracker.clone(),
+            guard.hlc_adopt_floor.clone(),
             guard.profile_card_publisher.clone(),
         )
     };
@@ -14315,6 +14391,7 @@ pub(crate) async fn republish_owner_card_impl(
         dm_self_owner,
         dm_device_id,
         hlc_tracker,
+        adopt_floor,
         profile_card_publisher,
         display_name,
         status_text,
@@ -14528,6 +14605,7 @@ pub(crate) async fn send_dm_impl(
         _dm_transport,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         _self_owner,
         cas,
@@ -14543,6 +14621,7 @@ pub(crate) async fn send_dm_impl(
             g.dm_transport.clone().ok_or("dm_transport missing")?,
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.content_store.clone().ok_or("content_store missing")?,
@@ -14587,6 +14666,10 @@ pub(crate) async fn send_dm_impl(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    // ZEB-790: bounded causal adoption — merge the highest verified remote
+    // wall this session has observed before it reaches the pure `next_hlc`
+    // inside `send_dm`. An empty floor is the identity (unchanged behavior).
+    let wall_now_ms = adopt_floor.merged_now(wall_now_ms);
 
     // Lock order: dm_outbox → crdt_state → hlc_tracker.
     // Mirror this order in event_loop drain (T7) to avoid deadlock.
@@ -15224,6 +15307,7 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
         dm_outbox,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         dm_send_inflight,
         dm_send_stopping,
@@ -15236,6 +15320,7 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             // ZEB-234: snapshot the fence handles so delete_outbox_entry
             // holds a permit for the duration of its outbox mutation,
@@ -15277,6 +15362,9 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    // ZEB-790: bounded causal adoption — merge before the wall reaches the
+    // pure `next_hlc` inside `delete_dm_outbox_entry`. Mirrors send_dm_impl.
+    let wall_now_ms = adopt_floor.merged_now(wall_now_ms);
 
     // Lock order: dm_outbox → crdt_state → hlc_tracker. Mirrors send_dm to
     // avoid deadlock against any concurrent send/drain.
@@ -16722,11 +16810,12 @@ async fn run_vine_authority_reoffer(
 /// Returns `true` iff the binding was written into the self-row (the caller
 /// latches its gate only then, so a no-op retries on the next vine publish).
 async fn stamp_feed_binding(state: &Mutex<NodeState>, rec_json: &str) -> bool {
-    let (doc_arc, snapshot_arc, sync_arc, tracker_arc, self_device_id) = {
+    let (doc_arc, snapshot_arc, sync_arc, tracker_arc, adopt_floor, self_device_id) = {
         let g = match state.lock() {
             Ok(g) => g,
             Err(_) => return false,
         };
+        let adopt_floor = g.hlc_adopt_floor.clone();
         match (
             g.fleet_net_doc.clone(),
             g.fleet_net_snapshot.clone(),
@@ -16734,7 +16823,7 @@ async fn stamp_feed_binding(state: &Mutex<NodeState>, rec_json: &str) -> bool {
             g.fleet_net_tracker.clone(),
             g.fleet_net_device_id.clone(),
         ) {
-            (Some(d), Some(s), Some(sy), Some(t), Some(id)) => (d, s, sy, t, id),
+            (Some(d), Some(s), Some(sy), Some(t), Some(id)) => (d, s, sy, t, adopt_floor, id),
             _ => {
                 tracing::debug!("vine authority: fleet-net not wired; skipping feed_binding stamp");
                 return false;
@@ -16745,8 +16834,13 @@ async fn stamp_feed_binding(state: &Mutex<NodeState>, rec_json: &str) -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let seen_at =
-        crate::dm_outbox::reserve_next_hlc_for_device(&tracker_arc, &self_device_id, now_ms).await;
+    let seen_at = crate::dm_outbox::reserve_next_hlc_for_device(
+        &tracker_arc,
+        &adopt_floor,
+        &self_device_id,
+        now_ms,
+    )
+    .await;
     {
         let mut doc = doc_arc.lock().await;
         match doc.devices.get_mut(&self_device_id) {
@@ -26696,7 +26790,7 @@ async fn join_voice_channel(
 
     // Snapshot the handles we need out of NodeState without holding the lock
     // across awaits (the guard is !Send).
-    let (tx, registry, dm_outbox, self_owner, device_hex, self_device, hlc_tracker) = {
+    let (tx, registry, dm_outbox, self_owner, device_hex, self_device, hlc_tracker, adopt_floor) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let tx = guard
             .voice_channel_tx
@@ -26730,6 +26824,7 @@ async fn join_voice_channel(
             .hlc_tracker
             .clone()
             .ok_or_else(|| "no hlc tracker".to_string())?;
+        let adopt_floor = guard.hlc_adopt_floor.clone();
         (
             tx,
             registry,
@@ -26738,6 +26833,7 @@ async fn join_voice_channel(
             device_hex,
             self_device,
             hlc_tracker,
+            adopt_floor,
         )
     };
 
@@ -26754,8 +26850,13 @@ async fn join_voice_channel(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let joined_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms).await;
+    let joined_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_hex,
+        wall_now_ms,
+    )
+    .await;
 
     tx.send(voice::VoiceChannelRequest::Join {
         community_id: community,
@@ -26897,7 +26998,7 @@ async fn moderate_voice(
     let action = voice::ModerateVoicePayload::parse_action(&payload.action)?;
 
     // Snapshot handles without holding the !Send guard across awaits.
-    let (tx, device_hex, hlc_tracker) = {
+    let (tx, device_hex, hlc_tracker, adopt_floor) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let tx = guard
             .voice_channel_tx
@@ -26911,15 +27012,21 @@ async fn moderate_voice(
             .hlc_tracker
             .clone()
             .ok_or_else(|| "no hlc tracker".to_string())?;
-        (tx, device_hex, hlc_tracker)
+        let adopt_floor = guard.hlc_adopt_floor.clone();
+        (tx, device_hex, hlc_tracker, adopt_floor)
     };
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let issued_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms).await;
+    let issued_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_hex,
+        wall_now_ms,
+    )
+    .await;
 
     tx.send(voice::VoiceChannelRequest::Moderate {
         community_id: community,
@@ -27615,7 +27722,7 @@ async fn join_group_call(
     let space_arr = parse_space_id_16(&space_id)?;
 
     // Snapshot device + hlc exactly like join_dm_call.
-    let (voice_channel_tx, device_hex, self_device, hlc_tracker) = {
+    let (voice_channel_tx, device_hex, self_device, hlc_tracker, adopt_floor) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let tx = guard
             .voice_channel_tx
@@ -27635,7 +27742,8 @@ async fn join_group_call(
             .hlc_tracker
             .clone()
             .ok_or_else(|| "no hlc tracker".to_string())?;
-        (tx, device_hex, self_device, hlc_tracker)
+        let adopt_floor = guard.hlc_adopt_floor.clone();
+        (tx, device_hex, self_device, hlc_tracker, adopt_floor)
     };
 
     let k_voice = crate::community_channel_log::derive_dm_voice_key(&dm_key, &call);
@@ -27646,8 +27754,13 @@ async fn join_group_call(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let joined_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms).await;
+    let joined_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_hex,
+        wall_now_ms,
+    )
+    .await;
 
     // Media: identical to a DM call (same topic/key/AAD), addressed by call_id.
     voice_channel_tx
@@ -27785,7 +27898,7 @@ async fn join_dm_call(
     let _ = peer; // not needed for media join
 
     // Snapshot voice_channel_tx + device fields.
-    let (voice_channel_tx, device_hex, self_device, hlc_tracker) = {
+    let (voice_channel_tx, device_hex, self_device, hlc_tracker, adopt_floor) = {
         let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
         let tx = guard
             .voice_channel_tx
@@ -27805,7 +27918,8 @@ async fn join_dm_call(
             .hlc_tracker
             .clone()
             .ok_or_else(|| "no hlc tracker".to_string())?;
-        (tx, device_hex, self_device, hlc_tracker)
+        let adopt_floor = guard.hlc_adopt_floor.clone();
+        (tx, device_hex, self_device, hlc_tracker, adopt_floor)
     };
 
     // Derive the per-call voice key.
@@ -27816,8 +27930,13 @@ async fn join_dm_call(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let joined_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_hex, wall_now_ms).await;
+    let joined_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_hex,
+        wall_now_ms,
+    )
+    .await;
 
     voice_channel_tx
         .send(voice::VoiceChannelRequest::JoinDmCall {
@@ -30663,6 +30782,7 @@ pub(crate) async fn create_channel_impl(
 
     let (
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_registry,
@@ -30675,6 +30795,7 @@ pub(crate) async fn create_channel_impl(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -30708,8 +30829,13 @@ pub(crate) async fn create_channel_impl(
     let normalized_name = display_name.to_lowercase();
 
     // ZEB-267: atomic HLC reservation.
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let event = {
         let outbox_g = dm_outbox.lock().await;
         // ZEB-339: ChannelCreate is a steady-state community-membership event —
@@ -31002,12 +31128,21 @@ async fn modify_channel(
         .map_err(|_| "channel_id must be 16 bytes (32 hex chars)".to_string())?;
     let channel_id = crate::community_membership::ChannelId(channel_id_bytes);
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -31022,8 +31157,13 @@ async fn modify_channel(
         .as_millis() as u64;
 
     // ZEB-267: atomic HLC reservation.
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let event = {
         let outbox_g = dm_outbox.lock().await;
         // ZEB-339: ChannelModify steady-state event — enrolled device key (#2),
@@ -31155,6 +31295,7 @@ async fn delete_channel(
 
     let (
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_registry,
@@ -31167,6 +31308,7 @@ async fn delete_channel(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -31248,8 +31390,13 @@ async fn delete_channel(
     // user memory rule — burning an HLC on a stale read-side rejection
     // is fine, but burning an HLC inside an actually-no-op event is
     // worse UX (caller pays for an HLC tick they can't see).
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let event = {
         let outbox_g = dm_outbox.lock().await;
         // ZEB-339: ChannelDelete steady-state event — enrolled device key (#2),
@@ -33565,11 +33712,14 @@ pub(crate) async fn generate_invite_impl(
                 o.device_id.clone(),
             )
         };
-        let hlc_tracker = {
+        let (hlc_tracker, adopt_floor) = {
             let g = state
                 .lock()
                 .map_err(|e| format!("NodeState poisoned: {e}"))?;
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+            (
+                g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+                g.hlc_adopt_floor.clone(),
+            )
         };
 
         // Security gate, extracted to `invite_only_generation_guard` so it's
@@ -33687,9 +33837,13 @@ pub(crate) async fn generate_invite_impl(
         // passes none; it is bound into the token signature so the redeemer
         // enforces it. `token_invitee_hint` is Some(invitee) for targeted
         // invites, None for untargeted.
-        let minted_at =
-            crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
-                .await;
+        let minted_at = crate::dm_outbox::reserve_next_hlc_for_device(
+            &hlc_tracker,
+            &adopt_floor,
+            &device_id,
+            wall_now_ms,
+        )
+        .await;
         let effective_expiry = Some(resolve_invite_expiry_ms(ttl_ms, wall_now_ms));
         let token = crate::invite_mint::mint_invite_token(
             self_owner,
@@ -34128,6 +34282,7 @@ pub async fn create_community_inner(
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
@@ -34178,8 +34333,13 @@ pub async fn create_community_inner(
     // tracker monotonicity since the reservation is atomic. We
     // still hold state_g across the apply for owner-state rollback
     // semantics, but tracker_g is gone from that block.
-    let creation_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let creation_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let minted = mint_community_creation(
         &name,
         is_invite_only,
@@ -34304,8 +34464,13 @@ pub async fn create_community_inner(
     // event_sort_key only requires strict ordering, not adjacency.
     // Burn semantics: same as the first reservation — if a downstream
     // step fails, the burned HLC is fine.
-    let default_channel_at =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let default_channel_at = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let default_channel_payload = crate::community_membership::EventPayload {
         id: default_channel_event_id,
         community_id: minted.community_id,
@@ -34492,6 +34657,7 @@ pub(crate) async fn create_community_impl(
     let (
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_registry,
@@ -34508,6 +34674,7 @@ pub(crate) async fn create_community_impl(
         (
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -34543,6 +34710,7 @@ pub(crate) async fn create_community_impl(
         is_invite_only,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_signing_key,
@@ -34833,6 +35001,7 @@ mod create_community_inner_tests {
 
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "test-dev".into(),
                 content_store: cs,
                 identity_resolver: std::sync::Arc::new(SingleOwnerResolver {
@@ -34872,6 +35041,7 @@ mod create_community_inner_tests {
             self_owner,
             self_device_id: "test-dev".into(),
             signing_key: std::sync::Arc::clone(&signing_key),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             engine_config: ChannelLogEngineConfig::default(),
             transport_epoch_rx: None,
             // ZEB-599 Direction 1: no presence watch in this test harness.
@@ -35025,6 +35195,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -35096,6 +35267,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -35218,6 +35390,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -35329,6 +35502,7 @@ mod create_community_inner_tests {
             .as_millis() as u64;
         let del_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
             &fixture.hlc_tracker,
+            &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             &fixture.device_id,
             wall_now_ms,
         )
@@ -35394,6 +35568,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -35691,6 +35866,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -35829,6 +36005,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -35966,6 +36143,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -36208,6 +36386,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -36337,6 +36516,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -36501,6 +36681,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -36621,6 +36802,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -36764,6 +36946,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -36880,6 +37063,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -37251,6 +37435,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -37295,6 +37480,7 @@ mod create_community_inner_tests {
             false,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -37550,6 +37736,7 @@ mod zeb_315_membership_at_event_hlc_tests {
             Duration::from_millis(1000),
         ));
         let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "test-dev".into(),
             content_store: cs,
             identity_resolver: Arc::new(NopResolver),
@@ -37777,6 +37964,7 @@ mod list_bootstrap_hint_tests {
         ));
 
         let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "test-dev".into(),
             content_store: cs,
             identity_resolver: Arc::new(NopResolver),
@@ -38741,6 +38929,7 @@ pub async fn redeem_invite_inner<F>(
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
@@ -38765,6 +38954,7 @@ where
         url,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         signing_key,
@@ -38794,6 +38984,7 @@ pub async fn redeem_invite_inner_with_overrides<F>(
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
@@ -38864,7 +39055,13 @@ where
             .map(|m| m.bootstrap_join.at.clone())
             .expect("pre_minted.is_some checked above")
     } else {
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await
+        crate::dm_outbox::reserve_next_hlc_for_device(
+            &hlc_tracker,
+            &adopt_floor,
+            &device_id,
+            wall_now_ms,
+        )
+        .await
     };
 
     // 5. Mint (pure helper — no side effects on owner-state yet).
@@ -39938,6 +40135,7 @@ pub(crate) async fn redeem_invite_impl(
     let (
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_registry,
@@ -39954,6 +40152,7 @@ pub(crate) async fn redeem_invite_impl(
         (
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -40019,6 +40218,7 @@ pub(crate) async fn redeem_invite_impl(
         url,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_signing_key,
@@ -40144,6 +40344,7 @@ async fn join_open_community_inner<F>(
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
@@ -40172,6 +40373,7 @@ where
         invite_url,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         signing_key,
@@ -40219,6 +40421,7 @@ pub(crate) async fn join_open_community_impl(
         library_directory,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_registry,
@@ -40236,6 +40439,7 @@ pub(crate) async fn join_open_community_impl(
             g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -40292,6 +40496,7 @@ pub(crate) async fn join_open_community_impl(
         &snapshot,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_signing_key,
@@ -40518,6 +40723,7 @@ mod redeem_invite_inner_tests {
         ));
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "joiner-dev".into(),
                 content_store: cs,
                 identity_resolver: std::sync::Arc::new(TwoOwnerResolver {
@@ -40574,6 +40780,7 @@ mod redeem_invite_inner_tests {
             self_owner,
             self_device_id: "joiner-dev".into(),
             signing_key: std::sync::Arc::clone(&signing_key),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             engine_config: ChannelLogEngineConfig::default(),
             transport_epoch_rx: None,
             // ZEB-599 Direction 1: no presence watch in this test harness.
@@ -40659,6 +40866,7 @@ mod redeem_invite_inner_tests {
             invite_url,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -40828,6 +41036,7 @@ mod redeem_invite_inner_tests {
             invite_url,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -40961,6 +41170,7 @@ mod redeem_invite_inner_tests {
             invite_url,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -41076,6 +41286,7 @@ mod redeem_invite_inner_tests {
             invite_url,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -41604,6 +41815,7 @@ mod zeb436_orphan_adoption_tests {
             url,
             std::sync::Arc::clone(crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -41946,6 +42158,7 @@ mod zeb436_orphan_adoption_tests {
         ));
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "joiner-dev".into(),
                 content_store: cs,
                 identity_resolver: std::sync::Arc::new(TwoOwnerResolver {
@@ -41993,6 +42206,7 @@ mod zeb436_orphan_adoption_tests {
             self_owner: joiner_self_owner,
             self_device_id: "joiner-dev".into(),
             signing_key: std::sync::Arc::clone(&signing_key),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             engine_config: ChannelLogEngineConfig::default(),
             transport_epoch_rx: None,
             // ZEB-599 Direction 1: no presence watch in this test harness.
@@ -42165,6 +42379,7 @@ mod zeb436_orphan_adoption_tests {
             rig.invite_url.clone(),
             std::sync::Arc::clone(&rig.crdt_state),
             std::sync::Arc::clone(&rig.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "joiner-dev".to_string(),
             rig.joiner_self_owner,
             std::sync::Arc::clone(&rig.signing_key),
@@ -42243,6 +42458,7 @@ mod zeb436_orphan_adoption_tests {
             None, // iroh_endpoint
             std::sync::Arc::clone(&rig.crdt_state),
             std::sync::Arc::clone(&rig.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "joiner-dev".to_string(),
             rig.joiner_self_owner,
             std::sync::Arc::clone(&rig.signing_key),
@@ -42311,6 +42527,7 @@ mod zeb436_orphan_adoption_tests {
             rig.invite_url.clone(),
             std::sync::Arc::clone(&rig.crdt_state),
             std::sync::Arc::clone(&rig.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "joiner-dev".to_string(),
             rig.joiner_self_owner,
             std::sync::Arc::clone(&rig.signing_key),
@@ -42451,6 +42668,7 @@ mod join_open_community_tests {
             &snapshot,
             std::sync::Arc::clone(&fixture.crdt_state),
             std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             fixture.device_id.clone(),
             fixture.self_owner,
             std::sync::Arc::clone(&fixture.signing_key),
@@ -42767,7 +42985,15 @@ async fn add_library(
     // R3 F3: snapshot `generation` paired-atomically with the Arcs so
     // the post-await fence below can detect a stop_node / start_node
     // racing through this command (mirrors add_space, send_dm).
-    let (crdt_state, library_directory, hlc_tracker, device_id, sync_engine, snapshot_generation) = {
+    let (
+        crdt_state,
+        library_directory,
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        sync_engine,
+        snapshot_generation,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -42775,6 +43001,7 @@ async fn add_library(
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-709 (audit A3): the owner-state engine — the libraries
             // write below must arm its flush. Option, not ok_or.
@@ -42786,8 +43013,13 @@ async fn add_library(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let now_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let now_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     {
         let mut crdt_g = crdt_state.lock().await;
         // R3 F3: post-await restart fence. If a stop_node/start_node
@@ -42843,7 +43075,15 @@ async fn remove_library(
     // R3 F3: snapshot `generation` paired-atomically with the Arcs so
     // the post-await fence below can detect a stop_node / start_node
     // racing through this command (mirrors add_library, add_space).
-    let (crdt_state, library_directory, hlc_tracker, device_id, sync_engine, snapshot_generation) = {
+    let (
+        crdt_state,
+        library_directory,
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        sync_engine,
+        snapshot_generation,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -42851,6 +43091,7 @@ async fn remove_library(
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             // ZEB-709 (audit A4): the owner-state engine — the tombstone
             // write below must arm its flush. Option, not ok_or.
@@ -42862,8 +43103,13 @@ async fn remove_library(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let now_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let now_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let mut tombstoned = false;
     {
         let mut crdt_g = crdt_state.lock().await;
@@ -42973,7 +43219,7 @@ async fn set_space_shared_in_profile(
     // reads from. The post-check after the mutation surfaces that as Err
     // rather than returning Ok(()) for an effectively dropped write. Same
     // idiom as `send_dm` (~lib.rs:2935).
-    let (crdt_state, publisher, hlc_tracker, device_id, snapshot_generation) = {
+    let (crdt_state, publisher, hlc_tracker, adopt_floor, device_id, snapshot_generation) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -42983,6 +43229,7 @@ async fn set_space_shared_in_profile(
                 .clone()
                 .ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.generation,
         )
@@ -43016,8 +43263,13 @@ async fn set_space_shared_in_profile(
     }
 
     // Reserve next HLC. Same idiom as add_space / leave_community.
-    let new_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let new_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Re-acquire the CRDT lock and apply the mutation. Re-find the
     // Space in case state moved between the no-op probe and now (e.g.,
@@ -44222,6 +44474,7 @@ pub(crate) async fn leave_community_impl(
 
     let (
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_registry,
@@ -44235,6 +44488,7 @@ pub(crate) async fn leave_community_impl(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -44257,8 +44511,13 @@ pub(crate) async fn leave_community_impl(
     // ZEB-267: atomic HLC reservation. Borrow the SigningKey from
     // `dm_outbox` under its lock — same canonical local-device key
     // create_community / redeem_invite use.
-    let leave_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let leave_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let leave = {
         let outbox_g = dm_outbox.lock().await;
         // ZEB-339: Leave is a steady-state community-membership event — enrolled
@@ -44377,6 +44636,7 @@ pub(crate) async fn leave_community_impl(
             // 4. Reserve HLC for rotation.
             let rotation_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
                 &hlc_tracker,
+                &adopt_floor,
                 &device_id,
                 wall_now_ms,
             )
@@ -44882,6 +45142,7 @@ mod zeb427_leave_left_at_tests {
             sub_rx,
             paths,
             600_000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         {
@@ -44959,6 +45220,7 @@ mod zeb268_leave_detach_fence_tests {
         ));
         let self_owner = OwnerAddr([0xAA; 16]);
         let registry = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             device_id: "leaver-dev".into(),
             content_store,
             identity_resolver: Arc::new(NopResolver),
@@ -46592,12 +46854,21 @@ pub(crate) async fn kick_from_community_impl(
         .map_err(|_| "target_addr must be 16 bytes (32 hex chars)".to_string())?;
     let target = crate::owner_state_types::OwnerAddr(target_bytes);
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -46615,8 +46886,13 @@ pub(crate) async fn kick_from_community_impl(
     // tracker lock) BEFORE minting. Replaces the prior
     // snapshot-then-release pattern that had a race window between
     // the prev_hlc read and the post-Inserted advance.
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Generation + registry fence (mirrors leave_community + the
     // create_community / redeem_invite shape). Plain generation check
@@ -46769,9 +47045,13 @@ pub(crate) async fn kick_from_community_impl(
         let recipients = build_sealed_epoch_recipients(&k_next, member_pubs)?;
 
         // 4. Reserve a second HLC for the rotation (must be strictly newer than kick_hlc).
-        let rotation_hlc =
-            crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
-                .await;
+        let rotation_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+            &hlc_tracker,
+            &adopt_floor,
+            &device_id,
+            wall_now_ms,
+        )
+        .await;
 
         // 5. Mint the EpochRotation event referencing the Kick's EventId.
         let rotation = {
@@ -46970,12 +47250,21 @@ async fn set_power_level(
         .map_err(|_| "target_addr must be 16 bytes (32 hex chars)".to_string())?;
     let target = crate::owner_state_types::OwnerAddr(target_bytes);
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -46990,8 +47279,13 @@ async fn set_power_level(
         .as_millis() as u64;
 
     // ZEB-267: atomic HLC reservation.
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Generation + registry fence (see kick_from_community for
     // motivation; stop_node nullifies registry without bumping
@@ -47153,12 +47447,21 @@ pub(crate) async fn unban_from_community_impl(
         .map_err(|_| "target_addr must be 16 bytes (32 hex chars)".to_string())?;
     let target = crate::owner_state_types::OwnerAddr(target_bytes);
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -47173,8 +47476,13 @@ pub(crate) async fn unban_from_community_impl(
         .as_millis() as u64;
 
     // ZEB-267: atomic HLC reservation.
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let event = {
         let outbox_g = dm_outbox.lock().await;
         // ZEB-339: Unban steady-state event — enrolled device key (#2), no cert.
@@ -48282,12 +48590,21 @@ pub(crate) async fn countersign_admin_proposal_impl(
                 .to_string()
         })?;
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -48302,8 +48619,13 @@ pub(crate) async fn countersign_admin_proposal_impl(
         .as_millis() as u64;
 
     // ZEB-267: atomic HLC reservation.
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Generation + registry fence.
     {
@@ -48500,12 +48822,21 @@ async fn propose_change_quorum(
         .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -48520,8 +48851,13 @@ async fn propose_change_quorum(
         .as_millis() as u64;
 
     // ZEB-267: atomic HLC reservation.
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Generation + registry fence.
     {
@@ -48683,12 +49019,21 @@ async fn propose_change_thresholds(
         .map_err(|e| format!("invalid community_id hex: {e}"))?;
     let space_id = crate::owner_state_types::SpaceId(id_bytes);
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -48703,8 +49048,13 @@ async fn propose_change_thresholds(
         .as_millis() as u64;
 
     // ZEB-267: atomic HLC reservation.
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Generation + registry fence.
     {
@@ -49085,12 +49435,21 @@ pub(crate) async fn set_recovery_designates_impl(
         ));
     }
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -49105,8 +49464,13 @@ pub(crate) async fn set_recovery_designates_impl(
         .as_millis() as u64;
 
     // ZEB-267: atomic HLC reservation.
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Generation + registry fence.
     {
@@ -49277,12 +49641,21 @@ pub(crate) async fn initiate_admin_recovery_impl(
         );
     }
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -49297,8 +49670,13 @@ pub(crate) async fn initiate_admin_recovery_impl(
         .as_millis() as u64;
 
     // ZEB-267: atomic HLC reservation.
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Generation + registry fence.
     {
@@ -49476,12 +49854,21 @@ pub(crate) async fn cosign_admin_recovery_impl(
             "cosign_admin_recovery: proposal_event_id must be 16 bytes (32 hex chars)".to_string()
         })?;
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -49496,8 +49883,13 @@ pub(crate) async fn cosign_admin_recovery_impl(
         .as_millis() as u64;
 
     // ZEB-267: atomic HLC reservation.
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Generation + registry fence.
     {
@@ -49635,12 +50027,21 @@ pub(crate) async fn veto_admin_recovery_impl(
             "veto_admin_recovery: proposal_event_id must be 16 bytes (32 hex chars)".to_string()
         })?;
 
-    let (hlc_tracker, device_id, self_owner, community_registry, dm_outbox, snapshot_generation) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        community_registry,
+        dm_outbox,
+        snapshot_generation,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -49655,8 +50056,13 @@ pub(crate) async fn veto_admin_recovery_impl(
         .as_millis() as u64;
 
     // ZEB-267: atomic HLC reservation.
-    let event_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let event_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Generation + registry fence.
     {
@@ -50366,6 +50772,7 @@ pub async fn self_heal_community_observer(
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
@@ -50531,9 +50938,13 @@ pub async fn self_heal_community_observer(
             }
         };
 
-        let hlc =
-            crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
-                .await;
+        let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+            &hlc_tracker,
+            &adopt_floor,
+            &device_id,
+            wall_now_ms,
+        )
+        .await;
 
         let rotation = match mint_epoch_rotation_event(
             community_id,
@@ -50678,9 +51089,13 @@ pub async fn self_heal_community_observer(
 
         let recipients = vec![(target, sealed_for_target)];
 
-        let hlc =
-            crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
-                .await;
+        let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+            &hlc_tracker,
+            &adopt_floor,
+            &device_id,
+            wall_now_ms,
+        )
+        .await;
 
         let catchup = match mint_epoch_catchup_event(
             community_id,
@@ -51442,6 +51857,7 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
 
     let (
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_registry,
@@ -51455,6 +51871,7 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -51482,8 +51899,13 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     let event = {
         let outbox_g = dm_outbox.lock().await;
@@ -51599,12 +52021,13 @@ async fn voting_cast_tier1_ballot<R: tauri::Runtime>(
         .map_err(|_| "poll_id must be 32 bytes (64 hex chars)".to_string())?;
     let pid = crate::community_voting_core::PollId(pid_bytes);
 
-    let (hlc_tracker, device_id, self_owner, dm_outbox, voting_logs) = {
+    let (hlc_tracker, adopt_floor, device_id, self_owner, dm_outbox, voting_logs) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -51672,8 +52095,13 @@ async fn voting_cast_tier1_ballot<R: tauri::Runtime>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     let approved_count: u8 = approved_indices.len().min(u8::MAX as usize) as u8;
     let event = {
@@ -52078,6 +52506,7 @@ async fn voting_create_tier3_proposal<R: tauri::Runtime>(
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
         &handles.hlc_tracker,
+        &handles.adopt_floor,
         &handles.device_id,
         wall_now_ms,
     )
@@ -52246,6 +52675,7 @@ async fn voting_submit_deliberation_statement<R: tauri::Runtime>(
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
         &handles.hlc_tracker,
+        &handles.adopt_floor,
         &handles.device_id,
         wall_now_ms,
     )
@@ -52338,6 +52768,7 @@ async fn voting_cast_deliberation_vote<R: tauri::Runtime>(
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
         &handles.hlc_tracker,
+        &handles.adopt_floor,
         &handles.device_id,
         wall_now_ms,
     )
@@ -52409,6 +52840,7 @@ async fn voting_propose_draft_candidate<R: tauri::Runtime>(
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
         &handles.hlc_tracker,
+        &handles.adopt_floor,
         &handles.device_id,
         wall_now_ms,
     )
@@ -52514,6 +52946,7 @@ async fn voting_approve_draft_candidate<R: tauri::Runtime>(
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
         &handles.hlc_tracker,
+        &handles.adopt_floor,
         &handles.device_id,
         wall_now_ms,
     )
@@ -52580,6 +53013,7 @@ async fn voting_decline_sortition<R: tauri::Runtime>(
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
         &handles.hlc_tracker,
+        &handles.adopt_floor,
         &handles.device_id,
         wall_now_ms,
     )
@@ -52646,6 +53080,7 @@ async fn voting_cast_ratification_ballot<R: tauri::Runtime>(
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
         &handles.hlc_tracker,
+        &handles.adopt_floor,
         &handles.device_id,
         wall_now_ms,
     )
@@ -52973,6 +53408,10 @@ pub struct DeliberationStatementExport {
     pub author: String,               // 32-char hex (OwnerAddr is 16 bytes)
     pub text: String,
     pub created_at_hlc_ms: i128,
+    // ZEB-790: full HLC tuple so the UI can order deterministically
+    // (wallMs alone ties on same-ms stamps — the ZEB-244 lesson).
+    pub created_at_hlc_logical: u32,
+    pub created_at_hlc_device_id: String,
     pub agree_count: u16,
     pub disagree_count: u16,
     pub pass_count: u16,
@@ -53000,6 +53439,10 @@ pub struct Tier3PollExport {
     /// HLC of PollCreate in ms since UNIX_EPOCH (whatever the HLC's
     /// wall-clock projection resolves to).
     pub poll_create_hlc_ms: i128,
+    // ZEB-790: full HLC tuple so the UI can order deterministically
+    // (wallMs alone ties on same-ms stamps — the ZEB-244 lesson).
+    pub poll_create_hlc_logical: u32,
+    pub poll_create_hlc_device_id: String,
     pub sortition_size: u16,
     pub deliberation_window_seconds: u32,
     pub drafting_window_seconds: u32,
@@ -53064,6 +53507,10 @@ pub struct Tier3PollSummary {
     pub proposer: String,
     pub stage: Tier3StageTag,
     pub poll_create_hlc_ms: i128,
+    // ZEB-790: full HLC tuple so the UI can order deterministically
+    // (wallMs alone ties on same-ms stamps — the ZEB-244 lesson).
+    pub poll_create_hlc_logical: u32,
+    pub poll_create_hlc_device_id: String,
     pub sortition_size: u16,
     /// Set once stage = Finalized; lets the panel show "Charter §3
     /// amended" without an extra fetch.
@@ -54033,6 +54480,7 @@ async fn ensure_voting_engine_for(
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     local_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     local_owner: crate::owner_state_types::OwnerAddr,
@@ -54127,6 +54575,7 @@ async fn ensure_voting_engine_for(
             publisher_tx,
             subscriber_rx,
             hlc_tracker: Some(hlc_tracker),
+            adopt_floor,
             device_id: Some(device_id),
             // ZEB-298+ZEB-312 PR 2 Task 2: typed Wry AppHandle for Tier 3
             // lifecycle emit. IPCs read this from NodeState.app_handle_wry
@@ -54261,6 +54710,8 @@ struct VotingEngineNodeHandles {
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module docs).
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     community_registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
@@ -54298,6 +54749,7 @@ impl VotingEngineNodeHandles {
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         Ok(Self {
             hlc_tracker: g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            adopt_floor: g.hlc_adopt_floor.clone(),
             device_id: g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             self_owner: g.dm_self_owner.ok_or("dm_self_owner missing")?,
             community_registry: g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -54352,6 +54804,7 @@ impl VotingEngineNodeHandles {
             space_id,
             self.voting_log_adapter_request_tx.clone(),
             self.hlc_tracker.clone(),
+            self.adopt_floor.clone(),
             self.device_id.clone(),
             local_signing_key,
             self.self_owner,
@@ -54720,6 +55173,7 @@ pub(crate) async fn voting_create_tier2_proposal_impl(
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
         &handles.hlc_tracker,
+        &handles.adopt_floor,
         &handles.device_id,
         wall_now_ms,
     )
@@ -54910,6 +55364,7 @@ pub(crate) async fn voting_signal_tier2_impl(
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
         &handles.hlc_tracker,
+        &handles.adopt_floor,
         &handles.device_id,
         wall_now_ms,
     )
@@ -54990,6 +55445,7 @@ async fn voting_delegate_tier2<R: tauri::Runtime>(
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
         &handles.hlc_tracker,
+        &handles.adopt_floor,
         &handles.device_id,
         wall_now_ms,
     )
@@ -55047,6 +55503,7 @@ async fn voting_undelegate_tier2<R: tauri::Runtime>(
         .as_millis() as u64;
     let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
         &handles.hlc_tracker,
+        &handles.adopt_floor,
         &handles.device_id,
         wall_now_ms,
     )
@@ -55594,6 +56051,8 @@ fn build_tier3_export(
                 author: hex::encode(s.author.0),
                 text: s.text.clone(),
                 created_at_hlc_ms: s.created_at_hlc.wall_ms as i128,
+                created_at_hlc_logical: s.created_at_hlc.logical,
+                created_at_hlc_device_id: s.created_at_hlc.device_id.clone(),
                 agree_count: a,
                 disagree_count: d,
                 pass_count: p,
@@ -55645,6 +56104,8 @@ fn build_tier3_export(
         proposer: hex::encode(t3.meta.proposer.0),
         stage: effective_stage.into(),
         poll_create_hlc_ms: t3.meta.poll_create_hlc.wall_ms as i128,
+        poll_create_hlc_logical: t3.meta.poll_create_hlc.logical,
+        poll_create_hlc_device_id: t3.meta.poll_create_hlc.device_id.clone(),
         sortition_size: t3.meta.config.sortition_size,
         deliberation_window_seconds: t3.meta.config.deliberation_window_seconds,
         drafting_window_seconds: t3.meta.config.drafting_window_seconds,
@@ -55767,13 +56228,26 @@ async fn voting_list_tier3_polls_raw(
                 proposer: hex::encode(t3.meta.proposer.0),
                 stage: effective_stage.into(),
                 poll_create_hlc_ms: t3.meta.poll_create_hlc.wall_ms as i128,
+                poll_create_hlc_logical: t3.meta.poll_create_hlc.logical,
+                poll_create_hlc_device_id: t3.meta.poll_create_hlc.device_id.clone(),
                 sortition_size: t3.meta.config.sortition_size,
                 winner_text,
                 privacy_mode: t3.meta.config.privacy_mode.clone(),
             })
         })
         .collect();
-    summaries.sort_by_key(|s| std::cmp::Reverse(s.poll_create_hlc_ms));
+    summaries.sort_by(|a, b| {
+        (
+            b.poll_create_hlc_ms,
+            b.poll_create_hlc_logical,
+            &b.poll_create_hlc_device_id,
+        )
+            .cmp(&(
+                a.poll_create_hlc_ms,
+                a.poll_create_hlc_logical,
+                &a.poll_create_hlc_device_id,
+            ))
+    });
     Ok(summaries)
 }
 
@@ -56145,12 +56619,21 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
     //    `dfrost_log_registry` is `None` in tests that bypass `start_node`;
     //    the broadcast call-site at the end of this function is a no-op in
     //    that case so the IPC integration tests still pass.
-    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs, dfrost_log_registry) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        dm_outbox,
+        dfrost_logs,
+        dfrost_log_registry,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("dfrost_initiate_dkg: NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -56175,8 +56658,13 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // 6. Derive ceremony_id = blake3(sorted_members || threshold_le ||
     //    hlc.wall_ms_le || hlc.logical_le || space_id). All inputs are
@@ -56469,12 +56957,21 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
     // T8: also pull `dfrost_log_registry` here (Option, None in test
     // contexts that bypass `start_node`). Broadcast call-sites below skip
     // if it's None so the IPC integration tests remain pass-through.
-    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs, dfrost_log_registry) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        dm_outbox,
+        dfrost_logs,
+        dfrost_log_registry,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -56517,9 +57014,13 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let hlc =
-            crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms)
-                .await;
+        let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+            &hlc_tracker,
+            &adopt_floor,
+            &device_id,
+            wall_now_ms,
+        )
+        .await;
 
         // R7 (Cursor MEDIUM "Round one DKG race"): hold the log lock
         // CONTINUOUSLY across gate → dkg_part1_local → build_signed →
@@ -56688,8 +57189,13 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // 5. Build the round-specific event (sealed dr rn=2 OR dk). Each
     //    branch returns `(event, self_x25519_priv, r2_secret_to_stash)`
@@ -57240,12 +57746,21 @@ pub(crate) async fn dfrost_request_vrf_beacon_inner(
     //    it as a parameter — for `ts` the impl falls through to `apply()`
     //    without ever touching the decrypt path.
     // T8: also pull `dfrost_log_registry` (Option, None in test contexts).
-    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs, dfrost_log_registry) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        dm_outbox,
+        dfrost_logs,
+        dfrost_log_registry,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("dfrost_request_vrf_beacon: NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -57363,8 +57878,13 @@ pub(crate) async fn dfrost_request_vrf_beacon_inner(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // R4-2 (Greptile P2): consolidate the outbox lock — previously this
     // acquired the lock twice (once to sign the event, once to derive
@@ -57504,12 +58024,21 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
 
     // 2. Snapshot NodeState handles. T8: also pull `dfrost_log_registry`
     //    (Option, None in test contexts that bypass `start_node`).
-    let (hlc_tracker, device_id, self_owner, dm_outbox, dfrost_logs, dfrost_log_registry) = {
+    let (
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        self_owner,
+        dm_outbox,
+        dfrost_logs,
+        dfrost_log_registry,
+    ) = {
         let g = state_lock
             .lock()
             .map_err(|e| format!("dfrost_contribute_threshold_sign: NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -57738,8 +58267,13 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // R4-2 (Greptile P2): consolidate the outbox lock — previously this
     // acquired the lock twice (once to sign the event, once to derive
@@ -57940,9 +58474,13 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc_vb =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms_vb)
-            .await;
+    let hlc_vb = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms_vb,
+    )
+    .await;
 
     let vb_event = {
         let outbox_g = dm_outbox.lock().await;
@@ -58155,6 +58693,7 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
     // T8: also pull `dfrost_log_registry` (Option, None in test contexts).
     let (
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         dm_outbox,
@@ -58167,6 +58706,7 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
             .map_err(|e| format!("dfrost_propose_refresh: NodeState poisoned: {e}"))?;
         (
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
@@ -58252,8 +58792,13 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // 8. Derive ceremony_id = blake3(sorted_members || proposed_epoch_le ||
     //    threshold_le || b"refresh-v1" || space_id). DETERMINISTIC by
@@ -58755,6 +59300,7 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         reachability_resolver,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_registry,
@@ -58773,6 +59319,7 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
             g.reachability_resolver.clone(),
             g.crdt_state.clone(),
             g.hlc_tracker.clone(),
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone(),
             g.dm_self_owner,
             g.community_registry.clone(),
@@ -58906,6 +59453,7 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         iroh_endpoint,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_signing_key,
@@ -59005,6 +59553,7 @@ pub(crate) async fn connectivity_open_join_iroh_impl(
         pkarr_resolver,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_registry,
@@ -59023,6 +59572,7 @@ pub(crate) async fn connectivity_open_join_iroh_impl(
             g.pkarr_resolver.clone(),
             g.crdt_state.clone(),
             g.hlc_tracker.clone(),
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone(),
             g.dm_self_owner,
             g.community_registry.clone(),
@@ -59118,6 +59668,7 @@ pub(crate) async fn connectivity_open_join_iroh_impl(
         invite_url,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         community_signing_key,
@@ -59325,6 +59876,7 @@ mod zeb427_fence_tests {
             // publishes; the wedge below is established deterministically, not
             // via the debounce-wakeup arm.
             600_000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
 
         // First flush fills the capacity-1 publisher channel (rx alive, never
@@ -59518,6 +60070,7 @@ pub async fn connectivity_redeem_invite_iroh_inner<F>(
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
@@ -59620,6 +60173,7 @@ where
             invite_url,
             crdt_state,
             hlc_tracker,
+            adopt_floor,
             device_id,
             self_owner,
             signing_key,
@@ -59966,8 +60520,13 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let join_hlc =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let join_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
     let minted = match mint_redemption(
         &payload,
         self_owner,
@@ -60292,6 +60851,7 @@ where
         invite_url,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         signing_key,
@@ -60616,6 +61176,7 @@ pub async fn connectivity_link_friend_iroh_inner(
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
     // ZEB-680 §1: the live by-owner revoked-device projection, consulted by the
@@ -60989,8 +61550,13 @@ pub async fn connectivity_link_friend_iroh_inner(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let learned_at =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let learned_at = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // ZEB-371 Task 7: derive the shared friendship secret via ECDH (this side's
     // ephemeral secret + the inviter's ephemeral public from the accept), then
@@ -61119,6 +61685,7 @@ mod friend_redeem_expiry_tests {
             Some("me".into()),
             crdt_state.clone(),
             hlc_tracker,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             "redeem-dev".to_string(),
             Arc::new(crate::owner_state_crypto::KeyTree::derive(&[9u8; 32]).expect("kt")),
             crate::revoked_device_projection::RevokedDeviceProjection::new(),
@@ -62211,6 +62778,7 @@ pub async fn unfriend_inner(
     hlc_tracker: &std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: &crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: &str,
     peer_addr: crate::owner_state_types::OwnerAddr,
 ) -> Result<bool, String> {
@@ -62237,8 +62805,13 @@ pub async fn unfriend_inner(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let learned_at =
-        crate::dm_outbox::reserve_next_hlc_for_device(hlc_tracker, device_id, wall_now_ms).await;
+    let learned_at = crate::dm_outbox::reserve_next_hlc_for_device(
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        wall_now_ms,
+    )
+    .await;
     let tombstone = crate::friend_graph::FriendEntry {
         master_ed25519: existing.master_ed25519,
         display: existing.display.clone(),
@@ -62321,13 +62894,14 @@ pub(crate) async fn generate_friend_token_impl(
     ttl_ms: Option<u64>,
 ) -> Result<String, String> {
     // Snapshot handles under the std lock, then drop it before any `.await`.
-    let (dm_outbox, hlc_tracker, pkarr_invite_publisher) = {
+    let (dm_outbox, hlc_tracker, adopt_floor, pkarr_invite_publisher) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.pkarr_invite_publisher.clone(),
         )
     };
@@ -62356,8 +62930,13 @@ pub(crate) async fn generate_friend_token_impl(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let minted_at =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let minted_at = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // ZEB-507: derive the absolute expiry from the TTL using the same `now`
     // that stamps `minted_at`, so both timestamps are server-authoritative and
@@ -62428,6 +63007,7 @@ pub(crate) async fn redeem_friend_token_impl(
         iroh_endpoint,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         dm_outbox,
@@ -62448,6 +63028,7 @@ pub(crate) async fn redeem_friend_token_impl(
             g.iroh_endpoint.clone(),
             g.crdt_state.clone(),
             g.hlc_tracker.clone(),
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone(),
             g.dm_self_owner,
             g.dm_outbox.clone(),
@@ -62528,6 +63109,7 @@ pub(crate) async fn redeem_friend_token_impl(
         None, // self_display — not persisted at this layer (see acceptor note).
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         owner_keytree,
         revoked,
@@ -62625,13 +63207,22 @@ async fn unfriend(
         .map_err(|_| "peer_addr must be 16 bytes (32 hex chars)".to_string())?;
     let peer = crate::owner_state_types::OwnerAddr(addr_bytes);
 
-    let (crdt_state, hlc_tracker, device_id, sync_engine, friend_publisher, owner_keytree) = {
+    let (
+        crdt_state,
+        hlc_tracker,
+        adopt_floor,
+        device_id,
+        sync_engine,
+        friend_publisher,
+        owner_keytree,
+    ) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.sync_engine.clone(),
             g.pkarr_friend_publisher.clone(),
@@ -62639,7 +63230,7 @@ async fn unfriend(
         )
     };
 
-    let changed = unfriend_inner(&crdt_state, &hlc_tracker, &device_id, peer).await?;
+    let changed = unfriend_inner(&crdt_state, &hlc_tracker, &adopt_floor, &device_id, peer).await?;
 
     // Owner-state mutated → arm the debounced publish-root + persist on the
     // owner-state SyncEngine so the tombstone reaches the user's other devices
@@ -62698,13 +63289,14 @@ async fn set_friend_referrable(
         .map_err(|_| "owner_id_hex must be 16 bytes (32 hex chars)".to_string())?;
     let owner = crate::owner_state_types::OwnerAddr(addr_bytes);
 
-    let (crdt_state, hlc_tracker, device_id, sync_engine) = {
+    let (crdt_state, hlc_tracker, adopt_floor, device_id, sync_engine) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
             g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
             g.sync_engine.clone(),
         )
@@ -62714,8 +63306,13 @@ async fn set_friend_referrable(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let at =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let at = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     {
         let mut s = crdt_state.lock().await;
@@ -63963,6 +64560,7 @@ pub(crate) async fn accept_friend_request_impl(
         iroh_endpoint,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         dm_outbox,
@@ -63983,6 +64581,7 @@ pub(crate) async fn accept_friend_request_impl(
             g.iroh_endpoint.clone(),
             g.crdt_state.clone(),
             g.hlc_tracker.clone(),
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone(),
             g.dm_self_owner,
             g.dm_outbox.clone(),
@@ -64097,6 +64696,7 @@ pub(crate) async fn accept_friend_request_impl(
             owner_keytree,
             crdt_state,
             hlc_tracker,
+            adopt_floor,
             device_id,
             sync_engine,
             friend_publisher,
@@ -64852,6 +65452,7 @@ pub async fn connectivity_add_friend_by_key_inner(
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     keytree: std::sync::Arc<crate::owner_state_crypto::KeyTree>,
     // ZEB-680 §1: the live by-owner revoked-device projection, consulted by the
@@ -65040,6 +65641,7 @@ pub async fn connectivity_add_friend_by_key_inner(
         keytree,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         identity_pub_hex,
         revoked,
@@ -65081,6 +65683,7 @@ pub(crate) async fn complete_introduction(
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     // ZEB-376 Task 10 (durability fix): the post-`Linked` handles this shared
     // action needs so an introduced friend is PERSISTED + REPLICATED + SURFACED —
@@ -65133,6 +65736,7 @@ pub(crate) async fn complete_introduction(
         keytree,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         hex::encode(subject.0),
         revoked,
@@ -65216,6 +65820,7 @@ pub(crate) async fn link_over_connection(
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     device_id: String,
     peer_label: String,
     // ZEB-680 §1: the live revoked-device projection, consulted by the
@@ -65466,8 +66071,13 @@ pub(crate) async fn link_over_connection(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let learned_at =
-        crate::dm_outbox::reserve_next_hlc_for_device(&hlc_tracker, &device_id, wall_now_ms).await;
+    let learned_at = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
 
     // Derive the shared rendezvous secret (our ephemeral secret + the target's
     // ephemeral public from the accept), KeyTree-seal it AAD-bound to the
@@ -65634,6 +66244,7 @@ pub(crate) async fn add_friend_by_key_with_origin(
         iroh_endpoint,
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         self_owner,
         dm_outbox,
@@ -65654,6 +66265,7 @@ pub(crate) async fn add_friend_by_key_with_origin(
             g.iroh_endpoint.clone(),
             g.crdt_state.clone(),
             g.hlc_tracker.clone(),
+            g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone(),
             g.dm_self_owner,
             g.dm_outbox.clone(),
@@ -65726,6 +66338,7 @@ pub(crate) async fn add_friend_by_key_with_origin(
         None, // self_display — not persisted at this layer (see acceptor note).
         crdt_state,
         hlc_tracker,
+        adopt_floor,
         device_id,
         owner_keytree,
         revoked,
@@ -66366,9 +66979,15 @@ mod friend_ipc_tests {
             t.observe_local(hlc(5));
         }
 
-        let changed = unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
-            .await
-            .expect("unfriend succeeds for an active friend");
+        let changed = unfriend_inner(
+            &crdt_state,
+            &hlc_tracker,
+            &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            "d",
+            addr,
+        )
+        .await
+        .expect("unfriend succeeds for an active friend");
         assert!(
             changed,
             "tombstoning an active friend changed owner-state (must signal notify_dirty)"
@@ -66397,9 +67016,15 @@ mod friend_ipc_tests {
             TokioMutex::new(harmony_crdt_sync::ReplayTracker::new("d".to_string())),
         );
         let unknown = OwnerAddr([0xEE; 16]);
-        let err = unfriend_inner(&crdt_state, &hlc_tracker, "d", unknown)
-            .await
-            .expect_err("unfriending a non-friend errors");
+        let err = unfriend_inner(
+            &crdt_state,
+            &hlc_tracker,
+            &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            "d",
+            unknown,
+        )
+        .await
+        .expect_err("unfriending a non-friend errors");
         assert!(err.contains("not a friend"), "got: {err}");
     }
 
@@ -66427,9 +67052,15 @@ mod friend_ipc_tests {
             t.observe_local(hlc(7));
         }
 
-        let changed = unfriend_inner(&crdt_state, &hlc_tracker, "d", addr)
-            .await
-            .expect("re-unfriending an already-revoked peer is Ok(false)");
+        let changed = unfriend_inner(
+            &crdt_state,
+            &hlc_tracker,
+            &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            "d",
+            addr,
+        )
+        .await
+        .expect("re-unfriending an already-revoked peer is Ok(false)");
         assert!(
             !changed,
             "idempotent no-op must report no change (caller skips notify_dirty)"
@@ -66467,9 +67098,15 @@ mod friend_ipc_tests {
         let hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> = Arc::new(
             TokioMutex::new(harmony_crdt_sync::ReplayTracker::new("self".to_string())),
         );
-        let changed = unfriend_inner(&crdt_state, &hlc_tracker, "self", addr)
-            .await
-            .expect("unfriend ok");
+        let changed = unfriend_inner(
+            &crdt_state,
+            &hlc_tracker,
+            &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            "self",
+            addr,
+        )
+        .await
+        .expect("unfriend ok");
         assert!(changed, "revoking an Active friend returns Ok(true)");
         let s = crdt_state.lock().await;
         let entry = &s.friend_graph.friends[&addr];
@@ -66512,9 +67149,15 @@ mod friend_ipc_tests {
             s.apply_revoked_dm_device(peer, [8u8; 32]);
             assert!(s.revoked_dm_devices.contains_key(&peer));
         }
-        let changed = unfriend_inner(&crdt_state, &hlc_tracker, "d", peer)
-            .await
-            .expect("unfriend ok");
+        let changed = unfriend_inner(
+            &crdt_state,
+            &hlc_tracker,
+            &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            "d",
+            peer,
+        )
+        .await
+        .expect("unfriend ok");
         assert!(changed);
         let s = crdt_state.lock().await;
         assert_eq!(s.friend_graph.friends[&peer].status, FriendStatus::Revoked);
@@ -75237,6 +75880,7 @@ mod zeb703_outbox_runtime_durability_tests {
             sub_rx,
             paths,
             250,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
 
         let node = Mutex::new(NodeState {
@@ -75355,6 +75999,7 @@ mod zeb703_outbox_runtime_durability_tests {
             sub_rx,
             paths,
             250,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
 
         let node = Mutex::new(NodeState {
@@ -75430,6 +76075,7 @@ mod zeb703_outbox_runtime_durability_tests {
             sub_rx,
             paths,
             250,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
         // Keep the receiver alive so the Subscribe request send isn't racing
         // a closed channel (the command ignores the send result either way).
@@ -75514,6 +76160,7 @@ mod zeb703_outbox_runtime_durability_tests {
                 sub_rx,
                 paths,
                 250,
+                crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             ));
             (engine, space_id)
         };
@@ -75676,6 +76323,7 @@ mod zeb703_outbox_runtime_durability_tests {
             sub_rx,
             paths,
             250,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
 
         // One drain tick well past EXPIRATION_MS: Phase A filters the
@@ -75762,6 +76410,7 @@ mod zeb703_outbox_runtime_durability_tests {
             sub_rx,
             paths,
             600_000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
         // Mint the entry via the raw primitive — NO notify_dirty anywhere.
         let entry_id = {
@@ -75966,6 +76615,7 @@ mod zeb703_outbox_runtime_durability_tests {
             sub_rx,
             paths,
             600_000,
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         ));
 
         let stopping_flag = Arc::new(AtomicBool::new(false));
@@ -76189,6 +76839,7 @@ mod zeb708_gui_exit_flush_tests {
                 // never fire here, so ONLY the quit-path flush can save the
                 // mutation — the exposure window this test pins.
                 600_000,
+                crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             ));
             (engine, space_id)
         };
@@ -76669,6 +77320,7 @@ mod start_node_race_tests {
             butler_deposit_client: None,
             crdt_state: None,
             hlc_tracker: None,
+            hlc_adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             dm_device_id: None,
             dm_self_owner: None,
             owner_keytree: None,
@@ -79260,6 +79912,7 @@ mod owner_loaded_tests {
 
         let community_registry =
             std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
                 device_id: "owner-loaded-test".into(),
                 content_store: cs,
                 identity_resolver: std::sync::Arc::new(SelfOnlyResolver {

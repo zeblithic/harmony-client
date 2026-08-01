@@ -623,6 +623,7 @@ mod tests {
                 sibling_acks: Arc::new(tokio::sync::Mutex::new(
                     harmony_crdt_sync::MonotoneMap::new(),
                 )),
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             }))
         };
         // Per-engine persist dirs must exist (save_owner_state_cbor_only

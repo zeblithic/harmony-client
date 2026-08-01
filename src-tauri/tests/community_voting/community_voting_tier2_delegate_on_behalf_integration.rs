@@ -384,6 +384,7 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     let app_handle_a = app_a.handle().clone();
 
     let engine_a = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         voting_log: Arc::clone(&log_a),
         publisher_tx: a_pub_tx.clone(),
@@ -419,6 +420,7 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
     let app_handle_b = app_b.handle().clone();
 
     let engine_b = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         voting_log: Arc::clone(&log_b),
         publisher_tx: b_pub_tx.clone(),

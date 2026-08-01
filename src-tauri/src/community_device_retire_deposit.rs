@@ -202,6 +202,9 @@ pub struct ProdCommunityDeviceRetireDepositCtx {
     /// uses, so retire HLCs are monotonic with every other event this
     /// device stamps).
     pub hlc_tracker: Arc<tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs).
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
 }
 
 #[async_trait]
@@ -250,8 +253,13 @@ impl CommunityDeviceRetireDepositCtx for ProdCommunityDeviceRetireDepositCtx {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        crate::dm_outbox::reserve_next_hlc_for_device(&self.hlc_tracker, &self.device_id, wall_ms)
-            .await
+        crate::dm_outbox::reserve_next_hlc_for_device(
+            &self.hlc_tracker,
+            &self.adopt_floor,
+            &self.device_id,
+            wall_ms,
+        )
+        .await
     }
 
     fn sign_and_encode(&self, payload: &EventPayload) -> Result<Vec<u8>, String> {

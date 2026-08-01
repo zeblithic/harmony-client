@@ -147,6 +147,9 @@ pub struct ProdRelayDepositCtx {
     pub relay_hold_doc: Arc<tokio::sync::Mutex<RelayHoldDoc>>,
     /// HLC tracker for minting `held_at`.
     pub relay_hold_tracker: Arc<tokio::sync::Mutex<ReplayTracker<String, Hlc>>>,
+    /// ZEB-790: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs).
+    pub adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     /// Flush seam (notify_dirty + flush_now over the fleet-sync engine).
     pub flush: Arc<dyn RelayHoldFlush>,
     /// Runtime per-community relay opt-in doc.
@@ -188,7 +191,12 @@ impl RelayDepositCtx for ProdRelayDepositCtx {
     }
 
     async fn mint_hlc(&self) -> Hlc {
-        crate::fleet_sync::mint_next_hlc(&self.relay_hold_tracker, &self.relay_device_id).await
+        crate::fleet_sync::mint_next_hlc(
+            &self.relay_hold_tracker,
+            &self.adopt_floor,
+            &self.relay_device_id,
+        )
+        .await
     }
 
     async fn persist_hold(
@@ -1333,6 +1341,7 @@ mod tests {
             relay_hold_tracker: Arc::new(tokio::sync::Mutex::new(
                 harmony_crdt_sync::ReplayTracker::new("relay-dev".into()),
             )),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             flush: Arc::new(NoopFlush),
             optin,
             membership,

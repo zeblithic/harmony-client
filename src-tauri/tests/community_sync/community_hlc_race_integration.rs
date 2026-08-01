@@ -136,7 +136,13 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
 
     // Mint Alice's community + bootstrap Join. Reserve via the helper
     // so the tracker has a valid starting state.
-    let bootstrap_hlc = reserve_next_hlc_for_device(&hlc_tracker, &device_id, 100_000).await;
+    let bootstrap_hlc = reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        &device_id,
+        100_000,
+    )
+    .await;
     let minted = mint_community_creation(
         "TestCommunity",
         false, // open
@@ -160,6 +166,7 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
     ))));
     let tmp = tempfile::tempdir().expect("tmp");
     let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         community_id,
         membership_key: minted.membership_key.clone(),
         admin_addr: alice_addr,
@@ -243,8 +250,13 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         let target_tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
             target_dev_id.clone(),
         )));
-        let target_join_hlc =
-            reserve_next_hlc_for_device(&target_tracker, &target_dev_id, 100_000).await;
+        let target_join_hlc = reserve_next_hlc_for_device(
+            &target_tracker,
+            &harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+            &target_dev_id,
+            100_000,
+        )
+        .await;
         let minted_join = mint_redemption(
             &invite_payload,
             target_addr,
@@ -293,7 +305,13 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         let barrier = Arc::clone(&barrier);
         tokio::spawn(async move {
             barrier.wait().await;
-            let hlc = reserve_next_hlc_for_device(&tracker, &device, wall_now_ms).await;
+            let hlc = reserve_next_hlc_for_device(
+                &tracker,
+                &harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+                &device,
+                wall_now_ms,
+            )
+            .await;
             mint_kick_event(
                 community_id,
                 alice_addr,
@@ -312,7 +330,13 @@ async fn concurrent_kicks_from_same_device_yield_distinct_hlcs() {
         let barrier = Arc::clone(&barrier);
         tokio::spawn(async move {
             barrier.wait().await;
-            let hlc = reserve_next_hlc_for_device(&tracker, &device, wall_now_ms).await;
+            let hlc = reserve_next_hlc_for_device(
+                &tracker,
+                &harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+                &device,
+                wall_now_ms,
+            )
+            .await;
             mint_kick_event(
                 community_id,
                 alice_addr,

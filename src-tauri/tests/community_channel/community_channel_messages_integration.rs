@@ -298,6 +298,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         self_owner: owner_a,
         self_device_id: "device-a".to_string(),
         signing_key: Arc::clone(&signing_a),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         engine_config: ChannelLogEngineConfig {
             log_config: ChannelLogConfig {
                 seal_threshold_events: TEST_SEAL_THRESHOLD,
@@ -315,6 +316,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
         self_owner: owner_b,
         self_device_id: "device-b".to_string(),
         signing_key: Arc::clone(&signing_b),
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
         engine_config: ChannelLogEngineConfig {
             log_config: ChannelLogConfig {
                 seal_threshold_events: TEST_SEAL_THRESHOLD,

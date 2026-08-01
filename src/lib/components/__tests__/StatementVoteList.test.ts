@@ -133,6 +133,55 @@ describe('StatementVoteList', () => {
     expect(getByLabelText('Statement votes: 3 agree, 1 disagree, 0 pass')).toBeTruthy();
   });
 
+  it('orders same-ms statements by logical then deviceId (ZEB-790)', () => {
+    const a: DeliberationStatementExport = {
+      ...stmt, statementEventHash: 'cc'.repeat(32),
+      text: 'second-by-logical', createdAtHlcMs: 1_700_000_020_000,
+      createdAtHlcLogical: 2, createdAtHlcDeviceId: 'dev-a',
+    };
+    const b: DeliberationStatementExport = {
+      ...stmt, statementEventHash: 'dd'.repeat(32),
+      text: 'first-by-logical', createdAtHlcMs: 1_700_000_020_000,
+      createdAtHlcLogical: 1, createdAtHlcDeviceId: 'dev-z',
+    };
+    const adapter = new VotingAdapter();
+    const { container } = render(StatementVoteList, {
+      props: {
+        detail: { ...baseDetail, deliberationStatements: [a, b] },
+        adapter, myAddr: otherAddr, onChange: () => {},
+      },
+    });
+    const text = container.textContent ?? '';
+    expect(text.indexOf('first-by-logical')).toBeGreaterThan(-1);
+    expect(text.indexOf('first-by-logical')).toBeLessThan(text.indexOf('second-by-logical'));
+  });
+
+  it('breaks same-ms same-logical statements by deviceId lexically (ZEB-790)', () => {
+    // Identical wall AND logical: only deviceId can order these — the final
+    // compareHlc tuple component, which wall-only sorting would leave to
+    // nondeterministic hash order.
+    const a: DeliberationStatementExport = {
+      ...stmt, statementEventHash: 'ee'.repeat(32),
+      text: 'device-z-second', createdAtHlcMs: 1_700_000_030_000,
+      createdAtHlcLogical: 5, createdAtHlcDeviceId: 'dev-z',
+    };
+    const b: DeliberationStatementExport = {
+      ...stmt, statementEventHash: 'ff'.repeat(32),
+      text: 'device-a-first', createdAtHlcMs: 1_700_000_030_000,
+      createdAtHlcLogical: 5, createdAtHlcDeviceId: 'dev-a',
+    };
+    const adapter = new VotingAdapter();
+    const { container } = render(StatementVoteList, {
+      props: {
+        detail: { ...baseDetail, deliberationStatements: [a, b] },
+        adapter, myAddr: otherAddr, onChange: () => {},
+      },
+    });
+    const text = container.textContent ?? '';
+    expect(text.indexOf('device-a-first')).toBeGreaterThan(-1);
+    expect(text.indexOf('device-a-first')).toBeLessThan(text.indexOf('device-z-second'));
+  });
+
   it('hides tri-button on own statement and shows "yours" chip', () => {
     const adapter = new VotingAdapter();
     // myAddr === stmt.author → self-vote case (Greptile bot-pass 2 P2).

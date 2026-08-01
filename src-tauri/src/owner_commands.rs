@@ -3466,6 +3466,10 @@ mod revoke_tests {
         let drain = tokio::spawn(async move { while out_rx.recv().await.is_some() {} });
         let persist_dir = tempfile::tempdir().unwrap();
         let owner_id = state.owner_id;
+        // ZEB-790: the carrier and trust engines model ONE node, so they must
+        // share ONE adoption floor (the invariant: all HLC-minting/feeding
+        // contexts within a node hold the same `HlcAdoptFloor` Arc).
+        let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
         let carrier_engine = std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
             crate::fleet_sync::FleetSyncConfig {
                 keys: crate::owner_state_crypto::FleetKeySet::new(kt0),
@@ -3495,6 +3499,7 @@ mod revoke_tests {
                 publish_seen: false,
                 on_applied: None,
                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+                adopt_floor: adopt_floor.clone(),
             },
         ));
         let trust_doc_arc = std::sync::Arc::new(tokio::sync::Mutex::new(state.clone()));
@@ -3526,6 +3531,7 @@ mod revoke_tests {
                 publish_seen: true,
                 on_applied: None,
                 sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+                adopt_floor: adopt_floor.clone(),
             },
         ));
         let node = std::sync::Mutex::new(crate::NodeState {

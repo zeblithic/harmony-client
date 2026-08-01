@@ -2262,6 +2262,7 @@ mod tests {
                 sibling_acks: Arc::new(tokio::sync::Mutex::new(
                     harmony_crdt_sync::MonotoneMap::new(),
                 )),
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             }));
             let quorum_doc = Arc::new(tokio::sync::Mutex::new(QuorumReqDoc::default()));
             let quorum_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
@@ -2286,6 +2287,7 @@ mod tests {
                 sibling_acks: Arc::new(tokio::sync::Mutex::new(
                     harmony_crdt_sync::MonotoneMap::new(),
                 )),
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             }));
             DevRig {
                 quorum_doc,
@@ -2855,6 +2857,7 @@ mod tests {
             sibling_acks: Arc::new(tokio::sync::Mutex::new(
                 harmony_crdt_sync::MonotoneMap::new(),
             )),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         }));
 
         let (q_out, mut q_drain) = mpsc::channel::<Vec<u8>>(64);
@@ -2882,6 +2885,7 @@ mod tests {
             sibling_acks: Arc::new(tokio::sync::Mutex::new(
                 harmony_crdt_sync::MonotoneMap::new(),
             )),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         }));
 
         SweepRig {
@@ -3005,6 +3009,7 @@ mod tests {
             sibling_acks: Arc::new(tokio::sync::Mutex::new(
                 harmony_crdt_sync::MonotoneMap::new(),
             )),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         }));
         CarrierRig {
             carrier: super::QuorumSweepCarrier {

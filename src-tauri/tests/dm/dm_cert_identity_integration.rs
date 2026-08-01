@@ -439,6 +439,7 @@ async fn cert_anchored_dm_roundtrip_end_to_end() {
             Some("bob".to_string()),
             Arc::clone(&bob_crdt_state),
             Arc::clone(&bob_hlc_tracker),
+            harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
             "bob-dev".to_string(),
             Arc::clone(&bob_keytree),
             harmony_app::revoked_device_projection::RevokedDeviceProjection::new(),
