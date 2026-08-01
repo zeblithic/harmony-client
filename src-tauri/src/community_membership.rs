@@ -2292,6 +2292,51 @@ pub fn materialize(
     materialize_with_now(events, admin_addr, None)
 }
 
+/// Materialize with a forward-skew *ceiling* (ZEB-846) on top of the optional
+/// aging *floor* (`now_ms`).
+///
+/// `receiver_now_ms` is the *receiver's own* trusted wall clock
+/// (`std::time::SystemTime::now()`), never a peer-supplied or `HlcAdoptFloor`
+/// value — a forward bound is only sound when measured against a clock the
+/// attacker cannot move. When `Some(rn)`, any event whose `at.wall_ms` is more
+/// than [`crate::clock_trust::MAX_FORWARD_SKEW_MS`] beyond `rn` is *excluded
+/// from the input entirely* before materializing. Excluding an event from the
+/// slice is exactly equivalent to skipping it in the sort/apply loop of
+/// [`materialize_with_now`]: it drops out of `event_sort_key` ordering (no
+/// POISON-SQUAT), out of `events_max_wall_ms` (the aging floor stays honest),
+/// and out of every recovery/expiry control — so a future-dated event cannot
+/// gain power.
+///
+/// `None` disables the ceiling (apply-all). This is the load-bearing
+/// non-destructive property: a *bad local* clock must never drop or defer
+/// honest governance, so callers without a trusted receiver clock pass `None`.
+/// The exclusion is a live view, re-evaluated on every materialize; nothing is
+/// ever deleted from the persisted log (`community_state_persist`).
+pub fn materialize_with_bounds(
+    events: &[SignedMembershipEvent],
+    admin_addr: OwnerAddr,
+    now_ms: Option<u64>,
+    receiver_now_ms: Option<u64>,
+) -> MaterializedMembership {
+    match receiver_now_ms {
+        Some(rn) => {
+            let effective: Vec<SignedMembershipEvent> = events
+                .iter()
+                .filter(|e| {
+                    !crate::clock_trust::reject_future(
+                        e.at.wall_ms,
+                        rn,
+                        crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                    )
+                })
+                .cloned()
+                .collect();
+            materialize_with_now(&effective, admin_addr, now_ms)
+        }
+        None => materialize_with_now(events, admin_addr, now_ms),
+    }
+}
+
 /// R4-6 variant of `materialize` that accepts an optional wall-clock
 /// "now floor" used as the time-reference for PendingJoin's 30-day
 /// expiry check.
@@ -18724,6 +18769,169 @@ mod zeb_813_supersession_tests {
             state.materialized(a.owner),
             materialize(&events, a.owner),
             "compacted state must materialize identically to the full pile"
+        );
+    }
+}
+
+// ── ZEB-846 forward-skew ceiling: materialize_with_bounds ─────────────────
+
+#[cfg(test)]
+mod zeb846_forward_ceiling {
+    use super::*;
+
+    // Reuse the module's existing event/identity helper patterns (mirror the
+    // block near community_membership.rs:7268-7380: make_identity,
+    // make_join_event, make_kick_event). Local copies here because those
+    // helpers are private to the sibling `mod tests`.
+
+    fn make_identity(seed_byte: u8) -> (TestOwner, [u8; 64], OwnerAddr) {
+        let owner = mint_test_owner(seed_byte);
+        let addr = owner.owner;
+        (owner, [0u8; 64], addr)
+    }
+
+    fn make_join_event(id_byte: u8, actor: OwnerAddr, at_wall_ms: u64) -> SignedMembershipEvent {
+        let mut id = [0xfd; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::Join,
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    /// `make_kick_event` copy parameterized on `at_wall_ms` (the sibling
+    /// helper already exposes it, but it's private to `mod tests`). The
+    /// trailing `_admin_owner` is accepted for call-site parity with a
+    /// signing identity even though `materialize`/`materialize_with_bounds`
+    /// are pure functions that never verify signatures (see `materialize`'s
+    /// doc comment) — a dummy `sig` is sufficient here, same as the sibling
+    /// helper.
+    fn make_kick_event_at(
+        id_byte: u8,
+        actor: OwnerAddr,
+        target: OwnerAddr,
+        at_wall_ms: u64,
+        _admin_owner: &TestOwner,
+    ) -> SignedMembershipEvent {
+        let mut id = [0xfa; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: SpaceId([0xc0; 16]),
+            kind: MembershipEventKind::Kick {
+                target,
+                reason: None,
+            },
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    /// Mirrors the `mat.members.get(&addr).map(|m| m.status)` inspection
+    /// pattern already used by `kick_of_joined_member_does_trigger_epoch_rotation`
+    /// (`:11190`) — a local test-only helper, not a new accessor on
+    /// `MaterializedMembership`.
+    fn member_is_present(mat: &MaterializedMembership, addr: &OwnerAddr) -> bool {
+        matches!(
+            mat.members.get(addr).map(|m| m.status),
+            Some(MemberStatus::Joined)
+        )
+    }
+
+    const T_NOW: u64 = 1_000_000; // receiver "now", ms
+    const SKEW: u64 = crate::clock_trust::MAX_FORWARD_SKEW_MS; // 300_000
+
+    #[test]
+    fn ceiling_excludes_future_kick_so_victim_retains_membership() {
+        // admin, victim identities; victim joins at an honest past wall.
+        let (admin_owner, _admin_pk, admin_addr) = make_identity(1);
+        let (_v_owner, _v_pk, victim) = make_identity(2);
+        let join = make_join_event(10, victim, T_NOW - 10_000);
+        // Malicious Kick stamped far in the future (now + 1 year). It sorts
+        // LAST (wall is primary sort key) and would win LWW without the bound.
+        let kick = make_kick_event_at(
+            20,
+            admin_addr,
+            victim,
+            T_NOW + 365 * 86_400_000,
+            &admin_owner,
+        );
+        let events = vec![join, kick];
+
+        // With the receiver-now ceiling: the future Kick is excluded, victim stays.
+        let bounded = materialize_with_bounds(&events, admin_addr, None, Some(T_NOW));
+        assert!(
+            member_is_present(&bounded, &victim),
+            "future-dated Kick must be excluded by the forward ceiling"
+        );
+
+        // Sanity: without the ceiling (receiver_now = None) the poison applies.
+        let unbounded = materialize_with_bounds(&events, admin_addr, None, None);
+        assert!(
+            !member_is_present(&unbounded, &victim),
+            "control: with no ceiling the future Kick dominates LWW and removes the victim"
+        );
+    }
+
+    #[test]
+    fn ceiling_disabled_when_receiver_now_is_none_applies_all() {
+        // A benign event stamped slightly ahead (within honest jitter) must NOT
+        // be dropped when there is no trusted receiver clock.
+        let (admin_owner, _pk, admin_addr) = make_identity(1);
+        let (_o, _p, m) = make_identity(2);
+        let join = make_join_event(10, m, T_NOW + 60_000); // 1 min ahead
+        let events = vec![join];
+        let mat = materialize_with_bounds(&events, admin_addr, None, None);
+        assert!(
+            member_is_present(&mat, &m),
+            "None ceiling ⇒ apply-all, honest event kept"
+        );
+        let _ = admin_owner;
+    }
+
+    #[test]
+    fn slow_local_clock_defers_not_drops_and_recovers_when_now_advances() {
+        // Receiver clock lags real time: an honest event looks future-dated.
+        // It must be EXCLUDED (deferred), never deleted — and reappear once the
+        // receiver clock catches up. materialize_with_bounds is a pure view over
+        // the same input slice, so "reappear" = re-materialize with a larger now.
+        let (_ao, _apk, admin_addr) = make_identity(1);
+        let (_o, _p, m) = make_identity(2);
+        let honest = make_join_event(10, m, T_NOW); // stamped at real now
+        let events = vec![honest];
+
+        // Behind clock: now = T_NOW - (SKEW + 1) ⇒ honest event is > now+SKEW ⇒ excluded.
+        let behind = T_NOW - (SKEW + 1);
+        let deferred = materialize_with_bounds(&events, admin_addr, None, Some(behind));
+        assert!(
+            !member_is_present(&deferred, &m),
+            "behind clock defers the honest join"
+        );
+
+        // Clock corrects: same input slice, larger now ⇒ event applies. Nothing was lost.
+        let applied = materialize_with_bounds(&events, admin_addr, None, Some(T_NOW));
+        assert!(
+            member_is_present(&applied, &m),
+            "advancing now re-admits the deferred event"
         );
     }
 }
