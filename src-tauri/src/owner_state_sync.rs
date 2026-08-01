@@ -1226,6 +1226,194 @@ mod subscriber_tests {
         let _ = engine.shutdown().await;
     }
 
+    /// ZEB-790 Task 7: a sibling publish that clears the full generic
+    /// `FleetSyncEngine` inbound pipeline (decrypt + decode + replay-tracker
+    /// admit/commit + merge) feeds the node's `HlcAdoptFloor` with the
+    /// publisher's observed wall — the invariant lives at the single
+    /// `ctx.adopt_floor.observe(...)` call site in `fleet_sync.rs`,
+    /// immediately after step 9's `tracker.commit(ticket)`.
+    ///
+    /// Mirrors `subscriber_accepts_strictly_newer_hlc_and_updates_tracker`
+    /// exactly, plus a floor assertion.
+    #[tokio::test]
+    async fn accepted_sibling_publish_feeds_adopt_floor() {
+        let (pub_tx, _pub_rx) = mpsc::channel(16);
+        let (sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let kt = make_kt();
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "self-device".into(),
+        )));
+        let state = Arc::new(Mutex::new(OwnerState::default()));
+        let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let engine = SyncEngine::new(
+            FleetKeySet::new(Arc::clone(&kt)),
+            "self-device".into(),
+            Arc::clone(&state),
+            Arc::clone(&tracker),
+            Arc::clone(&store),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000, // long debounce — keep self-publishes out of the way
+            adopt_floor.clone(),
+        );
+
+        let at_wall_ms = 1000u64;
+        let wire = make_wire(
+            &kt,
+            &store,
+            &OwnerState::default(),
+            "peer-bob",
+            at_wall_ms,
+            0,
+        )
+        .await;
+        sub_tx.send(wire).await.unwrap();
+        let accepted = wait_until(
+            || async {
+                let t = tracker.lock().await;
+                t.accepted()
+                    .get("peer-bob")
+                    .is_some_and(|s| s.wall_ms == at_wall_ms && s.logical == 0)
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            accepted,
+            "tracker did not record peer-bob wall_ms=1000 within 2s"
+        );
+
+        // NOTE: read with `merged_now(at_wall_ms)`, NOT `merged_now(0)` —
+        // merged_now clamps against `now + CAP`, so a tiny `now` would cap
+        // the answer well below the actual floor value.
+        assert_eq!(
+            adopt_floor.merged_now(at_wall_ms),
+            at_wall_ms + 1,
+            "accepted sibling publish feeds the floor (+1 rule)"
+        );
+
+        let _ = engine.shutdown().await;
+    }
+
+    /// ZEB-790 Task 7: the mirror-image invariant — a sibling publish that
+    /// the replay tracker rejects as `Duplicate` must never reach step 9's
+    /// `observe` call.
+    ///
+    /// "eve-dev"'s watermark is seeded directly to 9000 via
+    /// `ReplayTracker::from_accepted` (the restore-from-disk seam, also
+    /// used by the persist-restart test above) — bypassing the accept
+    /// pipeline entirely, so the floor is never fed for the seed itself.
+    /// A publish claiming eve at wall_ms=8000 (not strictly newer than the
+    /// seeded 9000) is then rejected as `Duplicate` before a `CommitTicket`
+    /// ever exists.
+    ///
+    /// Per the Task 5/6 review bar: a bare sleep-then-assert-zero has no
+    /// positive confirmation the stale frame was ever processed — that
+    /// assertion is indistinguishable from "nothing happened yet," since
+    /// zero is ALSO the floor's untouched initial state. So after the
+    /// stale frame, this test injects a second, genuinely-accepted publish
+    /// from a DIFFERENT peer ("peer-bob", wall_ms=500) through the SAME
+    /// engine and SAME subscriber_rx, and polls until the floor moves for
+    /// THAT publish. The stale wall (8000) is deliberately chosen ABOVE
+    /// the legit wall (500) so its contribution would be visible: if the
+    /// rejected frame had leaked into the floor, `merged_now(500)` below
+    /// would clamp to `500 + HLC_ADOPT_FORWARD_CAP_MS` (8000 is beyond the
+    /// 5s cap from `now=500`) instead of the expected `500 + 1`.
+    #[tokio::test]
+    async fn stale_sibling_publish_does_not_feed_adopt_floor() {
+        let (pub_tx, _pub_rx) = mpsc::channel(16);
+        let (sub_tx, sub_rx) = mpsc::channel(16);
+        let (_dir, paths) = paths();
+        let kt = make_kt();
+        let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
+
+        let mut seeded = BTreeMap::new();
+        seeded.insert(
+            "eve-dev".to_string(),
+            Hlc {
+                wall_ms: 9000,
+                logical: 0,
+                device_id: "eve-dev".into(),
+            },
+        );
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::from_accepted(
+            "self-device".to_string(),
+            seeded,
+        )));
+        let state = Arc::new(Mutex::new(OwnerState::default()));
+        let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let engine = SyncEngine::new(
+            FleetKeySet::new(Arc::clone(&kt)),
+            "self-device".into(),
+            Arc::clone(&state),
+            Arc::clone(&tracker),
+            Arc::clone(&store),
+            pub_tx,
+            sub_rx,
+            paths,
+            5000,
+            adopt_floor.clone(),
+        );
+
+        // Stale/duplicate: eve's watermark is already 9000; 8000 is not
+        // strictly newer, so `admit` returns `Duplicate` — no ticket, no
+        // commit, no observe.
+        sub_tx
+            .send(make_wire(&kt, &store, &OwnerState::default(), "eve-dev", 8000, 0).await)
+            .await
+            .unwrap();
+        // Tier B settle window (per spec §3 negative-assertion rule): give
+        // the subscriber loop time to process the duplicate before
+        // checking the floor stayed untouched. 500ms matches the sibling
+        // negative test above.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            adopt_floor.merged_now(0),
+            0,
+            "stale/duplicate publish must not feed the floor"
+        );
+
+        // Positive liveness signal: a second, genuinely-accepted publish
+        // from a different peer through the same engine/subscriber_rx.
+        let legit_wall_ms = 500u64;
+        sub_tx
+            .send(
+                make_wire(
+                    &kt,
+                    &store,
+                    &OwnerState::default(),
+                    "peer-bob",
+                    legit_wall_ms,
+                    0,
+                )
+                .await,
+            )
+            .await
+            .unwrap();
+        let mut fed = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if adopt_floor.merged_now(legit_wall_ms) == legit_wall_ms + 1 {
+                fed = true;
+                break;
+            }
+        }
+        assert!(
+            fed,
+            "legit publish must feed the floor within the poll window"
+        );
+        assert_eq!(
+            adopt_floor.merged_now(legit_wall_ms),
+            legit_wall_ms + 1,
+            "only the legit publish fed the floor — the stale one contributed nothing"
+        );
+
+        let _ = engine.shutdown().await;
+    }
+
     use crate::owner_state_types::{
         ContentId, DeliveryStatus, OutboxEntry, OutboxEntryId, OwnerAddr, ReadMarker, Space,
         SpaceId, SpaceKind,

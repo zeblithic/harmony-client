@@ -1440,6 +1440,9 @@ where
     // 9. NOW advance the watermark — only after a successful apply. The
     //    ticket has ridden every fallible step above to get here.
     ctx.replay_tracker.lock().await.commit(ticket);
+    // ZEB-790: verified sibling stamp — feed the adoption floor (post-
+    // commit only; every earlier Dropped return leaves it untouched).
+    ctx.adopt_floor.observe(payload.at.wall_ms);
 
     // 10. If running with `publish_seen`, record the sibling's
     //     acknowledgement of us: their `seen[our_device]`, if newer than
