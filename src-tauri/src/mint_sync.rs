@@ -2258,6 +2258,62 @@ mod tests {
         );
     }
 
+    /// Rejection-inert #3: a replay-skipped inbound root (step 3 — not
+    /// strictly newer than the tracked HLC for that device) returns before
+    /// the merge/apply and before the floor feed at step 6.
+    ///
+    /// This is the one rejection branch worth pinning specifically: the
+    /// replay tracker is PERSISTED across a restart (`mint_sync_persist`)
+    /// but the adoption floor is NOT (session-only by design — see
+    /// `hlc_adopt_floor` module docs). So a fresh-boot floor starts at 0
+    /// while the tracker can already hold a high watermark for a device —
+    /// if the feed were ever misplaced onto this branch, a replayed/stale
+    /// frame carrying `0 < W' <= tracked_W` would wrongly advance that
+    /// fresh floor. Seed the tracker directly (bypassing a real apply) to
+    /// simulate exactly that post-restart shape.
+    #[tokio::test]
+    async fn replay_skipped_inbound_root_does_not_feed_adopt_floor() {
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let cs: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let (shared, keys) = retry_test_shared_with_floor(cs.clone(), floor.clone());
+
+        let now = now_ms();
+        let tracked_wall = now + 5_000;
+        {
+            let mut st = shared.sync_state.lock().await;
+            st.replay_tracker.insert(
+                "remote-dev".to_string(),
+                crate::owner_state_types::Hlc {
+                    wall_ms: tracked_wall,
+                    logical: 0,
+                    device_id: "remote-dev".into(),
+                },
+            );
+        }
+
+        // Lower wall than the tracked watermark, same device — not strictly
+        // newer, so step 3 skips it as a duplicate/replay.
+        let replayed_wall = now + 1_000;
+        let wire = verified_sibling_root_wire(&keys, &cs, "remote-dev", replayed_wall).await;
+
+        handle_incoming_publish_zenoh(
+            &wire,
+            &shared,
+            &keys,
+            "local-dev",
+            std::path::Path::new("/nonexistent"),
+        )
+        .await
+        .expect("a replay-skip returns Ok(()), not an error");
+
+        assert_eq!(
+            floor.merged_now(0),
+            0,
+            "a replay-skipped inbound root must not feed the adoption floor"
+        );
+    }
+
     #[tokio::test]
     async fn subscriber_applies_remote_snapshot_to_local() {
         // Two DBs, one shared ContentStore. Engine A publishes; engine B's
