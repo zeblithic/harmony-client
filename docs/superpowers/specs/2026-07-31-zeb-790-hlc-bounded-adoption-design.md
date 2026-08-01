@@ -234,8 +234,9 @@ inversion, made impossible.
 **Budget pins:** the §6.2 relation test.
 
 **Suites:** wire fixtures unaffected by design (mint values unpinned, `Hlc` shape
-untouched). Iteration via `scripts/test-select`; full `--workspace --all-targets` sweep
-before PR.
+untouched). Iteration via `scripts/test-select` (paste its `round=… bucket=…` summary
+line into task reports for auditability, per CLAUDE.md's iterative-test-selection
+convention); full `--workspace --all-targets` sweep before PR.
 
 ## 9. Alternatives considered
 
