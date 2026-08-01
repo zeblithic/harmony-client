@@ -6630,10 +6630,28 @@ mod tests {
     /// signing dance — the membership gate runs on the unauthenticated
     /// `publisher_addr` before any signature is checked, so the forged
     /// publish's `publisher_sig` is deliberately garbage.
+    ///
+    /// Review round 1 fix: a bare sleep-then-assert-zero has no positive
+    /// confirmation the forged frame was ever processed — that assertion
+    /// is indistinguishable from "nothing happened yet," since zero is
+    /// ALSO the floor's untouched initial state. So after the forged
+    /// frame, this test injects a second, genuinely-accepted publish
+    /// from a real member ("dave") through the SAME engine and SAME
+    /// subscriber_rx, and polls (bounded, like the accepted-path test)
+    /// until the floor moves for THAT publish. The final assertion then
+    /// does double duty: it proves the engine loop was live and still
+    /// accepting during/after the rejection window, AND that the forged
+    /// frame contributed nothing — the forged wall_ms is chosen so far
+    /// past dave's (well beyond the adoption cap) that if it had fed the
+    /// floor, the read below would clamp to `legit_at.wall_ms + CAP`
+    /// instead of the expected `+ 1`.
     #[tokio::test]
     async fn rejected_publish_does_not_feed_adopt_floor() {
-        use crate::community_membership::MembershipEventKind;
+        use crate::community_membership::{
+            mint_test_owner, sign_event, EventPayload, MembershipEventKind,
+        };
         use crate::owner_state_crypto::canonical_cbor_encode;
+        use ed25519_dalek::Signer;
 
         let admin_addr = OwnerAddr([0xC1; 16]);
         let carol_addr = OwnerAddr([0xC2; 16]);
@@ -6653,6 +6671,9 @@ mod tests {
         let (sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(64);
 
         let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        // Retained for the liveness publish's CAS put below — `cs` itself
+        // is moved into the engine's config.
+        let cs_for_put = Arc::clone(&cs);
 
         let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
             adopt_floor: adopt_floor.clone(),
@@ -6686,11 +6707,11 @@ mod tests {
             root_serve_rx: None,
         });
 
-        // Seed a Joined-then-Left member directly via the trusted
-        // test-only insert (bypasses verify_event — admin power is
-        // implicit per `materialize_with_now`, so no admin bootstrap
+        // Seed a Joined-then-Left member ("carol") directly via the
+        // trusted test-only insert (bypasses verify_event — admin power
+        // is implicit per `materialize_with_now`, so no admin bootstrap
         // Join is needed either). `sig` is a dummy: the membership gate
-        // that rejects this publish runs BEFORE sig-verify.
+        // that rejects the forged publish below runs BEFORE sig-verify.
         let carol_join = SignedMembershipEvent {
             id: [0x02; 16],
             community_id,
@@ -6721,24 +6742,47 @@ mod tests {
             enrollment: None,
             signer_certs: Vec::new(),
         };
+
+        // Seed a genuinely-Joined member ("dave") with a REAL enrolled
+        // device key — this is who the liveness publish below claims to
+        // be from, so its sig-verify (step 3/4) must genuinely pass.
+        let dave = mint_test_owner(0xD4);
+        let dave_addr = dave.owner;
+        let dave_join_payload = EventPayload {
+            id: [0x04; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: dave_addr,
+            at: Hlc {
+                wall_ms: 100_150,
+                logical: 0,
+                device_id: "dave-dev".into(),
+            },
+        };
+        let dave_join = SignedMembershipEvent {
+            enrollment: Some(dave.cert.clone()),
+            ..sign_event(&dave_join_payload, &dave.device_key).expect("sign dave join")
+        };
         {
             let state = engine.state();
             let mut g = state.lock().await;
             g.insert_verified_for_test(carol_join);
             g.insert_verified_for_test(carol_leave);
+            g.insert_verified_for_test(dave_join);
         }
 
         // Forge a root publish claiming carol as publisher, stamped
         // strictly AFTER her Leave — `prior_state_at_hlc` sees her as
         // `Left`, so the membership-at-HLC gate returns
         // `PublisherNotJoined` before sig-verify, merge, or the tracker
-        // commit are ever reached.
+        // commit are ever reached. wall_ms is deliberately far beyond
+        // dave's forthcoming legit publish (see the final assertion).
         let forged_at = Hlc {
-            wall_ms: 100_300,
+            wall_ms: 50_000_000,
             logical: 0,
             device_id: "carol-dev".into(),
         };
-        let signed = CommunityRootSignedPayload {
+        let forged_signed = CommunityRootSignedPayload {
             root_cid: harmony_content::cid::ContentId::for_book(
                 b"zeb-790-forged-rejected-publish",
                 harmony_content::cid::ContentFlags {
@@ -6750,20 +6794,79 @@ mod tests {
             publisher_addr: carol_addr,
             at: forged_at,
         };
-        let payload = signed.into_wire([0u8; 64], None);
-        let payload_bytes = canonical_cbor_encode(&payload).expect("encode payload");
-        let wire = encrypt_root_publish(&membership_key, &payload_bytes).expect("encrypt");
+        let forged_payload = forged_signed.into_wire([0u8; 64], None);
+        let forged_payload_bytes =
+            canonical_cbor_encode(&forged_payload).expect("encode forged payload");
+        let forged_wire =
+            encrypt_root_publish(&membership_key, &forged_payload_bytes).expect("encrypt forged");
 
-        sub_tx.send(wire).await.expect("inject forged publish");
+        sub_tx
+            .send(forged_wire)
+            .await
+            .expect("inject forged publish");
 
-        // Give the internal task's inbound loop a beat to process the
-        // (rejected) frame.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Positive liveness signal (review round 1): a second, genuinely-
+        // accepted publish from dave through the SAME engine/subscriber_rx.
+        // Its root_cid must resolve in the SAME content store the engine
+        // reads from — an empty CommunityState blob is enough, since
+        // dave's Join is already merged into the engine's local state
+        // above and the merge phase treats it as AlreadyKnown.
+        let empty_remote = CommunityState::new(community_id);
+        let blob_cleartext = canonical_cbor_encode(&empty_remote).expect("encode empty snapshot");
+        let blob_ciphertext = encrypt_blob(&membership_key, &blob_cleartext).expect("encrypt blob");
+        let legit_root_cid = harmony_content::cid::ContentId::for_book(
+            &blob_ciphertext,
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid");
+        cs_for_put
+            .put_serveable(legit_root_cid, blob_ciphertext)
+            .await
+            .expect("put empty blob");
 
+        let legit_at = Hlc {
+            wall_ms: 100_500,
+            logical: 0,
+            device_id: "dave-dev".into(),
+        };
+        let legit_signed = CommunityRootSignedPayload {
+            root_cid: legit_root_cid,
+            publisher_addr: dave_addr,
+            at: legit_at.clone(),
+        };
+        let legit_signed_bytes = canonical_cbor_encode(&legit_signed).expect("encode legit signed");
+        let legit_sig = dave.device_key.sign(&legit_signed_bytes).to_bytes();
+        let legit_payload = legit_signed.into_wire(legit_sig, None);
+        let legit_payload_bytes =
+            canonical_cbor_encode(&legit_payload).expect("encode legit payload");
+        let legit_wire =
+            encrypt_root_publish(&membership_key, &legit_payload_bytes).expect("encrypt legit");
+
+        sub_tx.send(legit_wire).await.expect("inject legit publish");
+
+        let mut fed = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if adopt_floor.merged_now(legit_at.wall_ms) == legit_at.wall_ms + 1 {
+                fed = true;
+                break;
+            }
+        }
+        assert!(
+            fed,
+            "the engine loop must still be live and accepting after the \
+             rejected frame — the legit publish must feed the floor \
+             within the poll window"
+        );
         assert_eq!(
-            adopt_floor.merged_now(0),
-            0,
-            "rejected publish must NOT move the floor"
+            adopt_floor.merged_now(legit_at.wall_ms),
+            legit_at.wall_ms + 1,
+            "rejected publish must NOT move the floor — if the forged \
+             wall_ms (50_000_000) had fed it, this read would clamp to \
+             legit_at.wall_ms + CAP instead of + 1"
         );
     }
 
