@@ -119,7 +119,21 @@ impl OpenJoinRateLimiter {
     /// Returns true if a request is allowed; rolls the window over when it has
     /// elapsed. Mutates the in-window counter only when allowing.
     fn allow(&mut self, limiter_now_ms: u64) -> bool {
-        if limiter_now_ms.saturating_sub(self.window_start_ms) >= OPEN_JOIN_RATE_LIMIT_WINDOW_MS {
+        // Anchor the window on the FIRST request of a window, not on limiter
+        // construction. ZEB-711 moved the timeline to a monotonic epoch that
+        // starts at construction, so a fresh limiter has `window_start_ms == 0`
+        // while `limiter_now_ms` is small elapsed-ms. The old wall-clock code
+        // always rolled from the 0 sentinel on the first call (Unix-epoch ms >>
+        // window), which anchored the window at the first request; without this
+        // an acceptor that idles before the first open-join gets a shortened
+        // first window and sheds early (Qodo, PR #580). `count_in_window == 0`
+        // holds only before a window's first request — every admit leaves it
+        // >= 1, and a rollover resets to 0 then re-increments in the same call.
+        if self.count_in_window == 0 {
+            self.window_start_ms = limiter_now_ms;
+        } else if limiter_now_ms.saturating_sub(self.window_start_ms)
+            >= OPEN_JOIN_RATE_LIMIT_WINDOW_MS
+        {
             self.window_start_ms = limiter_now_ms;
             self.count_in_window = 0;
         }
@@ -833,5 +847,74 @@ mod tests {
             &mut lim,
         )
         .expect("window rolled on the monotonic limiter clock, so this admits");
+    }
+
+    #[test]
+    fn limiter_window_anchors_on_first_request_not_construction() {
+        // ZEB-711 / Qodo (PR #580): the monotonic epoch starts at limiter
+        // construction, so the window must anchor on the FIRST request, not at
+        // t=0 — else an acceptor that idles before the first open-join gets a
+        // shortened first window and sheds early.
+        let f = Fixture::new();
+        let mut lim = OpenJoinRateLimiter::new();
+        let first = 30_000; // acceptor idled ~30 s before the first request
+
+        for _ in 0..OPEN_JOIN_RATE_LIMIT_PER_WINDOW {
+            let (req, sig, sb) = f.fresh_request();
+            verify_and_admit_open_join(
+                &req,
+                &sig,
+                &sb,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                first,
+                &mut lim,
+            )
+            .expect("first-window requests admit");
+        }
+
+        // 40 s after the first request — still inside the 60 s window anchored at
+        // `first`, so this sheds. A window anchored at construction (t=0) would
+        // have rolled at t=60_000 and wrongly admitted.
+        let (req, sig, sb) = f.fresh_request();
+        assert_eq!(
+            verify_and_admit_open_join(
+                &req,
+                &sig,
+                &sb,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                first + 40_000,
+                &mut lim,
+            )
+            .unwrap_err(),
+            OpenJoinReject::RateLimited,
+            "window anchors on the first request, not limiter construction"
+        );
+
+        // 60 s+ after the first request → window rolls → admits resume.
+        let (req, sig, sb) = f.fresh_request();
+        verify_and_admit_open_join(
+            &req,
+            &sig,
+            &sb,
+            &f.epoch_key,
+            f.community_id,
+            f.admin_addr,
+            &f.current_events,
+            f.now_ms,
+            FRESHNESS,
+            first + OPEN_JOIN_RATE_LIMIT_WINDOW_MS + 1,
+            &mut lim,
+        )
+        .expect("window rolls 60 s after the first request");
     }
 }

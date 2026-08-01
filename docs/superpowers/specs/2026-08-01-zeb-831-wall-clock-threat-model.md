@@ -137,6 +137,7 @@ reachability (who can mount it) × recoverability.
 `ABK` addrbook `stamped_at_ms` unsigned & attacker-rewritable (`community_address_book.rs:201`).
 
 ### LOW / display-only / latent
+
 `RM` read-marker poison (`owner_state_crdt.rs:694`) · `C10` profile-broadcast in-memory (`profile_broadcast.rs:607`) ·
 `E5` governance sort display-only (`CharterView.svelte`/`StatementVoteList.svelte`) ·
 `E9` `list_pending_joins` partial-tuple render (`lib.rs:47859`) ·
@@ -144,7 +145,10 @@ reachability (who can mount it) × recoverability.
 `BS` backup-staleness banner never clears (`backup_state.rs:69`).
 
 ### NEEDS-VERIFICATION (resolve before ticketing)
-- **RR — RESOLVED (real; HIGH; closed by the §6.1 ingest gate).** `community_membership.rs:3113`.
+
+- **RR — VERIFIED REAL (HIGH); closure DESIGNED, deferred to T-GOV (ZEB-846) — NOT closed in this PR.** `community_membership.rs:3113`.
+  The §6.1 membership/voting ingest gate that closes RR is not implemented here; it ships with T-GOV,
+  and RR is not considered closed until that gate plus a replay/restart test land.
   ZEB-714 (PR #498 R1) made the 48 h finality margin a CRDT invariant via
   `event.at.wall_ms > deadline + RECOVERY_ROTATION_FINALITY_MS` — but the gate reads the **rotation
   author's own** (peer-supplied) `at.wall_ms`. A malicious recovery designate stamps the rotation
@@ -155,7 +159,8 @@ reachability (who can mount it) × recoverability.
   kick — but the **irreversible epoch-key advance already happened** in the pre-veto window (messages
   re-encrypted to the new epoch; deposed admin excluded until re-keyed). Closed by §6.1: a
   `now + MAX_FORWARD_SKEW_MS` (5 min) bound at ingest rejects a rotation stamped 48 h ahead, so F
-  can only be cleared by real elapsed time. Fold into **T-GOV**; the implementer should also confirm
+  can only be cleared by real elapsed time. This closure is **designed, not yet implemented** — folded
+  into **T-GOV (ZEB-846)**; the implementer should also confirm
   whether the epoch advance itself is retracted on the veto-driven re-materialize or is a residual.
 - **B7** `iroh_invite_acceptor` open-join has no pre-auth tier-1 limiter — unbounded pre-consent crypto
   per connection (ZEB-700 class) + one attacker can exhaust the global 20/60 s budget (raises B1).
@@ -212,10 +217,11 @@ leak clamps visibly) mirroring the ZEB-790 T5–T7 pattern.
 
 ## 7. Remediation plan (ticket map)
 
-**In ZEB-831 (this effort), per the scope decision:** close the 4 incomplete-prior-fixes
-(§5) — each is a shipped-ticket regression, highest-confidence, cheapest. Each is a small, testable
-forward-bound. Introduce the §6.5 policy module as the shared home for the constant + helper so the
-CRITICAL tickets build on it.
+**In ZEB-831 (this effort), per the scope decision:** close **3 of the 4** incomplete-prior-fixes
+(§5) — **ZEB-818, ZEB-711, ZEB-621** — each a shipped-ticket regression, highest-confidence, cheapest,
+a small testable forward-bound. The 4th, **ZEB-792 (A2)**, is a subset of the §6.1 governance ingest
+gate and is routed into **T-GOV (ZEB-846)** rather than patched narrowly here. Introduce the §6.5
+policy module as the shared home for the constant + helper so the CRITICAL tickets build on it.
 
 **Spawn as prioritized implementation tickets (do NOT fix here):**
 - **T-GOV (CRITICAL):** the §6.1 membership/voting ingest forward-gate → closes A1/SS/A2/A3/A4/A6/CD/E1.
@@ -263,6 +269,7 @@ CRITICAL tickets build on it.
 ---
 
 ## 9. Residual to record in the ZEB-790 spec
+
 The adoption floor caps *magnitude* at +5 s but not *duration*: one hostile verified frame pins this
 device's floor at `now+5 s` for the **rest of the process lifetime** (session-max register, no decay).
 Every wall-coupled mint is shifted +5 s in the permissive direction for the session. Magnitude-bounded
@@ -271,6 +278,7 @@ Every wall-coupled mint is shifted +5 s in the permissive direction for the sess
 ---
 
 ## 10. Testing & verification posture
+
 Each shipped bound gets a discrimination test (poisoned-higher-than-legit → visible clamp). The ingest
 gate (§6.1) additionally needs a replay/restart test (the poisoned frame is persisted; the bound must
 hold after reload). The policy module (§6.5) gets a single-source constant test pinning

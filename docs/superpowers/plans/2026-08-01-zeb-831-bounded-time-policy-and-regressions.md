@@ -12,7 +12,7 @@
 
 - **Spec:** `docs/superpowers/specs/2026-08-01-zeb-831-wall-clock-threat-model.md` (§3 trust model, §5 incomplete prior fixes, §6.5 policy module, §10 testing posture). Every requirement here traces to that spec.
 - **Scope boundary:** This PR is ONLY the `clock_trust` module + ZEB-818 + ZEB-711 + ZEB-621. **ZEB-792 (the governance apply-path bound) is OUT** — routed into T-GOV (ZEB-846), which is a superset. The CRITICAL findings (A1/SS/FR/GR/C3/C4/E1/SP) are separate spawned tickets (ZEB-846..854), NOT this PR. Do not add governance/owner-state/mint/card bounds here.
-- **House constants (exact values):** `MAX_FORWARD_SKEW_MS = 5 * 60 * 1000` (300_000); `DISPLAY_SKEW_TOLERANCE_MS = 30 * 60 * 1000` (1_800_000); `DISPLAY_SKEW_TOLERANCE_SECS = DISPLAY_SKEW_TOLERANCE_MS / 1000` (1800). These match the existing 5-min (`harmony_pkarr::record::FUTURE_TOLERANCE_MS`, `reachability_resolver::FUTURE_SKEW_TOLERANCE_MS`) and 30-min (`ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS`, `INTRODUCTION_MAX_FORWARD_SKEW_MS`, `VINE_PULL_INVALID_FORWARD_SKEW_SECS`) tiers already in the tree.
+- **House constants (exact values):** `MAX_FORWARD_SKEW_MS = 5 * 60 * 1000` (300_000); `DISPLAY_SKEW_TOLERANCE_MS = 30 * 60 * 1000` (1_800_000); `DISPLAY_SKEW_TOLERANCE_SECS = DISPLAY_SKEW_TOLERANCE_MS / 1000` (1800). These match the existing 5-min control tier (`harmony_pkarr::record::FUTURE_TOLERANCE_MS`, `reachability_resolver::FUTURE_SKEW_TOLERANCE_MS`) and the 30-min display/discovery tier (`VINE_PULL_INVALID_FORWARD_SKEW_SECS`, `INTRODUCTION_MAX_FORWARD_SKEW_MS`). `ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS` is *also* 30 min today, but it is a **governance control** budget (an existing, deferred value T-GOV will migrate onto the 5-min control tier) — not a display-tier policy match.
 - **Behavior-preserving consolidations only:** where an existing constant is re-derived from the module, the numeric value MUST stay identical (5 min → 5 min, 30 min → 30 min). No control's window changes in this PR.
 - **Every new bound ships a positive-discrimination test** (poisoned-higher-than-legit → visible reject/clamp), mirroring the ZEB-790 T5–T7 pattern.
 - **CI gates (run from `src-tauri/`):**
@@ -712,7 +712,7 @@ In `iroh_invite_acceptor.rs`:
 - [ ] **Step 5: Run the open-join + acceptor tests — expect PASS**
 
 Run: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(open_join) + test(iroh_invite_acceptor)'`
-Expected: all pass, including `limiter_window_immune_to_wall_clock_regression`.
+Expected: all pass, including `limiter_window_keys_on_monotonic_clock_not_wall`.
 
 > Note: `OpenJoinRateLimiter::new()` calls `tokio::time::Instant::now()`, which is safe in plain `#[test]` functions without a reactor (it falls back to the std monotonic clock when unpaused — the shipped `IntroRateLimiter::new()` does the same in plain `#[test]`s, e.g. `friend_intro.rs:1677`). No test needs converting to `#[tokio::test]`.
 
@@ -738,7 +738,7 @@ git commit -m "ZEB-831/ZEB-711: OpenJoinRateLimiter monotonic epoch; split open-
   - `cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures`
   - Expected: all green. Budget ~12 min warm; a cold sccache miss can run longer (slow, not hung — see the long-running-supervision discipline).
 - [ ] **Frontend gates unaffected** (no TS touched) — but run once to be safe: from repo root `npx tsc --noEmit` (vitest not needed; no frontend change).
-- [ ] Confirm the diff touches ONLY the eight files in the File Structure section and adds ONLY forward/monotonic bounds — no governance/owner-state/mint/card change leaked in (those are separate tickets).
+- [ ] Confirm the diff's **implementation** changes touch ONLY the files in the File Structure section (the spec/plan docs and their required test-clock realignments in already-existing vine test files are expected too) and add ONLY forward/monotonic bounds — no governance/owner-state/mint/card change leaked in (those are separate tickets).
 
 ## Self-review notes (author)
 

@@ -17,10 +17,16 @@
 //!   [`crate::reachability_resolver::FUTURE_SKEW_TOLERANCE_MS`].
 //! * [`DISPLAY_SKEW_TOLERANCE_MS`] (30 min) — pure display / discovery ordering
 //!   where no control is gated (vine feed, discovery lists). A future-dated
-//!   stamp can only mis-sort a list, not bypass a control. Matches the
-//!   governance/discovery 30-min house default
-//!   ([`crate::community_membership::ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS`],
-//!   [`crate::vine_pull_driver::VINE_PULL_INVALID_FORWARD_SKEW_SECS`]).
+//!   stamp can only mis-sort a list, not bypass a control. Its 30-min magnitude
+//!   matches the vine discovery default
+//!   ([`crate::vine_pull_driver::VINE_PULL_INVALID_FORWARD_SKEW_SECS`]).
+//!
+//! `community_membership::ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS` is *also* 30 min,
+//! but it is a **governance control** budget, not a display-tier consumer — it
+//! shares the magnitude only coincidentally. Governance ordering is a control
+//! and belongs on [`MAX_FORWARD_SKEW_MS`]; migrating it there is deferred to
+//! T-GOV (ZEB-846). Do **not** point a new *control* consumer at the display
+//! tier — controls take [`MAX_FORWARD_SKEW_MS`].
 //!
 //! The helpers are unit-agnostic: [`reject_future`] / [`clamp_future`] operate
 //! on raw `u64`, and the caller supplies `stamp`, `now`, and `tolerance` in one

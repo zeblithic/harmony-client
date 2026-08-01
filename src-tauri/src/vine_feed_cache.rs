@@ -460,7 +460,23 @@ impl VineFeedCache {
         let mut descriptors: Vec<DescriptorOnDisk> = file
             .descriptors
             .into_iter()
-            .filter(|d| d.created_at >= age_cutoff)
+            .filter(|d| {
+                // Backward age bound AND the ZEB-831/VF forward-skew bound that
+                // `on_descriptor_sample` applies at runtime. Without the forward
+                // bound here, a future-dated descriptor persisted by a pre-gate
+                // build survives reload and squats the feed head / evades the
+                // capacity-trim on every restart, and load/runtime would diverge
+                // (the symmetry the trim below documents). Skipped on a broken
+                // clock (now_secs == 0), matching the age filter's "keep data
+                // over losing it" fallback.
+                d.created_at >= age_cutoff
+                    && (now_secs == 0
+                        || !crate::clock_trust::reject_future(
+                            d.created_at,
+                            now_secs,
+                            crate::clock_trust::DISPLAY_SKEW_TOLERANCE_SECS,
+                        ))
+            })
             .collect();
 
         // Capacity-trim (defensive — production write path enforces cap
@@ -2134,6 +2150,86 @@ mod tests {
             cache.on_descriptor_sample(&topic("alice-addr"), &edge, &followed, now_ms),
             Some(DescriptorOutcome::Inserted { .. })
         ));
+    }
+
+    #[test]
+    fn load_drops_persisted_future_dated_descriptor() {
+        // ZEB-831/VF (whole-branch review Finding 1): the forward-skew bound must
+        // ALSO apply on the disk-load path, or a future-dated descriptor persisted
+        // by a pre-gate build survives reload and squats the feed head / evades the
+        // capacity-trim on every restart. `load()` reads the real wall clock (not
+        // injectable), so the future descriptor is dated well beyond the window.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now_real = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let followed = followed_set_with(&["alice-addr"]);
+
+        {
+            let mut cache = VineFeedCache::load(dir.path());
+
+            // A far-future descriptor (400 days ahead). It only reaches disk
+            // because at insert time we feed a matching future `now_ms`, so the
+            // runtime gate passes it — modeling state a pre-gate build persisted.
+            let future_secs = now_real + 400 * 86_400;
+            let future = canonical_descriptor_bytes(
+                "vine-future",
+                "alice-addr",
+                "Alice",
+                "cid-fut",
+                None,
+                None,
+                future_secs,
+                None,
+                None,
+            );
+            assert!(matches!(
+                cache.on_descriptor_sample(
+                    &topic("alice-addr"),
+                    &future,
+                    &followed,
+                    future_secs * 1000
+                ),
+                Some(DescriptorOutcome::Inserted { .. })
+            ));
+
+            // A legit, current descriptor.
+            let legit = canonical_descriptor_bytes(
+                "vine-legit",
+                "alice-addr",
+                "Alice",
+                "cid-legit",
+                None,
+                None,
+                now_real,
+                None,
+                None,
+            );
+            assert!(matches!(
+                cache.on_descriptor_sample(
+                    &topic("alice-addr"),
+                    &legit,
+                    &followed,
+                    now_real * 1000
+                ),
+                Some(DescriptorOutcome::Inserted { .. })
+            ));
+            assert_eq!(cache.len_descriptors(), 2);
+        }
+
+        // Reload uses the REAL wall clock: the future-dated descriptor is beyond
+        // the display-skew window and must be dropped; the legit one is kept.
+        let cache2 = VineFeedCache::load(dir.path());
+        assert!(
+            cache2.has_descriptor("vine-legit"),
+            "legit descriptor survives reload"
+        );
+        assert!(
+            !cache2.has_descriptor("vine-future"),
+            "future-dated descriptor must be dropped on load, not squat the feed"
+        );
+        assert_eq!(cache2.len_descriptors(), 1);
     }
 
     #[test]
