@@ -5573,30 +5573,10 @@ pub const MATERIALIZE_PENDING_EXPIRY_MS: u64 = 30 * 86_400_000;
 /// kept as a separate const for clarity at the call site.
 pub const ADMIN_PROPOSAL_EXPIRY_MS: u64 = 30 * 86_400_000;
 
-/// ZEB-792: how far into the FUTURE a peer-minted proposal wall may sit and
-/// still count as live. ±30 minutes, matching
-/// [`REACHABILITY_TIMESTAMP_SKEW_MAX_MS`] and
-/// `friend_intro::INTRODUCTION_MAX_FORWARD_SKEW_MS` — enough for ordinary
-/// device drift, far short of a usable expiry bypass.
-///
-/// Why a bound is needed at all: expiry is measured as
-/// `now_ms.saturating_sub(e.at.wall_ms)`, and `e.at.wall_ms` is minted by the
-/// *proposing peer* — the party the window exists to constrain. Any future
-/// stamp saturates the subtraction to `0`, and `0 <= EXPIRY` always holds, so
-/// without a forward bound a peer picks its own expiry by picking its own
-/// clock. The codebase already bounds every other peer-supplied stamp in both
-/// directions (`community_relay_announce::fresh_relay_entry`,
-/// `friend_intro`); this constant closes the one gap.
-///
-/// ZEB-790 (bounded adoption): the `now_ms` side is peer-influenced by at
-/// most `hlc_adopt_floor::HLC_ADOPT_FORWARD_CAP_MS` ms — verified peers can
-/// pull this device's minted wall forward up to the cap, never further
-/// (`merged_now = max(now, min(floor, now + CAP)) ≤ now + CAP`; the `+1` in
-/// the stored floor is absorbed by the clamp, so the effective forward pull
-/// is exactly CAP, not CAP + 1 — see hlc_adopt_floor.rs). The effective
-/// forward bound is therefore 30 min + CAP (~0.3% weakening), which the
-/// `adopt_cap_stays_far_below_consumer_budgets` test pins.
-pub const ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS: u64 = 30 * 60 * 1000;
+/// ZEB-846: unified onto the house control-tier ceiling. Retained as a named
+/// alias for the planner filter and the two planner boundary tests; the value
+/// is now 5 min, not 30. Delete once no external reference remains.
+pub const ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS: u64 = crate::clock_trust::MAX_FORWARD_SKEW_MS;
 
 /// ZEB-321 RCH4: maximum allowed skew (ms) between a
 /// ReachabilityAnnounce payload's `announced_at_ms` and the event's
@@ -6015,7 +5995,7 @@ pub(crate) fn plan_admin_proposal_auto_exec<'a>(
         // and suppresses every legitimate replacement for this (target, level).
         .filter(|e| {
             now_ms.saturating_sub(e.at.wall_ms) <= ADMIN_PROPOSAL_EXPIRY_MS
-                && e.at.wall_ms.saturating_sub(now_ms) <= ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS
+                && e.at.wall_ms.saturating_sub(now_ms) <= crate::clock_trust::MAX_FORWARD_SKEW_MS
         })
         .min_by_key(|e| e.id);
 
