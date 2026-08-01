@@ -835,14 +835,14 @@ describe('FileManagerService', () => {
     ]);
   });
 
-  it('listReceivedGrants falls back to the address when displayName is null', async () => {
+  it('listReceivedGrants falls back to a TRUNCATED address when displayName is null (ZEB-785)', async () => {
     const svc = new FileManagerService();
     const { adapter } = adapterWith({
       list_content: [],
       list_received_grants: [
         {
           cid: 'ab',
-          granterAddress: 'cd',
+          granterAddress: '2e9a2151303c23ed8630301147057e18', // full 32-char owner hex
           displayName: null,
           fileName: 'q.pdf',
           fileSize: 9,
@@ -855,7 +855,32 @@ describe('FileManagerService', () => {
 
     const rows = await svc.listReceivedGrants();
 
-    expect(rows[0].granterDisplay).toBe('cd');
+    // Not the 32-char wall the bug rendered mid-sentence — a short id chip.
+    expect(rows[0].granterDisplay).toBe('2e9a2151…');
+    expect(rows[0].granterDisplay).not.toContain('303c23ed');
+  });
+
+  it('listReceivedGrants treats an empty/blank displayName as absent (ZEB-785)', async () => {
+    const svc = new FileManagerService();
+    const { adapter } = adapterWith({
+      list_content: [],
+      list_received_grants: [
+        {
+          cid: 'ab',
+          granterAddress: '2e9a2151303c23ed8630301147057e18',
+          displayName: '   ', // a peer may publish a whitespace-only card name
+          fileName: 'q.pdf',
+          fileSize: 9,
+          mime: 'application/pdf',
+          receivedAt: 5,
+        },
+      ],
+    });
+    await svc.connectAdapter(adapter);
+
+    const rows = await svc.listReceivedGrants();
+
+    expect(rows[0].granterDisplay).toBe('2e9a2151…');
   });
 
   it('listReceivedGrants propagates an IPC error (never swallows to [])', async () => {

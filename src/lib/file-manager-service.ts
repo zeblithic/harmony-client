@@ -19,6 +19,8 @@ import {
   mockPublishedContent,
   mockCleanupRecommendations,
 } from './mock-file-data';
+import { nonEmpty } from './display-label';
+import { shortId } from './short-addr';
 
 /** Wire format for content availability announcements from the Rust backend. */
 export interface ContentAnnouncementEvent {
@@ -521,7 +523,10 @@ export class FileManagerService {
     return rows.map((r) => ({
       cid: r.cid,
       granterAddress: r.granterAddress,
-      granterDisplay: r.displayName ?? r.granterAddress,
+      // ZEB-785: a present, non-blank name wins; otherwise fall back to a
+      // truncated owner hex (the FriendsPanel/DelegationWidget convention for
+      // people), never the full 32-char address mid-sentence.
+      granterDisplay: nonEmpty(r.displayName) ?? shortId(r.granterAddress),
       fileName: r.fileName,
       fileSize: r.fileSize,
       mime: r.mime,
