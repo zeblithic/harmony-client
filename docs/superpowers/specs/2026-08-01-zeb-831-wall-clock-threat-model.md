@@ -144,10 +144,19 @@ reachability (who can mount it) × recoverability.
 `BS` backup-staleness banner never clears (`backup_state.rs:69`).
 
 ### NEEDS-VERIFICATION (resolve before ticketing)
-- **RR** `community_membership.rs:3113` — can a recovery-rotation author future-date `at` to clear the
-  48 h ZEB-212 finality window early? Does a later-arriving veto (sorting *before* the future rotation)
-  re-materialize to `Vetoed` and retract the derived kick, or is the epoch rotation already
-  irreversibly applied by the deposed admin's devices? **If not self-healing → CRITICAL.**
+- **RR — RESOLVED (real; HIGH; closed by the §6.1 ingest gate).** `community_membership.rs:3113`.
+  ZEB-714 (PR #498 R1) made the 48 h finality margin a CRDT invariant via
+  `event.at.wall_ms > deadline + RECOVERY_ROTATION_FINALITY_MS` — but the gate reads the **rotation
+  author's own** (peer-supplied) `at.wall_ms`. A malicious recovery designate stamps the rotation
+  `deadline + 48 h + 1` while real-time is `deadline + 1`, clearing the late-veto window early (the
+  "hasty/malicious build authors the irreversible follow-on at deadline+1" case the code comment says
+  F exists to prevent). **Self-heals at the membership layer** — a late veto has
+  `wall ≤ deadline < rotation.wall`, sorts before the rotation, and re-materialize retracts the derived
+  kick — but the **irreversible epoch-key advance already happened** in the pre-veto window (messages
+  re-encrypted to the new epoch; deposed admin excluded until re-keyed). Closed by §6.1: a
+  `now + MAX_FORWARD_SKEW_MS` (5 min) bound at ingest rejects a rotation stamped 48 h ahead, so F
+  can only be cleared by real elapsed time. Fold into **T-GOV**; the implementer should also confirm
+  whether the epoch advance itself is retracted on the veto-driven re-materialize or is a residual.
 - **B7** `iroh_invite_acceptor` open-join has no pre-auth tier-1 limiter — unbounded pre-consent crypto
   per connection (ZEB-700 class) + one attacker can exhaust the global 20/60 s budget (raises B1).
   Deliberate capacity limit or unswept ZEB-694/700 sibling?
