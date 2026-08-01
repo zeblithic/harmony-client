@@ -85,10 +85,16 @@
     (polls ?? [])
       .filter((p) => p.stage === 'fi')
       .slice()
+      // Newest-first (descending), matching the backend list order
+      // (`voting_list_tier3_polls` sorts `Reverse(poll_create_hlc)`) and the
+      // Tier3ProposalPanel, which renders that backend order un-re-sorted. The
+      // full (wall, logical, deviceId) tuple makes the tie-break deterministic
+      // (ZEB-790); the direction is aligned so the same polls never render in
+      // opposite orders across panels. `compareHlc(b, a)` = descending.
       .sort((a, b) =>
         compareHlc(
-          { wallMs: a.pollCreateHlcMs, logical: a.pollCreateHlcLogical ?? 0, deviceId: a.pollCreateHlcDeviceId ?? '' },
           { wallMs: b.pollCreateHlcMs, logical: b.pollCreateHlcLogical ?? 0, deviceId: b.pollCreateHlcDeviceId ?? '' },
+          { wallMs: a.pollCreateHlcMs, logical: a.pollCreateHlcLogical ?? 0, deviceId: a.pollCreateHlcDeviceId ?? '' },
         ),
       ),
   );
