@@ -285,6 +285,9 @@ struct EngineShared {
     /// notification, not a correctness requirement, so skipping it in
     /// tests is safe.
     app_handle: Option<std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>>,
+    /// ZEB-845: node-wide bounded-adoption floor (see `hlc_adopt_floor` module
+    /// docs). Read at `next_hlc_mint`, fed at the inbound mint-root apply.
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
 }
 
 /// Mint Phase 2 sync engine. Mirrors owner_state_sync's shape.
@@ -391,6 +394,9 @@ impl MintSyncEngine {
             sync_state: sync_state.clone(),
             sync_state_path: None,
             app_handle: None,
+            // ZEB-845: test constructors default to a fresh (empty/identity)
+            // floor. Production wires the real node-wide handle via `new`.
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         };
         let dirty_for_task = dirty.clone();
         let handle = tokio::spawn(internal_task(
@@ -436,6 +442,7 @@ impl MintSyncEngine {
         subscriber_rx: mpsc::Receiver<Vec<u8>>,
         debounce_ms: u64,
         app_handle: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+        adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     ) -> (Self, MintSyncEngineHandle) {
         let dirty = Arc::new(Notify::new());
         let (flush_tx, flush_rx) = mpsc::channel::<()>(4);
@@ -446,6 +453,8 @@ impl MintSyncEngine {
             sync_state: sync_state.clone(),
             sync_state_path: Some(sync_state_path.clone()),
             app_handle: Some(app_handle),
+            // ZEB-845: node-wide bounded-adoption floor.
+            adopt_floor,
         };
         let dirty_for_task = dirty.clone();
         let handle = tokio::spawn(internal_task_zenoh(
@@ -884,6 +893,7 @@ async fn internal_task_zenoh(
                     &keys,
                     &device_id,
                     &publisher_tx,
+                    &shared.adopt_floor,
                 )
                 .await
                 {
@@ -900,6 +910,7 @@ async fn internal_task_zenoh(
                     &keys,
                     &device_id,
                     &publisher_tx,
+                    &shared.adopt_floor,
                 )
                 .await
                 {
@@ -954,6 +965,7 @@ async fn internal_task_zenoh(
                     &keys,
                     &device_id,
                     &publisher_tx,
+                    &shared.adopt_floor,
                 )
                 .await
                 {
@@ -971,12 +983,17 @@ async fn internal_task_zenoh(
 async fn next_hlc_mint(
     sync_state: &Arc<TokioMutex<MintSyncState>>,
     device_id: &str,
+    floor: &crate::hlc_adopt_floor::HlcAdoptFloor, // ZEB-845
 ) -> crate::owner_state_types::Hlc {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let wall_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    // ZEB-845: bounded causal adoption — clamp local wall up to a verified
+    // remote wall (≤ CAP), same as the other mint seams.
+    let wall_ms = floor.merged_now(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    );
     let mut st = sync_state.lock().await;
     let prev = st.replay_tracker.get(device_id).cloned();
     let (logical, prev_wall) = match prev.as_ref() {
@@ -996,6 +1013,7 @@ async fn next_hlc_mint(
 }
 
 /// Encrypt and publish the current mint snapshot. Called by internal_task_zenoh.
+#[allow(clippy::too_many_arguments)]
 async fn publish_root_now_zenoh(
     mint_db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
     content_store: &Arc<dyn crate::content_store::ContentStore>,
@@ -1004,6 +1022,7 @@ async fn publish_root_now_zenoh(
     keys: &FleetKeySet,
     device_id: &str,
     publisher_tx: &mpsc::Sender<Vec<u8>>,
+    adopt_floor: &crate::hlc_adopt_floor::HlcAdoptFloor, // ZEB-845
 ) -> Result<(), MintSyncError> {
     // 1. Snapshot the DB.
     let mint_db_c = mint_db.clone();
@@ -1055,7 +1074,7 @@ async fn publish_root_now_zenoh(
         .map_err(|e| MintSyncError::Other(format!("content_store.put: {e}")))?;
 
     // 6. Build state-root payload with a fresh HLC.
-    let at = next_hlc_mint(sync_state, device_id).await;
+    let at = next_hlc_mint(sync_state, device_id, adopt_floor).await;
     let payload = crate::mint_sync_types::MintRootPublishPayload { root_cid, at };
     let mut payload_bytes = Vec::new();
     ciborium::into_writer(&payload, &mut payload_bytes)
@@ -1240,6 +1259,10 @@ async fn handle_incoming_publish_zenoh(
         let mut st = sync_state.lock().await;
         st.replay_tracker
             .insert(payload.at.device_id.clone(), payload.at.clone());
+        // ZEB-845: verified sibling mint-root — feed the adoption floor after
+        // the replay-tracker advance (step 6). Every earlier `?`/echo-suppress/
+        // replay-skip return leaves the floor untouched.
+        shared.adopt_floor.observe(payload.at.wall_ms);
         let st_snap = st.clone();
         let path = sync_state_path.to_path_buf();
         match tokio::task::spawn_blocking(move || crate::mint_sync_persist::save(&path, &st_snap))
@@ -1787,6 +1810,19 @@ mod tests {
     fn retry_test_shared_with(
         content_store: Arc<dyn crate::content_store::ContentStore>,
     ) -> (EngineShared, FleetKeySet) {
+        // ZEB-845: default to a fresh (empty/identity) floor — callers that
+        // need to observe the feed use retry_test_shared_with_floor below.
+        retry_test_shared_with_floor(content_store, crate::hlc_adopt_floor::HlcAdoptFloor::new())
+    }
+
+    /// ZEB-845: variant of `retry_test_shared_with` that threads a
+    /// caller-supplied adoption floor, so a test can observe `.observe()`
+    /// calls fed by the inbound zenoh path via the SAME `EngineShared` the
+    /// engine uses (rather than inventing parallel construction machinery).
+    fn retry_test_shared_with_floor(
+        content_store: Arc<dyn crate::content_store::ContentStore>,
+        adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
+    ) -> (EngineShared, FleetKeySet) {
         let keys = FleetKeySet::new(Arc::new(
             crate::owner_state_crypto::KeyTree::derive_at_epoch(&[7u8; 32], 0).expect("derive"),
         ));
@@ -1796,6 +1832,7 @@ mod tests {
             sync_state: Arc::new(TokioMutex::new(MintSyncState::default())),
             sync_state_path: None,
             app_handle: None,
+            adopt_floor,
         };
         (shared, keys)
     }
@@ -1962,6 +1999,263 @@ mod tests {
                 "{deterministic:?} must NOT retry — the same bytes fail the same way"
             );
         }
+    }
+
+    // ---- ZEB-845: wire MintSyncEngine to the shared HLC adoption floor ----
+
+    /// ZEB-845: build a valid encrypted root-publish envelope whose blob IS
+    /// present in `content_store` — the "verified inbound apply" condition
+    /// the adoption-floor feed gates on. Mirrors the encode/encrypt/put
+    /// sequence in `publish_root_now_zenoh` steps 2-6, but lets the caller
+    /// pick the sibling `device_id` and `wall_ms` directly (rather than
+    /// minting them), so tests can control echo-suppression and the fed
+    /// value precisely.
+    async fn verified_sibling_root_wire(
+        keys: &FleetKeySet,
+        content_store: &Arc<dyn crate::content_store::ContentStore>,
+        device_id: &str,
+        wall_ms: u64,
+    ) -> Vec<u8> {
+        let snap = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![],
+            transactions: vec![],
+            settings: vec![],
+            account_deletion_floor: HashMap::new(),
+            captured_at: "2026-08-01T00:00:00Z".into(),
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&snap, &mut cbor).expect("cbor encode");
+        let kt = keys.newest();
+        let lookup = crate::owner_state_crypto::space_lookup_key(&kt, b"mint-ledger-v1");
+        let ciphertext =
+            crate::owner_state_crypto::encrypt_entry(&kt, &lookup, &cbor).expect("encrypt entry");
+        let root_cid =
+            crate::owner_state_types::ContentId::from_bytes(blake3::hash(&ciphertext).into());
+        content_store
+            .put(root_cid, ciphertext)
+            .await
+            .expect("content_store put");
+
+        let payload = crate::mint_sync_types::MintRootPublishPayload {
+            root_cid,
+            at: crate::owner_state_types::Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: device_id.into(),
+            },
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).expect("payload encode");
+        crate::owner_state_crypto::encrypt_root_publish(&kt, &payload_bytes)
+            .expect("encrypt envelope")
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// A verified sibling mint-root apply (decrypt + decode + merge + record
+    /// all succeed) must feed the node-wide adoption floor with the
+    /// envelope's `at.wall_ms` — mirrors the community/channel-log/fleet
+    /// feed sites (ZEB-790 §A).
+    #[tokio::test]
+    async fn verified_mint_root_apply_feeds_adopt_floor() {
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let cs: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let (shared, keys) = retry_test_shared_with_floor(cs.clone(), floor.clone());
+
+        let now = now_ms();
+        let remote_wall = now + 2_000; // ahead of now, inside the 5000ms CAP
+        let wire = verified_sibling_root_wire(&keys, &cs, "remote-dev", remote_wall).await;
+
+        handle_incoming_publish_zenoh(
+            &wire,
+            &shared,
+            &keys,
+            "local-dev",
+            std::path::Path::new("/nonexistent"),
+        )
+        .await
+        .expect("verified sibling root must apply cleanly");
+
+        assert_eq!(
+            floor.merged_now(now),
+            remote_wall + 1,
+            "verified mint-root apply must feed the adoption floor",
+        );
+    }
+
+    /// Mint-side: once the floor has observed a high remote wall, a local
+    /// `next_hlc_mint` call adopts it (clamped within the CAP) rather than
+    /// minting off the raw local wall clock.
+    #[tokio::test]
+    async fn mint_after_observe_clamps_within_cap() {
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let sync_state = Arc::new(TokioMutex::new(MintSyncState::default()));
+
+        let remote_wall = now_ms() + 3_000;
+        floor.observe(remote_wall);
+
+        let minted = next_hlc_mint(&sync_state, "local-dev", &floor).await;
+        assert!(
+            minted.wall_ms > remote_wall,
+            "local mint must adopt the fed remote wall: got {}, expected > {}",
+            minted.wall_ms,
+            remote_wall,
+        );
+    }
+
+    /// Regression: mint-state row merge resolves purely by per-row
+    /// `updated_at` LWW (`upsert_account_lww`). Feeding the adoption floor
+    /// from the envelope's `at.wall_ms` must NOT leak into that comparison —
+    /// a "poisoned" (far-future) envelope wall must not make a stale remote
+    /// row win.
+    #[tokio::test]
+    async fn poisoned_envelope_wall_does_not_affect_row_merge_lww() {
+        let mut conn = fresh_db();
+        seed_account(&mut conn, "a1", "Local Wins", "2026-06-01T00:00:00Z");
+        let mint_db = Arc::new(std::sync::Mutex::new(conn));
+        let cs: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let keys = FleetKeySet::new(Arc::new(
+            crate::owner_state_crypto::KeyTree::derive_at_epoch(&[7u8; 32], 0).expect("derive"),
+        ));
+        let shared = EngineShared {
+            mint_db: mint_db.clone(),
+            content_store: cs.clone(),
+            sync_state: Arc::new(TokioMutex::new(MintSyncState::default())),
+            sync_state_path: None,
+            app_handle: None,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+        };
+
+        // Remote row is OLDER than local — must lose per-row LWW.
+        let remote_snap = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![AccountRow {
+                id: "a1".into(),
+                name: "Remote Should Lose".into(),
+                created_at: "2026-05-01T00:00:00Z".into(),
+                updated_at: "2026-05-01T00:00:00Z".into(),
+            }],
+            transactions: vec![],
+            settings: vec![],
+            account_deletion_floor: HashMap::new(),
+            captured_at: "2026-05-01T00:00:00Z".into(),
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&remote_snap, &mut cbor).unwrap();
+        let kt = keys.newest();
+        let lookup = crate::owner_state_crypto::space_lookup_key(&kt, b"mint-ledger-v1");
+        let ciphertext = crate::owner_state_crypto::encrypt_entry(&kt, &lookup, &cbor).unwrap();
+        let root_cid =
+            crate::owner_state_types::ContentId::from_bytes(blake3::hash(&ciphertext).into());
+        cs.put(root_cid, ciphertext).await.unwrap();
+
+        // Envelope `at.wall_ms` is "poisoned": far in the future, well past
+        // anything the row-level LWW should ever see.
+        let payload = crate::mint_sync_types::MintRootPublishPayload {
+            root_cid,
+            at: crate::owner_state_types::Hlc {
+                wall_ms: 9_999_999_999_000,
+                logical: 0,
+                device_id: "remote-dev".into(),
+            },
+        };
+        let mut payload_bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut payload_bytes).unwrap();
+        let wire = crate::owner_state_crypto::encrypt_root_publish(&kt, &payload_bytes).unwrap();
+
+        handle_incoming_publish_zenoh(
+            &wire,
+            &shared,
+            &keys,
+            "local-dev",
+            std::path::Path::new("/nonexistent"),
+        )
+        .await
+        .expect("verified apply must succeed");
+
+        let name: String = mint_db
+            .lock()
+            .unwrap()
+            .query_row("SELECT name FROM accounts WHERE id = 'a1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            name, "Local Wins",
+            "row merge must resolve by per-row updated_at LWW, not the envelope's poisoned wall_ms"
+        );
+    }
+
+    /// Rejection-inert #1: an echo-suppressed inbound root (own device_id,
+    /// step 2) returns before the floor feed at step 6 and must not move it.
+    #[tokio::test]
+    async fn echo_suppressed_inbound_root_does_not_feed_adopt_floor() {
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let cs: Arc<dyn crate::content_store::ContentStore> =
+            Arc::new(crate::content_store::InMemoryStub::default());
+        let (shared, keys) = retry_test_shared_with_floor(cs.clone(), floor.clone());
+
+        let remote_wall = now_ms() + 2_000;
+        // device_id == the receiver's own id => echo-suppressed at step 2.
+        let wire = verified_sibling_root_wire(&keys, &cs, "local-dev", remote_wall).await;
+
+        handle_incoming_publish_zenoh(
+            &wire,
+            &shared,
+            &keys,
+            "local-dev",
+            std::path::Path::new("/nonexistent"),
+        )
+        .await
+        .expect("echo-suppression returns Ok(()), not an error");
+
+        assert_eq!(
+            floor.merged_now(0),
+            0,
+            "an echo-suppressed inbound root must not feed the adoption floor"
+        );
+    }
+
+    /// Rejection-inert #2: a CAS-miss (step 4, `MissingBlob`) returns `Err`
+    /// before the merge/apply and before the floor feed at step 6 — reuses
+    /// the existing ZEB-805 `absent_blob_wire` fixture rather than inventing
+    /// new machinery.
+    #[tokio::test]
+    async fn cas_miss_inbound_root_does_not_feed_adopt_floor() {
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let (shared, keys) = retry_test_shared_with_floor(
+            Arc::new(crate::content_store::InMemoryStub::default()),
+            floor.clone(),
+        );
+        // absent_blob_wire's at.wall_ms is 1_700_000_000_000 and device_id
+        // "remote-dev" — far ahead of `merged_now(0)`'s baseline, so any
+        // erroneous feed would be unmistakable.
+        let (wire, _absent) = absent_blob_wire(&keys);
+
+        let err = handle_incoming_publish_zenoh(
+            &wire,
+            &shared,
+            &keys,
+            "local-dev",
+            std::path::Path::new("/nonexistent"),
+        )
+        .await
+        .expect_err("a CAS miss must surface as an error, not a silent success");
+        assert!(matches!(err, MintSyncError::MissingBlob(_)));
+
+        assert_eq!(
+            floor.merged_now(0),
+            0,
+            "a CAS-miss (rejected before the merge+feed) must not feed the adoption floor"
+        );
     }
 
     #[tokio::test]
