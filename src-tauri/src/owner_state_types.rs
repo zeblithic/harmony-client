@@ -332,6 +332,17 @@ where
 /// freshness) tolerate the cap by construction — the
 /// `adopt_cap_stays_far_below_consumer_budgets` test pins the margins.
 ///
+/// **Scope of guarantee (2).** Adoption is wired at the mint seams fed by
+/// the community-state, channel-log, and fleet-doc accept paths (spec §4).
+/// Two mint/sync seams are **not yet wired** and retain per-device
+/// monotonicity (1) only: the tier-3 voting-inbound accept (ZEB-843) and the
+/// owner mint-state-root sync `MintSyncEngine` (ZEB-845). For those, (2) does
+/// not hold — but neither orders cross-device by the un-adopted HLC (voting
+/// uses epoch cuts; the `MintRootPublishPayload` envelope HLC drives only
+/// per-device replay tracking, mint-state content merging by per-row
+/// `updated_at` LWW), so this is a bounded consistency gap, not a
+/// merge-correctness bug.
+///
 /// Field declaration order is **load-bearing twice over**: it fixes the
 /// locked wire order above, and the derived [`Ord`] is lexicographic in
 /// declaration order, which is exactly the ZEB-211 "strictly newer"
