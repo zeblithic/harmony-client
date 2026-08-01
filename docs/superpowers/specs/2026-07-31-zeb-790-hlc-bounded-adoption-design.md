@@ -127,6 +127,11 @@ returns before reaching it, exactly as rejections cannot advance the replay wate
   nudge surface from "community members + own fleet" to *any friend*, and DM thread
   ordering is driven by locally-minted `received_at`, so the causal payoff is small.
   Revisit if cross-participant DM ordering becomes a surface.
+- **Tier-3 voting inbound** (`community_voting_log_engine.rs`'s `process_inbound_packet`) —
+  a verified accept path of the same trust class as the channel-log feed, NOT fed in
+  v1 (surfaced by the final branch review). Consequence: the §6 lockout side-benefit
+  engages only when the skewed peer's clock is learned via a fed path; a voting-only
+  interaction retains today's `HlcNotMonotonic` behavior. Follow-up: ZEB-843.
 - Unverified/synthetic stamps of any kind (pkarr-derived, payload-claimed).
 
 ## 5. Mint seams (read side)
@@ -188,6 +193,8 @@ type and break ~50 hex fixture pins; mint *values* are pinned nowhere).
 shrinks from `skew` to `max(0, skew − CAP)` — for ordinary skew it vanishes — and the
 clamp converts the previously **unbounded** accepted-future-stamp clock-drag
 (`community_voting_log_engine.rs:1249` acknowledges the hazard) into a ≤ CAP nudge.
+Caveat (ZEB-843): this engages only when the skewed peer's clock was learned via a
+fed path (§4) — the voting inbound path itself does not feed the floor in v1.
 
 ## 7. UI layer — deterministic ties
 
@@ -264,7 +271,9 @@ Client-only — the upstream 10-crate lockstep rev does not move.
 ## 11. Security summary
 
 - **Nudge surface:** community members with valid enrolment (Ed25519-bound), channel
-  authors (same), and own fleet siblings (AEAD). No anonymous or unverified path feeds
+  authors (same), and own fleet siblings (AEAD; the `fleet_sync.rs` feed fires from every fleet-doc
+  engine — owner-state, notes, relay-hold, trust, quorum, etc. — all the same
+  own-fleet trust class). No anonymous or unverified path feeds
   the floor.
 - **Worst-case malicious influence:** a verified member stamping far-future drags every
   adopter's mints forward by **at most CAP against each device's own clock**,
