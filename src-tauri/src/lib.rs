@@ -53408,6 +53408,10 @@ pub struct DeliberationStatementExport {
     pub author: String,               // 32-char hex (OwnerAddr is 16 bytes)
     pub text: String,
     pub created_at_hlc_ms: i128,
+    // ZEB-790: full HLC tuple so the UI can order deterministically
+    // (wallMs alone ties on same-ms stamps — the ZEB-244 lesson).
+    pub created_at_hlc_logical: u32,
+    pub created_at_hlc_device_id: String,
     pub agree_count: u16,
     pub disagree_count: u16,
     pub pass_count: u16,
@@ -53435,6 +53439,10 @@ pub struct Tier3PollExport {
     /// HLC of PollCreate in ms since UNIX_EPOCH (whatever the HLC's
     /// wall-clock projection resolves to).
     pub poll_create_hlc_ms: i128,
+    // ZEB-790: full HLC tuple so the UI can order deterministically
+    // (wallMs alone ties on same-ms stamps — the ZEB-244 lesson).
+    pub poll_create_hlc_logical: u32,
+    pub poll_create_hlc_device_id: String,
     pub sortition_size: u16,
     pub deliberation_window_seconds: u32,
     pub drafting_window_seconds: u32,
@@ -53499,6 +53507,10 @@ pub struct Tier3PollSummary {
     pub proposer: String,
     pub stage: Tier3StageTag,
     pub poll_create_hlc_ms: i128,
+    // ZEB-790: full HLC tuple so the UI can order deterministically
+    // (wallMs alone ties on same-ms stamps — the ZEB-244 lesson).
+    pub poll_create_hlc_logical: u32,
+    pub poll_create_hlc_device_id: String,
     pub sortition_size: u16,
     /// Set once stage = Finalized; lets the panel show "Charter §3
     /// amended" without an extra fetch.
@@ -56039,6 +56051,8 @@ fn build_tier3_export(
                 author: hex::encode(s.author.0),
                 text: s.text.clone(),
                 created_at_hlc_ms: s.created_at_hlc.wall_ms as i128,
+                created_at_hlc_logical: s.created_at_hlc.logical,
+                created_at_hlc_device_id: s.created_at_hlc.device_id.clone(),
                 agree_count: a,
                 disagree_count: d,
                 pass_count: p,
@@ -56090,6 +56104,8 @@ fn build_tier3_export(
         proposer: hex::encode(t3.meta.proposer.0),
         stage: effective_stage.into(),
         poll_create_hlc_ms: t3.meta.poll_create_hlc.wall_ms as i128,
+        poll_create_hlc_logical: t3.meta.poll_create_hlc.logical,
+        poll_create_hlc_device_id: t3.meta.poll_create_hlc.device_id.clone(),
         sortition_size: t3.meta.config.sortition_size,
         deliberation_window_seconds: t3.meta.config.deliberation_window_seconds,
         drafting_window_seconds: t3.meta.config.drafting_window_seconds,
@@ -56212,13 +56228,26 @@ async fn voting_list_tier3_polls_raw(
                 proposer: hex::encode(t3.meta.proposer.0),
                 stage: effective_stage.into(),
                 poll_create_hlc_ms: t3.meta.poll_create_hlc.wall_ms as i128,
+                poll_create_hlc_logical: t3.meta.poll_create_hlc.logical,
+                poll_create_hlc_device_id: t3.meta.poll_create_hlc.device_id.clone(),
                 sortition_size: t3.meta.config.sortition_size,
                 winner_text,
                 privacy_mode: t3.meta.config.privacy_mode.clone(),
             })
         })
         .collect();
-    summaries.sort_by_key(|s| std::cmp::Reverse(s.poll_create_hlc_ms));
+    summaries.sort_by(|a, b| {
+        (
+            b.poll_create_hlc_ms,
+            b.poll_create_hlc_logical,
+            &b.poll_create_hlc_device_id,
+        )
+            .cmp(&(
+                a.poll_create_hlc_ms,
+                a.poll_create_hlc_logical,
+                &a.poll_create_hlc_device_id,
+            ))
+    });
     Ok(summaries)
 }
 
