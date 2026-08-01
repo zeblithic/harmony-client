@@ -2743,6 +2743,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         membership_resolver: Option<
             &Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>,
         >,
+        floor: &crate::hlc_adopt_floor::HlcAdoptFloor,
         packet: &[u8],
     ) -> Result<Option<(SignedVotingEvent, PollId)>, String> {
         // Decode.
@@ -2805,6 +2806,13 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             let mut tracker = tracker.lock().await;
             tracker.record(&event);
         }
+
+        // ZEB-843: feed the adoption floor ONLY here — after verify (V6
+        // membership + Ed25519) + apply + record all succeeded. Every earlier
+        // `?`/`return` on a rejection (decode, dedup, absent resolver, verify,
+        // eligibility, apply) leaves the floor untouched — the same
+        // rejection-inert discipline as the three ZEB-790 feed sites.
+        floor.observe(event.hlc.wall_ms);
 
         Ok(Some((event, applied_poll_id)))
     }
@@ -2872,6 +2880,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             let mut tracker = self.tracker.lock().await;
             tracker.record(&event);
         }
+
+        // ZEB-843: same trust class as process_inbound (verified + applied +
+        // recorded), so feed the floor here too — keeps the two voting-inbound
+        // accept twins symmetric.
+        self.adopt_floor.observe(event.hlc.wall_ms);
 
         // ZEB-718: persist the recovered event so it survives restart.
         self.persist_now().await;
@@ -2959,6 +2972,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             &self.tracker,
             self.identity_resolver.as_ref(),
             self.membership_resolver.as_ref(),
+            &self.adopt_floor, // ZEB-843
             packet,
         )
         .await?;
@@ -3302,12 +3316,18 @@ pub async fn process_inbound_for_test(
     // the Some/None distinction back to `Result<(), String>` so
     // existing integration tests which assert `is_ok()` / `is_err()`
     // / `unwrap_err()` continue to work without change.
+    //
+    // ZEB-843: default to a fresh (identity) floor so existing callers
+    // need no change — feed behavior is exercised via the engine path
+    // (`process_inbound_dispatch`), not this test shim.
+    let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
     VotingLogEngine::<tauri::Wry>::process_inbound(
         community_id,
         voting_log,
         tracker,
         identity_resolver,
         membership_resolver,
+        &floor,
         packet,
     )
     .await
@@ -3507,11 +3527,16 @@ mod tests {
     /// Start a minimal production-wired engine whose only member is
     /// `owner` (power 10), sharing `voting_log` with the caller so it can
     /// assert on the materialized state.
+    ///
+    /// ZEB-843: takes a caller-supplied `adopt_floor` (rather than always
+    /// building a fresh one internally) so feed tests can observe the SAME
+    /// floor handle the engine's `apply_backfilled_event` writes to.
     async fn start_backfill_test_engine(
         community_id: SpaceId,
         owner: OwnerAddr,
         pub64: [u8; 64],
         voting_log: Arc<Mutex<VotingLog>>,
+        adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     ) -> Arc<VotingLogEngine<tauri::test::MockRuntime>> {
         let mut members = HashMap::new();
         members.insert(
@@ -3538,7 +3563,7 @@ mod tests {
             publisher_tx,
             subscriber_rx,
             hlc_tracker: None,
-            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            adopt_floor,
             device_id: None,
             app_handle: Some(app.handle().clone()),
             identity_resolver: Some(id_resolver),
@@ -3553,7 +3578,14 @@ mod tests {
         let (key, owner, pub64) = fixture_identity_engine(0x71);
         let voting_log = Arc::new(Mutex::new(VotingLog::new()));
         let engine =
-            start_backfill_test_engine(community_id, owner, pub64, Arc::clone(&voting_log)).await;
+            start_backfill_test_engine(
+                community_id,
+                owner,
+                pub64,
+                Arc::clone(&voting_log),
+                crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            )
+            .await;
 
         let packet = encode_event(&signed_poll_create(&key, owner, "dev", 1_000));
 
@@ -3576,7 +3608,14 @@ mod tests {
         let (key, owner, pub64) = fixture_identity_engine(0x72);
         let voting_log = Arc::new(Mutex::new(VotingLog::new()));
         let engine =
-            start_backfill_test_engine(community_id, owner, pub64, Arc::clone(&voting_log)).await;
+            start_backfill_test_engine(
+                community_id,
+                owner,
+                pub64,
+                Arc::clone(&voting_log),
+                crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            )
+            .await;
 
         // Two independent polls on the SAME device lane; e1 older than e2.
         let e1 = signed_poll_create(&key, owner, "dev", 1_000);
@@ -3622,7 +3661,14 @@ mod tests {
         let (key, owner, pub64) = fixture_identity_engine(0x73);
         let voting_log = Arc::new(Mutex::new(VotingLog::new()));
         let engine =
-            start_backfill_test_engine(community_id, owner, pub64, Arc::clone(&voting_log)).await;
+            start_backfill_test_engine(
+                community_id,
+                owner,
+                pub64,
+                Arc::clone(&voting_log),
+                crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            )
+            .await;
         engine.install_persist_dir(dir.path().to_path_buf());
 
         let ev = signed_poll_create(&key, owner, "dev", 1_000);
@@ -4857,6 +4903,7 @@ mod tests {
             &tracker,
             Some(&id_resolver),
             Some(&mem_resolver),
+            &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             &packet,
         )
         .await;
@@ -4993,6 +5040,7 @@ mod tests {
             &tracker,
             Some(&id_resolver),
             Some(&mem_resolver),
+            &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             &packet,
         )
         .await;
@@ -5013,6 +5061,209 @@ mod tests {
             log.events.len(),
             1,
             "only PollCreate must be in the log; ballot must not have been applied"
+        );
+    }
+
+    // ── ZEB-843: adoption-floor feed from verified voting-inbound accepts ──
+    //
+    // Mirrors the three ZEB-790 feed-site tests (community-state,
+    // channel-log, fleet): a verified + applied + recorded inbound event
+    // must advance the node-wide `HlcAdoptFloor`; a rejected one must not.
+
+    /// A verified, freshly-applied inbound event feeds the floor —
+    /// `process_inbound` calls `floor.observe(event.hlc.wall_ms)`
+    /// immediately after `tracker.record` succeeds. This test passes a
+    /// caller-owned floor and observes the SAME handle advancing, proving
+    /// the feed reaches the caller (not just an internal copy).
+    #[tokio::test]
+    async fn process_inbound_verified_accept_feeds_adopt_floor() {
+        let community_id = SpaceId([0xF4; 16]);
+        let (keypair, actor, pub_64) = fixture_identity_engine(0xF4);
+
+        let resolvers = Arc::new(FixedTestResolvers {
+            identity: HashMap::from([(actor, pub_64)]),
+            snapshot: MembershipSnapshot {
+                members: HashMap::from([(
+                    actor,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )]),
+            },
+        });
+        let id_resolver: Arc<dyn crate::community_voting_core::VotingIdentityResolver> =
+            resolvers.clone();
+        let mem_resolver: Arc<dyn crate::community_voting_log::MembershipSnapshotResolver> =
+            resolvers;
+
+        // "Now" captured ONCE and reused for both the event's remote wall
+        // and the final assertion, so the test has no timing sensitivity
+        // from two independent `SystemTime::now()` reads.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let remote_wall = now_ms + 2_000; // ahead of "now", inside the 5s CAP
+
+        let event = crate::community_voting_core::build_signed_poll_create_tier1(
+            &keypair,
+            actor,
+            &good_tier1_config(),
+            Hlc {
+                wall_ms: remote_wall,
+                logical: 0,
+                device_id: "dev-f4".into(),
+            },
+        )
+        .expect("build event");
+        let packet = encode_event(&event);
+
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let tracker = Arc::new(Mutex::new(VotingReplayTracker::new()));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+
+        let result = VotingLogEngine::<tauri::test::MockRuntime>::process_inbound(
+            community_id,
+            &voting_log,
+            &tracker,
+            Some(&id_resolver),
+            Some(&mem_resolver),
+            &floor,
+            &packet,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "verified accept must succeed; got: {result:?}"
+        );
+
+        // `observe` stores max_observed_wall + 1 (monotone fetch_max), so
+        // `merged_now` at the SAME `now_ms` baseline must reach remote_wall+1.
+        assert_eq!(
+            floor.merged_now(now_ms),
+            remote_wall + 1,
+            "verified voting-inbound accept must feed the adoption floor"
+        );
+    }
+
+    /// A rejected inbound event (bad signature — signed by a key that
+    /// doesn't match the claimed actor) must NOT feed the floor. Every
+    /// earlier `?`/`return` in `process_inbound` sits before the feed
+    /// point, so `verify_voting_event`'s Ed25519 failure must leave the
+    /// floor at its identity value — same rejection-inert discipline as
+    /// the channel-log `rejected_replay_does_not_feed_floor` test (#578).
+    #[tokio::test]
+    async fn process_inbound_rejected_event_does_not_feed_adopt_floor() {
+        let community_id = SpaceId([0xF5; 16]);
+        let (_keypair, actor, pub_64) = fixture_identity_engine(0xF5);
+        let (wrong_keypair, _wrong_actor, _wrong_pub64) = fixture_identity_engine(0xF6);
+
+        let resolvers = Arc::new(FixedTestResolvers {
+            identity: HashMap::from([(actor, pub_64)]),
+            snapshot: MembershipSnapshot {
+                members: HashMap::from([(
+                    actor,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )]),
+            },
+        });
+        let id_resolver: Arc<dyn crate::community_voting_core::VotingIdentityResolver> =
+            resolvers.clone();
+        let mem_resolver: Arc<dyn crate::community_voting_log::MembershipSnapshotResolver> =
+            resolvers;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let remote_wall = now_ms + 2_000;
+
+        // Signed by the WRONG key for `actor` — verify_voting_event's
+        // Ed25519 check must reject this before apply/record ever run.
+        let event = crate::community_voting_core::build_signed_poll_create_tier1(
+            &wrong_keypair,
+            actor,
+            &good_tier1_config(),
+            Hlc {
+                wall_ms: remote_wall,
+                logical: 0,
+                device_id: "dev-f5".into(),
+            },
+        )
+        .expect("build event");
+        let packet = encode_event(&event);
+
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let tracker = Arc::new(Mutex::new(VotingReplayTracker::new()));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+
+        let result = VotingLogEngine::<tauri::test::MockRuntime>::process_inbound(
+            community_id,
+            &voting_log,
+            &tracker,
+            Some(&id_resolver),
+            Some(&mem_resolver),
+            &floor,
+            &packet,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "bad-signature event must be rejected; got Ok"
+        );
+
+        // Floor stays at its identity value: merged_now(now) == now.
+        assert_eq!(
+            floor.merged_now(now_ms),
+            now_ms,
+            "a rejected voting-inbound event must NOT feed the adoption floor"
+        );
+    }
+
+    /// `apply_backfilled_event` is the structurally-identical backfill twin
+    /// of `process_inbound` (same trust class: verified + applied +
+    /// recorded) and feeds the SAME `self.adopt_floor` directly. Proves the
+    /// second ZEB-843 feed site, using the caller-supplied-floor variant of
+    /// `start_backfill_test_engine`.
+    #[tokio::test]
+    async fn apply_backfilled_event_feeds_adopt_floor() {
+        let community_id = SpaceId([0xF6; 16]);
+        let (key, owner, pub64) = fixture_identity_engine(0xF7);
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let engine = start_backfill_test_engine(
+            community_id,
+            owner,
+            pub64,
+            Arc::clone(&voting_log),
+            floor.clone(),
+        )
+        .await;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let remote_wall = now_ms + 2_000;
+
+        let packet = encode_event(&signed_poll_create(&key, owner, "dev-f6", remote_wall));
+
+        let result = engine.apply_backfilled_event(&packet).await;
+        assert!(
+            result.is_ok_and(|r| r.is_some()),
+            "verified backfilled event must apply"
+        );
+
+        assert_eq!(
+            floor.merged_now(now_ms),
+            remote_wall + 1,
+            "a verified apply_backfilled_event accept must feed the adoption floor"
         );
     }
 
