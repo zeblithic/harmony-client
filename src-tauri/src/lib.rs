@@ -946,6 +946,10 @@ pub struct NodeState {
             >,
         >,
     >,
+    /// ZEB-790: bounded causal-adoption floor. Fed by the verified accept
+    /// paths, read by every mint seam. Reset to a fresh floor per
+    /// start_node (session-only — see hlc_adopt_floor.rs module docs).
+    hlc_adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
     /// Local device_id string + self OwnerAddr — captured at start_node
     /// time, snapshot for IPC handlers that mint OutboxEntry / HLC stamps.
     dm_device_id: Option<String>,
@@ -1953,6 +1957,7 @@ impl Default for NodeState {
             butler_deposit_client: None,
             crdt_state: None,
             hlc_tracker: None,
+            hlc_adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             dm_device_id: None,
             dm_self_owner: None,
             owner_keytree: None,
@@ -4423,6 +4428,10 @@ pub async fn start_node_inner(
                 >,
             >,
         > = None;
+        // ZEB-790: fresh adoption floor per node session. Not `Option` —
+        // always a valid (initially empty) floor even if the block below
+        // never runs, matching NodeState.hlc_adopt_floor's non-Option field.
+        let mut adopt_floor_for_state = crate::hlc_adopt_floor::HlcAdoptFloor::new();
         let mut content_store_for_state: Option<
             std::sync::Arc<dyn crate::content_store::ContentStore>,
         > = None;
@@ -5170,6 +5179,8 @@ pub async fn start_node_inner(
                             initial_replay,
                         ),
                     ));
+                    // ZEB-790: fresh adoption floor per node session.
+                    let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
                     // Phase 3b: real harmony-content CAS via RuntimeContentStore.
                     // Sends CasOp messages over cas_op_tx into the harmony-
                     // runtime event loop, which admits/queries through the
@@ -11602,6 +11613,7 @@ pub async fn start_node_inner(
                     keytree_for_state = Some(std::sync::Arc::clone(&kt));
                     crdt_state_for_state = Some(crdt_state);
                     tracker_for_state = Some(tracker);
+                    adopt_floor_for_state = adopt_floor.clone();
                     content_store_for_state = Some(content_store);
                     dm_outbox_arc = Some(outbox);
                     dm_transport_arc = Some(transport);
@@ -12344,6 +12356,7 @@ pub async fn start_node_inner(
                         guard.butler_deposit_client = butler_deposit_client_for_state.clone();
                         guard.crdt_state = crdt_state_for_state.clone();
                         guard.hlc_tracker = tracker_for_state.clone();
+                        guard.hlc_adopt_floor = adopt_floor_for_state.clone();
                         guard.dm_device_id = device_id_for_state.clone();
                         guard.dm_self_owner = self_owner_for_state;
                         guard.owner_keytree = keytree_for_state.clone();
@@ -76670,6 +76683,7 @@ mod start_node_race_tests {
             butler_deposit_client: None,
             crdt_state: None,
             hlc_tracker: None,
+            hlc_adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             dm_device_id: None,
             dm_self_owner: None,
             owner_keytree: None,
