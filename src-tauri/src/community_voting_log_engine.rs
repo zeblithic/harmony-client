@@ -3577,15 +3577,14 @@ mod tests {
         let community_id = SpaceId([0x71; 16]);
         let (key, owner, pub64) = fixture_identity_engine(0x71);
         let voting_log = Arc::new(Mutex::new(VotingLog::new()));
-        let engine =
-            start_backfill_test_engine(
-                community_id,
-                owner,
-                pub64,
-                Arc::clone(&voting_log),
-                crate::hlc_adopt_floor::HlcAdoptFloor::new(),
-            )
-            .await;
+        let engine = start_backfill_test_engine(
+            community_id,
+            owner,
+            pub64,
+            Arc::clone(&voting_log),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+        )
+        .await;
 
         let packet = encode_event(&signed_poll_create(&key, owner, "dev", 1_000));
 
@@ -3607,15 +3606,14 @@ mod tests {
         let community_id = SpaceId([0x72; 16]);
         let (key, owner, pub64) = fixture_identity_engine(0x72);
         let voting_log = Arc::new(Mutex::new(VotingLog::new()));
-        let engine =
-            start_backfill_test_engine(
-                community_id,
-                owner,
-                pub64,
-                Arc::clone(&voting_log),
-                crate::hlc_adopt_floor::HlcAdoptFloor::new(),
-            )
-            .await;
+        let engine = start_backfill_test_engine(
+            community_id,
+            owner,
+            pub64,
+            Arc::clone(&voting_log),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+        )
+        .await;
 
         // Two independent polls on the SAME device lane; e1 older than e2.
         let e1 = signed_poll_create(&key, owner, "dev", 1_000);
@@ -3660,15 +3658,14 @@ mod tests {
         let community_id = SpaceId([0x73; 16]);
         let (key, owner, pub64) = fixture_identity_engine(0x73);
         let voting_log = Arc::new(Mutex::new(VotingLog::new()));
-        let engine =
-            start_backfill_test_engine(
-                community_id,
-                owner,
-                pub64,
-                Arc::clone(&voting_log),
-                crate::hlc_adopt_floor::HlcAdoptFloor::new(),
-            )
-            .await;
+        let engine = start_backfill_test_engine(
+            community_id,
+            owner,
+            pub64,
+            Arc::clone(&voting_log),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+        )
+        .await;
         engine.install_persist_dir(dir.path().to_path_buf());
 
         let ev = signed_poll_create(&key, owner, "dev", 1_000);
