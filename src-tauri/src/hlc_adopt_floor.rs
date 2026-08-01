@@ -131,4 +131,17 @@ mod tests {
             "Arc-shared: feed via clone visible"
         );
     }
+
+    #[test]
+    fn adopt_cap_stays_far_below_consumer_budgets() {
+        // ZEB-790 spec §6.2. Widening CAP past these relations invalidates
+        // the blast-radius analysis — re-run it before touching this test.
+        // 60_000 = the invite/open-join forward windows
+        // (open_join_admit.rs `now + 60_000`, community_invite.rs same).
+        assert!(HLC_ADOPT_FORWARD_CAP_MS * 12 <= 60_000);
+        assert!(
+            HLC_ADOPT_FORWARD_CAP_MS * 360
+                <= crate::community_membership::ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS
+        );
+    }
 }

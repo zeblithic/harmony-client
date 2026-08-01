@@ -5502,10 +5502,12 @@ pub const ADMIN_PROPOSAL_EXPIRY_MS: u64 = 30 * 86_400_000;
 /// directions (`community_relay_announce::fresh_relay_entry`,
 /// `friend_intro`); this constant closes the one gap.
 ///
-/// Safe because the `now_ms` side is NOT peer-influenced: callers pass this
-/// device's own minted HLC wall, and `reserve_next_hlc_for_device` derives it
-/// from this device's previous stamp alone (ZEB-790). Should that ever change
-/// to merge remote walls, this bound must gain a clamp or it weakens.
+/// ZEB-790 (bounded adoption): the `now_ms` side is peer-influenced by at
+/// most `hlc_adopt_floor::HLC_ADOPT_FORWARD_CAP_MS + 1` ms — verified
+/// peers can pull this device's minted wall forward up to the cap, never
+/// further (see hlc_adopt_floor.rs). The effective forward bound is
+/// therefore 30 min + CAP (~0.3% weakening), which the
+/// `adopt_cap_stays_far_below_consumer_budgets` test pins.
 pub const ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS: u64 = 30 * 60 * 1000;
 
 /// ZEB-321 RCH4: maximum allowed skew (ms) between a
