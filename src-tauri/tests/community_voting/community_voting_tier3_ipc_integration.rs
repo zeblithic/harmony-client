@@ -1228,13 +1228,33 @@ async fn ipc_tier3_engine_auto_kd_cl_kd_rs_deterministic_repeat() {
 /// Also proves LIVENESS: the poll still reaches Stage::Finalized under a
 /// future-walled watermark (the helper's Finalized waits would time out
 /// otherwise).
+///
+/// ZEB-846 interaction: the kd=ss trigger is published via `engine_a` and
+/// BRIDGES to `engine_b` through `process_inbound`, which (post-ZEB-846) now
+/// rejects any inbound event whose `hlc.wall_ms` is beyond
+/// `receiver_now + clock_trust::MAX_FORWARD_SKEW_MS` (5 min) at admission.
+/// The old ~year-33658 (`1e15`) wall is therefore unreachable through
+/// ingestion any more — engine_b would never apply kd=ss and this guard would
+/// hang waiting for `Stage::Finalized`. The bounded worst case a receiver can
+/// actually observe is `now + MAX_FORWARD_SKEW_MS`, so the trigger wall here
+/// is real-now + 2min: comfortably inside the 5-min bound (ACCEPTED at
+/// engine_b) yet far enough above the honest device lane (~real-now) to still
+/// detect a ZEB-731 leak. This keeps proving both (a) liveness — the poll
+/// still finalizes under the bounded worst-case future watermark — and (b)
+/// the ZEB-731 guarantee — the kd=rs mint does not leak that wall into either
+/// engine's shared device lane.
 #[tokio::test]
 async fn ipc_tier3_engine_auto_kd_rs_future_walled_no_device_lane_leak() {
-    // ~year 33658 in ms — far above any real `SystemTime::now()`, so a mint
-    // that floored on this wall is trivially detectable in the device tracker.
-    const FUTURE_WALL: u64 = 1_000_000_000_000_000;
+    // Real-now + 2min: within clock_trust::MAX_FORWARD_SKEW_MS (5min) so the
+    // bridged kd=ss is ACCEPTED at engine_b (post-ZEB-846), yet far enough
+    // above the honest device lane (~real-now) to detect a ZEB-731 leak.
+    let future_wall: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX_EPOCH")
+        .as_millis() as u64
+        + 120_000;
 
-    let (engines, close_hash) = run_race_tolerant_inner(FUTURE_WALL).await;
+    let (engines, close_hash) = run_race_tolerant_inner(future_wall).await;
 
     // Liveness: the poll finalized despite the future-walled watermark.
     assert!(
@@ -1247,12 +1267,12 @@ async fn ipc_tier3_engine_auto_kd_rs_future_walled_no_device_lane_leak() {
     // watermark. kd=cl/kd=sf never touch the device tracker; the fixed kd=rs
     // mints on a poll-derived lane and must not either. So neither engine's own
     // device lane may have been advanced to the future wall. (Under the shipped
-    // wall-clock floor engine_a's lane read >= FUTURE_WALL — the device-wide
+    // wall-clock floor engine_a's lane read >= future_wall — the device-wide
     // leak; engine_a is the kd=ss originator so it deterministically mints its
     // own kd=rs before adopting a peer's.)
     //
     // Post-fix both trackers stay empty for a pu-mode poll (poll-lane kd=rs
-    // touches no device lane; kd=ts is se-mode only), so `< FUTURE_WALL` holds
+    // touches no device lane; kd=ts is se-mode only), so `< future_wall` holds
     // via the `unwrap_or(0)` absent-lane default.
     let lane_wall = |tr: &std::collections::BTreeMap<String, Hlc>, dev: &str| {
         tr.get(dev).map(|h| h.wall_ms).unwrap_or(0)
@@ -1266,14 +1286,14 @@ async fn ipc_tier3_engine_auto_kd_rs_future_walled_no_device_lane_leak() {
         )
     };
     assert!(
-        engine_a_lane_wall < FUTURE_WALL,
+        engine_a_lane_wall < future_wall,
         "ZEB-731: future-walled kd=rs mint leaked into engine_a's shared device \
-         lane — engine-a lane wall {engine_a_lane_wall} >= future {FUTURE_WALL}"
+         lane — engine-a lane wall {engine_a_lane_wall} >= future {future_wall}"
     );
     assert!(
-        engine_b_lane_wall < FUTURE_WALL,
+        engine_b_lane_wall < future_wall,
         "ZEB-731: future-walled kd=rs mint leaked into engine_b's shared device \
-         lane — engine-b lane wall {engine_b_lane_wall} >= future {FUTURE_WALL}"
+         lane — engine-b lane wall {engine_b_lane_wall} >= future {future_wall}"
     );
 
     drop(engines);
