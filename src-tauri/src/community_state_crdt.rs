@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::community_membership::{
-    event_sort_key, materialize, materialize_with_now, verify_event, EventId,
+    event_sort_key, materialize_with_bounds, materialize_with_now, verify_event, EventId,
     MaterializedMembership, SignedMembershipEvent, VerifyContext, VerifyError,
 };
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
@@ -493,7 +493,20 @@ impl CommunityState {
             && cache.cached_admin_addr == Some(admin_addr);
         if !cache_hit {
             let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
-            let m = materialize(&log, admin_addr);
+            // ZEB-846: apply the receiver-`now` forward-skew ceiling. `receiver_now`
+            // is THIS node's own trusted wall clock (never a peer/HLC-adopt value —
+            // the attacker we bound can move those). `None` (pre-epoch clock) ⇒
+            // ceiling disabled (apply-all), so a bad local clock can't drop honest
+            // governance. The floor stays `None` here (event-driven cached view).
+            // Fail-safe under caching: advancing real time only ever *un*-excludes a
+            // future-dated event, and un-exclusion requires a log mutation, which
+            // already busts this version-keyed cache — so a cached `now`-relative
+            // result only ever over-excludes future events, never under-excludes.
+            let receiver_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .ok();
+            let m = materialize_with_bounds(&log, admin_addr, None, receiver_now);
             cache.cached = Some(m.clone());
             cache.cached_version = Some(cache.version);
             cache.cached_admin_addr = Some(admin_addr);
@@ -567,7 +580,14 @@ impl CommunityState {
     /// cache pollution would be undesirable.
     pub fn materialize_now(&self, admin_addr: OwnerAddr) -> MaterializedMembership {
         let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
-        materialize(&log, admin_addr)
+        // ZEB-846: forward-skew ceiling against this node's own wall clock; floor
+        // stays `None` (this is the no-floor uncached read). `None` receiver_now
+        // (pre-epoch clock) ⇒ apply-all.
+        let receiver_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .ok();
+        materialize_with_bounds(&log, admin_addr, None, receiver_now)
     }
 
     /// ZEB-713: time-aware uncached materialization — the accessor every
@@ -589,7 +609,11 @@ impl CommunityState {
         now_ms: u64,
     ) -> MaterializedMembership {
         let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
-        materialize_with_now(&log, admin_addr, Some(now_ms))
+        // ZEB-846: recovery reads pass `wall_now_ms` here — it IS the receiver's
+        // own clock, so it serves as BOTH the aging floor and the forward-skew
+        // ceiling. A future-dated event is excluded before materialize just as in
+        // the cached read.
+        materialize_with_bounds(&log, admin_addr, Some(now_ms), Some(now_ms))
     }
 
     // ── ZEB-748 phase 6a: event-log accessors ──────────────────────────
@@ -812,5 +836,179 @@ mod policy_tests {
             CoreOutcome::Rejected(VerifyError::WrongCommunity)
         ));
         assert_eq!(log.len(), 1);
+    }
+}
+
+// ── ZEB-846 Task 2: forward-skew ceiling in the CommunityState accessors ──
+//
+// The three read accessors (`materialized`, `materialize_now`,
+// `materialized_with_now`) apply a receiver-`now` forward ceiling: an event
+// stamped more than `MAX_FORWARD_SKEW_MS` beyond THIS node's own wall clock is
+// excluded from the view. The exclusion is a live view over the persisted log —
+// non-destructive — so it must survive a persist→reload round-trip WITHOUT any
+// admission layer having filtered the log first.
+#[cfg(test)]
+mod zeb846_accessor_ceiling {
+    use super::*;
+    use crate::community_membership::{MemberStatus, MembershipEventKind};
+    use crate::community_state_persist;
+    use crate::owner_state_types::Hlc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
+
+    const COMMUNITY: SpaceId = SpaceId([0xc0; 16]);
+    const YEAR_MS: u64 = 365 * 86_400_000;
+
+    fn real_now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64
+    }
+
+    fn addr(seed: u8) -> OwnerAddr {
+        OwnerAddr([seed; 16])
+    }
+
+    /// Build a signed-shaped event with a dummy signature. `materialize*` is a
+    /// pure replay that never verifies signatures (see its doc comment), so a
+    /// zero `sig` is sufficient to exercise the accessors' ceiling.
+    fn join_event(id_byte: u8, actor: OwnerAddr, at_wall_ms: u64) -> SignedMembershipEvent {
+        let mut id = [0xfd; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: COMMUNITY,
+            kind: MembershipEventKind::Join,
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    fn kick_event(
+        id_byte: u8,
+        actor: OwnerAddr,
+        target: OwnerAddr,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let mut id = [0xfa; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: COMMUNITY,
+            kind: MembershipEventKind::Kick {
+                target,
+                reason: None,
+            },
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    /// Local "is `a` an active member of the view" read — mirrors the
+    /// `mat.members.get(&addr).map(|m| m.status)` inspection used throughout the
+    /// membership tests; not a new accessor.
+    fn membership_contains(m: &MaterializedMembership, a: &OwnerAddr) -> bool {
+        matches!(
+            m.members.get(a).map(|s| s.status),
+            Some(MemberStatus::Joined)
+        )
+    }
+
+    /// A `CommunityState` whose log holds an honest victim Join (stamped just
+    /// before real now) plus a far-future admin Kick of that victim (now + 1yr).
+    /// The admin holds power 100 implicitly via the materialize bootstrap rule,
+    /// so WITHOUT the ceiling the Kick wins LWW (wall is the primary sort key)
+    /// and bans the victim; WITH it the future Kick is excluded and the victim
+    /// retains membership.
+    fn state_with_join_and_future_kick() -> (CommunityState, OwnerAddr, OwnerAddr) {
+        let admin = addr(1);
+        let victim = addr(2);
+        let now = real_now_ms();
+        let join = join_event(10, victim, now - 10_000);
+        let kick = kick_event(20, admin, victim, now + YEAR_MS);
+        let state = CommunityState::from_trusted_events_for_test(COMMUNITY, [join, kick]);
+        (state, admin, victim)
+    }
+
+    #[test]
+    fn cached_materialized_excludes_future_dated_kick() {
+        let (state, admin, victim) = state_with_join_and_future_kick();
+        let m = state.materialized(admin);
+        assert!(
+            membership_contains(&m, &victim),
+            "cached materialized() read must exclude the future-dated Kick (receiver-now ceiling)"
+        );
+    }
+
+    #[test]
+    fn materialize_now_excludes_future_dated_kick() {
+        let (state, admin, victim) = state_with_join_and_future_kick();
+        let m = state.materialize_now(admin);
+        assert!(
+            membership_contains(&m, &victim),
+            "uncached materialize_now() read must also exclude the future-dated Kick"
+        );
+    }
+
+    #[test]
+    fn materialized_with_now_floor_and_ceiling_excludes_future_dated_kick() {
+        // Task 1 review carry-forward: exercise the recovery read where BOTH the
+        // aging floor Some(now) AND the forward ceiling Some(now) are active
+        // (the accessor passes `now_ms` as both), not only the None-floor path.
+        let (state, admin, victim) = state_with_join_and_future_kick();
+        let m = state.materialized_with_now(admin, real_now_ms());
+        assert!(
+            membership_contains(&m, &victim),
+            "materialized_with_now() (floor+ceiling both Some(now)) must exclude the future Kick"
+        );
+    }
+
+    #[test]
+    fn poison_survives_reload_but_is_still_deferred_on_materialize() {
+        // Reload-safety proof: persist a state carrying a far-future Kick frame
+        // directly (the poison is a normal trusted-log event here — Layer 3
+        // admission isn't wired yet), reload it, and confirm the ceiling STILL
+        // holds — proving the fix does NOT depend on admission having filtered
+        // the log.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("crdt.cbor");
+        let (state, admin, victim) = state_with_join_and_future_kick();
+        assert_eq!(
+            state.event_count(),
+            2,
+            "precondition: join + future kick both in the log"
+        );
+
+        community_state_persist::save_crdt(&path, &state).unwrap();
+        let reloaded = community_state_persist::load_crdt(&path, COMMUNITY).unwrap();
+
+        // (a) the poison event is RETAINED after reload (non-destructive):
+        assert!(
+            reloaded.event_count() >= 2,
+            "reload must RETAIN the poison event (non-destructive); we only defer it from the view"
+        );
+        // (b) but the materialized view still defers it:
+        let m = reloaded.materialized(admin);
+        assert!(
+            membership_contains(&m, &victim),
+            "after reload, materialized() still defers the future-dated Kick"
+        );
     }
 }
