@@ -96,7 +96,8 @@ fn cache_survives_reload() {
             Some("vine-prev"),
             recent_a,
         );
-        let out = cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, 10_000);
+        let out =
+            cache.on_descriptor_sample(&topic("alice-addr"), &desc, &followed, now_secs * 1000);
         assert!(
             matches!(out, Some(DescriptorOutcome::Inserted { .. })),
             "first descriptor must Insert; got {out:?}"
@@ -113,7 +114,12 @@ fn cache_survives_reload() {
             None,
             recent_b,
         );
-        let out2 = cache.on_descriptor_sample(&topic("alice-addr"), &desc2, &followed, 10_500);
+        let out2 = cache.on_descriptor_sample(
+            &topic("alice-addr"),
+            &desc2,
+            &followed,
+            now_secs * 1000 + 500,
+        );
         assert!(matches!(out2, Some(DescriptorOutcome::Inserted { .. })));
 
         // Insert two reactions on vine-A — different reactors, both liked

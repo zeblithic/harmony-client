@@ -73,9 +73,10 @@ pub const VINE_PKARR_RESOLVE_COOLDOWN_MS: u64 = 15 * 60 * 1000;
 /// plausible clock window. Rows that fail ingest AND claim a `created_at`
 /// further than this ahead of local time are treated as hostile-relay
 /// cursor poisoning and do not advance. Seconds domain (descriptor
-/// `created_at` is seconds; the session clock is ms). 30 min matches the
-/// house forward-skew defaults (cf. `friend_intro::INTRODUCTION_MAX_FORWARD_SKEW_MS`).
-pub const VINE_PULL_INVALID_FORWARD_SKEW_SECS: u64 = 30 * 60;
+/// `created_at` is seconds; the session clock is ms). 30 min = the display-tier
+/// house default (`clock_trust::DISPLAY_SKEW_TOLERANCE_SECS`).
+pub const VINE_PULL_INVALID_FORWARD_SKEW_SECS: u64 =
+    crate::clock_trust::DISPLAY_SKEW_TOLERANCE_SECS;
 
 /// Consecutive passes a creator may be skipped while live mesh delivery
 /// looks fresher than the last pull attempt, before the driver forces a
