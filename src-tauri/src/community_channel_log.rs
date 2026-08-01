@@ -521,6 +521,16 @@ pub enum ChannelEventError {
     AttachmentFieldTooLong { max: usize },
     #[error("attachment too large: {size} bytes (max {max})")]
     AttachmentTooLarge { size: u64, max: u64 },
+    /// ZEB-846 (Layer 1): the event's `at.wall_ms` is more than
+    /// `clock_trust::MAX_FORWARD_SKEW_MS` ahead of the receiver's own
+    /// trusted clock — an implausibly future-dated wall, rejected at
+    /// admission before any expensive state materialization.
+    #[error("event wall {wall_ms} more than {tolerance_ms}ms ahead of receiver clock {now_ms}")]
+    FutureSkew {
+        wall_ms: u64,
+        now_ms: u64,
+        tolerance_ms: u64,
+    },
 }
 
 /// Sign a channel post payload with the author's identity key. Returns
@@ -1350,11 +1360,68 @@ pub async fn verify_channel_event<S>(
 where
     S: CommunityStateAtHlc + Sync + ?Sized,
 {
+    // ZEB-846: production path uses the node's own trusted clock. `.ok()`
+    // degrades a pre-epoch clock to `None` (apply-all fallback), never a
+    // panic — matches the `now_ms: Option<u64>` convention used across the
+    // T-GOV bounded-wall guards (membership, voting).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .ok();
+    verify_channel_event_at(
+        event,
+        expected_community_id,
+        expected_channel_id,
+        state,
+        replay_tracker,
+        now_ms,
+    )
+    .await
+}
+
+/// Clock-injectable core of [`verify_channel_event`] (ZEB-846). `now_ms` is
+/// the *receiver's own* trusted wall clock — never a peer-supplied value.
+/// `Some(rn)` bounds an implausibly-future event wall (Layer 1, below) and
+/// clamps a far-future `deleted_at` before the tombstone gate (Layer 2,
+/// below); `None` is the non-destructive apply-all fallback (no reject, no
+/// clamp) for a receiver with no trusted clock.
+pub async fn verify_channel_event_at<S>(
+    event: &SignedChannelEvent,
+    expected_community_id: &SpaceId,
+    expected_channel_id: &ChannelId,
+    state: &S,
+    replay_tracker: &mut ChannelLogReplayTracker,
+    now_ms: Option<u64>,
+) -> Result<(), ChannelEventError>
+where
+    S: CommunityStateAtHlc + Sync + ?Sized,
+{
     let community_id = event.community_id();
     let channel_id = event.channel_id();
     let author = event.author();
     let at = event.at();
     let sig = event.sig();
+
+    // ZEB-846 (Layer 1): reject an implausibly-future event wall at
+    // admission, before any state materialization. Covers both a post's
+    // `at.wall_ms` and a React's — `event.at()` is the single accessor
+    // for both live `SignedChannelEvent` variants (the ChannelDelete /
+    // channel-config wall is a separate `MembershipEventKind` verified by
+    // `community_membership`'s own Layer-1 guard, not this function).
+    // `None` ⇒ apply-all (no trusted receiver clock to bound against).
+    if let Some(now) = now_ms {
+        if crate::clock_trust::reject_future(
+            at.wall_ms,
+            now,
+            crate::clock_trust::MAX_FORWARD_SKEW_MS,
+        ) {
+            return Err(ChannelEventError::FutureSkew {
+                wall_ms: at.wall_ms,
+                now_ms: now,
+                tolerance_ms: crate::clock_trust::MAX_FORWARD_SKEW_MS,
+            });
+        }
+    }
     // `mentions`/`attachments` are Post-only; a React event carries neither,
     // so the ZEB-534/535 inbound caps below are no-ops for reactions.
     let (mentions, attachments) = match event {
@@ -1521,12 +1588,32 @@ where
         ))
     })?;
     if let Some(deleted_at) = &channel_info.deleted_at {
-        // Strictly-newer-than: post happened AFTER deletion is rejected.
-        // Posts at exactly deleted_at or earlier are still valid.
-        if at.is_strictly_newer_than(deleted_at) {
+        // ZEB-846 (Layer 2): clamp a far-future `deleted_at` down to
+        // `now+MAX_FORWARD_SKEW_MS` before the comparison, so a poison
+        // ChannelDelete — persisted before Layer 1 existed, or replayed
+        // from an already-materialized state — still gates writes.
+        // Skipping the deletion would UN-delete the channel (the exact
+        // bug); we clamp, never defer. `None` ⇒ unclamped (apply-all
+        // fallback — no trusted receiver clock to clamp against).
+        let effective_deleted = match now_ms {
+            Some(rn) => Hlc {
+                wall_ms: crate::clock_trust::clamp_future(
+                    deleted_at.wall_ms,
+                    rn,
+                    crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                ),
+                logical: deleted_at.logical,
+                device_id: deleted_at.device_id.clone(),
+            },
+            None => deleted_at.clone(),
+        };
+        // Strictly-newer-than: post happened AFTER the (clamped) deletion
+        // is rejected. Posts at exactly effective_deleted or earlier are
+        // still valid.
+        if at.is_strictly_newer_than(&effective_deleted) {
             return Err(ChannelEventError::NotAuthorized(format!(
-                "channel deleted at {:?}, post at {:?}",
-                deleted_at, at
+                "channel deleted at {:?} (clamped {:?}), post at {:?}",
+                deleted_at, effective_deleted, at
             )));
         }
     }
@@ -4350,6 +4437,155 @@ mod tests {
         assert!(
             !tracker.last_seen().contains_key(&key),
             "tracker must NOT advance on failed authorization (was advance-before-auth bug)"
+        );
+    }
+
+    // ── ZEB-846 (T-GOV finding CD): bounded channel event walls ──
+
+    /// Mirrors `verify_channel_event_rejects_post_after_delete`'s state
+    /// shape, parameterized on `deleted_at` so the Layer-2 clamp tests can
+    /// supply an arbitrary (including far-future poison) tombstone HLC.
+    fn channel_state_with_deletion(deleted_at: Hlc) -> MockState {
+        let (_signing, alice, alice_pub64) = fixture_identity(0xa1);
+        let mut channels = HashMap::new();
+        let creator_hlc = Hlc {
+            wall_ms: 50_000,
+            logical: 0,
+            device_id: "creator".into(),
+        };
+        channels.insert(
+            fixture_channel(0x01),
+            vec![(
+                creator_hlc.clone(),
+                ChannelInfo {
+                    name: "deleted".into(),
+                    write_power: 0,
+                    kind: crate::community_membership::ChannelKind::Text,
+                    created_at: creator_hlc,
+                    deleted_at: Some(deleted_at),
+                },
+            )],
+        );
+        let mut members = HashMap::new();
+        members.insert(alice, vec![(fixture_hlc(60_000, "a-dev"), 100)]);
+        let mut enrolled = HashMap::new();
+        enrolled.insert(
+            alice,
+            vec![(
+                fixture_hlc(60_000, "a-dev"),
+                enrolled_key_from_pub64(&alice_pub64),
+            )],
+        );
+        MockState {
+            channels,
+            members,
+            left_at: HashMap::new(),
+            enrolled,
+        }
+    }
+
+    /// No deletion — a ZEB-846-test-local name (over `fixture_state_with_
+    /// alice_joined`) for readability at the Layer-1 admission call sites
+    /// below, where the point under test is the post wall, not the
+    /// channel-deletion state.
+    fn channel_state_open() -> MockState {
+        fixture_state_with_alice_joined()
+    }
+
+    /// A signed Post at the given `at.wall_ms`, alice-authored on "a-dev" —
+    /// thin wrapper over `fixture_signed_event` fixing `logical=0` for the
+    /// ZEB-846 admission tests below, which only vary the wall.
+    fn signed_post_at(wall_ms: u64) -> SignedChannelEvent {
+        fixture_signed_event(wall_ms, 0, "a-dev")
+    }
+
+    #[tokio::test]
+    async fn far_future_deleted_at_still_gates_posts_after_clamp_window() {
+        // Channel deleted with a far-future deleted_at (real-now + 1 year) —
+        // models a poison ChannelDelete persisted before Layer 1. A post
+        // stamped past the clamp window (now + 5min) must be REJECTED (the
+        // deletion still gates writes).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let deleted_at = Hlc {
+            wall_ms: now_ms + 365 * 86_400_000,
+            logical: 0,
+            device_id: "x".into(),
+        };
+        let state = channel_state_with_deletion(deleted_at);
+        // 6 min ahead of now — past the Layer-2 clamp window (now+5min).
+        let post = signed_post_at(now_ms + crate::clock_trust::MAX_FORWARD_SKEW_MS + 60_000);
+        let mut tracker = ChannelLogReplayTracker::new();
+        let res = verify_channel_event_at(
+            &post,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+            Some(now_ms),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "post past the clamped deletion window must be gated"
+        );
+    }
+
+    #[tokio::test]
+    async fn none_receiver_now_uses_unclamped_deleted_at() {
+        // None ⇒ apply-all: with a far-future deleted_at and None now, a
+        // present-day post is NOT gated (deleted_at unclamped) — the
+        // non-destructive fallback.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let deleted_at = Hlc {
+            wall_ms: now_ms + 365 * 86_400_000,
+            logical: 0,
+            device_id: "x".into(),
+        };
+        let state = channel_state_with_deletion(deleted_at);
+        let post = signed_post_at(now_ms);
+        let mut tracker = ChannelLogReplayTracker::new();
+        let res = verify_channel_event_at(
+            &post,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+            None,
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "None receiver clock ⇒ unclamped deleted_at, post allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn future_post_wall_rejected_at_admission() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let state = channel_state_open(); // no deletion
+        let post = signed_post_at(now_ms + crate::clock_trust::MAX_FORWARD_SKEW_MS + 1);
+        let mut tracker = ChannelLogReplayTracker::new();
+        let res = verify_channel_event_at(
+            &post,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker,
+            Some(now_ms),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a post wall beyond now+5min is rejected at admission"
         );
     }
 
