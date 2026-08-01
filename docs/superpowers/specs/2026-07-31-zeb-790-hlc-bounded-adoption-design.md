@@ -118,7 +118,7 @@ already owned by the persisted replay trackers, not the floor.
 | 1 | Community state | after `tracker.commit(replay_ticket)` at `community_state_sync.rs:4466-4474` | Ed25519 `verify_publisher_sig`, member Joined-at-HLC, TOCTOU re-check |
 | 2 | Channel log | in `ChannelLogEngine::process_inbound_packet`, after step 2c's atomic `check_and_advance` succeeds — i.e. `community_channel_log_engine.rs:1715-1738` — so replay check **and** signature verify (step 2b) both passed | Ed25519 `verify_strict` against enrolled author device keys |
 | 3 | Owner-state fleet | after `ctx.replay_tracker.lock().await.commit(ticket)` at `fleet_sync.rs:1442-1445` | fleet AEAD (own sibling devices only) |
-| 4 | Community voting inbound (ZEB-843) | after V6-membership + Ed25519 verify + apply + record all succeed, in `VotingLogEngine::process_inbound` (`community_voting_log_engine.rs:2810-2815`) and its backfill twin `apply_backfilled_event` (`:2884-2887`) | Ed25519 `verify_voting_event` (V6 membership-at-HLC), same trust class as channel-log |
+| 4 | Community voting inbound (ZEB-843) | after V6-membership + Ed25519 verify + apply + record all succeed, in `VotingLogEngine::process_inbound` (`community_voting_log_engine.rs:2810-2823`) and its backfill twin `apply_backfilled_event` (`:2884-2895`) | Ed25519 `verify_voting_event` (V6 membership-at-HLC), same trust class as channel-log |
 | 5 | Mint-state-root sync inbound (ZEB-845) | after the replay-tracker advance in `MintSyncEngine`'s verified-apply path, `mint_sync.rs:1260-1265` | fleet AEAD (own sibling devices only), same trust class as owner-state fleet |
 
 **Invariant (mirrors the tracker's censorship-defence discipline,
@@ -225,8 +225,8 @@ shrinks from `skew` to `max(0, skew − CAP)` — for ordinary skew it vanishes 
 clamp converts the previously **unbounded** accepted-future-stamp clock-drag
 (`community_voting_log_engine.rs:1249` acknowledges the hazard) into a ≤ CAP nudge. ZEB-843
 wired the voting-inbound accept path itself as a feed site (§4 row 4: `process_inbound`
-at `community_voting_log_engine.rs:2815`, and its backfill twin `apply_backfilled_event`
-at `:2887`), so this now applies unconditionally to any verified voting-inbound accept —
+at `community_voting_log_engine.rs:2823`, and its backfill twin `apply_backfilled_event`
+at `:2895`), so this now applies unconditionally to any verified voting-inbound accept —
 not only when the skewed peer's clock happened to be learned via a different fed path
 first.
 
@@ -263,7 +263,7 @@ adoption; existing mint tests unchanged via fresh floors (incl.
 
 **Unit (feed discipline):** a rejected community publish does not move the floor; a
 signature-failed channel event does not move the floor (parity with
-`community_channel_log.rs:1569-1573`'s failed-auth-does-not-mutate rule).
+`community_channel_log_engine.rs:1569-1573`'s failed-auth-does-not-mutate rule).
 
 **Integration (the repro):** skew-injection — verify-and-apply an event stamped
 `now + 600 ms`, mint, assert our stamp exceeds it. This is the exact ZEB-788 621 ms
@@ -334,7 +334,7 @@ Client-only — the upstream 10-crate lockstep rev does not move.
   `dm_outbox.rs:3216/:3295`, `community_state_sync.rs:3343/:3356`,
   `fleet_sync.rs:1113/:1153`.
 - Accept/commit sites: `community_state_sync.rs:4054/:4459`,
-  `community_channel_log.rs:1503/:1574`, `fleet_sync.rs:1348/:1422`.
+  `community_channel_log_engine.rs:1503/:1574`, `fleet_sync.rs:1348/:1422`.
 - Keyspace + squatting defence: `community_state_sync.rs:823-846`,
   `replay_admission.rs:265-302`.
 - Wall-coupling inventory highlights: `community_membership.rs:5490-5509/:5926`,
