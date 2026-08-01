@@ -3588,29 +3588,34 @@ pub struct ProdReachabilitySnapshot(pub crate::reachability_resolver::Reachabili
 impl ReachabilitySnapshot for ProdReachabilitySnapshot {
     fn list_records(&self) -> Vec<ResolverPeerRecord> {
         self.0
-            .list_active_peers()
+            .list_active_peers_effective()
             .into_iter()
-            .map(|(owner, payload)| ResolverPeerRecord {
-                owner_addr: owner.0,
-                iroh_node_id: payload.iroh_node_id,
-                // Phase 1: no profile-cache lookup wired here. Follow-up
-                // pulls display names out of the profile-broadcast cache.
-                display_name: None,
-                // Phase 1: no live iroh connection-mode inspection. The
-                // field defaults to NoConnection so the UI shows the
-                // peer without a misleading "Direct/Relay" badge.
-                connection_mode: ConnectionMode::NoConnection,
-                rtt_ms: None,
-                last_seen_ms: Some(payload.announced_at_ms),
-                // ZEB-623: filled by `NetworkHealthService::snapshot`'s compat
-                // join (the resolver has no view of the registry).
-                protocol_incompat_reason: None,
-                // ZEB-804: filled by `NetworkHealthService::snapshot`'s traffic
-                // merge (the resolver has no view of liveness or the registry).
-                last_traffic_ms: None,
-                last_relay_pull_served_ms: None,
-                connected_since_ms: None,
-            })
+            .map(
+                |(owner, payload, effective_announced_at_ms)| ResolverPeerRecord {
+                    owner_addr: owner.0,
+                    iroh_node_id: payload.iroh_node_id,
+                    // Phase 1: no profile-cache lookup wired here. Follow-up
+                    // pulls display names out of the profile-broadcast cache.
+                    display_name: None,
+                    // Phase 1: no live iroh connection-mode inspection. The
+                    // field defaults to NoConnection so the UI shows the
+                    // peer without a misleading "Direct/Relay" badge.
+                    connection_mode: ConnectionMode::NoConnection,
+                    rtt_ms: None,
+                    // ZEB-621 / D1: the future-skew-clamped announce, never the raw
+                    // `payload.announced_at_ms`, so a future-dated record cannot
+                    // report "seen 0 s ago".
+                    last_seen_ms: Some(effective_announced_at_ms),
+                    // ZEB-623: filled by `NetworkHealthService::snapshot`'s compat
+                    // join (the resolver has no view of the registry).
+                    protocol_incompat_reason: None,
+                    // ZEB-804: filled by `NetworkHealthService::snapshot`'s traffic
+                    // merge (the resolver has no view of liveness or the registry).
+                    last_traffic_ms: None,
+                    last_relay_pull_served_ms: None,
+                    connected_since_ms: None,
+                },
+            )
             .collect()
     }
 }
@@ -4612,6 +4617,46 @@ mod tests {
         std::sync::Arc::new(FakeMembership {
             table: std::collections::HashMap::new(),
         })
+    }
+
+    #[test]
+    fn prod_reachability_snapshot_last_seen_is_future_skew_clamped() {
+        use crate::owner_state_types::{Hlc, OwnerAddr};
+        use crate::reachability_record::ReachabilityAnnouncePayload;
+        use crate::reachability_resolver::{ReachabilityResolver, FUTURE_SKEW_TOLERANCE_MS};
+
+        const T: u64 = 1_000_000_000_000;
+        let resolver = ReachabilityResolver::new();
+        resolver.set_clock(std::sync::Arc::new(|| T)); // #[cfg(test)] pub(crate), same crate
+
+        // A future-dated durable record: announced 1 h ahead of now. Fields
+        // mirror `make_payload` (reachability_resolver.rs:939).
+        let payload = ReachabilityAnnouncePayload {
+            iroh_node_id: [2u8; 32],
+            home_relay_url: "https://derp.example/".into(),
+            direct_addresses: vec![],
+            announced_at_ms: T + 3_600_000,
+            identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
+        };
+        resolver.update(
+            OwnerAddr([9u8; 16]),
+            payload,
+            Hlc {
+                wall_ms: T,
+                logical: 0,
+                device_id: String::new(),
+            },
+        );
+
+        let records = ProdReachabilitySnapshot(resolver).list_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].last_seen_ms,
+            Some(T + FUTURE_SKEW_TOLERANCE_MS),
+            "network-health last-seen must read the clamped effective announce, not the raw future value"
+        );
     }
 
     #[tokio::test]

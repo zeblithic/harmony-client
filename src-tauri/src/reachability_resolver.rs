@@ -43,7 +43,7 @@ pub(crate) const PKARR_REFRESH_COOLDOWN: std::time::Duration =
 /// insert time so it cannot permanently dominate the freshest dial view or
 /// same-source LWW and starve out later, correct records. For realistic records
 /// (`announced_at_ms <= now`) the clamp is a no-op.
-pub(crate) const FUTURE_SKEW_TOLERANCE_MS: u64 = 5 * 60 * 1000;
+pub(crate) const FUTURE_SKEW_TOLERANCE_MS: u64 = crate::clock_trust::MAX_FORWARD_SKEW_MS;
 
 /// ZEB-621: maximum number of concurrent background pkarr refresh network calls
 /// across the whole resolver (see [`ReachabilityResolver::maybe_refresh_stale`]).
@@ -503,6 +503,24 @@ impl ReachabilityResolver {
         map.iter()
             .filter_map(|((owner, _node_id), v)| {
                 v.durable_preferred().map(|e| (*owner, e.payload.clone()))
+            })
+            .collect()
+    }
+
+    /// ZEB-621 / D1: like [`list_active_peers`](Self::list_active_peers), but
+    /// pairs each peer with its future-skew-clamped `effective_announced_at_ms`
+    /// (`announced_at_ms` capped at `now + FUTURE_SKEW_TOLERANCE_MS`).
+    /// Diagnostics (network-health "last seen") read THIS so a future-dated
+    /// record cannot report a peer as "seen 0 s ago". Backed by
+    /// `durable_preferred`, matching [`list_active_peers`](Self::list_active_peers).
+    pub fn list_active_peers_effective(
+        &self,
+    ) -> Vec<(OwnerAddr, ReachabilityAnnouncePayload, u64)> {
+        let map = self.inner.read().expect("resolver read lock");
+        map.iter()
+            .filter_map(|((owner, _node_id), v)| {
+                v.durable_preferred()
+                    .map(|e| (*owner, e.payload.clone(), e.effective_announced_at_ms))
             })
             .collect()
     }
@@ -1072,6 +1090,24 @@ mod tests {
             dial.announced_at_ms, 9000,
             "dial view keeps the fresher pkarr record"
         );
+    }
+
+    #[test]
+    fn list_active_peers_effective_reports_the_future_skew_clamp() {
+        const T: u64 = 1_000_000_000_000; // fixed "now" (ms)
+        let r = ReachabilityResolver::new();
+        r.set_clock(std::sync::Arc::new(|| T));
+
+        // A future-dated durable record: announced 1 h ahead of now.
+        let owner = OwnerAddr([7; 16]);
+        r.update(owner, make_payload(1, T + 3_600_000), make_hlc(T, 0, "a"));
+
+        let got = r.list_active_peers_effective();
+        assert_eq!(got.len(), 1);
+        // Raw announce is still the future value on the payload...
+        assert_eq!(got[0].1.announced_at_ms, T + 3_600_000);
+        // ...but the effective (clamped) value is capped at now + 5 min.
+        assert_eq!(got[0].2, T + crate::clock_trust::MAX_FORWARD_SKEW_MS);
     }
 
     /// The dual-slot separation governs only cross-source collisions; same-source
