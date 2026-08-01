@@ -44,9 +44,12 @@ store ever lands.
 {app_data_dir}/avatars/{cid_hex}.bin
 ```
 
-Per-identity (under `resolve_app_data_dir()`, same root as `mail/`, `follows/`), so it is
-wiped on identity reset for free — preserving the ZEB-586 per-identity-isolation lesson.
-Mirrors the proven `mail.rs` blob pattern (`mail.rs:160-196, 271-321`).
+Under `resolve_app_data_dir()`, same root as `mail/` and `follows/`. That root is nested
+per **named profile**, so avatars are isolated across profiles (the ZEB-586 lesson). It is
+**not** scrubbed by the ZEB-835/836 identity-reset escape hatch — that operates on the
+separate identity dir (`~/.harmony`) and, by design, leaves every app-data content cache in
+place (including `mail/`, which holds private message content). See §5. Mirrors the proven
+`mail.rs` blob pattern (`mail.rs:160-196, 271-321`).
 
 ```rust
 pub struct AvatarBlobStore {
@@ -68,13 +71,16 @@ There is no in-memory byte tracker: `prune` recomputes the total by scanning the
   `None` (self-heal → caller falls through to network). A read hit does **not** touch mtime
   (eviction is write-time-ordered, not access-ordered).
 - **`put(cid: &str, bytes: &[u8])`** — reject a malformed CID, over-`max_blob_bytes` bytes,
-  or bytes failing `hash == cid`; else write atomically (a **uniquely-named** temp file —
-  `{cid}.{pid}.{seq}.tmp`, removed on failure — then rename) and prune to `max_bytes`,
-  evicting oldest-**mtime** (write-time) files first. Best-effort: any error logs and is
-  swallowed (the cache is an optimization, never a correctness dependency).
-- **`load(dir, max_bytes, max_blob_bytes) -> Self`** — `create_dir_all`, then sweep any
-  stale `*.tmp` orphaned by a crash mid-write. Never fails the caller (warn-and-continue on
-  dir errors, like `MailManager::load`).
+  or bytes failing `hash == cid`; else write via the repo's durable
+  `owner_state_persist::save_atomically` (a uniquely-named `tempfile::NamedTempFile` +
+  `sync_all` on the file **and** the parent dir + rename — so a committed blob survives power
+  loss and concurrent same-CID writes never collide), then prune to `max_bytes`, evicting
+  oldest-**mtime** (write-time) files first. Best-effort: any error logs and is swallowed
+  (the cache is an optimization, never a correctness dependency).
+- **`load(dir, max_bytes, max_blob_bytes) -> Self`** — `create_dir_all`, then sweep every
+  non-`.bin` file (temp orphaned by a hard crash between `NamedTempFile` create and
+  `persist`; `NamedTempFile` cleans up its own temp on a clean drop). Never fails the caller
+  (warn-and-continue on dir errors, like `MailManager::load`).
 
 **Concurrency:** held as `Arc<AvatarBlobStore>` on `NodeState`. `get`/`put` take `&self`;
 all filesystem I/O runs **outside** any lock (distinct CID files never collide, and unique
@@ -123,8 +129,8 @@ isolation over a `tempfile::tempdir()`):
   oldest-mtime blob, keeps the newest.
 - `fresh_instance_reads_existing_blobs` — a second `AvatarBlobStore::load` over the same
   dir serves blobs the first one wrote ("survives restart").
-- `load_sweeps_stale_temp_files` — a `*.tmp` orphan is removed at load; committed blobs
-  survive.
+- `load_sweeps_stale_temp_files` — temp orphans (both the `.tmp`-extension and
+  `NamedTempFile` leading-dot shapes) are removed at load; committed blobs survive.
 
 Handler wiring stays thin over the tested store. Manual/e2e (not in CI): restart a node
 while a previously-seen peer is offline → avatar still renders (direct repro of the report).
@@ -135,7 +141,29 @@ while a previously-seen peer is offline → avatar still renders (direct repro o
 `NodeState` field and its `start_node` construction. All in `src-tauri`. No frontend, no
 upstream `harmony` change, no lockstep rev bump.
 
-## 5. References
+## 5. Security & isolation
+
+- **Verified-only, self-certifying.** Only bytes passing `hash == cid` (the network path's
+  own gate) are stored, and `get` re-verifies before serving, so a tampered on-disk file can
+  never serve bytes that disagree with the signed card's `avatar_cid`. A size check precedes
+  the read, so an oversized/corrupt file can't force a large allocation.
+- **Isolation is per-profile.** The cache lives under `resolve_app_data_dir()`, which nests
+  per named profile — so distinct profiles never share avatar bytes (the ZEB-586 lesson).
+- **Identity-reset behavior (Greptile PR #576).** The ZEB-835/836 `reset_local_identity`
+  escape hatch operates on the **identity dir** (`~/.harmony`) via a curated file manifest
+  (`OWNER_RESET_FILES`); it does **not** touch the separate app-data root, so it leaves
+  *every* content cache there — `avatars/`, `mail/`, `follows/`, `content_index` — in place.
+  Retaining the avatar cache across a same-profile reset→re-onboard is therefore consistent
+  with all sibling caches (including `mail/`, which holds private message content). It is
+  benign for avatars specifically: the bytes are **public**, content-addressed, and served
+  only for a CID the new identity independently holds a signed card for (which already
+  entitles it to fetch that public avatar) — no confidentiality boundary is crossed. The
+  only residue is disk-forensic (a file's existence reveals a prior fetch), which is out of
+  scope (local-disk inspection already sees `mail/`). A holistic "scrub app-data content
+  caches on reset" is a separate, cross-cutting change (it would cover `mail/` etc.) and is
+  deliberately **not** bolted on here as an avatars-only carve-out.
+
+## 6. References
 
 - Backend: `src-tauri/src/lib.rs` (`fetch_avatar` `:25797`, `AVATAR_MAX_BYTES` `:22483`,
   `resolve_app_data_dir` `:3583`, `MailManager::load` call `:4048`, `NodeState` struct),

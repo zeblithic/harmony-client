@@ -4059,9 +4059,11 @@ pub async fn start_node_inner(
             our_addr_bytes,
         )));
 
-        // ZEB-841: durable avatar-byte cache under the per-identity data dir
-        // (wiped on identity reset with `mail/`). Content-addressed, so it needs
-        // no owner address — just a directory and a byte budget.
+        // ZEB-841: durable avatar-byte cache under the per-profile app data dir
+        // (isolated across named profiles like `mail/`; not scrubbed by the
+        // narrow identity-reset escape hatch, which only clears the identity
+        // dir). Content-addressed, so it needs no owner address — just a
+        // directory and a byte budget.
         avatar_blob_store = std::sync::Arc::new(crate::avatar_blob_store::AvatarBlobStore::load(
             &app_data_dir.join("avatars"),
             crate::avatar_blob_store::DEFAULT_MAX_BYTES,

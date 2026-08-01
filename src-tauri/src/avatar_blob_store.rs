@@ -21,7 +21,6 @@
 //! `fetch_avatar` invokes `get`/`put` inside `tokio::task::spawn_blocking`.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use harmony_content::cid::ContentId;
@@ -45,10 +44,6 @@ pub struct AvatarBlobStore {
     /// lock — the filesystem is the source of truth.
     prune_lock: Mutex<()>,
 }
-
-/// Process-wide counter making each in-flight temp file name unique, so
-/// concurrent writes to the same CID never collide on one `.tmp` path.
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl AvatarBlobStore {
     /// Open (creating the directory) an avatar cache under `dir` with a total
@@ -151,7 +146,12 @@ impl AvatarBlobStore {
             tracing::warn!(cid = %cid_hex, "avatar cache: refusing put; bytes fail hash==cid");
             return;
         }
-        if let Err(e) = atomic_write(&self.dir, cid_hex, bytes) {
+        // Durable + concurrency-safe write via the repo's atomic-save helper:
+        // fsyncs the file and the parent directory (so a committed blob survives
+        // a power loss) and uses a uniquely-named temp so concurrent same-CID
+        // writes never collide (`tempfile::NamedTempFile`).
+        if let Err(e) = crate::owner_state_persist::save_atomically(&self.blob_path(cid_hex), bytes)
+        {
             tracing::warn!(cid = %cid_hex, error = %e, "avatar cache: write failed");
             return;
         }
@@ -207,34 +207,20 @@ impl AvatarBlobStore {
     }
 }
 
-/// Atomically write `bytes` to `{dir}/{cid_hex}.bin` via a **uniquely-named**
-/// sibling temp file + rename, so a crash mid-write never leaves a
-/// partially-written `{cid}.bin`, and two concurrent writes to the same CID
-/// never collide on one temp path. The temp file is removed on any failure so a
-/// partial write never lingers (a leftover would not be counted or evicted).
-fn atomic_write(dir: &Path, cid_hex: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!("{cid_hex}.{}.{seq}.tmp", std::process::id()));
-    let final_path = dir.join(format!("{cid_hex}.bin"));
-    if let Err(e) = std::fs::write(&tmp, bytes) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Err(e) = std::fs::rename(&tmp, &final_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
-}
-
-/// Delete any `*.tmp` files under `dir` (orphans from a crash mid-write).
+/// Delete any leftover temp files under `dir` — anything that is not a committed
+/// `{cid}.bin` blob. `save_atomically`'s `NamedTempFile` removes its own temp on
+/// clean drop, but a hard crash (SIGKILL / power loss) between create and
+/// `persist` can orphan one (named `.tmp…`, so it is never counted toward the
+/// budget nor evicted). This cache dir holds only `*.bin` blobs, so removing
+/// every non-`.bin` file at load is a safe, naming-agnostic sweep.
 fn sweep_stale_temp_files(dir: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for ent in rd.flatten() {
         let path = ent.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+        let is_blob = path.extension().and_then(|e| e.to_str()) == Some("bin");
+        if !is_blob && path.is_file() {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -279,12 +265,12 @@ mod tests {
 
         s.put(&cid, &data);
         assert_eq!(s.get(&cid).as_deref(), Some(data.as_slice()));
-        // No temp files linger after a successful write.
-        let tmp_left = std::fs::read_dir(dir.path())
+        // After a successful write only the committed `.bin` remains — no temp.
+        let non_blob = std::fs::read_dir(dir.path())
             .unwrap()
             .flatten()
-            .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("tmp"));
-        assert!(!tmp_left, "no .tmp should remain after put");
+            .any(|e| e.path().extension().and_then(|x| x.to_str()) != Some("bin"));
+        assert!(!non_blob, "only the committed .bin should remain after put");
     }
 
     #[test]
@@ -387,16 +373,25 @@ mod tests {
     #[test]
     fn load_sweeps_stale_temp_files() {
         let dir = tempfile::tempdir().unwrap();
-        // A committed blob and an orphaned temp file (crash mid-write).
+        // A committed blob plus orphaned temps from a crash mid-write, in both
+        // the `.tmp`-extension shape and `tempfile::NamedTempFile`'s leading-dot
+        // shape (`.tmp<random>`). The sweep is naming-agnostic: anything not a
+        // `.bin` blob goes.
         let data = b"kept".to_vec();
         let cid = cid_hex_for(&data);
         std::fs::write(dir.path().join(format!("{cid}.bin")), &data).unwrap();
-        let orphan = dir.path().join("deadbeef.12345.7.tmp");
-        std::fs::write(&orphan, b"partial").unwrap();
+        let orphan_ext = dir.path().join("deadbeef.12345.7.tmp");
+        let orphan_tempfile = dir.path().join(".tmpA1b2C3");
+        std::fs::write(&orphan_ext, b"partial").unwrap();
+        std::fs::write(&orphan_tempfile, b"partial").unwrap();
 
         let reopened = store(dir.path(), DEFAULT_MAX_BYTES);
 
-        assert!(!orphan.exists(), "load must sweep stale .tmp files");
+        assert!(!orphan_ext.exists(), "load must sweep .tmp orphans");
+        assert!(
+            !orphan_tempfile.exists(),
+            "load must sweep NamedTempFile-style orphans"
+        );
         assert_eq!(
             reopened.get(&cid).as_deref(),
             Some(data.as_slice()),
