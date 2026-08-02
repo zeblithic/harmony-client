@@ -13,7 +13,8 @@
 - CI gates (run from `src-tauri/`): `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run --locked --workspace --all-targets --features test-fixtures`. Implementers gate lib-only (`cargo nextest run -p harmony-app --lib` / `clippy -p harmony-app --lib`) during iteration; the controller runs the full `--all-targets` sweep at converge/final.
 - Reuse `clock_trust`; introduce NO new skew constants. The bound is `clock_trust::MAX_FORWARD_SKEW_MS` (5 min, control tier) — NOT the display tier.
 - `reject_future(stamp, now, tol) = stamp.saturating_sub(now) > tol` — inclusive boundary (a stamp exactly at `now + tol` is accepted). Do not change this.
-- Fail-open contract: `receiver_now_ms() == None` ⇒ skip the forward-skew check (never drop honest state on a bad *local* clock); an unparseable stamp is STILL rejected (that check needs no clock).
+- Fail-open contract: `receiver_now_ms() == None` ⇒ skip the forward-skew check (never drop honest state on a bad *local* clock); an unparseable OR non-canonical (non-UTC) stamp is STILL rejected (those checks need no clock — see the `parse_rfc3339_ms` canonical-UTC contract).
+- Canonical-UTC key: `parse_rfc3339_ms` accepts only zero-offset (`Z` / `+00:00`) encodings — a non-zero offset (`+05:00`) could sort above a UTC stamp of the same/older instant and win the raw-string LWW, so it is rejected. Accepted stamps are all zero-offset, so string order matches instant order to the second (the sub-second / `Z`-vs-`+00:00` residual is a same-second tie, non-exploitable).
 - REJECT, not clamp: drop the offending remote row; never store a clamped receiver-specific value (would diverge across replicas).
 - No wire-format change; no per-row HLC; ingest-only. Local edits (in `mint.rs`) never flow through `apply_remote_snapshot`, so the bound cannot reject the user's own `now`-stamped rows.
 
@@ -87,16 +88,20 @@ Expected: FAIL — `parse_rfc3339_ms` / `reject_rfc3339_future` not found.
 Add near the other `clock_trust` functions:
 
 ```rust
-/// Parse an RFC-3339 timestamp to non-negative epoch milliseconds.
+/// Parse a *canonical UTC* RFC-3339 timestamp to non-negative epoch milliseconds.
 ///
-/// Accepts both honest mint encodings — `+00:00` with variable fractional
+/// Accepts only zero-offset encodings — `+00:00` with variable fractional
 /// precision (`chrono::Utc::now().to_rfc3339()`) and the fixed `...Z` epoch
-/// literal. Pre-epoch instants floor to `0` (ancient — never future).
-/// Returns `None` when `stamp` is not valid RFC-3339.
+/// literal. Pre-epoch instants floor to `0` (ancient — never future). Returns
+/// `None` on a parse failure OR a non-zero UTC offset: the stored string is the
+/// LWW ordering key, so a non-zero offset (e.g. `+05:00`) could sort above a UTC
+/// stamp of the same or older instant and win the raw-string compare.
 pub fn parse_rfc3339_ms(stamp: &str) -> Option<u64> {
-    chrono::DateTime::parse_from_rfc3339(stamp)
-        .ok()
-        .map(|dt| dt.timestamp_millis().max(0) as u64)
+    let dt = chrono::DateTime::parse_from_rfc3339(stamp).ok()?;
+    if dt.offset().local_minus_utc() != 0 {
+        return None; // non-canonical (non-UTC) encoding — not a valid peer stamp
+    }
+    Some(dt.timestamp_millis().max(0) as u64)
 }
 
 /// Reject a peer-supplied RFC-3339 wall stamp used as a stored, replicated LWW

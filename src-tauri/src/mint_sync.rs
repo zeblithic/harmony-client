@@ -108,9 +108,15 @@ pub(crate) fn apply_remote_snapshot(
     // were not).
     let mut suppressed_account_ids = std::collections::HashSet::new();
     for r in &remote.accounts {
-        if upsert_account_lww(&tx, r, account_deletion_floor, now_ms)? == UpsertOutcome::Suppressed
-        {
-            suppressed_account_ids.insert(r.id.clone());
+        match upsert_account_lww(&tx, r, account_deletion_floor, now_ms)? {
+            // Both skip-outcomes mean "do not apply this account's transactions":
+            // Suppressed (stale w.r.t. our delete floor) and RejectedNoLocalAccount
+            // (poison stamp, account never inserted — an in-range txn referencing
+            // it would FK-abort the whole snapshot).
+            UpsertOutcome::Suppressed | UpsertOutcome::RejectedNoLocalAccount => {
+                suppressed_account_ids.insert(r.id.clone());
+            }
+            UpsertOutcome::Applied => {}
         }
     }
     for r in &remote.transactions {
@@ -181,7 +187,13 @@ pub(crate) fn apply_remote_snapshot(
 #[derive(PartialEq, Eq)]
 enum UpsertOutcome {
     Applied,
+    /// Blocked by the deletion floor — the peer's row is stale w.r.t. our delete.
     Suppressed,
+    /// The row's `updated_at` was rejected (poison / forward-skew / non-canonical)
+    /// and no local account exists. Skip its dependent transactions — an in-range
+    /// transaction referencing a never-inserted account would violate the accounts
+    /// FK and roll back the whole snapshot.
+    RejectedNoLocalAccount,
 }
 
 fn upsert_account_lww(
@@ -191,15 +203,31 @@ fn upsert_account_lww(
     now_ms: Option<u64>,
 ) -> Result<UpsertOutcome, MintSyncError> {
     // ZEB-848: bound the peer `updated_at` before it can win the string LWW.
-    // Return `Applied` (not `Suppressed`) on poison-reject: a rejected stamp is
-    // NOT a deletion-floor suppression, so this account's transactions must
-    // still be evaluated on their own merit rather than skipped wholesale.
+    // Drop a poison / forward-skew / non-canonical stamp. The skip decision must
+    // be account-aware: if the account is NOT already local, tell the caller to
+    // skip its dependent transactions (RejectedNoLocalAccount) — an in-range txn
+    // referencing this never-inserted account would violate the accounts FK and
+    // roll back the WHOLE snapshot. If the account DOES exist locally, its honest
+    // row stays and its transactions can still merge, so return `Applied` (a
+    // rejected stamp is NOT a deletion-floor suppression).
     if crate::clock_trust::reject_rfc3339_future(
         &r.updated_at,
         now_ms,
         crate::clock_trust::MAX_FORWARD_SKEW_MS,
     ) {
-        return Ok(UpsertOutcome::Applied);
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM accounts WHERE id = ?1",
+                params![r.id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        return Ok(if exists {
+            UpsertOutcome::Applied
+        } else {
+            UpsertOutcome::RejectedNoLocalAccount
+        });
     }
     if let Some(floor_ts) = floor.get(&r.id) {
         if &r.updated_at <= floor_ts {
@@ -1391,6 +1419,13 @@ mod tests {
             .is_some()
     }
 
+    fn tx_exists(conn: &Connection, id: &str) -> bool {
+        conn.query_row("SELECT 1 FROM transactions WHERE id = ?", [id], |_| Ok(()))
+            .optional()
+            .unwrap()
+            .is_some()
+    }
+
     fn tx_amount(conn: &Connection, id: &str) -> String {
         conn.query_row("SELECT amount FROM transactions WHERE id = ?", [id], |r| {
             r.get(0)
@@ -1659,6 +1694,149 @@ mod tests {
             apply_remote_snapshot(&mut conn, &remote, &HashMap::new(), Some(T_NOW)).unwrap();
         assert!(!account_exists(&conn, "a1"));
         assert!(merged.contains_key("a1"));
+    }
+
+    // ── ZEB-848 PR #585 converge round 1 ──
+
+    /// Fix A: a poison-rejected account that is NOT already local must skip its
+    /// dependent transactions, so an in-range txn referencing the never-inserted
+    /// account cannot FK-abort (and roll back) the WHOLE snapshot. A second
+    /// honest account in the same snapshot proves the rest still applies.
+    #[test]
+    fn rejected_missing_account_skips_dependent_txn_no_fk_abort() {
+        let mut conn = fresh_db();
+        let remote = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![
+                AccountRow {
+                    id: "a1".into(),
+                    name: "POISON".into(),
+                    created_at: ms_to_rfc3339(T_NOW - 60_000),
+                    updated_at: "9999-12-31T23:59:59Z".into(), // poison → dropped, a1 never inserted
+                },
+                AccountRow {
+                    id: "a2".into(),
+                    name: "honest".into(),
+                    created_at: ms_to_rfc3339(T_NOW - 60_000),
+                    updated_at: ms_to_rfc3339(T_NOW - 1_000), // in-range → applied
+                },
+            ],
+            transactions: vec![TransactionRow {
+                id: "t1".into(),
+                transaction_date: "2026-05-01".into(),
+                amount: "10.00".into(),
+                currency: "USD".into(),
+                account_id: "a1".into(), // references the dropped account
+                description: "orphan".into(),
+                metadata: None,
+                created_at: ms_to_rfc3339(T_NOW - 60_000),
+                updated_at: ms_to_rfc3339(T_NOW - 1_000), // in-range on its own merit
+                deleted_at: None,
+            }],
+            settings: vec![],
+            account_deletion_floor: HashMap::new(),
+            captured_at: "2026-05-19T12:00:00Z".into(),
+        };
+        // No error / rollback: the whole snapshot must apply atomically minus the
+        // skipped rows.
+        apply_remote_snapshot(&mut conn, &remote, &HashMap::new(), Some(T_NOW)).unwrap();
+        assert!(
+            !account_exists(&conn, "a1"),
+            "poison account never inserted"
+        );
+        assert!(
+            !tx_exists(&conn, "t1"),
+            "dependent txn skipped (no FK abort)"
+        );
+        assert!(account_exists(&conn, "a2"), "honest account still applied");
+    }
+
+    /// Fix A: when the poison-rejected account DOES exist locally, its honest row
+    /// survives (poison update dropped) and its in-range transaction still merges
+    /// against the surviving local account — no FK problem, so `Applied` (not a
+    /// skip) is the correct outcome.
+    #[test]
+    fn rejected_existing_account_still_merges_its_txn() {
+        let mut conn = fresh_db();
+        let local_ts = ms_to_rfc3339(T_NOW - 60_000);
+        seed_account(&mut conn, "a1", "honest", &local_ts);
+        let remote = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![AccountRow {
+                id: "a1".into(),
+                name: "POISON".into(),
+                created_at: local_ts.clone(),
+                updated_at: "9999-12-31T23:59:59Z".into(), // poison update → dropped
+            }],
+            transactions: vec![TransactionRow {
+                id: "t1".into(),
+                transaction_date: "2026-05-01".into(),
+                amount: "10.00".into(),
+                currency: "USD".into(),
+                account_id: "a1".into(),
+                description: "merged".into(),
+                metadata: None,
+                created_at: local_ts.clone(),
+                updated_at: ms_to_rfc3339(T_NOW - 1_000), // in-range
+                deleted_at: None,
+            }],
+            settings: vec![],
+            account_deletion_floor: HashMap::new(),
+            captured_at: "2026-05-19T12:00:00Z".into(),
+        };
+        apply_remote_snapshot(&mut conn, &remote, &HashMap::new(), Some(T_NOW)).unwrap();
+        // Poison update dropped: honest local name + updated_at survive.
+        assert_eq!(account_name(&conn, "a1"), "honest");
+        let a1_updated: String = conn
+            .query_row("SELECT updated_at FROM accounts WHERE id = 'a1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(a1_updated, local_ts);
+        // Its in-range txn still merged (existing local account → no FK problem).
+        assert!(tx_exists(&conn, "t1"));
+        assert_eq!(tx_amount(&conn, "t1"), "10.00");
+    }
+
+    /// Fix B: a non-UTC (`+05:00`) remote stamp whose INSTANT is within tolerance
+    /// but whose STRING sorts above the local UTC stamp must not overwrite the
+    /// local row — the canonical-UTC parse rejects the non-zero offset before it
+    /// can win the raw-string LWW.
+    #[test]
+    fn non_utc_offset_remote_cannot_overwrite_utc_local() {
+        let mut conn = fresh_db();
+        // Honest local: UTC (`+00:00`) string, in-range.
+        let local_ts = ms_to_rfc3339(T_NOW - 60_000);
+        seed_account(&mut conn, "a1", "honest", &local_ts);
+        // Remote poison: the SAME instant as `now`, re-encoded `+05:00`. Its
+        // instant is within tolerance (the skew check alone would accept it), yet
+        // its string ("…T23:…+05:00") sorts ABOVE the local "…+00:00" string and
+        // would win a raw-string LWW — the exploit the canonical-UTC parse closes.
+        let plus5 = chrono::FixedOffset::east_opt(5 * 3600).unwrap();
+        let non_utc_ts = chrono::DateTime::from_timestamp_millis(T_NOW as i64)
+            .unwrap()
+            .with_timezone(&plus5)
+            .to_rfc3339();
+        // Precondition of the exploit: the non-UTC string does sort high.
+        assert!(
+            non_utc_ts.as_str() > local_ts.as_str(),
+            "test fixture must reproduce the sort-above condition: {non_utc_ts} vs {local_ts}"
+        );
+        let remote = MintSnapshot {
+            schema_version: 1,
+            accounts: vec![AccountRow {
+                id: "a1".into(),
+                name: "POISON".into(),
+                created_at: local_ts.clone(),
+                updated_at: non_utc_ts,
+            }],
+            transactions: vec![],
+            settings: vec![],
+            account_deletion_floor: HashMap::new(),
+            captured_at: "2026-05-19T12:00:00Z".into(),
+        };
+        apply_remote_snapshot(&mut conn, &remote, &HashMap::new(), Some(T_NOW)).unwrap();
+        assert_eq!(account_name(&conn, "a1"), "honest");
     }
 
     #[test]

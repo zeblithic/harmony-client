@@ -69,16 +69,22 @@ pub fn clamp_future(stamp: u64, now: u64, tolerance: u64) -> u64 {
     stamp.min(now.saturating_add(tolerance))
 }
 
-/// Parse an RFC-3339 timestamp to non-negative epoch milliseconds.
+/// Parse a *canonical UTC* RFC-3339 timestamp to non-negative epoch milliseconds.
 ///
-/// Accepts both honest mint encodings — `+00:00` with variable fractional
-/// precision (`chrono::Utc::now().to_rfc3339()`) and the fixed `...Z` epoch
-/// literal. Pre-epoch instants floor to `0` (ancient — never future).
-/// Returns `None` when `stamp` is not valid RFC-3339.
+/// Accepts only zero-offset encodings (`Z` / `+00:00`) — the two forms honest
+/// mint producers emit (`chrono::Utc::now().to_rfc3339()` and the fixed `...Z`
+/// epoch literal) — and floors pre-epoch instants to `0` (ancient — never
+/// future). Returns `None` on a parse failure OR a non-zero UTC offset: the
+/// stored string is the LWW ordering key and the winner-compare is lexicographic,
+/// so a non-zero offset (e.g. `+05:00`) could sort above a UTC stamp of the same
+/// or older instant and win the raw-string compare — a revert/overwrite vector.
+/// Rejecting non-UTC keeps string order aligned with instant order to the second.
 pub fn parse_rfc3339_ms(stamp: &str) -> Option<u64> {
-    chrono::DateTime::parse_from_rfc3339(stamp)
-        .ok()
-        .map(|dt| dt.timestamp_millis().max(0) as u64)
+    let dt = chrono::DateTime::parse_from_rfc3339(stamp).ok()?;
+    if dt.offset().local_minus_utc() != 0 {
+        return None; // non-canonical (non-UTC) encoding — not a valid peer stamp
+    }
+    Some(dt.timestamp_millis().max(0) as u64)
 }
 
 /// Reject a peer-supplied RFC-3339 wall stamp used as a stored, replicated LWW
@@ -311,6 +317,11 @@ mod tests {
         // Epoch literal → 0; pre-epoch floors to 0 (ancient, never future).
         assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_rfc3339_ms("1960-01-01T00:00:00Z"), Some(0));
+        // Non-canonical (non-UTC) offsets → None, even though they parse as valid
+        // RFC-3339 instants: the stored string is the LWW key, so a non-zero
+        // offset could sort above a UTC stamp of the same/older instant and win.
+        assert_eq!(parse_rfc3339_ms("2026-08-02T23:59:00+05:00"), None);
+        assert_eq!(parse_rfc3339_ms("2026-08-02T13:59:00-05:00"), None);
         // Garbage / empty → None.
         assert_eq!(parse_rfc3339_ms("zzzz"), None);
         assert_eq!(parse_rfc3339_ms(""), None);
@@ -338,6 +349,15 @@ mod tests {
         ));
         // …but fail-open on skew when the local clock is unreadable.
         assert!(!reject_rfc3339_future("9999-12-31T23:59:59Z", None, tol));
+
+        // Non-UTC encoding whose INSTANT is well within tolerance is STILL
+        // rejected — the reject is about the non-canonical encoding, not the
+        // instant. `same_instant_now` sits exactly at that instant so the
+        // forward-skew check alone would accept it; only the non-UTC parse-None
+        // drives the rejection.
+        let non_utc = "2026-08-02T23:59:00+05:00"; // == 2026-08-02T18:59:00Z
+        let same_instant_now = parse_rfc3339_ms("2026-08-02T18:59:00Z").unwrap();
+        assert!(reject_rfc3339_future(non_utc, Some(same_instant_now), tol));
 
         // Inclusive boundary: exactly now+tol is accepted; just beyond is rejected.
         assert!(!reject_rfc3339_future(

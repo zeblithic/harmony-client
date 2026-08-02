@@ -67,12 +67,17 @@ persisted rows. High cost, no offsetting benefit for this fix.
   and leaves honest state to re-propagate. (Same reasoning as T-DISCOVERY's
   D2-MERGE `merge_from` reject; the reject-never-clamp rule for stored replicated
   registers.)
-- **Reject unparseable stamps.** `"zzzz"` is the sharpest vector *because* it is
-  unparseable and sorts above every real stamp. An unparseable string is never a
-  valid ordering key. Honest producers only emit `to_rfc3339()` (`+00:00`,
-  variable fractional precision) or the fixed `Z` epoch literal — both parse via
-  `chrono::DateTime::parse_from_rfc3339` — and pre-launch there is no legacy
-  non-RFC-3339 corpus. Rejecting unparseable only ever drops a *remote* poison
+- **Reject unparseable AND non-canonical (non-UTC) stamps.** `"zzzz"` is the
+  sharpest vector *because* it is unparseable and sorts above every real stamp.
+  A subtler sibling is a *parseable* but non-UTC offset (e.g. `+05:00`): the gate
+  bounds the parsed instant, but the stored `updated_at` STRING remains the LWW
+  key and the winner-compare is lexicographic, so a same-or-older instant encoded
+  with a high offset sorts above a newer `Z` stamp and wins — a revert/overwrite
+  vector. So `parse_rfc3339_ms` accepts only zero-offset encodings; both an
+  unparseable string and a non-zero offset return `None` and are dropped. Honest
+  producers only emit `to_rfc3339()` (`+00:00`, variable fractional precision) or
+  the fixed `Z` epoch literal — both zero-offset — and pre-launch there is no
+  legacy non-RFC-3339/non-UTC corpus, so this only ever drops a *remote* poison
   row, never a local edit.
 - **Fail-open on an unreadable receiver clock.** `receiver_now_ms() == None` ⇒
   skip the forward-skew check (a bad *local* clock must never drop honest
@@ -86,10 +91,12 @@ persisted rows. High cost, no offsetting benefit for this fix.
 ### New shared helpers (`clock_trust`)
 
 ```rust
-/// Parse an RFC-3339 timestamp to non-negative epoch milliseconds.
-/// Accepts both `Z` and `+00:00` offsets and variable fractional precision
-/// (the two honest encodings mint produces). Pre-epoch instants floor to 0
-/// (ancient — never future). `None` if the string is not valid RFC-3339.
+/// Parse a *canonical UTC* RFC-3339 timestamp to non-negative epoch milliseconds.
+/// Accepts only zero-offset encodings (`Z` / `+00:00`, variable fractional
+/// precision) — the two honest encodings mint produces. Pre-epoch instants floor
+/// to 0 (ancient — never future). `None` on a parse failure OR a non-zero UTC
+/// offset: the stored string is the LWW key, so a non-UTC offset could sort above
+/// a UTC stamp of the same/older instant and win the raw-string compare.
 pub fn parse_rfc3339_ms(stamp: &str) -> Option<u64>;
 
 /// Reject a peer-supplied RFC-3339 wall stamp used as a stored replicated LWW
@@ -113,9 +120,12 @@ Thread `now_ms: Option<u64>` from `handle_incoming_decoded`
 when `reject_rfc3339_future(stamp, now_ms, MAX_FORWARD_SKEW_MS)`:
 
 1. `upsert_account_lww` — gate `r.updated_at` at the top (before the floor
-   suppress at `:171` and the LWW at `:189`); return `Applied` (no-op, not
-   `Suppressed` — a poison-rejected account must not cascade-skip its
-   transactions).
+   suppress and the LWW). The skip decision is account-aware: return `Applied`
+   when the account already exists locally (its honest row stays, its txns still
+   merge — not `Suppressed`, which is reserved for deletion-floor staleness), but
+   return `RejectedNoLocalAccount` when it does NOT exist locally, so the caller
+   skips its dependent transactions — an in-range txn referencing a never-inserted
+   account would violate the accounts FK and roll back the whole snapshot.
 2. `upsert_transaction_lww` — gate `r.updated_at` at the top (before `:232`).
 3. `upsert_setting_lww` — gate `r.updated_at` before the SQL statement.
 4. Deletion-floor loop (`:124-150`) — gate each `remote_ts` before the
@@ -144,9 +154,17 @@ Each must fail with the gate neutralized:
 
 ## Non-goals
 
-- **Not** moving the winner-compare off strings. The mixed `Z`/`+00:00`
-  lexicographic fragility is pre-existing and only diverges at exact-instant ties
-  (already "keep local"). Noted; out of scope.
+- **Not** moving the winner-compare off strings. The gate now rejects non-UTC
+  (non-zero-offset) encodings, so every accepted stamp is zero-offset UTC and the
+  stored-string LWW order matches instant order **to the second**. The only
+  residual is a sub-second / `Z`-vs-`+00:00` difference at the *same second*,
+  which affects exact-second ties only and is non-exploitable — the seconds field
+  dominates the lexicographic sort, so no value older by ≥1 s can win. (An earlier
+  draft claimed the mixed-encoding fragility "only bites at exact-instant ties";
+  that was wrong — a non-UTC offset diverges at *distinct* instants, which is why
+  it is now rejected outright.) Moving every ordering decision onto parsed
+  epoch-ms would also erase the benign residual and is possible future hardening;
+  out of scope here.
 - **No** per-row HLC (Option B).
 - **Already-persisted** poison (a future stamp written before this fix) is healed
   by any local edit to that row (direct write bypasses LWW) but not purely by
