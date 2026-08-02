@@ -2858,7 +2858,11 @@ pub async fn run(
                                                     }
                                                 };
                                             match cache_for_task
-                                                .on_sample(subscription_id, broadcast)
+                                                .on_sample(
+                                                    subscription_id,
+                                                    broadcast,
+                                                    crate::iroh_friend_acceptor::wall_now_secs(),
+                                                )
                                                 .await
                                             {
                                                 Ok(outcome) => {

@@ -37,7 +37,7 @@ async fn peer_subscribe_receives_broadcast() {
         fixture_hlc(1000, 0),
     );
     let outcome = cache
-        .on_sample(1, broadcast)
+        .on_sample(1, broadcast, 0)
         .await
         .expect("on_sample should succeed for valid broadcast");
     assert_eq!(outcome, CacheOnSampleOutcome::InsertedFirst);
@@ -63,7 +63,7 @@ async fn attribution_mismatch_rejected() {
     let (_bytes, _y_addr, broadcast_from_y) =
         mock_profile_broadcast([2u8; 32], vec![fixture_space_id(7)], fixture_hlc(1000, 0));
     let err = cache
-        .on_sample(1, broadcast_from_y)
+        .on_sample(1, broadcast_from_y, 0)
         .await
         .expect_err("attribution mismatch must surface as Err");
     assert!(
@@ -88,7 +88,7 @@ async fn subscribe_unsubscribe_lifecycle() {
     let (_bytes, _addr, broadcast) =
         mock_profile_broadcast([3u8; 32], vec![fixture_space_id(1)], fixture_hlc(2000, 0));
     cache
-        .on_sample(7, broadcast)
+        .on_sample(7, broadcast, 0)
         .await
         .expect("on_sample for registered subscription");
     assert!(cache.get_cached(7).await.is_some());
@@ -109,7 +109,7 @@ async fn subscribe_unsubscribe_lifecycle() {
     let (_bytes2, _addr2, b2) =
         mock_profile_broadcast([3u8; 32], vec![fixture_space_id(1)], fixture_hlc(3000, 0));
     let err = cache
-        .on_sample(7, b2)
+        .on_sample(7, b2, 0)
         .await
         .expect_err("unknown subscription must surface as Err");
     assert!(
@@ -138,7 +138,7 @@ async fn self_publish_on_opt_in_change() {
     let cache = ProfileBroadcastCache::default();
     cache.register(11, owner_addr).await;
     cache
-        .on_sample(11, broadcast)
+        .on_sample(11, broadcast, 0)
         .await
         .expect("dev2 should receive + verify");
     let snap = cache.get_cached(11).await.expect("cached after on_sample");
@@ -162,7 +162,7 @@ async fn self_publish_rotation_to_empty() {
         fixture_hlc(1000, 0),
     );
     cache
-        .on_sample(13, b1)
+        .on_sample(13, b1, 0)
         .await
         .expect("first publish accepted");
     assert_eq!(
@@ -178,7 +178,7 @@ async fn self_publish_rotation_to_empty() {
     // Rotation: empty community_ids, strictly newer HLC.
     let (_bytes2, _addr2, b2) = mock_profile_broadcast([55u8; 32], vec![], fixture_hlc(2000, 0));
     let outcome = cache
-        .on_sample(13, b2)
+        .on_sample(13, b2, 0)
         .await
         .expect("rotation publish accepted");
     assert_eq!(
