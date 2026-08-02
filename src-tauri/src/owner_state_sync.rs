@@ -269,6 +269,12 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         dismissed_received_grants,
     } = remote;
 
+    // ZEB-847 (T-OWNER): sample the receiver's OWN wall clock ONCE for the whole
+    // merge. Every peer/sibling-supplied stamp below is bounded against this and
+    // this only — never a peer/HLC/adoption value. `None` (unreadable clock) ⇒
+    // apply-all: a bad LOCAL clock must never drop honest owner state.
+    let receiver_now = crate::clock_trust::receiver_now_ms();
+
     // ZEB-243: apply remote outbox tombstones FIRST. LWW per id by HLC;
     // sweep matching local outbox entries whose created_at is strictly
     // older than the merged tombstone HLC. Must precede the outbox merge
@@ -303,6 +309,13 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     }
 
     for (_, space) in spaces {
+        // ZEB-847: a future-dated `updated_at` would win the LWW and pin
+        // `shared_in_profile` (privacy-control bypass), discarding a later
+        // opt-out. Reject it; `created_at` is not a vector (earliest-wins +
+        // immutable-field guard at owner_state_crdt.rs:361-382).
+        if crate::clock_trust::wall_exceeds_forward_skew(space.updated_at.wall_ms, receiver_now) {
+            continue;
+        }
         local.apply_space_with_canonicalization(space);
     }
     for (_, entry) in outbox {
@@ -312,6 +325,11 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         local.apply_inbox(entry);
     }
     for (_, marker) in markers {
+        // ZEB-847: a future `last_read_at` would pin "all read" forever (RM).
+        if crate::clock_trust::wall_exceeds_forward_skew(marker.last_read_at.wall_ms, receiver_now)
+        {
+            continue;
+        }
         local.apply_marker(marker);
     }
     for tomb in tombstones {
@@ -333,6 +351,12 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // would only see entries learned locally), breaking DM unicast
     // addressing convergence across bound devices.
     for (addr, entry) in owner_device_cache.devices {
+        // ZEB-847: a future `learned_at` would LWW-replace and then block every
+        // later legit device update (DEV → peer devices unlearnable, DMs
+        // UnknownSigningKey).
+        if crate::clock_trust::wall_exceeds_forward_skew(entry.learned_at.wall_ms, receiver_now) {
+            continue;
+        }
         local.apply_owner_device_update(
             addr,
             entry.devices,
@@ -350,6 +374,17 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // closes the snapshot-merge path so the field round-trips correctly
     // across Flow A.
     for (addr, remote_entry) in libraries {
+        // ZEB-847: a future `added_at` pins the library present; a future
+        // `removed_at` pins it removed and blocks re-adds (LE). Reject if either
+        // bound is implausibly future.
+        if crate::clock_trust::wall_exceeds_forward_skew(
+            remote_entry.added_at.wall_ms,
+            receiver_now,
+        ) || remote_entry.removed_at.as_ref().is_some_and(|rm| {
+            crate::clock_trust::wall_exceeds_forward_skew(rm.wall_ms, receiver_now)
+        }) {
+            continue;
+        }
         let remote_max: &Hlc = match &remote_entry.removed_at {
             Some(rm) if rm.is_strictly_newer_than(&remote_entry.added_at) => rm,
             _ => &remote_entry.added_at,
@@ -383,6 +418,12 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // is normal LWW and `Inserted`/`Merged` are the success paths — only
     // `InvariantFail` is logged.
     for (addr, entry) in friend_graph.friends {
+        // ZEB-847: a future-dated `learned_at` would out-LWW every later honest
+        // revoke forever (FAIL-OPEN: blocked party keeps DM access). Reject it —
+        // clamping is insufficient (a clamped now+5min still beats an honest now).
+        if crate::clock_trust::wall_exceeds_forward_skew(entry.learned_at.wall_ms, receiver_now) {
+            continue;
+        }
         if let crate::owner_state_crdt::ApplyOutcome::Rejected(
             reason @ crate::owner_state_crdt::RejectionReason::InvariantFail(_),
         ) = local.apply_friend_update(addr, entry)
@@ -462,6 +503,25 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     for (cid, remote_grants) in file_grants {
         let entry = local.file_grants.entry(cid).or_default();
         for g in remote_grants {
+            // ZEB-847 (GR): reject a grant record carrying ANY future-dated stamp
+            // (more than MAX_FORWARD_SKEW_MS ahead of the receiver's own clock).
+            // `granted_at` future is the FAIL-OPEN vector — it wins the grow-only
+            // max and reactivates the grant past an honest revoke (a clamp is
+            // insufficient: a clamped now+5min still exceeds an honest revoke at
+            // now, and `granted_at > revoked_at` is a static compare). `revoked_at`
+            // future is bounded here too, but by REJECT, not clamp: clamping would
+            // persist a receiver-dependent value into this replicated grow-only
+            // max register and break cross-device convergence (two clocks clamp
+            // the same poison to different stored values). Dropping the record
+            // leaves honest local state untouched and stores only raw,
+            // all-devices-agree values, nullifying the poison rather than
+            // transforming it. Honest revokes stamp revoked_at = now.max(
+            // granted_at) <= now+5min, so they pass the gate.
+            if crate::clock_trust::wall_exceeds_forward_skew(g.granted_at, receiver_now)
+                || crate::clock_trust::wall_exceeds_forward_skew(g.revoked_at, receiver_now)
+            {
+                continue;
+            }
             match entry
                 .iter()
                 .position(|e| e.grantee_owner == g.grantee_owner)
@@ -510,6 +570,14 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // clobber a fresh re-share, which the sweep would then delete — a re-share
     // lost on merge (CodeRabbit/Qodo, converge round 1).
     for (cid, dismissed_at) in dismissed_received_grants {
+        // ZEB-847 (RG): reject (skip) a future-dated dismiss rather than clamp —
+        // this is a replicated grow-only tombstone, so clamping would persist a
+        // receiver-dependent value and diverge across devices. A poisoned future
+        // dismiss is nullified (never stored); an honest dismiss (<= now+5min)
+        // passes and merges by max as before.
+        if crate::clock_trust::wall_exceeds_forward_skew(dismissed_at, receiver_now) {
+            continue;
+        }
         let slot = local.dismissed_received_grants.entry(cid).or_insert(0);
         *slot = (*slot).max(dismissed_at);
     }
@@ -533,6 +601,15 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     //      both devices pick the SAME whole record and converge byte-for-byte.
     // Both records unseal to the same DEK, so the observable key is unchanged.
     for (cid, grant) in received_file_grants {
+        // ZEB-847 (RG, CRITICAL): `received_at` is the FAIL-OPEN direction
+        // — a future value wins the union/`active()` tie-break and survives the
+        // dismiss sweep (activeness is `received_at > dismissed_at`, a static
+        // max-merged compare). A clamp is insufficient (clamped now+5min still
+        // beats an honest dismiss at now), so REJECT — mirrors GR (Task 5). A
+        // legit re-share (received_at at real now, past receiver_now) is accepted.
+        if crate::clock_trust::wall_exceeds_forward_skew(grant.received_at, receiver_now) {
+            continue;
+        }
         match local.received_file_grants.get(&cid) {
             Some(existing) => {
                 let dismissed_at = local.dismissed_received_grants.get(&cid).copied();
@@ -1911,7 +1988,9 @@ mod publisher_tests {
 mod integration_tests {
     use super::*;
     use crate::content_store::InMemoryStub;
-    use crate::owner_state_types::{OwnerAddr, Space, SpaceId, SpaceKind};
+    use crate::owner_state_types::{
+        LibraryEntry, OwnerAddr, ReadMarker, Space, SpaceId, SpaceKind,
+    };
     use std::time::Duration;
 
     async fn wait_until<F, Fut>(mut cond: F, timeout: Duration) -> bool
@@ -2663,6 +2742,764 @@ mod integration_tests {
         assert!(
             local.friend_graph.friends.is_empty(),
             "no friend entry should have been merged"
+        );
+    }
+
+    /// ZEB-847 (T-OWNER, Finding FR): fixed master key for the forward-skew
+    /// FriendEntry-reject tests below. `friend_entry` always stamps this key,
+    /// so callers derive the matching `OwnerAddr` via
+    /// `owner_id_from_master_ed25519(&TEST_FRIEND_MASTER)` — satisfying the
+    /// addr↔master_ed25519 invariant `apply_friend_update` enforces
+    /// (owner_state_crdt.rs:1093) without every test having to thread a real
+    /// key through.
+    const TEST_FRIEND_MASTER: [u8; 32] = [0x5f; 32];
+
+    /// `Hlc` with a given `wall_ms`; `logical`/`device_id` held constant so
+    /// `learned_at` ordering below is decided purely by `wall_ms`.
+    fn hlc_at(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    /// `FriendEntry` for `TEST_FRIEND_MASTER` with the given status/learned_at.
+    fn friend_entry(
+        status: crate::friend_graph::FriendStatus,
+        learned_at: Hlc,
+    ) -> crate::friend_graph::FriendEntry {
+        crate::friend_graph::FriendEntry {
+            master_ed25519: TEST_FRIEND_MASTER,
+            display: None,
+            status,
+            established_via: crate::friend_graph::FriendOrigin::Token,
+            referrable: false,
+            learned_at,
+            sealed_secret: None,
+        }
+    }
+
+    /// ZEB-847 (T-OWNER, Finding FR, CRITICAL — FAIL-OPEN): a sibling
+    /// snapshot can carry a `FriendEntry` stamped with an arbitrary future
+    /// `learned_at.wall_ms`. `FriendEntry` is LWW-by-`learned_at` (newer
+    /// wins; `Revoked` is a tombstone), so an un-rejected future-dated
+    /// `Active` would out-LWW every later honest `Revoked` forever — the
+    /// blocked party keeps DM access permanently, defeating the DM cutoff.
+    /// The forward-skew reject in the friend loop must drop the poisoned
+    /// entry before it ever reaches `apply_friend_update`.
+    #[test]
+    fn future_dated_active_friend_cannot_block_an_honest_revoke() {
+        use crate::friend_graph::FriendStatus;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let friend = crate::friend_graph::owner_id_from_master_ed25519(&TEST_FRIEND_MASTER);
+
+        // Local state already holds an honest REVOKE at real `now`.
+        let mut local = OwnerState::default();
+        local.apply_friend_update(friend, friend_entry(FriendStatus::Revoked, hlc_at(now_ms)));
+
+        // A malicious sibling snapshot re-activates the friendship, stamped
+        // 400 days ahead so it would out-LWW the honest revoke forever.
+        let mut remote = OwnerState::default();
+        remote.apply_friend_update(
+            friend,
+            friend_entry(
+                FriendStatus::Active,
+                hlc_at(now_ms + 400 * 24 * 60 * 60 * 1000),
+            ),
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        // The forward-skew reject drops the poisoned Active → the revoke stands.
+        assert_eq!(
+            local.friend_graph.friends.get(&friend).map(|e| &e.status),
+            Some(&FriendStatus::Revoked),
+            "future-dated Active must not resurrect a revoked friendship",
+        );
+    }
+
+    /// Companion to the above: an honest re-activate at real `now` (well
+    /// within the forward-skew tolerance) must still merge normally — the
+    /// guard must not over-reject legitimate in-window updates.
+    #[test]
+    fn present_dated_active_friend_still_wins_normally() {
+        use crate::friend_graph::FriendStatus;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let friend = crate::friend_graph::owner_id_from_master_ed25519(&TEST_FRIEND_MASTER);
+
+        let mut local = OwnerState::default();
+        local.apply_friend_update(friend, friend_entry(FriendStatus::Revoked, hlc_at(now_ms)));
+
+        let mut remote = OwnerState::default();
+        // learned_at strictly newer than the revoke, but well within the
+        // 5-min forward-skew tolerance window.
+        remote.apply_friend_update(
+            friend,
+            friend_entry(FriendStatus::Active, hlc_at(now_ms + 1000)),
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local.friend_graph.friends.get(&friend).map(|e| &e.status),
+            Some(&FriendStatus::Active),
+            "an in-window re-activate must merge normally",
+        );
+    }
+
+    /// ZEB-847 (T-OWNER, Finding SP): fixed SpaceId for the forward-skew
+    /// Space-reject tests below. Community kind — `shared_in_profile` is
+    /// only meaningful for Community spaces (owner_state_types.rs:1950-1968),
+    /// and it's also the kind for which the same-SpaceId immutable-field
+    /// guard (owner_state_crdt.rs:333-383) is active, so this shape proves
+    /// the forward-skew reject is what blocks the pin — not the guard
+    /// rejecting the whole merge outright for an unrelated reason.
+    const TEST_SPACE_ID: SpaceId = SpaceId([0x9a; 16]);
+
+    /// Community `Space` for `TEST_SPACE_ID` with the given `updated_at` /
+    /// `shared_in_profile`. Every other field — including the guarded
+    /// `admin_addr`, `is_invite_only`, `created_at`, `current_epoch`,
+    /// `current_epoch_key`, `old_epoch_keys` — is held fixed across
+    /// local/remote callers so only `updated_at`/`shared_in_profile` differ;
+    /// a mismatch on any guarded field would make `apply_space` reject the
+    /// whole merge (owner_state_crdt.rs:333-383) for the wrong reason.
+    fn privacy_space(updated_at: Hlc, shared_in_profile: bool) -> Space {
+        Space {
+            id: TEST_SPACE_ID,
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "Privacy Test Community".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc_at(1),
+            updated_at,
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(crate::owner_state_types::EpochKey::new([0x11; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0x22; 16])),
+            is_invite_only: Some(false),
+            shared_in_profile,
+            pending_join_at: None,
+        }
+    }
+
+    /// ZEB-847 (T-OWNER, Finding SP, CRITICAL — FAIL-OPEN): a sibling
+    /// snapshot can carry a `Space` stamped with an arbitrary future
+    /// `updated_at.wall_ms`. `Space` is LWW-by-`updated_at`
+    /// (`lww_merge_space` — `owner_state_crdt.rs:1225`), and the winner's
+    /// `shared_in_profile` pins the community's public-profile listing. An
+    /// un-rejected future-dated flip to `true` would out-LWW every later
+    /// honest opt-out forever — the user's privacy control is permanently
+    /// bypassed. The forward-skew reject in the spaces loop must drop the
+    /// poisoned entry before it ever reaches
+    /// `apply_space_with_canonicalization`.
+    #[test]
+    fn future_dated_space_cannot_pin_shared_in_profile() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Local state already holds an honest opt-OUT at real `now`.
+        let mut local = OwnerState::default();
+        local.apply_space_with_canonicalization(privacy_space(hlc_at(now_ms), false));
+
+        // A malicious sibling snapshot flips the community back to public,
+        // stamped 400 days ahead so it would out-LWW the honest opt-out
+        // forever.
+        let mut remote = OwnerState::default();
+        remote.apply_space_with_canonicalization(privacy_space(
+            hlc_at(now_ms + 400 * 24 * 60 * 60 * 1000),
+            true,
+        ));
+
+        merge_remote_into_local(&mut local, remote);
+
+        // The forward-skew reject drops the poisoned flip → the opt-out stands.
+        assert_eq!(
+            local
+                .spaces
+                .get(&TEST_SPACE_ID)
+                .map(|s| s.shared_in_profile),
+            Some(false),
+            "future-dated shared_in_profile=true must not override an honest opt-out",
+        );
+    }
+
+    /// Companion to the above: an honest opt-out change at real `now` (well
+    /// within the forward-skew tolerance) must still merge normally — the
+    /// guard must not over-reject legitimate in-window updates.
+    #[test]
+    fn present_dated_space_update_still_wins_normally() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let mut local = OwnerState::default();
+        local.apply_space_with_canonicalization(privacy_space(hlc_at(now_ms), false));
+
+        let mut remote = OwnerState::default();
+        // updated_at strictly newer than local's, but well within the 5-min
+        // forward-skew tolerance window.
+        remote.apply_space_with_canonicalization(privacy_space(hlc_at(now_ms + 1000), true));
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local
+                .spaces
+                .get(&TEST_SPACE_ID)
+                .map(|s| s.shared_in_profile),
+            Some(true),
+            "an in-window opt-in must merge normally",
+        );
+    }
+
+    /// ZEB-847 (T-OWNER): fixed SpaceId for the forward-skew ReadMarker-reject
+    /// test below. Markers are keyed by `space_id`; the value is arbitrary
+    /// since no Space needs to exist for `apply_marker` to accept it.
+    const TEST_MARKER_SPACE: SpaceId = SpaceId([0x7c; 16]);
+
+    /// `ReadMarker` for `TEST_MARKER_SPACE` at the given `last_read_at`.
+    fn marker_at(last_read_at: Hlc) -> ReadMarker {
+        ReadMarker {
+            space_id: TEST_MARKER_SPACE,
+            last_read_at,
+        }
+    }
+
+    /// ZEB-847 (T-OWNER, Finding RM, CRITICAL — FAIL-OPEN): a sibling
+    /// snapshot can carry a `ReadMarker` stamped with an arbitrary future
+    /// `last_read_at.wall_ms`. `ReadMarker` is LWW-by-`last_read_at`
+    /// (`apply_marker` — owner_state_crdt.rs:687), so an un-rejected
+    /// future-dated marker would pin "everything read" and suppress unread
+    /// badges permanently. The forward-skew reject in the markers loop must
+    /// drop the poisoned entry before it ever reaches `apply_marker`.
+    #[test]
+    fn future_dated_marker_cannot_pin_all_read() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Local state already holds the honest (real, unread-since) marker.
+        let mut local = OwnerState::default();
+        local.apply_marker(marker_at(hlc_at(now_ms)));
+
+        // A malicious sibling snapshot pins "all read" 400 days ahead so it
+        // would out-LWW the honest marker forever.
+        let mut remote = OwnerState::default();
+        remote.apply_marker(marker_at(hlc_at(now_ms + 400 * 24 * 60 * 60 * 1000)));
+
+        merge_remote_into_local(&mut local, remote);
+
+        // The forward-skew reject drops the poisoned marker → the honest
+        // (older) last_read_at stands.
+        assert_eq!(
+            local
+                .markers
+                .get(&TEST_MARKER_SPACE)
+                .map(|m| &m.last_read_at),
+            Some(&hlc_at(now_ms)),
+            "future-dated last_read_at must not pin all-read forever",
+        );
+    }
+
+    /// Companion to the above: an honest marker advance at real `now` (well
+    /// within the forward-skew tolerance) must still merge normally — the
+    /// guard must not over-reject legitimate in-window updates.
+    #[test]
+    fn in_window_marker_advance_still_applies() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Local holds an older marker.
+        let mut local = OwnerState::default();
+        local.apply_marker(marker_at(hlc_at(now_ms)));
+
+        // Remote supplies a strictly newer marker, but well within the 5-min
+        // forward-skew tolerance window.
+        let mut remote = OwnerState::default();
+        remote.apply_marker(marker_at(hlc_at(now_ms + 1000)));
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local
+                .markers
+                .get(&TEST_MARKER_SPACE)
+                .map(|m| &m.last_read_at),
+            Some(&hlc_at(now_ms + 1000)),
+            "an in-window marker advance must still merge normally",
+        );
+    }
+
+    /// ZEB-847 (T-OWNER, Finding DEV, CRITICAL — FAIL-OPEN): a sibling
+    /// snapshot can carry an `OwnerDeviceEntry` stamped with an arbitrary
+    /// future `learned_at.wall_ms`. `OwnerDeviceEntry` is LWW-by-`learned_at`
+    /// (`apply_owner_device_update` — owner_state_crdt.rs:733), so an
+    /// un-rejected future-dated entry would LWW-replace and then block every
+    /// later legit device update forever — the peer's new/rotated device is
+    /// never learned and their DMs read `UnknownSigningKey`. The
+    /// forward-skew reject in the owner_device_cache loop must drop the
+    /// poisoned entry before it ever reaches `apply_owner_device_update`,
+    /// AND must not itself block a subsequent in-window legit update.
+    #[test]
+    fn future_dated_device_entry_is_rejected_and_does_not_block_a_later_legit_learn() {
+        use crate::owner_state_types::DeviceIdentityHash;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let owner = OwnerAddr([0x91; 16]);
+        let old_device = DeviceIdentityHash([0x01; 16]);
+        let new_device = DeviceIdentityHash([0x02; 16]);
+
+        // Local already knows the current device set, learned at real `now`.
+        let mut local = OwnerState::default();
+        local.apply_owner_device_update(
+            owner,
+            vec![old_device],
+            vec![None],
+            vec![None],
+            hlc_at(now_ms),
+        );
+
+        // A malicious sibling snapshot LWW-replaces with an empty device
+        // list, stamped 400 days ahead so it would out-LWW every later
+        // legit update forever.
+        let mut remote = OwnerState::default();
+        remote.apply_owner_device_update(
+            owner,
+            vec![],
+            vec![],
+            vec![],
+            hlc_at(now_ms + 400 * 24 * 60 * 60 * 1000),
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local
+                .owner_device_cache
+                .devices
+                .get(&owner)
+                .map(|e| e.devices.clone()),
+            Some(vec![old_device]),
+            "future-dated learned_at must not LWW-replace the honest device list",
+        );
+
+        // The rejected poison must not block a subsequent in-window legit
+        // relearn — if the poison had been stored, this strictly-older-than-
+        // the-poison update would be rejected as StaleHlc and the new device
+        // would never be learnable.
+        let outcome = local.apply_owner_device_update(
+            owner,
+            vec![old_device, new_device],
+            vec![None, None],
+            vec![None, None],
+            hlc_at(now_ms + 1000),
+        );
+        assert!(
+            !matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)),
+            "a real in-window device update must still apply after the poison is \
+             rejected, got {outcome:?}",
+        );
+        assert_eq!(
+            local
+                .owner_device_cache
+                .devices
+                .get(&owner)
+                .map(|e| e.devices.clone()),
+            Some(vec![old_device, new_device]),
+            "the new device must be learned after the in-window update",
+        );
+    }
+
+    /// ZEB-847 (T-OWNER): fixed OwnerAddr for the forward-skew
+    /// LibraryEntry-reject tests below.
+    const TEST_LIBRARY_ADDR: OwnerAddr = OwnerAddr([0x77; 16]);
+
+    /// `LibraryEntry` for `TEST_LIBRARY_ADDR` with the given `added_at` /
+    /// `removed_at`.
+    fn library_entry(added_at: Hlc, removed_at: Option<Hlc>) -> LibraryEntry {
+        LibraryEntry {
+            address: TEST_LIBRARY_ADDR,
+            added_at,
+            removed_at,
+        }
+    }
+
+    /// ZEB-847 (T-OWNER, Finding LE, CRITICAL — FAIL-OPEN): the trusted-
+    /// library set is LWW by `max(added_at, removed_at)`
+    /// (`LibraryEntry::is_effective` — owner_state_types.rs:2548). A sibling
+    /// snapshot can carry a future-dated `added_at` that would pin the
+    /// library present forever, undoing an honest removal. The forward-skew
+    /// reject in the libraries loop must drop the poisoned entry before it
+    /// ever reaches the remote_max/should_replace LWW comparison.
+    #[test]
+    fn future_dated_library_add_cannot_undo_an_honest_removal() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Local state already holds an honest removal at real `now`.
+        let mut local = OwnerState::default();
+        local.libraries.insert(
+            TEST_LIBRARY_ADDR,
+            library_entry(hlc_at(1), Some(hlc_at(now_ms))),
+        );
+
+        // A malicious sibling snapshot re-adds the library, stamped 400 days
+        // ahead so it would out-LWW the honest removal forever.
+        let mut remote = OwnerState::default();
+        remote.libraries.insert(
+            TEST_LIBRARY_ADDR,
+            library_entry(hlc_at(now_ms + 400 * 24 * 60 * 60 * 1000), None),
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local
+                .libraries
+                .get(&TEST_LIBRARY_ADDR)
+                .map(LibraryEntry::is_effective),
+            Some(false),
+            "future-dated added_at must not undo an honest removal",
+        );
+    }
+
+    /// Companion to the above: an honest removal at real `now` (well within
+    /// the forward-skew tolerance) must still merge normally — the guard
+    /// must not over-reject legitimate in-window updates.
+    #[test]
+    fn in_window_library_removal_still_applies() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let mut local = OwnerState::default();
+        local
+            .libraries
+            .insert(TEST_LIBRARY_ADDR, library_entry(hlc_at(now_ms), None));
+
+        let mut remote = OwnerState::default();
+        // removed_at strictly newer than added_at, but well within the
+        // 5-min forward-skew tolerance window.
+        remote.libraries.insert(
+            TEST_LIBRARY_ADDR,
+            library_entry(hlc_at(now_ms), Some(hlc_at(now_ms + 1000))),
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local
+                .libraries
+                .get(&TEST_LIBRARY_ADDR)
+                .map(LibraryEntry::is_effective),
+            Some(false),
+            "an in-window legit removal must still apply",
+        );
+    }
+
+    /// ZEB-847 (T-OWNER, Finding GR, CRITICAL — FAIL-OPEN): `file_grants` is
+    /// an LWW-element-set (`GrantEntry.granted_at`/`revoked_at`, both
+    /// grow-only `max` joins) — active iff `granted_at > revoked_at`. A
+    /// sibling snapshot can carry a `GrantEntry` re-shared with an
+    /// arbitrary future `granted_at`, which would out-LWW every honest
+    /// `revoked_at` and pin the grant active forever, bypassing a file-share
+    /// revoke. The forward-skew reject in the `file_grants` loop must drop the
+    /// poisoned record before the max-join; a clamp is insufficient, because a
+    /// clamped `now + 5min` still exceeds an honest `revoked_at` at `now`.
+    #[test]
+    fn future_dated_grant_reshare_cannot_undo_an_honest_revoke() {
+        use crate::file_sharing::{record_grant, revoke_grant_inner};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xe1u8; 32];
+        let grantee = OwnerAddr([0xe2; 16]);
+
+        // Local state already holds an honest REVOKE at real `now`.
+        let mut local = OwnerState::default();
+        record_grant(&mut local, cid, grantee, now_ms);
+        revoke_grant_inner(&mut local, cid, grantee, now_ms);
+
+        // A malicious sibling snapshot re-shares the same grantee, stamped
+        // 400 days ahead so it would out-LWW the honest revoke forever.
+        let mut remote = OwnerState::default();
+        record_grant(
+            &mut remote,
+            cid,
+            grantee,
+            now_ms + 400 * 24 * 60 * 60 * 1000,
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        let entry = local.file_grants[&cid]
+            .iter()
+            .find(|g| g.grantee_owner == grantee)
+            .expect("grantee entry present");
+        assert!(
+            entry.granted_at <= entry.revoked_at,
+            "future-dated re-share must not undo an honest revoke: granted_at={} revoked_at={}",
+            entry.granted_at,
+            entry.revoked_at,
+        );
+    }
+
+    /// Companion to the above: a legit re-share strictly newer than an
+    /// earlier revoke, but well within the forward-skew tolerance window,
+    /// must still reactivate the grant — the guard isn't over-rejecting.
+    #[test]
+    fn in_window_grant_reshare_still_reactivates_after_a_revoke() {
+        use crate::file_sharing::{record_grant, revoke_grant_inner};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xe3u8; 32];
+        let grantee = OwnerAddr([0xe4; 16]);
+
+        // Local holds an older revoke.
+        let mut local = OwnerState::default();
+        record_grant(&mut local, cid, grantee, now_ms);
+        revoke_grant_inner(&mut local, cid, grantee, now_ms);
+
+        // A legit re-share, strictly newer, but well within the 5-min
+        // forward-skew tolerance window.
+        let mut remote = OwnerState::default();
+        record_grant(&mut remote, cid, grantee, now_ms + 1000);
+
+        merge_remote_into_local(&mut local, remote);
+
+        let entry = local.file_grants[&cid]
+            .iter()
+            .find(|g| g.grantee_owner == grantee)
+            .expect("grantee entry present");
+        assert!(
+            entry.granted_at > entry.revoked_at,
+            "an in-window re-share must still reactivate the grant: granted_at={} revoked_at={}",
+            entry.granted_at,
+            entry.revoked_at,
+        );
+    }
+
+    /// ZEB-847 (T-OWNER, Finding GR, CRITICAL — FAIL-OPEN): `revoked_at` is
+    /// itself a grow-only `max` join, symmetric with `granted_at` above. A
+    /// sibling snapshot can re-supply an honest, in-window ACTIVE grant
+    /// (`granted_at = now`) paired with a poisoned future `revoked_at`,
+    /// which — absent the guard — would out-LWW the local unset revoke and
+    /// grief-lock the grant deactivated forever. The
+    /// `|| wall_exceeds_forward_skew(g.revoked_at, ..)` arm must drop the
+    /// whole record before the max-join, so the poison never lands.
+    #[test]
+    fn future_dated_revoke_reshare_cannot_grief_lock_an_active_grant() {
+        use crate::file_sharing::{record_grant, revoke_grant_inner};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xe5u8; 32];
+        let grantee = OwnerAddr([0xe6; 16]);
+
+        // Local state already holds an honest ACTIVE grant at real `now`.
+        let mut local = OwnerState::default();
+        record_grant(&mut local, cid, grantee, now_ms);
+
+        // A malicious sibling snapshot re-supplies the same grant with an
+        // honest in-window `granted_at` but a `revoked_at` stamped 400 days
+        // ahead, which would out-LWW the local unset revoke forever.
+        let mut remote = OwnerState::default();
+        record_grant(&mut remote, cid, grantee, now_ms);
+        revoke_grant_inner(
+            &mut remote,
+            cid,
+            grantee,
+            now_ms + 400 * 24 * 60 * 60 * 1000,
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        let entry = local.file_grants[&cid]
+            .iter()
+            .find(|g| g.grantee_owner == grantee)
+            .expect("grantee entry present");
+        assert!(
+            entry.granted_at > entry.revoked_at,
+            "future-dated revoke re-share must not grief-lock an active grant: granted_at={} revoked_at={}",
+            entry.granted_at,
+            entry.revoked_at,
+        );
+        // The poison must not partially land in the grow-only `revoked_at`
+        // max register either — the never-revoked default is `0`.
+        assert_eq!(
+            entry.revoked_at, 0,
+            "poisoned revoked_at must not merge into the max register: revoked_at={}",
+            entry.revoked_at,
+        );
+    }
+
+    /// Companion to the above: a legit revoke strictly newer than the grant,
+    /// but well within the forward-skew tolerance window, must still
+    /// deactivate it — the guard isn't over-rejecting.
+    #[test]
+    fn in_window_revoke_reshare_still_deactivates_a_grant() {
+        use crate::file_sharing::{record_grant, revoke_grant_inner};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xe7u8; 32];
+        let grantee = OwnerAddr([0xe8; 16]);
+
+        // Local holds an active grant.
+        let mut local = OwnerState::default();
+        record_grant(&mut local, cid, grantee, now_ms);
+
+        // A legit revoke, strictly newer, but well within the 5-min
+        // forward-skew tolerance window.
+        let mut remote = OwnerState::default();
+        record_grant(&mut remote, cid, grantee, now_ms);
+        revoke_grant_inner(&mut remote, cid, grantee, now_ms + 1000);
+
+        merge_remote_into_local(&mut local, remote);
+
+        let entry = local.file_grants[&cid]
+            .iter()
+            .find(|g| g.grantee_owner == grantee)
+            .expect("grantee entry present");
+        assert!(
+            entry.granted_at <= entry.revoked_at,
+            "an in-window revoke re-share must still deactivate the grant: granted_at={} revoked_at={}",
+            entry.granted_at,
+            entry.revoked_at,
+        );
+    }
+
+    /// ZEB-847 (T-OWNER, Finding RG, CRITICAL — FAIL-OPEN): `received_file_grants`
+    /// activeness is `received_at > dismissed_at`, both `max`-merged `u64`
+    /// (ZEB-727). A sibling snapshot can carry a `ReceivedFileGrant` re-supplied
+    /// with an arbitrary future `received_at`, which would out-LWW an honest
+    /// dismiss forever, undoing it. The forward-skew reject in the
+    /// `received_file_grants` union loop must drop the poisoned re-supply before
+    /// it ever enters the union/`active()` tie-break, so the existing dismiss
+    /// sweeps the (unchanged, still-stale) local grant out.
+    #[test]
+    fn future_dated_received_grant_reshare_cannot_undo_an_honest_dismiss() {
+        use crate::owner_state_types::{OwnerAddr, ReceivedFileGrant};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xf1u8; 32];
+        let grant = ReceivedFileGrant {
+            granter_owner: OwnerAddr([0xf2; 16]),
+            cid,
+            file_name: "f".into(),
+            file_size: 1,
+            mime: "application/octet-stream".into(),
+            sealed_dek: vec![0x01; 8],
+            received_at: now_ms - 1000,
+        };
+
+        // Local already holds an honest DISMISS at real `now`, for a grant
+        // received strictly before it (currently inactive).
+        let mut local = OwnerState::default();
+        local.received_file_grants.insert(cid, grant.clone());
+        local.dismissed_received_grants.insert(cid, now_ms);
+
+        // A malicious sibling snapshot re-supplies the same CID, stamped 400
+        // days ahead so it would out-LWW the honest dismiss forever.
+        let mut remote = OwnerState::default();
+        let mut poisoned = grant.clone();
+        poisoned.received_at = now_ms + 400 * 24 * 60 * 60 * 1000;
+        remote.received_file_grants.insert(cid, poisoned);
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert!(
+            !local.received_file_grants.contains_key(&cid),
+            "future-dated re-supply must not undo an honest dismiss: grant reads {:?}",
+            local.received_file_grants.get(&cid),
+        );
+    }
+
+    /// Companion to the above: a legit re-supply strictly newer than an
+    /// earlier dismiss, but well within the forward-skew tolerance window,
+    /// must still reactivate the grant (survive the ZEB-727 sweep) — the
+    /// guard isn't over-rejecting.
+    #[test]
+    fn in_window_received_grant_reshare_still_reactivates_after_a_dismiss() {
+        use crate::owner_state_types::{OwnerAddr, ReceivedFileGrant};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xf3u8; 32];
+
+        // Local holds an older dismiss, no grant on file (a prior re-supply
+        // was fully swept away).
+        let mut local = OwnerState::default();
+        local.dismissed_received_grants.insert(cid, now_ms - 5000);
+
+        // A legit re-supply, strictly newer than the dismiss, but well within
+        // the 5-min forward-skew tolerance window.
+        let mut remote = OwnerState::default();
+        remote.received_file_grants.insert(
+            cid,
+            ReceivedFileGrant {
+                granter_owner: OwnerAddr([0xf4; 16]),
+                cid,
+                file_name: "f".into(),
+                file_size: 1,
+                mime: "application/octet-stream".into(),
+                sealed_dek: vec![0x02; 8],
+                received_at: now_ms + 1000,
+            },
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        let got = local
+            .received_file_grants
+            .get(&cid)
+            .expect("an in-window re-supply must still reactivate the grant");
+        assert_eq!(
+            got.received_at,
+            now_ms + 1000,
+            "in-window re-supply must survive the merge sweep unmodified"
         );
     }
 

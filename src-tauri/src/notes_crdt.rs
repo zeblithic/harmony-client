@@ -89,8 +89,16 @@ impl NotesDoc {
     /// whether the VISIBLE projection (text or live/tombstoned status) changed,
     /// so it drives a UI refresh only when something user-visible moved.
     pub fn merge_from(&mut self, remote: NotesDoc) -> MergeOutcome {
+        // ZEB-847 (C9): bound each remote note's `updated_at` against the
+        // receiver's own clock; a future stamp would LWW-win and silently drop
+        // a legitimate local edit. Sampled once for the whole merge; `None`
+        // (unreadable clock) ⇒ apply-all.
+        let receiver_now = crate::clock_trust::receiver_now_ms();
         let mut changed = false;
         for (id, r) in remote.notes {
+            if crate::clock_trust::wall_exceeds_forward_skew(r.updated_at.wall_ms, receiver_now) {
+                continue;
+            }
             let accept = match self.notes.get(&id) {
                 Some(l) => r.updated_at.is_strictly_newer_than(&l.updated_at),
                 None => true,
@@ -182,6 +190,68 @@ mod tests {
         d.delete("n1", hlc(3, "A"));
         let live: Vec<_> = d.list().into_iter().map(|n| n.id.clone()).collect();
         assert_eq!(live, vec!["n2".to_string()]);
+    }
+
+    /// ZEB-847 (T-OWNER, Finding C9): a remote `NotesDoc` can carry a note
+    /// stamped with an arbitrary future `updated_at`. `merge_from` is
+    /// per-id LWW on `updated_at` (`notes_crdt.rs:91-109`), so an
+    /// un-rejected future stamp would out-LWW every later honest edit
+    /// forever, silently dropping the user's real edit.
+    #[test]
+    fn future_dated_note_edit_is_rejected_at_merge() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Local holds an honest edit at real `now`.
+        let mut local = NotesDoc::default();
+        local.upsert("n1".into(), "honest".into(), hlc(now_ms, "A"));
+
+        // Remote carries the same note, edited, but stamped 400 days ahead —
+        // it would out-LWW the honest edit forever if not rejected.
+        let mut remote = NotesDoc::default();
+        remote.upsert(
+            "n1".into(),
+            "malicious-future".into(),
+            hlc(now_ms + 400 * 24 * 60 * 60 * 1000, "B"),
+        );
+
+        let out = local.merge_from(remote);
+
+        assert!(!out.changed, "future-dated edit must not be visible");
+        assert_eq!(
+            local.get("n1").unwrap().text,
+            "honest",
+            "future-dated note edit must not override an honest edit"
+        );
+    }
+
+    /// Companion to the above: an honest edit at real `now` (well within the
+    /// forward-skew tolerance) must still merge normally.
+    #[test]
+    fn present_dated_note_edit_still_merges_normally() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let mut local = NotesDoc::default();
+        local.upsert("n1".into(), "honest".into(), hlc(now_ms, "A"));
+
+        let mut remote = NotesDoc::default();
+        // Strictly newer than local's, but well within the forward-skew
+        // tolerance window.
+        remote.upsert("n1".into(), "later-edit".into(), hlc(now_ms + 1000, "B"));
+
+        let out = local.merge_from(remote);
+
+        assert!(out.changed);
+        assert_eq!(
+            local.get("n1").unwrap().text,
+            "later-edit",
+            "an in-window edit must merge normally"
+        );
     }
 
     #[test]

@@ -92,6 +92,16 @@ pub fn receiver_now_ms() -> Option<u64> {
         .ok()
 }
 
+/// `true` iff `wall_ms` is implausibly far in the receiver's *future* under the
+/// control-tier ceiling ([`MAX_FORWARD_SKEW_MS`]). `receiver_now_ms == None`
+/// (unreadable / pre-epoch clock) ⇒ `false` (apply-all): a bad LOCAL clock must
+/// never drop honest state. The forward-skew half of the T-OWNER (ZEB-847) and
+/// T-GOV (ZEB-846) owner/governance merge bounds; boundary is inclusive.
+#[inline]
+pub fn wall_exceeds_forward_skew(wall_ms: u64, receiver_now_ms: Option<u64>) -> bool {
+    receiver_now_ms.is_some_and(|rn| reject_future(wall_ms, rn, MAX_FORWARD_SKEW_MS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +160,34 @@ mod tests {
             clamp_future(now + MAX_FORWARD_SKEW_MS + 10_000, now, MAX_FORWARD_SKEW_MS),
             now + MAX_FORWARD_SKEW_MS,
             "future capped to the ceiling"
+        );
+    }
+
+    #[test]
+    fn wall_exceeds_forward_skew_none_now_is_apply_all() {
+        // Unreadable local clock ⇒ never reject (a bad LOCAL clock must not drop honest state).
+        assert!(!wall_exceeds_forward_skew(u64::MAX, None));
+        assert!(!wall_exceeds_forward_skew(0, None));
+    }
+
+    #[test]
+    fn wall_exceeds_forward_skew_honors_the_inclusive_ceiling() {
+        let now = 1_700_000_000_000;
+        assert!(
+            !wall_exceeds_forward_skew(now, Some(now)),
+            "present accepted"
+        );
+        assert!(
+            !wall_exceeds_forward_skew(now - 10_000, Some(now)),
+            "past accepted"
+        );
+        assert!(
+            !wall_exceeds_forward_skew(now + MAX_FORWARD_SKEW_MS, Some(now)),
+            "exactly at the ceiling is accepted (inclusive)"
+        );
+        assert!(
+            wall_exceeds_forward_skew(now + MAX_FORWARD_SKEW_MS + 1, Some(now)),
+            "one past the ceiling is rejected"
         );
     }
 
