@@ -498,10 +498,14 @@ impl CommunityState {
             // the attacker we bound can move those). `None` (pre-epoch clock) ⇒
             // ceiling disabled (apply-all), so a bad local clock can't drop honest
             // governance. The floor stays `None` here (event-driven cached view).
-            // Fail-safe under caching: advancing real time only ever *un*-excludes a
-            // future-dated event, and un-exclusion requires a log mutation, which
-            // already busts this version-keyed cache — so a cached `now`-relative
-            // result only ever over-excludes future events, never under-excludes.
+            // Fail-safe under caching: as real time advances, a future-dated event
+            // can become includable, but this version-keyed cache only reflects
+            // that once the next log mutation busts it — so a stale cached
+            // `now`-relative result only ever OVER-excludes a future-dated event
+            // (delaying a governance action), never UNDER-excludes (never applies
+            // a still-future event early). The excluded set is view-only: nothing
+            // is deleted from the stored CRDT state, only from this materialized
+            // snapshot.
             let receiver_now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)

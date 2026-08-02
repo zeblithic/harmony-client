@@ -4369,17 +4369,19 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             // receiver's OWN trusted wall clock (never a peer-supplied or
             // HlcAdoptFloor value) is threaded through so verify_event can
             // reject an implausibly-future membership wall before it ever
-            // reaches `state.insert_event`. Pre-epoch clock (never in
-            // practice) degrades to `now_ms: Some(0)`, which only rejects
-            // walls beyond `MAX_FORWARD_SKEW_MS` — never drops honest
-            // present-day events. Matches the `.unwrap_or_default()` idiom
-            // used elsewhere in this file (e.g. `:2151`).
+            // reaches `state.insert_event`. A pre-epoch clock (dead RTC,
+            // manual mis-set) must NOT collapse to `Some(0)` — at now=0,
+            // every honest present-day wall (~1.7e12) reads as beyond
+            // `MAX_FORWARD_SKEW_MS` and would be rejected, freezing
+            // governance ingestion. So a failed `duration_since` maps to
+            // `None` ⇒ no forward reject (apply-all), matching the
+            // channel (`.ok()`) and voting (`!= 0`) fallbacks elsewhere.
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
+                .map(|d| d.as_millis() as u64)
+                .ok();
             let ctx_v = VerifyContext {
-                now_ms: Some(now_ms),
+                now_ms,
                 expected_community_id: ctx.community_id,
                 admin_addr: ctx.admin_addr,
                 is_invite_only: ctx.is_invite_only,
