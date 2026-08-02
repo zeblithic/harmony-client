@@ -222,6 +222,16 @@ struct MaterializedCache {
     /// skewed event becomes effective the moment it is plausible rather than
     /// waiting for the next log mutation to bust the cache.
     recompute_after_ms: Option<u64>,
+    /// ZEB-846: whether the forward-skew ceiling was ENABLED (receiver clock
+    /// available, `Some`) when this view was built. The bound is time-dependent
+    /// *only while enabled*; the enabled/disabled MODE is a second axis the
+    /// version key does not capture. A view built with the ceiling disabled
+    /// (pre-epoch clock ⇒ apply-all) must not keep serving after the clock
+    /// recovers — it would UNDER-exclude a now-boundable future event; a bounded
+    /// view must not keep serving after the clock is lost — it would keep
+    /// DEFERRING honest governance. So a cache hit additionally requires the
+    /// current mode to equal this one. `None` = cache never populated.
+    cached_ceiling_enabled: Option<bool>,
 }
 
 /// ZEB-846: whether a time-aware cached materialization is still valid at
@@ -237,6 +247,30 @@ fn cache_time_still_valid(recompute_after_ms: Option<u64>, receiver_now_ms: Opti
         None => true,
         Some(t) => receiver_now_ms.is_none_or(|rn| rn < t),
     }
+}
+
+/// ZEB-846: whether a cached materialization is still valid to serve at the
+/// current clock, across BOTH axes the version key does not capture:
+///
+/// 1. **Ceiling mode** — the view is only reusable if the ceiling is in the
+///    same enabled/disabled state it was built under. A `None`-clock (apply-all)
+///    view surviving a clock recovery would UNDER-exclude a now-boundable future
+///    event (the direction ZEB-846 exists to prevent); a bounded view surviving
+///    a clock loss would keep DEFERRING honest governance. A never-populated
+///    cache (`cached_ceiling_enabled == None`) is never a hit.
+/// 2. **Time** — within a bounded (enabled) mode, the soonest-deferred event
+///    must not yet have entered the window ([`cache_time_still_valid`]).
+///
+/// Pure so both mode-flip directions are exhaustively unit-testable without
+/// mocking the system clock.
+fn cache_policy_still_valid(
+    cached_ceiling_enabled: Option<bool>,
+    now_ceiling_enabled: bool,
+    recompute_after_ms: Option<u64>,
+    receiver_now_ms: Option<u64>,
+) -> bool {
+    cached_ceiling_enabled == Some(now_ceiling_enabled)
+        && cache_time_still_valid(recompute_after_ms, receiver_now_ms)
 }
 
 // `VerifiedLog<MembershipPolicy>` (the core engine) does not derive `Debug`,
@@ -481,6 +515,17 @@ impl CommunityState {
             .recompute_after_ms
     }
 
+    /// Test-only: the ceiling MODE (`Some(true)` = ceiling enabled / receiver
+    /// clock available) recorded when the cache was last populated. `None` until
+    /// `materialized()` has run. ZEB-846 clock-mode invalidation marker.
+    #[cfg(test)]
+    pub(crate) fn cache_ceiling_enabled_for_test(&self) -> Option<bool> {
+        self.cache
+            .lock()
+            .expect("cache mutex poisoned")
+            .cached_ceiling_enabled
+    }
+
     /// Cache version counter. Bumps on every successful insert.
     /// Useful for IPC layers that want to short-circuit "did anything
     /// change?" checks across calls. Mirrors the version-counter
@@ -532,9 +577,15 @@ impl CommunityState {
         // (pre-epoch clock) ⇒ ceiling disabled (apply-all), so a bad local clock
         // can't drop honest governance.
         let receiver_now = crate::clock_trust::receiver_now_ms();
+        let now_ceiling_enabled = receiver_now.is_some();
         let cache_hit = cache.cached_version == Some(cache.version)
             && cache.cached_admin_addr == Some(admin_addr)
-            && cache_time_still_valid(cache.recompute_after_ms, receiver_now);
+            && cache_policy_still_valid(
+                cache.cached_ceiling_enabled,
+                now_ceiling_enabled,
+                cache.recompute_after_ms,
+                receiver_now,
+            );
         if !cache_hit {
             let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
             // Apply the receiver-`now` forward-skew ceiling. The floor stays
@@ -566,6 +617,7 @@ impl CommunityState {
             cache.cached_version = Some(cache.version);
             cache.cached_admin_addr = Some(admin_addr);
             cache.recompute_after_ms = recompute_after_ms;
+            cache.cached_ceiling_enabled = Some(now_ceiling_enabled);
             return m;
         }
         cache
@@ -1115,6 +1167,61 @@ mod zeb846_accessor_ceiling {
             state.cache_recompute_after_for_test(),
             Some(kick_wall - crate::clock_trust::MAX_FORWARD_SKEW_MS),
             "recompute_after must mark exactly when the sole deferred Kick becomes plausible"
+        );
+    }
+
+    #[test]
+    fn cache_policy_invalidates_on_ceiling_mode_flip() {
+        // Greptile P1: the cache must not reuse a view built under a different
+        // ceiling MODE (receiver-clock availability).
+        //
+        // None→Some (clock recovers): an apply-all view (built ceiling-disabled)
+        // must NOT survive — it would keep INCLUDING a future poison event the
+        // recovered clock should now bound out (under-exclusion).
+        assert!(
+            !cache_policy_still_valid(Some(false), true, None, Some(1_000)),
+            "apply-all view must be invalidated once the clock recovers (else under-exclusion)"
+        );
+        // Some→None (clock breaks): a bounded view (built ceiling-enabled) must
+        // NOT survive — it would keep DEFERRING honest governance after the
+        // clock is lost, violating the apply-all-on-bad-clock invariant.
+        assert!(
+            !cache_policy_still_valid(Some(true), false, Some(1_000), None),
+            "bounded view must be invalidated once the clock is lost (else honest governance stays dropped)"
+        );
+        // Same mode + time still valid ⇒ hit.
+        assert!(
+            cache_policy_still_valid(Some(true), true, Some(1_000), Some(999)),
+            "same enabled mode, deferred event not yet plausible ⇒ still valid"
+        );
+        assert!(
+            cache_policy_still_valid(Some(false), false, None, None),
+            "same disabled mode ⇒ still valid"
+        );
+        // Same enabled mode but the deferred event has entered the window ⇒
+        // the time axis still forces a recompute.
+        assert!(
+            !cache_policy_still_valid(Some(true), true, Some(1_000), Some(1_000)),
+            "same mode but deferred event now plausible ⇒ recompute"
+        );
+        // A never-populated cache is never a hit.
+        assert!(
+            !cache_policy_still_valid(None, true, None, Some(1_000)),
+            "unpopulated cache (cached_ceiling_enabled None) is never a hit"
+        );
+    }
+
+    #[test]
+    fn materialized_records_enabled_ceiling_mode() {
+        // Wiring proof: on any real host the clock is available, so a populated
+        // cache records the ENABLED mode — the value the mode gate compares
+        // against on the next read.
+        let (state, admin, _victim) = state_with_join_and_future_kick();
+        let _ = state.materialized(admin);
+        assert_eq!(
+            state.cache_ceiling_enabled_for_test(),
+            Some(true),
+            "a real-clock materialize must record the ceiling as enabled"
         );
     }
 
