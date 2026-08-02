@@ -17,6 +17,12 @@
 //!   7. Nonce-replay + per-window rate limit.
 //!   8. Ban-check (materialized state strictly before the Join HLC).
 //!   9. Admit via the shipping `bootstrap_admit_open_publisher` gate.
+//!
+//! ZEB-846 Task 7 adds one more bound, checked immediately after step 2:
+//! `join_event.at.wall_ms` — the Join's OWN wall — must also be within
+//! `clock_trust::MAX_FORWARD_SKEW_MS` of the beacon's wall clock. This is
+//! separate from `created_at` above (which only bounds the request envelope)
+//! because the Join event is what actually lands in the persisted log.
 
 use crate::community_invite::{device_hash_from_identity_pub, OpenJoinRequest};
 use crate::community_membership::{
@@ -56,6 +62,13 @@ pub enum OpenJoinReject {
     BadEnrollment,
     /// `created_at` is outside the bounded freshness window (too old or too far future).
     Stale,
+    /// `join_event.at.wall_ms` — the Join's OWN wall, distinct from the
+    /// envelope's `created_at` — is more than `clock_trust::MAX_FORWARD_SKEW_MS`
+    /// ahead of the beacon's wall clock. This is the timestamp that actually
+    /// lands in the persisted membership log, so it gets its own bound
+    /// (ZEB-846 Task 7 — closes the gap left by Task 3's zenoh-merge-only
+    /// `community_membership::verify_event` forward-skew reject).
+    JoinEventFutureSkew,
     /// The request nonce was already seen within the replay-cache horizon.
     Replay,
     /// The joiner owner is `Banned` at the Join HLC.
@@ -214,6 +227,20 @@ pub fn verify_and_admit_open_join(
         || created > wall_now_ms.saturating_add(60_000)
     {
         return Err(OpenJoinReject::Stale);
+    }
+
+    // 2b. ZEB-846 (Task 7): bound the join_event's OWN wall — separate from
+    //     `created_at` above, which only bounds the request envelope. This
+    //     event is what `bootstrap_admit_open_publisher` (step 9) appends to
+    //     the persisted membership log, so an attacker who mints a fresh
+    //     envelope around a far-future-walled Join must be rejected here,
+    //     not just at the zenoh-merge path's `verify_event` (Task 3).
+    if crate::clock_trust::reject_future(
+        req.join_event.at.wall_ms,
+        wall_now_ms,
+        crate::clock_trust::MAX_FORWARD_SKEW_MS,
+    ) {
+        return Err(OpenJoinReject::JoinEventFutureSkew);
     }
 
     // 3. Capability proof. `timestamp_ms` is `created_at.wall_ms` — the joiner
@@ -442,16 +469,19 @@ mod tests {
             Self::build(true)
         }
 
-        /// The joiner's self-signed open Join the request carries, at a fresh
-        /// HLC after any prior ban events.
-        fn join_event(&self) -> SignedMembershipEvent {
+        /// The joiner's self-signed open Join the request carries, at the
+        /// given `at.wall_ms` (a fresh HLC after any prior ban events).
+        /// Parameterized so the ZEB-846 join-event forward-skew bound can be
+        /// exercised independently of `created_at` (which stays fixed at 1000
+        /// in `request_with_nonce_and_join_wall_ms`).
+        fn join_event_at(&self, wall_ms: u64) -> SignedMembershipEvent {
             let p = EventPayload {
                 id: [0x10; 16],
                 community_id: self.community_id,
                 kind: MembershipEventKind::Join,
                 actor: self.joiner.owner,
                 at: Hlc {
-                    wall_ms: 1000,
+                    wall_ms,
                     logical: 0,
                     device_id: "joiner".into(),
                 },
@@ -467,6 +497,18 @@ mod tests {
         /// over (community, identity_pub, nonce, created_at.wall_ms) and a real
         /// packet signature over canonical CBOR of the request.
         fn request_with_nonce(&self, nonce: [u8; 16]) -> (OpenJoinRequest, [u8; 64], Vec<u8>) {
+            self.request_with_nonce_and_join_wall_ms(nonce, 1000)
+        }
+
+        /// Like `request_with_nonce`, but lets the caller set the inner
+        /// `join_event`'s own `at.wall_ms` (`created_at` stays fixed at 1000,
+        /// so it remains fresh regardless) — used to test the ZEB-846
+        /// join-event forward-skew bound in isolation from envelope freshness.
+        fn request_with_nonce_and_join_wall_ms(
+            &self,
+            nonce: [u8; 16],
+            join_wall_ms: u64,
+        ) -> (OpenJoinRequest, [u8; 64], Vec<u8>) {
             let created_at = Hlc {
                 wall_ms: 1000,
                 logical: 0,
@@ -481,7 +523,7 @@ mod tests {
             );
             let req = OpenJoinRequest {
                 community_id: self.community_id,
-                join_event: self.join_event(),
+                join_event: self.join_event_at(join_wall_ms),
                 joiner_identity_pub: self.joiner_identity_pub,
                 signing_device_hash: DeviceIdentityHash(device_hash_from_identity_pub(
                     &self.joiner_identity_pub,
@@ -648,6 +690,67 @@ mod tests {
             .unwrap_err(),
             OpenJoinReject::Stale
         );
+    }
+
+    /// ZEB-846 Task 7: `req.join_event.at.wall_ms` — the Join's OWN wall —
+    /// must be bounded even when `created_at` (the envelope) is fresh. This
+    /// is the timestamp that actually lands in the persisted membership log
+    /// via `bootstrap_admit_open_publisher`, so a skewed/malicious peer that
+    /// mints a fresh envelope around a far-future-walled Join must still be
+    /// rejected.
+    #[test]
+    fn rejects_join_event_future_skew_with_fresh_envelope() {
+        let f = Fixture::new();
+        let just_outside = f.now_ms + crate::clock_trust::MAX_FORWARD_SKEW_MS + 1;
+        let (req, sig, signed_bytes) =
+            f.request_with_nonce_and_join_wall_ms([0x09; 16], just_outside);
+        let mut lim = OpenJoinRateLimiter::new();
+        assert_eq!(
+            verify_and_admit_open_join(
+                &req,
+                &sig,
+                &signed_bytes,
+                &f.epoch_key,
+                f.community_id,
+                f.admin_addr,
+                &f.current_events,
+                f.now_ms,
+                FRESHNESS,
+                f.now_ms,
+                &mut lim,
+            )
+            .unwrap_err(),
+            OpenJoinReject::JoinEventFutureSkew,
+            "created_at stayed fresh — the rejection must be attributable to the \
+             join_event's own forward-skew bound, not envelope freshness (Stale)"
+        );
+    }
+
+    /// Boundary companion to the above: `join_event.at.wall_ms` exactly at
+    /// `wall_now_ms + MAX_FORWARD_SKEW_MS` must still admit — `reject_future`'s
+    /// boundary is inclusive.
+    #[test]
+    fn admits_join_event_exactly_at_skew_boundary() {
+        let f = Fixture::new();
+        let at_boundary = f.now_ms + crate::clock_trust::MAX_FORWARD_SKEW_MS;
+        let (req, sig, signed_bytes) =
+            f.request_with_nonce_and_join_wall_ms([0x0a; 16], at_boundary);
+        let mut lim = OpenJoinRateLimiter::new();
+        let ok = verify_and_admit_open_join(
+            &req,
+            &sig,
+            &signed_bytes,
+            &f.epoch_key,
+            f.community_id,
+            f.admin_addr,
+            &f.current_events,
+            f.now_ms,
+            FRESHNESS,
+            f.now_ms,
+            &mut lim,
+        )
+        .expect("join_event.at.wall_ms exactly at the skew boundary must admit");
+        assert_eq!(ok.joiner_addr, f.joiner_addr);
     }
 
     #[test]

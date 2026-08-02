@@ -632,6 +632,21 @@ mod verify_rejection_tests {
         OwnerAddr,
         [u8; 64],
     ) {
+        minted_join_event_at(joiner_identity, community_id, 1000)
+    }
+
+    /// Like `minted_join_event`, but lets the caller set the Join event's own
+    /// `at.wall_ms` — used to exercise the ZEB-846 join-event forward-skew
+    /// bound independently of the packet envelope's `created_at`.
+    fn minted_join_event_at(
+        joiner_identity: &harmony_identity::PrivateIdentity,
+        community_id: SpaceId,
+        wall_ms: u64,
+    ) -> (
+        harmony_app::community_membership::SignedMembershipEvent,
+        OwnerAddr,
+        [u8; 64],
+    ) {
         let seed = joiner_identity.identity.address_hash[0] | 0x01;
         let joiner = harmony_app::community_membership::mint_test_owner(seed);
         let join_event = sign_event(
@@ -641,7 +656,7 @@ mod verify_rejection_tests {
                 kind: MembershipEventKind::Join,
                 actor: joiner.owner,
                 at: Hlc {
-                    wall_ms: 1000,
+                    wall_ms,
                     logical: 0,
                     device_id: "j".into(),
                 },
@@ -667,10 +682,31 @@ mod verify_rejection_tests {
         joiner_identity: &harmony_identity::PrivateIdentity,
         community_id: SpaceId,
     ) -> CommunityInviteSigned {
+        make_valid_packet_with_join_wall_ms(
+            self_identity,
+            self_device_sk,
+            joiner_identity,
+            community_id,
+            1000,
+        )
+    }
+
+    /// Like `make_valid_packet`, but lets the caller set the inner Join
+    /// event's own `at.wall_ms` — used to test the ZEB-846 join-event
+    /// forward-skew bound independently of the packet envelope's
+    /// `created_at` (which stays fixed at 1100, well within the freshness
+    /// tolerance relative to `now_ms() == 2000`).
+    fn make_valid_packet_with_join_wall_ms(
+        self_identity: &harmony_identity::PrivateIdentity,
+        self_device_sk: &ed25519_dalek::SigningKey,
+        joiner_identity: &harmony_identity::PrivateIdentity,
+        community_id: SpaceId,
+        join_wall_ms: u64,
+    ) -> CommunityInviteSigned {
         use ed25519_dalek::Signer as _;
         let self_owner = OwnerAddr(self_identity.identity.address_hash);
         let (join_event, joiner_owner, joiner_pub) =
-            minted_join_event(joiner_identity, community_id);
+            minted_join_event_at(joiner_identity, community_id, join_wall_ms);
 
         // Build an InviteToken signed by the counter-signer's enrolled device
         // key (#2). ZEB-339: verify_packet_pure step 6 now verifies against
@@ -849,6 +885,73 @@ mod verify_rejection_tests {
         )
         .expect_err("must reject");
         assert!(matches!(err, CommunityInviteVerifyError::Expired));
+    }
+
+    /// ZEB-846 Task 7: `signed.join_event.at.wall_ms` — the Join's OWN wall —
+    /// must be bounded even when `created_at` (the envelope) is fresh. This is
+    /// the timestamp that actually lands in the persisted membership log, so a
+    /// skewed/malicious inviter-redeem packet with a fresh envelope wrapped
+    /// around a far-future-walled Join must still be rejected.
+    #[test]
+    fn community_invite_join_event_future_skew_rejected() {
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xc7; 32]);
+        let self_device_sk = device_sk_from_identity(&self_id);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xc8; 32]);
+        let community_id = SpaceId([0x10; 16]);
+
+        // now_ms() == 2000; MAX_FORWARD_SKEW_MS == 300_000 — one past the bound.
+        let just_outside = now_ms() + harmony_app::clock_trust::MAX_FORWARD_SKEW_MS + 1;
+        let signed = make_valid_packet_with_join_wall_ms(
+            &self_id,
+            &self_device_sk,
+            &joiner_id,
+            community_id,
+            just_outside,
+        );
+        // created_at (1100) stays fresh — the rejection must be attributable
+        // to the join_event's own forward-skew bound, not the envelope check.
+
+        let err = verify_packet_pure(
+            &signed,
+            OwnerAddr(self_id.identity.address_hash),
+            now_ms,
+            &self_device_sk.verifying_key().to_bytes(),
+        )
+        .expect_err("must reject");
+        assert!(matches!(
+            err,
+            CommunityInviteVerifyError::JoinEventFutureSkew
+        ));
+    }
+
+    /// Boundary companion to the above: `join_event.at.wall_ms` exactly at
+    /// `now + MAX_FORWARD_SKEW_MS` must still admit — `reject_future`'s
+    /// boundary is inclusive.
+    #[test]
+    fn community_invite_join_event_at_skew_boundary_admits() {
+        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xc9; 32]);
+        let self_device_sk = device_sk_from_identity(&self_id);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xca; 32]);
+        let community_id = SpaceId([0x10; 16]);
+
+        let at_boundary = now_ms() + harmony_app::clock_trust::MAX_FORWARD_SKEW_MS;
+        let signed = make_valid_packet_with_join_wall_ms(
+            &self_id,
+            &self_device_sk,
+            &joiner_id,
+            community_id,
+            at_boundary,
+        );
+        let expected_actor = signed.join_event.actor;
+
+        let join_event = verify_packet_pure(
+            &signed,
+            OwnerAddr(self_id.identity.address_hash),
+            now_ms,
+            &self_device_sk.verifying_key().to_bytes(),
+        )
+        .expect("join_event.at.wall_ms exactly at the skew boundary must admit");
+        assert_eq!(join_event.actor, expected_actor);
     }
 
     #[test]
