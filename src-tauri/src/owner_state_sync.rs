@@ -503,6 +503,23 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     for (cid, remote_grants) in file_grants {
         let entry = local.file_grants.entry(cid).or_default();
         for g in remote_grants {
+            // ZEB-847 (GR, CRITICAL): `granted_at` is the FAIL-OPEN vector — a
+            // future value wins the grow-only max and reactivates the grant past
+            // an honest revoke. A clamp is INSUFFICIENT (a clamped now+5min still
+            // exceeds an honest revoke at now, and `granted_at > revoked_at` is a
+            // static compare never re-evaluated against time), so REJECT the
+            // record outright — mirrors FR/SP/LE and the spec §6.2 primary
+            // `reject_future`-at-merge-boundary instruction. A later honest
+            // re-grant (granted_at at real now, past receiver_now) is accepted.
+            if crate::clock_trust::wall_exceeds_forward_skew(g.granted_at, receiver_now) {
+                continue;
+            }
+            // `revoked_at` is the SAFE (deactivating) direction, but a future
+            // value over-revokes and pins the register out of reach of a legit
+            // re-grant (grief-lockout). Clamp its magnitude before the max-join.
+            let mut g = g;
+            g.revoked_at =
+                crate::clock_trust::clamp_wall_to_forward_skew(g.revoked_at, receiver_now);
             match entry
                 .iter()
                 .position(|e| e.grantee_owner == g.grantee_owner)
@@ -3155,6 +3172,92 @@ mod integration_tests {
                 .map(LibraryEntry::is_effective),
             Some(false),
             "an in-window legit removal must still apply",
+        );
+    }
+
+    /// ZEB-847 (T-OWNER, Finding GR, CRITICAL — FAIL-OPEN): `file_grants` is
+    /// an LWW-element-set (`GrantEntry.granted_at`/`revoked_at`, both
+    /// grow-only `max` joins) — active iff `granted_at > revoked_at`. A
+    /// sibling snapshot can carry a `GrantEntry` re-shared with an
+    /// arbitrary future `granted_at`, which would out-LWW every honest
+    /// `revoked_at` and pin the grant active forever, bypassing a file-share
+    /// revoke. The forward-skew clamp in the `file_grants` loop must cap the
+    /// incoming stamp before the max-join.
+    #[test]
+    fn future_dated_grant_reshare_cannot_undo_an_honest_revoke() {
+        use crate::file_sharing::{record_grant, revoke_grant_inner};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xe1u8; 32];
+        let grantee = OwnerAddr([0xe2; 16]);
+
+        // Local state already holds an honest REVOKE at real `now`.
+        let mut local = OwnerState::default();
+        record_grant(&mut local, cid, grantee, now_ms);
+        revoke_grant_inner(&mut local, cid, grantee, now_ms);
+
+        // A malicious sibling snapshot re-shares the same grantee, stamped
+        // 400 days ahead so it would out-LWW the honest revoke forever.
+        let mut remote = OwnerState::default();
+        record_grant(
+            &mut remote,
+            cid,
+            grantee,
+            now_ms + 400 * 24 * 60 * 60 * 1000,
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        let entry = local.file_grants[&cid]
+            .iter()
+            .find(|g| g.grantee_owner == grantee)
+            .expect("grantee entry present");
+        assert!(
+            entry.granted_at <= entry.revoked_at,
+            "future-dated re-share must not undo an honest revoke: granted_at={} revoked_at={}",
+            entry.granted_at,
+            entry.revoked_at,
+        );
+    }
+
+    /// Companion to the above: a legit re-share strictly newer than an
+    /// earlier revoke, but well within the forward-skew tolerance window,
+    /// must still reactivate the grant — the guard isn't over-clamping.
+    #[test]
+    fn in_window_grant_reshare_still_reactivates_after_a_revoke() {
+        use crate::file_sharing::{record_grant, revoke_grant_inner};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xe3u8; 32];
+        let grantee = OwnerAddr([0xe4; 16]);
+
+        // Local holds an older revoke.
+        let mut local = OwnerState::default();
+        record_grant(&mut local, cid, grantee, now_ms);
+        revoke_grant_inner(&mut local, cid, grantee, now_ms);
+
+        // A legit re-share, strictly newer, but well within the 5-min
+        // forward-skew tolerance window.
+        let mut remote = OwnerState::default();
+        record_grant(&mut remote, cid, grantee, now_ms + 1000);
+
+        merge_remote_into_local(&mut local, remote);
+
+        let entry = local.file_grants[&cid]
+            .iter()
+            .find(|g| g.grantee_owner == grantee)
+            .expect("grantee entry present");
+        assert!(
+            entry.granted_at > entry.revoked_at,
+            "an in-window re-share must still reactivate the grant: granted_at={} revoked_at={}",
+            entry.granted_at,
+            entry.revoked_at,
         );
     }
 
