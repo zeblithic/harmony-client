@@ -89,11 +89,24 @@ pub struct DmInboxEntry {
     pub ingested_by: BTreeSet<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DmInboxDoc {
     #[serde(rename = "en")]
     pub entries: BTreeMap<String, DmInboxEntry>,
+    /// ZEB-851: LOCAL per-replica first-observation clock (ms) keyed by
+    /// entry key, driving TTL GC instead of the untrusted butler
+    /// `deposited_at`. Never serialized (canonical wire bytes unchanged) and
+    /// excluded from `PartialEq` below.
+    #[serde(skip)]
+    first_observed_ms: BTreeMap<String, u64>,
 }
+
+impl PartialEq for DmInboxDoc {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+impl Eq for DmInboxDoc {}
 
 // Manual CanonicalPayload registration: the `impl_canonical!` macro in
 // owner_state_types.rs is module-private, so we register these types with the
@@ -102,6 +115,14 @@ impl CanonicalPayloadSealed for DmInboxEntry {}
 impl CanonicalPayload for DmInboxEntry {}
 impl CanonicalPayloadSealed for DmInboxDoc {}
 impl CanonicalPayload for DmInboxDoc {}
+
+impl DmInboxDoc {
+    /// ZEB-851: mutable handle to the local first-observation clock for the
+    /// ingest GC (same crate). Not serialized; not part of equality.
+    pub(crate) fn first_observed_ms_mut(&mut self) -> &mut BTreeMap<String, u64> {
+        &mut self.first_observed_ms
+    }
+}
 
 impl DmInboxDoc {
     pub fn key(space_id: &[u8; 16], message_cid: &[u8]) -> String {
