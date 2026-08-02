@@ -3824,19 +3824,23 @@ mod tests {
 
     // ── Cluster A regression tests ────────────────────────────────────────────
 
-    // A1: verify_sr on a Stage 2 (Deliberation) poll with no status_quo synthesized
-    //     must NOT panic — must return StatusQuoNotSynthesized.
+    // A1: verify_sr on a candidate-less poll (kd=ss + kd=cl applied, no kd=dc) must
+    //     NOT panic. ZEB-850 Task 5: status_quo is now ALWAYS synthesized into the
+    //     ranking set (verify_sr mirrors the engine's apply-time locals), so the
+    //     poll is never "status_quo not synthesized" — the ratification set is the
+    //     degenerate [status_quo]. The claimed result here (a 2-finalist
+    //     star_result()) cannot match the recompute over [status_quo] with zero
+    //     ballots, so verify_sr correctly rejects with TallyMismatch.
     #[test]
-    fn verify_sr_on_stage_2_poll_rejects_with_status_quo_not_synthesized() {
+    fn verify_sr_candidateless_poll_result_mismatch_rejected_tally_mismatch() {
         // Poll in Stage::Deliberation (sortition done, dw not elapsed).
-        // status_quo has NOT been synthesized into candidates yet.
         let mut poll = new_poll(0); // create at 0, dw=10s, fw=10s
         poll.apply_event(&ss_event(10, vec![addr(1), addr(2), addr(3)], vec![]))
             .expect("ss");
-        // Apply kd=cl so NotInClosedStage is bypassed (we want to hit StatusQuoNotSynthesized).
+        // Apply kd=cl so the R1 close-applied check is satisfied.
         let cl_ev = make_event(PollEventKindCode::PollClose, 5000, addr(0xff));
         poll.apply_event(&cl_ev).expect("cl");
-        // No status_quo in candidates — poll hasn't reached Drafting yet.
+        // No kd=dc applied — candidates empty; ranking set is just [status_quo].
         assert!(poll.candidates.is_empty());
 
         let payload = Tier3PollResultPayload {
@@ -3849,32 +3853,35 @@ mod tests {
             addr(0xfe),
             encode(&payload),
         );
-        // Must not panic; must return StatusQuoNotSynthesized.
+        // No panic; the fabricated result != the recompute over [status_quo]
+        // (zero ballots) → TallyMismatch.
         let result = verify_sr(&ev, &poll);
         assert_eq!(
             result,
-            Err(VerifyError::StatusQuoNotSynthesized),
-            "expected StatusQuoNotSynthesized, got {result:?}"
+            Err(VerifyError::TallyMismatch),
+            "expected TallyMismatch, got {result:?}"
         );
     }
 
-    // A2: verify_ratification_ballot on a Stage 1 (Sortition) poll with no status_quo
-    //     must NOT panic — must return StatusQuoNotSynthesized.
+    // A2: verify_ratification_ballot on a candidate-less poll (no kd=dc) in the
+    //     Ratification window must NOT panic. ZEB-850 Task 5: status_quo is now
+    //     always synthesized, so the degenerate ratification set is [status_quo] =
+    //     1 candidate. A ballot carrying 2 scores is legitimately length-mismatched
+    //     against that single-candidate set → BallotLengthMismatch.
     #[test]
-    fn verify_ratification_ballot_on_stage_1_poll_rejects_with_status_quo_not_synthesized() {
-        // Poll in Stage::Ratification time window, but status_quo NOT synthesized.
+    fn verify_ratification_ballot_candidateless_ratification_poll_rejects_length_mismatch() {
+        // Poll in the Ratification time window, but no kd=dc → candidates empty.
         let mut meta = meta_at(0);
         meta.config.sortition_size = 3;
         let mut poll = Tier3PollState::new_from_create(meta, electorate(20));
         poll.apply_event(&ss_event(10, vec![addr(1), addr(2), addr(3)], vec![]))
             .expect("ss");
         // Wall_ms=25000 → past dw+fw threshold (20000) → Ratification stage.
-        // But no candidates / status_quo synthesized.
         assert!(poll.candidates.is_empty());
 
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: Some(vec![3, 1]), // 2 scores — but no status_quo yet
+            scores: Some(vec![3, 1]), // 2 scores, but the degenerate set is [status_quo] = 1
             ciphertexts_scores: None,
             ciphertexts_indicators: None,
             proof: None,
@@ -3885,12 +3892,17 @@ mod tests {
             addr(5), // in electorate
             encode(&rb_payload),
         );
-        // Must not panic; must return StatusQuoNotSynthesized.
+        // No panic; 2 scores vs the 1-candidate [status_quo] set → length mismatch.
         let result = verify_ratification_ballot(&ev, &poll);
         assert_eq!(
             result,
-            Err(VerifyError::StatusQuoNotSynthesized),
-            "expected StatusQuoNotSynthesized, got {result:?}"
+            Err(VerifyError::BallotInvalid(
+                ValidateError::BallotLengthMismatch {
+                    scores: 2,
+                    expected: 1,
+                }
+            )),
+            "expected BallotLengthMismatch (2 vs 1), got {result:?}"
         );
     }
 
