@@ -218,9 +218,19 @@ impl FleetNetDoc {
 }
 
 /// Ordered butler-set candidates: pinned first (if its row is fresh), then by
-/// most-recent seen_at (ties broken by device-id ordering for determinism),
-/// self included wherever it falls. Rows with seen_at.wall_ms < stale_before_ms
-/// are excluded entirely.
+/// most-recent seen_at — the ranking key is CLAMPED to the receiver `now`, then
+/// ties broken by device-id ordering for determinism — self included wherever
+/// it falls. Rows are kept only inside the freshness window: `seen_at.wall_ms`
+/// below `stale_before_ms` (stale) **or** more than one `BUTLER_SET_FRESHNESS_MS`
+/// window past `now` (implausibly future-dated) are excluded entirely (ZEB-852 D2).
+///
+/// **Caller contract (load-bearing):** `stale_before_ms` MUST equal
+/// `now - BUTLER_SET_FRESHNESS_MS`. The receiver `now` used for the upper freshness
+/// bound and the sort clamp is recovered here as
+/// `stale_before_ms + BUTLER_SET_FRESHNESS_MS`, so a caller passing any other cutoff
+/// (e.g. `0` for "no lower bound") would mis-bound the upper filter and the clamp and
+/// could silently drop or mis-rank valid rows. All current callers — the lib.rs pkarr
+/// blob builder and `selection_view` — satisfy this.
 ///
 /// This is the heart of the fleet-net-v1 contribution: it maps the
 /// replicated `FleetNetDoc` to an ordered advisory butler-set for the
@@ -264,7 +274,15 @@ pub fn butler_set_order(doc: &FleetNetDoc, stale_before_ms: u64) -> Vec<(String,
         if w != std::cmp::Ordering::Equal {
             return w;
         }
-        // Secondary: descending logical
+        // Secondary: descending logical.
+        // KNOWN RESIDUAL (ZEB-856): `logical` is a peer-self-stamped HLC counter, so
+        // after the wall clamp a future-dated sibling can set `logical = u32::MAX` to
+        // win a clamped-wall tie against an honest present row. Left as-is here on
+        // purpose: clamp-to-now is the fail-open-safe choice (it never deprioritizes a
+        // live device), and closing this peer-controlled tiebreak — plus the
+        // near-future clamp-to-top and the pin/petname freeze — is tracked together in
+        // ZEB-856 so the butler-rank residuals are addressed with one coherent policy
+        // rather than piecemeal. (Also applies to the `selection_view` ordering below.)
         let l = row_b.seen_at.logical.cmp(&row_a.seen_at.logical);
         if l != std::cmp::Ordering::Equal {
             return l;
