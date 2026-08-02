@@ -1243,7 +1243,9 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 // watermark while we still hold the `voting_log` lock, so the
                 // kd=rs mint below can be floored strictly above it. See the
                 // mint-site comment for why a floor (not plain `now`) is needed.
-                let last_received = t3.last_received_hlc.clone();
+                // ZEB-850: the floor must clear EVERY per-lane watermark, so
+                // take the max across lanes rather than a single global one.
+                let last_received = t3.max_received_hlc();
                 // Build candidate ordering. Same pattern as verify_sr.
                 let sq = crate::community_voting_tier3::synthesize_status_quo(&t3.meta.poll_id);
                 let sq_hash = sq.event_hash;
@@ -1721,8 +1723,9 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             } else {
                 // ZEB-316 (Greptile P1 fix): snapshot the poll's live receive
                 // watermark under the log lock so the kd=rs mint below can floor
-                // strictly above it (see mint-site comment).
-                let last_received = t3.last_received_hlc.clone();
+                // strictly above it (see mint-site comment). ZEB-850: max across
+                // per-lane watermarks so the floor clears every received event.
+                let last_received = t3.max_received_hlc();
                 // Build candidate ordering (mirror kd=rs pu-mode path).
                 let sq = crate::community_voting_tier3::synthesize_status_quo(&t3.meta.poll_id);
                 let sq_hash = sq.event_hash;

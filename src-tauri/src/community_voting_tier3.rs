@@ -211,15 +211,14 @@ pub struct Tier3PollState {
     /// Used as the `now` watermark by `current_stage_at` and `current_mini_public`
     /// via `build_tier3_export`. Drop paths must NOT advance this (ZEB-320).
     pub last_hlc: Option<Hlc>,
-    /// HLC of the most recent **dispatched** event, accepted *or* silently
-    /// dropped. Used for the monotonic-HLC guard at the top of `apply_event`
-    /// so out-of-order peer delivery is still surfaced as `HlcNotMonotonic`
-    /// even when the previous event was dropped — without this, a dropped
-    /// event followed by an earlier-HLC event that would change drop decisions
-    /// (e.g., the kd=ds whose existence is the prerequisite for a previously
-    /// target-missing kd=dv) would silently bypass the guard and never be
-    /// re-materialized, causing replica divergence (Qodo PR #154 finding).
-    pub last_received_hlc: Option<Hlc>,
+    /// Per-`(actor, device_id)` receive-watermark lanes (ZEB-850, mirrors the
+    /// channel-log `WatermarkVector`, ZEB-585). Each lane holds the highest
+    /// `(wall_ms, logical)` dispatched on that lane — accepted OR silently
+    /// dropped (the ZEB-320 property, now per-lane). Keying per lane stops one
+    /// sibling's future-stamped event from freezing every other member's
+    /// events (the T-VOTE-LANE GRIEF-LOCKOUT). Rebuilt by replay; never
+    /// serialized (community_voting_persist.rs).
+    pub last_received_hlc: std::collections::BTreeMap<(OwnerAddr, String), (u64, u32)>,
     /// ZEB-295 Phase 6: ballot-secret tally projection. Populated by
     /// `kd=ts` apply (Task 7) and the decrypted-result derivation
     /// (Task 8). Empty in pu-mode polls.
@@ -420,7 +419,7 @@ impl Tier3PollState {
             result: None,
             deliberation: DeliberationState::default(),
             last_hlc: None,
-            last_received_hlc: None,
+            last_received_hlc: std::collections::BTreeMap::new(),
             secret_tally: SecretTallyState::default(),
             committee_oracle: std::sync::Arc::new(NullCommitteeOracle),
         }
@@ -454,15 +453,14 @@ impl Tier3PollState {
         //    Reads `last_received_hlc` (advances on every dispatch, accept or
         //    drop) rather than `last_hlc` (advances on accepts only) so the
         //    guard still catches out-of-order delivery after a dropped event.
-        if let Some(ref last) = self.last_received_hlc {
-            let incoming = &ev.hlc;
-            let last_tuple = (last.wall_ms, last.logical, last.device_id.as_str());
-            let inc_tuple = (
-                incoming.wall_ms,
-                incoming.logical,
-                incoming.device_id.as_str(),
-            );
-            if inc_tuple < last_tuple {
+        // ZEB-850: per-(actor, device) monotonic guard. Compare the incoming
+        // event only against the high-water mark of ITS OWN lane. device_id is
+        // constant within a lane, so comparing (wall_ms, logical) is equivalent
+        // to the old (wall_ms, logical, device_id) 3-tuple compare. A future
+        // event on one lane no longer blocks another lane's honest events.
+        let lane = (ev.actor, ev.hlc.device_id.clone());
+        if let Some(&(w, l)) = self.last_received_hlc.get(&lane) {
+            if (ev.hlc.wall_ms, ev.hlc.logical) < (w, l) {
                 return Err(ApplyError::HlcNotMonotonic);
             }
         }
@@ -1046,14 +1044,38 @@ impl Tier3PollState {
             }
         }
 
-        // last_received_hlc always advances on Ok return — including silent
-        // drops — so the monotonic guard keeps catching out-of-order delivery
-        // after a drop. last_hlc only advances on accepts (ZEB-320).
-        self.last_received_hlc = Some(ev.hlc.clone());
+        // Raise this event's (actor, device) lane to max((wall_ms, logical)),
+        // mirroring channel-log raise_watermark. Advances on every Ok (accept
+        // or silent drop) — the ZEB-320 property, per lane — so the monotonic
+        // guard keeps catching out-of-order delivery after a drop. last_hlc
+        // only advances on accepts (ZEB-320).
+        let lane = (ev.actor, ev.hlc.device_id.clone());
+        let cand = (ev.hlc.wall_ms, ev.hlc.logical);
+        let entry = self.last_received_hlc.entry(lane).or_insert((0, 0));
+        if cand > *entry {
+            *entry = cand;
+        }
         if advance_last_hlc {
             self.last_hlc = Some(ev.hlc.clone());
         }
         Ok(())
+    }
+
+    /// Highest `(wall_ms, logical)` across all per-(actor,device) receive
+    /// lanes, as an `Hlc` with an empty `device_id`, or `None` before any
+    /// dispatch. The engine-auto kd=rs mint floor needs a floor strictly above
+    /// EVERY received event regardless of lane; `engine_auto_hlc_from_base`
+    /// synthesizes its own device_id, so the empty one here is never used.
+    pub fn max_received_hlc(&self) -> Option<Hlc> {
+        self.last_received_hlc
+            .values()
+            .copied()
+            .max()
+            .map(|(wall_ms, logical)| Hlc {
+                wall_ms,
+                logical,
+                device_id: String::new(),
+            })
     }
 
     /// Compute the effective Stage at HLC watermark `now`.
@@ -4500,7 +4522,7 @@ mod tests {
         );
         // But last_received_hlc DID advance — the guard sees the late event.
         assert_eq!(
-            poll.last_received_hlc.as_ref().unwrap().wall_ms,
+            poll.max_received_hlc().unwrap().wall_ms,
             15_000,
             "drop advanced received watermark (guard)"
         );
@@ -4513,6 +4535,85 @@ mod tests {
             .apply_event(&earlier_ev)
             .expect_err("guard must reject earlier-HLC delivery");
         assert!(matches!(err, ApplyError::HlcNotMonotonic));
+    }
+
+    // ZEB-850 T-VOTE-LANE: a far-future stamp on ONE (actor, device) lane must
+    // not freeze another lane's honest events. Under the OLD single global
+    // watermark, device A's hour-in-the-future ds raised the lone watermark and
+    // every later honest event from device B was rejected HlcNotMonotonic — the
+    // GRIEF-LOCKOUT. Per-lane watermarks isolate the two.
+    #[test]
+    fn future_event_on_one_lane_does_not_stall_another_lane() {
+        let mut poll = build_poll_in_deliberation_stage();
+
+        // Device A (actor addr(1)): stamps an hour into the future. Past the 10s
+        // deliberation window, so it silently drops — but still advances A's lane.
+        let far_future = 3_600_000;
+        let a_ev = ds_event_with_text(far_future, addr(1), "from the future");
+        poll.apply_event(&a_ev)
+            .expect("A dispatch is Ok (silent drop)");
+
+        // Device B (actor addr(2)): two honest statements at now / now+1. Under
+        // the OLD global watermark the first B apply would be HlcNotMonotonic
+        // (100 < 3_600_000); per-lane, B's lane is untouched by A's future stamp.
+        let b1 = ds_event_with_text(100, addr(2), "honest one");
+        poll.apply_event(&b1)
+            .expect("B@now must apply — A's future stamp is on a different lane");
+        let b2 = ds_event_with_text(101, addr(2), "honest two");
+        poll.apply_event(&b2)
+            .expect("B@now+1 must apply — B's own lane advances monotonically");
+
+        // Both B statements materialized (proves accept, not merely Ok).
+        assert_eq!(
+            poll.deliberation.statements_per_author[&addr(2)],
+            2,
+            "both honest B statements must be accepted"
+        );
+    }
+
+    // ZEB-850 / ZEB-320 / Qodo #154: per-lane must NOT weaken the within-lane
+    // guard. On a single (actor, device) lane, an earlier-HLC event delivered
+    // after a later event that silently dropped must still be rejected — the
+    // dropped event advanced the lane watermark. Neutralizing the guard (or
+    // reading last_hlc, which drops don't advance) lets the earlier event slip
+    // through and this test fails.
+    #[test]
+    fn within_lane_earlier_hlc_still_rejected_after_dropped_event() {
+        let mut poll = build_poll_in_deliberation_stage();
+
+        // Same lane (addr(1), "test"). A later ds that drops (past the 10s
+        // deliberation window) but still advances the lane watermark to 15_000.
+        let later = ds_event_with_text(15_000, addr(1), "later, dropped");
+        poll.apply_event(&later).expect("Ok (silent drop)");
+
+        // An earlier-HLC ds on the SAME lane must be rejected.
+        let earlier = ds_event_with_text(100, addr(1), "earlier");
+        let err = poll
+            .apply_event(&earlier)
+            .expect_err("earlier-HLC on same lane must be rejected");
+        assert!(matches!(err, ApplyError::HlcNotMonotonic));
+    }
+
+    // ZEB-850: max_received_hlc() is the max (wall_ms, logical) across ALL
+    // lanes, independent of BTreeMap lane order. Here the HIGHER watermark sits
+    // on the lower-sorted lane (addr(1)), so a naive "last lane wins" would
+    // return 100 — the max-over-lanes contract pins 200. The kd=rs mint floor
+    // depends on this max.
+    #[test]
+    fn max_received_hlc_is_max_over_lanes() {
+        let mut poll = build_poll_in_deliberation_stage();
+
+        // Lane (addr(1), "test") @ wall=200; lane (addr(2), "test") @ wall=100.
+        poll.apply_event(&ds_event_with_text(200, addr(1), "high"))
+            .expect("apply high");
+        poll.apply_event(&ds_event_with_text(100, addr(2), "low"))
+            .expect("apply low");
+
+        assert_eq!(
+            poll.max_received_hlc().unwrap().wall_ms,
+            200,
+            "max_received_hlc must be the max wall_ms across all lanes"
+        );
     }
 
     // CodeRabbit PR #154 bot-pass-1 nitpick: cover the remaining gated drop
@@ -4882,7 +4983,7 @@ mod tests {
             "drop must not advance last_hlc (ZEB-320)"
         );
         assert_eq!(
-            state.last_received_hlc.as_ref().map(|h| h.wall_ms),
+            state.max_received_hlc().map(|h| h.wall_ms),
             Some(RATIFICATION_OPEN_MS),
             "last_received_hlc must advance on every dispatch"
         );
