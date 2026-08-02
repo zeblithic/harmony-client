@@ -126,11 +126,45 @@ impl FleetNetDoc {
     /// Absent keys are inserted. `pinned`+`pinned_at` merge as an LWW PAIR
     /// by `pinned_at` (remote strictly newer → take both fields).
     /// Returns `changed = true` on any insert, replacement, or pin change.
+    ///
+    /// ZEB-852 (D2-MERGE): device rows are a STORED replicated register LWW'd by
+    /// the sibling's self-stamped `seen_at`, so a future-dated `seen_at` would
+    /// win the LWW and FREEZE the row (no honest later stamp could ever be
+    /// `is_strictly_newer_than` it), pinning butler deposits onto a dead device.
+    /// A stored register must be REJECTED (never clamped — a clamped stored value
+    /// is receiver-dependent and would diverge across peers), so incoming rows
+    /// are bounded against the receiver's OWN control-tier ceiling. Sampled once
+    /// via [`crate::clock_trust::receiver_now_ms`]; `None` (unreadable clock) ⇒
+    /// apply-all so a bad LOCAL clock never drops honest sibling rows. Delegated
+    /// to [`Self::merge_from_bounded`] so the reject / adopt / apply-all branches
+    /// are unit-testable without the real system clock.
     pub fn merge_from(&mut self, remote: FleetNetDoc) -> MergeOutcome {
+        self.merge_from_bounded(remote, crate::clock_trust::receiver_now_ms())
+    }
+
+    /// Clock-injected core of [`Self::merge_from`]. `receiver_now` is the
+    /// receiver's own wall clock (`None` ⇒ unreadable ⇒ apply-all); the
+    /// forward-skew bound applies ONLY to the self-stamped device-row `seen_at`
+    /// register (pin/petname stamps are out of this task's scope — ZEB-852 D2).
+    fn merge_from_bounded(
+        &mut self,
+        remote: FleetNetDoc,
+        receiver_now: Option<u64>,
+    ) -> MergeOutcome {
         let mut changed = false;
 
         // Device rows: per-row LWW by seen_at.
         for (device_id, remote_row) in remote.devices {
+            // ZEB-852 (D2-MERGE): drop a row whose self-stamped seen_at is
+            // implausibly far in the receiver's future (control tier). Gates
+            // BOTH the absent-key insert and the LWW replace — either path would
+            // otherwise store a poison stamp that freezes the register.
+            if crate::clock_trust::wall_exceeds_forward_skew(
+                remote_row.seen_at.wall_ms,
+                receiver_now,
+            ) {
+                continue;
+            }
             match self.devices.get(&device_id) {
                 None => {
                     // Absent key: insert unconditionally.
@@ -192,20 +226,41 @@ impl FleetNetDoc {
 /// replicated `FleetNetDoc` to an ordered advisory butler-set for the
 /// pkarr advertisement.
 pub fn butler_set_order(doc: &FleetNetDoc, stale_before_ms: u64) -> Vec<(String, FleetNetRow)> {
-    // Collect fresh rows only (stale = wall_ms < stale_before_ms).
+    // ZEB-852 (D2): recover the caller's receiver `now`. Every caller derives
+    // `stale_before_ms = now - BUTLER_SET_FRESHNESS_MS` (the lib.rs pkarr blob
+    // builder and `selection_view`), so this inversion is exact and keeps the
+    // public signature unchanged.
+    let now = stale_before_ms.saturating_add(crate::butler_deposit::BUTLER_SET_FRESHNESS_MS);
+
+    // Collect fresh rows only. LOWER bound: stale = wall_ms < stale_before_ms.
+    // UPPER bound (ZEB-852): a maliciously fast-clocked sibling self-stamps its
+    // row in the future; with a descending sort that row ranks slot 0 and is
+    // published to other owners, who then route butler DEPOSITS onto a dead
+    // device. Drop rows more than one freshness window ahead of `now`, mirroring
+    // `fresh_butler_set`'s both-sided `bs_at` bound (reachability_record.rs).
+    // Shape B (transient sort/filter, nothing persisted) → CLAMP, not reject.
     let mut fresh: Vec<(String, FleetNetRow)> = doc
         .devices
         .iter()
-        .filter(|(_, row)| row.seen_at.wall_ms >= stale_before_ms)
+        .filter(|(_, row)| {
+            row.seen_at.wall_ms >= stale_before_ms
+                && row.seen_at.wall_ms
+                    <= now.saturating_add(crate::butler_deposit::BUTLER_SET_FRESHNESS_MS)
+        })
         .map(|(id, row)| (id.clone(), row.clone()))
         .collect();
 
     // Sort by descending seen_at, ties broken by ascending device-id
     // (device-id tiebreak is deterministic across the fleet since all
-    // devices share the same CRDT state).
+    // devices share the same CRDT state). The primary key is CLAMPED to `now`
+    // (ZEB-852): a still-in-window but future-dated sibling must not out-rank an
+    // honest present row purely by its inflated wall_ms — `min(wall_ms, now)`
+    // collapses any future stamp to `now`, after which the honest logical /
+    // device-id tiebreak decides.
+    let clamp = |wall_ms: u64| wall_ms.min(now);
     fresh.sort_by(|(id_a, row_a), (id_b, row_b)| {
-        // Primary: descending wall_ms
-        let w = row_b.seen_at.wall_ms.cmp(&row_a.seen_at.wall_ms);
+        // Primary: descending wall_ms (clamped to now)
+        let w = clamp(row_b.seen_at.wall_ms).cmp(&clamp(row_a.seen_at.wall_ms));
         if w != std::cmp::Ordering::Equal {
             return w;
         }
@@ -808,6 +863,88 @@ mod tests {
         assert!(local.devices.contains_key("dev-b"));
     }
 
+    /// ZEB-852 (D2-MERGE): device rows are a STORED replicated register LWW'd by
+    /// the sibling's self-stamped `seen_at`. A future-dated `seen_at` would win
+    /// the LWW and freeze the row forever — so it must be REJECTED against the
+    /// receiver's control-tier ceiling. All three branches:
+    ///   (1) a year-ahead row does NOT replace an honest current row, and does
+    ///       NOT insert on an absent key (poison-insert also blocked);
+    ///   (2) an honest NEWER in-range row IS adopted (guard doesn't over-reject);
+    ///   (3) an unreadable receiver clock (`None`) ⇒ apply-all: even a far-future
+    ///       row is adopted (a bad LOCAL clock must never drop honest rows).
+    /// (1) and (2) run through the public `merge_from` (real `receiver_now_ms()`
+    /// clock seam); (3) uses the injected `merge_from_bounded` seam `merge_from`
+    /// delegates to, the only way to force the `None` branch deterministically.
+    #[test]
+    fn merge_from_rejects_future_seen_at() {
+        let now = crate::clock_trust::receiver_now_ms().expect("host clock is post-epoch");
+        let one_year: u64 = 365 * 24 * 60 * 60 * 1000;
+
+        // (1a) Future-dated remote row must NOT replace an honest current row.
+        let mut local = FleetNetDoc::default();
+        local
+            .devices
+            .insert("dev-a".into(), row(0x01, "relay.honest", hlc(now, "dev-a")));
+        let mut remote = FleetNetDoc::default();
+        remote.devices.insert(
+            "dev-a".into(),
+            row(0x02, "relay.future", hlc(now + one_year, "dev-a")),
+        );
+        let out = local.merge_from(remote);
+        assert!(!out.changed, "future-dated remote row must be rejected");
+        assert_eq!(local.devices["dev-a"].home_relay, "relay.honest");
+        assert_eq!(local.devices["dev-a"].seen_at.wall_ms, now);
+
+        // (1b) Future-dated remote row on an ABSENT key must also be rejected
+        // (a poison-insert freezes the register just as a poison-replace does).
+        let mut local_abs = FleetNetDoc::default();
+        let mut remote_abs = FleetNetDoc::default();
+        remote_abs.devices.insert(
+            "dev-new".into(),
+            row(0x03, "relay.future", hlc(now + one_year, "dev-new")),
+        );
+        let out_abs = local_abs.merge_from(remote_abs);
+        assert!(
+            !out_abs.changed,
+            "future-dated absent-key insert must be rejected"
+        );
+        assert!(!local_abs.devices.contains_key("dev-new"));
+
+        // (2) An honest NEWER in-range row IS adopted (well within the 5-min
+        // control tier), proving the guard doesn't over-reject.
+        let mut local_ok = FleetNetDoc::default();
+        local_ok.devices.insert(
+            "dev-a".into(),
+            row(0x01, "relay.old", hlc(now - 10_000, "dev-a")),
+        );
+        let mut remote_ok = FleetNetDoc::default();
+        remote_ok.devices.insert(
+            "dev-a".into(),
+            row(0x02, "relay.newer", hlc(now + 1_000, "dev-a")),
+        );
+        let out_ok = local_ok.merge_from(remote_ok);
+        assert!(out_ok.changed, "in-range newer row must be adopted");
+        assert_eq!(local_ok.devices["dev-a"].home_relay, "relay.newer");
+
+        // (3) Unreadable receiver clock (None) ⇒ apply-all: even a far-future row
+        // is adopted, so a bad LOCAL clock never drops honest sibling rows.
+        let mut local_none = FleetNetDoc::default();
+        local_none
+            .devices
+            .insert("dev-a".into(), row(0x01, "relay.honest", hlc(now, "dev-a")));
+        let mut remote_none = FleetNetDoc::default();
+        remote_none.devices.insert(
+            "dev-a".into(),
+            row(0x02, "relay.future", hlc(now + one_year, "dev-a")),
+        );
+        let out_none = local_none.merge_from_bounded(remote_none, None);
+        assert!(
+            out_none.changed,
+            "None receiver clock ⇒ apply-all (adopt), never drop honest rows"
+        );
+        assert_eq!(local_none.devices["dev-a"].home_relay, "relay.future");
+    }
+
     // ── Pin LWW pair tests ────────────────────────────────────────────────────
 
     #[test]
@@ -1052,6 +1189,72 @@ mod tests {
             "lower device-id wins tiebreak (deterministic)"
         );
         assert_eq!(order[1].0, "dev-z");
+    }
+
+    /// ZEB-852 (D2 read-side): a fast-clocked sibling must not win the butler-set
+    /// order. Two defenses, both exercised here:
+    ///   (a) UPPER-BOUND FILTER — a row stamped a full year ahead of `now` is
+    ///       dropped entirely (mirrors `fresh_butler_set`'s upper `bs_at` bound).
+    ///   (b) SORT CLAMP — a still-in-window but future-dated row (its stamp is
+    ///       ≤ `now + BUTLER_SET_FRESHNESS_MS`, so it survives the filter) must
+    ///       NOT out-rank an honest present row purely by its inflated wall_ms;
+    ///       `min(wall_ms, now)` collapses it to `now` and the device-id tiebreak
+    ///       decides.
+    /// In-range ordering is preserved: an honest fresh row still leads an honest
+    /// stale one.
+    #[test]
+    fn butler_set_order_sweeps_and_deranks_future_sibling() {
+        let window = crate::butler_deposit::BUTLER_SET_FRESHNESS_MS;
+        let now: u64 = 2_000_000_000_000; // realistic present-day wall (ms)
+        let stale_before = now - window; // exactly how every caller derives it
+        let one_year: u64 = 365 * 24 * 60 * 60 * 1000;
+
+        let mut doc = FleetNetDoc::default();
+        // Honest present row (device-id sorts FIRST among the clamp-tied pair).
+        doc.devices.insert(
+            "dev-a-honest-fresh".into(),
+            row(0x01, "relay.fresh", hlc(now, "d")),
+        );
+        // Honest older-but-in-window row → ranks behind the present rows.
+        doc.devices.insert(
+            "dev-b-honest-stale".into(),
+            row(0x02, "relay.stale", hlc(now - 100_000, "d")),
+        );
+        // Future-but-in-window sibling (≤ now + window): SURVIVES the filter, so
+        // it exercises the sort clamp. Its device-id sorts AFTER the honest one,
+        // so if the clamp works it must land behind dev-a-honest-fresh.
+        doc.devices.insert(
+            "dev-z-future-inwindow".into(),
+            row(0x03, "relay.future", hlc(now + window / 2, "d")),
+        );
+        // Far-future sibling (a year ahead): must be FILTERED OUT by the upper bound.
+        doc.devices.insert(
+            "dev-future-1yr".into(),
+            row(0x04, "relay.evil", hlc(now + one_year, "d")),
+        );
+
+        let order = butler_set_order(&doc, stale_before);
+
+        // (a) Upper bound: the year-ahead row is gone; the other three remain.
+        assert_eq!(order.len(), 3, "far-future row must be filtered out");
+        assert!(
+            !order.iter().any(|(id, _)| id == "dev-future-1yr"),
+            "far-future sibling must not appear at all"
+        );
+        // (b) Sort clamp: the in-window future sibling clamps to `now`, tying with
+        // the honest present row, so the device-id tiebreak puts the honest row at
+        // slot 0 — the future sibling does NOT rank ahead by its inflated stamp.
+        assert_eq!(
+            order[0].0, "dev-a-honest-fresh",
+            "future-dated in-window sibling must not out-rank the honest present row"
+        );
+        // In-range ordering preserved: honest fresh ahead of honest stale.
+        let pos_fresh = order.iter().position(|(id, _)| id == "dev-a-honest-fresh");
+        let pos_stale = order.iter().position(|(id, _)| id == "dev-b-honest-stale");
+        assert!(
+            pos_fresh < pos_stale,
+            "honest fresh row must rank ahead of the honest stale row"
+        );
     }
 
     // ── build_butler_set tests (ZEB-418 P2 Task 7) ────────────────────────────
