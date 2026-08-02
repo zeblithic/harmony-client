@@ -2770,6 +2770,9 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// over case-splitting PollCreate-fresh vs others-cached): freshness
     /// cost is small, and the uniform shape avoids snapshot-shape
     /// divergence between tier1_snapshot and tier3 eligible_electorate.
+    // Fixed receive-loop pipeline args (resolvers + floor + beacon oracle,
+    // ZEB-850 Task 3); named-positional reads clearer than a one-off struct.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn process_inbound(
         community_id: SpaceId,
         voting_log: &Arc<Mutex<VotingLog>>,
@@ -2779,6 +2782,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             &Arc<dyn crate::community_voting_log::MembershipSnapshotResolver>,
         >,
         floor: &crate::hlc_adopt_floor::HlcAdoptFloor,
+        beacon_oracle: Option<&dyn crate::community_voting_tier3::BeaconOracle>,
         packet: &[u8],
     ) -> Result<Option<(SignedVotingEvent, PollId)>, String> {
         // Decode.
@@ -2852,7 +2856,8 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // intentionally skips eligibility. For peer-submitted events that
         // create or vote on proposals, we enforce the proposal's eligibility
         // predicate before applying, matching local-IPC parity.
-        inbound_eligibility_check(&event, &snapshot, voting_log).await?;
+        inbound_eligibility_check(&event, &snapshot, voting_log, community_id, beacon_oracle)
+            .await?;
 
         // Apply with the verified snapshot.
         let applied_poll_id: PollId = {
@@ -2878,6 +2883,22 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         floor.observe(event.hlc.wall_ms);
 
         Ok(Some((event, applied_poll_id)))
+    }
+
+    /// ZEB-850 Task 3: build a `DfrostBeaconOracle` from the wired dfrost
+    /// registry (if any), for the kd=ss ingest authz check (`verify_ss`).
+    /// `None` ⇒ fail-closed at the seam (a kd=ss is rejected rather than
+    /// admitted un-verified). Holds the registry mutex only long enough to
+    /// clone the `Arc` — no await while held.
+    async fn beacon_oracle_holder(
+        &self,
+    ) -> Option<crate::community_voting_tier3::DfrostBeaconOracle<R>> {
+        let reg_g = self.dfrost_registry.lock().await;
+        reg_g
+            .as_ref()
+            .map(|r| crate::community_voting_tier3::DfrostBeaconOracle {
+                registry: r.clone(),
+            })
     }
 
     /// ZEB-718: apply an event received via the backfill pull path.
@@ -2962,7 +2983,22 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             .await
             .map_err(|e| format!("verify: {e}"))?;
 
-        inbound_eligibility_check(&event, &snapshot, &self.voting_log).await?;
+        // ZEB-850 Task 3: build the kd=ss BeaconOracle from the wired dfrost
+        // registry (fail-closed to `None` when unwired). Backfill-pull is a
+        // second admission route for a NEW voting event, so it needs the same
+        // kd=ss authz gate as `process_inbound`.
+        let oracle_holder = self.beacon_oracle_holder().await;
+        let beacon_oracle = oracle_holder
+            .as_ref()
+            .map(|o| o as &dyn crate::community_voting_tier3::BeaconOracle);
+        inbound_eligibility_check(
+            &event,
+            &snapshot,
+            &self.voting_log,
+            self.community_id,
+            beacon_oracle,
+        )
+        .await?;
 
         let applied_poll_id: PollId = {
             let mut log = self.voting_log.lock().await;
@@ -3062,6 +3098,12 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // applied `(event, pid)` on success, `None` on dedup-drop /
         // resolvers-not-wired (silent), or `Err` on verify / apply
         // failures.
+        // ZEB-850 Task 3: build the kd=ss BeaconOracle from the wired dfrost
+        // registry (fail-closed to `None` when unwired).
+        let oracle_holder = self.beacon_oracle_holder().await;
+        let beacon_oracle = oracle_holder
+            .as_ref()
+            .map(|o| o as &dyn crate::community_voting_tier3::BeaconOracle);
         let applied = Self::process_inbound(
             self.community_id,
             &self.voting_log,
@@ -3069,6 +3111,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             self.identity_resolver.as_ref(),
             self.membership_resolver.as_ref(),
             &self.adopt_floor, // ZEB-843
+            beacon_oracle,
             packet,
         )
         .await?;
@@ -3218,17 +3261,28 @@ where
 ///   (verify_sr: kd=cl applied + tally bit-identical), `kd=md`/`kd=dc`
 ///   (verify_sd: mini-public membership), `kd=da` (verify_sd + referenced
 ///   candidate exists), `kd=rb` (verify_ratification_ballot: B2-B5 electorate
-///   authz). These run the SYNC verifiers via [`with_tier3`]; `kd=ss` is gated
-///   asynchronously in Task 3 (BeaconOracle) and stays a no-op here until then.
+///   authz). These run the SYNC verifiers via [`with_tier3`]. `kd=ss` is gated
+///   asynchronously (ZEB-850 Task 3) via [`verify_ss`] + a [`BeaconOracle`]:
+///   the poll state is cloned under the log guard, the guard is DROPPED, then
+///   the async verify runs (it locks the dfrost log internally — never hold
+///   `voting_log` across that await, ZEB-803 cross-lock class). Fail-closed:
+///   `beacon_oracle == None` (oracle unwired) or `BeaconNotYetAvailable`
+///   (beacon not yet indexed) ⇒ reject — liveness-safe because kd=ss is
+///   engine-auto-derived locally from this node's own beacon.
 /// - Tier 3 engine-auto `kd=cl` (PollClose) has no verifier (no `verify_cl`
 ///   exists by design); membership-V6 from `verify_voting_event` is the outer
 ///   gate.
 /// - Tier 3 `kd=ds`/`kd=dv` already inline-check mini-public membership in the
 ///   apply path (`community_voting_tier3.rs`), so no additional check here.
+///
+/// [`verify_ss`]: crate::community_voting_tier3::verify_ss
+/// [`BeaconOracle`]: crate::community_voting_tier3::BeaconOracle
 async fn inbound_eligibility_check(
     event: &SignedVotingEvent,
     snapshot: &crate::community_voting_core::MembershipSnapshot,
     voting_log: &Arc<Mutex<VotingLog>>,
+    community_id: SpaceId,
+    beacon_oracle: Option<&dyn crate::community_voting_tier3::BeaconOracle>,
 ) -> Result<(), String> {
     match event.tier {
         crate::community_voting_core::Tier::Approval => {
@@ -3371,10 +3425,38 @@ async fn inbound_eligibility_check(
                 }
                 // kd=cl (PollClose) is engine-auto with no authz verifier
                 // (no verify_cl exists); membership-V6 is the outer gate.
-                // kd=ss is gated in ZEB-850 Task 3 (async, BeaconOracle) — it
-                // stays a no-op here until then.
-                crate::community_voting_core::PollEventKindCode::SortitionSelection
-                | crate::community_voting_core::PollEventKindCode::PollClose => {}
+                crate::community_voting_core::PollEventKindCode::PollClose => {}
+                // kd=ss (ZEB-850 Task 3): else a member could install a chosen
+                // mini-public, whose forged members then pass the ds/dv inline
+                // checks. verify_ss recomputes the sortition from the VRF beacon.
+                // Clone the poll state under the guard, DROP the guard, THEN
+                // await verify_ss (it locks the dfrost log internally — never
+                // hold voting_log across that await, ZEB-803 cross-lock class).
+                crate::community_voting_core::PollEventKindCode::SortitionSelection => {
+                    let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                        .ok_or_else(|| "kd=ss: undecodable poll id".to_string())?;
+                    let t3 = {
+                        let log_g = voting_log.lock().await;
+                        log_g
+                            .polls
+                            .get(&pid)
+                            .and_then(|ps| ps.tier_state.as_tier3())
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!(
+                                    "kd=ss authz: unknown/non-tier3 poll {}",
+                                    hex::encode(pid.0)
+                                )
+                            })?
+                    };
+                    // Fail-closed: no oracle wired ⇒ drop (liveness-safe, this
+                    // node re-derives kd=ss from its own beacon).
+                    let oracle = beacon_oracle
+                        .ok_or_else(|| "kd=ss authz: no beacon oracle (fail-closed)".to_string())?;
+                    crate::community_voting_tier3::verify_ss(event, &t3, oracle, &community_id)
+                        .await
+                        .map_err(|e| format!("kd=ss authz: {e:?}"))?;
+                }
                 // kd=sf: else any member could forge Stage::Failed and kill the
                 // poll. verify_sf: proposer-signed + backup pool exhausted.
                 crate::community_voting_core::PollEventKindCode::SortitionFailed => {
@@ -3499,6 +3581,7 @@ pub async fn process_inbound_for_test(
         identity_resolver,
         membership_resolver,
         &floor,
+        None, // beacon_oracle — kd=ss authz not exercised via this shim
         packet,
     )
     .await
@@ -5072,6 +5155,7 @@ mod tests {
             Some(&id_resolver),
             Some(&mem_resolver),
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            None, // beacon_oracle — kd=ss authz not exercised here
             &packet,
         )
         .await;
@@ -5209,6 +5293,7 @@ mod tests {
             Some(&id_resolver),
             Some(&mem_resolver),
             &crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            None, // beacon_oracle — kd=ss authz not exercised here
             &packet,
         )
         .await;
@@ -5298,6 +5383,7 @@ mod tests {
             Some(&id_resolver),
             Some(&mem_resolver),
             &floor,
+            None, // beacon_oracle — kd=ss authz not exercised here
             &packet,
         )
         .await;
@@ -5377,6 +5463,7 @@ mod tests {
             Some(&id_resolver),
             Some(&mem_resolver),
             &floor,
+            None, // beacon_oracle — kd=ss authz not exercised here
             &packet,
         )
         .await;
@@ -5453,6 +5540,7 @@ mod tests {
             Some(&id_resolver),
             Some(&mem_resolver),
             &floor,
+            None, // beacon_oracle — kd=ss authz not exercised here
             &packet,
         )
         .await;
@@ -7174,7 +7262,7 @@ mod tests {
     // SfActorNotProposer must reject at ingest (else any member kills the poll).
     #[tokio::test]
     async fn kd_sf_from_non_proposer_rejected_at_ingest() {
-        let (log, pid, _proposer, member, snapshot, _cid) = tier3_ingest_fixture().await;
+        let (log, pid, _proposer, member, snapshot, cid) = tier3_ingest_fixture().await;
         // Actor = mini-public member who is NOT the proposer.
         let sf = tier3_ingest_event(
             PollEventKindCode::SortitionFailed,
@@ -7182,7 +7270,7 @@ mod tests {
             9_000_000,
             encode_sf_payload(pid),
         );
-        let res = inbound_eligibility_check(&sf, &snapshot, &log).await;
+        let res = inbound_eligibility_check(&sf, &snapshot, &log, cid, None).await;
         assert!(
             res.is_err(),
             "kd=sf from a non-proposer must be rejected at ingest; got {res:?}"
@@ -7192,7 +7280,7 @@ mod tests {
     // kd=sf control: proposer-signed with the full pool exhausted → admitted.
     #[tokio::test]
     async fn kd_sf_from_proposer_with_exhausted_pool_admitted() {
-        let (log, pid, proposer, _member, snapshot, _cid) = tier3_ingest_fixture().await;
+        let (log, pid, proposer, _member, snapshot, cid) = tier3_ingest_fixture().await;
         // Exhaust the pool: capacity = primary.len() + backup.len() = 20 + 0.
         // Push 20 distinct declines dated before the kd=sf event's HLC.
         {
@@ -7224,7 +7312,7 @@ mod tests {
             9_000_000,
             encode_sf_payload(pid),
         );
-        let res = inbound_eligibility_check(&sf, &snapshot, &log).await;
+        let res = inbound_eligibility_check(&sf, &snapshot, &log, cid, None).await;
         assert!(
             res.is_ok(),
             "proposer-signed kd=sf with an exhausted pool must be admitted; got {res:?}"
@@ -7235,7 +7323,7 @@ mod tests {
     // verify_sd's NotInMiniPublic must reject at ingest.
     #[tokio::test]
     async fn kd_md_from_non_mini_public_rejected() {
-        let (log, pid, _proposer, _member, snapshot, _cid) = tier3_ingest_fixture().await;
+        let (log, pid, _proposer, _member, snapshot, cid) = tier3_ingest_fixture().await;
         // A fresh identity that is not in the electorate/mini-public.
         let (_k, outsider, _o64) = fixture_identity_engine(0xB9);
         let md = tier3_ingest_event(
@@ -7244,7 +7332,7 @@ mod tests {
             1_500_000,
             encode_md_payload(pid),
         );
-        let res = inbound_eligibility_check(&md, &snapshot, &log).await;
+        let res = inbound_eligibility_check(&md, &snapshot, &log, cid, None).await;
         assert!(
             res.is_err(),
             "kd=md from a non-mini-public actor must be rejected at ingest; got {res:?}"
@@ -7254,14 +7342,14 @@ mod tests {
     // kd=md control: a mini-public member signs MiniPublicDecline → admitted.
     #[tokio::test]
     async fn kd_md_from_mini_public_member_admitted() {
-        let (log, pid, _proposer, member, snapshot, _cid) = tier3_ingest_fixture().await;
+        let (log, pid, _proposer, member, snapshot, cid) = tier3_ingest_fixture().await;
         let md = tier3_ingest_event(
             PollEventKindCode::MiniPublicDecline,
             member,
             1_500_000,
             encode_md_payload(pid),
         );
-        let res = inbound_eligibility_check(&md, &snapshot, &log).await;
+        let res = inbound_eligibility_check(&md, &snapshot, &log, cid, None).await;
         assert!(
             res.is_ok(),
             "kd=md from a mini-public member must be admitted; got {res:?}"
@@ -7272,7 +7360,7 @@ mod tests {
     // NotInClosedStage must reject at ingest (else a member forges a result).
     #[tokio::test]
     async fn kd_rs_before_close_rejected() {
-        let (log, pid, _proposer, member, snapshot, _cid) = tier3_ingest_fixture().await;
+        let (log, pid, _proposer, member, snapshot, cid) = tier3_ingest_fixture().await;
         // The fixture stops at kd=ss, so close_event_hash is None.
         let rs = tier3_ingest_event(
             PollEventKindCode::PollResult,
@@ -7280,7 +7368,7 @@ mod tests {
             9_000_000,
             encode_pid_ref(pid),
         );
-        let res = inbound_eligibility_check(&rs, &snapshot, &log).await;
+        let res = inbound_eligibility_check(&rs, &snapshot, &log, cid, None).await;
         assert!(
             res.is_err(),
             "kd=rs before kd=cl must be rejected at ingest; got {res:?}"
@@ -7304,7 +7392,7 @@ mod tests {
     // then provably isolates the B3 electorate check.
     #[tokio::test]
     async fn kd_rb_from_non_electorate_rejected() {
-        let (log, pid, _proposer, _member, snapshot, _cid) = tier3_ingest_fixture().await;
+        let (log, pid, _proposer, _member, snapshot, cid) = tier3_ingest_fixture().await;
         // Fixture windows: create=1_000_000, dw=fw=7_200_000s→ms → current_stage_at
         // returns Ratification once wall_ms ≥ 15_400_000. 0xB9 is not in the
         // frozen eligible_electorate_snapshot.
@@ -7315,7 +7403,7 @@ mod tests {
             20_000_000,
             encode_pid_ref(pid),
         );
-        let res = inbound_eligibility_check(&rb, &snapshot, &log).await;
+        let res = inbound_eligibility_check(&rb, &snapshot, &log, cid, None).await;
         let err = res.expect_err("kd=rb from a non-electorate actor must be rejected at ingest");
         assert!(
             err.contains("NotInEligibleElectorate"),
@@ -7331,7 +7419,7 @@ mod tests {
     // otherwise pass silently.
     #[tokio::test]
     async fn kd_da_unknown_candidate_rejected() {
-        let (log, pid, _proposer, member, snapshot, _cid) = tier3_ingest_fixture().await;
+        let (log, pid, _proposer, member, snapshot, cid) = tier3_ingest_fixture().await;
         // The fixture applies no kd=dc, so poll.candidates is empty — any hash is
         // unknown. member is in the mini-public → verify_sd passes, isolating the
         // candidate-exists leg.
@@ -7341,12 +7429,268 @@ mod tests {
             1_500_000,
             encode_da_payload(pid, [0xAB; 32]),
         );
-        let res = inbound_eligibility_check(&da, &snapshot, &log).await;
+        let res = inbound_eligibility_check(&da, &snapshot, &log, cid, None).await;
         let err =
             res.expect_err("kd=da referencing an unknown candidate must be rejected at ingest");
         assert!(
             err.contains("UnknownCandidate"),
             "reject must come from the candidate-exists leg (member passes verify_sd); got {err:?}"
+        );
+    }
+
+    // ── ZEB-850 Task 3: async kd=ss peer-ingest authz (verify_ss) ──────────────
+    //
+    // These exercise the `Tier::Sortition` → `SortitionSelection` arm of
+    // `inbound_eligibility_check`, which clones the poll state under the log
+    // guard, DROPS the guard, then awaits `verify_ss` against a `BeaconOracle`.
+    // The forge test would return `Ok` under the pre-Task-3 no-op arm (so it
+    // fails there and passes only once verify_ss is wired); the fail-closed
+    // test proves an absent oracle rejects rather than admits un-verified.
+
+    /// Local mock `BeaconOracle` returning a fixed VRF output. tier3.rs's
+    /// `MockBeaconOracle` is `#[cfg(test)]`-private to that file; the
+    /// `BeaconOracle` trait is `pub`, so we define our own here.
+    struct FixedBeacon(Option<[u8; 32]>);
+
+    #[async_trait::async_trait]
+    impl crate::community_voting_tier3::BeaconOracle for FixedBeacon {
+        async fn vrf_output_for(
+            &self,
+            _c: &crate::owner_state_types::SpaceId,
+            _s: &[u8; 32],
+            _e: u64,
+        ) -> Option<[u8; 32]> {
+            self.0
+        }
+    }
+
+    /// Build a Tier 3 poll at PollCreate stage (kd=ss NOT applied), so
+    /// `sortition_result` starts `None`. Returns the log, poll id, proposer
+    /// (the kd=ss signer), membership snapshot, and community id. The
+    /// electorate is `sortition_size * 2` members so `fisher_yates_select`
+    /// (which draws primary + backup = 2 * sortition_size) has enough to
+    /// sample from.
+    async fn tier3_pre_ss_fixture() -> (
+        Arc<Mutex<VotingLog>>,
+        PollId,
+        OwnerAddr, // proposer (kd=ss signer)
+        MembershipSnapshot,
+        SpaceId,
+    ) {
+        use crate::community_voting_core::{
+            Eligibility, MemberAttrs, MembershipSnapshot, Tier3PollConfigPayload,
+        };
+
+        let community_id = SpaceId([0xF4; 16]);
+        let (_proposer_key, proposer_owner, _p64) = fixture_identity_engine(0xA3);
+
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+
+        let sortition_size: u16 = 20; // minimum valid; primary + backup = 40 draws
+        let config = Tier3PollConfigPayload {
+            proposal_text: "ZEB-850 kd=ss ingest authz test".into(),
+            sortition_size,
+            deliberation_window_seconds: 7200,
+            drafting_window_seconds: 7200,
+            ratification_window_seconds: 7200,
+            privacy_mode: "pu".into(),
+            incentive_mode: "a".into(),
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        };
+        let mut cfg_payload = Vec::new();
+        ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
+        let create_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: Hlc {
+                wall_ms: 1_000_000,
+                logical: 0,
+                device_id: "dev-cr".into(),
+            },
+            actor: proposer_owner,
+            payload: cfg_payload,
+            sig: vec![0u8; 64],
+        };
+
+        // Need ≥ 2 * sortition_size eligible members for fisher_yates_select.
+        let electorate: Vec<OwnerAddr> = (0..(sortition_size as usize * 2))
+            .map(|i| {
+                let mut a = [0u8; 16];
+                a[0] = (i & 0xFF) as u8;
+                a[1] = 0xF4;
+                OwnerAddr(a)
+            })
+            .collect();
+        let snapshot = MembershipSnapshot {
+            members: electorate
+                .iter()
+                .map(|o| {
+                    (
+                        *o,
+                        MemberAttrs {
+                            power: 1,
+                            vouching_depth: 0,
+                        },
+                    )
+                })
+                .chain(std::iter::once((
+                    proposer_owner,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )))
+                .collect(),
+        };
+
+        let pid = {
+            let mut log = voting_log.lock().await;
+            log.apply_with_snapshot(create_event, &community_id, Some(snapshot.clone()))
+                .expect("apply tier3 PollCreate")
+        };
+
+        (voting_log, pid, proposer_owner, snapshot, community_id)
+    }
+
+    /// Read the poll's frozen electorate + sortition size, then compute the
+    /// deterministic sortition the verifier will recompute for `vrf` — the
+    /// same `fisher_yates_select` over the same `eligible_electorate_snapshot`
+    /// that `verify_ss` uses.
+    async fn correct_ss_for(
+        log: &Arc<Mutex<VotingLog>>,
+        pid: PollId,
+        vrf: &[u8; 32],
+    ) -> crate::community_voting_sortition::SortitionResult {
+        let g = log.lock().await;
+        let t3 = g
+            .polls
+            .get(&pid)
+            .and_then(|ps| ps.tier_state.as_tier3())
+            .expect("tier3 poll present");
+        let size = t3.meta.config.sortition_size as usize;
+        crate::community_voting_sortition::fisher_yates_select(
+            vrf,
+            &t3.eligible_electorate_snapshot,
+            size,
+            size,
+        )
+    }
+
+    fn encode_ss_payload(pid: PollId, primary: Vec<OwnerAddr>, backup: Vec<OwnerAddr>) -> Vec<u8> {
+        let p = crate::community_voting_core::SortitionSelectionPayload {
+            poll_id: pid,
+            primary,
+            backup,
+        };
+        let mut b = Vec::new();
+        ciborium::into_writer(&p, &mut b).expect("encode ss");
+        b
+    }
+
+    // kd=ss forge: a peer submits a SortitionSelection whose primary does NOT
+    // match the deterministic recompute from the VRF beacon → verify_ss's
+    // SortitionMismatch must reject at ingest. Else a forged mini-public is
+    // installed whose members then pass the ds/dv inline apply-path checks.
+    #[tokio::test]
+    async fn kd_ss_mismatched_sortition_rejected() {
+        let (log, pid, proposer, snapshot, cid) = tier3_pre_ss_fixture().await;
+        let vrf = [0x55u8; 32];
+        let correct = correct_ss_for(&log, pid, &vrf).await;
+        // Perturb primary[0] to an addr outside the electorate → recompute differs.
+        let mut primary = correct.primary.clone();
+        primary[0] = OwnerAddr([0xDE; 16]);
+        let ss = tier3_ingest_event(
+            PollEventKindCode::SortitionSelection,
+            proposer,
+            1_000_002,
+            encode_ss_payload(pid, primary, correct.backup),
+        );
+        let oracle = FixedBeacon(Some(vrf));
+        let res = inbound_eligibility_check(
+            &ss,
+            &snapshot,
+            &log,
+            cid,
+            Some(&oracle as &dyn crate::community_voting_tier3::BeaconOracle),
+        )
+        .await;
+        let err = res.expect_err("forged kd=ss must be rejected at ingest");
+        assert!(
+            err.contains("SortitionMismatch"),
+            "reject must be a sortition mismatch; got {err:?}"
+        );
+        // The check is read-only; the poll's sortition_result stays unset.
+        let g = log.lock().await;
+        let t3 = g.polls.get(&pid).unwrap().tier_state.as_tier3().unwrap();
+        assert!(
+            t3.sortition_result.is_none(),
+            "a rejected kd=ss must not install a sortition_result"
+        );
+    }
+
+    // kd=ss control: a SortitionSelection matching the deterministic recompute
+    // is admitted — proves the gate does not over-reject an honest selection.
+    #[tokio::test]
+    async fn kd_ss_matching_sortition_admitted() {
+        let (log, pid, proposer, snapshot, cid) = tier3_pre_ss_fixture().await;
+        let vrf = [0x55u8; 32];
+        let correct = correct_ss_for(&log, pid, &vrf).await;
+        let ss = tier3_ingest_event(
+            PollEventKindCode::SortitionSelection,
+            proposer,
+            1_000_002,
+            encode_ss_payload(pid, correct.primary, correct.backup),
+        );
+        let oracle = FixedBeacon(Some(vrf));
+        let res = inbound_eligibility_check(
+            &ss,
+            &snapshot,
+            &log,
+            cid,
+            Some(&oracle as &dyn crate::community_voting_tier3::BeaconOracle),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "a kd=ss matching the deterministic recompute must be admitted; got {res:?}"
+        );
+    }
+
+    // kd=ss fail-closed: no beacon oracle wired ⇒ the kd=ss is rejected (never
+    // admitted un-verified), and no sortition_result is installed. Liveness-safe
+    // because kd=ss is engine-auto-derived locally from this node's own beacon,
+    // so a node without the beacon indexed simply waits rather than trusting a
+    // peer's claim. A *correct* payload is used to prove the reject is the
+    // fail-closed oracle gate, not a mismatch.
+    #[tokio::test]
+    async fn kd_ss_no_oracle_fail_closed() {
+        let (log, pid, proposer, snapshot, cid) = tier3_pre_ss_fixture().await;
+        let vrf = [0x55u8; 32];
+        let correct = correct_ss_for(&log, pid, &vrf).await;
+        let ss = tier3_ingest_event(
+            PollEventKindCode::SortitionSelection,
+            proposer,
+            1_000_002,
+            encode_ss_payload(pid, correct.primary, correct.backup),
+        );
+        let res = inbound_eligibility_check(&ss, &snapshot, &log, cid, None).await;
+        let err = res.expect_err("kd=ss with no beacon oracle must be rejected (fail-closed)");
+        assert!(
+            err.contains("no beacon oracle"),
+            "reject must be the fail-closed oracle gate; got {err:?}"
+        );
+        let g = log.lock().await;
+        let t3 = g.polls.get(&pid).unwrap().tier_state.as_tier3().unwrap();
+        assert!(
+            t3.sortition_result.is_none(),
+            "a fail-closed kd=ss must not install a sortition_result"
         );
     }
 }
