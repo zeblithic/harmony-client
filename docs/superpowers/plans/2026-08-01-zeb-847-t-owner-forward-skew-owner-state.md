@@ -4,7 +4,7 @@
 
 **Goal:** Bound every peer/sibling-supplied wall-clock stamp at the owner-state CRDT merge boundary so a skewed or compromised own-device can no longer pin a revocation/privacy control off (or on) forever.
 
-**Architecture:** The owner-state remote-merge is a single pure free function, `merge_remote_into_local(local, remote)` (`owner_state_sync.rs:251`), that folds every owner sub-CRDT. Sample the receiver's own wall clock **once** at the top (`clock_trust::receiver_now_ms()`), then apply one of two guards per field: **reject/skip** a remote entry whose deciding HLC wall is implausibly future (LWW-replace-by-HLC registers — Friend, Space, owner-device, read-marker, Library), or **clamp** an incoming raw-`u64` stamp down to `now + MAX_FORWARD_SKEW_MS` before a grow-only `max` join (Grant `granted_at`/`revoked_at`, received-grant dismiss/`received_at`). Notes merge through a **separate** engine (`NotesDoc::merge_from`, `notes_crdt.rs:91`) and get the same reject at their own sample point. `receiver_now_ms()` returning `None` (unreadable/pre-epoch clock) means **apply-all** everywhere — a bad *local* clock must never drop honest owner state.
+**Architecture:** The owner-state remote-merge is a single pure free function, `merge_remote_into_local(local, remote)` (`owner_state_sync.rs:251`), that folds every owner sub-CRDT. Sample the receiver's own wall clock **once** at the top (`clock_trust::receiver_now_ms()`), then **reject/skip** any remote entry whose deciding wall is implausibly future — both the LWW-replace-by-HLC registers (Friend, Space, owner-device, read-marker, Library) and every grow-only `max`-join `u64` stamp (Grant `granted_at`/`revoked_at`, received-grant `received_at`/`dismissed_at`). Notes merge through a **separate** engine (`NotesDoc::merge_from`, `notes_crdt.rs:91`) and get the same reject at their own sample point. `receiver_now_ms()` returning `None` (unreadable/pre-epoch clock) means **apply-all** everywhere — a bad *local* clock must never drop honest owner state. *(Converge revision: the plan originally clamped the grow-only stamps; converge round 1 made every site reject — see the Converge Revision note in Global Constraints.)*
 
 **Tech Stack:** Rust (workspace crate `harmony-app` under `src-tauri/`), `cargo nextest`, the ZEB-831 `clock_trust` policy module (already in-tree from ZEB-846).
 
@@ -12,13 +12,32 @@
 
 Every task's requirements implicitly include this section. Values are verbatim.
 
+> **⚠ Converge revision (round 1, post-review) — REJECT supersedes CLAMP everywhere.**
+> As written below, Tasks 5 and 6 *clamp* the grow-only `max`-join stamps
+> (`revoked_at`, `dismissed_at`) while rejecting the fail-open direction
+> (`granted_at`, `received_at`). During PR #582 bot review, CodeAnt flagged that
+> clamping writes a **receiver-dependent** value (`receiver_now + 5min`) into a
+> *replicated grow-only register*: two devices with different wall clocks store
+> different values for the same poisoned stamp (transient cross-device
+> divergence), and a poisoned future stamp still deactivates a legit grant at
+> `now+5min`. The whole PR converged to one uniform rule: **reject every
+> future-skewed stamp; never clamp-and-store.** Reject stores nothing, nullifies
+> the poisoned deactivation (keeps local, self-heals next sync round), and is
+> convergence-clean. Consequently the GrantEntry loop rejects when `granted_at`
+> **or** `revoked_at` is future-skewed, the received-grant loop rejects when
+> `received_at` **or** `dismissed_at` is future-skewed, and
+> `clamp_wall_to_forward_skew` (Task 1) was removed as dead code. Where the task
+> bodies below say "clamp `revoked_at`/`dismissed_at`", read "reject the entry
+> when that stamp is future-skewed." The task bodies are left as the historical
+> record of what each task's commit did at the time; **this note governs.**
+
 - **Policy module is the one auditable home.** All forward-skew logic uses `crate::clock_trust`: the constant `MAX_FORWARD_SKEW_MS` (`= 5*60*1000`), `reject_future(stamp, now, tol)` (returns `true` when `stamp.saturating_sub(now) > tol` — boundary **inclusive**, `stamp == now+tol` is accepted), `clamp_future(stamp, now, tol)` (returns `stamp.min(now+tol)`), and `receiver_now_ms() -> Option<u64>`. Do **not** hand-roll `SystemTime::now()` at a merge site or introduce a second constant.
 - **Receiver-`now` is `receiver_now_ms()` ONLY.** Never a peer-supplied, HLC, or adoption-nudged value — those are exactly the clocks the bound distrusts.
 - **`None` ⇒ apply-all, NEVER `0`.** When `receiver_now_ms()` is `None`, every guard is a no-op (merge everything). Substituting `0` would make every honest present-day wall (~1.7e12 ms) exceed the ceiling and reject *all* owner state — the inversion of the invariant that a bad LOCAL clock must never drop honest state.
 - **Forward bounds only.** Every T-OWNER guard rejects/clamps *future* stamps. Do **not** add a backward/anti-backdating guard at any owner-state merge site (the sole backward-bound site in the threat model, relay-hold, is out of scope). `created_at` backdating on Space is already defended structurally at `owner_state_crdt.rs:361-382`; do not touch it.
 - **Reject in place — no destructive write-back.** A rejected/skipped remote entry means "keep local, ignore the poisoned incoming this round." Never persist a *mutated/erased* copy back, and never delete local state on a slow clock: the merge must be self-healing (the peer re-offers its snapshot next sync round; once the clock is within tolerance the entry merges). This is the ZEB-621/831 "gate the decision, not a destructive store rewrite" rule.
 - **Sample `receiver_now` ONCE per merge**, at the top of the merge function (mirrors `community_state_sync.rs:4353`). Do not re-sample per entry.
-- **Sign of the guard per site is load-bearing:** LWW-replace-by-HLC ⇒ **reject/skip** (clamping is insufficient — a clamped `now+5min` still out-stamps an honest `now`). Grow-only `max`-join of raw `u64` ⇒ **clamp** (preserves the CRDT join; the local revoke, which stamps `now.max(granted_at)`, can always catch a clamped grant).
+- **Sign of the guard per site is load-bearing:** **every** site ⇒ **reject/skip** a future-skewed stamp — both LWW-replace-by-HLC (a clamped `now+5min` still out-stamps an honest `now`) and grow-only `max`-join of raw `u64`. *(Converge revision — see the note above: the plan originally clamped the grow-only stamps; converge round 1 switched them to reject after CodeAnt flagged that a clamp writes a receiver-dependent value into a replicated grow-only register.)*
 - **One positive-discrimination test per site:** a poisoned stamp set *higher* than a legitimate opposing one, asserting the legitimate control still wins after merge — so any leak clamps visibly (the ZEB-790 T5–T7 / ZEB-846 pattern). Tests run at real wall time: build the honest stamp from `SystemTime::now()` (ms) and the poisoned stamp `now + 400 days`; the 5-min tolerance dwarfs test execution time, so this is deterministic without clock mocking.
 - **CI gates (run from `src-tauri/`):** `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run --locked --workspace --all-targets --features test-fixtures`. MSRV is 1.91 (`Option::is_some_and`/`map_or`/`is_none_or` all available). Iterative gating may use `scripts/test-select --context task`; the **final** pre-PR gate is the full `--workspace --all-targets` sweep. Paste the `round=… bucket=…` line from `test-select` into task reports.
 
