@@ -194,6 +194,8 @@ pub enum CardVerifyError {
     EnrollmentOwnerMismatch,
     #[error("Ed25519 signature verification failed")]
     SignatureInvalid,
+    #[error("shared_at.wall_ms is implausibly far in the receiver's future")]
+    SharedAtTooFarInFuture,
     #[error("canonical CBOR encode failed: {0}")]
     Encode(#[from] CryptoError),
 }
@@ -216,6 +218,19 @@ pub fn verify_card(
     }
     if card.status_text.len() > MAX_STATUS_TEXT_BYTES {
         return Err(CardVerifyError::StatusTextTooLong);
+    }
+    // ZEB-849 (C4): reject an implausibly future-dated shared_at before it can
+    // out-HLC every honest card in both the live cache and the disk store.
+    // now_secs == 0 ⇒ unreadable local clock (wall_now_secs().unwrap_or(0)) ⇒
+    // apply-all: a bad LOCAL clock must never drop honest state.
+    if now_secs != 0
+        && crate::clock_trust::reject_future(
+            card.shared_at.wall_ms,
+            now_secs.saturating_mul(1000),
+            crate::clock_trust::MAX_FORWARD_SKEW_MS,
+        )
+    {
+        return Err(CardVerifyError::SharedAtTooFarInFuture);
     }
     // ZEB-677: chokepoint verification — Master certs self-contained; Quorum
     // certs against the card's signer-cert bundle (depth-1). No-bundle
@@ -1709,5 +1724,111 @@ mod tests {
         ));
         // before expiry → ok
         assert!(verify_card(&card, 1_500).is_ok());
+    }
+
+    #[test]
+    fn verify_card_rejects_future_dated_shared_at() {
+        // C4: a card whose shared_at.wall_ms is beyond now + MAX_FORWARD_SKEW_MS
+        // must never verify — otherwise it out-HLCs every honest card forever.
+        let owner = crate::community_membership::mint_test_owner(0x71);
+        const NOW_S: u64 = 1_700_000_000;
+        let now_ms = NOW_S * 1000;
+        let one_year_ms = 365 * 86_400 * 1000;
+        let poison = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Mallory".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: now_ms + one_year_ms,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .expect("sign");
+        assert!(matches!(
+            verify_card(&poison, NOW_S),
+            Err(CardVerifyError::SharedAtTooFarInFuture)
+        ));
+    }
+
+    #[test]
+    fn verify_card_accepts_in_range_shared_at_at_the_inclusive_ceiling() {
+        let owner = crate::community_membership::mint_test_owner(0x72);
+        const NOW_S: u64 = 1_700_000_000;
+        let now_ms = NOW_S * 1000;
+        // Present, and exactly at the inclusive ceiling, both verify.
+        for wall_ms in [now_ms, now_ms + crate::clock_trust::MAX_FORWARD_SKEW_MS] {
+            let card = sign_card(
+                &owner.device_key,
+                owner.owner.0,
+                "Ann".into(),
+                "".into(),
+                None,
+                None,
+                owner.cert.clone(),
+                Hlc {
+                    wall_ms,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            )
+            .expect("sign");
+            assert_eq!(
+                verify_card(&card, NOW_S).expect("in-range verifies"),
+                owner.owner.0
+            );
+        }
+        // One millisecond past the ceiling is rejected.
+        let over = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Ann".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: now_ms + crate::clock_trust::MAX_FORWARD_SKEW_MS + 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .expect("sign");
+        assert!(matches!(
+            verify_card(&over, NOW_S),
+            Err(CardVerifyError::SharedAtTooFarInFuture)
+        ));
+    }
+
+    #[test]
+    fn verify_card_zero_now_is_apply_all_for_shared_at() {
+        // now_secs == 0 is the unreadable-local-clock sentinel (wall_now_secs()
+        // .unwrap_or(0)); a bad LOCAL clock must never reject an honest card, so the
+        // bound disables itself. (This is also why every legacy verify_card(&card, 0)
+        // test keeps passing.)
+        let owner = crate::community_membership::mint_test_owner(0x73);
+        let far_future = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Ann".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: u64::MAX / 2,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .expect("sign");
+        assert_eq!(
+            verify_card(&far_future, 0).expect("apply-all"),
+            owner.owner.0
+        );
     }
 }
