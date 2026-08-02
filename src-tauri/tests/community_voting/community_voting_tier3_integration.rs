@@ -178,6 +178,120 @@ pub struct TwoVotingEngines {
     /// Tests call `resolvers.add_identity(&id)` for each actor that
     /// will publish events crossing the bridge.
     pub resolvers: Arc<BridgeTestResolvers>,
+    /// ZEB-850 Task 5: each engine's D-FROST log, wired via
+    /// `install_beacon_oracle_for` so the tier-3 peer-ingest `verify_ss`
+    /// gate can consult a `DfrostBeaconOracle` and ADMIT a test-injected
+    /// kd=ss. Seed a VRF beacon into both with `seed_ss_beacon` after
+    /// PollCreate and before publishing the kd=ss.
+    pub dfrost_log_a: Arc<Mutex<harmony_app::community_dfrost_log::DfrostLog>>,
+    pub dfrost_log_b: Arc<Mutex<harmony_app::community_dfrost_log::DfrostLog>>,
+}
+
+/// ZEB-850 Task 5: wire a lightweight beacon oracle into `engine` so the
+/// tier-3 peer-ingest `verify_ss` gate can consult a `DfrostBeaconOracle`
+/// (`beacon_oracle_holder()` returns `Some`) and ADMIT a legitimately
+/// test-injected kd=ss rather than fail-closed on `BeaconNotYetAvailable`.
+///
+/// Registers a `DfrostLogEngine` (with a no-op `BeaconRequester`) for
+/// `community_id` in a fresh registry, installs the handle, and returns the
+/// engine's `DfrostLog` so `seed_ss_beacon` can insert VRF outputs straight
+/// into `beacon_index`. Nothing here drives the beacon apply path: the no-op
+/// requester never issues a real request and no `VrfBeacon` event is ever
+/// applied, so the engine's `on_dfrost_beacon` self-mint path never fires
+/// (which would change what the tests exercise).
+async fn install_beacon_oracle_for(
+    engine: &Arc<VotingLogEngine<tauri::test::MockRuntime>>,
+    community_id: SpaceId,
+) -> Arc<Mutex<harmony_app::community_dfrost_log::DfrostLog>> {
+    use harmony_app::community_dfrost_log::DfrostLog;
+    use harmony_app::community_dfrost_log_engine::{DfrostLogEngineParams, DfrostLogRegistry};
+    use harmony_app::community_voting_log_engine::BeaconRequester;
+
+    let dfrost_log = Arc::new(Mutex::new(DfrostLog::new()));
+    let registry = Arc::new(DfrostLogRegistry::<tauri::test::MockRuntime>::new());
+
+    // A DfrostLogEngine needs an AppHandle + publish/subscribe channels. None of
+    // it is exercised — tests seed `beacon_index` directly, so no VrfBeacon event
+    // is ever applied through this engine's receive loop. The cloned AppHandle
+    // survives the mock_app drop (same pattern as the in-crate engine tests).
+    let app = tauri::test::mock_app();
+    let app_handle = app.handle().clone();
+    let (pub_tx, _pub_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (_sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(8);
+
+    DfrostLogRegistry::register(
+        &registry,
+        DfrostLogEngineParams {
+            community_id,
+            dfrost_log: Arc::clone(&dfrost_log),
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            app_handle,
+            self_addr: OwnerAddr([0u8; 16]),
+            self_x25519_priv: [0u8; 32],
+            identity_resolver: Arc::new(StaticIdentityResolver(HashMap::new())),
+            registry_weak: None,
+        },
+    )
+    .await;
+
+    // No-op BeaconRequester: present only so `beacon_oracle_holder()` returns
+    // `Some`; never issues a real beacon request.
+    let requester: BeaconRequester =
+        Arc::new(|_cid, _seed, _epoch| Box::pin(async { Ok(String::new()) }));
+    VotingLogEngine::install_dfrost_handle(engine, registry, requester).await;
+
+    dfrost_log
+}
+
+impl TwoVotingEngines {
+    /// ZEB-850 Task 5: seed a VRF beacon into BOTH engines' D-FROST logs so the
+    /// tier-3 peer-ingest `verify_ss` gate ADMITS a test-injected kd=ss.
+    ///
+    /// `verify_ss` looks up `beacon_index[derive_vrf_seed(derive_beacon_seed(
+    /// poll_create_event_hash, community_epoch), community_epoch)]` and recomputes
+    /// the sortition from the stored `vrf_output`, so `vrf_output` MUST equal the
+    /// value the test used to build the injected sortition. The
+    /// `poll_create_event_hash` + `community_epoch` are read straight from the
+    /// already-applied poll state (identical on both logs), so the caller only
+    /// supplies the `poll_id` and the `vrf_output`.
+    ///
+    /// Call AFTER PollCreate is applied (so the poll's meta exists) and BEFORE
+    /// publishing the kd=ss. Seeds both logs because tests bridge in either
+    /// direction.
+    pub async fn seed_ss_beacon(
+        &self,
+        poll_id: harmony_app::community_voting_core::PollId,
+        vrf_output: [u8; 32],
+    ) {
+        let (poll_create_event_hash, community_epoch) = {
+            let log = self.log_a.lock().await;
+            let meta = &log
+                .polls
+                .get(&poll_id)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .expect("seed_ss_beacon: tier3 poll must be applied to log_a first")
+                .meta;
+            (meta.poll_create_event_hash, meta.community_epoch)
+        };
+
+        let seed = harmony_app::community_voting_sortition::derive_beacon_seed(
+            &poll_create_event_hash,
+            community_epoch,
+        );
+        let message_hash =
+            harmony_app::community_dfrost_types::derive_vrf_seed(&seed, community_epoch);
+
+        for dfrost_log in [&self.dfrost_log_a, &self.dfrost_log_b] {
+            let mut log = dfrost_log.lock().await;
+            log.beacon_index.insert(message_hash, vrf_output);
+            // `find_vrf_beacon_output_by_seed` ignores committee_state, but keep
+            // it consistent with a real post-DKG log (matches the in-crate seed
+            // pattern in community_dfrost_log_engine.rs).
+            log.committee_state.active = true;
+            log.committee_state.current_epoch = community_epoch;
+        }
+    }
 }
 
 /// Wire two `VotingLogEngine` instances with bidirectional mpsc channels,
@@ -279,12 +393,19 @@ pub async fn setup_two_voting_engine_bridge(community_id: SpaceId) -> TwoVotingE
     })
     .await;
 
+    // ZEB-850 Task 5: wire a beacon oracle into each engine so the tier-3
+    // peer-ingest verify_ss gate can admit a test-injected kd=ss.
+    let dfrost_log_a = install_beacon_oracle_for(&engine_a, community_id).await;
+    let dfrost_log_b = install_beacon_oracle_for(&engine_b, community_id).await;
+
     TwoVotingEngines {
         engine_a,
         engine_b,
         log_a,
         log_b,
         resolvers,
+        dfrost_log_a,
+        dfrost_log_b,
     }
 }
 
@@ -404,12 +525,19 @@ pub async fn setup_two_voting_engine_bridge_with_signing_and_app(
         .install_local_signing_key(signing_key, proposer.owner)
         .await;
 
+    // ZEB-850 Task 5: wire a beacon oracle into each engine so the tier-3
+    // peer-ingest verify_ss gate can admit a test-injected kd=ss.
+    let dfrost_log_a = install_beacon_oracle_for(&engine_a, community_id).await;
+    let dfrost_log_b = install_beacon_oracle_for(&engine_b, community_id).await;
+
     TwoVotingEngines {
         engine_a,
         engine_b,
         log_a,
         log_b,
         resolvers,
+        dfrost_log_a,
+        dfrost_log_b,
     }
 }
 
@@ -870,6 +998,9 @@ async fn tier3_full_lifecycle_4_stage_convergence() {
         SORTITION_SIZE as usize,
     );
 
+    // ZEB-850 Task 5: seed the beacon so the peer's verify_ss admits this kd=ss.
+    engines.seed_ss_beacon(poll_id, vrf_output).await;
+
     let ss_event = build_sortition_selection_event(
         proposer,
         poll_id,
@@ -1307,6 +1438,9 @@ async fn tier3_decline_triggers_backup_promotion_across_engines() {
         SORTITION_SIZE as usize,
     );
 
+    // ZEB-850 Task 5: seed the beacon so the peer's verify_ss admits this kd=ss.
+    engines.seed_ss_beacon(poll_id, vrf_output).await;
+
     let ss_event = build_sortition_selection_event(
         proposer,
         poll_id,
@@ -1566,31 +1700,21 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
 
     // ── Step 1: electorate ────────────────────────────────────────────────────
     //
-    // Proposer = identities[49] (outside the primary/backup pool selection since
-    // Fisher-Yates picks 40 from [0..49] — identities[49] is in the pool but may
-    // still be selected. Use a deterministic VRF seed and verify post-hoc, or
-    // simply include identities[49] in the electorate but verify it's not in the
-    // primary/backup pools. Cleanest: exclude identities[49] from the electorate
-    // that fisher_yates_select operates on; include them in the snapshot for
-    // eligibility, but use only identities[0..49] for the sortition electorate.)
-    //
-    // Simplest correct approach: proposer = identities[49]. The electorate passed
-    // to fisher_yates_select uses all 50 identities. We verify post-hoc that
-    // identities[49] is not in primary or backup (if it is, we adjust; but with
-    // seed [0xEF; 32] and 50 identities selecting 40, there's a 10/50 = 20% chance
-    // it IS selected. To guarantee it, we exclude it from the Fisher-Yates pool by
-    // passing only identities[0..49] to fisher_yates_select while still including
-    // all 50 in the PollCreate snapshot).
+    // Proposer = identities[49], deliberately kept OUT of the sortition. Since
+    // ZEB-850 Task 3's verify_ss recomputes fisher_yates_select over the poll's
+    // `eligible_electorate_snapshot` and rejects a mismatch, the poll's electorate
+    // must equal the pool the injected kd=ss is drawn from. So the proposer is
+    // excluded from BOTH the sortition pool and the PollCreate snapshot; it still
+    // mints kd=sf as the proposer (verify_sf checks actor == proposer, not
+    // electorate membership).
 
     let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
 
     // Proposer is identities[49] — separate from the sortition pool.
     let proposer = &identities[49];
 
-    // Electorate for PollCreate snapshot: all 50 members.
-    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
-
-    // Sortition pool: only identities[0..49] (49 members), so proposer is never selected.
+    // Sortition pool == PollCreate electorate: identities[0..49] (49 members),
+    // so the proposer is never selected into the mini-public.
     let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
 
     // ── Step 2: two-engine bridge ─────────────────────────────────────────────
@@ -1627,8 +1751,14 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
         .expect("create event signing_bytes");
     let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
 
+    // ZEB-850 Task 5 (Issue A): the poll's electorate must equal the set the
+    // injected kd=ss sortition is drawn from — verify_ss recomputes
+    // fisher_yates_select over `eligible_electorate_snapshot` and rejects a
+    // mismatch. Exclude the proposer (never a sortition candidate) from the
+    // electorate; it still mints kd=sf as the proposer (verify_sf checks
+    // actor == proposer, not electorate membership).
     let snapshot = MembershipSnapshot {
-        members: full_electorate
+        members: sortition_pool
             .iter()
             .map(|addr| {
                 (
@@ -1642,7 +1772,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
             .collect(),
     };
 
-    // Apply PollCreate directly to both logs with the full snapshot.
+    // Apply PollCreate directly to both logs with the sortition-pool snapshot.
     {
         let mut log = engines.log_a.lock().await;
         log.apply_with_snapshot(create_event.clone(), &COMMUNITY_ID, Some(snapshot.clone()))
@@ -1665,8 +1795,8 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
         );
         assert_eq!(
             t3.eligible_electorate_snapshot.len(),
-            N_IDENTITIES,
-            "engine_a: full electorate snapshotted"
+            sortition_pool.len(),
+            "engine_a: sortition-pool electorate snapshotted (proposer excluded)"
         );
     }
 
@@ -1679,6 +1809,9 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
         SORTITION_SIZE as usize,
         SORTITION_SIZE as usize,
     );
+
+    // ZEB-850 Task 5: seed the beacon so the peer's verify_ss admits this kd=ss.
+    engines.seed_ss_beacon(poll_id, vrf_output).await;
 
     // Sanity: proposer must NOT be in primary or backup (by construction).
     assert!(
@@ -1937,7 +2070,7 @@ async fn tier3_mass_decline_sortition_failed_with_retry_chain() {
     let retry_poll_id = derive_poll_id(&COMMUNITY_ID, &retry_signing_bytes);
 
     let retry_snapshot = MembershipSnapshot {
-        members: full_electorate
+        members: sortition_pool
             .iter()
             .map(|addr| {
                 (
@@ -2286,6 +2419,9 @@ async fn tier3_kd_ss_idempotent_apply_cross_engine_convergence() {
         SORTITION_SIZE as usize,
     );
 
+    // ZEB-850 Task 5: seed the beacon so the peer's verify_ss admits this kd=ss.
+    engines.seed_ss_beacon(poll_id, vrf_output).await;
+
     // ── Step 5: race — engine_a publishes kd=ss at HLC 5000, engine_b at HLC 5001 ──
     //
     // Both events carry the same primary + backup arrays (bit-identical content).
@@ -2518,6 +2654,9 @@ async fn tier3_cross_engine_kd_ss_hlc_tied_resolves_by_device_id_lex() {
         SORTITION_SIZE as usize,
     );
 
+    // ZEB-850 Task 5: seed the beacon so the peer's verify_ss admits this kd=ss.
+    engines.seed_ss_beacon(poll_id, vrf_output).await;
+
     // ── Step 4: tied HLC — same wall_ms + logical, different device_id ─────────
     //
     // "engine-a" < "engine-z" lexicographically. The materialize HLC monotonicity
@@ -2676,7 +2815,6 @@ async fn engine_auto_sf_on_mass_decline_from_proposer() {
 
     let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
     let proposer = &identities[49];
-    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
     let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
 
     // engine_a holds the proposer's signing key → orchestration hook active.
@@ -2710,8 +2848,14 @@ async fn engine_auto_sf_on_mass_decline_from_proposer() {
         .expect("create event signing_bytes");
     let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
 
+    // ZEB-850 Task 5 (Issue A): the poll's electorate must equal the set the
+    // injected kd=ss sortition is drawn from — verify_ss recomputes
+    // fisher_yates_select over `eligible_electorate_snapshot` and rejects a
+    // mismatch. The proposer is deliberately excluded from sortition, so exclude
+    // it from the electorate too (it still mints kd=sf as the proposer;
+    // verify_sf checks actor == proposer, not electorate membership).
     let snapshot = MembershipSnapshot {
-        members: full_electorate
+        members: sortition_pool
             .iter()
             .map(|addr| {
                 (
@@ -2725,7 +2869,7 @@ async fn engine_auto_sf_on_mass_decline_from_proposer() {
             .collect(),
     };
 
-    // Apply PollCreate directly to both logs with the full electorate snapshot.
+    // Apply PollCreate directly to both logs with the sortition-pool electorate.
     // (We skip publish_event for the create to avoid wiring D-FROST in this
     // test; the existing kd=ss / kd=md publish path below exercises the
     // orchestration hook.)
@@ -2748,6 +2892,9 @@ async fn engine_auto_sf_on_mass_decline_from_proposer() {
         SORTITION_SIZE as usize,
         SORTITION_SIZE as usize,
     );
+
+    // ZEB-850 Task 5: seed the beacon so the peer's verify_ss admits this kd=ss.
+    engines.seed_ss_beacon(poll_id, vrf_output).await;
     assert!(
         !sortition_result.primary.contains(&proposer.owner),
         "proposer must not be selected"
@@ -2894,7 +3041,6 @@ async fn engine_auto_cl_when_ratification_window_expires() {
 
     let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
     let proposer = &identities[49];
-    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
     let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
 
     // engine_a holds the proposer's signing key → orchestration hook active.
@@ -2935,7 +3081,7 @@ async fn engine_auto_cl_when_ratification_window_expires() {
     let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
 
     let snapshot = MembershipSnapshot {
-        members: full_electorate
+        members: sortition_pool
             .iter()
             .map(|addr| {
                 (
@@ -2978,6 +3124,9 @@ async fn engine_auto_cl_when_ratification_window_expires() {
         SORTITION_SIZE as usize,
         SORTITION_SIZE as usize,
     );
+
+    // ZEB-850 Task 5: seed the beacon so the peer's verify_ss admits this kd=ss.
+    engines.seed_ss_beacon(poll_id, vrf_output).await;
     let ss_hlc_wall = t0 + 500_000;
     let ss_event = build_sortition_selection_event(
         proposer,
@@ -3018,6 +3167,21 @@ async fn engine_auto_cl_when_ratification_window_expires() {
         );
     }
 
+    // ZEB-850 peer verify_ss admission (CodeAnt Major): engine_b must have
+    // ADMITTED the bridged kd=ss (sortition_result set), not merely applied the
+    // ungated kd=cl. With the snapshot built from `sortition_pool`, verify_ss
+    // recomputes the same selection and admits it; with the prior 50-member
+    // `full_electorate` snapshot it rejected as SortitionMismatch and this
+    // assertion fails, proving the peer sortition-admission cascade runs.
+    {
+        let log = engines.log_b.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert!(
+            t3.sortition_result.is_some(),
+            "engine_b: must admit peer kd=ss via verify_ss (sortition_result set)"
+        );
+    }
+
     drop(engines);
 }
 
@@ -3047,7 +3211,6 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
 
     let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
     let proposer = &identities[49];
-    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
     let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
 
     let engines = setup_two_voting_engine_bridge_with_signing(COMMUNITY_ID, proposer).await;
@@ -3080,7 +3243,7 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
     let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
 
     let snapshot = MembershipSnapshot {
-        members: full_electorate
+        members: sortition_pool
             .iter()
             .map(|addr| {
                 (
@@ -3112,6 +3275,9 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
         SORTITION_SIZE as usize,
         SORTITION_SIZE as usize,
     );
+
+    // ZEB-850 Task 5: seed the beacon so the peer's verify_ss admits this kd=ss.
+    engines.seed_ss_beacon(poll_id, vrf_output).await;
     let ss_hlc_wall = t0 + 500_000;
     let ss_event = build_sortition_selection_event(
         proposer,
@@ -3163,6 +3329,18 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
     };
     assert_eq!(t3_a.stage, Stage::Finalized);
     assert_eq!(t3_b.stage, Stage::Finalized);
+    // ZEB-850 peer verify_ss admission (CodeAnt Major): engine_b must ADMIT the
+    // bridged kd=ss (sortition_result set) rather than only replay the ungated
+    // kd=cl/kd=rs. Aligning the snapshot with `sortition_pool` makes verify_ss
+    // recompute the same selection; the prior 50-member snapshot rejected it.
+    assert!(
+        t3_a.sortition_result.is_some(),
+        "engine_a: sortition_result must be Some"
+    );
+    assert!(
+        t3_b.sortition_result.is_some(),
+        "engine_b: must admit peer kd=ss via verify_ss (sortition_result set)"
+    );
     assert!(
         t3_a.close_event_hash.is_some(),
         "engine_a: close_event_hash must be Some"
@@ -3218,7 +3396,6 @@ async fn engine_auto_tier3_tauri_events_fire_at_expected_lifecycle_points() {
 
     let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
     let proposer = &identities[49];
-    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
     let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
 
     // Mock Tauri app + handle, plus listeners for the two events we assert on.
@@ -3284,7 +3461,7 @@ async fn engine_auto_tier3_tauri_events_fire_at_expected_lifecycle_points() {
     let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
 
     let snapshot = MembershipSnapshot {
-        members: full_electorate
+        members: sortition_pool
             .iter()
             .map(|addr| {
                 (
@@ -3324,6 +3501,9 @@ async fn engine_auto_tier3_tauri_events_fire_at_expected_lifecycle_points() {
         SORTITION_SIZE as usize,
         SORTITION_SIZE as usize,
     );
+
+    // ZEB-850 Task 5: seed the beacon so the peer's verify_ss admits this kd=ss.
+    engines.seed_ss_beacon(poll_id, vrf_output).await;
     let ss_hlc_wall = t0 + 500_000;
     let ss_event = build_sortition_selection_event(
         proposer,

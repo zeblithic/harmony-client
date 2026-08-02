@@ -211,15 +211,14 @@ pub struct Tier3PollState {
     /// Used as the `now` watermark by `current_stage_at` and `current_mini_public`
     /// via `build_tier3_export`. Drop paths must NOT advance this (ZEB-320).
     pub last_hlc: Option<Hlc>,
-    /// HLC of the most recent **dispatched** event, accepted *or* silently
-    /// dropped. Used for the monotonic-HLC guard at the top of `apply_event`
-    /// so out-of-order peer delivery is still surfaced as `HlcNotMonotonic`
-    /// even when the previous event was dropped — without this, a dropped
-    /// event followed by an earlier-HLC event that would change drop decisions
-    /// (e.g., the kd=ds whose existence is the prerequisite for a previously
-    /// target-missing kd=dv) would silently bypass the guard and never be
-    /// re-materialized, causing replica divergence (Qodo PR #154 finding).
-    pub last_received_hlc: Option<Hlc>,
+    /// Per-`(actor, device_id)` receive-watermark lanes (ZEB-850, mirrors the
+    /// channel-log `WatermarkVector`, ZEB-585). Each lane holds the highest
+    /// `(wall_ms, logical)` dispatched on that lane — accepted OR silently
+    /// dropped (the ZEB-320 property, now per-lane). Keying per lane stops one
+    /// sibling's future-stamped event from freezing every other member's
+    /// events (the T-VOTE-LANE GRIEF-LOCKOUT). Rebuilt by replay; never
+    /// serialized (community_voting_persist.rs).
+    pub last_received_hlc: std::collections::BTreeMap<(OwnerAddr, String), (u64, u32)>,
     /// ZEB-295 Phase 6: ballot-secret tally projection. Populated by
     /// `kd=ts` apply (Task 7) and the decrypted-result derivation
     /// (Task 8). Empty in pu-mode polls.
@@ -420,7 +419,7 @@ impl Tier3PollState {
             result: None,
             deliberation: DeliberationState::default(),
             last_hlc: None,
-            last_received_hlc: None,
+            last_received_hlc: std::collections::BTreeMap::new(),
             secret_tally: SecretTallyState::default(),
             committee_oracle: std::sync::Arc::new(NullCommitteeOracle),
         }
@@ -454,15 +453,14 @@ impl Tier3PollState {
         //    Reads `last_received_hlc` (advances on every dispatch, accept or
         //    drop) rather than `last_hlc` (advances on accepts only) so the
         //    guard still catches out-of-order delivery after a dropped event.
-        if let Some(ref last) = self.last_received_hlc {
-            let incoming = &ev.hlc;
-            let last_tuple = (last.wall_ms, last.logical, last.device_id.as_str());
-            let inc_tuple = (
-                incoming.wall_ms,
-                incoming.logical,
-                incoming.device_id.as_str(),
-            );
-            if inc_tuple < last_tuple {
+        // ZEB-850: per-(actor, device) monotonic guard. Compare the incoming
+        // event only against the high-water mark of ITS OWN lane. device_id is
+        // constant within a lane, so comparing (wall_ms, logical) is equivalent
+        // to the old (wall_ms, logical, device_id) 3-tuple compare. A future
+        // event on one lane no longer blocks another lane's honest events.
+        let lane = (ev.actor, ev.hlc.device_id.clone());
+        if let Some(&(w, l)) = self.last_received_hlc.get(&lane) {
+            if (ev.hlc.wall_ms, ev.hlc.logical) < (w, l) {
                 return Err(ApplyError::HlcNotMonotonic);
             }
         }
@@ -1046,14 +1044,38 @@ impl Tier3PollState {
             }
         }
 
-        // last_received_hlc always advances on Ok return — including silent
-        // drops — so the monotonic guard keeps catching out-of-order delivery
-        // after a drop. last_hlc only advances on accepts (ZEB-320).
-        self.last_received_hlc = Some(ev.hlc.clone());
+        // Raise this event's (actor, device) lane to max((wall_ms, logical)),
+        // mirroring channel-log raise_watermark. Advances on every Ok (accept
+        // or silent drop) — the ZEB-320 property, per lane — so the monotonic
+        // guard keeps catching out-of-order delivery after a drop. last_hlc
+        // only advances on accepts (ZEB-320).
+        let lane = (ev.actor, ev.hlc.device_id.clone());
+        let cand = (ev.hlc.wall_ms, ev.hlc.logical);
+        let entry = self.last_received_hlc.entry(lane).or_insert((0, 0));
+        if cand > *entry {
+            *entry = cand;
+        }
         if advance_last_hlc {
             self.last_hlc = Some(ev.hlc.clone());
         }
         Ok(())
+    }
+
+    /// Highest `(wall_ms, logical)` across all per-(actor,device) receive
+    /// lanes, as an `Hlc` with an empty `device_id`, or `None` before any
+    /// dispatch. The engine-auto kd=rs mint floor needs a floor strictly above
+    /// EVERY received event regardless of lane; `engine_auto_hlc_from_base`
+    /// synthesizes its own device_id, so the empty one here is never used.
+    pub fn max_received_hlc(&self) -> Option<Hlc> {
+        self.last_received_hlc
+            .values()
+            .copied()
+            .max()
+            .map(|(wall_ms, logical)| Hlc {
+                wall_ms,
+                logical,
+                device_id: String::new(),
+            })
     }
 
     /// Compute the effective Stage at HLC watermark `now`.
@@ -1393,15 +1415,34 @@ pub fn verify_sr(
     let sq_hash = sq.event_hash;
 
     // Build candidate list from state (same as the ordered list used at ratification open).
-    // For SR1, we re-derive the ordered candidate set from the stored candidates.
-    // If status_quo is not yet present, the poll hasn't reached Drafting/Ratification
-    // stage — the PollResult event is premature; reject with StatusQuoNotSynthesized.
+    // ZEB-850 (Task 2 completion): status_quo is synthesized on demand and never
+    // persisted into `candidates`, so mirror the apply-time locals
+    // (`Tier3PollState::apply_event`, community_voting_tier3.rs:742-743) and include
+    // it before ranking — otherwise `drafting_advancers` returns None and this
+    // verifier rejects every legitimate peer kd=rs. Prematurity is already caught
+    // by the R1 close-applied check above.
     let primary_size = poll_state.meta.config.sortition_size as usize;
-    let advancers = drafting_advancers(&poll_state.candidates, primary_size, sq_hash)
+    let mut all_candidates = poll_state.candidates.clone();
+    all_candidates.push(sq);
+    let advancers = drafting_advancers(&all_candidates, primary_size, sq_hash)
         .ok_or(VerifyError::StatusQuoNotSynthesized)?;
     let ordered_candidates = ratification_candidates_ordering(&advancers, sq_hash);
 
-    let recomputed = tally_star(&ordered_candidates, &poll_state.ratification_ballots);
+    // ZEB-850 (Task 2 completion): recompute the result the SAME way the engine
+    // produces it, per privacy mode. se-mode is a threshold-decrypted tally
+    // (`recover_secret_tally`, mirroring `try_finalize_secret_tally`), NOT a
+    // plaintext STAR tally — `tally_star` skips se-mode ciphertext ballots and
+    // would return an all-zero result, so verify_sr would reject every legitimate
+    // peer se-mode kd=rs. `recover_secret_tally` is deterministic across replicas
+    // (Lagrange invariance), so this is a real authz check, not a weakening:
+    // a forged result recovers to a different tally → TallyMismatch. `None`
+    // (fewer than `threshold` shares applied) means this node cannot yet confirm
+    // the claim → fail-closed.
+    let recomputed = match poll_state.meta.config.privacy_mode.as_str() {
+        "se" => recover_secret_tally(poll_state, &ordered_candidates)
+            .ok_or(VerifyError::TallyMismatch)?,
+        _ => tally_star(&ordered_candidates, &poll_state.ratification_ballots),
+    };
 
     if recomputed != payload.result {
         return Err(VerifyError::TallyMismatch);
@@ -1439,12 +1480,18 @@ pub fn verify_ratification_ballot(
         decode_payload(&event.payload).map_err(VerifyError::PayloadDecode)?;
 
     // Compute the ratification candidate count from state.
-    // If status_quo is not yet present, the poll hasn't reached Drafting/Ratification
-    // stage — a RatificationBallot arriving now is premature.
+    // ZEB-850 (Task 2 completion): status_quo is synthesized on demand and never
+    // persisted into `candidates`, so mirror the apply-time locals
+    // (`Tier3PollState::apply_event`, community_voting_tier3.rs:742-743) and include
+    // it before ranking — otherwise `drafting_advancers` returns None and this
+    // verifier rejects every legitimate peer kd=rb. Prematurity is already caught
+    // by the B2 Ratification-stage check above.
     let sq = synthesize_status_quo(&poll_state.meta.poll_id);
     let sq_hash = sq.event_hash;
     let primary_size = poll_state.meta.config.sortition_size as usize;
-    let advancers = drafting_advancers(&poll_state.candidates, primary_size, sq_hash)
+    let mut all_candidates = poll_state.candidates.clone();
+    all_candidates.push(sq);
+    let advancers = drafting_advancers(&all_candidates, primary_size, sq_hash)
         .ok_or(VerifyError::StatusQuoNotSynthesized)?;
     let expected_candidate_count = advancers.len();
 
@@ -3777,19 +3824,23 @@ mod tests {
 
     // ── Cluster A regression tests ────────────────────────────────────────────
 
-    // A1: verify_sr on a Stage 2 (Deliberation) poll with no status_quo synthesized
-    //     must NOT panic — must return StatusQuoNotSynthesized.
+    // A1: verify_sr on a candidate-less poll (kd=ss + kd=cl applied, no kd=dc) must
+    //     NOT panic. ZEB-850 Task 5: status_quo is now ALWAYS synthesized into the
+    //     ranking set (verify_sr mirrors the engine's apply-time locals), so the
+    //     poll is never "status_quo not synthesized" — the ratification set is the
+    //     degenerate [status_quo]. The claimed result here (a 2-finalist
+    //     star_result()) cannot match the recompute over [status_quo] with zero
+    //     ballots, so verify_sr correctly rejects with TallyMismatch.
     #[test]
-    fn verify_sr_on_stage_2_poll_rejects_with_status_quo_not_synthesized() {
+    fn verify_sr_candidateless_poll_result_mismatch_rejected_tally_mismatch() {
         // Poll in Stage::Deliberation (sortition done, dw not elapsed).
-        // status_quo has NOT been synthesized into candidates yet.
         let mut poll = new_poll(0); // create at 0, dw=10s, fw=10s
         poll.apply_event(&ss_event(10, vec![addr(1), addr(2), addr(3)], vec![]))
             .expect("ss");
-        // Apply kd=cl so NotInClosedStage is bypassed (we want to hit StatusQuoNotSynthesized).
+        // Apply kd=cl so the R1 close-applied check is satisfied.
         let cl_ev = make_event(PollEventKindCode::PollClose, 5000, addr(0xff));
         poll.apply_event(&cl_ev).expect("cl");
-        // No status_quo in candidates — poll hasn't reached Drafting yet.
+        // No kd=dc applied — candidates empty; ranking set is just [status_quo].
         assert!(poll.candidates.is_empty());
 
         let payload = Tier3PollResultPayload {
@@ -3802,32 +3853,35 @@ mod tests {
             addr(0xfe),
             encode(&payload),
         );
-        // Must not panic; must return StatusQuoNotSynthesized.
+        // No panic; the fabricated result != the recompute over [status_quo]
+        // (zero ballots) → TallyMismatch.
         let result = verify_sr(&ev, &poll);
         assert_eq!(
             result,
-            Err(VerifyError::StatusQuoNotSynthesized),
-            "expected StatusQuoNotSynthesized, got {result:?}"
+            Err(VerifyError::TallyMismatch),
+            "expected TallyMismatch, got {result:?}"
         );
     }
 
-    // A2: verify_ratification_ballot on a Stage 1 (Sortition) poll with no status_quo
-    //     must NOT panic — must return StatusQuoNotSynthesized.
+    // A2: verify_ratification_ballot on a candidate-less poll (no kd=dc) in the
+    //     Ratification window must NOT panic. ZEB-850 Task 5: status_quo is now
+    //     always synthesized, so the degenerate ratification set is [status_quo] =
+    //     1 candidate. A ballot carrying 2 scores is legitimately length-mismatched
+    //     against that single-candidate set → BallotLengthMismatch.
     #[test]
-    fn verify_ratification_ballot_on_stage_1_poll_rejects_with_status_quo_not_synthesized() {
-        // Poll in Stage::Ratification time window, but status_quo NOT synthesized.
+    fn verify_ratification_ballot_candidateless_ratification_poll_rejects_length_mismatch() {
+        // Poll in the Ratification time window, but no kd=dc → candidates empty.
         let mut meta = meta_at(0);
         meta.config.sortition_size = 3;
         let mut poll = Tier3PollState::new_from_create(meta, electorate(20));
         poll.apply_event(&ss_event(10, vec![addr(1), addr(2), addr(3)], vec![]))
             .expect("ss");
         // Wall_ms=25000 → past dw+fw threshold (20000) → Ratification stage.
-        // But no candidates / status_quo synthesized.
         assert!(poll.candidates.is_empty());
 
         let rb_payload = RatificationBallotPayload {
             poll_id: poll_id(),
-            scores: Some(vec![3, 1]), // 2 scores — but no status_quo yet
+            scores: Some(vec![3, 1]), // 2 scores, but the degenerate set is [status_quo] = 1
             ciphertexts_scores: None,
             ciphertexts_indicators: None,
             proof: None,
@@ -3838,12 +3892,17 @@ mod tests {
             addr(5), // in electorate
             encode(&rb_payload),
         );
-        // Must not panic; must return StatusQuoNotSynthesized.
+        // No panic; 2 scores vs the 1-candidate [status_quo] set → length mismatch.
         let result = verify_ratification_ballot(&ev, &poll);
         assert_eq!(
             result,
-            Err(VerifyError::StatusQuoNotSynthesized),
-            "expected StatusQuoNotSynthesized, got {result:?}"
+            Err(VerifyError::BallotInvalid(
+                ValidateError::BallotLengthMismatch {
+                    scores: 2,
+                    expected: 1,
+                }
+            )),
+            "expected BallotLengthMismatch (2 vs 1), got {result:?}"
         );
     }
 
@@ -4500,7 +4559,7 @@ mod tests {
         );
         // But last_received_hlc DID advance — the guard sees the late event.
         assert_eq!(
-            poll.last_received_hlc.as_ref().unwrap().wall_ms,
+            poll.max_received_hlc().unwrap().wall_ms,
             15_000,
             "drop advanced received watermark (guard)"
         );
@@ -4513,6 +4572,124 @@ mod tests {
             .apply_event(&earlier_ev)
             .expect_err("guard must reject earlier-HLC delivery");
         assert!(matches!(err, ApplyError::HlcNotMonotonic));
+    }
+
+    // ZEB-850 T-VOTE-LANE: a far-future stamp on ONE (actor, device) lane must
+    // not freeze another lane's honest events. Under the OLD single global
+    // watermark, device A's hour-in-the-future ds raised the lone watermark and
+    // every later honest event from device B was rejected HlcNotMonotonic — the
+    // GRIEF-LOCKOUT. Per-lane watermarks isolate the two.
+    #[test]
+    fn future_event_on_one_lane_does_not_stall_another_lane() {
+        let mut poll = build_poll_in_deliberation_stage();
+
+        // Device A (actor addr(1)): stamps an hour into the future. Past the 10s
+        // deliberation window, so it silently drops — but still advances A's lane.
+        let far_future = 3_600_000;
+        let a_ev = ds_event_with_text(far_future, addr(1), "from the future");
+        poll.apply_event(&a_ev)
+            .expect("A dispatch is Ok (silent drop)");
+
+        // Device B (actor addr(2)): two honest statements at now / now+1. Under
+        // the OLD global watermark the first B apply would be HlcNotMonotonic
+        // (100 < 3_600_000); per-lane, B's lane is untouched by A's future stamp.
+        let b1 = ds_event_with_text(100, addr(2), "honest one");
+        poll.apply_event(&b1)
+            .expect("B@now must apply — A's future stamp is on a different lane");
+        let b2 = ds_event_with_text(101, addr(2), "honest two");
+        poll.apply_event(&b2)
+            .expect("B@now+1 must apply — B's own lane advances monotonically");
+
+        // Both B statements materialized (proves accept, not merely Ok).
+        assert_eq!(
+            poll.deliberation.statements_per_author[&addr(2)],
+            2,
+            "both honest B statements must be accepted"
+        );
+    }
+
+    // ZEB-850 T-VOTE-LANE (CodeRabbit): the receive-watermark lane key is the
+    // FULL `(OwnerAddr, device_id)` tuple, not just the actor. The same member
+    // on two devices must occupy two lanes — a future stamp from device "dev-a"
+    // must not stall an honest event from the SAME actor's device "dev-b". If
+    // the key collapsed to actor-only, dev-a's future stamp would advance the
+    // shared lane and dev-b's now-event would be rejected HlcNotMonotonic.
+    #[test]
+    fn future_event_on_one_device_does_not_stall_same_actor_other_device() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let author = addr(1); // in the mini-public primary set
+
+        // Device "dev-a": an hour into the future → silent drop (past the 10s
+        // deliberation window), but advances the (author, "dev-a") lane.
+        let mut a_ev = ds_event_with_text(3_600_000, author, "dev-a from the future");
+        a_ev.hlc.device_id = "dev-a".into();
+        poll.apply_event(&a_ev)
+            .expect("dev-a dispatch is Ok (silent drop)");
+
+        // Device "dev-b" (SAME actor): honest statement at wall=100. Its lane
+        // (author, "dev-b") is untouched by dev-a's future stamp, so it applies.
+        let mut b_ev = ds_event_with_text(100, author, "dev-b honest");
+        b_ev.hlc.device_id = "dev-b".into();
+        poll.apply_event(&b_ev)
+            .expect("dev-b@now must apply — a different device is a different lane");
+
+        // Exactly the dev-b statement materialized (dev-a's dropped).
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 1,
+            "only the dev-b statement is accepted; the future dev-a stamp dropped"
+        );
+        // The dev-a lane watermark did advance (max over lanes reflects it),
+        // so a within-lane earlier event on dev-a would still be rejected.
+        assert_eq!(
+            poll.max_received_hlc().unwrap().wall_ms,
+            3_600_000,
+            "dev-a lane watermark advanced on its silent drop"
+        );
+    }
+
+    // ZEB-850 / ZEB-320 / Qodo #154: per-lane must NOT weaken the within-lane
+    // guard. On a single (actor, device) lane, an earlier-HLC event delivered
+    // after a later event that silently dropped must still be rejected — the
+    // dropped event advanced the lane watermark. Neutralizing the guard (or
+    // reading last_hlc, which drops don't advance) lets the earlier event slip
+    // through and this test fails.
+    #[test]
+    fn within_lane_earlier_hlc_still_rejected_after_dropped_event() {
+        let mut poll = build_poll_in_deliberation_stage();
+
+        // Same lane (addr(1), "test"). A later ds that drops (past the 10s
+        // deliberation window) but still advances the lane watermark to 15_000.
+        let later = ds_event_with_text(15_000, addr(1), "later, dropped");
+        poll.apply_event(&later).expect("Ok (silent drop)");
+
+        // An earlier-HLC ds on the SAME lane must be rejected.
+        let earlier = ds_event_with_text(100, addr(1), "earlier");
+        let err = poll
+            .apply_event(&earlier)
+            .expect_err("earlier-HLC on same lane must be rejected");
+        assert!(matches!(err, ApplyError::HlcNotMonotonic));
+    }
+
+    // ZEB-850: max_received_hlc() is the max (wall_ms, logical) across ALL
+    // lanes, independent of BTreeMap lane order. Here the HIGHER watermark sits
+    // on the lower-sorted lane (addr(1)), so a naive "last lane wins" would
+    // return 100 — the max-over-lanes contract pins 200. The kd=rs mint floor
+    // depends on this max.
+    #[test]
+    fn max_received_hlc_is_max_over_lanes() {
+        let mut poll = build_poll_in_deliberation_stage();
+
+        // Lane (addr(1), "test") @ wall=200; lane (addr(2), "test") @ wall=100.
+        poll.apply_event(&ds_event_with_text(200, addr(1), "high"))
+            .expect("apply high");
+        poll.apply_event(&ds_event_with_text(100, addr(2), "low"))
+            .expect("apply low");
+
+        assert_eq!(
+            poll.max_received_hlc().unwrap().wall_ms,
+            200,
+            "max_received_hlc must be the max wall_ms across all lanes"
+        );
     }
 
     // CodeRabbit PR #154 bot-pass-1 nitpick: cover the remaining gated drop
@@ -4882,7 +5059,7 @@ mod tests {
             "drop must not advance last_hlc (ZEB-320)"
         );
         assert_eq!(
-            state.last_received_hlc.as_ref().map(|h| h.wall_ms),
+            state.max_received_hlc().map(|h| h.wall_ms),
             Some(RATIFICATION_OPEN_MS),
             "last_received_hlc must advance on every dispatch"
         );
