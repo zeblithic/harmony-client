@@ -40,11 +40,24 @@ pub struct RelayHoldEntry {
     pub pulled_by: BTreeSet<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RelayHoldDoc {
     #[serde(rename = "en")]
     pub entries: BTreeMap<String, RelayHoldEntry>,
+    /// ZEB-851: LOCAL per-replica first-observation clock (ms) keyed by
+    /// entry key, driving TTL GC instead of the untrusted peer `held_at`.
+    /// Never serialized (canonical wire bytes unchanged) and excluded from
+    /// `PartialEq` below, so it never affects convergence or equality.
+    #[serde(skip)]
+    first_observed_ms: BTreeMap<String, u64>,
 }
+
+impl PartialEq for RelayHoldDoc {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+impl Eq for RelayHoldDoc {}
 
 // Manual CanonicalPayload registrations (mirrors dm_inbox_crdt.rs).
 impl CanonicalPayloadSealed for RelayHoldEntry {}
@@ -147,9 +160,13 @@ impl RelayHoldDoc {
     /// `covered_at_start` set is snapshotted before the retain loop, and
     /// `retain` only removes entries whose key is IN that snapshot.
     ///
-    /// **TTL** — `held_at.wall_ms + RELAY_HOLD_TTL_MS < now_ms` (strict
-    /// less-than, same boundary as `dm_inbox_ingest`). TTL eviction is
-    /// immediate — no deferral.
+    /// **TTL** — `first_observed_ms[key] + RELAY_HOLD_TTL_MS < now_ms` (strict
+    /// less-than, keyed off this replica's OWN local receipt time rather than
+    /// the peer-supplied `held_at`, so a backdated stamp cannot pre-expire a
+    /// live hold). `first_observed_ms` is lazily stamped on the first sweep
+    /// that observes each entry and is process-local (never persisted or
+    /// replicated) — a restart clears it, restarting the TTL from the first
+    /// post-restart sweep.
     ///
     /// Returns `true` iff the doc changed (some entry was removed).
     pub fn gc(&mut self, now_ms: u64) -> bool {
@@ -163,11 +180,24 @@ impl RelayHoldDoc {
             .map(|(k, _)| k.clone())
             .collect();
 
+        // ZEB-851: expire from this replica's OWN first observation, not the
+        // peer-supplied `held_at` (a backdated stamp must not pre-expire a
+        // live hold). Lazy-stamp on the first sweep that sees each entry —
+        // consistent with the churn-tolerant / resurrection-by-merge model.
+        for key in self.entries.keys().cloned().collect::<Vec<_>>() {
+            self.first_observed_ms.entry(key).or_insert(now_ms);
+        }
+
         let before = self.entries.len();
-        self.entries.retain(|key, e| {
-            let ttl_expired = e.held_at.wall_ms.saturating_add(RELAY_HOLD_TTL_MS) < now_ms;
+        let first_observed = &self.first_observed_ms;
+        self.entries.retain(|key, _e| {
+            let observed = first_observed.get(key).copied().unwrap_or(now_ms);
+            let ttl_expired = observed.saturating_add(RELAY_HOLD_TTL_MS) < now_ms;
             !(ttl_expired || covered_at_start.contains(key))
         });
+        // Prune the side-map for removed keys (bounded with `entries`).
+        let live: BTreeSet<String> = self.entries.keys().cloned().collect();
+        self.first_observed_ms.retain(|k, _| live.contains(k));
         self.entries.len() != before
     }
 }
@@ -508,31 +538,77 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn gc_removes_ttl_expired_entry_immediately() {
+    fn gc_uses_local_receipt_not_backdated_held_at() {
+        let mut doc = RelayHoldDoc::default();
+        let key = RelayHoldDoc::key(&[1u8; 16], &[2u8; 32]);
+        // A BACKDATED held_at (far in the past): under the old
+        // `held_at.wall_ms + TTL < now` rule this is already expired.
+        doc.entries.insert(
+            key.clone(),
+            RelayHoldEntry {
+                recipient_owner: [1u8; 16],
+                sender_owner: [3u8; 16],
+                community_id: space(7),
+                sealed_blob: vec![9],
+                held_at: hlc(1, "relay"),
+                held_by: "relay".into(),
+                pulled_by: BTreeSet::new(),
+            },
+        );
+        let now = RELAY_HOLD_TTL_MS + 1_000_000;
+        // First sweep OBSERVES the entry locally at `now` → must NOT expire it.
+        assert!(!doc.gc(now), "no entry removed on first observation");
+        assert!(
+            doc.entries.contains_key(&key),
+            "a backdated held_at must not pre-expire a freshly-observed hold"
+        );
+        // A later sweep past first_observed + TTL DOES expire it.
+        assert!(doc.gc(now + RELAY_HOLD_TTL_MS + 1));
+        assert!(
+            !doc.entries.contains_key(&key),
+            "expired from local receipt"
+        );
+    }
+
+    #[test]
+    fn gc_removes_ttl_expired_entry_after_local_receipt_ttl() {
+        // ZEB-851: TTL now keys off local first-observation, not the
+        // peer-supplied (and possibly backdated) `held_at` — so eviction
+        // takes a first observing sweep plus a later sweep past the TTL,
+        // rather than being immediate on the first sweep.
         let now_ms: u64 = RELAY_HOLD_TTL_MS + 1_000_000;
-        // TTL-expired: held_at.wall_ms + RELAY_HOLD_TTL_MS < now_ms (strict).
         let mut doc = RelayHoldDoc::default();
         doc.entries.insert(
             key_rr(1, 1),
             entry([1; 16], [2; 16], space(0xCC), hlc(500, "R"), "r", &[]),
         );
         let changed = doc.gc(now_ms);
-        assert!(changed, "TTL eviction must return true");
+        assert!(!changed, "first observation must not immediately expire");
+        assert_eq!(doc.entries.len(), 1);
+
+        let changed = doc.gc(now_ms + RELAY_HOLD_TTL_MS + 1);
+        assert!(changed, "TTL eviction must return true past the deadline");
         assert!(doc.entries.is_empty(), "expired entry must be removed");
     }
 
     #[test]
     fn gc_ttl_boundary_is_strict() {
-        // Exact boundary: held_at.wall_ms + RELAY_HOLD_TTL_MS == now_ms → NOT expired.
-        let now_ms: u64 = 1_000_000 + RELAY_HOLD_TTL_MS;
+        // Exact boundary: first_observed_ms + RELAY_HOLD_TTL_MS == now_ms → NOT expired.
         let mut doc = RelayHoldDoc::default();
         doc.entries.insert(
             key_rr(1, 1),
             entry([1; 16], [2; 16], space(0xCC), hlc(1_000_000, "R"), "r", &[]),
         );
-        let changed = doc.gc(now_ms);
+        let observed_at: u64 = 1_000_000;
+        doc.gc(observed_at); // stamps first_observed_ms[key] = observed_at
+
+        let changed = doc.gc(observed_at + RELAY_HOLD_TTL_MS);
         assert!(!changed, "boundary is NOT expired (strict <)");
         assert_eq!(doc.entries.len(), 1);
+
+        let changed = doc.gc(observed_at + RELAY_HOLD_TTL_MS + 1);
+        assert!(changed, "past-boundary IS expired");
+        assert!(doc.entries.is_empty());
     }
 
     #[test]
@@ -635,10 +711,17 @@ mod tests {
         let now_ms: u64 = RELAY_HOLD_TTL_MS + 1_000_000;
 
         let mut doc = RelayHoldDoc::default();
-        // TTL-expired → removed.
+        // TTL-target: first-observed on an EARLIER sweep (ZEB-851 keys TTL
+        // off local receipt, so it must be stamped before `now_ms` to have
+        // any chance of expiring by the final sweep below).
         doc.entries.insert(
             key_rr(1, 1),
             entry([1; 16], [2; 16], space(0xCC), hlc(500, "R"), "r", &[]),
+        );
+        let pre_changed = doc.gc(0); // stamps first_observed_ms[key_rr(1,1)] = 0
+        assert!(
+            !pre_changed,
+            "pre-stamp sweep must not remove a fresh entry"
         );
         // Covered at start → removed.
         doc.entries.insert(
@@ -664,7 +747,9 @@ mod tests {
                 &[],
             ),
         );
-        // Boundary (not expired, uncovered) → retained.
+        // Freshly observed on this sweep, uncovered → retained. (`held_at` no
+        // longer drives TTL post-ZEB-851, so this is a second fresh-uncovered
+        // case rather than a `held_at` boundary case.)
         doc.entries.insert(
             key_rr(4, 4),
             entry(
@@ -679,7 +764,10 @@ mod tests {
 
         let changed = doc.gc(now_ms);
         assert!(changed);
-        assert!(!doc.entries.contains_key(&key_rr(1, 1)), "TTL → removed");
+        assert!(
+            !doc.entries.contains_key(&key_rr(1, 1)),
+            "TTL-from-earlier-observation → removed"
+        );
         assert!(
             !doc.entries.contains_key(&key_rr(2, 2)),
             "covered-at-start → removed"
@@ -690,7 +778,7 @@ mod tests {
         );
         assert!(
             doc.entries.contains_key(&key_rr(4, 4)),
-            "boundary → retained"
+            "fresh uncovered → retained"
         );
     }
 
