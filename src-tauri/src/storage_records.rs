@@ -80,12 +80,20 @@ impl RecordOutcome {
 pub struct PledgeListRecord {
     pub pledges: Vec<PledgeEntry>,
     pub updated_at: u64,
+    /// Local receipt clock (ms) — eviction ordering only, no trust meaning
+    /// (mirrors `HostingReportRecord::received_at_ms` and
+    /// `StorageSignerPin::pinned_at_ms`). Never the peer `updated_at`.
+    pub received_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupSetRecord {
     pub entries: Vec<BackupEntry>,
     pub updated_at: u64,
+    /// Local receipt clock (ms) — eviction ordering only, no trust meaning
+    /// (mirrors `HostingReportRecord::received_at_ms` and
+    /// `StorageSignerPin::pinned_at_ms`). Never the peer `updated_at`.
+    pub received_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +213,10 @@ impl StorageRecordStore {
                 PledgeListRecord {
                     pledges: row.pledges,
                     updated_at: row.updated_at,
+                    // A record that survived to disk is "most-established";
+                    // 0 is older than any live now_ms, so a post-restart
+                    // flood is still the newest and evicts itself first.
+                    received_at_ms: 0,
                 },
             );
         }
@@ -221,6 +233,10 @@ impl StorageRecordStore {
                 BackupSetRecord {
                     entries: row.entries,
                     updated_at: row.updated_at,
+                    // A record that survived to disk is "most-established";
+                    // 0 is older than any live now_ms, so a post-restart
+                    // flood is still the newest and evicts itself first.
+                    received_at_ms: 0,
                 },
             );
         }
@@ -244,8 +260,8 @@ impl StorageRecordStore {
                 },
             );
         }
-        evict_stalest(&mut store.pledge_lists, |r| r.updated_at);
-        evict_stalest(&mut store.backup_sets, |r| r.updated_at);
+        evict_overflow(&mut store.pledge_lists, |r| r.received_at_ms);
+        evict_overflow(&mut store.backup_sets, |r| r.received_at_ms);
         evict_pins(
             &mut store.signer_pins,
             &store.pledge_lists,
@@ -414,11 +430,12 @@ impl StorageRecordStore {
             PledgeListRecord {
                 pledges: list.pledges,
                 updated_at: list.updated_at,
+                received_at_ms: now_ms,
             },
             |r| r.updated_at,
         );
         if outcome.changed() {
-            evict_stalest(&mut self.pledge_lists, |r| r.updated_at);
+            evict_overflow(&mut self.pledge_lists, |r| r.received_at_ms);
         }
         if pin_changed {
             evict_pins(
@@ -485,11 +502,12 @@ impl StorageRecordStore {
             BackupSetRecord {
                 entries: set.entries,
                 updated_at: set.updated_at,
+                received_at_ms: now_ms,
             },
             |r| r.updated_at,
         );
         if outcome.changed() {
-            evict_stalest(&mut self.backup_sets, |r| r.updated_at);
+            evict_overflow(&mut self.backup_sets, |r| r.received_at_ms);
         }
         if pin_changed {
             evict_pins(
@@ -556,7 +574,7 @@ impl StorageRecordStore {
             |r| r.updated_at,
         );
         if outcome.changed() {
-            evict_stalest(&mut self.hosting_reports, |r| r.updated_at);
+            evict_overflow(&mut self.hosting_reports, |r| r.received_at_ms);
             // Hosting reports are in-memory only — no save() for them…
         }
         if pin_changed {
@@ -767,13 +785,20 @@ fn evict_pins(
     }
 }
 
-/// Bounded-store overflow: evict the stalest record (min `updated_at`,
-/// ties broken by owner) until within [`MAX_TRACKED_OWNERS`].
-fn evict_stalest<R>(map: &mut HashMap<String, R>, updated_at: impl Fn(&R) -> u64) {
+/// Bounded-store overflow: evict the record with the NEWEST local
+/// `received_at_ms` first (owner tiebreak) until within
+/// [`MAX_TRACKED_OWNERS`]. Newest-first makes a flood self-limiting,
+/// mirroring [`evict_pins`]: an attacker minting throwaway addresses and
+/// publishing far-future `updated_at` evicts their OWN just-received rows,
+/// while an established honest owner's row (older receipt) is never the
+/// newest and survives. Keying on the LOCAL receipt clock — never the
+/// peer-supplied `updated_at` — is what closes the ZEB-851 flood-evict
+/// vector: a peer stamp can no longer choose the eviction victim.
+fn evict_overflow<R>(map: &mut HashMap<String, R>, received_at_ms: impl Fn(&R) -> u64) {
     while map.len() > MAX_TRACKED_OWNERS {
         let victim = map
             .iter()
-            .map(|(owner, r)| (updated_at(r), owner.clone()))
+            .map(|(owner, r)| (std::cmp::Reverse(received_at_ms(r)), owner.clone()))
             .min()
             .map(|(_, owner)| owner);
         match victim {
@@ -1222,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_cap_evicts_stalest() {
+    fn owner_cap_evicts_overflow_newest_received_first() {
         let mut store = StorageRecordStore::new(None);
         // Directly exercise the bounded-map helper: driving 1025 signed
         // ingests would mostly re-test signing. Ingest→evict wiring is
@@ -1232,19 +1257,20 @@ mod tests {
                 format!("owner-{i:04}"),
                 PledgeListRecord {
                     pledges: vec![],
-                    updated_at: i as u64 + 1,
+                    updated_at: 1,
+                    received_at_ms: i as u64 + 1,
                 },
             );
         }
-        evict_stalest(&mut store.pledge_lists, |r| r.updated_at);
+        evict_overflow(&mut store.pledge_lists, |r| r.received_at_ms);
         assert_eq!(store.pledge_lists.len(), MAX_TRACKED_OWNERS);
         assert!(
-            store.pledge_list("owner-0000").is_none(),
-            "stalest (min updated_at) evicted first"
+            store
+                .pledge_list(&format!("owner-{MAX_TRACKED_OWNERS:04}"))
+                .is_none(),
+            "newest (max received_at_ms) evicted first"
         );
-        assert!(store
-            .pledge_list(&format!("owner-{MAX_TRACKED_OWNERS:04}"))
-            .is_some());
+        assert!(store.pledge_list("owner-0000").is_some());
     }
 
     #[test]
@@ -1545,6 +1571,7 @@ mod tests {
             PledgeListRecord {
                 pledges: vec![],
                 updated_at: 1,
+                received_at_ms: 0,
             },
         );
         pins.insert("established-ratchet".into(), pin(5));
@@ -1564,6 +1591,65 @@ mod tests {
         assert!(
             !pins.contains_key(&format!("flood-{:05}", MAX_SIGNER_PINS - 1)),
             "the flood's newest pins are the ones evicted"
+        );
+    }
+
+    #[test]
+    fn evict_overflow_is_flood_proof_newest_received_first() {
+        // MAX_TRACKED_OWNERS honest rows, all received long ago.
+        let mut map: HashMap<String, PledgeListRecord> = HashMap::new();
+        for i in 0..MAX_TRACKED_OWNERS {
+            map.insert(
+                format!("honest-{i:04}"),
+                PledgeListRecord {
+                    pledges: vec![],
+                    updated_at: 1,
+                    received_at_ms: 1,
+                },
+            );
+        }
+        // A flood of throwaway owners: far-FUTURE peer updated_at, but freshly
+        // received (received_at_ms = the newest). Under the OLD min(updated_at)
+        // evictor these never lose; the honest rows were evicted instead.
+        for i in 0..16 {
+            map.insert(
+                format!("flood-{i:04}"),
+                PledgeListRecord {
+                    pledges: vec![],
+                    updated_at: u64::MAX,
+                    received_at_ms: 10_000,
+                },
+            );
+        }
+        evict_overflow(&mut map, |r| r.received_at_ms);
+        assert_eq!(map.len(), MAX_TRACKED_OWNERS);
+        for i in 0..MAX_TRACKED_OWNERS {
+            assert!(
+                map.contains_key(&format!("honest-{i:04}")),
+                "honest-{i:04} must survive the flood"
+            );
+        }
+        assert!(
+            !map.keys().any(|k| k.starts_with("flood-")),
+            "every flood row evicted itself"
+        );
+    }
+
+    #[test]
+    fn ingest_stamps_local_received_clock_not_peer_updated_at() {
+        let mut store = StorageRecordStore::new(None);
+        let id = test_identity();
+        let owner = addr_of(&id);
+        // Peer claims a far-future updated_at; local receipt is now_ms = 5_000.
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("x", 1)], u64::MAX);
+        assert_eq!(
+            store.on_pledge_list_sample(&topic, &bytes, &rvk(), 5_000),
+            RecordOutcome::Inserted
+        );
+        assert_eq!(
+            store.pledge_list(&owner).unwrap().received_at_ms,
+            5_000,
+            "received_at_ms is the LOCAL receipt clock, independent of the peer updated_at"
         );
     }
 
