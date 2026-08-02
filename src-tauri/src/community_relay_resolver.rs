@@ -30,9 +30,28 @@ impl CommunityRelayResolver {
         &self,
         community_id: SpaceId,
         advertiser: OwnerAddr,
-        payload: CommunityRelayAnnouncePayload,
+        mut payload: CommunityRelayAnnouncePayload,
         _hlc: Hlc,
     ) {
+        // ZEB-852 D4 (defense-in-depth, "B6"): clamp the stored `ad_at` down to
+        // the receiver's control-tier forward-skew ceiling (`now + 5 min`) before
+        // LWW/insert. The sole production ingest caller
+        // (`address_book_sync::ingest_verified_row`) already clamps, so this is a
+        // belt-and-braces guard for any other caller: an unclamped far-future
+        // `ad_at` would win LWW and squat the advertiser's slot until the wall
+        // clock caught up. Mirrors `ReachabilityResolver::update_with_source` —
+        // this resolver is a terminal, in-memory, non-replicated projection, so
+        // clamping is receiver-independent in effect (every peer re-clamps at its
+        // own ingest), which is why we CLAMP rather than reject. Clock-unreadable
+        // is fail-open: `receiver_now_ms() == None` yields a `u64::MAX` ceiling
+        // ⇒ apply-all (no clamp), never a downward rewrite of honest state.
+        let now = crate::clock_trust::receiver_now_ms().unwrap_or(u64::MAX);
+        payload.ad_at = crate::clock_trust::clamp_future(
+            payload.ad_at,
+            now,
+            crate::clock_trust::MAX_FORWARD_SKEW_MS,
+        );
+
         let mut g = self.inner.lock().unwrap();
         let k = (community_id, advertiser);
         match g.get(&k) {
@@ -62,7 +81,16 @@ impl CommunityRelayResolver {
         let mut fresh: Vec<(u64, CommunityRelayEntry)> = g
             .iter()
             .filter(|((c, _), _)| c == community_id)
-            .filter_map(|(_, p)| fresh_relay_entry(p, now_ms).map(|e| (p.ad_at, e)))
+            // ZEB-852 D4: rank on the CLAMPED key `min(ad_at, now_ms)`, not the
+            // raw `ad_at`. `fresh_relay_entry` admits stamps up to `now + 15 min`,
+            // so without this a clique of four ceiling-stamped ads would sort
+            // above every honest advertiser at `now` and fill all four slots,
+            // truncating the honest ones out. Clamping the sort key to `now`
+            // collapses any forward advantage to zero (tier-agnostic: `now`
+            // exactly), while leaving in-range recency ordering intact. This only
+            // reorders — it never drops an entry (freshness stays in the filter),
+            // and it inherits the caller's `now_ms` seam (fail-open).
+            .filter_map(|(_, p)| fresh_relay_entry(p, now_ms).map(|e| (p.ad_at.min(now_ms), e)))
             .collect();
         fresh.sort_by(|a, b| b.0.cmp(&a.0));
         fresh.truncate(COMMUNITY_RELAY_ADVERTISERS_MAX);
@@ -210,6 +238,53 @@ mod tests {
             !got.contains(&other_addr),
             "another community's advertiser must be excluded"
         );
+    }
+
+    #[test]
+    fn relay_slots_not_censored_by_future_advertisers() {
+        // ZEB-852 D4: four advertisers stamped at the clamp ceiling try to fill
+        // every rendezvous slot and censor an honest advertiser refreshed at
+        // `now`. The read-side rank key is clamped to `min(ad_at, now)`, so a
+        // forward-dated stamp buys NO ranking advantage over `now`.
+        let max = crate::community_relay_announce::COMMUNITY_RELAY_ADVERTISERS_MAX;
+        let now = 1_700_000_000_000;
+        let ceiling = now + crate::clock_trust::MAX_FORWARD_SKEW_MS;
+
+        let r = CommunityRelayResolver::new();
+        let c = SpaceId([0xCC; 16]);
+        // Honest advertiser refreshed exactly at `now` (low addr so it is not the
+        // last BTreeMap key among the ties the clamp produces).
+        let honest = OwnerAddr([0x01; 16]);
+        r.update(c, honest, payload(0x01, now), hlc(now));
+        // Four future-dated advertisers at the ceiling — enough to fill all slots.
+        for i in 0..(max as u8) {
+            let a = OwnerAddr([0x10 + i; 16]);
+            r.update(c, a, payload(0x10 + i, ceiling), hlc(ceiling));
+        }
+
+        let got = r.relays_for_community(&c, now);
+        assert_eq!(got.len(), max, "returns a full slot set");
+        assert!(
+            got.iter().any(|e| e.relay_device_id == [0x01; 16]),
+            "honest advertiser at `now` must not be truncated out of the {max} \
+             slots by future-dated ceiling stamps",
+        );
+
+        // In-range ordering is preserved: among honest advertisers a fresher one
+        // still ranks ahead of a staler one (the clamp only collapses *forward*
+        // advantage, it does not flatten legitimate recency).
+        let r2 = CommunityRelayResolver::new();
+        let staler = OwnerAddr([0xA1; 16]);
+        let fresher = OwnerAddr([0xA2; 16]);
+        r2.update(c, staler, payload(0xA1, now - 100), hlc(now - 100));
+        r2.update(c, fresher, payload(0xA2, now - 50), hlc(now - 50));
+        let got2 = r2.relays_for_community(&c, now);
+        assert_eq!(got2.len(), 2);
+        assert_eq!(
+            got2[0].relay_device_id, [0xA2; 16],
+            "fresher honest advertiser ranks ahead of the staler one",
+        );
+        assert_eq!(got2[1].relay_device_id, [0xA1; 16]);
     }
 
     #[test]

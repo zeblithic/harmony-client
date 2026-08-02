@@ -412,12 +412,21 @@ impl ReachabilityResolver {
     ) {
         let key: ResolverKey = (actor, payload.iroh_node_id);
         let node_id = payload.iroh_node_id;
-        // ZEB-621 future-skew clamp: bound the announce time (and, for the
-        // SYNTHETIC pkarr HLC only, the HLC wall time) to `now + skew` so a
-        // future-dated record cannot permanently dominate the freshest dial view
-        // (`effective_announced_at_ms`) or same-source LWW (pkarr `hlc.wall_ms`)
-        // and block later correct records from installing. Durable-CRDT HLCs are
-        // authored by the owner's own device and are left untouched.
+        // ZEB-621 / ZEB-852 future-skew clamp: bound the announce time AND the HLC
+        // wall time to `now + skew` so a future-dated record cannot permanently
+        // dominate the freshest dial view (`effective_announced_at_ms`) or same-
+        // source LWW (`hlc.wall_ms`) and block later correct records from
+        // installing. Post-ZEB-815 the `DurableCrdt`/`FleetSibling` HLC is no longer
+        // owner-authored-and-trusted: it arrives peer-signed via the address book
+        // (`ingest_verified_row` feeds `DurableCrdt` a peer-signed `row.at`), so a
+        // hostile future `wall_ms` would win LWW and pin the durable slot for
+        // process life. All three sources are therefore clamped to the receiver's
+        // control-tier skew ceiling (`FUTURE_SKEW_TOLERANCE_MS ==
+        // clock_trust::MAX_FORWARD_SKEW_MS`). This resolver is a terminal, in-memory,
+        // non-replicated projection, so clamping is receiver-independent in effect —
+        // every peer re-clamps at its own ingest — which is why we clamp rather than
+        // reject. Clock-unreadable handling is inherited from `self.now_ms()`
+        // (fail-open, symmetric across all arms).
         let skew_ceiling = self.now_ms().saturating_add(FUTURE_SKEW_TOLERANCE_MS);
         let effective_announced_at_ms = payload.announced_at_ms.min(skew_ceiling);
         let hlc = match source {
@@ -425,7 +434,10 @@ impl ReachabilityResolver {
                 wall_ms: hlc.wall_ms.min(skew_ceiling),
                 ..hlc
             },
-            ReachabilitySource::DurableCrdt | ReachabilitySource::FleetSibling => hlc,
+            ReachabilitySource::DurableCrdt | ReachabilitySource::FleetSibling => Hlc {
+                wall_ms: hlc.wall_ms.min(skew_ceiling),
+                ..hlc
+            },
         };
         let next = ResolverEntry {
             payload,
@@ -1108,6 +1120,66 @@ mod tests {
         assert_eq!(got[0].1.announced_at_ms, T + 3_600_000);
         // ...but the effective (clamped) value is capped at now + 5 min.
         assert_eq!(got[0].2, T + crate::clock_trust::MAX_FORWARD_SKEW_MS);
+    }
+
+    /// ZEB-852 (RB): a future-dated `DurableCrdt` HLC must not permanently pin the
+    /// durable routing slot. Post-ZEB-815 the durable/sibling HLC arrives
+    /// peer-signed via the address book (`ingest_verified_row` feeds `DurableCrdt`
+    /// a peer-signed `row.at`), so a hostile peer can stamp `wall_ms = now + 1yr`
+    /// and — absent the insert-time clamp — win same-source LWW for process life,
+    /// locking out every honest later record. The clamp to the control-tier skew
+    /// ceiling (`now + MAX_FORWARD_SKEW_MS`) bounds that stamp so an honest
+    /// in-range record minted after the clock advances still overtakes it.
+    ///
+    /// Discrimination (both halves): the future HLC must NOT pin the slot over an
+    /// honest in-range record, AND an honest newer in-range record must win it.
+    #[test]
+    fn durable_future_hlc_is_clamped_so_later_honest_record_wins() {
+        const T0: u64 = 1_000_000_000_000; // fixed "now" at ingest of the hostile record
+        const ONE_YEAR_MS: u64 = 365 * 24 * 60 * 60 * 1000;
+        let r = ReachabilityResolver::new();
+        // Advance-able clock: the hostile record is clamped against T0, the honest
+        // record against the later T1 (mirrors real ingest — each peer re-clamps at
+        // its own "now").
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(T0));
+        {
+            let c = std::sync::Arc::clone(&clock);
+            r.set_clock(std::sync::Arc::new(move || {
+                c.load(std::sync::atomic::Ordering::SeqCst)
+            }));
+        }
+
+        let owner = OwnerAddr([7; 16]);
+        // Hostile peer-signed durable record stamped a year into the future. Without
+        // the clamp this raw HLC (T0 + 1yr) wins LWW and pins the slot forever.
+        r.update_with_source(
+            owner,
+            make_payload(1, 111_000),
+            make_hlc(T0 + ONE_YEAR_MS, 0, "attacker"),
+            ReachabilitySource::DurableCrdt,
+        );
+
+        // Clock advances an hour; the honest device re-announces in-range.
+        let t1 = T0 + 3_600_000;
+        clock.store(t1, std::sync::atomic::Ordering::SeqCst);
+        r.update_with_source(
+            owner,
+            make_payload(1, 222_000),
+            make_hlc(t1, 0, "honest"),
+            ReachabilitySource::DurableCrdt,
+        );
+
+        // Durable slot (butler / durable-preferred view) must now be the honest
+        // record: the hostile HLC was clamped to T0 + skew, which the honest T1
+        // overtakes. Without the clamp the durable slot stays pinned to the future
+        // record (announced 111_000) and this assertion fails.
+        let tagged = r.resolve_with_source(&owner);
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].1, ReachabilitySource::DurableCrdt);
+        assert_eq!(
+            tagged[0].0.announced_at_ms, 222_000,
+            "honest in-range durable record must win the slot; the future HLC must not pin it"
+        );
     }
 
     /// The dual-slot separation governs only cross-source collisions; same-source

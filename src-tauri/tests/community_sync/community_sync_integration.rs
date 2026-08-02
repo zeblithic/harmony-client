@@ -3511,6 +3511,250 @@ async fn addrbook_replaces_announce_events_end_to_end() {
     registry_b.shutdown_all().await.expect("shutdown b");
 }
 
+/// ZEB-852 ABK: `stamped_at_ms` sits OUTSIDE the signed preimage
+/// (`verify_inner_signature` covers `(payload, actor, at)` only), so a peer can
+/// re-seal a validly-signed row with any `stamped_at_ms` it likes. Before the
+/// fix, `upsert` merely clamped that value to `now + 5 min`, which STILL beat
+/// every honestly-stamped row and refreshed the TTL, letting an attacker keep a
+/// stale row alive and squat its book LWW slot against the member's own honest
+/// updates. The fix derives `stamped_at_ms` locally at PEER receipt inside
+/// `ingest_sealed_packet` (the sole peer path), discarding the wire value.
+///
+/// This drives the REAL peer pipeline — the same `ingest_sealed_packet` the
+/// live-record subscriber runs, membership gate and all — and asserts both
+/// halves: (1) the stored stamp is the receiver's receipt time, not the wire
+/// value's clamp; and (2) an honest update at a later receipt then WINS the LWW,
+/// which under the old clamp-only behavior would have been rejected as older.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_ingest_stamps_receipt_time_not_wire_value() {
+    use harmony_app::address_book_sync::{derive_addrbook_key, ingest_sealed_packet, seal_records};
+    use harmony_app::community_address_book::{
+        AddressBookEntry, AddressBookRow, CommunityAddressBook, UpsertOutcome,
+        ADDRBOOK_SKEW_TOLERANCE_MS,
+    };
+    use harmony_app::community_relay_resolver::CommunityRelayResolver;
+    use harmony_app::reachability_record::build_signed_payload_with_key;
+    use harmony_app::reachability_resolver::ReachabilityResolver;
+
+    let cas_tx = spawn_shared_cas();
+    let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+        cas_tx,
+        Duration::from_millis(2000),
+    ));
+
+    let community_id = SpaceId([9u8; 16]);
+    let mk = EpochKey::new([0x52; 32]);
+
+    let id_admin = mint_test_owner(0xc9);
+    let admin = id_admin.owner;
+    let admin_device = id_admin.device_key.verifying_key().to_bytes();
+
+    let id_b = mint_test_owner(0xd0);
+    let b_owner = id_b.owner;
+    let b_signing = signing_key_from(&id_b);
+
+    let mut resolver_map = std::collections::HashMap::new();
+    resolver_map.insert(admin, [0u8; 64]);
+    let resolver: Arc<dyn IdentityResolver> = Arc::new(StaticResolver { map: resolver_map });
+
+    let dir_b = tempfile::tempdir().expect("tempdir B");
+    let registry_b = Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+        adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor::new(),
+        device_id: "b-dev".into(),
+        content_store: Arc::clone(&cs),
+        identity_resolver: Arc::clone(&resolver),
+        identity_dir: dir_b.path().to_path_buf(),
+        debounce_ms: DEFAULT_DEBOUNCE_MS,
+        error_tx: None,
+        delta_tx: None,
+        self_owner: b_owner,
+        signing_key: Arc::clone(&b_signing),
+        crdt_state: None,
+        nav_emitter: None,
+        presence_resync_rx: None,
+    }));
+
+    let (b_pub_tx, _b_pub_rx) = mpsc::channel(8);
+    let (_b_sub_tx, b_sub_rx) = mpsc::channel(8);
+    registry_b
+        .spawn_engine_inner_now(
+            community_id,
+            mk.clone(),
+            admin,
+            false,
+            b_pub_tx,
+            b_sub_rx,
+            harmony_app::community_state_sync::CatchUpChannels::none(),
+        )
+        .await
+        .expect("spawn b");
+
+    // B's `beacon_signer_is_member` gate (inside `ingest_sealed_packet`) needs
+    // admin materialized as an enrolled Joined member before it accepts admin's
+    // address-book row — the cert on the Join enrolls admin's device key.
+    let admin_join_event = {
+        let payload = EventPayload {
+            id: [7u8; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: admin,
+            at: Hlc {
+                wall_ms: 100,
+                logical: 0,
+                device_id: "a-dev".into(),
+            },
+        };
+        sign_event_with_identity(&payload, &id_admin).expect("sign")
+    };
+    let state_b = registry_b
+        .state_for(&community_id)
+        .await
+        .expect("engine spawned");
+    {
+        let mut sb = state_b.lock().await;
+        let outcome = sb.insert_event(
+            admin_join_event,
+            &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
+                expected_community_id: community_id,
+                admin_addr: admin,
+                is_invite_only: false,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            harmony_app::community_state_crdt::InsertOutcome::Inserted
+        ));
+    }
+
+    let key = derive_addrbook_key(&mk, &community_id);
+    let node_id = [0xEE; 32];
+
+    // ── (1) A malicious peer re-seals a validly-signed row with a wildly
+    //        future `stamped_at_ms`. The PAYLOAD (and thus its signature) is
+    //        honest; only the out-of-preimage row stamp is a lie.
+    let now1 = 1_700_000_500_000u64;
+    let one_year_ms = 365 * 24 * 60 * 60 * 1000u64;
+    let wire_stamp = now1 + one_year_ms;
+    let at1 = Hlc {
+        wall_ms: now1,
+        logical: 0,
+        device_id: "a-dev".into(),
+    };
+    let payload1 = build_signed_payload_with_key(
+        node_id,
+        "https://derp.example/".into(),
+        vec![],
+        now1,
+        &admin,
+        &at1,
+        Vec::new(),
+        0,
+        &id_admin.device_key,
+    )
+    .expect("build signed reachability payload");
+    let malicious_row = AddressBookRow {
+        entry: AddressBookEntry::Reachability(payload1),
+        actor: admin,
+        device: admin_device,
+        at: at1,
+        stamped_at_ms: wire_stamp, // the lie — outside the signed preimage
+    };
+    let packet1 = seal_records(&key, &community_id, std::slice::from_ref(&malicious_row))
+        .expect("seal malicious record");
+
+    let book = CommunityAddressBook::new();
+    let rr = ReachabilityResolver::new();
+    let crr = CommunityRelayResolver::new();
+
+    let batch1 =
+        ingest_sealed_packet(&registry_b, &book, &rr, &crr, community_id, &packet1, now1).await;
+    assert_eq!(
+        batch1.outcomes,
+        vec![harmony_app::address_book_sync::IngestOutcome::Applied(
+            UpsertOutcome::Inserted
+        )],
+        "the validly-signed row is accepted (only its stamp was a lie)"
+    );
+
+    let rows = book.rows_for_community(&community_id, now1);
+    assert_eq!(rows.len(), 1, "admin's row is in the book");
+    assert_eq!(
+        rows[0].stamped_at_ms, now1,
+        "the stored stamp is the receiver's RECEIPT time — not the wire value \
+         (pre-fix this would be now1 + {ADDRBOOK_SKEW_TOLERANCE_MS}, the +5min clamp)"
+    );
+
+    // ── (2) An honest update from the SAME member (same LWW key: same actor +
+    //        node id) arrives 60s later. Under receipt-time stamping the stored
+    //        stamp is now1, so this update (receipt now2 > now1) WINS the LWW.
+    //        Under the old clamp-only behavior the stored stamp was now1+5min,
+    //        so this honest update — well inside the 5-min window — would have
+    //        been rejected as IgnoredOlder, the exact squat the fix prevents.
+    let now2 = now1 + 60_000;
+    assert!(
+        now2 < now1 + ADDRBOOK_SKEW_TOLERANCE_MS,
+        "the honest update lands inside the old clamp window, so pre-fix it would lose"
+    );
+    let at2 = Hlc {
+        wall_ms: now2,
+        logical: 0,
+        device_id: "a-dev".into(),
+    };
+    let payload2 = build_signed_payload_with_key(
+        node_id,
+        "https://derp2.example/".into(), // a genuinely newer record, same key
+        vec![],
+        now2,
+        &admin,
+        &at2,
+        Vec::new(),
+        0,
+        &id_admin.device_key,
+    )
+    .expect("build signed reachability payload (honest update)");
+    let honest_row = AddressBookRow {
+        entry: AddressBookEntry::Reachability(payload2),
+        actor: admin,
+        device: admin_device,
+        at: at2,
+        stamped_at_ms: now2,
+    };
+    let packet2 = seal_records(&key, &community_id, std::slice::from_ref(&honest_row))
+        .expect("seal honest record");
+
+    let batch2 =
+        ingest_sealed_packet(&registry_b, &book, &rr, &crr, community_id, &packet2, now2).await;
+    assert_eq!(
+        batch2.outcomes,
+        vec![harmony_app::address_book_sync::IngestOutcome::Applied(
+            UpsertOutcome::Replaced
+        )],
+        "the member's honest update wins the LWW — pre-fix the +5min-clamped \
+         squat would have made this IgnoredOlder"
+    );
+    assert!(
+        batch2.changed_book(),
+        "the honest update materially changed the book"
+    );
+
+    let rows2 = book.rows_for_community(&community_id, now2);
+    assert_eq!(rows2.len(), 1, "still exactly one row at the shared key");
+    assert_eq!(
+        rows2[0].stamped_at_ms, now2,
+        "the winning row carries the honest update's receipt stamp"
+    );
+    assert!(
+        matches!(
+            &rows2[0].entry,
+            AddressBookEntry::Reachability(p) if p.home_relay_url == "https://derp2.example/"
+        ),
+        "the stored record is the honest update, not the squatted original"
+    );
+
+    registry_b.shutdown_all().await.expect("shutdown b");
+}
+
 /// ZEB-815 Task 8 fix round (review Finding 2): confound-free coverage of the
 /// SNAPSHOT query/reply DATA PATH. The test above only exercises the live
 /// single-record codec (`publish_own_rows` → `seal_records` over one row);

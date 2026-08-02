@@ -63,7 +63,9 @@ fn announce_canonical_cbor_roundtrip() {
 #[test]
 fn announce_verifies_after_signing() {
     let (announce, expected_addr_hex) = canonical_test_announce();
-    let addr = verify_announce(&announce).expect("verify");
+    // `None` ⇒ apply-all: this pins signing/verification, not the ZEB-852
+    // forward-skew bound, so it stays independent of the wall clock.
+    let addr = verify_announce(&announce, None).expect("verify");
     assert_eq!(hex::encode(addr.0), expected_addr_hex);
 }
 

@@ -354,7 +354,7 @@ pub async fn ingest_sealed_packet(
         outcomes: Vec::with_capacity(rows.len()),
         reachability_actors: BTreeSet::new(),
     };
-    for row in rows {
+    for mut row in rows {
         let is_member = crate::voice_presence::beacon_signer_is_member(
             registry,
             &community,
@@ -368,6 +368,18 @@ pub async fn ingest_sealed_packet(
         }
         let actor = row.actor;
         let is_reachability = matches!(row.entry, AddressBookEntry::Reachability(_));
+        // `stamped_at_ms` is outside the signed preimage (ZEB-852 ABK) —
+        // derive it locally at peer receipt; do not trust the wire value.
+        // `verify_inner_signature` covers only `(payload, actor, at)`, so a
+        // peer can re-seal a validly-signed row with any `stamped_at_ms`; left
+        // trusted it would win the book LWW (via `upsert`'s `now + 5min` clamp)
+        // and refresh the TTL indefinitely, keeping a stale row alive. Stamping
+        // the receipt clock here discards that lever. `upsert`'s clamp stays as
+        // belt-and-suspenders. This is the SOLE peer-ingest path: the self path
+        // (`publish_own_rows`) and the disk-load boot seed both call
+        // `ingest_verified_row` directly and must keep their own stamp, so the
+        // assignment lives here, not in the shared gate.
+        row.stamped_at_ms = now_ms;
         let outcome = ingest_verified_row(
             book,
             reachability_resolver,
@@ -2390,6 +2402,120 @@ mod tests {
             relay.relays_for_community(&community, honest).len(),
             1,
             "and the resolver accepted it (unclamped squat would have pinned the slot)"
+        );
+    }
+
+    // ── ZEB-852 ABK: `stamped_at_ms` is derived at PEER receipt only ────
+    //
+    // The peer-only re-stamp lives in `ingest_sealed_packet` (the sole peer
+    // path); reaching it needs a live registry + engine, so the positive
+    // peer test is the integration harness's job
+    // (`peer_ingest_stamps_receipt_time_not_wire_value` in
+    // `community_sync_integration.rs`). The two guards below pin the OTHER
+    // half of the seam distinction — that the SHARED gate
+    // (`ingest_verified_row`) and the SELF path (`publish_own_rows`) must
+    // NOT re-stamp — so a regression that moved the assignment inside
+    // `ingest_verified_row` (which the disk-load boot seed and the publisher
+    // both share) would fail here.
+
+    /// Disk-load guard: a row replayed from `addrbook.cbor` at boot goes back
+    /// in through `ingest_verified_row` (lib.rs boot seed) with the receiver's
+    /// current `now_ms`. Its PERSISTED `stamped_at_ms` must survive — a re-stamp
+    /// to `now_ms` on load would refresh the TTL on every boot, so the shared
+    /// gate must leave the wire/persisted stamp untouched (only `upsert`'s
+    /// forward-skew clamp may touch it, and a past stamp is never clamped).
+    #[test]
+    fn disk_loaded_row_not_restamped() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x81; 32]);
+        let vk = sk.verifying_key();
+        let actor = OwnerAddr([0x81; 16]);
+        let community = SpaceId([0xCA; 16]);
+
+        // Row persisted at `stamped_at_ms = persisted`, re-ingested at a LATER
+        // boot clock `now_ms` (well within the 24h reachability TTL).
+        let persisted = 1_700_000_000_000u64;
+        let now_ms = persisted + 3_600_000; // one boot, an hour later
+        let at = hlc(persisted);
+        let payload = build_signed_payload_with_key(
+            [0xA1; 32],
+            "https://derp.example/".into(),
+            vec![],
+            persisted,
+            &actor,
+            &at,
+            Vec::new(),
+            0,
+            &sk,
+        )
+        .expect("build signed reachability payload");
+        let row = AddressBookRow {
+            entry: AddressBookEntry::Reachability(payload),
+            actor,
+            device: vk.to_bytes(),
+            at,
+            stamped_at_ms: persisted,
+        };
+
+        let book = CommunityAddressBook::new();
+        let reach = ReachabilityResolver::new();
+        let relay = CommunityRelayResolver::new();
+        assert_eq!(
+            ingest_verified_row(&book, &reach, &relay, community, row, now_ms),
+            IngestOutcome::Applied(UpsertOutcome::Inserted),
+        );
+
+        let rows = book.rows_for_community(&community, now_ms);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].stamped_at_ms, persisted,
+            "a disk-loaded row keeps its persisted stamp — re-stamping to now_ms \
+             on the shared gate would refresh the TTL every boot"
+        );
+    }
+
+    /// Self-authored guard: a row this device mints and publishes through
+    /// `publish_own_rows` must keep the stamp the minting path chose. The self
+    /// path shares `ingest_verified_row` with the peer path, so a re-stamp
+    /// placed inside that shared gate would silently overwrite our own stamp
+    /// with the wall clock here. `key_fn` returns `None` so nothing goes on the
+    /// wire — the row still lands in our own book, which is all this guard
+    /// reads.
+    #[tokio::test]
+    async fn self_authored_row_keeps_its_stamp() {
+        let community = SpaceId([0xCB; 16]);
+        // `own_row_fixture` stamps at ts = 1_700_000_000_000 — deliberately in
+        // the past relative to the real wall clock, so the receipt value a
+        // (buggy) re-stamp would write is unmistakably different from ts, and
+        // `upsert`'s forward-skew clamp is a no-op on it.
+        let ts = 1_700_000_000_000u64;
+        let (row, _actor) = own_row_fixture(0x82);
+        assert_eq!(row.stamped_at_ms, ts, "fixture stamps in the past");
+
+        let book = CommunityAddressBook::new();
+        let rr = ReachabilityResolver::new();
+        let crr = CommunityRelayResolver::new();
+        let dirty = AddrbookDirtyHub::new();
+        let (publish_tx, _publish_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::PublishRequest>(8);
+
+        let key_fn = |_: &SpaceId| None;
+        publish_own_rows(
+            &key_fn,
+            &book,
+            &rr,
+            &crr,
+            &publish_tx,
+            vec![(community, row)],
+            &dirty,
+        )
+        .await;
+
+        let rows = book.rows_for_community(&community, ts);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].stamped_at_ms, ts,
+            "a self-authored row keeps its own stamp — it must not be rewritten \
+             to the local receipt clock (that is the PEER path's behavior only)"
         );
     }
 }
