@@ -220,16 +220,13 @@ pub fn verify_card(
         return Err(CardVerifyError::StatusTextTooLong);
     }
     // ZEB-849 (C4): reject an implausibly future-dated shared_at before it can
-    // out-HLC every honest card in both the live cache and the disk store.
-    // now_secs == 0 ⇒ unreadable local clock (wall_now_secs().unwrap_or(0)) ⇒
-    // apply-all: a bad LOCAL clock must never drop honest state.
-    if now_secs != 0
-        && crate::clock_trust::reject_future(
-            card.shared_at.wall_ms,
-            now_secs.saturating_mul(1000),
-            crate::clock_trust::MAX_FORWARD_SKEW_MS,
-        )
-    {
+    // out-HLC every honest card. Control tier — a card pins IDENTITY fields
+    // (name/avatar/profile-page), so the tight 5-min bound is correct.
+    if crate::clock_trust::wall_exceeds_forward_skew_secs(
+        card.shared_at.wall_ms,
+        now_secs,
+        crate::clock_trust::MAX_FORWARD_SKEW_MS,
+    ) {
         return Err(CardVerifyError::SharedAtTooFarInFuture);
     }
     // ZEB-677: chokepoint verification — Master certs self-contained; Quorum
@@ -1782,7 +1779,10 @@ mod tests {
                 owner.owner.0
             );
         }
-        // One millisecond past the ceiling is rejected.
+        // Past the ceiling is rejected. The seconds→ms conversion is compensated
+        // by +999 (the shared helper's floored-conversion fail-open margin), so
+        // the first rejected sample is one ms past the compensated ceiling; the
+        // exact ±1 ms boundary is pinned in `clock_trust`'s own test.
         let over = sign_card(
             &owner.device_key,
             owner.owner.0,
@@ -1792,7 +1792,7 @@ mod tests {
             None,
             owner.cert.clone(),
             Hlc {
-                wall_ms: now_ms + crate::clock_trust::MAX_FORWARD_SKEW_MS + 1,
+                wall_ms: now_ms + crate::clock_trust::MAX_FORWARD_SKEW_MS + 1000,
                 logical: 0,
                 device_id: "d".into(),
             },

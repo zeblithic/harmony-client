@@ -102,6 +102,33 @@ pub fn wall_exceeds_forward_skew(wall_ms: u64, receiver_now_ms: Option<u64>) -> 
     receiver_now_ms.is_some_and(|rn| reject_future(wall_ms, rn, MAX_FORWARD_SKEW_MS))
 }
 
+/// Seconds-domain sibling of [`wall_exceeds_forward_skew`] for callers whose
+/// receiver clock is epoch-**seconds** (e.g.
+/// `crate::iroh_friend_acceptor::wall_now_secs` = `wall_now_ms()/1000` with
+/// `.unwrap_or(0)`), and who pick the tier explicitly: [`MAX_FORWARD_SKEW_MS`]
+/// for a control/identity concern, [`DISPLAY_SKEW_TOLERANCE_MS`] for pure
+/// display / discovery ordering.
+///
+/// `now_secs == 0` is the unreadable-local-clock sentinel (the `.unwrap_or(0)`
+/// above) ⇒ `false` (apply-all): a bad LOCAL clock must never drop honest state.
+///
+/// The `+999` upper-bounds the floored seconds→ms conversion: `now_secs` is
+/// `floor(true_now_ms / 1000)`, so `now_secs * 1000` can trail true wall time by
+/// up to 999 ms. Comparing against `now_secs*1000 + 999` keeps the compensated
+/// `now` at or above true wall time, so sub-second truncation never *tightens*
+/// the ceiling — it errs toward accepting an honest near-ceiling stamp rather
+/// than dropping it (the fail-open priority), at a cost of at most 999 ms of
+/// extra tolerance on a 5-min-plus window.
+#[inline]
+pub fn wall_exceeds_forward_skew_secs(wall_ms: u64, now_secs: u64, tolerance_ms: u64) -> bool {
+    now_secs != 0
+        && reject_future(
+            wall_ms,
+            now_secs.saturating_mul(1000).saturating_add(999),
+            tolerance_ms,
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +215,58 @@ mod tests {
         assert!(
             wall_exceeds_forward_skew(now + MAX_FORWARD_SKEW_MS + 1, Some(now)),
             "one past the ceiling is rejected"
+        );
+    }
+
+    #[test]
+    fn wall_exceeds_forward_skew_secs_zero_now_is_apply_all() {
+        assert!(!wall_exceeds_forward_skew_secs(
+            u64::MAX,
+            0,
+            MAX_FORWARD_SKEW_MS
+        ));
+        assert!(!wall_exceeds_forward_skew_secs(
+            u64::MAX,
+            0,
+            DISPLAY_SKEW_TOLERANCE_MS
+        ));
+    }
+
+    #[test]
+    fn wall_exceeds_forward_skew_secs_compensates_floored_conversion_and_honors_tier() {
+        let now_secs = 1_700_000_000u64;
+        let now_ms = now_secs * 1000;
+        // Compensated inclusive ceiling is now_ms + 999 + tolerance.
+        assert!(
+            !wall_exceeds_forward_skew_secs(now_ms, now_secs, MAX_FORWARD_SKEW_MS),
+            "present accepted"
+        );
+        assert!(
+            !wall_exceeds_forward_skew_secs(
+                now_ms + 999 + MAX_FORWARD_SKEW_MS,
+                now_secs,
+                MAX_FORWARD_SKEW_MS
+            ),
+            "at the compensated ceiling accepted (no sub-second tightening)"
+        );
+        assert!(
+            wall_exceeds_forward_skew_secs(
+                now_ms + 1000 + MAX_FORWARD_SKEW_MS,
+                now_secs,
+                MAX_FORWARD_SKEW_MS
+            ),
+            "one ms past the compensated ceiling rejected"
+        );
+        // Tier is a parameter: 10 min ahead exceeds the control tier but is within
+        // the display tier.
+        let ten_min = 10 * 60 * 1000;
+        assert!(
+            wall_exceeds_forward_skew_secs(now_ms + ten_min, now_secs, MAX_FORWARD_SKEW_MS),
+            "10 min > 5-min control tier"
+        );
+        assert!(
+            !wall_exceeds_forward_skew_secs(now_ms + ten_min, now_secs, DISPLAY_SKEW_TOLERANCE_MS),
+            "10 min < 30-min display tier"
         );
     }
 

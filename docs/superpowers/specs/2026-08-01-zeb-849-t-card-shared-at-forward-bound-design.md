@@ -129,3 +129,32 @@ pin.
 - Destructive on-load pruning (slow-clock purge risk).
 - Tracing/metrics on the new reject sites — folds under the already-filed
   **ZEB-855** (uniform observability across all `clock_trust` reject boundaries).
+
+## Converge note (round 1)
+
+- **Tier by concern, not by convenience.** L1 (`verify_card`) and L2
+  (`PersistentCardStore`) stay on the **control tier** (`MAX_FORWARD_SKEW_MS`,
+  5 min): a card pins IDENTITY fields (name/avatar/profile-page), so a tight
+  bound on identity spoofing is correct, and CodeAnt did not flag them. L3
+  (`ProfileBroadcastCache::on_sample`) moved to the **display tier**
+  (`DISPLAY_SKEW_TOLERANCE_MS`, 30 min) per CodeAnt (Major): that cache feeds
+  profile discovery / display only (`profile-broadcast-received` + display IPCs;
+  verified no control path reads it — `vine_feed_cache` / `vine_pull_driver`
+  precedent), so the 5-min control bound over-rejected honest peers 5–30 min
+  ahead, dropping them from discovery.
+- **Floored-conversion compensation (Qodo, Moderate).** The seconds→ms
+  conversion `now_secs * 1000` floors, trailing true wall time by up to 999 ms
+  and silently tightening the ceiling. The shared helper compensates with `+999`
+  so the compensated `now` stays at or above true wall time — sub-second
+  truncation now errs toward accepting an honest near-ceiling stamp (fail-open),
+  never dropping it, at a cost of ≤999 ms extra tolerance on a 5-min-plus window.
+- **DRY (reviewers' minor #5).** The two **seconds-domain** ingest sites — L1
+  (`verify_card`) and L3 (`on_sample`), both taking `now_secs: u64` with the
+  `.unwrap_or(0)` sentinel — now share
+  `clock_trust::wall_exceeds_forward_skew_secs(wall_ms, now_secs, tolerance_ms)`:
+  one tested helper carrying the `now_secs == 0` apply-all sentinel and the
+  `+999` compensation, with the tier passed explicitly per caller. L2
+  (`PersistentCardStore`) is unchanged — it is not a seconds-domain site: it
+  filters at the **load/view** boundary in the ms domain via the existing
+  `clock_trust::wall_exceeds_forward_skew(wall_ms, receiver_now_ms())`
+  (`Option<u64>` receiver clock), still at the control tier.

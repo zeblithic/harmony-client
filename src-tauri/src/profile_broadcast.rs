@@ -589,14 +589,15 @@ impl ProfileBroadcastCache {
         // (1) Verify
         let derived = verify_broadcast(&broadcast)?;
         // ZEB-849 (C10): reject a future-dated shared_at before newer-wins can
-        // pin it. now_secs == 0 ⇒ unreadable local clock ⇒ apply-all.
-        if now_secs != 0
-            && crate::clock_trust::reject_future(
-                broadcast.shared_at.wall_ms,
-                now_secs.saturating_mul(1000),
-                crate::clock_trust::MAX_FORWARD_SKEW_MS,
-            )
-        {
+        // pin it. Display tier — this cache feeds profile discovery / display
+        // only (no control gated), so the 30-min DISPLAY_SKEW_TOLERANCE_MS
+        // tolerates honest moderate clock drift instead of the 5-min control
+        // bound (which would drop a peer 5–30 min ahead).
+        if crate::clock_trust::wall_exceeds_forward_skew_secs(
+            broadcast.shared_at.wall_ms,
+            now_secs,
+            crate::clock_trust::DISPLAY_SKEW_TOLERANCE_MS,
+        ) {
             return Err(CacheOnSampleError::FutureSkew);
         }
         // (2) Attribution check + replay defense — atomic against the map.
@@ -1440,6 +1441,35 @@ mod tests {
         assert_eq!(
             cache.on_sample(8, newer, NOW_S).await.unwrap(),
             CacheOnSampleOutcome::Replaced
+        );
+    }
+
+    #[tokio::test]
+    async fn on_sample_uses_display_tier_tolerating_moderate_drift() {
+        // C10 is display/discovery only (feeds profile-broadcast-received), so it
+        // uses the 30-min DISPLAY tier: a peer 10 min ahead (beyond the 5-min
+        // control tier) is still accepted rather than vanishing from discovery.
+        let (signer, identity_pub) = build_identity([203u8; 32]);
+        let peer_addr = OwnerAddr(
+            harmony_identity::Identity::from_public_bytes(&identity_pub)
+                .unwrap()
+                .address_hash,
+        );
+        let cache = ProfileBroadcastCache::default();
+        cache.register(9, peer_addr).await;
+        const NOW_S: u64 = 1_700_000_000;
+        let now_ms = NOW_S * 1000;
+        let ten_min_ahead = sign_broadcast(
+            &signer,
+            identity_pub,
+            vec![fixture_space_id(1)],
+            fixture_hlc(now_ms + 10 * 60 * 1000),
+        )
+        .unwrap();
+        assert_eq!(
+            cache.on_sample(9, ten_min_ahead, NOW_S).await.unwrap(),
+            CacheOnSampleOutcome::InsertedFirst,
+            "10 min ahead is within the 30-min display tier"
         );
     }
 }
