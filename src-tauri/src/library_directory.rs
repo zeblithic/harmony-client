@@ -282,6 +282,8 @@ pub enum AnnounceVerifyError {
     NameTooLong,
     #[error("description exceeds {MAX_DESCRIPTION_LEN} bytes")]
     DescriptionTooLong,
+    #[error("listed_at is too far in the future (beyond display skew tolerance)")]
+    ListedAtTooFarInFuture,
 }
 
 /// Verify a `LibraryDirectoryEntry` end-to-end and return the
@@ -431,10 +433,27 @@ pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<AttestationStatus, 
 ///    halves of the X25519||Ed25519 bundle)
 /// 3. Verify the Ed25519 signature over canonical-CBOR-encoded fields
 ///    with `library_signature` zeroed (so verify == sign exactly)
+/// 4. Forward-skew bound on `announce.listed_at.wall_ms` (ZEB-852 C7):
+///    `listed_at` is inside the signed CBOR (authenticated) but
+///    self-attested by the broadcasting library. A future-dated stamp
+///    both wins the per-community LWW (`is_strictly_newer_than`) — pinning
+///    the top of discovery — AND is never the min in cap-eviction, so it
+///    is immune to eviction and evicts honest libraries instead. Reject
+///    when it exceeds `now + DISPLAY_SKEW_TOLERANCE_MS`. This is pure
+///    discovery ranking + cap eviction (a DISPLAY-tier concern), not a
+///    control/routing decision.
+///
+/// `now_ms` is the receiver's own trusted wall clock
+/// (`clock_trust::receiver_now_ms()`); production call sites pass that.
+/// `None` ⇒ apply-all: an unreadable local clock never rejects an honest
+/// announce (fail-open — never substitute `0`).
 ///
 /// Returns the derived `OwnerAddr` (library_addr) on success — callers
 /// need this to insert into the Announces map.
-pub fn verify_announce(announce: &LibraryAnnounce) -> Result<OwnerAddr, AnnounceVerifyError> {
+pub fn verify_announce(
+    announce: &LibraryAnnounce,
+    now_ms: Option<u64>,
+) -> Result<OwnerAddr, AnnounceVerifyError> {
     // (1) Bounds
     if announce.name.len() > MAX_NAME_LEN {
         return Err(AnnounceVerifyError::NameTooLong);
@@ -456,6 +475,18 @@ pub fn verify_announce(announce: &LibraryAnnounce) -> Result<OwnerAddr, Announce
         .verifying_key
         .verify_strict(&signed_bytes, &sig)
         .map_err(|_| AnnounceVerifyError::SignatureInvalid)?;
+
+    // (4) Forward-skew bound on the self-attested `listed_at` (DISPLAY tier).
+    if let Some(now) = now_ms {
+        if crate::clock_trust::reject_future(
+            announce.listed_at.wall_ms,
+            now,
+            crate::clock_trust::DISPLAY_SKEW_TOLERANCE_MS,
+        ) {
+            return Err(AnnounceVerifyError::ListedAtTooFarInFuture);
+        }
+    }
+    // None ⇒ apply-all (unreadable local clock never rejects an honest announce).
 
     Ok(OwnerAddr(identity.address_hash))
 }
@@ -1125,7 +1156,7 @@ impl LibraryDirectory {
     ) -> Result<AnnounceProcessResult, AnnounceVerifyError> {
         let announce: LibraryAnnounce = ciborium::from_reader(&bytes[..])
             .map_err(|e| AnnounceVerifyError::DecodeFailed(format!("{e}")))?;
-        let library_addr = verify_announce(&announce)?;
+        let library_addr = verify_announce(&announce, crate::clock_trust::receiver_now_ms())?;
         let mut announces = self.announces.lock().await;
         Ok(announces.on_announce(library_addr, announce))
     }
@@ -2888,6 +2919,12 @@ mod tests {
 #[cfg(test)]
 mod announce_verify_tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// A plausible present-day wall used as the receiver's `now` in the
+    /// forward-skew tests (~2023-11-14).
+    const NOW_MS: u64 = 1_700_000_000_000;
+    const ONE_YEAR_MS: u64 = 365 * 24 * 60 * 60 * 1000;
 
     fn unsigned_announce_with_identity(identity_pub: [u8; 64]) -> LibraryAnnounce {
         LibraryAnnounce {
@@ -2903,6 +2940,32 @@ mod announce_verify_tests {
         }
     }
 
+    /// Build a validly-signed `LibraryAnnounce` whose `listed_at.wall_ms`
+    /// is `wall_ms`, so the forward-skew bound (which runs AFTER the sig
+    /// check) is what these tests actually exercise.
+    fn signed_announce_at(wall_ms: u64) -> LibraryAnnounce {
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let ed_verifying = signing_key.verifying_key().to_bytes();
+        let mut identity_pub = [0u8; 64];
+        identity_pub[..32].copy_from_slice(&[0x11; 32]);
+        identity_pub[32..].copy_from_slice(&ed_verifying);
+
+        let mut announce = LibraryAnnounce {
+            library_identity_pub: identity_pub,
+            name: "Test".to_string(),
+            description: "Test desc".to_string(),
+            listed_at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "d".to_string(),
+            },
+            library_signature: [0u8; 64],
+        };
+        let signed_bytes = canonical_cbor_encode(&announce).expect("encode for sign");
+        announce.library_signature = signing_key.sign(&signed_bytes).to_bytes();
+        announce
+    }
+
     #[test]
     fn rejects_invalid_identity_pub() {
         // Ed25519 half `[0x7F; 32]` doesn't decompress under ed25519-dalek
@@ -2911,7 +2974,7 @@ mod announce_verify_tests {
         let mut bad_identity_pub = [0u8; 64];
         bad_identity_pub[32..].copy_from_slice(&[0x7F; 32]);
         let announce = unsigned_announce_with_identity(bad_identity_pub);
-        let err = verify_announce(&announce).unwrap_err();
+        let err = verify_announce(&announce, None).unwrap_err();
         assert!(matches!(err, AnnounceVerifyError::InvalidIdentityPub(_)));
     }
 
@@ -2922,8 +2985,42 @@ mod announce_verify_tests {
         // fires before the (otherwise-invalid) identity is ever parsed.
         let mut announce = unsigned_announce_with_identity([0x7F; 64]);
         announce.name = "x".repeat(MAX_NAME_LEN + 1);
-        let err = verify_announce(&announce).unwrap_err();
+        let err = verify_announce(&announce, None).unwrap_err();
         assert!(matches!(err, AnnounceVerifyError::NameTooLong));
+    }
+
+    // ZEB-852 C7: forward-skew bound on the self-attested `listed_at`.
+
+    #[test]
+    fn verify_announce_rejects_future_listed_at() {
+        // A stamp a full year past the receiver's `now` is well beyond the
+        // 30-min DISPLAY tolerance → rejected.
+        let announce = signed_announce_at(NOW_MS + ONE_YEAR_MS);
+        let err = verify_announce(&announce, Some(NOW_MS)).unwrap_err();
+        assert!(
+            matches!(err, AnnounceVerifyError::ListedAtTooFarInFuture),
+            "future listed_at must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_announce_accepts_in_range() {
+        // A present stamp verifies.
+        let present = signed_announce_at(NOW_MS);
+        verify_announce(&present, Some(NOW_MS)).expect("present listed_at verifies");
+
+        // An OLDER in-range stamp verifies too — the forward bound never
+        // over-rejects the past (staleness is a separate, opposite concern).
+        let older = signed_announce_at(NOW_MS - ONE_YEAR_MS);
+        verify_announce(&older, Some(NOW_MS)).expect("older in-range listed_at verifies");
+    }
+
+    #[test]
+    fn verify_announce_none_now_is_apply_all() {
+        // Fail-open: an unreadable local clock (None) must never reject an
+        // honest announce — even a far-future one verifies (apply-all pin).
+        let announce = signed_announce_at(NOW_MS + ONE_YEAR_MS);
+        verify_announce(&announce, None).expect("None ⇒ apply-all: future announce still verifies");
     }
 }
 
