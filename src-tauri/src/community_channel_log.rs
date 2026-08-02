@@ -1595,6 +1595,16 @@ where
         // Skipping the deletion would UN-delete the channel (the exact
         // bug); we clamp, never defer. `None` ⇒ unclamped (apply-all
         // fallback — no trusted receiver clock to clamp against).
+        //
+        // ZEB-846 CD: the post-wall Layer-1 reject above is the primary
+        // bound (a future-dated post can't be admitted to slip past any
+        // deletion); this clamp is defense-in-depth for the tombstone
+        // gate — it makes a legacy/far-future `deleted_at` resolve to a
+        // plausible `now+MAX_FORWARD_SKEW_MS` rather than never gating,
+        // and is independently effective at the inclusive Layer-1
+        // boundary (a post whose wall lands exactly at `now+tol` can
+        // still be out-ranked by HLC tiebreak against the clamped
+        // tombstone, where it would NOT be against the unclamped one).
         let effective_deleted = match now_ms {
             Some(rn) => Hlc {
                 wall_ms: crate::clock_trust::clamp_future(
@@ -4499,27 +4509,54 @@ mod tests {
         fixture_signed_event(wall_ms, 0, "a-dev")
     }
 
+    /// ZEB-846 CD test-discrimination fix: a fixed injected `now` (no
+    /// dependency on real wall-clock at test-run time). Arbitrary realistic
+    /// ms-since-epoch — the exact value doesn't matter, only that it's
+    /// fixed, so `now + MAX_FORWARD_SKEW_MS` (the Layer-1/Layer-2 shared
+    /// boundary below) is deterministic.
+    const CD_TEST_NOW_MS: u64 = 1_700_000_000_000;
+
     #[tokio::test]
     async fn far_future_deleted_at_still_gates_posts_after_clamp_window() {
-        // Channel deleted with a far-future deleted_at (real-now + 1 year) —
-        // models a poison ChannelDelete persisted before Layer 1. A post
-        // stamped past the clamp window (now + 5min) must be REJECTED (the
-        // deletion still gates writes).
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        // Layer 1 and Layer 2 share the SAME (now, tolerance) in the same
+        // call, Layer 1 first — so any post that SURVIVES Layer 1 has
+        // at.wall_ms <= now+tol, and the clamped tombstone is also
+        // <= now+tol. The clamp can therefore only gate a post whose
+        // at.wall_ms == now+tol EXACTLY, via an HLC tiebreak (logical /
+        // device_id) that is lexicographically newer than the clamped
+        // tombstone. A post further out (e.g. now+tol+60s) is already
+        // caught by Layer 1 regardless of the clamp, so it would NOT
+        // discriminate this guard — the boundary case below is the one
+        // that does.
+        let now_ms = CD_TEST_NOW_MS;
+        // Far-future poison deleted_at — models a ChannelDelete persisted
+        // before Layer 1 existed. logical/device chosen LOW (5, "aaa") so
+        // a post at the same (clamped) wall can out-rank it by HLC
+        // tiebreak.
         let deleted_at = Hlc {
             wall_ms: now_ms + 365 * 86_400_000,
-            logical: 0,
-            device_id: "x".into(),
+            logical: 5,
+            device_id: "aaa".into(),
         };
         let state = channel_state_with_deletion(deleted_at);
-        // 6 min ahead of now — past the Layer-2 clamp window (now+5min).
-        let post = signed_post_at(now_ms + crate::clock_trust::MAX_FORWARD_SKEW_MS + 60_000);
+
+        // Boundary post: wall EXACTLY at the inclusive Layer-1 ceiling
+        // (now + MAX_FORWARD_SKEW_MS), so it SURVIVES Layer 1, with a
+        // higher logical (6 > 5) on the same device_id ("aaa") so it is
+        // strictly-newer than the CLAMPED tombstone (now+tol, 5, "aaa")
+        // but NOT newer than the unclamped far-future tombstone
+        // (now+1yr, 5, "aaa").
+        //
+        // Discriminates Layer 2: without the deleted_at clamp, this post
+        // (at the inclusive Layer-1 boundary) is NOT strictly-newer than
+        // the far-future deleted_at → would be ALLOWED (the un-delete
+        // bug). The clamp lowers the effective tombstone to now+tol so
+        // the post's higher logical gates it.
+        let boundary_post =
+            fixture_signed_event(now_ms + crate::clock_trust::MAX_FORWARD_SKEW_MS, 6, "aaa");
         let mut tracker = ChannelLogReplayTracker::new();
         let res = verify_channel_event_at(
-            &post,
+            &boundary_post,
             &fixture_community(0xc0),
             &fixture_channel(0x01),
             &state,
@@ -4529,29 +4566,55 @@ mod tests {
         .await;
         assert!(
             res.is_err(),
-            "post past the clamped deletion window must be gated"
+            "post at the inclusive Layer-1 boundary must still be gated by the clamped deleted_at"
+        );
+
+        // Companion: an honest present-day post (wall_ms == now, strictly
+        // below the clamped tombstone's now+tol wall) is ALLOWED even with
+        // the far-future deleted_at + clamp in effect — the residual
+        // window between "now" and the clamped tombstone (up to
+        // MAX_FORWARD_SKEW_MS) is an intended, bounded consequence of
+        // clamping rather than rejecting outright on an unreliable
+        // tombstone timestamp.
+        let honest_post = signed_post_at(now_ms);
+        let mut tracker2 = ChannelLogReplayTracker::new();
+        let res2 = verify_channel_event_at(
+            &honest_post,
+            &fixture_community(0xc0),
+            &fixture_channel(0x01),
+            &state,
+            &mut tracker2,
+            Some(now_ms),
+        )
+        .await;
+        assert!(
+            res2.is_ok(),
+            "present-day post below the clamped tombstone window must be allowed"
         );
     }
 
     #[tokio::test]
     async fn none_receiver_now_uses_unclamped_deleted_at() {
-        // None ⇒ apply-all: with a far-future deleted_at and None now, a
-        // present-day post is NOT gated (deleted_at unclamped) — the
-        // non-destructive fallback.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        // None ⇒ apply-all: with a far-future deleted_at and None now, the
+        // SAME boundary post as
+        // far_future_deleted_at_still_gates_posts_after_clamp_window is NOT
+        // gated — deleted_at is used UNCLAMPED (now+1yr, 5, "aaa"), which
+        // strictly dominates the boundary post (now+tol, 6, "aaa") by
+        // wall_ms alone. This confirms the None fallback discriminates
+        // against the clamp too: the SAME post that Layer 2 gates under
+        // `Some(now_ms)` above is allowed here under `None`.
+        let now_ms = CD_TEST_NOW_MS;
         let deleted_at = Hlc {
             wall_ms: now_ms + 365 * 86_400_000,
-            logical: 0,
-            device_id: "x".into(),
+            logical: 5,
+            device_id: "aaa".into(),
         };
         let state = channel_state_with_deletion(deleted_at);
-        let post = signed_post_at(now_ms);
+        let boundary_post =
+            fixture_signed_event(now_ms + crate::clock_trust::MAX_FORWARD_SKEW_MS, 6, "aaa");
         let mut tracker = ChannelLogReplayTracker::new();
         let res = verify_channel_event_at(
-            &post,
+            &boundary_post,
             &fixture_community(0xc0),
             &fixture_channel(0x01),
             &state,
@@ -4561,7 +4624,7 @@ mod tests {
         .await;
         assert!(
             res.is_ok(),
-            "None receiver clock ⇒ unclamped deleted_at, post allowed"
+            "None receiver clock ⇒ unclamped deleted_at, boundary post allowed"
         );
     }
 
