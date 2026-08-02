@@ -1308,6 +1308,15 @@ pub enum CommunityInviteVerifyError {
     /// created_at >= invite_token expires_at, OR created_at > now + 60s.
     #[error("invite expired or clock-skew rejected")]
     Expired,
+    /// `join_event.at.wall_ms` — the Join's OWN wall, distinct from the
+    /// envelope's `created_at` above — is more than
+    /// `clock_trust::MAX_FORWARD_SKEW_MS` ahead of the receiver's wall clock.
+    /// This is the timestamp that actually lands in the persisted membership
+    /// log, so it gets its own bound (ZEB-846 Task 7 — closes the gap left by
+    /// Task 3's zenoh-merge-only `community_membership::verify_event`
+    /// forward-skew reject).
+    #[error("Join event forward-skew rejected")]
+    JoinEventFutureSkew,
     /// invite_token.invitee_hint set and != join_event.actor.
     #[error("invitee_hint mismatch")]
     InviteeHintMismatch,
@@ -1367,6 +1376,7 @@ impl CommunityInviteVerifyError {
             Self::InviteSignerMismatch { .. } => "community_invite_signer_mismatch",
             Self::CommunityIdMismatch => "community_invite_id_mismatch",
             Self::Expired => "community_invite_expired",
+            Self::JoinEventFutureSkew => "community_invite_join_event_future_skew",
             Self::InviteeHintMismatch => "community_invitee_hint_mismatch",
             Self::CommunityUnknown { .. } => "community_invite_unknown",
             Self::SelfNotJoined => "community_invite_self_not_joined",
@@ -1785,6 +1795,12 @@ pub fn build_signed_open_join_packet(
 ///   6. InviteToken sig (1× Ed25519 verify_strict against the canonical
 ///      token payload, verified against `self_device_ed25519`)
 ///
+/// ZEB-846 Task 7 adds one more bound, checked immediately after step 3:
+/// `join_event.at.wall_ms` — the Join's OWN wall — must also be within
+/// `clock_trust::MAX_FORWARD_SKEW_MS` of the receiver's wall clock. This is
+/// separate from `created_at` above (which only bounds the request envelope)
+/// because the Join event is what actually lands in the persisted log.
+///
 /// `self_device_ed25519` must be the counter-signer's enrolled device #2
 /// ed25519 verifying key (32 bytes). This aligns step 6 with
 /// `verify_event`'s P5 gate (`verify_invite_token_sig_with_enrolled`),
@@ -1843,6 +1859,21 @@ where
         if now >= exp {
             return Err(CommunityInviteVerifyError::Expired);
         }
+    }
+
+    // 3b. ZEB-846 (Task 7): bound the inner join_event's OWN wall — separate
+    //     from `signed.created_at` above, which only bounds the request
+    //     envelope. This is the Join event `verify_admin_bootstrap`/the
+    //     engine's counter-sign path actually inserts into the persisted
+    //     membership log, so an attacker who mints a fresh envelope around a
+    //     far-future-walled Join must be rejected here too, not just at the
+    //     zenoh-merge path's `verify_event` (Task 3).
+    if crate::clock_trust::reject_future(
+        signed.join_event.at.wall_ms,
+        now,
+        crate::clock_trust::MAX_FORWARD_SKEW_MS,
+    ) {
+        return Err(CommunityInviteVerifyError::JoinEventFutureSkew);
     }
 
     // 4. InviteToken signer == self.

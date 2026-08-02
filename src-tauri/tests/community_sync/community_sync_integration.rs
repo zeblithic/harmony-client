@@ -295,6 +295,7 @@ async fn two_members_dag_sync_full_event_log() {
         let outcome = sa.insert_event(
             admin_join_event.clone(),
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -321,6 +322,7 @@ async fn two_members_dag_sync_full_event_log() {
         let outcome = sb.insert_event(
             admin_join_event,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -494,6 +496,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
         let outcome = sb.insert_event(
             valid_admin_join,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -752,6 +755,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         let outcome = sb.insert_event(
             admin_join_event.clone(),
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -784,6 +788,7 @@ async fn malformed_wire_packet_does_not_panic_engine() {
         let outcome = sa.insert_event(
             admin_join_event,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -968,6 +973,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         let outcome = sb.insert_event(
             admin_join_event.clone(),
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -994,6 +1000,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         let outcome = sa.insert_event(
             admin_join_event,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -1026,6 +1033,7 @@ async fn replay_of_same_root_publish_is_idempotent() {
         let outcome = sa.insert_event(
             admin_set_power_event,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -1289,6 +1297,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
         sign_event_with_identity(&payload, &id_alice).expect("sign alice join")
     };
     let verify_ctx = harmony_app::community_membership::VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr: alice_addr,
         is_invite_only: false,
@@ -1752,6 +1761,7 @@ async fn leave_does_not_prune_per_device_tracker_entry() {
         sign_event_with_identity(&payload, &id_alice).expect("sign alice join")
     };
     let verify_ctx = harmony_app::community_membership::VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr: alice_addr,
         is_invite_only: false,
@@ -3308,6 +3318,7 @@ async fn addrbook_replaces_announce_events_end_to_end() {
         let outcome = sa.insert_event(
             admin_join_event.clone(),
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -3327,6 +3338,7 @@ async fn addrbook_replaces_announce_events_end_to_end() {
         let outcome = sb.insert_event(
             admin_join_event,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -3674,6 +3686,7 @@ async fn addrbook_snapshot_path_ingest_end_to_end() {
         let outcome = sa.insert_event(
             admin_join_event.clone(),
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -3693,6 +3706,7 @@ async fn addrbook_snapshot_path_ingest_end_to_end() {
         let outcome = sb.insert_event(
             admin_join_event,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,

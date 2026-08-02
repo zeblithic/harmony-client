@@ -1378,6 +1378,7 @@ fn verify_event_accepts_valid_join_in_open_community() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -1407,6 +1408,7 @@ fn verify_event_rejects_invite_only_join_without_countersig() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: true,
@@ -1441,6 +1443,7 @@ fn verify_event_accepts_admin_self_join_in_invite_only_community_without_counter
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: true,
@@ -1477,6 +1480,7 @@ fn verify_event_rejects_admin_invite_only_join_with_spurious_countersig() {
     let event = attach_countersig_with_identity(&event, &someone_priv).expect("countersig");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: true,
@@ -1511,6 +1515,7 @@ fn verify_event_accepts_invite_only_join_with_valid_countersig() {
     let event = attach_countersig_with_identity(&event, &admin_priv).expect("countersign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: true,
@@ -1551,6 +1556,7 @@ fn verify_event_rejects_kick_when_actor_power_below_threshold() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -1596,6 +1602,7 @@ fn verify_event_rejects_kick_on_target_who_never_joined() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -1672,6 +1679,7 @@ fn verify_event_accepts_kick_on_left_member() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -1719,6 +1727,7 @@ fn verify_event_rejects_kick_when_target_power_equals_actor() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -1759,6 +1768,7 @@ fn verify_event_rejects_setpower_when_actor_power_insufficient() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -1845,6 +1855,7 @@ fn verify_event_rejects_invite_targeting_banned_member() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -1883,6 +1894,7 @@ fn verify_event_rejects_invite_from_non_joined_actor() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -1938,6 +1950,7 @@ fn verify_event_rejects_kick_from_non_joined_actor() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -1989,6 +2002,7 @@ fn verify_event_rejects_setpower_from_non_joined_actor() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -2043,6 +2057,7 @@ fn verify_event_rejects_invite_only_join_with_non_joined_countersigner() {
     let event = attach_countersig_with_identity(&event, &outsider_priv).expect("countersign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: true,
@@ -2125,6 +2140,7 @@ fn verify_event_rejects_leave_from_banned_actor() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -2353,6 +2369,7 @@ fn verify_event_rejects_join_replay_after_kick() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -2396,6 +2413,7 @@ fn verify_event_rejects_setpower_when_level_exceeds_max() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -2436,6 +2454,7 @@ fn verify_event_accepts_setpower_at_max_boundary() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -2475,6 +2494,7 @@ fn verify_event_rejects_countersig_on_open_community_join() {
     let event = attach_countersig_with_identity(&event, &admin_priv).expect("countersig");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false, // OPEN community
@@ -2511,6 +2531,7 @@ fn verify_event_rejects_countersig_on_invite_event() {
     let event = attach_countersig_with_identity(&event, &admin_priv).expect("countersig");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -2555,6 +2576,7 @@ fn verify_event_rejects_event_for_wrong_community() {
     let event = sign_event_with_identity(&payload, &alice_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_a, // verify against A
         admin_addr: admin,
         is_invite_only: false,
@@ -2599,6 +2621,7 @@ fn verify_event_rejects_when_actor_pubkey_doesnt_bind_to_actor() {
     };
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([3u8; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -2645,6 +2668,7 @@ fn kick_self_rejected_with_kick_target_power_not_lower() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([0x77; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -2680,6 +2704,7 @@ fn set_power_out_of_range_rejected() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([0x88; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -2720,6 +2745,7 @@ fn set_power_admin_self_demote_inserts() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: SpaceId([0x99; 16]),
         admin_addr: admin,
         is_invite_only: false,
@@ -3220,6 +3246,7 @@ fn verify_event_channel_create_succeeds_for_admin_at_bootstrap_power() {
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3284,6 +3311,7 @@ fn verify_event_channel_create_rejects_below_mod_power() {
     let event = sign_event_with_identity(&payload, &sub_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3366,6 +3394,7 @@ fn verify_event_channel_create_accepts_at_kick_threshold() {
     let event = sign_event_with_identity(&payload, &mod_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3472,6 +3501,7 @@ fn verify_event_channel_create_rejects_empty_name() {
     };
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3521,6 +3551,7 @@ fn verify_event_channel_create_rejects_oversized_name() {
     };
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3569,6 +3600,7 @@ fn verify_event_channel_create_rejects_write_power_above_max() {
     };
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3606,6 +3638,7 @@ fn verify_event_channel_modify_rejects_all_none() {
     };
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3655,6 +3688,7 @@ fn verify_event_channel_modify_allows_unknown_channel_id() {
     };
     let event = sign_event_with_identity(&payload, &admin_priv).expect("sign");
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3736,6 +3770,7 @@ fn verify_event_channel_delete_allows_already_tombstoned_for_replica_convergence
         sign_event_with_identity(&second_delete_payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3809,6 +3844,7 @@ fn verify_event_channel_modify_allows_value_matching_for_replica_convergence() {
     let modify = sign_event_with_identity(&modify_payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3876,6 +3912,7 @@ fn verify_event_channel_modify_accepts_partial_change() {
     let modify = sign_event_with_identity(&modify_payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3923,6 +3960,7 @@ fn verify_event_channel_delete_allows_unknown_channel_for_dag_sync_safety() {
     let delete = sign_event_with_identity(&delete_payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,
@@ -3997,6 +4035,7 @@ fn verify_event_channel_create_allows_duplicate_channel_id_for_replica_convergen
         sign_event_with_identity(&second_create_payload, &admin_priv).expect("sign");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only: false,

@@ -1632,6 +1632,7 @@ impl CommunitySyncEngine {
         // (Join/PendingJoin) or the actor's materialized
         // enrolled_device_keys (steady-state).
         let ctx = crate::community_membership::VerifyContext {
+            now_ms: None,
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
             is_invite_only: self.is_invite_only,
@@ -1815,11 +1816,13 @@ impl CommunitySyncEngine {
         // EnrollmentCert / materialized membership — the resolver's
         // owner_id miss no longer rejects valid remote events.
         let first_ctx = crate::community_membership::VerifyContext {
+            now_ms: None,
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
             is_invite_only: self.is_invite_only,
         };
         let second_ctx = crate::community_membership::VerifyContext {
+            now_ms: None,
             expected_community_id: self.community_id,
             admin_addr: self.admin_addr,
             is_invite_only: self.is_invite_only,
@@ -2191,6 +2194,7 @@ async fn spawn_auto_counter_sign_task(
     // cert-bearing Join events); the identity_resolver is not consulted because
     // it caches Reticulum-keyed pubs and misses for owner_id actors.
     let ctx_v = crate::community_membership::VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr,
         is_invite_only,
@@ -4335,6 +4339,18 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             }
         }
 
+        // ZEB-846 (Layer 1): this is the live network-merge site — the
+        // receiver's OWN trusted wall clock (never a peer-supplied or
+        // HlcAdoptFloor value) bounds an implausibly-future membership wall
+        // before it ever reaches `state.insert_event`. Sampled ONCE per publish
+        // (not per event): the receiver clock does not meaningfully move within
+        // one merge loop, and one snapshot means every event in the batch is
+        // judged against the same `now`. `receiver_now_ms()` returns `None` on a
+        // pre-epoch clock ⇒ no forward reject (apply-all): a dead/mis-set local
+        // RTC must NOT collapse to `Some(0)`, where every honest present-day
+        // wall (~1.7e12) reads as beyond `MAX_FORWARD_SKEW_MS` and would freeze
+        // governance ingestion.
+        let now_ms = crate::clock_trust::receiver_now_ms();
         for event in resolved {
             if state.contains_event(&event.id) {
                 // C1 restart-recovery: even though we've already seen this
@@ -4359,8 +4375,11 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
 
             // ZEB-339 Task 9: VerifyContext carries no caller-resolved
             // pubs; verify_event derives signer keys from the carried
-            // cert / materialized membership.
+            // cert / materialized membership. `now_ms` (the ZEB-846 Layer 1
+            // receiver clock) is hoisted above this loop — see the comment
+            // there.
             let ctx_v = VerifyContext {
+                now_ms,
                 expected_community_id: ctx.community_id,
                 admin_addr: ctx.admin_addr,
                 is_invite_only: ctx.is_invite_only,

@@ -299,6 +299,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         let outcome = sa.insert_event(
             event,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -333,6 +334,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         let outcome = sb.insert_event(
             event,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -588,6 +590,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         let outcome1 = sa.insert_event(
             admin_join_event.clone(),
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -603,6 +606,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         let outcome2 = sa.insert_event(
             setpower_event.clone(),
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -625,6 +629,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         let outcome = sb.insert_event(
             admin_join_event,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -1189,6 +1194,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
         let outcome = alice_state.insert_event(
             event,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: alice_addr,
                 is_invite_only: false,
@@ -1391,6 +1397,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
         let outcome = state.insert_event(
             ev,
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr,
                 is_invite_only: false,
@@ -1643,6 +1650,7 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
         let outcome = state.insert_event(
             alice_join.clone(),
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: alice_addr,
                 is_invite_only: true,
@@ -1762,6 +1770,7 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
         let outcome = sb.insert_event(
             alice_join.clone(),
             &harmony_app::community_membership::VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: alice_addr,
                 is_invite_only: true,

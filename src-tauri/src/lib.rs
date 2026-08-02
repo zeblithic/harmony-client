@@ -37648,6 +37648,7 @@ mod create_community_inner_tests {
         //    signer's enrolled device key with no prior state. This is the
         //    exact path that previously failed with ActorPubkeyMismatch.
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: minted.community_id,
             admin_addr: owner.owner,
             is_invite_only: false,
@@ -72178,6 +72179,7 @@ mod list_community_members_ipc_tests {
             let outcome = sa.insert_event(
                 evt,
                 &crate::community_membership::VerifyContext {
+                    now_ms: None,
                     expected_community_id: community_id,
                     admin_addr: admin,
                     is_invite_only: false,
@@ -74511,6 +74513,7 @@ mod unban_from_community_tests {
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
@@ -74616,6 +74619,7 @@ mod unban_from_community_tests {
             g.insert_event(
                 unban_ev,
                 &VerifyContext {
+                    now_ms: None,
                     expected_community_id: community_id,
                     admin_addr: admin,
                     is_invite_only: false,
@@ -74762,6 +74766,7 @@ mod unban_from_community_tests {
         let outcome = state.insert_event(
             unban_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -74842,6 +74847,7 @@ mod unban_from_community_tests {
         let outcome = state.insert_event(
             unban_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -74922,6 +74928,7 @@ mod unban_from_community_tests {
         let outcome = state.insert_event(
             kick_ev.clone(),
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -75012,6 +75019,7 @@ mod unban_from_community_tests {
         let sp_outcome = state.insert_event(
             sp_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -75032,6 +75040,7 @@ mod unban_from_community_tests {
         let kick_outcome = state.insert_event(
             kick_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -75052,6 +75061,7 @@ mod unban_from_community_tests {
         let unban_outcome = state.insert_event(
             unban_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -75200,6 +75210,7 @@ mod unban_from_community_tests {
             let outcome = state.insert_event(
                 kick_ev,
                 &VerifyContext {
+                    now_ms: None,
                     expected_community_id: community_id,
                     admin_addr: admin,
                     is_invite_only: false,
@@ -77610,6 +77621,7 @@ mod admin_action_result_routing_tests {
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
@@ -77687,6 +77699,7 @@ mod admin_action_result_routing_tests {
         let outcome = state.insert_event(
             sp_event,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -77770,6 +77783,7 @@ mod admin_action_result_routing_tests {
         let promote_outcome = state.insert_event(
             promote_event,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -77796,6 +77810,7 @@ mod admin_action_result_routing_tests {
         let cq_outcome = state.insert_event(
             change_quorum_proposal,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -77828,6 +77843,7 @@ mod admin_action_result_routing_tests {
         let direct_outcome = state.insert_event(
             direct_sp,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -77869,6 +77885,7 @@ mod admin_action_result_routing_tests {
         let proposal_outcome = state.insert_event(
             proposal,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -78676,6 +78693,7 @@ mod countersign_admin_proposal_tests {
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
@@ -78752,6 +78770,7 @@ mod countersign_admin_proposal_tests {
         let promote_outcome = state.insert_event(
             promote_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -78775,6 +78794,7 @@ mod countersign_admin_proposal_tests {
         let cq_outcome = state.insert_event(
             cq_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -78809,6 +78829,7 @@ mod countersign_admin_proposal_tests {
         let proposal_outcome = state.insert_event(
             proposal_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -78867,6 +78888,7 @@ mod countersign_admin_proposal_tests {
         let cs_outcome = state.insert_event(
             cs_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -78895,6 +78917,7 @@ mod countersign_admin_proposal_tests {
         let dup_outcome = state.insert_event(
             duplicate_cs,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -79003,6 +79026,7 @@ mod countersign_admin_proposal_tests {
         let cs_outcome = state.insert_event(
             cs_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -79075,6 +79099,7 @@ mod propose_change_quorum_tests {
     ) {
         let ev = sign_event_with_identity(&payload, identity).expect("sign");
         let ctx = VerifyContext {
+            now_ms: None,
             expected_community_id: payload.community_id,
             admin_addr: admin,
             is_invite_only: false,
@@ -79143,6 +79168,7 @@ mod propose_change_quorum_tests {
         let sp_outcome = state.insert_event(
             sp_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,
@@ -79184,6 +79210,7 @@ mod propose_change_quorum_tests {
         let cq_outcome = state.insert_event(
             cq_ev,
             &VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: admin,
                 is_invite_only: false,

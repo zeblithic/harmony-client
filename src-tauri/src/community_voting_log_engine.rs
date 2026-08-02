@@ -1109,6 +1109,30 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                     Some(h) => h.wall_ms,
                     None => return,
                 };
+                // ZEB-846 (Layer 2 / E1): a future accepted event (legacy
+                // poison predating Layer 1, or replay) must not let
+                // last_hlc jump the poll straight to Ratification. Clamp
+                // the effective "now" fed to `current_stage_at` to the
+                // receiver's own clock (`SystemTime::now()`, never a
+                // peer-supplied value) + `MAX_FORWARD_SKEW_MS`. A
+                // past/present `last_wall` — including the synthetic
+                // test HLCs the "Time reference" note above describes —
+                // passes through unchanged; `clamp_future` only caps the
+                // future. `now_ms == 0` (pre-epoch clock) falls back to
+                // the unclamped `last_wall` (apply-all fallback).
+                let last_wall = match std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                {
+                    Ok(receiver_now_ms) if receiver_now_ms != 0 => {
+                        crate::clock_trust::clamp_future(
+                            last_wall,
+                            receiver_now_ms,
+                            crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                        )
+                    }
+                    _ => last_wall, // pre-epoch clock ⇒ apply-all fallback
+                };
                 let now_hlc_cl = Hlc {
                     wall_ms: last_wall,
                     logical: 0,
@@ -2758,6 +2782,34 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         let event: SignedVotingEvent =
             ciborium::from_reader(packet).map_err(|e| format!("decode: {e}"))?;
 
+        // ZEB-846 (Layer 1): reject an implausibly-future voting event
+        // before it can be applied, observed into the adoption floor, or
+        // re-gossiped. `receiver_now_ms` is this node's own trusted wall
+        // clock (`SystemTime::now()`) — never a peer/`HlcAdoptFloor`
+        // value, since a forward bound is only sound when measured
+        // against a clock the sender cannot move. `receiver_now_ms == 0`
+        // (pre-epoch clock) disables the reject entirely (apply-all
+        // fallback) — a bad local clock must never drop honest
+        // governance.
+        let receiver_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if receiver_now_ms != 0
+            && crate::clock_trust::reject_future(
+                event.hlc.wall_ms,
+                receiver_now_ms,
+                crate::clock_trust::MAX_FORWARD_SKEW_MS,
+            )
+        {
+            return Err(format!(
+                "voting event wall {} is beyond receiver now {} + {}ms forward-skew bound",
+                event.hlc.wall_ms,
+                receiver_now_ms,
+                crate::clock_trust::MAX_FORWARD_SKEW_MS
+            ));
+        }
+
         // Dedup gate (ZEB-731: lane-aware — high-water for single-writer device
         // lanes, exact-coordinate for multi-writer engine-auto poll lanes).
         {
@@ -2837,6 +2889,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     ///    historical; the inbound dispatch already suppresses the
     ///    orchestration cascade for the same peer-mint-HLC-race reason.
     ///
+    /// ZEB-846 (Layer 1): also carries its own forward-skew reject,
+    /// identical to `process_inbound`'s — this is a second, independent
+    /// route by which a NEW voting event is verified + applied into the
+    /// log, so `process_inbound`'s guard alone does not cover it.
+    ///
     /// Returns `Ok(None)` on a duplicate coordinate or when resolvers are
     /// not wired; `Ok(Some(pid))` on a fresh apply.
     pub(crate) async fn apply_backfilled_event(
@@ -2845,6 +2902,34 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     ) -> Result<Option<PollId>, String> {
         let event: SignedVotingEvent =
             ciborium::from_reader(packet).map_err(|e| format!("decode: {e}"))?;
+
+        // ZEB-846 (Layer 1, sibling admission route): `process_inbound`'s
+        // forward-skew reject does not automatically cover this path —
+        // backfill-pull is a second, independent route by which a NEW
+        // voting event is verified + applied into the log (see the
+        // method doc: decode → verify@hlc → eligibility → apply →
+        // record, mirroring `process_inbound`). A malicious/compromised
+        // peer serving backfill frames could otherwise smuggle a
+        // future-poisoned event past Layer 1 entirely. Same bound,
+        // same apply-all fallback on a pre-epoch clock.
+        let receiver_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if receiver_now_ms != 0
+            && crate::clock_trust::reject_future(
+                event.hlc.wall_ms,
+                receiver_now_ms,
+                crate::clock_trust::MAX_FORWARD_SKEW_MS,
+            )
+        {
+            return Err(format!(
+                "backfilled voting event wall {} is beyond receiver now {} + {}ms forward-skew bound",
+                event.hlc.wall_ms,
+                receiver_now_ms,
+                crate::clock_trust::MAX_FORWARD_SKEW_MS
+            ));
+        }
 
         // Coordinate dedup — NOT the high-water gate (see method doc).
         {
@@ -5231,6 +5316,97 @@ mod tests {
         );
     }
 
+    /// ZEB-846 (Layer 1): `process_inbound` rejects a voting event whose
+    /// `hlc.wall_ms` is implausibly far ahead of the receiver's own clock
+    /// (beyond `clock_trust::MAX_FORWARD_SKEW_MS`), before it can be
+    /// applied, observed into the adoption floor, or re-gossiped. Mirrors
+    /// `process_inbound_rejected_event_does_not_feed_adopt_floor`'s floor
+    /// assertion pattern.
+    #[tokio::test]
+    async fn process_inbound_rejects_far_future_voting_event() {
+        let community_id = SpaceId([0xE3; 16]);
+        let (keypair, actor, pub_64) = fixture_identity_engine(0xE3);
+
+        let resolvers = Arc::new(FixedTestResolvers {
+            identity: HashMap::from([(actor, pub_64)]),
+            snapshot: MembershipSnapshot {
+                members: HashMap::from([(
+                    actor,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )]),
+            },
+        });
+        let id_resolver: Arc<dyn crate::community_voting_core::VotingIdentityResolver> =
+            resolvers.clone();
+        let mem_resolver: Arc<dyn crate::community_voting_log::MembershipSnapshotResolver> =
+            resolvers;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        // Real-now + 1 year: implausibly future, far beyond MAX_FORWARD_SKEW_MS (5min).
+        let poison_wall = now_ms + 365 * 86_400_000;
+
+        let event = crate::community_voting_core::build_signed_poll_create_tier1(
+            &keypair,
+            actor,
+            &good_tier1_config(),
+            Hlc {
+                wall_ms: poison_wall,
+                logical: 0,
+                device_id: "dev-e3".into(),
+            },
+        )
+        .expect("build event");
+        let packet = encode_event(&event);
+
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let tracker = Arc::new(Mutex::new(VotingReplayTracker::new()));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+
+        let result = VotingLogEngine::<tauri::test::MockRuntime>::process_inbound(
+            community_id,
+            &voting_log,
+            &tracker,
+            Some(&id_resolver),
+            Some(&mem_resolver),
+            &floor,
+            &packet,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a voting event beyond now+5min must be rejected at admission; got Ok"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("forward-skew"),
+            "error must mention the forward-skew bound; got: {err:?}"
+        );
+
+        // Must not have been applied into the log.
+        {
+            let log = voting_log.lock().await;
+            assert!(
+                log.polls.is_empty(),
+                "a future-rejected event must not create a poll"
+            );
+        }
+
+        // Must not have been observed into the adoption floor either —
+        // floor stays at its identity value: merged_now(now) == now.
+        assert_eq!(
+            floor.merged_now(now_ms),
+            now_ms,
+            "a future-rejected voting event must NOT feed the adoption floor"
+        );
+    }
+
     /// `apply_backfilled_event` is the structurally-identical backfill twin
     /// of `process_inbound` (same trust class: verified + applied +
     /// recorded) and feeds the SAME `self.adopt_floor` directly. Proves the
@@ -5269,6 +5445,57 @@ mod tests {
             floor.merged_now(now_ms),
             remote_wall + 1,
             "a verified apply_backfilled_event accept must feed the adoption floor"
+        );
+    }
+
+    /// ZEB-846 (Layer 1, sibling admission route): `apply_backfilled_event`
+    /// carries its own forward-skew reject — it is a second, independent
+    /// route by which a NEW voting event is verified + applied into the
+    /// log, so `process_inbound`'s guard alone does not cover it. Mirrors
+    /// `process_inbound_rejects_far_future_voting_event`.
+    #[tokio::test]
+    async fn apply_backfilled_event_rejects_far_future_voting_event() {
+        let community_id = SpaceId([0xE4; 16]);
+        let (key, owner, pub64) = fixture_identity_engine(0xE4);
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let engine = start_backfill_test_engine(
+            community_id,
+            owner,
+            pub64,
+            Arc::clone(&voting_log),
+            floor.clone(),
+        )
+        .await;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        // Real-now + 1 year: implausibly future, far beyond MAX_FORWARD_SKEW_MS (5min).
+        let poison_wall = now_ms + 365 * 86_400_000;
+
+        let packet = encode_event(&signed_poll_create(&key, owner, "dev-e4", poison_wall));
+
+        let result = engine.apply_backfilled_event(&packet).await;
+        assert!(
+            result.is_err(),
+            "a backfilled event beyond now+5min must be rejected at admission; got {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("forward-skew"),
+            "error must mention the forward-skew bound; got: {err:?}"
+        );
+
+        assert!(
+            voting_log.lock().await.polls.is_empty(),
+            "a future-rejected backfilled event must not create a poll"
+        );
+        assert_eq!(
+            floor.merged_now(now_ms),
+            now_ms,
+            "a future-rejected backfilled event must NOT feed the adoption floor"
         );
     }
 
@@ -6456,6 +6683,198 @@ mod tests {
             "second reserve {:?} must strictly advance past first {:?}",
             (second.wall_ms, second.logical),
             (first.wall_ms, first.logical)
+        );
+    }
+
+    // ── ZEB-846 (Layer 2 / E1): stage-now clamp in kd=cl orchestration ────
+
+    /// A Tier 3 poll's `last_hlc` can carry a poisoned far-future wall
+    /// (legacy poison predating Layer 1, or a value that slipped past a
+    /// sibling admission route). `maybe_trigger_engine_auto_orchestration`
+    /// must not let that poison advance the HLC-projected stage straight to
+    /// Ratification and instant-finalize the poll via kd=cl.
+    ///
+    /// Builds a Tier 3 poll (PollCreate + kd=ss, past sortition) whose
+    /// `poll_create_hlc` sits at real "now" with 1-hour windows — well
+    /// above the 5-minute clamp ceiling — then poisons `last_hlc` to
+    /// real-now + 1 year and invokes the orchestration trigger directly.
+    /// Without the E1 clamp the poisoned `last_hlc` would blow past both
+    /// windows, `current_stage_at` would report `Ratification`, and
+    /// `last_wall >= created + total_window` would trivially hold — firing
+    /// kd=cl. With the clamp, the effective "now" is capped to receiver-now
+    /// + 5min, which (given 1hr windows) keeps the poll in `Deliberation` —
+    /// so kd=cl must NOT fire.
+    #[tokio::test]
+    async fn future_event_does_not_advance_poll_stage_to_ratification() {
+        use crate::community_voting_core::{
+            Eligibility, MemberAttrs, MembershipSnapshot, SortitionSelectionPayload,
+            Tier3PollConfigPayload,
+        };
+
+        let community_id = SpaceId([0xE1; 16]);
+        let (_proposer_key, proposer_owner, _proposer_pub64) = fixture_identity_engine(0xE1);
+        let (local_key, local_owner, _local_pub64) = fixture_identity_engine(0xE2);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let sortition_size: u16 = 20;
+        let config = Tier3PollConfigPayload {
+            proposal_text: "ZEB-846 E1 clamp test".into(),
+            sortition_size,
+            deliberation_window_seconds: 3600, // 1hr — far above the 5min clamp ceiling
+            drafting_window_seconds: 3600,
+            ratification_window_seconds: 3600,
+            privacy_mode: "pu".into(),
+            incentive_mode: "a".into(),
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        };
+        let mut cfg_payload = Vec::new();
+        ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
+        let create_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: Hlc {
+                wall_ms: now_ms,
+                logical: 0,
+                device_id: "dev-e1-cr".into(),
+            },
+            actor: proposer_owner,
+            payload: cfg_payload,
+            sig: vec![0u8; 64],
+        };
+
+        let electorate: Vec<OwnerAddr> = (0..(sortition_size as usize))
+            .map(|i| {
+                let mut a = [0u8; 16];
+                a[0] = i as u8;
+                a[1] = 0xE1;
+                OwnerAddr(a)
+            })
+            .collect();
+        let snapshot = MembershipSnapshot {
+            members: electorate
+                .iter()
+                .map(|o| {
+                    (
+                        *o,
+                        MemberAttrs {
+                            power: 1,
+                            vouching_depth: 0,
+                        },
+                    )
+                })
+                .chain(std::iter::once((
+                    proposer_owner,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )))
+                .collect(),
+        };
+
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply_with_snapshot(create_event, &community_id, Some(snapshot))
+            .expect("apply tier3 PollCreate");
+
+        let ss_payload_struct = SortitionSelectionPayload {
+            poll_id: pid,
+            primary: electorate,
+            backup: vec![],
+        };
+        let mut ss_payload = Vec::new();
+        ciborium::into_writer(&ss_payload_struct, &mut ss_payload).expect("encode ss");
+        let ss_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::SortitionSelection,
+            hlc: Hlc {
+                wall_ms: now_ms + 1,
+                logical: 0,
+                device_id: "dev-e1-ss".into(),
+            },
+            actor: proposer_owner,
+            payload: ss_payload,
+            sig: vec![0u8; 64],
+        };
+        log.apply_with_snapshot(ss_event, &community_id, None)
+            .expect("apply kd=ss");
+
+        // ZEB-846 (E1 test setup): poison last_hlc far into the future —
+        // models legacy poison that predates Layer 1 (or a value that
+        // slipped past a sibling admission route lacking its own bound).
+        {
+            let t3 = log
+                .polls
+                .get_mut(&pid)
+                .expect("poll present")
+                .tier_state
+                .as_tier3_mut()
+                .expect("tier3 state");
+            t3.last_hlc = Some(Hlc {
+                wall_ms: now_ms + 365 * 86_400_000,
+                logical: 0,
+                device_id: "dev-poison".into(),
+            });
+        }
+
+        let (publisher_tx, mut publisher_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (_subscriber_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(8);
+        let app = tauri::test::mock_app();
+        let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+            community_id,
+            voting_log: Arc::new(Mutex::new(log)),
+            publisher_tx,
+            subscriber_rx,
+            hlc_tracker: Some(Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "dev-e1-local".to_string(),
+            )))),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            device_id: Some("dev-e1-local".to_string()),
+            app_handle: Some(app.handle().clone()),
+            identity_resolver: None,
+            membership_resolver: None,
+        })
+        .await;
+
+        engine
+            .install_local_signing_key(Arc::new(local_key), local_owner)
+            .await;
+
+        let base_hlc = Hlc {
+            wall_ms: now_ms,
+            logical: 0,
+            device_id: "dev-e1-local".into(),
+        };
+        engine
+            .maybe_trigger_engine_auto_orchestration(&pid, &base_hlc)
+            .await;
+
+        {
+            let log = engine.voting_log.lock().await;
+            let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+            assert!(
+                t3.close_event_hash.is_none(),
+                "clamped stage-now must keep the poll pre-Ratification; a poisoned \
+                 far-future last_hlc must not instant-finalize it via kd=cl"
+            );
+        }
+
+        assert!(
+            publisher_rx.try_recv().is_err(),
+            "no kd=cl packet should have been published from a clamped future last_hlc"
         );
     }
 }

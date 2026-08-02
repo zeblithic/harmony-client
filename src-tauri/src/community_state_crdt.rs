@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::community_membership::{
-    event_sort_key, materialize, materialize_with_now, verify_event, EventId,
+    event_sort_key, materialize_with_bounds, materialize_with_now, verify_event, EventId,
     MaterializedMembership, SignedMembershipEvent, VerifyContext, VerifyError,
 };
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
@@ -211,6 +211,66 @@ struct MaterializedCache {
     /// but pinning this is cheap defense in depth.
     cached_admin_addr: Option<OwnerAddr>,
     cached: Option<MaterializedMembership>,
+    /// ZEB-846: wall time (ms) at which the soonest currently-deferred
+    /// future-dated event enters the `MAX_FORWARD_SKEW_MS` window, i.e.
+    /// `min(excluded event walls) - MAX_FORWARD_SKEW_MS`. `None` = the cached
+    /// view excluded nothing on forward-skew grounds, so advancing wall time
+    /// cannot change it (the version key alone governs validity). When `Some`,
+    /// a cache hit is additionally gated on `receiver_now < recompute_after_ms`
+    /// — past that instant the version-keyed view is stale w.r.t. the clock and
+    /// must re-materialize even though the log is unchanged, so a legitimately
+    /// skewed event becomes effective the moment it is plausible rather than
+    /// waiting for the next log mutation to bust the cache.
+    recompute_after_ms: Option<u64>,
+    /// ZEB-846: whether the forward-skew ceiling was ENABLED (receiver clock
+    /// available, `Some`) when this view was built. The bound is time-dependent
+    /// *only while enabled*; the enabled/disabled MODE is a second axis the
+    /// version key does not capture. A view built with the ceiling disabled
+    /// (pre-epoch clock ⇒ apply-all) must not keep serving after the clock
+    /// recovers — it would UNDER-exclude a now-boundable future event; a bounded
+    /// view must not keep serving after the clock is lost — it would keep
+    /// DEFERRING honest governance. So a cache hit additionally requires the
+    /// current mode to equal this one. `None` = cache never populated.
+    cached_ceiling_enabled: Option<bool>,
+}
+
+/// ZEB-846: whether a time-aware cached materialization is still valid at
+/// `receiver_now_ms`. `recompute_after_ms` is the wall time at which the
+/// soonest currently-deferred event enters the forward-skew window (see
+/// [`MaterializedCache::recompute_after_ms`]); `None` means nothing was
+/// deferred, so the cache is time-insensitive. A `None` `receiver_now_ms`
+/// (pre-epoch clock) keeps the cache valid — the ceiling is disabled anyway, so
+/// nothing was deferred to become includable. Pulled out as a pure fn so the
+/// refresh boundary is exhaustively unit-testable without mocking the clock.
+fn cache_time_still_valid(recompute_after_ms: Option<u64>, receiver_now_ms: Option<u64>) -> bool {
+    match recompute_after_ms {
+        None => true,
+        Some(t) => receiver_now_ms.is_none_or(|rn| rn < t),
+    }
+}
+
+/// ZEB-846: whether a cached materialization is still valid to serve at the
+/// current clock, across BOTH axes the version key does not capture:
+///
+/// 1. **Ceiling mode** — the view is only reusable if the ceiling is in the
+///    same enabled/disabled state it was built under. A `None`-clock (apply-all)
+///    view surviving a clock recovery would UNDER-exclude a now-boundable future
+///    event (the direction ZEB-846 exists to prevent); a bounded view surviving
+///    a clock loss would keep DEFERRING honest governance. A never-populated
+///    cache (`cached_ceiling_enabled == None`) is never a hit.
+/// 2. **Time** — within a bounded (enabled) mode, the soonest-deferred event
+///    must not yet have entered the window ([`cache_time_still_valid`]).
+///
+/// Pure so both mode-flip directions are exhaustively unit-testable without
+/// mocking the system clock.
+fn cache_policy_still_valid(
+    cached_ceiling_enabled: Option<bool>,
+    now_ceiling_enabled: bool,
+    recompute_after_ms: Option<u64>,
+    receiver_now_ms: Option<u64>,
+) -> bool {
+    cached_ceiling_enabled == Some(now_ceiling_enabled)
+        && cache_time_still_valid(recompute_after_ms, receiver_now_ms)
 }
 
 // `VerifiedLog<MembershipPolicy>` (the core engine) does not derive `Debug`,
@@ -445,6 +505,27 @@ impl CommunityState {
         self.log.len()
     }
 
+    /// Test-only: the cache's current `recompute_after_ms` (ZEB-846 time-aware
+    /// invalidation marker). `None` until `materialized()` has populated it.
+    #[cfg(test)]
+    pub(crate) fn cache_recompute_after_for_test(&self) -> Option<u64> {
+        self.cache
+            .lock()
+            .expect("cache mutex poisoned")
+            .recompute_after_ms
+    }
+
+    /// Test-only: the ceiling MODE (`Some(true)` = ceiling enabled / receiver
+    /// clock available) recorded when the cache was last populated. `None` until
+    /// `materialized()` has run. ZEB-846 clock-mode invalidation marker.
+    #[cfg(test)]
+    pub(crate) fn cache_ceiling_enabled_for_test(&self) -> Option<bool> {
+        self.cache
+            .lock()
+            .expect("cache mutex poisoned")
+            .cached_ceiling_enabled
+    }
+
     /// Cache version counter. Bumps on every successful insert.
     /// Useful for IPC layers that want to short-circuit "did anything
     /// change?" checks across calls. Mirrors the version-counter
@@ -489,14 +570,54 @@ impl CommunityState {
                 }
             }
         }
+        // ZEB-846: sample the receiver-`now` ONCE up front — it feeds both the
+        // time-aware cache-invalidation check below and (on a miss) the forward
+        // ceiling. `receiver_now` is THIS node's own trusted wall clock (never a
+        // peer/HLC-adopt value — the attacker we bound can move those). `None`
+        // (pre-epoch clock) ⇒ ceiling disabled (apply-all), so a bad local clock
+        // can't drop honest governance.
+        let receiver_now = crate::clock_trust::receiver_now_ms();
+        let now_ceiling_enabled = receiver_now.is_some();
         let cache_hit = cache.cached_version == Some(cache.version)
-            && cache.cached_admin_addr == Some(admin_addr);
+            && cache.cached_admin_addr == Some(admin_addr)
+            && cache_policy_still_valid(
+                cache.cached_ceiling_enabled,
+                now_ceiling_enabled,
+                cache.recompute_after_ms,
+                receiver_now,
+            );
         if !cache_hit {
             let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
-            let m = materialize(&log, admin_addr);
+            // Apply the receiver-`now` forward-skew ceiling. The floor stays
+            // `None` here (event-driven cached view). The excluded set is
+            // view-only: nothing is deleted from the stored CRDT state, only
+            // from this materialized snapshot. Reload-safe: the store is never
+            // mutated, so a reloaded log re-derives the same bound on first read.
+            let m = materialize_with_bounds(&log, admin_addr, None, receiver_now);
+            // Compute when the soonest currently-deferred event will enter the
+            // window so the version-keyed cache self-refreshes at that instant
+            // instead of over-excluding until the next log mutation. `None`
+            // receiver_now (pre-epoch) excludes nothing ⇒ no time sensitivity.
+            let recompute_after_ms = receiver_now.and_then(|rn| {
+                log.iter()
+                    .map(|e| e.at.wall_ms)
+                    .filter(|&w| {
+                        crate::clock_trust::reject_future(
+                            w,
+                            rn,
+                            crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                        )
+                    })
+                    .min()
+                    .map(|min_excluded| {
+                        min_excluded.saturating_sub(crate::clock_trust::MAX_FORWARD_SKEW_MS)
+                    })
+            });
             cache.cached = Some(m.clone());
             cache.cached_version = Some(cache.version);
             cache.cached_admin_addr = Some(admin_addr);
+            cache.recompute_after_ms = recompute_after_ms;
+            cache.cached_ceiling_enabled = Some(now_ceiling_enabled);
             return m;
         }
         cache
@@ -567,7 +688,11 @@ impl CommunityState {
     /// cache pollution would be undesirable.
     pub fn materialize_now(&self, admin_addr: OwnerAddr) -> MaterializedMembership {
         let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
-        materialize(&log, admin_addr)
+        // ZEB-846: forward-skew ceiling against this node's own wall clock; floor
+        // stays `None` (this is the no-floor uncached read). `None` receiver_now
+        // (pre-epoch clock) ⇒ apply-all.
+        let receiver_now = crate::clock_trust::receiver_now_ms();
+        materialize_with_bounds(&log, admin_addr, None, receiver_now)
     }
 
     /// ZEB-713: time-aware uncached materialization — the accessor every
@@ -589,7 +714,11 @@ impl CommunityState {
         now_ms: u64,
     ) -> MaterializedMembership {
         let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
-        materialize_with_now(&log, admin_addr, Some(now_ms))
+        // ZEB-846: recovery reads pass `wall_now_ms` here — it IS the receiver's
+        // own clock, so it serves as BOTH the aging floor and the forward-skew
+        // ceiling. A future-dated event is excluded before materialize just as in
+        // the cached read.
+        materialize_with_bounds(&log, admin_addr, Some(now_ms), Some(now_ms))
     }
 
     // ── ZEB-748 phase 6a: event-log accessors ──────────────────────────
@@ -774,6 +903,7 @@ mod policy_tests {
         // as Task 7's per-insert ctx will thread it.
         let ctx = MembershipInsertCtx {
             verify: VerifyContext {
+                now_ms: None,
                 expected_community_id: community_id,
                 admin_addr: addr,
                 is_invite_only: false,
@@ -812,5 +942,305 @@ mod policy_tests {
             CoreOutcome::Rejected(VerifyError::WrongCommunity)
         ));
         assert_eq!(log.len(), 1);
+    }
+}
+
+// ── ZEB-846 Task 2: forward-skew ceiling in the CommunityState accessors ──
+//
+// The three read accessors (`materialized`, `materialize_now`,
+// `materialized_with_now`) apply a receiver-`now` forward ceiling: an event
+// stamped more than `MAX_FORWARD_SKEW_MS` beyond THIS node's own wall clock is
+// excluded from the view. The exclusion is a live view over the persisted log —
+// non-destructive — so it must survive a persist→reload round-trip WITHOUT any
+// admission layer having filtered the log first.
+#[cfg(test)]
+mod zeb846_accessor_ceiling {
+    use super::*;
+    use crate::community_membership::{MemberStatus, MembershipEventKind};
+    use crate::community_state_persist;
+    use crate::owner_state_types::Hlc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
+
+    const COMMUNITY: SpaceId = SpaceId([0xc0; 16]);
+    const YEAR_MS: u64 = 365 * 86_400_000;
+
+    fn real_now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64
+    }
+
+    fn addr(seed: u8) -> OwnerAddr {
+        OwnerAddr([seed; 16])
+    }
+
+    /// Build a signed-shaped event with a dummy signature. `materialize*` is a
+    /// pure replay that never verifies signatures (see its doc comment), so a
+    /// zero `sig` is sufficient to exercise the accessors' ceiling.
+    fn join_event(id_byte: u8, actor: OwnerAddr, at_wall_ms: u64) -> SignedMembershipEvent {
+        let mut id = [0xfd; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: COMMUNITY,
+            kind: MembershipEventKind::Join,
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    fn kick_event(
+        id_byte: u8,
+        actor: OwnerAddr,
+        target: OwnerAddr,
+        at_wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let mut id = [0xfa; 16];
+        id[15] = id_byte;
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id: COMMUNITY,
+            kind: MembershipEventKind::Kick {
+                target,
+                reason: None,
+            },
+            actor,
+            at: Hlc {
+                wall_ms: at_wall_ms,
+                logical: 0,
+                device_id: "test".into(),
+            },
+            sig: [0; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    /// Local "is `a` an active member of the view" read — mirrors the
+    /// `mat.members.get(&addr).map(|m| m.status)` inspection used throughout the
+    /// membership tests; not a new accessor.
+    fn membership_contains(m: &MaterializedMembership, a: &OwnerAddr) -> bool {
+        matches!(
+            m.members.get(a).map(|s| s.status),
+            Some(MemberStatus::Joined)
+        )
+    }
+
+    /// A `CommunityState` whose log holds an honest victim Join (stamped just
+    /// before real now) plus a far-future admin Kick of that victim (now + 1yr).
+    /// The admin holds power 100 implicitly via the materialize bootstrap rule,
+    /// so WITHOUT the ceiling the Kick wins LWW (wall is the primary sort key)
+    /// and bans the victim; WITH it the future Kick is excluded and the victim
+    /// retains membership.
+    fn state_with_join_and_future_kick() -> (CommunityState, OwnerAddr, OwnerAddr) {
+        let admin = addr(1);
+        let victim = addr(2);
+        let now = real_now_ms();
+        let join = join_event(10, victim, now - 10_000);
+        let kick = kick_event(20, admin, victim, now + YEAR_MS);
+        let state = CommunityState::from_trusted_events_for_test(COMMUNITY, [join, kick]);
+        (state, admin, victim)
+    }
+
+    #[test]
+    fn cached_materialized_excludes_future_dated_kick() {
+        let (state, admin, victim) = state_with_join_and_future_kick();
+        let m = state.materialized(admin);
+        assert!(
+            membership_contains(&m, &victim),
+            "cached materialized() read must exclude the future-dated Kick (receiver-now ceiling)"
+        );
+    }
+
+    #[test]
+    fn materialize_now_excludes_future_dated_kick() {
+        let (state, admin, victim) = state_with_join_and_future_kick();
+        let m = state.materialize_now(admin);
+        assert!(
+            membership_contains(&m, &victim),
+            "uncached materialize_now() read must also exclude the future-dated Kick"
+        );
+    }
+
+    #[test]
+    fn materialized_with_now_floor_and_ceiling_excludes_future_dated_kick() {
+        // Task 1 review carry-forward: exercise the recovery read where BOTH the
+        // aging floor Some(now) AND the forward ceiling Some(now) are active
+        // (the accessor passes `now_ms` as both), not only the None-floor path.
+        let (state, admin, victim) = state_with_join_and_future_kick();
+        let m = state.materialized_with_now(admin, real_now_ms());
+        assert!(
+            membership_contains(&m, &victim),
+            "materialized_with_now() (floor+ceiling both Some(now)) must exclude the future Kick"
+        );
+    }
+
+    #[test]
+    fn poison_survives_reload_but_is_still_deferred_on_materialize() {
+        // Reload-safety proof: persist a state carrying a far-future Kick frame
+        // directly (the poison is a normal trusted-log event here — Layer 3
+        // admission isn't wired yet), reload it, and confirm the ceiling STILL
+        // holds — proving the fix does NOT depend on admission having filtered
+        // the log.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("crdt.cbor");
+        let (state, admin, victim) = state_with_join_and_future_kick();
+        assert_eq!(
+            state.event_count(),
+            2,
+            "precondition: join + future kick both in the log"
+        );
+
+        community_state_persist::save_crdt(&path, &state).unwrap();
+        let reloaded = community_state_persist::load_crdt(&path, COMMUNITY).unwrap();
+
+        // (a) the poison event is RETAINED after reload (non-destructive):
+        assert!(
+            reloaded.event_count() >= 2,
+            "reload must RETAIN the poison event (non-destructive); we only defer it from the view"
+        );
+        // (b) but the materialized view still defers it:
+        let m = reloaded.materialized(admin);
+        assert!(
+            membership_contains(&m, &victim),
+            "after reload, materialized() still defers the future-dated Kick"
+        );
+    }
+
+    #[test]
+    fn cache_time_still_valid_covers_the_refresh_boundary() {
+        // No deferred event ⇒ time-insensitive: valid at any clock, including a
+        // pre-epoch (None) one.
+        assert!(cache_time_still_valid(None, Some(1_000)));
+        assert!(cache_time_still_valid(None, None));
+        // Some(t): the cache is valid strictly BEFORE the deferred event enters
+        // the window, and stale AT or AFTER that instant (must re-materialize so
+        // the now-plausible event takes effect).
+        assert!(
+            cache_time_still_valid(Some(1_000), Some(999)),
+            "before the window: cache still valid"
+        );
+        assert!(
+            !cache_time_still_valid(Some(1_000), Some(1_000)),
+            "at the window edge: recompute (event just became plausible)"
+        );
+        assert!(
+            !cache_time_still_valid(Some(1_000), Some(1_001)),
+            "past the window: recompute"
+        );
+        // A pre-epoch receiver clock disables the ceiling entirely (nothing was
+        // deferred), so the cache stays valid rather than thrashing.
+        assert!(
+            cache_time_still_valid(Some(1_000), None),
+            "pre-epoch receiver clock keeps the cache valid (apply-all)"
+        );
+    }
+
+    #[test]
+    fn materialized_sets_recompute_after_to_when_the_deferred_kick_becomes_plausible() {
+        // Wiring proof for the time-aware invalidation: after materializing a
+        // view that defers a far-future Kick, the cache records EXACTLY when that
+        // Kick enters the 5-min window (`kick_wall - MAX_FORWARD_SKEW_MS`), so a
+        // silent community (no further log mutations) still self-refreshes at
+        // that instant instead of over-excluding forever.
+        let admin = addr(1);
+        let victim = addr(2);
+        let now = real_now_ms();
+        let kick_wall = now + YEAR_MS;
+        let join = join_event(10, victim, now - 10_000);
+        let kick = kick_event(20, admin, victim, kick_wall);
+        let state = CommunityState::from_trusted_events_for_test(COMMUNITY, [join, kick]);
+
+        let _ = state.materialized(admin); // populate the cache
+        assert_eq!(
+            state.cache_recompute_after_for_test(),
+            Some(kick_wall - crate::clock_trust::MAX_FORWARD_SKEW_MS),
+            "recompute_after must mark exactly when the sole deferred Kick becomes plausible"
+        );
+    }
+
+    #[test]
+    fn cache_policy_invalidates_on_ceiling_mode_flip() {
+        // Greptile P1: the cache must not reuse a view built under a different
+        // ceiling MODE (receiver-clock availability).
+        //
+        // None→Some (clock recovers): an apply-all view (built ceiling-disabled)
+        // must NOT survive — it would keep INCLUDING a future poison event the
+        // recovered clock should now bound out (under-exclusion).
+        assert!(
+            !cache_policy_still_valid(Some(false), true, None, Some(1_000)),
+            "apply-all view must be invalidated once the clock recovers (else under-exclusion)"
+        );
+        // Some→None (clock breaks): a bounded view (built ceiling-enabled) must
+        // NOT survive — it would keep DEFERRING honest governance after the
+        // clock is lost, violating the apply-all-on-bad-clock invariant.
+        assert!(
+            !cache_policy_still_valid(Some(true), false, Some(1_000), None),
+            "bounded view must be invalidated once the clock is lost (else honest governance stays dropped)"
+        );
+        // Same mode + time still valid ⇒ hit.
+        assert!(
+            cache_policy_still_valid(Some(true), true, Some(1_000), Some(999)),
+            "same enabled mode, deferred event not yet plausible ⇒ still valid"
+        );
+        assert!(
+            cache_policy_still_valid(Some(false), false, None, None),
+            "same disabled mode ⇒ still valid"
+        );
+        // Same enabled mode but the deferred event has entered the window ⇒
+        // the time axis still forces a recompute.
+        assert!(
+            !cache_policy_still_valid(Some(true), true, Some(1_000), Some(1_000)),
+            "same mode but deferred event now plausible ⇒ recompute"
+        );
+        // A never-populated cache is never a hit.
+        assert!(
+            !cache_policy_still_valid(None, true, None, Some(1_000)),
+            "unpopulated cache (cached_ceiling_enabled None) is never a hit"
+        );
+    }
+
+    #[test]
+    fn materialized_records_enabled_ceiling_mode() {
+        // Wiring proof: on any real host the clock is available, so a populated
+        // cache records the ENABLED mode — the value the mode gate compares
+        // against on the next read.
+        let (state, admin, _victim) = state_with_join_and_future_kick();
+        let _ = state.materialized(admin);
+        assert_eq!(
+            state.cache_ceiling_enabled_for_test(),
+            Some(true),
+            "a real-clock materialize must record the ceiling as enabled"
+        );
+    }
+
+    #[test]
+    fn materialized_leaves_recompute_after_none_when_nothing_is_deferred() {
+        // No future-dated event ⇒ the cached view is time-insensitive and the
+        // version key alone governs validity (no wall-clock invalidation cost on
+        // the common path).
+        let admin = addr(1);
+        let member = addr(2);
+        let now = real_now_ms();
+        let join = join_event(10, member, now - 20_000);
+        let state = CommunityState::from_trusted_events_for_test(COMMUNITY, [join]);
+
+        let _ = state.materialized(admin);
+        assert_eq!(
+            state.cache_recompute_after_for_test(),
+            None,
+            "no future-dated event ⇒ recompute_after stays None"
+        );
     }
 }

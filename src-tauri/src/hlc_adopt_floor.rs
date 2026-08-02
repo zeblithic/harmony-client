@@ -154,9 +154,16 @@ mod tests {
         // the blast-radius analysis — re-run it before touching this test.
         // 60_000 = the invite/open-join forward windows
         // (open_join_admit.rs `now + 60_000`, community_invite.rs same).
+        //
+        // ZEB-846 unified ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS onto
+        // clock_trust::MAX_FORWARD_SKEW_MS (30min → 5min = 300_000ms);
+        // headroom re-derived 360x → 60x. The 5s adopt cap stays far below the
+        // tightened budget (60x), so ZEB-790 §6.2's blast-radius conclusion
+        // holds — a 5s adopt advance is negligible against a 5min governance
+        // skew gate. Widening CAP still trips this pin.
         assert!(HLC_ADOPT_FORWARD_CAP_MS * 12 <= 60_000);
         assert!(
-            HLC_ADOPT_FORWARD_CAP_MS * 360
+            HLC_ADOPT_FORWARD_CAP_MS * 60
                 <= crate::community_membership::ADMIN_PROPOSAL_MAX_FORWARD_SKEW_MS
         );
     }

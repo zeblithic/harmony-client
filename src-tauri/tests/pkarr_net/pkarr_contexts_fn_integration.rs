@@ -254,6 +254,7 @@ async fn setup_one_community(
         .expect("spawn engine");
 
     let ctx = VerifyContext {
+        now_ms: None,
         expected_community_id: community_id,
         admin_addr: admin.owner,
         is_invite_only: false,
