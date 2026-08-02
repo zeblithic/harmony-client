@@ -3312,6 +3312,100 @@ mod integration_tests {
         );
     }
 
+    /// ZEB-847 (T-OWNER, Finding GR, CRITICAL — FAIL-OPEN): `revoked_at` is
+    /// itself a grow-only `max` join, symmetric with `granted_at` above. A
+    /// sibling snapshot can re-supply an honest, in-window ACTIVE grant
+    /// (`granted_at = now`) paired with a poisoned future `revoked_at`,
+    /// which — absent the guard — would out-LWW the local unset revoke and
+    /// grief-lock the grant deactivated forever. The
+    /// `|| wall_exceeds_forward_skew(g.revoked_at, ..)` arm must drop the
+    /// whole record before the max-join, so the poison never lands.
+    #[test]
+    fn future_dated_revoke_reshare_cannot_grief_lock_an_active_grant() {
+        use crate::file_sharing::{record_grant, revoke_grant_inner};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xe5u8; 32];
+        let grantee = OwnerAddr([0xe6; 16]);
+
+        // Local state already holds an honest ACTIVE grant at real `now`.
+        let mut local = OwnerState::default();
+        record_grant(&mut local, cid, grantee, now_ms);
+
+        // A malicious sibling snapshot re-supplies the same grant with an
+        // honest in-window `granted_at` but a `revoked_at` stamped 400 days
+        // ahead, which would out-LWW the local unset revoke forever.
+        let mut remote = OwnerState::default();
+        record_grant(&mut remote, cid, grantee, now_ms);
+        revoke_grant_inner(
+            &mut remote,
+            cid,
+            grantee,
+            now_ms + 400 * 24 * 60 * 60 * 1000,
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        let entry = local.file_grants[&cid]
+            .iter()
+            .find(|g| g.grantee_owner == grantee)
+            .expect("grantee entry present");
+        assert!(
+            entry.granted_at > entry.revoked_at,
+            "future-dated revoke re-share must not grief-lock an active grant: granted_at={} revoked_at={}",
+            entry.granted_at,
+            entry.revoked_at,
+        );
+        // The poison must not partially land in the grow-only `revoked_at`
+        // max register either — the never-revoked default is `0`.
+        assert_eq!(
+            entry.revoked_at, 0,
+            "poisoned revoked_at must not merge into the max register: revoked_at={}",
+            entry.revoked_at,
+        );
+    }
+
+    /// Companion to the above: a legit revoke strictly newer than the grant,
+    /// but well within the forward-skew tolerance window, must still
+    /// deactivate it — the guard isn't over-rejecting.
+    #[test]
+    fn in_window_revoke_reshare_still_deactivates_a_grant() {
+        use crate::file_sharing::{record_grant, revoke_grant_inner};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xe7u8; 32];
+        let grantee = OwnerAddr([0xe8; 16]);
+
+        // Local holds an active grant.
+        let mut local = OwnerState::default();
+        record_grant(&mut local, cid, grantee, now_ms);
+
+        // A legit revoke, strictly newer, but well within the 5-min
+        // forward-skew tolerance window.
+        let mut remote = OwnerState::default();
+        record_grant(&mut remote, cid, grantee, now_ms);
+        revoke_grant_inner(&mut remote, cid, grantee, now_ms + 1000);
+
+        merge_remote_into_local(&mut local, remote);
+
+        let entry = local.file_grants[&cid]
+            .iter()
+            .find(|g| g.grantee_owner == grantee)
+            .expect("grantee entry present");
+        assert!(
+            entry.granted_at <= entry.revoked_at,
+            "an in-window revoke re-share must still deactivate the grant: granted_at={} revoked_at={}",
+            entry.granted_at,
+            entry.revoked_at,
+        );
+    }
+
     /// ZEB-847 (T-OWNER, Finding RG, CRITICAL — FAIL-OPEN): `received_file_grants`
     /// activeness is `received_at > dismissed_at`, both `max`-merged `u64`
     /// (ZEB-727). A sibling snapshot can carry a `ReceivedFileGrant` re-supplied
