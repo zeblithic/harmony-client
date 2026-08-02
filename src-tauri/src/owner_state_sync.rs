@@ -269,6 +269,12 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         dismissed_received_grants,
     } = remote;
 
+    // ZEB-847 (T-OWNER): sample the receiver's OWN wall clock ONCE for the whole
+    // merge. Every peer/sibling-supplied stamp below is bounded against this and
+    // this only — never a peer/HLC/adoption value. `None` (unreadable clock) ⇒
+    // apply-all: a bad LOCAL clock must never drop honest owner state.
+    let receiver_now = crate::clock_trust::receiver_now_ms();
+
     // ZEB-243: apply remote outbox tombstones FIRST. LWW per id by HLC;
     // sweep matching local outbox entries whose created_at is strictly
     // older than the merged tombstone HLC. Must precede the outbox merge
@@ -383,6 +389,12 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // is normal LWW and `Inserted`/`Merged` are the success paths — only
     // `InvariantFail` is logged.
     for (addr, entry) in friend_graph.friends {
+        // ZEB-847: a future-dated `learned_at` would out-LWW every later honest
+        // revoke forever (FAIL-OPEN: blocked party keeps DM access). Reject it —
+        // clamping is insufficient (a clamped now+5min still beats an honest now).
+        if crate::clock_trust::wall_exceeds_forward_skew(entry.learned_at.wall_ms, receiver_now) {
+            continue;
+        }
         if let crate::owner_state_crdt::ApplyOutcome::Rejected(
             reason @ crate::owner_state_crdt::RejectionReason::InvariantFail(_),
         ) = local.apply_friend_update(addr, entry)
@@ -2663,6 +2675,117 @@ mod integration_tests {
         assert!(
             local.friend_graph.friends.is_empty(),
             "no friend entry should have been merged"
+        );
+    }
+
+    /// ZEB-847 (T-OWNER, Finding FR): fixed master key for the forward-skew
+    /// FriendEntry-reject tests below. `friend_entry` always stamps this key,
+    /// so callers derive the matching `OwnerAddr` via
+    /// `owner_id_from_master_ed25519(&TEST_FRIEND_MASTER)` — satisfying the
+    /// addr↔master_ed25519 invariant `apply_friend_update` enforces
+    /// (owner_state_crdt.rs:1093) without every test having to thread a real
+    /// key through.
+    const TEST_FRIEND_MASTER: [u8; 32] = [0x5f; 32];
+
+    /// `Hlc` with a given `wall_ms`; `logical`/`device_id` held constant so
+    /// `learned_at` ordering below is decided purely by `wall_ms`.
+    fn hlc_at(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "test".into(),
+        }
+    }
+
+    /// `FriendEntry` for `TEST_FRIEND_MASTER` with the given status/learned_at.
+    fn friend_entry(
+        status: crate::friend_graph::FriendStatus,
+        learned_at: Hlc,
+    ) -> crate::friend_graph::FriendEntry {
+        crate::friend_graph::FriendEntry {
+            master_ed25519: TEST_FRIEND_MASTER,
+            display: None,
+            status,
+            established_via: crate::friend_graph::FriendOrigin::Token,
+            referrable: false,
+            learned_at,
+            sealed_secret: None,
+        }
+    }
+
+    /// ZEB-847 (T-OWNER, Finding FR, CRITICAL — FAIL-OPEN): a sibling
+    /// snapshot can carry a `FriendEntry` stamped with an arbitrary future
+    /// `learned_at.wall_ms`. `FriendEntry` is LWW-by-`learned_at` (newer
+    /// wins; `Revoked` is a tombstone), so an un-rejected future-dated
+    /// `Active` would out-LWW every later honest `Revoked` forever — the
+    /// blocked party keeps DM access permanently, defeating the DM cutoff.
+    /// The forward-skew reject in the friend loop must drop the poisoned
+    /// entry before it ever reaches `apply_friend_update`.
+    #[test]
+    fn future_dated_active_friend_cannot_block_an_honest_revoke() {
+        use crate::friend_graph::FriendStatus;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let friend = crate::friend_graph::owner_id_from_master_ed25519(&TEST_FRIEND_MASTER);
+
+        // Local state already holds an honest REVOKE at real `now`.
+        let mut local = OwnerState::default();
+        local.apply_friend_update(friend, friend_entry(FriendStatus::Revoked, hlc_at(now_ms)));
+
+        // A malicious sibling snapshot re-activates the friendship, stamped
+        // 400 days ahead so it would out-LWW the honest revoke forever.
+        let mut remote = OwnerState::default();
+        remote.apply_friend_update(
+            friend,
+            friend_entry(
+                FriendStatus::Active,
+                hlc_at(now_ms + 400 * 24 * 60 * 60 * 1000),
+            ),
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        // The forward-skew reject drops the poisoned Active → the revoke stands.
+        assert_eq!(
+            local.friend_graph.friends.get(&friend).map(|e| &e.status),
+            Some(&FriendStatus::Revoked),
+            "future-dated Active must not resurrect a revoked friendship",
+        );
+    }
+
+    /// Companion to the above: an honest re-activate at real `now` (well
+    /// within the forward-skew tolerance) must still merge normally — the
+    /// guard must not over-reject legitimate in-window updates.
+    #[test]
+    fn present_dated_active_friend_still_wins_normally() {
+        use crate::friend_graph::FriendStatus;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let friend = crate::friend_graph::owner_id_from_master_ed25519(&TEST_FRIEND_MASTER);
+
+        let mut local = OwnerState::default();
+        local.apply_friend_update(friend, friend_entry(FriendStatus::Revoked, hlc_at(now_ms)));
+
+        let mut remote = OwnerState::default();
+        // learned_at strictly newer than the revoke, but well within the
+        // 5-min forward-skew tolerance window.
+        remote.apply_friend_update(
+            friend,
+            friend_entry(FriendStatus::Active, hlc_at(now_ms + 1000)),
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local.friend_graph.friends.get(&friend).map(|e| &e.status),
+            Some(&FriendStatus::Active),
+            "an in-window re-activate must merge normally",
         );
     }
 
