@@ -309,6 +309,13 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     }
 
     for (_, space) in spaces {
+        // ZEB-847: a future-dated `updated_at` would win the LWW and pin
+        // `shared_in_profile` (privacy-control bypass), discarding a later
+        // opt-out. Reject it; `created_at` is not a vector (earliest-wins +
+        // immutable-field guard at owner_state_crdt.rs:361-382).
+        if crate::clock_trust::wall_exceeds_forward_skew(space.updated_at.wall_ms, receiver_now) {
+            continue;
+        }
         local.apply_space_with_canonicalization(space);
     }
     for (_, entry) in outbox {
@@ -2786,6 +2793,121 @@ mod integration_tests {
             local.friend_graph.friends.get(&friend).map(|e| &e.status),
             Some(&FriendStatus::Active),
             "an in-window re-activate must merge normally",
+        );
+    }
+
+    /// ZEB-847 (T-OWNER, Finding SP): fixed SpaceId for the forward-skew
+    /// Space-reject tests below. Community kind — `shared_in_profile` is
+    /// only meaningful for Community spaces (owner_state_types.rs:1950-1968),
+    /// and it's also the kind for which the same-SpaceId immutable-field
+    /// guard (owner_state_crdt.rs:333-383) is active, so this shape proves
+    /// the forward-skew reject is what blocks the pin — not the guard
+    /// rejecting the whole merge outright for an unrelated reason.
+    const TEST_SPACE_ID: SpaceId = SpaceId([0x9a; 16]);
+
+    /// Community `Space` for `TEST_SPACE_ID` with the given `updated_at` /
+    /// `shared_in_profile`. Every other field — including the guarded
+    /// `admin_addr`, `is_invite_only`, `created_at`, `current_epoch`,
+    /// `current_epoch_key`, `old_epoch_keys` — is held fixed across
+    /// local/remote callers so only `updated_at`/`shared_in_profile` differ;
+    /// a mismatch on any guarded field would make `apply_space` reject the
+    /// whole merge (owner_state_crdt.rs:333-383) for the wrong reason.
+    fn privacy_space(updated_at: Hlc, shared_in_profile: bool) -> Space {
+        Space {
+            id: TEST_SPACE_ID,
+            kind: SpaceKind::Community,
+            parent: None,
+            community_id: None,
+            name: "Privacy Test Community".into(),
+            transport: None,
+            members: vec![],
+            custom_name: None,
+            notification_pref: None,
+            left_at: None,
+            created_at: hlc_at(1),
+            updated_at,
+            content_key: None,
+            prior_content_keys: vec![],
+            current_epoch: Some(0),
+            current_epoch_key: Some(crate::owner_state_types::EpochKey::new([0x11; 32])),
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: Some(OwnerAddr([0x22; 16])),
+            is_invite_only: Some(false),
+            shared_in_profile,
+            pending_join_at: None,
+        }
+    }
+
+    /// ZEB-847 (T-OWNER, Finding SP, CRITICAL — FAIL-OPEN): a sibling
+    /// snapshot can carry a `Space` stamped with an arbitrary future
+    /// `updated_at.wall_ms`. `Space` is LWW-by-`updated_at`
+    /// (`lww_merge_space` — `owner_state_crdt.rs:1225`), and the winner's
+    /// `shared_in_profile` pins the community's public-profile listing. An
+    /// un-rejected future-dated flip to `true` would out-LWW every later
+    /// honest opt-out forever — the user's privacy control is permanently
+    /// bypassed. The forward-skew reject in the spaces loop must drop the
+    /// poisoned entry before it ever reaches
+    /// `apply_space_with_canonicalization`.
+    #[test]
+    fn future_dated_space_cannot_pin_shared_in_profile() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Local state already holds an honest opt-OUT at real `now`.
+        let mut local = OwnerState::default();
+        local.apply_space_with_canonicalization(privacy_space(hlc_at(now_ms), false));
+
+        // A malicious sibling snapshot flips the community back to public,
+        // stamped 400 days ahead so it would out-LWW the honest opt-out
+        // forever.
+        let mut remote = OwnerState::default();
+        remote.apply_space_with_canonicalization(privacy_space(
+            hlc_at(now_ms + 400 * 24 * 60 * 60 * 1000),
+            true,
+        ));
+
+        merge_remote_into_local(&mut local, remote);
+
+        // The forward-skew reject drops the poisoned flip → the opt-out stands.
+        assert_eq!(
+            local
+                .spaces
+                .get(&TEST_SPACE_ID)
+                .map(|s| s.shared_in_profile),
+            Some(false),
+            "future-dated shared_in_profile=true must not override an honest opt-out",
+        );
+    }
+
+    /// Companion to the above: an honest opt-out change at real `now` (well
+    /// within the forward-skew tolerance) must still merge normally — the
+    /// guard must not over-reject legitimate in-window updates.
+    #[test]
+    fn present_dated_space_update_still_wins_normally() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let mut local = OwnerState::default();
+        local.apply_space_with_canonicalization(privacy_space(hlc_at(now_ms), false));
+
+        let mut remote = OwnerState::default();
+        // updated_at strictly newer than local's, but well within the 5-min
+        // forward-skew tolerance window.
+        remote.apply_space_with_canonicalization(privacy_space(hlc_at(now_ms + 1000), true));
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local
+                .spaces
+                .get(&TEST_SPACE_ID)
+                .map(|s| s.shared_in_profile),
+            Some(true),
+            "an in-window opt-in must merge normally",
         );
     }
 
