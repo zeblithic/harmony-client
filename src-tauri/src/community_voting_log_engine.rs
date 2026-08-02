@@ -3425,7 +3425,9 @@ async fn inbound_eligibility_check(
                     .await?;
                 }
                 // kd=ds / kd=dv already inline-check mini-public membership in
-                // apply_event (community_voting_tier3.rs:507/585).
+                // apply_event (community_voting_tier3.rs:507/585); kd=ts
+                // (TallyShare) likewise inline-checks committee membership + DLEQ
+                // at apply. No ingest gate needed for these.
                 _ => {}
             }
         }
@@ -7282,6 +7284,69 @@ mod tests {
         assert!(
             res.is_err(),
             "kd=rs before kd=cl must be rejected at ingest; got {res:?}"
+        );
+    }
+
+    fn encode_da_payload(pid: PollId, candidate_event_hash: [u8; 32]) -> Vec<u8> {
+        let p = crate::community_voting_core::DraftApprovalPayload {
+            poll_id: pid,
+            candidate_event_hash,
+        };
+        let mut b = Vec::new();
+        ciborium::into_writer(&p, &mut b).expect("encode da");
+        b
+    }
+
+    // kd=rb forge: an actor OUTSIDE the eligible electorate signs a
+    // RatificationBallot in the Ratification stage → verify_ratification_ballot's
+    // B3 NotInEligibleElectorate must reject at ingest. The event HLC is dated
+    // past both windows so B2 (NotInRatificationStage) passes first — the reject
+    // then provably isolates the B3 electorate check.
+    #[tokio::test]
+    async fn kd_rb_from_non_electorate_rejected() {
+        let (log, pid, _proposer, _member, snapshot, _cid) = tier3_ingest_fixture().await;
+        // Fixture windows: create=1_000_000, dw=fw=7_200_000s→ms → current_stage_at
+        // returns Ratification once wall_ms ≥ 15_400_000. 0xB9 is not in the
+        // frozen eligible_electorate_snapshot.
+        let (_k, outsider, _o64) = fixture_identity_engine(0xB9);
+        let rb = tier3_ingest_event(
+            PollEventKindCode::RatificationBallot,
+            outsider,
+            20_000_000,
+            encode_pid_ref(pid),
+        );
+        let res = inbound_eligibility_check(&rb, &snapshot, &log).await;
+        let err = res.expect_err("kd=rb from a non-electorate actor must be rejected at ingest");
+        assert!(
+            err.contains("NotInEligibleElectorate"),
+            "reject must isolate the B3 electorate check (not B2 stage); got {err:?}"
+        );
+    }
+
+    // kd=da forge (second verifier leg): a mini-public MEMBER (so verify_sd
+    // passes) signs a DraftApproval referencing a candidate hash absent from
+    // poll.candidates → verify_da_candidate_exists's UnknownCandidate must reject
+    // at ingest. kd=da is the only two-verifier arm; this is the one leg no
+    // other test covers — a regression dropping the candidate-exists check would
+    // otherwise pass silently.
+    #[tokio::test]
+    async fn kd_da_unknown_candidate_rejected() {
+        let (log, pid, _proposer, member, snapshot, _cid) = tier3_ingest_fixture().await;
+        // The fixture applies no kd=dc, so poll.candidates is empty — any hash is
+        // unknown. member is in the mini-public → verify_sd passes, isolating the
+        // candidate-exists leg.
+        let da = tier3_ingest_event(
+            PollEventKindCode::DraftApproval,
+            member,
+            1_500_000,
+            encode_da_payload(pid, [0xAB; 32]),
+        );
+        let res = inbound_eligibility_check(&da, &snapshot, &log).await;
+        let err =
+            res.expect_err("kd=da referencing an unknown candidate must be rejected at ingest");
+        assert!(
+            err.contains("UnknownCandidate"),
+            "reject must come from the candidate-exists leg (member passes verify_sd); got {err:?}"
         );
     }
 }
