@@ -1877,9 +1877,11 @@ mod tests {
         // After mark_pulled has set pulled_by (covered state), a direct call to
         // `doc.gc(now_ms_large)` — simulating the periodic sweep — removes the
         // entry. This confirms that the SWEEP (not mark_pulled inline) is what
-        // reclaims storage. The now_ms used here is large enough not to TTL-expire
-        // the entry on its own (we use a held_at.wall_ms that is well within TTL
-        // at any test-time clock); the removal is by coverage, not TTL.
+        // reclaims storage. TTL is keyed off `first_observed_ms` (ZEB-851), which
+        // this doc has never had stamped before this point — the `gc()` call below
+        // lazily stamps it to `now_ms` on the very sweep that observes it, so TTL
+        // trivially cannot have expired yet, regardless of `held_at`; the removal
+        // is by coverage, not TTL.
         let c = space(0xCC);
         let recipient = [0xAA; 16];
         let sender = [0x22; 16];
@@ -1906,9 +1908,11 @@ mod tests {
         );
 
         // Step 2: the periodic sweep (gc) now sees the entry as covered-at-start
-        // (pulled_by is non-empty) and removes it. Use a now_ms that is WITHIN
-        // TTL for the held_at.wall_ms=1_000 entry (held_at + TTL ≥ 1_000 +
-        // RELAY_HOLD_TTL_MS >> 2_000_000) — the removal is by coverage, not TTL.
+        // (pulled_by is non-empty) and removes it. Step 1's `mark_pulled` never
+        // touches `first_observed_ms`, so it is still unstamped for this key; the
+        // `gc()` call below (ZEB-851) lazily stamps it to `now_ms` on this same
+        // sweep, so TTL trivially cannot have expired yet regardless of
+        // `held_at.wall_ms` — the removal is by coverage, not TTL.
         let now_ms: u64 = 2_000_000;
         let removed = doc_arc.lock().await.gc(now_ms);
         assert!(removed, "gc sweep must remove the covered entry");

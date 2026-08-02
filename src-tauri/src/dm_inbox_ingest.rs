@@ -393,17 +393,27 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
     //
     // Churn-tolerant model (resurrection-by-merge): a sibling that GC'd
     // later than us can re-merge an old doc and resurrect a removed entry
-    // (the insert-once merge sees the missing key as new). That is FINE:
-    // both GC criteria are deterministic functions of (ingested_by, now),
-    // and `ingested_by` is grow-only with union merge — so every replica
-    // evaluating the resurrected entry reaches the same removable verdict
-    // and the next sweep removes it again (a resurrected entry arrives
-    // already covered, so it IS covered at that sweep's start). Once every
-    // replica has GC'd, no copy remains to resurrect, so the fleet
-    // converges WITHOUT tombstones. Re-ingestion after a lost ig-update is
-    // likewise safe: `apply_inbox` is idempotent on (space_id,
-    // message_cid), and the dm-received emit is gated on its Inserted
-    // outcome.
+    // (the insert-once merge sees the missing key as new). The COVERAGE
+    // criterion remains a deterministic function of (ingested_by, now):
+    // `ingested_by` is grow-only with union merge, so every replica
+    // evaluating a resurrected-but-covered entry reaches the same removable
+    // verdict and the next sweep removes it again (a resurrected entry
+    // arrives already covered, so it IS covered at that sweep's start).
+    // Once every replica has GC'd, no copy remains to resurrect, so the
+    // fleet converges WITHOUT tombstones.
+    //
+    // The TTL criterion is NOT fleet-wide deterministic (ZEB-851): it is
+    // keyed off this replica's own LOCAL, non-replicated
+    // `first_observed_ms`, lazily stamped on first local observation — a
+    // per-replica SOFT deadline, not a shared one. A never-covered entry
+    // resurrected by a still-holding peer re-stamps `first_observed_ms` on
+    // this replica and gets a fresh TTL window, so it may persist beyond a
+    // single TTL window in a continuously-merging fleet. This is bounded by
+    // the store's caps and is the deliberately-safe direction —
+    // over-retaining an undelivered DM beats dropping a live one.
+    // Re-ingestion after a lost ig-update is likewise safe: `apply_inbox`
+    // is idempotent on (space_id, message_cid), and the dm-received emit is
+    // gated on its Inserted outcome.
     //
     // An expired entry that was just ingested above is still removed —
     // delivery beat the deadline; the deposit record's job is done.

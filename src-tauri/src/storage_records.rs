@@ -794,6 +794,16 @@ fn evict_pins(
 /// newest and survives. Keying on the LOCAL receipt clock — never the
 /// peer-supplied `updated_at` — is what closes the ZEB-851 flood-evict
 /// vector: a peer stamp can no longer choose the eviction victim.
+///
+/// Consequence: once the map is at [`MAX_TRACKED_OWNERS`] with established
+/// rows, a genuinely NEW honest owner has the newest `received_at_ms` and
+/// evicts itself — it is NOT admitted until a slot frees (an LWW-replace of
+/// an existing owner, or a revocation purge). The established working set is
+/// frozen. This is inherent to flood resistance: admitting newcomers over
+/// established rows would re-open the flood this fn exists to close.
+/// [`MAX_TRACKED_OWNERS`] (1024) is set well above realistic honest
+/// storage-buddy counts, so honest saturation is not expected; if it ever
+/// becomes real, the mitigation is a higher cap or a liveness distinction.
 fn evict_overflow<R>(map: &mut HashMap<String, R>, received_at_ms: impl Fn(&R) -> u64) {
     while map.len() > MAX_TRACKED_OWNERS {
         let victim = map

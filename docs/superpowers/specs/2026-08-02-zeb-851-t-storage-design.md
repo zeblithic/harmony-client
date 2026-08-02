@@ -141,6 +141,11 @@ Per-replica local clocks are already the GC model here (churn-tolerant /
 resurrection-by-merge — line 139 doc). A restart clears the skip-serialized
 side-map, so post-restart the TTL restarts from the first sweep — an undelivered
 blob lives slightly longer, bounded and strictly safer than the grief closed.
+The same applies within a single fleet lifetime: a never-covered entry
+resurrected by a still-holding peer re-stamps `first_observed_ms` on this
+replica and gets a fresh TTL window, so it can persist beyond a single TTL in
+a continuously-merging fleet — still bounded by the store's caps, and the
+deliberately-safe direction.
 
 ### Test
 `gc` with a **backdated `held_at`** (far in the past) but a *fresh* local
@@ -172,6 +177,13 @@ Symmetric to Fix B:
 3. `deposited_at` untouched as FWW metadata. The `InboxEntry.received_at =
    deposited_at` display value (line 356) is left as-is (cosmetic; out of scope —
    it is what the sender claims, and does not gate delivery).
+
+As with Fix B, this trades fleet-wide TTL determinism for a per-replica soft
+deadline: a never-covered entry resurrected by a still-holding peer re-stamps
+`first_observed_ms` on this replica and gets a fresh TTL window, so an
+undelivered DM can persist beyond a single TTL in a continuously-merging
+fleet — bounded by the inbox's store caps, and the deliberately-safe
+direction (over-retaining an undelivered DM beats dropping a live one).
 
 ### Test
 `ingest_pending` with a **backdated `deposited_at`**: assert the entry is

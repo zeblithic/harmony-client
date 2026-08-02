@@ -153,7 +153,10 @@ impl RelayHoldDoc {
     ///
     /// **Coverage** — an entry with a non-empty `pulled_by` set is removed
     /// ONLY if it was already non-empty at sweep start (one-sweep deferral,
-    /// exactly mirroring `dm_inbox_ingest`'s `covered_at_start` pattern).
+    /// exactly mirroring `dm_inbox_ingest`'s `covered_at_start` pattern). A
+    /// deterministic function of (`pulled_by`, now_ms): every replica
+    /// evaluating a resurrected-but-covered entry reaches the same verdict,
+    /// so the fleet converges WITHOUT tombstones (see `dm_inbox_ingest.rs`).
     /// An entry whose ack landed DURING this gc call survives one call so
     /// the freshly-covered state can replicate before any replica destroys
     /// it. Deferral is implemented identically to `dm_inbox_ingest`: a
@@ -166,7 +169,12 @@ impl RelayHoldDoc {
     /// live hold). `first_observed_ms` is lazily stamped on the first sweep
     /// that observes each entry and is process-local (never persisted or
     /// replicated) — a restart clears it, restarting the TTL from the first
-    /// post-restart sweep.
+    /// post-restart sweep. Unlike coverage, this is a per-replica SOFT
+    /// deadline, not fleet-wide deterministic: a never-covered entry
+    /// resurrected by a still-holding peer re-stamps `first_observed_ms` and
+    /// gets a fresh TTL window here too, so it may persist beyond a single
+    /// TTL window in a continuously-merging fleet — bounded by the store's
+    /// caps.
     ///
     /// Returns `true` iff the doc changed (some entry was removed).
     pub fn gc(&mut self, now_ms: u64) -> bool {
@@ -600,7 +608,11 @@ mod tests {
             entry([1; 16], [2; 16], space(0xCC), hlc(1_000_000, "R"), "r", &[]),
         );
         let observed_at: u64 = 1_000_000;
-        doc.gc(observed_at); // stamps first_observed_ms[key] = observed_at
+        let pre_changed = doc.gc(observed_at); // stamps first_observed_ms[key] = observed_at
+        assert!(
+            !pre_changed,
+            "pre-stamp sweep must not remove a fresh entry"
+        );
 
         let changed = doc.gc(observed_at + RELAY_HOLD_TTL_MS);
         assert!(!changed, "boundary is NOT expired (strict <)");
