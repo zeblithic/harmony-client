@@ -3041,7 +3041,6 @@ async fn engine_auto_cl_when_ratification_window_expires() {
 
     let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
     let proposer = &identities[49];
-    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
     let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
 
     // engine_a holds the proposer's signing key → orchestration hook active.
@@ -3082,7 +3081,7 @@ async fn engine_auto_cl_when_ratification_window_expires() {
     let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
 
     let snapshot = MembershipSnapshot {
-        members: full_electorate
+        members: sortition_pool
             .iter()
             .map(|addr| {
                 (
@@ -3168,6 +3167,21 @@ async fn engine_auto_cl_when_ratification_window_expires() {
         );
     }
 
+    // ZEB-850 peer verify_ss admission (CodeAnt Major): engine_b must have
+    // ADMITTED the bridged kd=ss (sortition_result set), not merely applied the
+    // ungated kd=cl. With the snapshot built from `sortition_pool`, verify_ss
+    // recomputes the same selection and admits it; with the prior 50-member
+    // `full_electorate` snapshot it rejected as SortitionMismatch and this
+    // assertion fails, proving the peer sortition-admission cascade runs.
+    {
+        let log = engines.log_b.lock().await;
+        let t3 = log.polls[&poll_id].tier_state.as_tier3().unwrap();
+        assert!(
+            t3.sortition_result.is_some(),
+            "engine_b: must admit peer kd=ss via verify_ss (sortition_result set)"
+        );
+    }
+
     drop(engines);
 }
 
@@ -3197,7 +3211,6 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
 
     let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
     let proposer = &identities[49];
-    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
     let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
 
     let engines = setup_two_voting_engine_bridge_with_signing(COMMUNITY_ID, proposer).await;
@@ -3230,7 +3243,7 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
     let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
 
     let snapshot = MembershipSnapshot {
-        members: full_electorate
+        members: sortition_pool
             .iter()
             .map(|addr| {
                 (
@@ -3316,6 +3329,18 @@ async fn engine_auto_rs_after_cl_with_bit_identical_tally() {
     };
     assert_eq!(t3_a.stage, Stage::Finalized);
     assert_eq!(t3_b.stage, Stage::Finalized);
+    // ZEB-850 peer verify_ss admission (CodeAnt Major): engine_b must ADMIT the
+    // bridged kd=ss (sortition_result set) rather than only replay the ungated
+    // kd=cl/kd=rs. Aligning the snapshot with `sortition_pool` makes verify_ss
+    // recompute the same selection; the prior 50-member snapshot rejected it.
+    assert!(
+        t3_a.sortition_result.is_some(),
+        "engine_a: sortition_result must be Some"
+    );
+    assert!(
+        t3_b.sortition_result.is_some(),
+        "engine_b: must admit peer kd=ss via verify_ss (sortition_result set)"
+    );
     assert!(
         t3_a.close_event_hash.is_some(),
         "engine_a: close_event_hash must be Some"
@@ -3371,7 +3396,6 @@ async fn engine_auto_tier3_tauri_events_fire_at_expected_lifecycle_points() {
 
     let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
     let proposer = &identities[49];
-    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
     let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
 
     // Mock Tauri app + handle, plus listeners for the two events we assert on.
@@ -3437,7 +3461,7 @@ async fn engine_auto_tier3_tauri_events_fire_at_expected_lifecycle_points() {
     let poll_id = derive_poll_id(&COMMUNITY_ID, &create_signing_bytes);
 
     let snapshot = MembershipSnapshot {
-        members: full_electorate
+        members: sortition_pool
             .iter()
             .map(|addr| {
                 (

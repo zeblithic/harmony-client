@@ -3469,13 +3469,30 @@ async fn inbound_eligibility_check(
                 }
                 // kd=rs: else a member could forge an arbitrary finalized result.
                 // verify_sr: kd=cl applied + tally bit-identical to recompute.
+                // se-mode verify_sr runs a threshold-decrypt recompute
+                // (`recover_secret_tally`); clone the poll state under the guard
+                // and DROP the guard before verifying so the voting_log mutex is
+                // not held across that CPU-bound work (mirrors the kd=ss path;
+                // reduces the ZEB-858 ingest lock-hold surface).
                 crate::community_voting_core::PollEventKindCode::PollResult => {
                     let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
                         .ok_or_else(|| "kd=rs: undecodable poll id".to_string())?;
-                    with_tier3(voting_log, &pid, "kd=rs", |t3| {
-                        crate::community_voting_tier3::verify_sr(event, t3)
-                    })
-                    .await?;
+                    let t3 = {
+                        let log_g = voting_log.lock().await;
+                        log_g
+                            .polls
+                            .get(&pid)
+                            .and_then(|ps| ps.tier_state.as_tier3())
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!(
+                                    "kd=rs authz: unknown/non-tier3 poll {}",
+                                    hex::encode(pid.0)
+                                )
+                            })?
+                    };
+                    crate::community_voting_tier3::verify_sr(event, &t3)
+                        .map_err(|e| format!("kd=rs authz: {e:?}"))?;
                 }
                 // kd=md / kd=dc: mini-public membership (verify_sd).
                 crate::community_voting_core::PollEventKindCode::MiniPublicDecline

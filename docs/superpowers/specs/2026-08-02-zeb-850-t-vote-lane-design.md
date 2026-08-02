@@ -70,8 +70,9 @@ Recon identified the non-test readers of `last_received_hlc`:
    (`t3.last_received_hlc.clone()`), expects a single global max HLC.
 2. `community_voting_log_engine.rs:1725` — kd=rs **se-mode** mint floor, same.
 
-Add a helper `Tier3PollState::max_received_hlc() -> Option<(u64, u32)>` returning
-the max `(wall_ms, logical)` over all lanes; the two mint-floor sites rebuild their
+Add a helper `Tier3PollState::max_received_hlc() -> Option<Hlc>` returning the
+`Hlc` at the max `(wall_ms, logical)` over all lanes (its `device_id` is empty —
+the lane's device is irrelevant to the mint floor); the two mint-floor sites rebuild their
 floor from it (the engine mints with its **own** `device_id`, so the lane's
 `device_id` is irrelevant to the floor). `last_hlc` (the accepted-only projection
 watermark) is genuinely a single global value and is **not** changed.

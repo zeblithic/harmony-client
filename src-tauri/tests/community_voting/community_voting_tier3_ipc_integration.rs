@@ -1132,7 +1132,6 @@ async fn run_race_tolerant_inner(ss_hlc_wall: u64) -> (TwoVotingEngines, Option<
 
     let identities: Vec<TestIdentity> = (0..N_IDENTITIES as u8).map(fixture_identity).collect();
     let proposer = &identities[49];
-    let full_electorate: Vec<OwnerAddr> = identities.iter().map(|id| id.owner).collect();
     let sortition_pool: Vec<OwnerAddr> = identities[..49].iter().map(|id| id.owner).collect();
 
     // Both engines have the signing key installed → both can auto-orchestrate.
@@ -1162,7 +1161,7 @@ async fn run_race_tolerant_inner(ss_hlc_wall: u64) -> (TwoVotingEngines, Option<
     );
 
     let snapshot = MembershipSnapshot {
-        members: full_electorate
+        members: sortition_pool
             .iter()
             .map(|addr| {
                 (
@@ -1270,6 +1269,21 @@ async fn run_race_tolerant_inner(ss_hlc_wall: u64) -> (TwoVotingEngines, Option<
     };
     assert_eq!(t3_a.stage, Stage::Finalized);
     assert_eq!(t3_b.stage, Stage::Finalized);
+    // ZEB-850 peer verify_ss admission (CodeAnt/CodeRabbit): both engines must
+    // have set `sortition_result` from the bridged kd=ss. Before the snapshot
+    // was aligned with `sortition_pool`, engine_b's peer verify_ss rejected the
+    // selection (SortitionMismatch) and only reached Finalized via the bridged
+    // kd=cl/kd=rs fallback with `sortition_result == None` — this assertion
+    // fails in that degenerate case, proving the peer kd=ss accept path runs.
+    assert!(
+        t3_a.sortition_result.is_some(),
+        "engine_a must have applied kd=ss (sortition_result set)"
+    );
+    assert!(
+        t3_b.sortition_result.is_some(),
+        "engine_b must ADMIT the peer kd=ss via verify_ss (sortition_result set), \
+         not merely finalize through bridged kd=cl/kd=rs"
+    );
     // CRITICAL: close_event_hash must match (only one kd=cl winner).
     assert_eq!(
         t3_a.close_event_hash, t3_b.close_event_hash,

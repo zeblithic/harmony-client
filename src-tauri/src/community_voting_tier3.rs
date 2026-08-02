@@ -4608,6 +4608,45 @@ mod tests {
         );
     }
 
+    // ZEB-850 T-VOTE-LANE (CodeRabbit): the receive-watermark lane key is the
+    // FULL `(OwnerAddr, device_id)` tuple, not just the actor. The same member
+    // on two devices must occupy two lanes — a future stamp from device "dev-a"
+    // must not stall an honest event from the SAME actor's device "dev-b". If
+    // the key collapsed to actor-only, dev-a's future stamp would advance the
+    // shared lane and dev-b's now-event would be rejected HlcNotMonotonic.
+    #[test]
+    fn future_event_on_one_device_does_not_stall_same_actor_other_device() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let author = addr(1); // in the mini-public primary set
+
+        // Device "dev-a": an hour into the future → silent drop (past the 10s
+        // deliberation window), but advances the (author, "dev-a") lane.
+        let mut a_ev = ds_event_with_text(3_600_000, author, "dev-a from the future");
+        a_ev.hlc.device_id = "dev-a".into();
+        poll.apply_event(&a_ev)
+            .expect("dev-a dispatch is Ok (silent drop)");
+
+        // Device "dev-b" (SAME actor): honest statement at wall=100. Its lane
+        // (author, "dev-b") is untouched by dev-a's future stamp, so it applies.
+        let mut b_ev = ds_event_with_text(100, author, "dev-b honest");
+        b_ev.hlc.device_id = "dev-b".into();
+        poll.apply_event(&b_ev)
+            .expect("dev-b@now must apply — a different device is a different lane");
+
+        // Exactly the dev-b statement materialized (dev-a's dropped).
+        assert_eq!(
+            poll.deliberation.statements_per_author[&author], 1,
+            "only the dev-b statement is accepted; the future dev-a stamp dropped"
+        );
+        // The dev-a lane watermark did advance (max over lanes reflects it),
+        // so a within-lane earlier event on dev-a would still be rejected.
+        assert_eq!(
+            poll.max_received_hlc().unwrap().wall_ms,
+            3_600_000,
+            "dev-a lane watermark advanced on its silent drop"
+        );
+    }
+
     // ZEB-850 / ZEB-320 / Qodo #154: per-lane must NOT weaken the within-lane
     // guard. On a single (actor, device) lane, an earlier-HLC event delivered
     // after a later event that silently dropped must still be rejected — the
