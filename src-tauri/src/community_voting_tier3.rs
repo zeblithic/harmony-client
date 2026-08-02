@@ -1415,15 +1415,34 @@ pub fn verify_sr(
     let sq_hash = sq.event_hash;
 
     // Build candidate list from state (same as the ordered list used at ratification open).
-    // For SR1, we re-derive the ordered candidate set from the stored candidates.
-    // If status_quo is not yet present, the poll hasn't reached Drafting/Ratification
-    // stage — the PollResult event is premature; reject with StatusQuoNotSynthesized.
+    // ZEB-850 (Task 2 completion): status_quo is synthesized on demand and never
+    // persisted into `candidates`, so mirror the apply-time locals
+    // (`Tier3PollState::apply_event`, community_voting_tier3.rs:742-743) and include
+    // it before ranking — otherwise `drafting_advancers` returns None and this
+    // verifier rejects every legitimate peer kd=rs. Prematurity is already caught
+    // by the R1 close-applied check above.
     let primary_size = poll_state.meta.config.sortition_size as usize;
-    let advancers = drafting_advancers(&poll_state.candidates, primary_size, sq_hash)
+    let mut all_candidates = poll_state.candidates.clone();
+    all_candidates.push(sq);
+    let advancers = drafting_advancers(&all_candidates, primary_size, sq_hash)
         .ok_or(VerifyError::StatusQuoNotSynthesized)?;
     let ordered_candidates = ratification_candidates_ordering(&advancers, sq_hash);
 
-    let recomputed = tally_star(&ordered_candidates, &poll_state.ratification_ballots);
+    // ZEB-850 (Task 2 completion): recompute the result the SAME way the engine
+    // produces it, per privacy mode. se-mode is a threshold-decrypted tally
+    // (`recover_secret_tally`, mirroring `try_finalize_secret_tally`), NOT a
+    // plaintext STAR tally — `tally_star` skips se-mode ciphertext ballots and
+    // would return an all-zero result, so verify_sr would reject every legitimate
+    // peer se-mode kd=rs. `recover_secret_tally` is deterministic across replicas
+    // (Lagrange invariance), so this is a real authz check, not a weakening:
+    // a forged result recovers to a different tally → TallyMismatch. `None`
+    // (fewer than `threshold` shares applied) means this node cannot yet confirm
+    // the claim → fail-closed.
+    let recomputed = match poll_state.meta.config.privacy_mode.as_str() {
+        "se" => recover_secret_tally(poll_state, &ordered_candidates)
+            .ok_or(VerifyError::TallyMismatch)?,
+        _ => tally_star(&ordered_candidates, &poll_state.ratification_ballots),
+    };
 
     if recomputed != payload.result {
         return Err(VerifyError::TallyMismatch);
@@ -1461,12 +1480,18 @@ pub fn verify_ratification_ballot(
         decode_payload(&event.payload).map_err(VerifyError::PayloadDecode)?;
 
     // Compute the ratification candidate count from state.
-    // If status_quo is not yet present, the poll hasn't reached Drafting/Ratification
-    // stage — a RatificationBallot arriving now is premature.
+    // ZEB-850 (Task 2 completion): status_quo is synthesized on demand and never
+    // persisted into `candidates`, so mirror the apply-time locals
+    // (`Tier3PollState::apply_event`, community_voting_tier3.rs:742-743) and include
+    // it before ranking — otherwise `drafting_advancers` returns None and this
+    // verifier rejects every legitimate peer kd=rb. Prematurity is already caught
+    // by the B2 Ratification-stage check above.
     let sq = synthesize_status_quo(&poll_state.meta.poll_id);
     let sq_hash = sq.event_hash;
     let primary_size = poll_state.meta.config.sortition_size as usize;
-    let advancers = drafting_advancers(&poll_state.candidates, primary_size, sq_hash)
+    let mut all_candidates = poll_state.candidates.clone();
+    all_candidates.push(sq);
+    let advancers = drafting_advancers(&all_candidates, primary_size, sq_hash)
         .ok_or(VerifyError::StatusQuoNotSynthesized)?;
     let expected_candidate_count = advancers.len();
 
