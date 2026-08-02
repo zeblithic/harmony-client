@@ -325,6 +325,11 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         local.apply_inbox(entry);
     }
     for (_, marker) in markers {
+        // ZEB-847: a future `last_read_at` would pin "all read" forever (RM).
+        if crate::clock_trust::wall_exceeds_forward_skew(marker.last_read_at.wall_ms, receiver_now)
+        {
+            continue;
+        }
         local.apply_marker(marker);
     }
     for tomb in tombstones {
@@ -346,6 +351,12 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // would only see entries learned locally), breaking DM unicast
     // addressing convergence across bound devices.
     for (addr, entry) in owner_device_cache.devices {
+        // ZEB-847: a future `learned_at` would LWW-replace and then block every
+        // later legit device update (DEV → peer devices unlearnable, DMs
+        // UnknownSigningKey).
+        if crate::clock_trust::wall_exceeds_forward_skew(entry.learned_at.wall_ms, receiver_now) {
+            continue;
+        }
         local.apply_owner_device_update(
             addr,
             entry.devices,
@@ -363,6 +374,17 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // closes the snapshot-merge path so the field round-trips correctly
     // across Flow A.
     for (addr, remote_entry) in libraries {
+        // ZEB-847: a future `added_at` pins the library present; a future
+        // `removed_at` pins it removed and blocks re-adds (LE). Reject if either
+        // bound is implausibly future.
+        if crate::clock_trust::wall_exceeds_forward_skew(
+            remote_entry.added_at.wall_ms,
+            receiver_now,
+        ) || remote_entry.removed_at.as_ref().is_some_and(|rm| {
+            crate::clock_trust::wall_exceeds_forward_skew(rm.wall_ms, receiver_now)
+        }) {
+            continue;
+        }
         let remote_max: &Hlc = match &remote_entry.removed_at {
             Some(rm) if rm.is_strictly_newer_than(&remote_entry.added_at) => rm,
             _ => &remote_entry.added_at,
@@ -1930,7 +1952,9 @@ mod publisher_tests {
 mod integration_tests {
     use super::*;
     use crate::content_store::InMemoryStub;
-    use crate::owner_state_types::{OwnerAddr, Space, SpaceId, SpaceKind};
+    use crate::owner_state_types::{
+        LibraryEntry, OwnerAddr, ReadMarker, Space, SpaceId, SpaceKind,
+    };
     use std::time::Duration;
 
     async fn wait_until<F, Fut>(mut cond: F, timeout: Duration) -> bool
@@ -2908,6 +2932,229 @@ mod integration_tests {
                 .map(|s| s.shared_in_profile),
             Some(true),
             "an in-window opt-in must merge normally",
+        );
+    }
+
+    /// ZEB-847 (T-OWNER): fixed SpaceId for the forward-skew ReadMarker-reject
+    /// test below. Markers are keyed by `space_id`; the value is arbitrary
+    /// since no Space needs to exist for `apply_marker` to accept it.
+    const TEST_MARKER_SPACE: SpaceId = SpaceId([0x7c; 16]);
+
+    /// `ReadMarker` for `TEST_MARKER_SPACE` at the given `last_read_at`.
+    fn marker_at(last_read_at: Hlc) -> ReadMarker {
+        ReadMarker {
+            space_id: TEST_MARKER_SPACE,
+            last_read_at,
+        }
+    }
+
+    /// ZEB-847 (T-OWNER, Finding RM, CRITICAL — FAIL-OPEN): a sibling
+    /// snapshot can carry a `ReadMarker` stamped with an arbitrary future
+    /// `last_read_at.wall_ms`. `ReadMarker` is LWW-by-`last_read_at`
+    /// (`apply_marker` — owner_state_crdt.rs:687), so an un-rejected
+    /// future-dated marker would pin "everything read" and suppress unread
+    /// badges permanently. The forward-skew reject in the markers loop must
+    /// drop the poisoned entry before it ever reaches `apply_marker`.
+    #[test]
+    fn future_dated_marker_cannot_pin_all_read() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Local state already holds the honest (real, unread-since) marker.
+        let mut local = OwnerState::default();
+        local.apply_marker(marker_at(hlc_at(now_ms)));
+
+        // A malicious sibling snapshot pins "all read" 400 days ahead so it
+        // would out-LWW the honest marker forever.
+        let mut remote = OwnerState::default();
+        remote.apply_marker(marker_at(hlc_at(now_ms + 400 * 24 * 60 * 60 * 1000)));
+
+        merge_remote_into_local(&mut local, remote);
+
+        // The forward-skew reject drops the poisoned marker → the honest
+        // (older) last_read_at stands.
+        assert_eq!(
+            local
+                .markers
+                .get(&TEST_MARKER_SPACE)
+                .map(|m| &m.last_read_at),
+            Some(&hlc_at(now_ms)),
+            "future-dated last_read_at must not pin all-read forever",
+        );
+    }
+
+    /// ZEB-847 (T-OWNER, Finding DEV, CRITICAL — FAIL-OPEN): a sibling
+    /// snapshot can carry an `OwnerDeviceEntry` stamped with an arbitrary
+    /// future `learned_at.wall_ms`. `OwnerDeviceEntry` is LWW-by-`learned_at`
+    /// (`apply_owner_device_update` — owner_state_crdt.rs:733), so an
+    /// un-rejected future-dated entry would LWW-replace and then block every
+    /// later legit device update forever — the peer's new/rotated device is
+    /// never learned and their DMs read `UnknownSigningKey`. The
+    /// forward-skew reject in the owner_device_cache loop must drop the
+    /// poisoned entry before it ever reaches `apply_owner_device_update`,
+    /// AND must not itself block a subsequent in-window legit update.
+    #[test]
+    fn future_dated_device_entry_is_rejected_and_does_not_block_a_later_legit_learn() {
+        use crate::owner_state_types::DeviceIdentityHash;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let owner = OwnerAddr([0x91; 16]);
+        let old_device = DeviceIdentityHash([0x01; 16]);
+        let new_device = DeviceIdentityHash([0x02; 16]);
+
+        // Local already knows the current device set, learned at real `now`.
+        let mut local = OwnerState::default();
+        local.apply_owner_device_update(
+            owner,
+            vec![old_device],
+            vec![None],
+            vec![None],
+            hlc_at(now_ms),
+        );
+
+        // A malicious sibling snapshot LWW-replaces with an empty device
+        // list, stamped 400 days ahead so it would out-LWW every later
+        // legit update forever.
+        let mut remote = OwnerState::default();
+        remote.apply_owner_device_update(
+            owner,
+            vec![],
+            vec![],
+            vec![],
+            hlc_at(now_ms + 400 * 24 * 60 * 60 * 1000),
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local
+                .owner_device_cache
+                .devices
+                .get(&owner)
+                .map(|e| e.devices.clone()),
+            Some(vec![old_device]),
+            "future-dated learned_at must not LWW-replace the honest device list",
+        );
+
+        // The rejected poison must not block a subsequent in-window legit
+        // relearn — if the poison had been stored, this strictly-older-than-
+        // the-poison update would be rejected as StaleHlc and the new device
+        // would never be learnable.
+        let outcome = local.apply_owner_device_update(
+            owner,
+            vec![old_device, new_device],
+            vec![None, None],
+            vec![None, None],
+            hlc_at(now_ms + 1000),
+        );
+        assert!(
+            !matches!(outcome, crate::owner_state_crdt::ApplyOutcome::Rejected(_)),
+            "a real in-window device update must still apply after the poison is \
+             rejected, got {outcome:?}",
+        );
+        assert_eq!(
+            local
+                .owner_device_cache
+                .devices
+                .get(&owner)
+                .map(|e| e.devices.clone()),
+            Some(vec![old_device, new_device]),
+            "the new device must be learned after the in-window update",
+        );
+    }
+
+    /// ZEB-847 (T-OWNER): fixed OwnerAddr for the forward-skew
+    /// LibraryEntry-reject tests below.
+    const TEST_LIBRARY_ADDR: OwnerAddr = OwnerAddr([0x77; 16]);
+
+    /// `LibraryEntry` for `TEST_LIBRARY_ADDR` with the given `added_at` /
+    /// `removed_at`.
+    fn library_entry(added_at: Hlc, removed_at: Option<Hlc>) -> LibraryEntry {
+        LibraryEntry {
+            address: TEST_LIBRARY_ADDR,
+            added_at,
+            removed_at,
+        }
+    }
+
+    /// ZEB-847 (T-OWNER, Finding LE, CRITICAL — FAIL-OPEN): the trusted-
+    /// library set is LWW by `max(added_at, removed_at)`
+    /// (`LibraryEntry::is_effective` — owner_state_types.rs:2548). A sibling
+    /// snapshot can carry a future-dated `added_at` that would pin the
+    /// library present forever, undoing an honest removal. The forward-skew
+    /// reject in the libraries loop must drop the poisoned entry before it
+    /// ever reaches the remote_max/should_replace LWW comparison.
+    #[test]
+    fn future_dated_library_add_cannot_undo_an_honest_removal() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Local state already holds an honest removal at real `now`.
+        let mut local = OwnerState::default();
+        local.libraries.insert(
+            TEST_LIBRARY_ADDR,
+            library_entry(hlc_at(1), Some(hlc_at(now_ms))),
+        );
+
+        // A malicious sibling snapshot re-adds the library, stamped 400 days
+        // ahead so it would out-LWW the honest removal forever.
+        let mut remote = OwnerState::default();
+        remote.libraries.insert(
+            TEST_LIBRARY_ADDR,
+            library_entry(hlc_at(now_ms + 400 * 24 * 60 * 60 * 1000), None),
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local
+                .libraries
+                .get(&TEST_LIBRARY_ADDR)
+                .map(LibraryEntry::is_effective),
+            Some(false),
+            "future-dated added_at must not undo an honest removal",
+        );
+    }
+
+    /// Companion to the above: an honest removal at real `now` (well within
+    /// the forward-skew tolerance) must still merge normally — the guard
+    /// must not over-reject legitimate in-window updates.
+    #[test]
+    fn in_window_library_removal_still_applies() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let mut local = OwnerState::default();
+        local
+            .libraries
+            .insert(TEST_LIBRARY_ADDR, library_entry(hlc_at(now_ms), None));
+
+        let mut remote = OwnerState::default();
+        // removed_at strictly newer than added_at, but well within the
+        // 5-min forward-skew tolerance window.
+        remote.libraries.insert(
+            TEST_LIBRARY_ADDR,
+            library_entry(hlc_at(now_ms), Some(hlc_at(now_ms + 1000))),
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local
+                .libraries
+                .get(&TEST_LIBRARY_ADDR)
+                .map(LibraryEntry::is_effective),
+            Some(false),
+            "an in-window legit removal must still apply",
         );
     }
 
