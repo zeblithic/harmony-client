@@ -236,19 +236,43 @@ impl PersistentCardStore {
         true
     }
 
-    /// Last-known card for an owner, if any.
+    /// Last-known card for an owner, if any and not implausibly future-dated.
     pub fn get(&self, owner_id: &[u8; 16]) -> Option<PersistedCard> {
+        self.get_with_now(owner_id, crate::clock_trust::receiver_now_ms())
+    }
+
+    /// ZEB-849 (C4) L2 seam: `get`, but with the receiver clock injected. A
+    /// resident entry whose `shared_at.wall_ms` is beyond `now_ms + skew` is
+    /// suppressed from the view (never deleted — the map/disk are untouched;
+    /// `now_ms == None` ⇒ apply-all). Poison that predates the L1 ingest bound
+    /// can never be out-HLC'd by an honest card, so gating the read is the only
+    /// non-destructive remedy.
+    fn get_with_now(&self, owner_id: &[u8; 16], now_ms: Option<u64>) -> Option<PersistedCard> {
         let inner = self.inner.lock().expect("card store poisoned");
-        inner.map.get(owner_id).map(|e| e.card.clone())
+        let card = inner.map.get(owner_id).map(|e| e.card.clone())?;
+        if crate::clock_trust::wall_exceeds_forward_skew(card.shared_at.wall_ms, now_ms) {
+            return None;
+        }
+        Some(card)
     }
 
     /// `owner_id` → last-known display name, for bulk roster / network-health
     /// enrichment fallback (mirrors the live cache's `display_names_by_owner`).
     pub fn display_names_by_owner(&self) -> HashMap<[u8; 16], String> {
+        self.display_names_by_owner_with_now(crate::clock_trust::receiver_now_ms())
+    }
+
+    /// ZEB-849 (C4) L2 seam: `display_names_by_owner` with the receiver clock
+    /// injected; future-dated entries are omitted from the view (`None` ⇒
+    /// apply-all).
+    fn display_names_by_owner_with_now(&self, now_ms: Option<u64>) -> HashMap<[u8; 16], String> {
         let inner = self.inner.lock().expect("card store poisoned");
         inner
             .map
             .iter()
+            .filter(|(_, e)| {
+                !crate::clock_trust::wall_exceeds_forward_skew(e.card.shared_at.wall_ms, now_ms)
+            })
             .map(|(owner, e)| (*owner, e.card.display_name.clone()))
             .collect()
     }
@@ -620,6 +644,58 @@ mod tests {
         let names = store.display_names_by_owner();
         assert_eq!(names.get(&[1; 16]).map(String::as_str), Some("Alice"));
         assert_eq!(names.get(&[2; 16]).map(String::as_str), Some("Bob"));
+    }
+
+    #[test]
+    fn get_with_now_suppresses_future_dated_entry_non_destructively() {
+        // A poison entry (wall_ms far in the future) is omitted from the read view
+        // when the local clock is readable, but is NOT removed from the map/disk —
+        // suppress-from-view, never delete-on-load (slow-clock-purge safe).
+        let dir = tempfile::tempdir().unwrap();
+        let now_ms = 1_700_000_000_000u64;
+        let future = now_ms + 500 * 86_400 * 1000; // ~1.4 yr ahead
+        let store = PersistentCardStore::from_cards(
+            dir.path().join("profile_cards.x.cbor"),
+            DEFAULT_MAX_ENTRIES,
+            vec![card(0xEE, "Mallory", future), card(0x01, "Alice", now_ms)],
+        );
+        // Readable clock: poison suppressed, in-range shown.
+        assert!(store.get_with_now(&[0xEE; 16], Some(now_ms)).is_none());
+        assert_eq!(
+            store
+                .get_with_now(&[0x01; 16], Some(now_ms))
+                .unwrap()
+                .display_name,
+            "Alice"
+        );
+        // Non-destructive: the entry is still resident and still returned when the
+        // clock is unreadable (apply-all).
+        assert_eq!(store.len(), 2);
+        assert_eq!(
+            store.get_with_now(&[0xEE; 16], None).unwrap().display_name,
+            "Mallory"
+        );
+    }
+
+    #[test]
+    fn display_names_by_owner_with_now_omits_future_dated_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let now_ms = 1_700_000_000_000u64;
+        let future = now_ms + 500 * 86_400 * 1000;
+        let store = PersistentCardStore::from_cards(
+            dir.path().join("profile_cards.x.cbor"),
+            DEFAULT_MAX_ENTRIES,
+            vec![card(0xEE, "Mallory", future), card(0x01, "Alice", now_ms)],
+        );
+        let names = store.display_names_by_owner_with_now(Some(now_ms));
+        assert!(
+            !names.contains_key(&[0xEE; 16]),
+            "poison omitted from the view"
+        );
+        assert_eq!(names.get(&[0x01; 16]).map(String::as_str), Some("Alice"));
+        // Apply-all when the clock is unreadable.
+        let all = store.display_names_by_owner_with_now(None);
+        assert!(all.contains_key(&[0xEE; 16]));
     }
 
     #[test]
