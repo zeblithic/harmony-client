@@ -568,6 +568,11 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // clobber a fresh re-share, which the sweep would then delete — a re-share
     // lost on merge (CodeRabbit/Qodo, converge round 1).
     for (cid, dismissed_at) in dismissed_received_grants {
+        // ZEB-847 (RG): `dismissed_at` is the safe (deactivating) direction;
+        // clamp its magnitude so a future dismiss can't pin a received-grant
+        // dismissed out of reach of a legit re-share (grief-lockout).
+        let dismissed_at =
+            crate::clock_trust::clamp_wall_to_forward_skew(dismissed_at, receiver_now);
         let slot = local.dismissed_received_grants.entry(cid).or_insert(0);
         *slot = (*slot).max(dismissed_at);
     }
@@ -591,6 +596,15 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     //      both devices pick the SAME whole record and converge byte-for-byte.
     // Both records unseal to the same DEK, so the observable key is unchanged.
     for (cid, grant) in received_file_grants {
+        // ZEB-847 (RG, CRITICAL): `received_at` is the FAIL-OPEN direction
+        // — a future value wins the union/`active()` tie-break and survives the
+        // dismiss sweep (activeness is `received_at > dismissed_at`, a static
+        // max-merged compare). A clamp is insufficient (clamped now+5min still
+        // beats an honest dismiss at now), so REJECT — mirrors GR (Task 5). A
+        // legit re-share (received_at at real now, past receiver_now) is accepted.
+        if crate::clock_trust::wall_exceeds_forward_skew(grant.received_at, receiver_now) {
+            continue;
+        }
         match local.received_file_grants.get(&cid) {
             Some(existing) => {
                 let dismissed_at = local.dismissed_received_grants.get(&cid).copied();
@@ -3258,6 +3272,103 @@ mod integration_tests {
             "an in-window re-share must still reactivate the grant: granted_at={} revoked_at={}",
             entry.granted_at,
             entry.revoked_at,
+        );
+    }
+
+    /// ZEB-847 (T-OWNER, Finding RG, CRITICAL — FAIL-OPEN): `received_file_grants`
+    /// activeness is `received_at > dismissed_at`, both `max`-merged `u64`
+    /// (ZEB-727). A sibling snapshot can carry a `ReceivedFileGrant` re-supplied
+    /// with an arbitrary future `received_at`, which would out-LWW an honest
+    /// dismiss forever, undoing it. The forward-skew reject in the
+    /// `received_file_grants` union loop must drop the poisoned re-supply before
+    /// it ever enters the union/`active()` tie-break, so the existing dismiss
+    /// sweeps the (unchanged, still-stale) local grant out.
+    #[test]
+    fn future_dated_received_grant_reshare_cannot_undo_an_honest_dismiss() {
+        use crate::owner_state_types::{OwnerAddr, ReceivedFileGrant};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xf1u8; 32];
+        let grant = ReceivedFileGrant {
+            granter_owner: OwnerAddr([0xf2; 16]),
+            cid,
+            file_name: "f".into(),
+            file_size: 1,
+            mime: "application/octet-stream".into(),
+            sealed_dek: vec![0x01; 8],
+            received_at: now_ms - 1000,
+        };
+
+        // Local already holds an honest DISMISS at real `now`, for a grant
+        // received strictly before it (currently inactive).
+        let mut local = OwnerState::default();
+        local.received_file_grants.insert(cid, grant.clone());
+        local.dismissed_received_grants.insert(cid, now_ms);
+
+        // A malicious sibling snapshot re-supplies the same CID, stamped 400
+        // days ahead so it would out-LWW the honest dismiss forever.
+        let mut remote = OwnerState::default();
+        let mut poisoned = grant.clone();
+        poisoned.received_at = now_ms + 400 * 24 * 60 * 60 * 1000;
+        remote.received_file_grants.insert(cid, poisoned);
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert!(
+            !local.received_file_grants.contains_key(&cid),
+            "future-dated re-supply must not undo an honest dismiss: grant reads {:?}",
+            local.received_file_grants.get(&cid),
+        );
+    }
+
+    /// Companion to the above: a legit re-supply strictly newer than an
+    /// earlier dismiss, but well within the forward-skew tolerance window,
+    /// must still reactivate the grant (survive the ZEB-727 sweep) — the
+    /// guard isn't over-rejecting.
+    #[test]
+    fn in_window_received_grant_reshare_still_reactivates_after_a_dismiss() {
+        use crate::owner_state_types::{OwnerAddr, ReceivedFileGrant};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cid = [0xf3u8; 32];
+
+        // Local holds an older dismiss, no grant on file (a prior re-supply
+        // was fully swept away).
+        let mut local = OwnerState::default();
+        local.dismissed_received_grants.insert(cid, now_ms - 5000);
+
+        // A legit re-supply, strictly newer than the dismiss, but well within
+        // the 5-min forward-skew tolerance window.
+        let mut remote = OwnerState::default();
+        remote.received_file_grants.insert(
+            cid,
+            ReceivedFileGrant {
+                granter_owner: OwnerAddr([0xf4; 16]),
+                cid,
+                file_name: "f".into(),
+                file_size: 1,
+                mime: "application/octet-stream".into(),
+                sealed_dek: vec![0x02; 8],
+                received_at: now_ms + 1000,
+            },
+        );
+
+        merge_remote_into_local(&mut local, remote);
+
+        let got = local
+            .received_file_grants
+            .get(&cid)
+            .expect("an in-window re-supply must still reactivate the grant");
+        assert_eq!(
+            got.received_at,
+            now_ms + 1000,
+            "in-window re-supply must survive the merge sweep unmodified"
         );
     }
 
