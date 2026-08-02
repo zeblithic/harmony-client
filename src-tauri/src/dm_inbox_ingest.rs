@@ -2366,7 +2366,10 @@ mod tests {
             ..ProbeCtx::new()
         };
         let _ = ingest_pending(&mut doc, &later).await;
-        assert!(!doc.entries.contains_key(&key), "expired from local receipt");
+        assert!(
+            !doc.entries.contains_key(&key),
+            "expired from local receipt"
+        );
     }
 
     // ── ZEB-691: recipient inbox-sweeper revocation arm ──────────────────────
