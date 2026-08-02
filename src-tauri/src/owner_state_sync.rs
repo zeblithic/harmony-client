@@ -503,23 +503,25 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     for (cid, remote_grants) in file_grants {
         let entry = local.file_grants.entry(cid).or_default();
         for g in remote_grants {
-            // ZEB-847 (GR, CRITICAL): `granted_at` is the FAIL-OPEN vector — a
-            // future value wins the grow-only max and reactivates the grant past
-            // an honest revoke. A clamp is INSUFFICIENT (a clamped now+5min still
-            // exceeds an honest revoke at now, and `granted_at > revoked_at` is a
-            // static compare never re-evaluated against time), so REJECT the
-            // record outright — mirrors FR/SP/LE and the spec §6.2 primary
-            // `reject_future`-at-merge-boundary instruction. A later honest
-            // re-grant (granted_at at real now, past receiver_now) is accepted.
-            if crate::clock_trust::wall_exceeds_forward_skew(g.granted_at, receiver_now) {
+            // ZEB-847 (GR): reject a grant record carrying ANY future-dated stamp
+            // (more than MAX_FORWARD_SKEW_MS ahead of the receiver's own clock).
+            // `granted_at` future is the FAIL-OPEN vector — it wins the grow-only
+            // max and reactivates the grant past an honest revoke (a clamp is
+            // insufficient: a clamped now+5min still exceeds an honest revoke at
+            // now, and `granted_at > revoked_at` is a static compare). `revoked_at`
+            // future is bounded here too, but by REJECT, not clamp: clamping would
+            // persist a receiver-dependent value into this replicated grow-only
+            // max register and break cross-device convergence (two clocks clamp
+            // the same poison to different stored values). Dropping the record
+            // leaves honest local state untouched and stores only raw,
+            // all-devices-agree values, nullifying the poison rather than
+            // transforming it. Honest revokes stamp revoked_at = now.max(
+            // granted_at) <= now+5min, so they pass the gate.
+            if crate::clock_trust::wall_exceeds_forward_skew(g.granted_at, receiver_now)
+                || crate::clock_trust::wall_exceeds_forward_skew(g.revoked_at, receiver_now)
+            {
                 continue;
             }
-            // `revoked_at` is the SAFE (deactivating) direction, but a future
-            // value over-revokes and pins the register out of reach of a legit
-            // re-grant (grief-lockout). Clamp its magnitude before the max-join.
-            let mut g = g;
-            g.revoked_at =
-                crate::clock_trust::clamp_wall_to_forward_skew(g.revoked_at, receiver_now);
             match entry
                 .iter()
                 .position(|e| e.grantee_owner == g.grantee_owner)
@@ -568,11 +570,14 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     // clobber a fresh re-share, which the sweep would then delete — a re-share
     // lost on merge (CodeRabbit/Qodo, converge round 1).
     for (cid, dismissed_at) in dismissed_received_grants {
-        // ZEB-847 (RG): `dismissed_at` is the safe (deactivating) direction;
-        // clamp its magnitude so a future dismiss can't pin a received-grant
-        // dismissed out of reach of a legit re-share (grief-lockout).
-        let dismissed_at =
-            crate::clock_trust::clamp_wall_to_forward_skew(dismissed_at, receiver_now);
+        // ZEB-847 (RG): reject (skip) a future-dated dismiss rather than clamp —
+        // this is a replicated grow-only tombstone, so clamping would persist a
+        // receiver-dependent value and diverge across devices. A poisoned future
+        // dismiss is nullified (never stored); an honest dismiss (<= now+5min)
+        // passes and merges by max as before.
+        if crate::clock_trust::wall_exceeds_forward_skew(dismissed_at, receiver_now) {
+            continue;
+        }
         let slot = local.dismissed_received_grants.entry(cid).or_insert(0);
         *slot = (*slot).max(dismissed_at);
     }
@@ -3016,6 +3021,37 @@ mod integration_tests {
         );
     }
 
+    /// Companion to the above: an honest marker advance at real `now` (well
+    /// within the forward-skew tolerance) must still merge normally — the
+    /// guard must not over-reject legitimate in-window updates.
+    #[test]
+    fn in_window_marker_advance_still_applies() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Local holds an older marker.
+        let mut local = OwnerState::default();
+        local.apply_marker(marker_at(hlc_at(now_ms)));
+
+        // Remote supplies a strictly newer marker, but well within the 5-min
+        // forward-skew tolerance window.
+        let mut remote = OwnerState::default();
+        remote.apply_marker(marker_at(hlc_at(now_ms + 1000)));
+
+        merge_remote_into_local(&mut local, remote);
+
+        assert_eq!(
+            local
+                .markers
+                .get(&TEST_MARKER_SPACE)
+                .map(|m| &m.last_read_at),
+            Some(&hlc_at(now_ms + 1000)),
+            "an in-window marker advance must still merge normally",
+        );
+    }
+
     /// ZEB-847 (T-OWNER, Finding DEV, CRITICAL — FAIL-OPEN): a sibling
     /// snapshot can carry an `OwnerDeviceEntry` stamped with an arbitrary
     /// future `learned_at.wall_ms`. `OwnerDeviceEntry` is LWW-by-`learned_at`
@@ -3195,8 +3231,9 @@ mod integration_tests {
     /// sibling snapshot can carry a `GrantEntry` re-shared with an
     /// arbitrary future `granted_at`, which would out-LWW every honest
     /// `revoked_at` and pin the grant active forever, bypassing a file-share
-    /// revoke. The forward-skew clamp in the `file_grants` loop must cap the
-    /// incoming stamp before the max-join.
+    /// revoke. The forward-skew reject in the `file_grants` loop must drop the
+    /// poisoned record before the max-join; a clamp is insufficient, because a
+    /// clamped `now + 5min` still exceeds an honest `revoked_at` at `now`.
     #[test]
     fn future_dated_grant_reshare_cannot_undo_an_honest_revoke() {
         use crate::file_sharing::{record_grant, revoke_grant_inner};
@@ -3239,7 +3276,7 @@ mod integration_tests {
 
     /// Companion to the above: a legit re-share strictly newer than an
     /// earlier revoke, but well within the forward-skew tolerance window,
-    /// must still reactivate the grant — the guard isn't over-clamping.
+    /// must still reactivate the grant — the guard isn't over-rejecting.
     #[test]
     fn in_window_grant_reshare_still_reactivates_after_a_revoke() {
         use crate::file_sharing::{record_grant, revoke_grant_inner};

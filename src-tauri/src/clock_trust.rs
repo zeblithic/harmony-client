@@ -102,15 +102,6 @@ pub fn wall_exceeds_forward_skew(wall_ms: u64, receiver_now_ms: Option<u64>) -> 
     receiver_now_ms.is_some_and(|rn| reject_future(wall_ms, rn, MAX_FORWARD_SKEW_MS))
 }
 
-/// Clamps `wall_ms` down to at most `receiver_now + MAX_FORWARD_SKEW_MS` for a
-/// grow-only `max`-merged register, so a future-dated stamp cannot win the join
-/// and pin the register forever. `receiver_now_ms == None` ⇒ unchanged
-/// (apply-all). A past/present stamp is returned unchanged.
-#[inline]
-pub fn clamp_wall_to_forward_skew(wall_ms: u64, receiver_now_ms: Option<u64>) -> u64 {
-    receiver_now_ms.map_or(wall_ms, |rn| clamp_future(wall_ms, rn, MAX_FORWARD_SKEW_MS))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,26 +188,6 @@ mod tests {
         assert!(
             wall_exceeds_forward_skew(now + MAX_FORWARD_SKEW_MS + 1, Some(now)),
             "one past the ceiling is rejected"
-        );
-    }
-
-    #[test]
-    fn clamp_wall_to_forward_skew_caps_only_the_future() {
-        let now = 1_700_000_000_000;
-        assert_eq!(
-            clamp_wall_to_forward_skew(now - 5, Some(now)),
-            now - 5,
-            "past unchanged"
-        );
-        assert_eq!(
-            clamp_wall_to_forward_skew(now + MAX_FORWARD_SKEW_MS + 10_000, Some(now)),
-            now + MAX_FORWARD_SKEW_MS,
-            "future capped to the ceiling"
-        );
-        assert_eq!(
-            clamp_wall_to_forward_skew(u64::MAX, None),
-            u64::MAX,
-            "None ⇒ apply-all (unchanged)"
         );
     }
 
