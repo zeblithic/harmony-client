@@ -7044,6 +7044,200 @@ mod tests {
         );
     }
 
+    /// ZEB-850 Task 4 (E1 pin): a tighter mirror of the test above, sized so
+    /// the poisoned watermark sits only +1h in the future (not +1yr) and the
+    /// poll windows elapse just past the 5-minute clamp ceiling. This narrows
+    /// the discrimination margin: the auto-trigger clamps the effective "now"
+    /// fed to `current_stage_at` to `receiver_now + MAX_FORWARD_SKEW_MS`
+    /// (5 min) via `clock_trust::clamp_future`, so a `last_hlc.wall_ms` of
+    /// `receiver_now + 1h` is capped to +5min — which (given a 10-min
+    /// deliberation window) keeps the poll in `Deliberation`, NOT
+    /// `Ratification`. kd=cl must therefore NOT fire.
+    ///
+    /// Discrimination: replace the `clamp_future(...)` call at the trigger with
+    /// the raw `last_wall` and the effective "now" jumps to +1h — past the
+    /// 30-min total window — so `current_stage_at` reports `Ratification` and
+    /// `last_wall >= created + total_window` holds, firing kd=cl. The
+    /// `close_event_hash.is_none()` + no-packet assertions then fail.
+    #[tokio::test]
+    async fn e1_kd_cl_trigger_clamps_future_last_hlc_to_control_tier() {
+        use crate::community_voting_core::{
+            Eligibility, MemberAttrs, MembershipSnapshot, SortitionSelectionPayload,
+            Tier3PollConfigPayload,
+        };
+
+        let community_id = SpaceId([0xC1; 16]);
+        let (_proposer_key, proposer_owner, _proposer_pub64) = fixture_identity_engine(0xC1);
+        let (local_key, local_owner, _local_pub64) = fixture_identity_engine(0xC2);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Windows elapse only after the 5-min clamp ceiling (10 min each,
+        // 30 min total) but well before the +1h poison — so with the clamp the
+        // poll is pre-Ratification, and without it the +1h watermark is past
+        // the full window.
+        let sortition_size: u16 = 20;
+        let config = Tier3PollConfigPayload {
+            proposal_text: "ZEB-850 Task 4 E1 clamp pin".into(),
+            sortition_size,
+            deliberation_window_seconds: 600, // 10 min — above the 5-min clamp ceiling
+            drafting_window_seconds: 600,
+            ratification_window_seconds: 600,
+            privacy_mode: "pu".into(),
+            incentive_mode: "a".into(),
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        };
+        let mut cfg_payload = Vec::new();
+        ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
+        let create_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: Hlc {
+                wall_ms: now_ms,
+                logical: 0,
+                device_id: "dev-c1-cr".into(),
+            },
+            actor: proposer_owner,
+            payload: cfg_payload,
+            sig: vec![0u8; 64],
+        };
+
+        let electorate: Vec<OwnerAddr> = (0..(sortition_size as usize))
+            .map(|i| {
+                let mut a = [0u8; 16];
+                a[0] = i as u8;
+                a[1] = 0xC1;
+                OwnerAddr(a)
+            })
+            .collect();
+        let snapshot = MembershipSnapshot {
+            members: electorate
+                .iter()
+                .map(|o| {
+                    (
+                        *o,
+                        MemberAttrs {
+                            power: 1,
+                            vouching_depth: 0,
+                        },
+                    )
+                })
+                .chain(std::iter::once((
+                    proposer_owner,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )))
+                .collect(),
+        };
+
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply_with_snapshot(create_event, &community_id, Some(snapshot))
+            .expect("apply tier3 PollCreate");
+
+        // Apply kd=ss so the poll is past sortition and `current_stage_at`
+        // projects from the deliberation/drafting windows (not Stage::Sortition).
+        let ss_payload_struct = SortitionSelectionPayload {
+            poll_id: pid,
+            primary: electorate,
+            backup: vec![],
+        };
+        let mut ss_payload = Vec::new();
+        ciborium::into_writer(&ss_payload_struct, &mut ss_payload).expect("encode ss");
+        let ss_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::SortitionSelection,
+            hlc: Hlc {
+                wall_ms: now_ms + 1,
+                logical: 0,
+                device_id: "dev-c1-ss".into(),
+            },
+            actor: proposer_owner,
+            payload: ss_payload,
+            sig: vec![0u8; 64],
+        };
+        log.apply_with_snapshot(ss_event, &community_id, None)
+            .expect("apply kd=ss");
+
+        // Poison last_hlc to receiver-now + 1h. The clamp caps the effective
+        // "now" to +5min, so this future watermark must NOT force Ratification.
+        {
+            let t3 = log
+                .polls
+                .get_mut(&pid)
+                .expect("poll present")
+                .tier_state
+                .as_tier3_mut()
+                .expect("tier3 state");
+            t3.last_hlc = Some(Hlc {
+                wall_ms: now_ms + 3_600_000, // +1h
+                logical: 0,
+                device_id: "dev-poison".into(),
+            });
+        }
+
+        let (publisher_tx, mut publisher_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (_subscriber_tx, subscriber_rx) = mpsc::channel::<Vec<u8>>(8);
+        let app = tauri::test::mock_app();
+        let engine = VotingLogEngine::<tauri::test::MockRuntime>::start(VotingLogEngineParams {
+            community_id,
+            voting_log: Arc::new(Mutex::new(log)),
+            publisher_tx,
+            subscriber_rx,
+            hlc_tracker: Some(Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "dev-c1-local".to_string(),
+            )))),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            device_id: Some("dev-c1-local".to_string()),
+            app_handle: Some(app.handle().clone()),
+            identity_resolver: None,
+            membership_resolver: None,
+        })
+        .await;
+
+        engine
+            .install_local_signing_key(Arc::new(local_key), local_owner)
+            .await;
+
+        let base_hlc = Hlc {
+            wall_ms: now_ms,
+            logical: 0,
+            device_id: "dev-c1-local".into(),
+        };
+        engine
+            .maybe_trigger_engine_auto_orchestration(&pid, &base_hlc)
+            .await;
+
+        {
+            let log = engine.voting_log.lock().await;
+            let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+            assert!(
+                t3.close_event_hash.is_none(),
+                "clamped stage-now must keep the poll pre-Ratification; a +1h \
+                 last_hlc must not force it to Ratification/Finalized via kd=cl"
+            );
+        }
+
+        assert!(
+            publisher_rx.try_recv().is_err(),
+            "no kd=cl packet should have been published from a clamped +1h last_hlc"
+        );
+    }
+
     // ── ZEB-850 Task 2: sync tier-3 peer-ingest authz verifiers ────────────────
     //
     // These exercise the `Tier::Sortition` arm of `inbound_eligibility_check`
@@ -7685,6 +7879,49 @@ mod tests {
         assert!(
             err.contains("no beacon oracle"),
             "reject must be the fail-closed oracle gate; got {err:?}"
+        );
+        let g = log.lock().await;
+        let t3 = g.polls.get(&pid).unwrap().tier_state.as_tier3().unwrap();
+        assert!(
+            t3.sortition_result.is_none(),
+            "a fail-closed kd=ss must not install a sortition_result"
+        );
+    }
+
+    // kd=ss fail-closed on BeaconNotYetAvailable (ZEB-850 Task 4, design-mandated):
+    // distinct from `kd_ss_no_oracle_fail_closed` (oracle == None) — here the
+    // oracle IS wired but its VRF output isn't indexed yet (`FixedBeacon(None)`),
+    // so `verify_ss` returns `VerifyError::BeaconNotYetAvailable`. The ingest gate
+    // must fail closed: the kd=ss is REJECTED (never admitted un-verified) and no
+    // sortition_result is installed. A *correct* payload is used to prove the
+    // reject is the beacon-not-yet-available gate, not a sortition mismatch.
+    #[tokio::test]
+    async fn kd_ss_beacon_not_yet_available_fail_closed() {
+        let (log, pid, proposer, snapshot, cid) = tier3_pre_ss_fixture().await;
+        let vrf = [0x55u8; 32];
+        let correct = correct_ss_for(&log, pid, &vrf).await;
+        let ss = tier3_ingest_event(
+            PollEventKindCode::SortitionSelection,
+            proposer,
+            1_000_002,
+            encode_ss_payload(pid, correct.primary, correct.backup),
+        );
+        // Oracle present, but the beacon isn't indexed yet ⇒ verify_ss returns
+        // BeaconNotYetAvailable.
+        let oracle = FixedBeacon(None);
+        let res = inbound_eligibility_check(
+            &ss,
+            &snapshot,
+            &log,
+            cid,
+            Some(&oracle as &dyn crate::community_voting_tier3::BeaconOracle),
+        )
+        .await;
+        let err = res
+            .expect_err("kd=ss must be rejected when the beacon isn't yet available (fail-closed)");
+        assert!(
+            err.contains("BeaconNotYetAvailable"),
+            "reject must be the beacon-not-yet-available gate; got {err:?}"
         );
         let g = log.lock().await;
         let t3 = g.polls.get(&pid).unwrap().tier_state.as_tier3().unwrap();
