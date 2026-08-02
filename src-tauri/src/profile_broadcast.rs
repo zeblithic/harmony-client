@@ -549,6 +549,8 @@ pub enum CacheOnSampleError {
     },
     #[error("replay: incoming HLC not strictly newer than cached")]
     Replay,
+    #[error("shared_at.wall_ms is implausibly far in the receiver's future")]
+    FutureSkew,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -582,9 +584,22 @@ impl ProfileBroadcastCache {
         &self,
         sub: SubscriptionId,
         broadcast: ProfileMembershipBroadcast,
+        now_secs: u64,
     ) -> Result<CacheOnSampleOutcome, CacheOnSampleError> {
         // (1) Verify
         let derived = verify_broadcast(&broadcast)?;
+        // ZEB-849 (C10): reject a future-dated shared_at before newer-wins can
+        // pin it. Display tier — this cache feeds profile discovery / display
+        // only (no control gated), so the 30-min DISPLAY_SKEW_TOLERANCE_MS
+        // tolerates honest moderate clock drift instead of the 5-min control
+        // bound (which would drop a peer 5–30 min ahead).
+        if crate::clock_trust::wall_exceeds_forward_skew_secs(
+            broadcast.shared_at.wall_ms,
+            now_secs,
+            crate::clock_trust::DISPLAY_SKEW_TOLERANCE_MS,
+        ) {
+            return Err(CacheOnSampleError::FutureSkew);
+        }
         // (2) Attribution check + replay defense — atomic against the map.
         let mut g = self.by_sub.lock().await;
         let entry = g
@@ -1301,12 +1316,12 @@ mod tests {
 
         // Land the newer first.
         assert_eq!(
-            cache.on_sample(1, newer.clone()).await.unwrap(),
+            cache.on_sample(1, newer.clone(), 0).await.unwrap(),
             CacheOnSampleOutcome::InsertedFirst
         );
         // Older arrives second → Replay.
         assert!(matches!(
-            cache.on_sample(1, older).await,
+            cache.on_sample(1, older, 0).await,
             Err(CacheOnSampleError::Replay)
         ));
         // Cached state unchanged: still the newer.
@@ -1341,16 +1356,120 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            cache.on_sample(2, older).await.unwrap(),
+            cache.on_sample(2, older, 0).await.unwrap(),
             CacheOnSampleOutcome::InsertedFirst
         );
         assert_eq!(
-            cache.on_sample(2, newer).await.unwrap(),
+            cache.on_sample(2, newer, 0).await.unwrap(),
             CacheOnSampleOutcome::Replaced
         );
         // Cached state updated to the newer.
         let snap = cache.get_cached(2).await.unwrap();
         assert_eq!(snap.shared_at, "200");
         assert_eq!(snap.community_ids, vec![hex::encode([2u8; 16])]);
+    }
+
+    #[tokio::test]
+    async fn on_sample_rejects_future_dated_shared_at() {
+        // C10: a future-dated shared_at must not be cached, or it out-HLCs every
+        // honest in-memory sample for the session.
+        let (signer, identity_pub) = build_identity([201u8; 32]);
+        let peer_addr = OwnerAddr(
+            harmony_identity::Identity::from_public_bytes(&identity_pub)
+                .unwrap()
+                .address_hash,
+        );
+        let cache = ProfileBroadcastCache::default();
+        cache.register(7, peer_addr).await;
+
+        const NOW_S: u64 = 1_700_000_000;
+        let now_ms = NOW_S * 1000;
+        let poison = sign_broadcast(
+            &signer,
+            identity_pub,
+            vec![fixture_space_id(1)],
+            fixture_hlc(now_ms + 365 * 86_400 * 1000),
+        )
+        .unwrap();
+        assert!(matches!(
+            cache.on_sample(7, poison.clone(), NOW_S).await,
+            Err(CacheOnSampleError::FutureSkew)
+        ));
+        assert!(cache.get_cached(7).await.is_none(), "poison never cached");
+
+        // now_secs == 0 ⇒ apply-all (unreadable local clock): the same broadcast is
+        // accepted.
+        assert_eq!(
+            cache.on_sample(7, poison, 0).await.unwrap(),
+            CacheOnSampleOutcome::InsertedFirst
+        );
+    }
+
+    #[tokio::test]
+    async fn on_sample_in_range_newer_still_wins() {
+        // The bound must not over-reject: an in-range newer sample still replaces an
+        // in-range older one.
+        let (signer, identity_pub) = build_identity([202u8; 32]);
+        let peer_addr = OwnerAddr(
+            harmony_identity::Identity::from_public_bytes(&identity_pub)
+                .unwrap()
+                .address_hash,
+        );
+        let cache = ProfileBroadcastCache::default();
+        cache.register(8, peer_addr).await;
+
+        const NOW_S: u64 = 1_700_000_000;
+        let now_ms = NOW_S * 1000;
+        let older = sign_broadcast(
+            &signer,
+            identity_pub,
+            vec![fixture_space_id(1)],
+            fixture_hlc(now_ms - 10_000),
+        )
+        .unwrap();
+        let newer = sign_broadcast(
+            &signer,
+            identity_pub,
+            vec![fixture_space_id(2)],
+            fixture_hlc(now_ms),
+        )
+        .unwrap();
+        assert_eq!(
+            cache.on_sample(8, older, NOW_S).await.unwrap(),
+            CacheOnSampleOutcome::InsertedFirst
+        );
+        assert_eq!(
+            cache.on_sample(8, newer, NOW_S).await.unwrap(),
+            CacheOnSampleOutcome::Replaced
+        );
+    }
+
+    #[tokio::test]
+    async fn on_sample_uses_display_tier_tolerating_moderate_drift() {
+        // C10 is display/discovery only (feeds profile-broadcast-received), so it
+        // uses the 30-min DISPLAY tier: a peer 10 min ahead (beyond the 5-min
+        // control tier) is still accepted rather than vanishing from discovery.
+        let (signer, identity_pub) = build_identity([203u8; 32]);
+        let peer_addr = OwnerAddr(
+            harmony_identity::Identity::from_public_bytes(&identity_pub)
+                .unwrap()
+                .address_hash,
+        );
+        let cache = ProfileBroadcastCache::default();
+        cache.register(9, peer_addr).await;
+        const NOW_S: u64 = 1_700_000_000;
+        let now_ms = NOW_S * 1000;
+        let ten_min_ahead = sign_broadcast(
+            &signer,
+            identity_pub,
+            vec![fixture_space_id(1)],
+            fixture_hlc(now_ms + 10 * 60 * 1000),
+        )
+        .unwrap();
+        assert_eq!(
+            cache.on_sample(9, ten_min_ahead, NOW_S).await.unwrap(),
+            CacheOnSampleOutcome::InsertedFirst,
+            "10 min ahead is within the 30-min display tier"
+        );
     }
 }
