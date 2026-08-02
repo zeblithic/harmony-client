@@ -21,7 +21,7 @@
 - **No backward / anti-backdating bound anywhere.** Membership is verified at the event's own HLC; backdating containment is epoch-encryption (ZEB-717), out of scope. This work adds a forward (too-far-*future*) bound only.
 - **`reject_future(stamp, now, tol)` is inclusive at the boundary** (`stamp == now + tol` is accepted; `> tol` rejected). `clamp_future(stamp, now, tol) = stamp.min(now.saturating_add(tol))`.
 - Own focused PR; **not bundled** with other ZEB-831 tickets (ZEB-847…854).
-- Frequent commits: each task ends with a commit. Use `scripts/test-select --context task` for iterative per-task gates; run the **full** `--workspace --all-targets` sweep before the PR.
+- Frequent commits: each task ends with a commit. Use `scripts/test-select --context task` for iterative per-task gates, and **paste the printed `round=… bucket=…` summary line into that task's report** so the selection is auditable; run the **full** `--workspace --all-targets` sweep before the PR.
 
 ---
 
@@ -467,7 +467,7 @@ if let Some(now) = ctx.now_ms {
 
 - [ ] **Step 4: Update every `VerifyContext` constructor**
 
-- `community_state_sync.rs:4363` (live merge): `now_ms: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0))`. (A pre-epoch `unwrap_or(0)` yields `now=0`; `reject_future(wall, 0, tol)` rejects only walls `> tol` — acceptably degenerate and never drops honest present-day events, which are all `> tol`. If you prefer strict `None`-on-error semantics, use `.ok()` and pass the `Option` — either is acceptable; be consistent.)
+- `community_state_sync.rs:4363` (live merge): `now_ms: clock_trust::receiver_now_ms()` — the shared helper that maps a pre-epoch / unreadable clock to `None`, disabling the forward bound (apply-all). **Do NOT use `unwrap_or(0)`:** at `now = 0`, `reject_future(wall, 0, tol)` rejects every wall `> tol`, and every honest present-day wall (~1.7e12 ms) is far `> tol` (300_000 ms) — so an `unwrap_or(0)` fallback rejects EVERY real event and freezes governance ingestion, the exact inversion of the §2 invariant (a bad LOCAL clock must never drop honest governance). Only the `None`-on-error form is safe.
 - `community_state_sync.rs:1634`, `:1817`, `:1822`, `:2193`: `now_ms: None` (fork-veto pre-validate and other clock-less callers keep working).
 - Any `VerifyContext { .. }` in `community_state_crdt.rs` and in test modules: add `now_ms: None` unless the test specifically exercises the bound.
 

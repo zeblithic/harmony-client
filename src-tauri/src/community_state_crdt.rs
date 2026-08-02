@@ -211,6 +211,32 @@ struct MaterializedCache {
     /// but pinning this is cheap defense in depth.
     cached_admin_addr: Option<OwnerAddr>,
     cached: Option<MaterializedMembership>,
+    /// ZEB-846: wall time (ms) at which the soonest currently-deferred
+    /// future-dated event enters the `MAX_FORWARD_SKEW_MS` window, i.e.
+    /// `min(excluded event walls) - MAX_FORWARD_SKEW_MS`. `None` = the cached
+    /// view excluded nothing on forward-skew grounds, so advancing wall time
+    /// cannot change it (the version key alone governs validity). When `Some`,
+    /// a cache hit is additionally gated on `receiver_now < recompute_after_ms`
+    /// — past that instant the version-keyed view is stale w.r.t. the clock and
+    /// must re-materialize even though the log is unchanged, so a legitimately
+    /// skewed event becomes effective the moment it is plausible rather than
+    /// waiting for the next log mutation to bust the cache.
+    recompute_after_ms: Option<u64>,
+}
+
+/// ZEB-846: whether a time-aware cached materialization is still valid at
+/// `receiver_now_ms`. `recompute_after_ms` is the wall time at which the
+/// soonest currently-deferred event enters the forward-skew window (see
+/// [`MaterializedCache::recompute_after_ms`]); `None` means nothing was
+/// deferred, so the cache is time-insensitive. A `None` `receiver_now_ms`
+/// (pre-epoch clock) keeps the cache valid — the ceiling is disabled anyway, so
+/// nothing was deferred to become includable. Pulled out as a pure fn so the
+/// refresh boundary is exhaustively unit-testable without mocking the clock.
+fn cache_time_still_valid(recompute_after_ms: Option<u64>, receiver_now_ms: Option<u64>) -> bool {
+    match recompute_after_ms {
+        None => true,
+        Some(t) => receiver_now_ms.is_none_or(|rn| rn < t),
+    }
 }
 
 // `VerifiedLog<MembershipPolicy>` (the core engine) does not derive `Debug`,
@@ -445,6 +471,16 @@ impl CommunityState {
         self.log.len()
     }
 
+    /// Test-only: the cache's current `recompute_after_ms` (ZEB-846 time-aware
+    /// invalidation marker). `None` until `materialized()` has populated it.
+    #[cfg(test)]
+    pub(crate) fn cache_recompute_after_for_test(&self) -> Option<u64> {
+        self.cache
+            .lock()
+            .expect("cache mutex poisoned")
+            .recompute_after_ms
+    }
+
     /// Cache version counter. Bumps on every successful insert.
     /// Useful for IPC layers that want to short-circuit "did anything
     /// change?" checks across calls. Mirrors the version-counter
@@ -489,31 +525,47 @@ impl CommunityState {
                 }
             }
         }
+        // ZEB-846: sample the receiver-`now` ONCE up front — it feeds both the
+        // time-aware cache-invalidation check below and (on a miss) the forward
+        // ceiling. `receiver_now` is THIS node's own trusted wall clock (never a
+        // peer/HLC-adopt value — the attacker we bound can move those). `None`
+        // (pre-epoch clock) ⇒ ceiling disabled (apply-all), so a bad local clock
+        // can't drop honest governance.
+        let receiver_now = crate::clock_trust::receiver_now_ms();
         let cache_hit = cache.cached_version == Some(cache.version)
-            && cache.cached_admin_addr == Some(admin_addr);
+            && cache.cached_admin_addr == Some(admin_addr)
+            && cache_time_still_valid(cache.recompute_after_ms, receiver_now);
         if !cache_hit {
             let log: Vec<SignedMembershipEvent> = self.log.events().cloned().collect();
-            // ZEB-846: apply the receiver-`now` forward-skew ceiling. `receiver_now`
-            // is THIS node's own trusted wall clock (never a peer/HLC-adopt value —
-            // the attacker we bound can move those). `None` (pre-epoch clock) ⇒
-            // ceiling disabled (apply-all), so a bad local clock can't drop honest
-            // governance. The floor stays `None` here (event-driven cached view).
-            // Fail-safe under caching: as real time advances, a future-dated event
-            // can become includable, but this version-keyed cache only reflects
-            // that once the next log mutation busts it — so a stale cached
-            // `now`-relative result only ever OVER-excludes a future-dated event
-            // (delaying a governance action), never UNDER-excludes (never applies
-            // a still-future event early). The excluded set is view-only: nothing
-            // is deleted from the stored CRDT state, only from this materialized
-            // snapshot.
-            let receiver_now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .ok();
+            // Apply the receiver-`now` forward-skew ceiling. The floor stays
+            // `None` here (event-driven cached view). The excluded set is
+            // view-only: nothing is deleted from the stored CRDT state, only
+            // from this materialized snapshot. Reload-safe: the store is never
+            // mutated, so a reloaded log re-derives the same bound on first read.
             let m = materialize_with_bounds(&log, admin_addr, None, receiver_now);
+            // Compute when the soonest currently-deferred event will enter the
+            // window so the version-keyed cache self-refreshes at that instant
+            // instead of over-excluding until the next log mutation. `None`
+            // receiver_now (pre-epoch) excludes nothing ⇒ no time sensitivity.
+            let recompute_after_ms = receiver_now.and_then(|rn| {
+                log.iter()
+                    .map(|e| e.at.wall_ms)
+                    .filter(|&w| {
+                        crate::clock_trust::reject_future(
+                            w,
+                            rn,
+                            crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                        )
+                    })
+                    .min()
+                    .map(|min_excluded| {
+                        min_excluded.saturating_sub(crate::clock_trust::MAX_FORWARD_SKEW_MS)
+                    })
+            });
             cache.cached = Some(m.clone());
             cache.cached_version = Some(cache.version);
             cache.cached_admin_addr = Some(admin_addr);
+            cache.recompute_after_ms = recompute_after_ms;
             return m;
         }
         cache
@@ -587,10 +639,7 @@ impl CommunityState {
         // ZEB-846: forward-skew ceiling against this node's own wall clock; floor
         // stays `None` (this is the no-floor uncached read). `None` receiver_now
         // (pre-epoch clock) ⇒ apply-all.
-        let receiver_now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .ok();
+        let receiver_now = crate::clock_trust::receiver_now_ms();
         materialize_with_bounds(&log, admin_addr, None, receiver_now)
     }
 
@@ -1014,6 +1063,77 @@ mod zeb846_accessor_ceiling {
         assert!(
             membership_contains(&m, &victim),
             "after reload, materialized() still defers the future-dated Kick"
+        );
+    }
+
+    #[test]
+    fn cache_time_still_valid_covers_the_refresh_boundary() {
+        // No deferred event ⇒ time-insensitive: valid at any clock, including a
+        // pre-epoch (None) one.
+        assert!(cache_time_still_valid(None, Some(1_000)));
+        assert!(cache_time_still_valid(None, None));
+        // Some(t): the cache is valid strictly BEFORE the deferred event enters
+        // the window, and stale AT or AFTER that instant (must re-materialize so
+        // the now-plausible event takes effect).
+        assert!(
+            cache_time_still_valid(Some(1_000), Some(999)),
+            "before the window: cache still valid"
+        );
+        assert!(
+            !cache_time_still_valid(Some(1_000), Some(1_000)),
+            "at the window edge: recompute (event just became plausible)"
+        );
+        assert!(
+            !cache_time_still_valid(Some(1_000), Some(1_001)),
+            "past the window: recompute"
+        );
+        // A pre-epoch receiver clock disables the ceiling entirely (nothing was
+        // deferred), so the cache stays valid rather than thrashing.
+        assert!(
+            cache_time_still_valid(Some(1_000), None),
+            "pre-epoch receiver clock keeps the cache valid (apply-all)"
+        );
+    }
+
+    #[test]
+    fn materialized_sets_recompute_after_to_when_the_deferred_kick_becomes_plausible() {
+        // Wiring proof for the time-aware invalidation: after materializing a
+        // view that defers a far-future Kick, the cache records EXACTLY when that
+        // Kick enters the 5-min window (`kick_wall - MAX_FORWARD_SKEW_MS`), so a
+        // silent community (no further log mutations) still self-refreshes at
+        // that instant instead of over-excluding forever.
+        let admin = addr(1);
+        let victim = addr(2);
+        let now = real_now_ms();
+        let kick_wall = now + YEAR_MS;
+        let join = join_event(10, victim, now - 10_000);
+        let kick = kick_event(20, admin, victim, kick_wall);
+        let state = CommunityState::from_trusted_events_for_test(COMMUNITY, [join, kick]);
+
+        let _ = state.materialized(admin); // populate the cache
+        assert_eq!(
+            state.cache_recompute_after_for_test(),
+            Some(kick_wall - crate::clock_trust::MAX_FORWARD_SKEW_MS),
+            "recompute_after must mark exactly when the sole deferred Kick becomes plausible"
+        );
+    }
+
+    #[test]
+    fn materialized_leaves_recompute_after_none_when_nothing_is_deferred() {
+        // No future-dated event ⇒ the cached view is time-insensitive and the
+        // version key alone governs validity (no wall-clock invalidation cost on
+        // the common path).
+        let admin = addr(1);
+        let member = addr(2);
+        let now = real_now_ms();
+        let join = join_event(10, member, now - 20_000);
+        let state = CommunityState::from_trusted_events_for_test(COMMUNITY, [join]);
+
+        let _ = state.materialized(admin);
+        assert_eq!(
+            state.cache_recompute_after_for_test(),
+            None,
+            "no future-dated event ⇒ recompute_after stays None"
         );
     }
 }

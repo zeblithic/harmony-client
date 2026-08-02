@@ -69,6 +69,29 @@ pub fn clamp_future(stamp: u64, now: u64, tolerance: u64) -> u64 {
     stamp.min(now.saturating_add(tolerance))
 }
 
+/// This node's own trusted wall clock as milliseconds since the Unix epoch,
+/// or `None` when the system clock is pre-epoch / unreadable.
+///
+/// The single source for the receiver-`now` that every ZEB-846 forward-skew
+/// bound is measured against. It is deliberately derived only from
+/// [`std::time::SystemTime::now`] — NEVER a peer-supplied or HLC-adopt value,
+/// which are exactly the clocks the bound exists to distrust (an attacker who
+/// can nudge those forward must not be able to widen their own window).
+///
+/// The `None`-on-failure contract is load-bearing and callers MUST honour it as
+/// "disable the forward bound (apply-all)", never substitute `0`: at `now = 0`
+/// every honest present-day wall (~1.7e12 ms) exceeds [`MAX_FORWARD_SKEW_MS`],
+/// so an `unwrap_or(0)` fallback would reject *every* real event and freeze
+/// governance ingestion — the exact inversion of the §2 invariant that a bad
+/// LOCAL clock must never drop honest governance.
+#[inline]
+pub fn receiver_now_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +114,22 @@ mod tests {
         assert!(
             reject_future(now + MAX_FORWARD_SKEW_MS + 1, now, MAX_FORWARD_SKEW_MS),
             "one past the ceiling is rejected"
+        );
+    }
+
+    #[test]
+    fn receiver_now_ms_is_a_plausible_present_wall() {
+        // Pins the load-bearing `.ok()` semantics: on any real (post-epoch)
+        // host clock the helper yields `Some` — never the `unwrap_or(0)`
+        // degenerate that would freeze governance ingestion. The lower bound
+        // (2024-01-01T00:00:00Z in ms) is comfortably below any real run and
+        // far above `MAX_FORWARD_SKEW_MS`, so it also documents that an honest
+        // present-day wall is orders of magnitude past the ceiling — which is
+        // exactly why a `now = 0` fallback would reject everything.
+        let now = receiver_now_ms().expect("host clock is post-epoch");
+        assert!(
+            now > 1_704_067_200_000,
+            "receiver_now_ms() must be a real present-day wall, got {now}"
         );
     }
 

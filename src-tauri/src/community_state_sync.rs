@@ -4339,6 +4339,18 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             }
         }
 
+        // ZEB-846 (Layer 1): this is the live network-merge site — the
+        // receiver's OWN trusted wall clock (never a peer-supplied or
+        // HlcAdoptFloor value) bounds an implausibly-future membership wall
+        // before it ever reaches `state.insert_event`. Sampled ONCE per publish
+        // (not per event): the receiver clock does not meaningfully move within
+        // one merge loop, and one snapshot means every event in the batch is
+        // judged against the same `now`. `receiver_now_ms()` returns `None` on a
+        // pre-epoch clock ⇒ no forward reject (apply-all): a dead/mis-set local
+        // RTC must NOT collapse to `Some(0)`, where every honest present-day
+        // wall (~1.7e12) reads as beyond `MAX_FORWARD_SKEW_MS` and would freeze
+        // governance ingestion.
+        let now_ms = crate::clock_trust::receiver_now_ms();
         for event in resolved {
             if state.contains_event(&event.id) {
                 // C1 restart-recovery: even though we've already seen this
@@ -4363,23 +4375,9 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
 
             // ZEB-339 Task 9: VerifyContext carries no caller-resolved
             // pubs; verify_event derives signer keys from the carried
-            // cert / materialized membership.
-            //
-            // ZEB-846 (Layer 1): this is the live network-merge site — the
-            // receiver's OWN trusted wall clock (never a peer-supplied or
-            // HlcAdoptFloor value) is threaded through so verify_event can
-            // reject an implausibly-future membership wall before it ever
-            // reaches `state.insert_event`. A pre-epoch clock (dead RTC,
-            // manual mis-set) must NOT collapse to `Some(0)` — at now=0,
-            // every honest present-day wall (~1.7e12) reads as beyond
-            // `MAX_FORWARD_SKEW_MS` and would be rejected, freezing
-            // governance ingestion. So a failed `duration_since` maps to
-            // `None` ⇒ no forward reject (apply-all), matching the
-            // channel (`.ok()`) and voting (`!= 0`) fallbacks elsewhere.
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .ok();
+            // cert / materialized membership. `now_ms` (the ZEB-846 Layer 1
+            // receiver clock) is hoisted above this loop — see the comment
+            // there.
             let ctx_v = VerifyContext {
                 now_ms,
                 expected_community_id: ctx.community_id,
