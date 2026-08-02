@@ -3170,6 +3170,35 @@ fn engine_auto_hlc_from_base(base: &Hlc, pid: &PollId, kind: &str) -> Hlc {
 
 // ── Inbound eligibility helper ──────────────────────────────────────────────
 
+/// Look up a tier-3 poll's `Tier3PollState` under the log guard and run a
+/// SYNC authz verifier against it. Holds the guard only across the sync check
+/// (no await → no cross-lock hazard). Maps any `VerifyError` and an
+/// unknown/non-tier3 poll to a rejection string.
+async fn with_tier3<F>(
+    voting_log: &Arc<Mutex<VotingLog>>,
+    pid: &PollId,
+    kind: &str,
+    f: F,
+) -> Result<(), String>
+where
+    F: FnOnce(
+        &crate::community_voting_tier3::Tier3PollState,
+    ) -> Result<(), crate::community_voting_tier3::VerifyError>,
+{
+    let log_g = voting_log.lock().await;
+    let t3 = log_g
+        .polls
+        .get(pid)
+        .and_then(|ps| ps.tier_state.as_tier3())
+        .ok_or_else(|| {
+            format!(
+                "{kind} authz: unknown/non-tier3 poll {}",
+                hex::encode(pid.0)
+            )
+        })?;
+    f(t3).map_err(|e| format!("{kind} authz: {e:?}"))
+}
+
 /// Per-tier inbound eligibility check called from `process_inbound` between
 /// `verify_voting_event` and `apply_with_snapshot`. Mirrors the predicates
 /// that each local-IPC handler enforces before signing:
@@ -3184,15 +3213,18 @@ fn engine_auto_hlc_from_base(base: &Hlc, pid: &PollId, kind: &str) -> Hlc {
 /// - Tier 2 Delegate / Undelegate: community-wide graph mutations — no
 ///   proposal-specific eligibility check (membership-V6 sufficient).
 /// - Tier 3 PollCreate: creator must satisfy `Tier3PollConfigPayload.eligibility`.
-/// - Tier 3 engine-auto events (SortitionSelection, SortitionFailed, PollClose,
-///   PollResult): signed by the local engine itself, not a remote peer
-///   proposer/voter. No proposal-specific eligibility check required.
-/// - All other Tier 3 peer events (DeliberationStatement, MiniPublicDecline,
-///   DraftCandidate, DraftApproval, RatificationBallot): eligibility for
-///   these events is membership in the sortition selection, not the proposal's
-///   eligibility predicate. The Tier 3 apply path enforces sortition membership
-///   (the electorate snapshot was frozen at PollCreate time). No additional
-///   check here to avoid double-enforcement.
+/// - Tier 3 peer events carrying a tier-3-specific authz predicate (ZEB-850):
+///   `kd=sf` (verify_sf: proposer-signed + backup pool exhausted), `kd=rs`
+///   (verify_sr: kd=cl applied + tally bit-identical), `kd=md`/`kd=dc`
+///   (verify_sd: mini-public membership), `kd=da` (verify_sd + referenced
+///   candidate exists), `kd=rb` (verify_ratification_ballot: B2-B5 electorate
+///   authz). These run the SYNC verifiers via [`with_tier3`]; `kd=ss` is gated
+///   asynchronously in Task 3 (BeaconOracle) and stays a no-op here until then.
+/// - Tier 3 engine-auto `kd=cl` (PollClose) has no verifier (no `verify_cl`
+///   exists by design); membership-V6 from `verify_voting_event` is the outer
+///   gate.
+/// - Tier 3 `kd=ds`/`kd=dv` already inline-check mini-public membership in the
+///   apply path (`community_voting_tier3.rs`), so no additional check here.
 async fn inbound_eligibility_check(
     event: &SignedVotingEvent,
     snapshot: &crate::community_voting_core::MembershipSnapshot,
@@ -3337,22 +3369,63 @@ async fn inbound_eligibility_check(
                     )
                     .map_err(|e| format!("Tier 3 PollCreate: creator not eligible: {e:?}"))?;
                 }
-                // Engine-auto events (SortitionSelection, SortitionFailed, PollClose,
-                // PollResult): signed by the local engine, not a remote peer proposer.
-                // No proposal-specific eligibility check — the engine signing key is
-                // the trust anchor.
+                // kd=cl (PollClose) is engine-auto with no authz verifier
+                // (no verify_cl exists); membership-V6 is the outer gate.
+                // kd=ss is gated in ZEB-850 Task 3 (async, BeaconOracle) — it
+                // stays a no-op here until then.
                 crate::community_voting_core::PollEventKindCode::SortitionSelection
-                | crate::community_voting_core::PollEventKindCode::SortitionFailed
-                | crate::community_voting_core::PollEventKindCode::PollClose
-                | crate::community_voting_core::PollEventKindCode::PollResult => {}
-                // Tier 3 peer events scoped to sortition members
-                // (DeliberationStatement, MiniPublicDecline, DraftCandidate,
-                // DraftApproval, RatificationBallot): eligibility for these is
-                // membership in the sortition selection (snapshotted at PollCreate
-                // time as eligible_electorate_snapshot). The Tier 3 apply path
-                // already enforces sortition membership — no additional check here
-                // to avoid double-enforcement. Membership-V6 from
-                // verify_voting_event is sufficient for the outer gate.
+                | crate::community_voting_core::PollEventKindCode::PollClose => {}
+                // kd=sf: else any member could forge Stage::Failed and kill the
+                // poll. verify_sf: proposer-signed + backup pool exhausted.
+                crate::community_voting_core::PollEventKindCode::SortitionFailed => {
+                    let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                        .ok_or_else(|| "kd=sf: undecodable poll id".to_string())?;
+                    with_tier3(voting_log, &pid, "kd=sf", |t3| {
+                        crate::community_voting_tier3::verify_sf(event, t3)
+                    })
+                    .await?;
+                }
+                // kd=rs: else a member could forge an arbitrary finalized result.
+                // verify_sr: kd=cl applied + tally bit-identical to recompute.
+                crate::community_voting_core::PollEventKindCode::PollResult => {
+                    let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                        .ok_or_else(|| "kd=rs: undecodable poll id".to_string())?;
+                    with_tier3(voting_log, &pid, "kd=rs", |t3| {
+                        crate::community_voting_tier3::verify_sr(event, t3)
+                    })
+                    .await?;
+                }
+                // kd=md / kd=dc: mini-public membership (verify_sd).
+                crate::community_voting_core::PollEventKindCode::MiniPublicDecline
+                | crate::community_voting_core::PollEventKindCode::DraftCandidate => {
+                    let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                        .ok_or_else(|| "kd=md/dc: undecodable poll id".to_string())?;
+                    with_tier3(voting_log, &pid, "kd=md/dc", |t3| {
+                        crate::community_voting_tier3::verify_sd(event, t3)
+                    })
+                    .await?;
+                }
+                // kd=da: membership + referenced candidate must exist.
+                crate::community_voting_core::PollEventKindCode::DraftApproval => {
+                    let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                        .ok_or_else(|| "kd=da: undecodable poll id".to_string())?;
+                    with_tier3(voting_log, &pid, "kd=da", |t3| {
+                        crate::community_voting_tier3::verify_sd(event, t3)?;
+                        crate::community_voting_tier3::verify_da_candidate_exists(event, t3)
+                    })
+                    .await?;
+                }
+                // kd=rb: crypto is checked at apply; add B3 electorate authz.
+                crate::community_voting_core::PollEventKindCode::RatificationBallot => {
+                    let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                        .ok_or_else(|| "kd=rb: undecodable poll id".to_string())?;
+                    with_tier3(voting_log, &pid, "kd=rb", |t3| {
+                        crate::community_voting_tier3::verify_ratification_ballot(event, t3)
+                    })
+                    .await?;
+                }
+                // kd=ds / kd=dv already inline-check mini-public membership in
+                // apply_event (community_voting_tier3.rs:507/585).
                 _ => {}
             }
         }
@@ -6878,6 +6951,337 @@ mod tests {
         assert!(
             publisher_rx.try_recv().is_err(),
             "no kd=cl packet should have been published from a clamped future last_hlc"
+        );
+    }
+
+    // ── ZEB-850 Task 2: sync tier-3 peer-ingest authz verifiers ────────────────
+    //
+    // These exercise the `Tier::Sortition` arm of `inbound_eligibility_check`
+    // directly (the admission seam that runs between `verify_voting_event` and
+    // `apply_with_snapshot` in `process_inbound`). Each forge test would return
+    // `Ok` under the pre-ZEB-850 no-op arm — it fails there and passes only once
+    // the sync verifier is wired in. Each happy-path control proves the wiring
+    // does not over-reject a legitimately-formed event.
+
+    /// Build a `VotingLog` holding a Tier 3 poll seeded past sortition
+    /// (PollCreate + kd=ss applied) for the peer-ingest authz tests. The
+    /// mini-public is the 20-member `primary` slice (backup empty); the proposer
+    /// is NOT a mini-public member (proposer signs PollCreate/kd=ss/kd=sf, a
+    /// separate member signs kd=md/kd=dc/kd=da). Returns the log, poll id,
+    /// proposer, one mini-public member, and the membership snapshot.
+    async fn tier3_ingest_fixture() -> (
+        Arc<Mutex<VotingLog>>,
+        PollId,
+        OwnerAddr, // proposer (signs PollCreate + kd=ss + kd=sf)
+        OwnerAddr, // mini-public member (in primary)
+        MembershipSnapshot,
+        SpaceId,
+    ) {
+        use crate::community_voting_core::{
+            Eligibility, MemberAttrs, MembershipSnapshot, Tier3PollConfigPayload,
+        };
+
+        let community_id = SpaceId([0xF3; 16]);
+        // Primary mini-public member (actor for kd=md/dc/da tests).
+        let (_member_key, member_owner, _m64) = fixture_identity_engine(0xA1);
+        // Proposer who creates the poll + kd=ss + kd=sf.
+        let (_proposer_key, proposer_owner, _p64) = fixture_identity_engine(0xA2);
+
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+
+        let sortition_size: u16 = 20; // minimum valid per validate_tier3_poll_config
+        let config = Tier3PollConfigPayload {
+            proposal_text: "ZEB-850 ingest authz test".into(),
+            sortition_size,
+            deliberation_window_seconds: 7200,
+            drafting_window_seconds: 7200,
+            ratification_window_seconds: 7200,
+            privacy_mode: "pu".into(),
+            incentive_mode: "a".into(),
+            eligibility: Eligibility {
+                min_power: 0,
+                min_vouching_depth: None,
+                sortition_size: None,
+            },
+            retry_of: None,
+        };
+        let mut cfg_payload = Vec::new();
+        ciborium::into_writer(&config, &mut cfg_payload).expect("encode tier3 cfg");
+        let create_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::PollCreate,
+            hlc: Hlc {
+                wall_ms: 1_000_000,
+                logical: 0,
+                device_id: "dev-cr".into(),
+            },
+            actor: proposer_owner,
+            payload: cfg_payload,
+            sig: vec![0u8; 64],
+        };
+
+        // Snapshot: need sortition_size * 2 eligible members plus proposer/member.
+        let electorate: Vec<OwnerAddr> = (0..(sortition_size as usize * 2))
+            .map(|i| {
+                let mut a = [0u8; 16];
+                a[0] = (i & 0xFF) as u8;
+                a[1] = 0xF3;
+                OwnerAddr(a)
+            })
+            .collect();
+        // Make member_owner one of the primary members (for mini-public).
+        let primary: Vec<OwnerAddr> = {
+            let mut p = vec![member_owner];
+            p.extend(electorate.iter().take(sortition_size as usize - 1).copied());
+            p
+        };
+
+        let snapshot = MembershipSnapshot {
+            members: electorate
+                .iter()
+                .map(|o| {
+                    (
+                        *o,
+                        MemberAttrs {
+                            power: 1,
+                            vouching_depth: 0,
+                        },
+                    )
+                })
+                .chain(std::iter::once((
+                    member_owner,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )))
+                .chain(std::iter::once((
+                    proposer_owner,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )))
+                .collect(),
+        };
+
+        let pid = {
+            let mut log = voting_log.lock().await;
+            log.apply_with_snapshot(create_event, &community_id, Some(snapshot.clone()))
+                .expect("apply tier3 PollCreate")
+        };
+
+        // Apply kd=ss (member_owner in primary, no backup).
+        let ss_payload_struct = crate::community_voting_core::SortitionSelectionPayload {
+            poll_id: pid,
+            primary: primary.clone(),
+            backup: vec![],
+        };
+        let mut ss_payload = Vec::new();
+        ciborium::into_writer(&ss_payload_struct, &mut ss_payload).expect("encode ss");
+        let ss_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::SortitionSelection,
+            hlc: Hlc {
+                wall_ms: 1_000_001,
+                logical: 0,
+                device_id: "dev-ss".into(),
+            },
+            actor: proposer_owner,
+            payload: ss_payload,
+            sig: vec![0u8; 64],
+        };
+        {
+            let mut log = voting_log.lock().await;
+            log.apply_with_snapshot(ss_event, &community_id, None)
+                .expect("apply kd=ss");
+        }
+
+        (
+            voting_log,
+            pid,
+            proposer_owner,
+            member_owner,
+            snapshot,
+            community_id,
+        )
+    }
+
+    /// Build an unsigned (dummy-sig) Tier 3 peer event for the ingest tests.
+    /// `inbound_eligibility_check` runs after signature verification, so a
+    /// placeholder sig is sufficient here.
+    fn tier3_ingest_event(
+        kind: PollEventKindCode,
+        actor: OwnerAddr,
+        wall_ms: u64,
+        payload: Vec<u8>,
+    ) -> SignedVotingEvent {
+        SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind,
+            hlc: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "dev-ingest".into(),
+            },
+            actor,
+            payload,
+            sig: vec![0u8; 64],
+        }
+    }
+
+    fn encode_sf_payload(pid: PollId) -> Vec<u8> {
+        let p = crate::community_voting_core::SortitionFailedPayload { poll_id: pid };
+        let mut b = Vec::new();
+        ciborium::into_writer(&p, &mut b).expect("encode sf");
+        b
+    }
+
+    fn encode_md_payload(pid: PollId) -> Vec<u8> {
+        let p = crate::community_voting_core::MiniPublicDeclinePayload {
+            poll_id: pid,
+            reason: None,
+        };
+        let mut b = Vec::new();
+        ciborium::into_writer(&p, &mut b).expect("encode md");
+        b
+    }
+
+    /// A `{ "pi": pid }` map — the poll-id reference `decode_poll_id_ref` reads.
+    /// Used for the kd=rs test: `verify_sr` rejects on `close_event_hash == None`
+    /// before it decodes the (otherwise heavier) `Tier3PollResultPayload`, so the
+    /// result body is irrelevant to what this test discriminates.
+    fn encode_pid_ref(pid: PollId) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct PollIdRef {
+            #[serde(rename = "pi")]
+            poll_id: PollId,
+        }
+        let mut b = Vec::new();
+        ciborium::into_writer(&PollIdRef { poll_id: pid }, &mut b).expect("encode pid ref");
+        b
+    }
+
+    // kd=sf forge: a non-proposer member signs SortitionFailed → verify_sf's
+    // SfActorNotProposer must reject at ingest (else any member kills the poll).
+    #[tokio::test]
+    async fn kd_sf_from_non_proposer_rejected_at_ingest() {
+        let (log, pid, _proposer, member, snapshot, _cid) = tier3_ingest_fixture().await;
+        // Actor = mini-public member who is NOT the proposer.
+        let sf = tier3_ingest_event(
+            PollEventKindCode::SortitionFailed,
+            member,
+            9_000_000,
+            encode_sf_payload(pid),
+        );
+        let res = inbound_eligibility_check(&sf, &snapshot, &log).await;
+        assert!(
+            res.is_err(),
+            "kd=sf from a non-proposer must be rejected at ingest; got {res:?}"
+        );
+    }
+
+    // kd=sf control: proposer-signed with the full pool exhausted → admitted.
+    #[tokio::test]
+    async fn kd_sf_from_proposer_with_exhausted_pool_admitted() {
+        let (log, pid, proposer, _member, snapshot, _cid) = tier3_ingest_fixture().await;
+        // Exhaust the pool: capacity = primary.len() + backup.len() = 20 + 0.
+        // Push 20 distinct declines dated before the kd=sf event's HLC.
+        {
+            let mut g = log.lock().await;
+            let t3 = g
+                .polls
+                .get_mut(&pid)
+                .expect("poll present")
+                .tier_state
+                .as_tier3_mut()
+                .expect("tier3 state");
+            for i in 0..20u8 {
+                let mut a = [0u8; 16];
+                a[0] = i;
+                a[1] = 0xDE;
+                t3.declines.push((
+                    OwnerAddr(a),
+                    Hlc {
+                        wall_ms: 2_000_000,
+                        logical: 0,
+                        device_id: "dev-decl".into(),
+                    },
+                ));
+            }
+        }
+        let sf = tier3_ingest_event(
+            PollEventKindCode::SortitionFailed,
+            proposer,
+            9_000_000,
+            encode_sf_payload(pid),
+        );
+        let res = inbound_eligibility_check(&sf, &snapshot, &log).await;
+        assert!(
+            res.is_ok(),
+            "proposer-signed kd=sf with an exhausted pool must be admitted; got {res:?}"
+        );
+    }
+
+    // kd=md forge: an actor outside the mini-public signs MiniPublicDecline →
+    // verify_sd's NotInMiniPublic must reject at ingest.
+    #[tokio::test]
+    async fn kd_md_from_non_mini_public_rejected() {
+        let (log, pid, _proposer, _member, snapshot, _cid) = tier3_ingest_fixture().await;
+        // A fresh identity that is not in the electorate/mini-public.
+        let (_k, outsider, _o64) = fixture_identity_engine(0xB9);
+        let md = tier3_ingest_event(
+            PollEventKindCode::MiniPublicDecline,
+            outsider,
+            1_500_000,
+            encode_md_payload(pid),
+        );
+        let res = inbound_eligibility_check(&md, &snapshot, &log).await;
+        assert!(
+            res.is_err(),
+            "kd=md from a non-mini-public actor must be rejected at ingest; got {res:?}"
+        );
+    }
+
+    // kd=md control: a mini-public member signs MiniPublicDecline → admitted.
+    #[tokio::test]
+    async fn kd_md_from_mini_public_member_admitted() {
+        let (log, pid, _proposer, member, snapshot, _cid) = tier3_ingest_fixture().await;
+        let md = tier3_ingest_event(
+            PollEventKindCode::MiniPublicDecline,
+            member,
+            1_500_000,
+            encode_md_payload(pid),
+        );
+        let res = inbound_eligibility_check(&md, &snapshot, &log).await;
+        assert!(
+            res.is_ok(),
+            "kd=md from a mini-public member must be admitted; got {res:?}"
+        );
+    }
+
+    // kd=rs forge: a PollResult before kd=cl has been applied → verify_sr's
+    // NotInClosedStage must reject at ingest (else a member forges a result).
+    #[tokio::test]
+    async fn kd_rs_before_close_rejected() {
+        let (log, pid, _proposer, member, snapshot, _cid) = tier3_ingest_fixture().await;
+        // The fixture stops at kd=ss, so close_event_hash is None.
+        let rs = tier3_ingest_event(
+            PollEventKindCode::PollResult,
+            member,
+            9_000_000,
+            encode_pid_ref(pid),
+        );
+        let res = inbound_eligibility_check(&rs, &snapshot, &log).await;
+        assert!(
+            res.is_err(),
+            "kd=rs before kd=cl must be rejected at ingest; got {res:?}"
         );
     }
 }
