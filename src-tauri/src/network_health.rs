@@ -212,8 +212,8 @@ pub struct PeerHealth {
     /// ZEB-804: when the current connection to this peer was established —
     /// liveness `Connected.since_ms` first, else the reconnect supervisor's
     /// `Connected.since_ms`. The establishment stamp under its honest name (it
-    /// is NOT traffic evidence; the presence cache does not feed it). `None`
-    /// when neither source reports the peer connected. Additive wire field —
+    /// is NOT traffic evidence). `None` when neither source reports the peer
+    /// connected. Additive wire field —
     /// `#[serde(default)]`.
     #[serde(default)]
     pub connected_since_ms: Option<u64>,
@@ -2032,42 +2032,6 @@ impl LivenessSnapshot for ProdLivenessSnapshot {
     }
 }
 
-/// ZEB-622: presence-beacon last-seen cache. Fed by `CommunityPresenceMap::apply`
-/// on EVERY verified, member-gated beacon that reaches it (even a stale/duplicate
-/// refresh that leaves the roster unchanged — still fresh evidence we just heard
-/// from that owner), and read by [`NetworkHealthService::snapshot`] to max-merge
-/// each peer's `last_seen_ms`. Keyed by owner addr (`[u8; 16]`); values are
-/// wall-clock ms. A `std::sync::RwLock` (not the presence map's `tokio::Mutex`)
-/// so the synchronous snapshot read path stays `.await`-free.
-#[derive(Debug, Default)]
-pub struct PresenceLastSeenCache {
-    inner: std::sync::RwLock<std::collections::HashMap<[u8; 16], u64>>,
-}
-
-impl PresenceLastSeenCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record that `owner`'s presence beacon was observed at `last_seen_ms`.
-    /// Max-merge: a stale (lower) timestamp never regresses a fresher recorded
-    /// one. A poisoned lock is RECOVERED rather than treated as a no-op (the
-    /// critical section is a panic-free map op) — matches `MembershipProjection`'s
-    /// ZEB-495 recovery.
-    pub fn note_seen(&self, owner: [u8; 16], last_seen_ms: u64) {
-        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let slot = g.entry(owner).or_insert(last_seen_ms);
-        *slot = (*slot).max(last_seen_ms);
-    }
-
-    /// Freshest recorded presence-beacon wall-clock for `owner`, if any.
-    /// Poisoned lock recovered (see [`note_seen`](Self::note_seen)).
-    pub fn last_seen(&self, owner: &[u8; 16]) -> Option<u64> {
-        let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        g.get(owner).copied()
-    }
-}
-
 /// ZEB-380: per-relay health source for the snapshot. Mirrors `DialSnapshot`.
 /// Returns the core `harmony_pkarr::RelayHealth`; `snapshot()` maps it to the
 /// camelCase wire DTO.
@@ -2114,16 +2078,12 @@ pub struct NetworkHealthService {
     /// are inert). Installed at boot via
     /// [`set_liveness_source`](Self::set_liveness_source).
     liveness: Option<std::sync::Arc<dyn LivenessSnapshot>>,
-    /// ZEB-622: presence last-seen cache. `None` in unit tests that don't exercise
-    /// presence freshness. Installed at boot via
-    /// [`set_presence_source`](Self::set_presence_source).
-    presence: Option<std::sync::Arc<PresenceLastSeenCache>>,
     /// ZEB-623: per-peer protocol-compatibility registry, shared with the
     /// TunnelManager that writes it from the tunnel-v2 hello negotiation. Reads
     /// only; defaults to an empty registry (inert — every lookup is `None`) so
     /// unit tests and pre-boot construction need no wiring. Installed at boot via
     /// [`set_protocol_compat_source`](Self::set_protocol_compat_source),
-    /// mirroring the liveness/presence handles.
+    /// mirroring the liveness handle.
     protocol_compat: std::sync::Arc<crate::protocol_versioning::ProtocolCompatRegistry>,
     last_self_test: std::sync::Arc<tokio::sync::RwLock<Option<SelfTestReport>>>,
     /// Channel into the rate-limiter task. `None` until `spawn_rate_limiter`
@@ -2203,7 +2163,6 @@ impl NetworkHealthService {
             relay,
             supervisor: None,
             liveness: None,
-            presence: None,
             protocol_compat: std::sync::Arc::new(
                 crate::protocol_versioning::ProtocolCompatRegistry::default(),
             ),
@@ -2236,12 +2195,6 @@ impl NetworkHealthService {
     /// value (existing behavior).
     pub fn set_liveness_source(&mut self, src: std::sync::Arc<dyn LivenessSnapshot>) {
         self.liveness = Some(src);
-    }
-
-    /// ZEB-622: install the presence last-seen cache. Called once at boot. When
-    /// unset, the presence contribution to `last_seen_ms` is inert.
-    pub fn set_presence_source(&mut self, src: std::sync::Arc<PresenceLastSeenCache>) {
-        self.presence = Some(src);
     }
 
     /// ZEB-623: install the per-peer protocol-compat registry (the SAME Arc the
@@ -2522,19 +2475,14 @@ impl NetworkHealthService {
         // ZEB-622: fold the freshest last-seen evidence into each record. The
         // supervisor `Connected.since_ms` fallback (above) fills a record that
         // had none; here we additionally max-merge the liveness `Connected
-        // .since_ms` and the presence-beacon cache so a fresher signal from
-        // either advances the record's own value (never regresses it).
+        // .since_ms` so a fresher signal advances the record's own value (never
+        // regresses it). Both sides are WALL-epoch ms.
         for record in &mut records {
             let mut best = record.last_seen_ms;
             if let Some(LivenessStateWire::Connected { since_ms, .. }) =
                 liveness_states.get(&record.iroh_node_id)
             {
                 best = Some(best.map_or(*since_ms, |b| b.max(*since_ms)));
-            }
-            if let Some(cache) = self.presence.as_ref() {
-                if let Some(seen) = cache.last_seen(&record.owner_addr) {
-                    best = Some(best.map_or(seen, |b| b.max(seen)));
-                }
             }
             record.last_seen_ms = best;
         }
@@ -2543,9 +2491,7 @@ impl NetworkHealthService {
         // record (joined by iroh node id).
         //   `connected_since_ms` — the establishment stamp under its honest
         //   name: liveness `Connected.since_ms` first (the live transport's
-        //   view), else the supervisor's `Connected.since_ms`. The presence
-        //   cache deliberately does NOT feed it — presence is heard-from
-        //   evidence, not connection establishment.
+        //   view), else the supervisor's `Connected.since_ms`.
         //   `last_traffic_ms` — max of the liveness rx stamp and the acceptor
         //   registry's `last_any_served_ms`; either source alone surfaces.
         //   `last_relay_pull_served_ms` — registry value verbatim
@@ -5411,7 +5357,7 @@ mod tests {
         assert_eq!(snap.peers[0].staleness, None);
     }
 
-    // ── ZEB-622 Task 5: liveness fusion + Degraded + presence last-seen ──
+    // ── ZEB-622 Task 5: liveness fusion + Degraded + last-seen merge ──
 
     /// Test `LivenessSnapshot` double: replays a scripted per-peer state list +
     /// a fixed min relay RTT.
@@ -5725,40 +5671,46 @@ mod tests {
         assert_eq!(snap2.my_network.expect("ready").relay_rtt_ms, Some(24));
     }
 
-    /// (d) `last_seen_ms` prefers the freshest of {record ts, presence cache,
-    /// liveness Connected.since_ms}. Record < presence cache → cache wins; both
-    /// < since_ms → since_ms wins.
+    /// (d) `last_seen_ms` merges only WALL-epoch sources: the resolver record
+    /// timestamp and the liveness `Connected.since_ms`. The freshest of the two
+    /// wins the `max()`. (ZEB-853 D6: the former presence-cache contribution was
+    /// removed — it fed a MONOTONIC `Instant::elapsed()` value into this same
+    /// wall-epoch `max()`, a magnitude that could never win, so it was inert.)
     #[tokio::test]
-    async fn last_seen_prefers_freshest_source() {
-        // Case 1: presence cache (5_000) fresher than record (1_000), no liveness.
+    async fn last_seen_merges_only_wall_epoch_sources() {
+        let record_wall = 1_700_000_000_000u64; // resolver announce (wall epoch)
+        let liveness_wall = 1_700_000_005_000u64; // fresher liveness since_ms (wall epoch)
+
+        // Record present, no liveness yet → record ts surfaces.
         let mut svc = NetworkHealthService::new(
             std::sync::Arc::new(FakeIroh { ready: true }),
             std::sync::Arc::new(FakePkarr),
             std::sync::Arc::new(FakeResolver {
-                records: vec![make_record(0x77, ConnectionMode::NoConnection, Some(1_000))],
+                records: vec![make_record(
+                    0x77,
+                    ConnectionMode::NoConnection,
+                    Some(record_wall),
+                )],
             }),
             membership_sharing(&[0x77]),
             std::sync::Arc::new(EmptyDialSnapshot),
             std::sync::Arc::new(EmptyRelaySnapshot),
         );
-        let cache = std::sync::Arc::new(PresenceLastSeenCache::new());
-        cache.note_seen([0x77; 16], 5_000);
-        svc.set_presence_source(std::sync::Arc::clone(&cache));
         let snap = svc.snapshot().await;
         assert_eq!(
             snap.peers[0].last_seen_ms,
-            Some(5_000),
-            "presence cache is fresher than the record → cache wins"
+            Some(record_wall),
+            "with only the resolver record, last_seen is the record ts"
         );
 
-        // Case 2: add liveness Connected.since_ms (9_000) — fresher than both.
+        // Add liveness Connected.since_ms (fresher than the record) → it wins.
         svc.set_liveness_source(std::sync::Arc::new(FakeLiveness {
             states: vec![(
                 [0x77u8; 32],
                 LivenessStateWire::Connected {
                     mode: LivenessMode::Direct,
                     rtt_ms: Some(3),
-                    since_ms: 9_000,
+                    since_ms: liveness_wall,
                 },
             )],
             min_relay: None,
@@ -5766,8 +5718,8 @@ mod tests {
         let snap2 = svc.snapshot().await;
         assert_eq!(
             snap2.peers[0].last_seen_ms,
-            Some(9_000),
-            "liveness Connected.since_ms is freshest → since_ms wins"
+            Some(liveness_wall),
+            "last_seen must be the freshest WALL-epoch source; no monotonic presence merge"
         );
     }
 
@@ -6413,22 +6365,6 @@ mod tests {
     fn connection_mode_degraded_serde_pin() {
         let v = serde_json::to_value(ConnectionMode::Degraded).expect("serialize");
         assert_eq!(v, serde_json::json!("degraded"));
-    }
-
-    /// (g) `PresenceLastSeenCache` max-merges: a stale (lower) note never
-    /// regresses a fresher recorded value; a fresher note advances it.
-    #[test]
-    fn presence_last_seen_cache_max_merges() {
-        let c = PresenceLastSeenCache::new();
-        assert_eq!(c.last_seen(&[1; 16]), None);
-        c.note_seen([1; 16], 100);
-        assert_eq!(c.last_seen(&[1; 16]), Some(100));
-        c.note_seen([1; 16], 50); // stale → must not regress
-        assert_eq!(c.last_seen(&[1; 16]), Some(100));
-        c.note_seen([1; 16], 200); // fresher → advances
-        assert_eq!(c.last_seen(&[1; 16]), Some(200));
-        // A different owner is independent.
-        assert_eq!(c.last_seen(&[2; 16]), None);
     }
 
     #[tokio::test]

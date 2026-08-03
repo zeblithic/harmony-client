@@ -277,11 +277,6 @@ pub struct CommunityPresenceMap {
     /// (`Arc<AtomicBool>::default()`), which would silently ship every node
     /// invisible; hence the explicit `new()`/`Default` below.
     presence_visible: Arc<AtomicBool>,
-    /// ZEB-622: network-health presence last-seen cache. Fed from [`apply`](Self::apply)
-    /// on every verified beacon (see there). `None` until boot wires it via
-    /// [`set_last_seen_cache`](Self::set_last_seen_cache) — test callers that
-    /// construct a bare map leave it inert.
-    last_seen_cache: Option<Arc<crate::network_health::PresenceLastSeenCache>>,
 }
 
 impl Default for CommunityPresenceMap {
@@ -295,18 +290,7 @@ impl CommunityPresenceMap {
         Self {
             inner: BTreeMap::new(),
             presence_visible: Arc::new(AtomicBool::new(true)),
-            last_seen_cache: None,
         }
-    }
-
-    /// ZEB-622: wire the network-health presence last-seen cache. Called once at
-    /// boot (lib.rs, right after constructing the map, before it is shared).
-    /// Every subsequent [`apply`](Self::apply) feeds the cache.
-    pub fn set_last_seen_cache(
-        &mut self,
-        cache: Arc<crate::network_health::PresenceLastSeenCache>,
-    ) {
-        self.last_seen_cache = Some(cache);
     }
 
     /// ZEB-600: clone the node-global visibility gate handle for a presence
@@ -340,15 +324,6 @@ impl CommunityPresenceMap {
     /// session is rejected, and within the same session only a strictly-newer
     /// `seq` advances liveness.
     pub fn apply(&mut self, c: &SpaceId, beacon: &PresenceBeacon, now_ms: u64) -> bool {
-        // ZEB-622: feed the network-health presence last-seen cache for EVERY
-        // beacon that reaches apply — the subscriber only calls this for
-        // signature-verified, member-gated beacons, so even a stale/duplicate
-        // refresh that leaves the roster unchanged (returns `false` below) is
-        // still fresh evidence we just heard from this owner. Keyed by owner
-        // ([u8;16]); max-merged in the cache. Inert until boot wires the cache.
-        if let Some(cache) = &self.last_seen_cache {
-            cache.note_seen(beacon.owner, now_ms);
-        }
         let community = self.inner.entry(*c).or_default();
         match community.get_mut(&beacon.device) {
             Some(e) if beacon.started_hlc.is_strictly_newer_than(&e.started_hlc) => {
@@ -928,43 +903,13 @@ mod tests {
         on_presence_roster_change(&resync_tx, None, None);
     }
 
-    /// ZEB-622: `apply` feeds the network-health presence last-seen cache for
-    /// EVERY beacon that reaches it — the first (roster-changing) beacon AND a
-    /// subsequent stale/duplicate refresh that leaves the roster unchanged. The
-    /// cache max-merges, so the freshest `now_ms` wins.
+    /// A first beacon for an owner is a roster change (`apply` → true) and
+    /// populates the online-owner set.
     #[test]
-    fn apply_feeds_last_seen_cache_regardless_of_changed() {
-        let cache = Arc::new(crate::network_health::PresenceLastSeenCache::new());
-        let mut m = CommunityPresenceMap::new();
-        m.set_last_seen_cache(Arc::clone(&cache));
-        let c = SpaceId([7u8; 16]);
-
-        // First beacon: a roster change (apply → true) also feeds the cache.
-        assert!(m.apply(&c, &b(0x0a, 1, 100, 0), 1_000));
-        assert_eq!(cache.last_seen(&[0x0a; 16]), Some(1_000));
-
-        // A duplicate-seq refresh is NOT a roster change (apply → false) but
-        // still feeds the cache with the fresher wall clock.
-        assert!(!m.apply(&c, &b(0x0a, 1, 100, 0), 2_000));
-        assert_eq!(
-            cache.last_seen(&[0x0a; 16]),
-            Some(2_000),
-            "unchanged refresh still advances last-seen"
-        );
-
-        // A stale (lower) now_ms never regresses the recorded value.
-        assert!(!m.apply(&c, &b(0x0a, 1, 100, 0), 1_500));
-        assert_eq!(cache.last_seen(&[0x0a; 16]), Some(2_000));
-    }
-
-    /// ZEB-622: a map without a wired cache (the test/default construction) is
-    /// inert — `apply` neither panics nor records anything.
-    #[test]
-    fn apply_without_cache_is_inert() {
+    fn apply_first_beacon_updates_roster() {
         let mut m = CommunityPresenceMap::new();
         let c = SpaceId([7u8; 16]);
         assert!(m.apply(&c, &b(0x0a, 1, 100, 0), 1_000));
-        // Nothing to assert beyond "no panic"; the roster still updates.
         assert_eq!(m.online_owners(&c).len(), 1);
     }
 }

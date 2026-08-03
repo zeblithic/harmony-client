@@ -4666,19 +4666,9 @@ pub async fn start_node_inner(
         // is unreachable from them, so a locally-published row would never be
         // persisted until a peer echoed it back.
         let addrbook_dirty_hub = crate::address_book_sync::AddrbookDirtyHub::new();
-        // ZEB-622: network-health presence last-seen cache. Created here so it can
-        // be (a) wired into the presence map below — every verified beacon's
-        // `apply` feeds it — and (b) installed on the NetworkHealthService at the
-        // boot block far below (`set_presence_source`), which max-merges it into
-        // each peer's `last_seen_ms`. A plain `Arc`; the map holds one clone, the
-        // service another.
-        let network_health_presence_cache =
-            std::sync::Arc::new(crate::network_health::PresenceLastSeenCache::new());
-        let community_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new({
-            let mut m = crate::community_presence::CommunityPresenceMap::new();
-            m.set_last_seen_cache(std::sync::Arc::clone(&network_health_presence_cache));
-            m
-        }));
+        let community_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::community_presence::CommunityPresenceMap::new(),
+        ));
         let community_presence_map_for_state = std::sync::Arc::clone(&community_presence_map);
 
         // ── ZEB-323 Phase 2b: pkarr lifted state holders ─────────────────
@@ -12889,11 +12879,6 @@ pub async fn start_node_inner(
                                 crate::network_health::ProdLivenessSnapshot::new(
                                     reachability_resolver.clone(),
                                 ),
-                            ));
-                            // ZEB-622: presence last-seen cache (fed by the
-                            // community-presence subscriber's `apply`).
-                            nh.set_presence_source(std::sync::Arc::clone(
-                                &network_health_presence_cache,
                             ));
                             // ZEB-623: per-peer protocol-compat registry. Share
                             // the SAME Arc NodeState holds (published just above
