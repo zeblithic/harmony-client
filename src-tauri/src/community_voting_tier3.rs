@@ -1302,6 +1302,12 @@ pub enum VerifyError {
     BackupPoolNotExhausted { declined: usize, capacity: usize },
     #[error("PollResult tally mismatch: recomputed differs from claimed")]
     TallyMismatch,
+    /// se-mode `verify_sr`: fewer than `threshold` committee tally shares have
+    /// been applied on this node, so the secret tally cannot yet be recomputed.
+    /// Distinct from `TallyMismatch` — the claim is *unconfirmable here yet*, not
+    /// forged (a later share may make it verifiable). Fail-closed, but retryable.
+    #[error("tally shares not yet available to confirm result (below threshold)")]
+    TallySharesNotReady,
     #[error("payload decode failed: {0}")]
     PayloadDecode(String),
     #[error("ballot validation failed: {0}")]
@@ -1515,17 +1521,17 @@ pub fn verify_sr(
     // plaintext STAR tally — `tally_star` skips se-mode ciphertext ballots and
     // would return an all-zero result, so verify_sr would reject every legitimate
     // peer se-mode kd=rs. `recover_secret_tally` is deterministic across replicas
-    // (Lagrange invariance), so this is a real authz check, not a weakening:
-    // a forged result recovers to a different tally → TallyMismatch. `None`
-    // (fewer than `threshold` shares applied) means this node cannot yet confirm
-    // the claim → fail-closed.
-    let recomputed = match poll_state.meta.config.privacy_mode.as_str() {
-        "se" => recover_secret_tally(poll_state, &ordered_candidates)
-            .ok_or(VerifyError::TallyMismatch)?,
-        _ => tally_star(&ordered_candidates, &poll_state.ratification_ballots),
-    };
-
-    if recomputed != payload.result {
+    // (Lagrange invariance), so this is a real authz check, not a weakening.
+    //
+    // ZEB-858: the recompute is now shared via `recompute_expected_result`, and
+    // its two failure modes are disambiguated:
+    // - `None` (se-mode, fewer than `threshold` shares applied here) means this
+    //   node cannot YET confirm the claim → `TallySharesNotReady` (retryable).
+    // - recompute succeeds but differs from the claim → genuine forgery →
+    //   `TallyMismatch`.
+    let expected = recompute_expected_result(poll_state, &ordered_candidates)
+        .ok_or(VerifyError::TallySharesNotReady)?;
+    if expected != payload.result {
         return Err(VerifyError::TallyMismatch);
     }
 
@@ -1844,6 +1850,32 @@ pub fn recover_secret_tally(
         ));
     }
     None
+}
+
+/// Recompute the PollResult a legitimate producer would claim, per privacy mode.
+///
+/// This is the single deterministic tally-recompute shared by `verify_sr` (and,
+/// from ZEB-857/859, the ingest arm). It mirrors the engine's own result
+/// production:
+/// - `se`: threshold-decrypted secret tally (`recover_secret_tally`). Returns
+///   `None` when fewer than `threshold` committee shares have been applied on
+///   this node — the tally is not yet recoverable here (retryable), which the
+///   caller must distinguish from a genuine mismatch.
+/// - otherwise (`pu`): plaintext STAR tally (`tally_star`), always `Some`.
+///
+/// `ordered_candidates` must be the canonical ratification ordering
+/// (`ratification_candidates_ordering`); its length is the spec's `n`.
+fn recompute_expected_result(
+    poll_state: &Tier3PollState,
+    ordered_candidates: &[crate::community_voting_star::CandidateRef],
+) -> Option<crate::community_voting_star::StarResult> {
+    match poll_state.meta.config.privacy_mode.as_str() {
+        "se" => recover_secret_tally(poll_state, ordered_candidates),
+        _ => Some(tally_star(
+            ordered_candidates,
+            &poll_state.ratification_ballots,
+        )),
+    }
 }
 
 /// LWW-dedup helper for se-mode ratification ballots. Phase 6 v1 ships a
@@ -3696,6 +3728,114 @@ mod tests {
             encode(&payload),
         );
         assert_eq!(verify_sr(&ev, &poll), Err(VerifyError::TallyMismatch));
+    }
+
+    // 15b. ZEB-858: se-mode poll whose committee tally shares are below
+    // threshold — `recover_secret_tally` returns `None`, so this node cannot
+    // yet confirm the claimed result. verify_sr must surface the DISTINCT
+    // `TallySharesNotReady` (retryable), NOT `TallyMismatch` (forgery).
+    #[test]
+    fn verify_sr_shares_not_ready_returns_distinct_error() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // One real ballot + one real tally share. Committee threshold is 2,
+        // so a single share leaves the secret tally unrecoverable (None).
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb ok");
+        let share = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let ts_ev = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &share,
+        );
+        state.apply_event(&ts_ev).expect("ts apply");
+        // Satisfy R1: a kd=cl on its own (proposer) lane records close_event_hash.
+        let cl_ev = make_event(
+            PollEventKindCode::PollClose,
+            RATIFICATION_END_MS + 1000,
+            addr(0xff),
+        );
+        state.apply_event(&cl_ev).expect("cl");
+        // Any claimed result — the recompute is unavailable, so it is unconfirmable.
+        let payload = Tier3PollResultPayload {
+            poll_id: poll_id(),
+            result: star_result(),
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::PollResult,
+            RATIFICATION_END_MS + 2000,
+            addr(0xfe),
+            encode(&payload),
+        );
+        assert_eq!(
+            verify_sr(&ev, &state),
+            Err(VerifyError::TallySharesNotReady)
+        );
+    }
+
+    // 15c. ZEB-858: se-mode poll with a FULLY recoverable tally (threshold
+    // shares applied) but a deliberately wrong claimed result. The recompute
+    // succeeds and differs from the claim → genuine forgery → `TallyMismatch`
+    // (the split must NOT weaken forgery detection).
+    #[test]
+    fn verify_sr_forgery_returns_tally_mismatch() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // Three ballots so the recompute yields non-zero score sums.
+        let ballots = [[5u64, 1, 0], [5, 2, 0], [5, 3, 0]];
+        for (i, scores) in ballots.iter().enumerate() {
+            let payload = ts_apply_helpers::build_real_se_ballot_payload(&committee, scores);
+            let ev = ts_apply_helpers::rb_event_at_with_actor(
+                RATIFICATION_OPEN_MS + i as u64,
+                committee.member_addrs[i],
+                &payload,
+            );
+            state.apply_event(&ev).expect("rb apply");
+        }
+        // Two valid shares (threshold = 2-of-3) → recover_secret_tally is Some.
+        for member_idx in [0, 1] {
+            let ts_payload =
+                ts_apply_helpers::build_real_tally_share_payload(&state, &committee, member_idx, 0);
+            let ev = ts_apply_helpers::ts_event_at_with_actor(
+                RATIFICATION_END_MS + member_idx as u64,
+                committee.member_addrs[member_idx],
+                &ts_payload,
+            );
+            state.apply_event(&ev).expect("ts apply");
+        }
+        // Satisfy R1.
+        let cl_ev = make_event(
+            PollEventKindCode::PollClose,
+            RATIFICATION_END_MS + 1000,
+            addr(0xff),
+        );
+        state.apply_event(&cl_ev).expect("cl");
+        // Deliberately wrong result: real recompute yields non-zero total_scores.
+        let wrong_result = StarResult {
+            winner: crate::community_voting_star::CandidateRef {
+                event_hash: [0x00; 32],
+                approval_count: 0,
+            },
+            finalists: vec![],
+            total_scores: vec![0, 0, 0],
+            runoff_votes: vec![0],
+        };
+        let payload = Tier3PollResultPayload {
+            poll_id: poll_id(),
+            result: wrong_result,
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::PollResult,
+            RATIFICATION_END_MS + 2000,
+            addr(0xfe),
+            encode(&payload),
+        );
+        assert_eq!(verify_sr(&ev, &state), Err(VerifyError::TallyMismatch));
     }
 
     // ── verify_ratification_ballot tests ─────────────────────────────────────
