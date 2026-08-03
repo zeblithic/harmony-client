@@ -4,7 +4,9 @@
 //! ingest (byte cap → parse → signature → pubkey→address binding → topic
 //! shape → caps → eligibility) before any state effect, whole-record LWW
 //! replace by `updated_at` (strictly-greater wins), bounded owner maps
-//! with stalest-evicted overflow.
+//! with newest-received-first overflow eviction (ZEB-851 flood-proofing: a
+//! flood of throwaway rows evicts itself, never established honest rows —
+//! see `evict_overflow`).
 //!
 //! Pledge lists and backup sets persist to `storage_records.json`
 //! (verify-once-at-ingest — signatures are never written to disk, the
@@ -43,7 +45,9 @@ pub const MAX_BACKUP_SET_WIRE_BYTES: usize = 96 * 1024;
 pub const MAX_HOSTING_REPORTS: usize = 64;
 /// Wire cap for hosting reports, checked before serde.
 pub const MAX_HOSTING_REPORT_WIRE_BYTES: usize = 16 * 1024;
-/// Bounded-store cap per record family; stalest owner evicted beyond it.
+/// Bounded-store cap per record family; beyond it the NEWEST-received owner
+/// is evicted first, so a flood of throwaway rows evicts itself rather than
+/// established honest rows (ZEB-851 flood-proofing — see `evict_overflow`).
 pub const MAX_TRACKED_OWNERS: usize = 1024;
 /// Cap on first-write-wins signer pins (ZEB-679). Strictly above the
 /// worst-case live-owner union (3 families × [`MAX_TRACKED_OWNERS`]), so

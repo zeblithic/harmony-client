@@ -117,10 +117,31 @@ impl CanonicalPayloadSealed for DmInboxDoc {}
 impl CanonicalPayload for DmInboxDoc {}
 
 impl DmInboxDoc {
-    /// ZEB-851: mutable handle to the local first-observation clock for the
-    /// ingest GC (same crate). Not serialized; not part of equality.
-    pub(crate) fn first_observed_ms_mut(&mut self) -> &mut BTreeMap<String, u64> {
-        &mut self.first_observed_ms
+    /// ZEB-851 GC: drop entries that are either covered (`covered`) or past
+    /// this replica's per-replica local TTL, returning whether `entries`
+    /// changed. Expiry keys off the LOCAL `first_observed_ms` (lazily stamped
+    /// here on the first sweep that sees each entry), never the butler-minted
+    /// `deposited_at` — a backdated deposit must not drop a DM as pre-expired.
+    ///
+    /// Borrows `entries` and `first_observed_ms` as disjoint fields across the
+    /// `retain` (no per-sweep clone of the side-map), mirroring `RelayHoldDoc::gc`
+    /// in `community_relay_hold_crdt`.
+    pub(crate) fn gc_expired(&mut self, now_ms: u64, covered: &BTreeSet<String>) -> bool {
+        // Lazy-stamp first observation for any entry not yet seen.
+        for key in self.entries.keys().cloned().collect::<Vec<_>>() {
+            self.first_observed_ms.entry(key).or_insert(now_ms);
+        }
+        let before = self.entries.len();
+        let first_observed = &self.first_observed_ms;
+        self.entries.retain(|key, _e| {
+            let observed = first_observed.get(key).copied().unwrap_or(now_ms);
+            let ttl_expired = observed.saturating_add(crate::butler_deposit::INBOX_TTL_MS) < now_ms;
+            !(ttl_expired || covered.contains(key))
+        });
+        // Prune the side-map for removed keys (bounded with `entries`).
+        let live: BTreeSet<String> = self.entries.keys().cloned().collect();
+        self.first_observed_ms.retain(|k, _| live.contains(k));
+        self.entries.len() != before
     }
 }
 

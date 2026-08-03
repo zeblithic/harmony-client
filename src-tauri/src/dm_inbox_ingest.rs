@@ -38,6 +38,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
 
+// Only the test module references `INBOX_TTL_MS` directly now; the production
+// TTL comparison moved into `DmInboxDoc::gc_expired` (ZEB-851).
+#[cfg(test)]
 use crate::butler_deposit::INBOX_TTL_MS;
 use crate::dm_inbox_crdt::{DmInboxDoc, DmInboxEntry};
 use crate::owner_state_types::{ContentId, Hlc, InboxEntry, OwnerAddr, ReceivedMessage, SpaceId};
@@ -420,20 +423,9 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
     let now_ms = ctx.now_ms();
     // ZEB-851: expire from this replica's OWN first observation, not the
     // butler-minted `deposited_at` (a backdated deposit must not drop a DM as
-    // pre-expired). Lazy-stamp on the first sweep that sees each entry.
-    for key in doc.entries.keys().cloned().collect::<Vec<_>>() {
-        doc.first_observed_ms_mut().entry(key).or_insert(now_ms);
-    }
-    let before = doc.entries.len();
-    let first_observed = doc.first_observed_ms_mut().clone();
-    doc.entries.retain(|key, _e| {
-        let observed = first_observed.get(key).copied().unwrap_or(now_ms);
-        let ttl_expired = observed.saturating_add(INBOX_TTL_MS) < now_ms;
-        !(ttl_expired || covered_at_start.contains(key))
-    });
-    let live: BTreeSet<String> = doc.entries.keys().cloned().collect();
-    doc.first_observed_ms_mut().retain(|k, _| live.contains(k));
-    changed |= doc.entries.len() != before;
+    // pre-expired). `gc_expired` lazy-stamps on the first sweep that sees each
+    // entry and borrows the side-map clone-free (see `DmInboxDoc::gc_expired`).
+    changed |= doc.gc_expired(now_ms, &covered_at_start);
 
     changed
 }
