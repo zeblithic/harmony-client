@@ -38,6 +38,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, Mutex};
 
+// Only the test module references `INBOX_TTL_MS` directly now; the production
+// TTL comparison moved into `DmInboxDoc::gc_expired` (ZEB-851).
+#[cfg(test)]
 use crate::butler_deposit::INBOX_TTL_MS;
 use crate::dm_inbox_crdt::{DmInboxDoc, DmInboxEntry};
 use crate::owner_state_types::{ContentId, Hlc, InboxEntry, OwnerAddr, ReceivedMessage, SpaceId};
@@ -388,31 +391,41 @@ pub async fn ingest_pending(doc: &mut DmInboxDoc, ctx: &dyn DmInboxIngestCtx) ->
     //       `ingested_by` at sweep START (compared in the shared 64-hex
     //       device-id string form — see the `covered_at_start` snapshot
     //       above and `DmInboxIngestCtx::enrolled_device_ids`), or
-    //   (b) TTL: `deposited_at.wall_ms + INBOX_TTL_MS < now` (strict).
+    //   (b) TTL: `first_observed_ms[key] + INBOX_TTL_MS < now` (strict,
+    //       local receipt — see below).
     //
     // Churn-tolerant model (resurrection-by-merge): a sibling that GC'd
     // later than us can re-merge an old doc and resurrect a removed entry
-    // (the insert-once merge sees the missing key as new). That is FINE:
-    // both GC criteria are deterministic functions of (ingested_by, now),
-    // and `ingested_by` is grow-only with union merge — so every replica
-    // evaluating the resurrected entry reaches the same removable verdict
-    // and the next sweep removes it again (a resurrected entry arrives
-    // already covered, so it IS covered at that sweep's start). Once every
-    // replica has GC'd, no copy remains to resurrect, so the fleet
-    // converges WITHOUT tombstones. Re-ingestion after a lost ig-update is
-    // likewise safe: `apply_inbox` is idempotent on (space_id,
-    // message_cid), and the dm-received emit is gated on its Inserted
-    // outcome.
+    // (the insert-once merge sees the missing key as new). The COVERAGE
+    // criterion remains a deterministic function of (ingested_by, now):
+    // `ingested_by` is grow-only with union merge, so every replica
+    // evaluating a resurrected-but-covered entry reaches the same removable
+    // verdict and the next sweep removes it again (a resurrected entry
+    // arrives already covered, so it IS covered at that sweep's start).
+    // Once every replica has GC'd, no copy remains to resurrect, so the
+    // fleet converges WITHOUT tombstones.
+    //
+    // The TTL criterion is NOT fleet-wide deterministic (ZEB-851): it is
+    // keyed off this replica's own LOCAL, non-replicated
+    // `first_observed_ms`, lazily stamped on first local observation — a
+    // per-replica SOFT deadline, not a shared one. A never-covered entry
+    // resurrected by a still-holding peer re-stamps `first_observed_ms` on
+    // this replica and gets a fresh TTL window, so it may persist beyond a
+    // single TTL window in a continuously-merging fleet. This is bounded by
+    // the store's caps and is the deliberately-safe direction —
+    // over-retaining an undelivered DM beats dropping a live one.
+    // Re-ingestion after a lost ig-update is likewise safe: `apply_inbox`
+    // is idempotent on (space_id, message_cid), and the dm-received emit is
+    // gated on its Inserted outcome.
     //
     // An expired entry that was just ingested above is still removed —
     // delivery beat the deadline; the deposit record's job is done.
     let now_ms = ctx.now_ms();
-    let before = doc.entries.len();
-    doc.entries.retain(|key, e| {
-        let ttl_expired = e.deposited_at.wall_ms.saturating_add(INBOX_TTL_MS) < now_ms;
-        !(ttl_expired || covered_at_start.contains(key))
-    });
-    changed |= doc.entries.len() != before;
+    // ZEB-851: expire from this replica's OWN first observation, not the
+    // butler-minted `deposited_at` (a backdated deposit must not drop a DM as
+    // pre-expired). `gc_expired` lazy-stamps on the first sweep that sees each
+    // entry and borrows the side-map clone-free (see `DmInboxDoc::gc_expired`).
+    changed |= doc.gc_expired(now_ms, &covered_at_start);
 
     changed
 }
@@ -2206,25 +2219,21 @@ mod tests {
         };
 
         // (a) coverage-complete: every enrolled device (self + sibling)
-        //     has ingested → removed.
+        //     has ingested → removed on the FIRST sweep. Coverage is
+        //     unaffected by ZEB-851's local-clock TTL change.
         let (key_covered, entry_covered) =
             make_entry([1; 16], [1; 32], now_ms - 1_000, &[SELF_ID, SIBLING_ID]);
-        // (b) TTL-expired (strictly past the deadline) → removed even
-        //     though coverage is incomplete.
+        // (b) backdated `deposited_at` (ms=500, ancient) but
+        //     coverage-incomplete (ig carries SELF only). Under local-clock
+        //     TTL this entry is first OBSERVED on this very sweep, so it
+        //     must NOT pre-expire here — that's the ZEB-851 regression this
+        //     test now pins alongside coverage.
         let (key_ttl, entry_ttl) = make_entry([2; 16], [2; 32], 500, &[SELF_ID]);
-        // (c) fresh + coverage-incomplete → retained.
-        let (key_fresh, entry_fresh) = make_entry([3; 16], [3; 32], now_ms - 1_000, &[SELF_ID]);
-        // (d) TTL boundary pin: deposited_at + TTL == now is NOT yet
-        //     expired (strict `<`) → retained.
-        let (key_edge, entry_edge) =
-            make_entry([4; 16], [4; 32], now_ms - INBOX_TTL_MS, &[SELF_ID]);
 
         let mut doc = DmInboxDoc::default();
         doc.entries
             .insert(key_covered.clone(), entry_covered.clone());
         doc.entries.insert(key_ttl.clone(), entry_ttl);
-        doc.entries.insert(key_fresh.clone(), entry_fresh);
-        doc.entries.insert(key_edge.clone(), entry_edge);
 
         let changed = ingest_pending(&mut doc, &ctx).await;
         assert!(changed, "GC removals are doc mutations");
@@ -2232,22 +2241,61 @@ mod tests {
             !doc.entries.contains_key(&key_covered),
             "ig ⊇ enrolled set → coverage GC"
         );
-        assert!(!doc.entries.contains_key(&key_ttl), "past TTL → GC");
         assert!(
-            doc.entries.contains_key(&key_fresh),
-            "fresh + uncovered → retained"
-        );
-        assert!(
-            doc.entries.contains_key(&key_edge),
-            "TTL is strict `<` — boundary retained"
+            doc.entries.contains_key(&key_ttl),
+            "a backdated deposited_at must not pre-expire a freshly-observed entry"
         );
         assert!(
             ctx.calls().is_empty(),
             "all entries already carried self in ig — GC must not re-ingest"
         );
 
+        // (c) fresh + coverage-incomplete, inserted only NOW — first
+        //     observed on the boundary sweep below, so it stays retained
+        //     through both subsequent sweeps.
+        let (key_fresh, entry_fresh) = make_entry([3; 16], [3; 32], now_ms - 1_000, &[SELF_ID]);
+        doc.entries.insert(key_fresh.clone(), entry_fresh);
+
+        // (d) TTL boundary pin: a sweep exactly at
+        //     first_observed(key_ttl) + INBOX_TTL_MS is NOT yet expired
+        //     (strict `<`) → retained.
+        let ctx_boundary = ProbeCtx {
+            now_ms: now_ms + INBOX_TTL_MS,
+            ..ProbeCtx::new()
+        };
+        let changed = ingest_pending(&mut doc, &ctx_boundary).await;
+        assert!(!changed, "boundary sweep must not mutate anything");
+        assert!(
+            doc.entries.contains_key(&key_ttl),
+            "TTL is strict `<` — boundary retained"
+        );
+        assert!(
+            doc.entries.contains_key(&key_fresh),
+            "fresh + uncovered → retained"
+        );
+
+        // One ms past the boundary: key_ttl (first-observed at `now_ms`)
+        // expires from local receipt; key_fresh (first-observed one sweep
+        // later, on ctx_boundary) does not.
+        let ctx_expired = ProbeCtx {
+            now_ms: now_ms + INBOX_TTL_MS + 1,
+            ..ProbeCtx::new()
+        };
+        let changed = ingest_pending(&mut doc, &ctx_expired).await;
+        assert!(changed, "TTL GC removal is a doc mutation");
+        assert!(
+            !doc.entries.contains_key(&key_ttl),
+            "expired from local receipt → GC"
+        );
+        assert!(
+            doc.entries.contains_key(&key_fresh),
+            "fresh + uncovered → still retained"
+        );
+
         // Empty-enrolled guard: ig ⊇ ∅ is vacuously true, so an empty
-        // provider snapshot must NOT wipe the inbox (TTL still applies).
+        // provider snapshot must NOT wipe the inbox (TTL still applies; the
+        // entry is first-observed on this very sweep, so it isn't expired
+        // either).
         let ctx_empty = ProbeCtx {
             enrolled: BTreeSet::new(),
             now_ms,
@@ -2273,20 +2321,56 @@ mod tests {
         assert!(doc.entries.contains_key(&key_covered));
 
         // ...and the NEXT sweep removes it again without re-ingesting
-        // (self is already in the resurrected ig): GC criteria are
-        // deterministic on (ig, now), so every replica converges on
-        // removal and once all have GC'd no copy remains to resurrect.
-        let applied_before = ctx.applied().len();
-        let changed = ingest_pending(&mut doc, &ctx).await;
+        // (self is already in the resurrected ig): coverage GC is
+        // deterministic on (ig, now) regardless of local-clock TTL state,
+        // so every replica converges on removal and once all have GC'd no
+        // copy remains to resurrect.
+        let applied_before = ctx_expired.applied().len();
+        let changed = ingest_pending(&mut doc, &ctx_expired).await;
         assert!(changed);
         assert!(
             !doc.entries.contains_key(&key_covered),
             "re-GC after resurrection-by-merge converges"
         );
         assert_eq!(
-            ctx.applied().len(),
+            ctx_expired.applied().len(),
             applied_before,
             "no duplicate ingestion/emit for a resurrected entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_gc_uses_local_receipt_not_backdated_deposited_at() {
+        let now: u64 = INBOX_TTL_MS + 1_000_000;
+        // Backdated deposited_at (deposited_ms = 1); ig carries SELF only, so
+        // coverage is INCOMPLETE (ProbeCtx::new enrolls self + sibling) → the
+        // only removal path is the TTL GC, and the ingest loop skips it (already
+        // self-ingested — same posture as the retained entries in
+        // gc_removes_when_ig_covers_enrolled_set_or_ttl).
+        let (key, entry) = make_entry([7; 16], [7; 32], 1, &[SELF_ID]);
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key.clone(), entry);
+
+        // First sweep observes the entry locally at `now`.
+        let ctx = ProbeCtx {
+            now_ms: now,
+            ..ProbeCtx::new()
+        };
+        let _ = ingest_pending(&mut doc, &ctx).await;
+        assert!(
+            doc.entries.contains_key(&key),
+            "a backdated deposited_at must not pre-expire a freshly-observed inbox entry"
+        );
+
+        // A later sweep past first_observed + INBOX_TTL_MS removes it normally.
+        let later = ProbeCtx {
+            now_ms: now + INBOX_TTL_MS + 1,
+            ..ProbeCtx::new()
+        };
+        let _ = ingest_pending(&mut doc, &later).await;
+        assert!(
+            !doc.entries.contains_key(&key),
+            "expired from local receipt"
         );
     }
 

@@ -89,11 +89,24 @@ pub struct DmInboxEntry {
     pub ingested_by: BTreeSet<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DmInboxDoc {
     #[serde(rename = "en")]
     pub entries: BTreeMap<String, DmInboxEntry>,
+    /// ZEB-851: LOCAL per-replica first-observation clock (ms) keyed by
+    /// entry key, driving TTL GC instead of the untrusted butler
+    /// `deposited_at`. Never serialized (canonical wire bytes unchanged) and
+    /// excluded from `PartialEq` below.
+    #[serde(skip)]
+    first_observed_ms: BTreeMap<String, u64>,
 }
+
+impl PartialEq for DmInboxDoc {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+impl Eq for DmInboxDoc {}
 
 // Manual CanonicalPayload registration: the `impl_canonical!` macro in
 // owner_state_types.rs is module-private, so we register these types with the
@@ -102,6 +115,35 @@ impl CanonicalPayloadSealed for DmInboxEntry {}
 impl CanonicalPayload for DmInboxEntry {}
 impl CanonicalPayloadSealed for DmInboxDoc {}
 impl CanonicalPayload for DmInboxDoc {}
+
+impl DmInboxDoc {
+    /// ZEB-851 GC: drop entries that are either covered (`covered`) or past
+    /// this replica's per-replica local TTL, returning whether `entries`
+    /// changed. Expiry keys off the LOCAL `first_observed_ms` (lazily stamped
+    /// here on the first sweep that sees each entry), never the butler-minted
+    /// `deposited_at` — a backdated deposit must not drop a DM as pre-expired.
+    ///
+    /// Borrows `entries` and `first_observed_ms` as disjoint fields across the
+    /// `retain` (no per-sweep clone of the side-map), mirroring `RelayHoldDoc::gc`
+    /// in `community_relay_hold_crdt`.
+    pub(crate) fn gc_expired(&mut self, now_ms: u64, covered: &BTreeSet<String>) -> bool {
+        // Lazy-stamp first observation for any entry not yet seen.
+        for key in self.entries.keys().cloned().collect::<Vec<_>>() {
+            self.first_observed_ms.entry(key).or_insert(now_ms);
+        }
+        let before = self.entries.len();
+        let first_observed = &self.first_observed_ms;
+        self.entries.retain(|key, _e| {
+            let observed = first_observed.get(key).copied().unwrap_or(now_ms);
+            let ttl_expired = observed.saturating_add(crate::butler_deposit::INBOX_TTL_MS) < now_ms;
+            !(ttl_expired || covered.contains(key))
+        });
+        // Prune the side-map for removed keys (bounded with `entries`).
+        let live: BTreeSet<String> = self.entries.keys().cloned().collect();
+        self.first_observed_ms.retain(|k, _| live.contains(k));
+        self.entries.len() != before
+    }
+}
 
 impl DmInboxDoc {
     pub fn key(space_id: &[u8; 16], message_cid: &[u8]) -> String {

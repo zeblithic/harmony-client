@@ -153,9 +153,12 @@ pub const DM_INBOX_DATASET_MAX_BYTES: usize = 64 * DEPOSIT_MAX_FRAME_BYTES;
 const _: () =
     assert!(DM_INBOX_DATASET_MAX_BYTES == crate::dm_outhold::DM_OUTHOLD_DATASET_MAX_BYTES);
 
-/// GC TTL for un-ingested dm-inbox deposits (spec §5): an entry is removed
-/// once `deposited_at.wall_ms + INBOX_TTL_MS < now`, regardless of how many
-/// enrolled devices have ingested it. 30 days, deliberately equal to
+/// GC TTL for un-ingested dm-inbox deposits (spec §5): the retention window
+/// for a deposit absent full-fleet coverage. Since ZEB-851, enforcement is
+/// on the RECIPIENT's own local first-observation clock, not
+/// `deposited_at.wall_ms` (a backdated or peer-controlled stamp can no
+/// longer pre-expire a live deposit) — see the `ingest_pending` GC pass in
+/// `dm_inbox_ingest.rs`. 30 days, deliberately equal to
 /// `dm_outbox::EXPIRATION_MS` (ZEB-227 alignment): once the sender's own
 /// outbox has given up retrying, a parked deposit no longer has a delivery
 /// path worth pinning fleet storage for.
