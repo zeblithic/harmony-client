@@ -6381,6 +6381,96 @@ mod tests {
         );
         assert_eq!(poll.deliberation.statements, statements_before);
     }
+
+    // ── ZEB-860 Task 4: order-invariance sweep for the non-trigger kinds ───────
+    //
+    // The canonical rebuild trigger (community_voting_log::apply_with_snapshot)
+    // fires only for the order-DEPENDENT Deliberation family {ss, md, ds, dv}.
+    // The drafting-family kinds kd=dc (append a candidate) and kd=da (idempotent
+    // set-insert into a candidate's approvals) are order-INDEPENDENT: their
+    // projection is identical regardless of delivery order (every downstream
+    // consumer — `drafting_advancers` — re-sorts, so the raw append order of
+    // `candidates` never reaches a result). This guards that contract: fold a
+    // representative dc/dc/da set in two delivery orders — one delivering the
+    // lower-HLC dc LAST, i.e. genuinely out of order — and assert (a) the
+    // semantic candidate/approval projection is identical, and (b) neither poll
+    // self-triggered a rebuild (`rebuild_count` stays 0; `apply_event` is the
+    // pure materialize layer and never routes through `rebuild_from_events`, so
+    // this also pins that these kinds can never enter the rebuild path).
+    //
+    // kd=rb (append to `ratification_ballots`) and kd=ts (LWW-keyed, exactly the
+    // class as kd=dv within its own key) are order-independent by those SAME
+    // append / last-writer-wins classes; reaching them needs a Ratification-stage
+    // poll plus committee/NIZK crypto setup, so they are covered by class here
+    // rather than duplicating that heavy fixture — they too are absent from the
+    // {ss, md, ds, dv} trigger set.
+    #[test]
+    fn order_independent_kinds_converge_without_rebuild() {
+        // Semantic projection of the drafting family: candidate identity
+        // (event_hash) → its approver-address set. Delivery-order-independent by
+        // construction (BTree containers), unlike the arrival-ordered
+        // `candidates` Vec.
+        fn candidate_projection(
+            poll: &Tier3PollState,
+        ) -> std::collections::BTreeMap<[u8; 32], std::collections::BTreeSet<[u8; 16]>> {
+            poll.candidates
+                .iter()
+                .map(|c| (c.event_hash, c.approvals.iter().map(|a| a.0).collect()))
+                .collect()
+        }
+
+        // Two DraftCandidates by distinct proposers + one DraftApproval by a
+        // third actor on the FIRST candidate. HLCs: dc_a@200 < dc_b@300 < da@400.
+        let dc_a = dc_event(200, addr(1), "alpha proposal");
+        let dc_b = dc_event(300, addr(2), "beta proposal");
+        let dc_a_hash = sha256_of_signing_bytes(&dc_a);
+        let da = da_event(400, addr(3), dc_a_hash);
+
+        // Order 1 (in HLC order): dc_a, dc_b, da.
+        let mut poll_in_order = new_poll(0);
+        for ev in [&dc_a, &dc_b, &da] {
+            poll_in_order.apply_event(ev).expect("apply (in order)");
+        }
+
+        // Order 2 (out of order: the lower-HLC dc_a delivered AFTER dc_b). da is
+        // still delivered after its candidate dc_a in BOTH orders, so it Applies
+        // per the ingest rule "approval requires its candidate present". Each
+        // event is on a distinct (actor, device) lane, so the per-lane monotonic
+        // guard never rejects the reorder.
+        let mut poll_reordered = new_poll(0);
+        for ev in [&dc_b, &dc_a, &da] {
+            poll_reordered.apply_event(ev).expect("apply (reordered)");
+        }
+
+        // (a) The semantic projection converges despite the reorder.
+        assert_eq!(
+            candidate_projection(&poll_in_order),
+            candidate_projection(&poll_reordered),
+            "dc/da projection must be identical regardless of delivery order"
+        );
+        // Concretely: candidate A carries {addr(1) self-approval, addr(3) da};
+        // candidate B carries {addr(2) self-approval}.
+        let proj = candidate_projection(&poll_in_order);
+        let expected_a: std::collections::BTreeSet<[u8; 16]> =
+            [addr(1).0, addr(3).0].into_iter().collect();
+        assert_eq!(
+            proj.get(&dc_a_hash),
+            Some(&expected_a),
+            "candidate A approved by its proposer and the da actor"
+        );
+
+        // (b) Neither poll self-rebuilt: dc/da are absent from the
+        // {ss, md, ds, dv} trigger set, so folding them — even out of order —
+        // must never trigger a canonical rebuild.
+        assert_eq!(
+            poll_in_order.rebuild_count, 0,
+            "in-order dc/da fold must not rebuild"
+        );
+        assert_eq!(
+            poll_reordered.rebuild_count, 0,
+            "out-of-order dc/da delivery must NOT trigger a canonical rebuild"
+        );
+    }
 }
 
 #[cfg(test)]

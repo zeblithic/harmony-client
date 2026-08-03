@@ -54163,6 +54163,174 @@ mod zeb718_voting_reconcile_tests {
     }
 
     #[tokio::test]
+    async fn reconcile_converges_out_of_order_deliberation_vote() {
+        // ZEB-860: the restore path replays the persisted `events` through
+        // `apply_with_snapshot`, so it inherits the Task-3 out-of-order
+        // canonical rebuild. Here a kd=dv is persisted BEFORE its kd=ds
+        // (arrival order [.., dv, ds]): on the live log the dv dropped (its
+        // target statement was absent) and the later, out-of-order ds triggered
+        // a rebuild that landed the vote. This proves the SAME convergence
+        // happens on a cold boot — reconcile replays [create, ss, dv, ds] and
+        // the out-of-order ds re-materializes the vote. Pre-Task-3 the reloaded
+        // projection would be missing it.
+        use crate::community_voting_core::{
+            DeliberationStatementPayload, DeliberationVotePayload, SortitionSelectionPayload,
+        };
+
+        /// Build a signed Tier-3 (Sortition-tier) non-create event carrying a
+        /// CBOR `payload`. Mirrors `tier3_poll_create`'s unsigned-fixture shape
+        /// (replay does not re-verify signatures — trusted local disk).
+        fn tier3_event<T: serde::Serialize>(
+            kind: PollEventKindCode,
+            wall: u64,
+            actor: OwnerAddr,
+            payload: &T,
+        ) -> SignedVotingEvent {
+            let mut buf = Vec::new();
+            ciborium::into_writer(payload, &mut buf).expect("encode tier3 payload");
+            SignedVotingEvent {
+                tag: 'p',
+                version: 1,
+                tier: Tier::Sortition,
+                kind,
+                hlc: Hlc {
+                    wall_ms: wall,
+                    logical: 0,
+                    device_id: "dev".into(),
+                },
+                actor,
+                payload: buf,
+                sig: vec![0u8; 64],
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let cid = SpaceId([0x7b; 16]);
+        let creator = OwnerAddr([0xc0; 16]);
+        let author = OwnerAddr([0x01; 16]); // mini-public member A → posts kd=ds
+        let voter = OwnerAddr([0x02; 16]); // mini-public member B → posts kd=dv
+
+        // Resolver returns the poll's electorate (creator + A + B) at every
+        // HLC so the Tier-3 PollCreate re-materializes an electorate covering
+        // the mini-public on replay (mirrors the epoch test's resolver).
+        let mut members = HashMap::new();
+        for a in [creator, author, voter] {
+            members.insert(
+                a,
+                MemberAttrs {
+                    power: 10,
+                    vouching_depth: 0,
+                },
+            );
+        }
+        let snapshot = MembershipSnapshot { members };
+
+        // ── Live log: create → ss (→ Deliberation) → dv (dropped) → ds
+        //    (out-of-order, applied → live rebuild). ──
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply_with_snapshot(
+                tier3_poll_create(creator, 1_000),
+                &cid,
+                Some(snapshot.clone()),
+            )
+            .expect("apply tier3 create");
+
+        // kd=ss seats {A, B} as the primary mini-public → poll enters
+        // Deliberation. create wall=1000 + dw=3600s → window ends at 3_601_000,
+        // so the ds/dv wall stamps below sit inside Deliberation.
+        let ss_payload = SortitionSelectionPayload {
+            poll_id: pid,
+            primary: vec![author, voter],
+            backup: vec![],
+        };
+        log.apply_with_snapshot(
+            tier3_event(
+                PollEventKindCode::SortitionSelection,
+                2_000,
+                OwnerAddr([0xfe; 16]),
+                &ss_payload,
+            ),
+            &cid,
+            Some(snapshot.clone()),
+        )
+        .expect("apply kd=ss");
+
+        // A's statement (wall 3000) and B's vote on it (wall 4000).
+        let ds_payload = DeliberationStatementPayload {
+            poll_id: pid,
+            text: "let us deliberate".into(),
+        };
+        let ds_ev = tier3_event(
+            PollEventKindCode::DeliberationStatement,
+            3_000,
+            author,
+            &ds_payload,
+        );
+        // The hash a kd=dv references == SHA-256 of the ds event's signing
+        // bytes; `canonical_key`'s 4th element is exactly that, and is stable
+        // across the CBOR round-trip so it still matches after reload.
+        let s_hash = crate::community_voting_tier3::canonical_key(&ds_ev).3;
+        let dv_payload = DeliberationVotePayload {
+            poll_id: pid,
+            statement_event_hash: s_hash,
+            vote: 0, // BridgingVoteCode::Agree
+        };
+        let dv_ev = tier3_event(
+            PollEventKindCode::DeliberationVote,
+            4_000,
+            voter,
+            &dv_payload,
+        );
+
+        // Arrival order dv-before-ds: dv drops (target statement absent), then
+        // the out-of-order ds (wall 3000 ≤ max_applied 4000) applies and
+        // triggers the live rebuild. Persisted `events` end [.., dv, ds].
+        log.apply_with_snapshot(dv_ev, &cid, Some(snapshot.clone()))
+            .expect("apply kd=dv (dropped, still Ok)");
+        log.apply_with_snapshot(ds_ev, &cid, Some(snapshot.clone()))
+            .expect("apply kd=ds (out-of-order, applied)");
+
+        // Precondition: the persisted arrival order really is [.., dv, ds].
+        let n = log.events.len();
+        assert!(
+            matches!(
+                (log.events[n - 2].kind, log.events[n - 1].kind),
+                (
+                    PollEventKindCode::DeliberationVote,
+                    PollEventKindCode::DeliberationStatement
+                )
+            ),
+            "the persisted event log must end [.., dv, ds] (vote appended before its statement)"
+        );
+
+        let path = crate::community_voting_persist::voting_path_for(dir.path(), &cid);
+        crate::community_voting_persist::save_voting_log(&path, &log, &cid).unwrap();
+
+        // Cold boot: reconcile replays [create, ss, dv, ds] through
+        // apply_with_snapshot; the out-of-order ds triggers the same canonical
+        // rebuild during boot, so the reloaded projection is canonical.
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver { snapshot });
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        reconcile_voting_from_state(&voting_logs, Some(dir.path()), cid, &resolver)
+            .await
+            .unwrap();
+
+        let map = voting_logs.lock().await;
+        let restored = map.get(&cid).expect("reloaded");
+        let g = restored.lock().await;
+        let t3 = g
+            .polls
+            .get(&pid)
+            .and_then(|s| s.tier_state.as_tier3())
+            .expect("tier3 poll rematerialized on replay");
+        assert!(
+            t3.deliberation.votes.contains_key(&(voter, s_hash)),
+            "restored projection is canonical: the out-of-order vote is applied"
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_restores_tier2_threshold_reached_timing() {
         // ZEB-787: a Tier-2 (Conviction) proposal that has crossed its
         // threshold carries a tick-driven contestability clock —
