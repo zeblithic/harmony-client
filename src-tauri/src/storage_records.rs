@@ -1759,6 +1759,117 @@ mod tests {
     }
 
     #[test]
+    fn local_clock_rollback_keeps_established() {
+        // ZEB-863 #4: a backward jump of THIS replica's wall clock must not
+        // invert newest-first. Established rows carry a HIGH received_at_ms but
+        // LOW seq; a row received after a rollback carries a LOW received_at_ms
+        // but the HIGHEST seq. Eviction keys on seq, so the rollback-era row
+        // (newest by insert order) self-evicts and the established set survives
+        // — under the old wall-clock key the established (high-ms) rows would
+        // have looked "newest" and been evicted instead.
+        let mut map: HashMap<String, PledgeListRecord> = HashMap::new();
+        for i in 0..MAX_TRACKED_OWNERS {
+            map.insert(
+                format!("established-{i:04}"),
+                PledgeListRecord {
+                    pledges: vec![],
+                    updated_at: 1,
+                    received_at_ms: 10_000, // high wall clock
+                    seq: i as u64,          // low seq (received earlier)
+                },
+            );
+        }
+        map.insert(
+            "post-rollback".into(),
+            PledgeListRecord {
+                pledges: vec![],
+                updated_at: 1,
+                received_at_ms: 1_000,          // LOWER wall clock (rollback)
+                seq: MAX_TRACKED_OWNERS as u64, // highest seq (received last)
+            },
+        );
+        evict_overflow(&mut map, |r| r.seq);
+        assert_eq!(map.len(), MAX_TRACKED_OWNERS);
+        assert!(
+            !map.contains_key("post-rollback"),
+            "the post-rollback row (highest seq) is evicted despite its smaller wall-ms"
+        );
+        for i in 0..MAX_TRACKED_OWNERS {
+            assert!(
+                map.contains_key(&format!("established-{i:04}")),
+                "established-{i:04} survives the rollback"
+            );
+        }
+    }
+
+    #[test]
+    fn ingest_stamps_monotonic_seq() {
+        // The counter advances once per insert through the real ingest path,
+        // and an LWW-replace re-stamps a fresh (higher) seq. Pins the
+        // uniqueness/monotonicity the owner-drop in eviction relies on.
+        let mut store = StorageRecordStore::new(None);
+        let a = test_identity();
+        let b = test_identity();
+
+        let (ta, ba) = signed_pledge_bytes(&a, vec![pledge("x", 1)], 1);
+        assert!(store
+            .on_pledge_list_sample(&ta, &ba, &rvk(), 1_000)
+            .changed());
+        let seq_a0 = store.pledge_list(&addr_of(&a)).unwrap().seq;
+
+        let (tb, bb) = signed_pledge_bytes(&b, vec![pledge("y", 1)], 1);
+        assert!(store
+            .on_pledge_list_sample(&tb, &bb, &rvk(), 1_000)
+            .changed());
+        let seq_b = store.pledge_list(&addr_of(&b)).unwrap().seq;
+        assert!(seq_b > seq_a0, "a later ingest gets a strictly higher seq");
+
+        // LWW-replace of a's record (newer updated_at) re-stamps a fresh seq,
+        // so the re-received row is the newest in eviction order.
+        let (ta2, ba2) = signed_pledge_bytes(&a, vec![pledge("x", 2)], 2);
+        assert!(store
+            .on_pledge_list_sample(&ta2, &ba2, &rvk(), 1_000)
+            .changed());
+        let seq_a1 = store.pledge_list(&addr_of(&a)).unwrap().seq;
+        assert!(seq_a1 > seq_b, "an LWW-replace re-stamps the newest seq");
+    }
+
+    #[test]
+    fn evict_pins_same_ms_prefers_oldest_seq() {
+        // ZEB-863 for the pin path: identical pinned_at_ms across pins must not
+        // let the smallest owner address be the victim. The honest dead pin has
+        // the SMALLEST owner but the LOWEST seq (received first) and must
+        // survive; the newest (highest seq) pin is evicted.
+        let mut pins: HashMap<String, StorageSignerPin> = HashMap::new();
+        let pledges: HashMap<String, PledgeListRecord> = HashMap::new();
+        let backups: HashMap<String, BackupSetRecord> = HashMap::new();
+        let hosting: HashMap<String, HostingReportRecord> = HashMap::new();
+        let same_ms = 7_000u64;
+        let mk = |seq| StorageSignerPin {
+            owner_id: [1; 16],
+            device_ed25519: [2; 32],
+            pinned_at_ms: same_ms,
+            seq,
+        };
+        // Honest: smallest owner address, received first (lowest seq).
+        pins.insert("pin-00000".into(), mk(0));
+        // Flood: larger owner addresses, same ms, received later (higher seq).
+        for i in 1..=MAX_SIGNER_PINS {
+            pins.insert(format!("pin-{i:05}"), mk(i as u64));
+        }
+        evict_pins(&mut pins, &pledges, &backups, &hosting);
+        assert_eq!(pins.len(), MAX_SIGNER_PINS);
+        assert!(
+            pins.contains_key("pin-00000"),
+            "honest oldest-seq pin survives despite its smallest owner and identical pinned_at_ms"
+        );
+        assert!(
+            !pins.contains_key(&format!("pin-{MAX_SIGNER_PINS:05}")),
+            "newest (highest seq) pin evicted"
+        );
+    }
+
+    #[test]
     fn ingest_stamps_local_received_clock_not_peer_updated_at() {
         let mut store = StorageRecordStore::new(None);
         let id = test_identity();
