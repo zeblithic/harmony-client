@@ -196,7 +196,8 @@
   Expected: FAIL (kd=da from declined member currently applies locally).
 
 - [ ] **Step 3: Implement.** In `publish_event`, after the event kind is known and before `apply_with_snapshot`, add a match on the Tier-3 user-action kinds ONLY:
-  ```
+
+  ```rust
   match kind {
       MiniPublicDecline | DraftCandidate => { let ps = with_tier3(poll_id)?; verify_sd(&event, &ps).map_err(|e| format!("local publish rejected: {e:?}"))?; }
       DraftApproval => { let ps = with_tier3(poll_id)?; verify_sd(&event, &ps)...?; verify_da_candidate_exists(&event, &ps)...?; }
@@ -204,6 +205,7 @@
       _ => {} // creates, engine-auto (cl/rs/sf/ss/ts), tier1/2, ds/dv/ts — unchanged
   }
   ```
+
   The four kinds are disjoint from engine-auto self-mints, so no exemption logic is needed. If the poll state is absent for one of these kinds (shouldn't happen for a user action on an existing poll), preserve current behavior (don't newly hard-fail beyond what apply would do).
 
 - [ ] **Step 4: Run to verify it passes.**
