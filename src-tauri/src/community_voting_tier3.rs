@@ -1227,7 +1227,37 @@ impl Tier3PollState {
             PollEventKindCode::PollResult => {
                 let payload: Tier3PollResultPayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
-                self.result = Some(payload.result);
+                // ZEB-867: pu finalize stores the tally RECOMPUTED from the
+                // canonical ballot set at apply (cheap tally_star; no decrypt),
+                // not the peer-claimed `payload.result` — so the finalized pu
+                // result is a pure function of the fold and the verify/apply
+                // TOCTOU cannot store a stale value. All valid kd=rb are
+                // canonically pre-finalize (stage-gated to Ratification), so the
+                // set-tally equals the canonical-prefix tally. se stays verbatim:
+                // Lagrange-invariant, already validated by the ingest memo, and
+                // must never decrypt under the apply lock (ZEB-858). On the
+                // (unexpected) recompute Err — e.g. StatusQuoNotSynthesized in a
+                // malformed pre-drafting state — fall back to the verbatim value
+                // so this arm is never worse than before, but WARN first so the
+                // deviation from canonical-fold finalize is diagnosable rather than
+                // silently swallowed.
+                let result = if self.meta.config.privacy_mode == "pu" {
+                    match expected_result_from_state(self) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(
+                                poll_id = %hex::encode(self.meta.poll_id.0),
+                                err = ?e,
+                                "ZEB-867: pu PollResult recompute failed at apply; \
+                                 falling back to claimed payload.result"
+                            );
+                            payload.result
+                        }
+                    }
+                } else {
+                    payload.result
+                };
+                self.result = Some(result);
                 self.stage = Stage::Finalized;
             }
 
@@ -4130,6 +4160,83 @@ mod tests {
             encode(&payload),
         );
         assert_eq!(verify_sr(&ev, &poll), Err(VerifyError::TallyMismatch));
+    }
+
+    // ZEB-867 Component 1: pu finalize RECOMPUTES the tally from the canonical
+    // ballot set at apply, ignoring the peer-claimed `payload.result`. A kd=rs
+    // carrying a deliberately-wrong result must finalize to the recompute, not the
+    // claim — closing the verify/apply TOCTOU (the stored value is a pure function
+    // of the fold).
+    #[test]
+    fn pu_apply_recomputes_result_ignoring_claimed_payload() {
+        let mut poll = poll_at_closed_with_ballots(&[(25000, addr(5), vec![5, 3])]);
+        let correct = expected_result_from_state(&poll).expect("pu recompute Ok");
+        // A deliberately wrong claim (all zeros) — must be ignored by the pu arm.
+        let wrong_result = StarResult {
+            winner: crate::community_voting_star::CandidateRef {
+                event_hash: [0x00; 32],
+                approval_count: 0,
+            },
+            finalists: vec![],
+            total_scores: vec![0, 0],
+            runoff_votes: vec![0],
+        };
+        assert_ne!(
+            correct, wrong_result,
+            "test setup: claim must differ from recompute"
+        );
+        let payload = Tier3PollResultPayload {
+            poll_id: poll_id(),
+            result: wrong_result,
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::PollResult,
+            41000,
+            addr(0xfe),
+            encode(&payload),
+        );
+        assert_eq!(poll.apply_event(&ev), Ok(ApplyOutcome::Applied));
+        assert_eq!(
+            poll.result.as_ref(),
+            Some(&correct),
+            "pu finalize stores the recompute, not the claimed payload.result"
+        );
+        assert_eq!(poll.stage, Stage::Finalized);
+    }
+
+    // ZEB-867 Component 1: se finalize is UNCHANGED — it stores `payload.result`
+    // verbatim (Lagrange-invariant; validated by the ingest memo; must not decrypt
+    // under the apply lock, ZEB-858). The se branch never recomputes.
+    #[test]
+    fn se_mode_apply_stores_payload_result_verbatim() {
+        let mut poll = poll_at_closed_with_ballots(&[(25000, addr(5), vec![5, 3])]);
+        // Exercise the se branch of the PollResult arm.
+        poll.meta.config.privacy_mode = "se".into();
+        let claimed = StarResult {
+            winner: crate::community_voting_star::CandidateRef {
+                event_hash: [0x11; 32],
+                approval_count: 7,
+            },
+            finalists: vec![],
+            total_scores: vec![9, 1],
+            runoff_votes: vec![9],
+        };
+        let payload = Tier3PollResultPayload {
+            poll_id: poll_id(),
+            result: claimed.clone(),
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::PollResult,
+            41000,
+            addr(0xfe),
+            encode(&payload),
+        );
+        assert_eq!(poll.apply_event(&ev), Ok(ApplyOutcome::Applied));
+        assert_eq!(
+            poll.result.as_ref(),
+            Some(&claimed),
+            "se finalize stores the claimed payload.result verbatim"
+        );
     }
 
     // 15b. ZEB-858: se-mode poll whose committee tally shares are below

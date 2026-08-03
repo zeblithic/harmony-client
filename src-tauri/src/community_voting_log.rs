@@ -496,20 +496,77 @@ impl VotingLog {
                     | PollEventKindCode::DeliberationVote
             );
 
-            let outcome = tier3_state.apply_event(&event).map_err(|e| match e {
-                crate::community_voting_tier3::ApplyError::InvalidKindForTier3(_) => {
-                    ApplyError::InvalidKindForTier3
+            // ZEB-867 (Component 2): decide up front (tier3_state is borrowed here
+            // and `event` is moved below) whether a post-finalize arrival is a
+            // backdated ratification ballot to refold. The gate compares the ballot's
+            // OWN canonical key against the poll's FINALIZE key — the kd=rs event's
+            // key (the min if more than one was ever recorded) — NOT the global
+            // `max_applied` watermark. `max_applied` can exceed the finalize key (a
+            // ballot may apply pre-finalize with a higher key), so a watermark gate
+            // could admit a ballot that sorts AFTER the finalize and is then dropped
+            // by canonical replay (recorded-but-absent from the projection).
+            // Comparing against the actual finalize key is exact: an admitted ballot
+            // always sorts before the finalize, so replay always folds it in.
+            // (CodeAnt, PR #593.) pu-gated: se keeps today's drop-on-finalize
+            // behavior (se finalize is Lagrange-invariant).
+            let finalize_key = state
+                .events
+                .iter()
+                .filter(|e| e.kind == PollEventKindCode::PollResult)
+                .map(|e| (e.hlc.wall_ms, e.hlc.logical, e.hlc.device_id.clone()))
+                .min();
+            let refold_backdated_ballot = tier3_state.meta.config.privacy_mode == "pu"
+                && event.kind == PollEventKindCode::RatificationBallot
+                && finalize_key.as_ref().is_some_and(|rk| ev_key3 < *rk);
+
+            // ZEB-867 (Component 2): such a ballot arriving AFTER the pu poll
+            // finalized is rejected by apply_event's terminal guard
+            // (PollInFinalizedState). Instead of dropping it, RECORD it and
+            // re-materialize in canonical order so the late ballot folds into the
+            // tally before the finalize and re-finalizes — preserving live ==
+            // boot-restore. A refolded ballot always sorts before the finalize, so it
+            // is always reflected in the rebuilt projection (never
+            // persisted-but-absent). Genuinely post-close events (key at/after the
+            // finalize) fail the gate and keep today's drop behavior. Failed is never
+            // loosened; the terminal guard runs before any field write, so the
+            // rejected apply leaves the projection untouched and the rebuild is the
+            // sole mutation.
+            let outcome = match tier3_state.apply_event(&event) {
+                Ok(o) => o,
+                Err(crate::community_voting_tier3::ApplyError::PollInFinalizedState)
+                    if refold_backdated_ballot =>
+                {
+                    state.events.push(event.clone());
+                    self.events.push(event);
+                    let state = self
+                        .polls
+                        .get_mut(&poll_id)
+                        .expect("poll present (just appended)");
+                    let events = std::mem::take(&mut state.events);
+                    if let Some(t3) = state.tier_state.as_tier3_mut() {
+                        t3.rebuild_from_events(&events);
+                    }
+                    state.events = events;
+                    sync_lifecycle_from_stage(state);
+                    return Ok(poll_id);
                 }
-                // Terminal-state rejections map to IllegalTransition.
-                crate::community_voting_tier3::ApplyError::PollInFailedState
-                | crate::community_voting_tier3::ApplyError::PollInFinalizedState
-                | crate::community_voting_tier3::ApplyError::HlcNotMonotonic => {
-                    ApplyError::IllegalTransition
+                Err(e) => {
+                    return Err(match e {
+                        crate::community_voting_tier3::ApplyError::InvalidKindForTier3(_) => {
+                            ApplyError::InvalidKindForTier3
+                        }
+                        // Terminal-state rejections map to IllegalTransition.
+                        crate::community_voting_tier3::ApplyError::PollInFailedState
+                        | crate::community_voting_tier3::ApplyError::PollInFinalizedState
+                        | crate::community_voting_tier3::ApplyError::HlcNotMonotonic => {
+                            ApplyError::IllegalTransition
+                        }
+                        crate::community_voting_tier3::ApplyError::PayloadDecode(_) => {
+                            ApplyError::PayloadDecode
+                        }
+                    });
                 }
-                crate::community_voting_tier3::ApplyError::PayloadDecode(_) => {
-                    ApplyError::PayloadDecode
-                }
-            })?;
+            };
 
             // Cluster K fix: sync PollMeta.lifecycle from tier3 stage after a
             // terminal transition (Finalized / Failed).  Must happen BEFORE
@@ -2954,5 +3011,300 @@ mod tier3_dispatch_tests {
             "backdated vote must be dropped after canonical rebuild"
         );
         assert_eq!(t3.rebuild_count, 1);
+    }
+
+    // ── ZEB-867: canonical-fold pu finalize ─────────────────────────────────────
+
+    /// Drive a pu poll (tier3_config) through Drafting into Ratification with one
+    /// above-threshold draft candidate + status_quo (ratification set = 2), apply
+    /// the given `(wall_ms, actor_byte, scores)` ballots, then kd=cl at 310_000.
+    /// Returns the log at the closed (pre-finalize) stage.
+    fn pu_poll_closed_with_ballots(ballots: &[(u64, u8, Vec<u8>)]) -> (VotingLog, PollId) {
+        use crate::community_voting_core::{
+            DraftApprovalPayload, DraftCandidatePayload, PollClosePayload,
+            SortitionSelectionPayload,
+        };
+        use crate::community_voting_tier3::event_hash_of;
+
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply(tier3_create_event(addr(0xaa), &tier3_config()), &cid())
+            .expect("tier3 create");
+
+        let ss_payload = SortitionSelectionPayload {
+            poll_id: pid,
+            primary: (1..=20u8).map(addr).collect(),
+            backup: vec![],
+        };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::SortitionSelection,
+                2000,
+                addr(0xfe),
+                encode(&ss_payload),
+            ),
+            &cid(),
+        )
+        .expect("apply kd=ss");
+
+        let dc_payload = DraftCandidatePayload {
+            poll_id: pid,
+            text: "proposal A".into(),
+        };
+        let dc_ev = tier3_event_with_payload(
+            PollEventKindCode::DraftCandidate,
+            110_000,
+            addr(1),
+            encode(&dc_payload),
+        );
+        let candidate_hash = event_hash_of(&dc_ev);
+        log.apply(dc_ev, &cid()).expect("apply kd=dc");
+
+        for (i, approver_byte) in (2u8..=10).enumerate() {
+            let da_payload = DraftApprovalPayload {
+                poll_id: pid,
+                candidate_event_hash: candidate_hash,
+            };
+            log.apply(
+                tier3_event_with_payload(
+                    PollEventKindCode::DraftApproval,
+                    110_001 + i as u64,
+                    addr(approver_byte),
+                    encode(&da_payload),
+                ),
+                &cid(),
+            )
+            .expect("apply kd=da");
+        }
+
+        for (wall_ms, actor_byte, scores) in ballots {
+            log.apply(
+                rb_event_pu(pid, *wall_ms, addr(*actor_byte), scores.clone()),
+                &cid(),
+            )
+            .expect("apply kd=rb");
+        }
+
+        let cl_payload = PollClosePayload { poll_id: pid };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::PollClose,
+                310_000,
+                addr(0xff),
+                encode(&cl_payload),
+            ),
+            &cid(),
+        )
+        .expect("apply kd=cl");
+
+        (log, pid)
+    }
+
+    fn rb_event_pu(
+        pid: PollId,
+        wall_ms: u64,
+        author: OwnerAddr,
+        scores: Vec<u8>,
+    ) -> SignedVotingEvent {
+        tier3_event_with_payload(
+            PollEventKindCode::RatificationBallot,
+            wall_ms,
+            author,
+            encode(&crate::community_voting_core::RatificationBallotPayload {
+                poll_id: pid,
+                scores: Some(scores),
+                ciphertexts_scores: None,
+                ciphertexts_indicators: None,
+                proof: None,
+            }),
+        )
+    }
+
+    fn rs_event(
+        pid: PollId,
+        wall_ms: u64,
+        author: OwnerAddr,
+        result: crate::community_voting_star::StarResult,
+    ) -> SignedVotingEvent {
+        tier3_event_with_payload(
+            PollEventKindCode::PollResult,
+            wall_ms,
+            author,
+            encode(&crate::community_voting_tier3::Tier3PollResultPayload {
+                poll_id: pid,
+                result,
+            }),
+        )
+    }
+
+    fn dummy_star_result() -> crate::community_voting_star::StarResult {
+        crate::community_voting_star::StarResult {
+            winner: crate::community_voting_star::CandidateRef {
+                event_hash: [0u8; 32],
+                approval_count: 0,
+            },
+            finalists: vec![],
+            total_scores: vec![],
+            runoff_votes: vec![],
+        }
+    }
+
+    // A backdated pu kd=rb (canonically pre-finalize) arriving after finalize is
+    // RECORDED and re-folded (Component 2), so the finalized tally reflects it and
+    // live == boot-restore.
+    #[test]
+    fn pu_backdated_ballot_after_finalize_refolds() {
+        let (mut log, pid) = pu_poll_closed_with_ballots(&[(210_000, 5, vec![5, 0])]);
+        log.apply(
+            rs_event(pid, 311_000, addr(0xfd), dummy_star_result()),
+            &cid(),
+        )
+        .expect("apply kd=rs (finalize)");
+        let before = log.polls[&pid]
+            .tier_state
+            .as_tier3()
+            .unwrap()
+            .result
+            .clone();
+        assert!(before.is_some(), "poll finalized");
+
+        // Backdated ballot (wall 205_000 < finalize, in the Ratification window)
+        // arrives after finalize; apply_event rejects it (terminal guard), then
+        // Component 2 records it + rebuilds so it folds into the tally.
+        let r = log.apply(rb_event_pu(pid, 205_000, addr(6), vec![3, 1]), &cid());
+        assert!(
+            r.is_ok(),
+            "backdated pu ballot recorded + rebuilt, not rejected: {r:?}"
+        );
+
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.stage, crate::community_voting_tier3::Stage::Finalized);
+        assert_eq!(t3.ratification_ballots.len(), 2, "late ballot folded in");
+        assert_ne!(t3.result, before, "re-finalized tally changed");
+        assert!(t3.rebuild_count >= 1, "a canonical rebuild ran");
+
+        // live projection == a fresh canonical rebuild (ZEB-860 boot-restore parity).
+        let events = log.polls[&pid].events.clone();
+        let live = log.polls[&pid].tier_state.as_tier3().unwrap().clone();
+        let mut restored = live.clone();
+        restored.rebuild_from_events(&events);
+        assert_eq!(restored.result, live.result, "live == boot-restore");
+        assert_eq!(restored.ratification_ballots, live.ratification_ballots);
+    }
+
+    // A ballot whose key sorts AT/AFTER the finalize (320_000 > the kd=rs at
+    // 311_000) is canonically post-finalize, so Component 2's finalize-key gate is
+    // false → it stays dropped (today's behavior); the finalized tally is unchanged.
+    #[test]
+    fn pu_post_close_higher_hlc_ballot_excluded() {
+        let (mut log, pid) = pu_poll_closed_with_ballots(&[(210_000, 5, vec![5, 0])]);
+        log.apply(
+            rs_event(pid, 311_000, addr(0xfd), dummy_star_result()),
+            &cid(),
+        )
+        .expect("finalize");
+        let before = log.polls[&pid]
+            .tier_state
+            .as_tier3()
+            .unwrap()
+            .result
+            .clone();
+
+        let r = log.apply(rb_event_pu(pid, 320_000, addr(6), vec![3, 1]), &cid());
+        assert!(
+            r.is_err(),
+            "genuine post-close (higher-HLC) ballot stays dropped"
+        );
+
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.result, before, "result unchanged");
+        assert_eq!(
+            t3.ratification_ballots.len(),
+            1,
+            "post-close ballot not folded"
+        );
+    }
+
+    // se polls keep today's exact behavior: a late ballot after finalize is
+    // dropped — Component 2 is pu-gated.
+    #[test]
+    fn se_late_ballot_after_finalize_is_unaffected() {
+        let mut cfg = tier3_config();
+        cfg.privacy_mode = "se".into();
+        let mut log = VotingLog::new();
+        let pid = log
+            .apply(tier3_create_event(addr(0xaa), &cfg), &cid())
+            .expect("se create");
+        // se finalize stores payload.result verbatim (no recompute, no committee).
+        let claimed = crate::community_voting_star::StarResult {
+            winner: crate::community_voting_star::CandidateRef {
+                event_hash: [0x22; 32],
+                approval_count: 3,
+            },
+            finalists: vec![crate::community_voting_star::CandidateRef {
+                event_hash: [0x22; 32],
+                approval_count: 3,
+            }],
+            total_scores: vec![7],
+            runoff_votes: vec![7],
+        };
+        log.apply(rs_event(pid, 311_000, addr(0xfd), claimed.clone()), &cid())
+            .expect("se finalize (verbatim)");
+        assert_eq!(
+            log.polls[&pid]
+                .tier_state
+                .as_tier3()
+                .unwrap()
+                .result
+                .as_ref(),
+            Some(&claimed),
+            "se stored the claim verbatim"
+        );
+
+        let r = log.apply(rb_event_pu(pid, 205_000, addr(6), vec![3, 1]), &cid());
+        assert!(r.is_err(), "se late ballot dropped (pu-gate)");
+        assert_eq!(
+            log.polls[&pid]
+                .tier_state
+                .as_tier3()
+                .unwrap()
+                .result
+                .as_ref(),
+            Some(&claimed),
+            "se result unchanged"
+        );
+    }
+
+    // Two replicas fed the same event set in different orders (one in-order, one
+    // with a ballot delivered after finalize) converge to the same finalized tally.
+    #[test]
+    fn pu_finalize_converges_under_reordered_delivery() {
+        let (mut a, pid) =
+            pu_poll_closed_with_ballots(&[(205_000, 6, vec![3, 1]), (210_000, 5, vec![5, 0])]);
+        a.apply(
+            rs_event(pid, 311_000, addr(0xfd), dummy_star_result()),
+            &cid(),
+        )
+        .expect("A finalize");
+
+        let (mut b, _pid_b) = pu_poll_closed_with_ballots(&[(210_000, 5, vec![5, 0])]);
+        b.apply(
+            rs_event(pid, 311_000, addr(0xfd), dummy_star_result()),
+            &cid(),
+        )
+        .expect("B finalize");
+        b.apply(rb_event_pu(pid, 205_000, addr(6), vec![3, 1]), &cid())
+            .expect("B late ballot recorded + rebuilt");
+
+        let a_result = a.polls[&pid].tier_state.as_tier3().unwrap().result.clone();
+        let b_result = b.polls[&pid].tier_state.as_tier3().unwrap().result.clone();
+        assert_eq!(
+            a_result, b_result,
+            "replicas converge to the same finalized tally"
+        );
+        assert_eq!(
+            a.polls[&pid].tier_state.as_tier3().unwrap().stage,
+            crate::community_voting_tier3::Stage::Finalized
+        );
     }
 }
