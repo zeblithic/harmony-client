@@ -1238,9 +1238,22 @@ impl Tier3PollState {
                 // must never decrypt under the apply lock (ZEB-858). On the
                 // (unexpected) recompute Err — e.g. StatusQuoNotSynthesized in a
                 // malformed pre-drafting state — fall back to the verbatim value
-                // so this arm is never worse than before.
+                // so this arm is never worse than before, but WARN first so the
+                // deviation from canonical-fold finalize is diagnosable rather than
+                // silently swallowed.
                 let result = if self.meta.config.privacy_mode == "pu" {
-                    expected_result_from_state(self).unwrap_or(payload.result)
+                    match expected_result_from_state(self) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(
+                                poll_id = %hex::encode(self.meta.poll_id.0),
+                                err = ?e,
+                                "ZEB-867: pu PollResult recompute failed at apply; \
+                                 falling back to claimed payload.result"
+                            );
+                            payload.result
+                        }
+                    }
                 } else {
                     payload.result
                 };

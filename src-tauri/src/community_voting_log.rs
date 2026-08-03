@@ -496,28 +496,45 @@ impl VotingLog {
                     | PollEventKindCode::DeliberationVote
             );
 
-            // ZEB-867 (Component 2): capture privacy_mode now (tier3_state is
-            // borrowed here and `event` is moved below) for the post-finalize
-            // backdated-ballot record-and-rebuild path. pu-gated: se keeps today's
-            // drop-on-finalize behavior (se finalize is Lagrange-invariant).
-            let is_pu = tier3_state.meta.config.privacy_mode == "pu";
+            // ZEB-867 (Component 2): decide up front (tier3_state is borrowed here
+            // and `event` is moved below) whether a post-finalize arrival is a
+            // backdated ratification ballot to refold. The gate compares the ballot's
+            // OWN canonical key against the poll's FINALIZE key — the kd=rs event's
+            // key (the min if more than one was ever recorded) — NOT the global
+            // `max_applied` watermark. `max_applied` can exceed the finalize key (a
+            // ballot may apply pre-finalize with a higher key), so a watermark gate
+            // could admit a ballot that sorts AFTER the finalize and is then dropped
+            // by canonical replay (recorded-but-absent from the projection).
+            // Comparing against the actual finalize key is exact: an admitted ballot
+            // always sorts before the finalize, so replay always folds it in.
+            // (CodeAnt, PR #593.) pu-gated: se keeps today's drop-on-finalize
+            // behavior (se finalize is Lagrange-invariant).
+            let finalize_key = state
+                .events
+                .iter()
+                .filter(|e| e.kind == PollEventKindCode::PollResult)
+                .map(|e| (e.hlc.wall_ms, e.hlc.logical, e.hlc.device_id.clone()))
+                .min();
+            let refold_backdated_ballot = tier3_state.meta.config.privacy_mode == "pu"
+                && event.kind == PollEventKindCode::RatificationBallot
+                && finalize_key.as_ref().is_some_and(|rk| ev_key3 < *rk);
 
-            // ZEB-867 (Component 2): a backdated kd=rb (canonically pre-finalize)
-            // can arrive AFTER a pu poll finalized; apply_event rejects it with
-            // PollInFinalizedState (terminal guard). Instead of dropping it, RECORD
-            // it and re-materialize in canonical order so the late ballot folds into
-            // the tally and re-finalizes — preserving live == boot-restore. Gated to
-            // out-of-order + kd=rb + pu; se and genuinely post-close (not
-            // out-of-order) events keep today's drop behavior. Failed is never
-            // loosened. The terminal guard runs before any field write, so the
+            // ZEB-867 (Component 2): such a ballot arriving AFTER the pu poll
+            // finalized is rejected by apply_event's terminal guard
+            // (PollInFinalizedState). Instead of dropping it, RECORD it and
+            // re-materialize in canonical order so the late ballot folds into the
+            // tally before the finalize and re-finalizes — preserving live ==
+            // boot-restore. A refolded ballot always sorts before the finalize, so it
+            // is always reflected in the rebuilt projection (never
+            // persisted-but-absent). Genuinely post-close events (key at/after the
+            // finalize) fail the gate and keep today's drop behavior. Failed is never
+            // loosened; the terminal guard runs before any field write, so the
             // rejected apply leaves the projection untouched and the rebuild is the
             // sole mutation.
             let outcome = match tier3_state.apply_event(&event) {
                 Ok(o) => o,
                 Err(crate::community_voting_tier3::ApplyError::PollInFinalizedState)
-                    if is_pu
-                        && event.kind == PollEventKindCode::RatificationBallot
-                        && prev_max.as_ref().is_some_and(|m| ev_key3 <= *m) =>
+                    if refold_backdated_ballot =>
                 {
                     state.events.push(event.clone());
                     self.events.push(event);
@@ -3175,9 +3192,9 @@ mod tier3_dispatch_tests {
         assert_eq!(restored.ratification_ballots, live.ratification_ballots);
     }
 
-    // A ballot whose HLC is AFTER the finalize (genuinely post-close) is NOT
-    // out-of-order → Component 2's guard is false → it stays dropped (today's
-    // behavior); the finalized tally is unchanged.
+    // A ballot whose key sorts AT/AFTER the finalize (320_000 > the kd=rs at
+    // 311_000) is canonically post-finalize, so Component 2's finalize-key gate is
+    // false → it stays dropped (today's behavior); the finalized tally is unchanged.
     #[test]
     fn pu_post_close_higher_hlc_ballot_excluded() {
         let (mut log, pid) = pu_poll_closed_with_ballots(&[(210_000, 5, vec![5, 0])]);

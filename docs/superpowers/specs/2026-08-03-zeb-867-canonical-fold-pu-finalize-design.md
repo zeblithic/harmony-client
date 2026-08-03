@@ -96,15 +96,25 @@ order-independent sum). Recompute-over-set is therefore correct.
 (never recorded). For Option B, a backdated ballot arriving after finalize must be
 foldable. So:
 
-> When `apply_event` returns `Err(PollInFinalizedState)` for an **out-of-order**
-> (`ev_key3 <= prev_max`) `kd=rb` on a **pu** poll, do **not** propagate: append the
-> event to `state.events` + `self.events` and call `rebuild_from_events`, then
-> `sync_lifecycle_from_stage`.
+> When `apply_event` returns `Err(PollInFinalizedState)` for a `kd=rb` on a **pu**
+> poll whose own canonical key sorts **strictly before the poll's finalize key**
+> (the `kd=rs` event's key — the min if more than one was recorded), do **not**
+> propagate: append the event to `state.events` + `self.events` and call
+> `rebuild_from_events`, then `sync_lifecycle_from_stage`.
 
 The canonical replay folds the backdated ballot in *before* the `kd=rs`, re-derives the
-tally via Component 1, and re-finalizes. Genuinely post-close events (HLC after the
-finalize) are **not** out-of-order (`ev_key3 > prev_max`, since the finalize advanced
-`max_applied`) → not recorded → dropped, correctly excluded.
+tally via Component 1, and re-finalizes. Genuinely post-close events (key at/after the
+finalize) fail the gate → not recorded → dropped, correctly excluded.
+
+**Why the finalize key, not the global watermark (PR #593 review — CodeAnt, Major):**
+gating on `max_applied` (the global receive watermark) would be sound only while
+`max_applied == rs_key`. That equality holds in production — the engine-auto `kd=rs`
+mints its HLC strictly above every received event, and ingest verify rejects any peer
+`kd=rs` whose claim disagrees with the local recompute (so a key-above-finalize ballot
+cannot be both applied pre-finalize and material) — but it is a **non-local** invariant.
+Comparing the ballot key against the *actual* finalize event key is locally exact: an
+admitted ballot always sorts before the finalize, so canonical replay always folds it in
+(never recorded-but-absent from the projection).
 
 - **pu-gated:** se polls keep today's exact behavior (the post-finalize event is dropped
   — se finalize is Lagrange-invariant, so nothing would change anyway; avoids se rebuild
