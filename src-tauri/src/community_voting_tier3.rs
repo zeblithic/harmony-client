@@ -488,12 +488,11 @@ impl Tier3PollState {
     /// resolver is needed. Each `Err` on re-fold is a terminal/monotonic
     /// rejection, ignored exactly as boot replay ignores un-replayable events.
     ///
-    /// ZEB-860 Task 2 lands the method + its tests; the production trigger that
-    /// calls it on out-of-order arrival arrives in Task 3. Until then its only
-    /// caller is the test module, so the non-test lib compilation sees it (and
-    /// its `canonical_key` callee) as unused. `allow(dead_code)` keeps that build
-    /// warning-clean; remove it when Task 3 wires the caller.
-    #[allow(dead_code)]
+    /// ZEB-860 Task 2 lands the method + its tests; Task 3 wires the production
+    /// trigger in `VotingLog::apply_with_snapshot`, which calls this on
+    /// out-of-order arrival of an order-dependent Deliberation-family event —
+    /// so the helper (and its `canonical_key` callee) is now live in the
+    /// non-test lib build.
     pub(crate) fn rebuild_from_events(&mut self, events: &[SignedVotingEvent]) {
         let meta = self.meta.clone();
         let electorate = std::mem::take(&mut self.eligible_electorate_snapshot);

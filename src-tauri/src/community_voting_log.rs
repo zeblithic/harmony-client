@@ -183,6 +183,44 @@ pub enum ApplyError {
     RetryOfPollNotTier3,
 }
 
+/// ZEB-860 / Cluster K: mirror a Tier-3 poll's terminal `stage` into the
+/// generic `PollMeta.lifecycle` (+ `finalized_at_ms`). Runs after every Tier-3
+/// apply and again after an out-of-order canonical rebuild (which can move the
+/// stage), so `archive_finalized_polls()` always sees a consistent lifecycle.
+///
+/// Behavior mirrors the inline match it replaces. `finalized_at_ms` is stamped
+/// from the finalizing (kd=rs) event's wall_ms, read off `last_hlc`: a kd=rs
+/// finalize always accepts (advances `last_hlc`), so at the post-apply call
+/// site `last_hlc.wall_ms` equals the `event.hlc.wall_ms` the inline match
+/// previously read; at the post-rebuild call site it is the canonical
+/// finalizer's wall. Non-terminal stages are a no-op (lifecycle stays Open);
+/// no-op if the poll is not Tier-3.
+fn sync_lifecycle_from_stage(state: &mut PollState) {
+    let Some(stage) = state.tier_state.as_tier3().map(|t3| t3.stage) else {
+        return;
+    };
+    match stage {
+        crate::community_voting_tier3::Stage::Finalized => {
+            state.meta.lifecycle = Lifecycle::Finalized;
+            // Stamp finalized_at_ms so archive_finalized_polls() can age it.
+            if let Some(wall_ms) = state
+                .tier_state
+                .as_tier3()
+                .and_then(|t3| t3.last_hlc.as_ref())
+                .map(|h| h.wall_ms)
+            {
+                state.meta.finalized_at_ms = Some(wall_ms);
+            }
+        }
+        crate::community_voting_tier3::Stage::Failed => {
+            // No Lifecycle::Failed variant; Closed is the closest match
+            // and prevents the poll from appearing Open after failure.
+            state.meta.lifecycle = Lifecycle::Closed;
+        }
+        _ => {} // Non-terminal stages: lifecycle stays Open.
+    }
+}
+
 impl VotingLog {
     pub fn new() -> Self {
         Self::default()
@@ -439,7 +477,26 @@ impl VotingLog {
                 .tier_state
                 .as_tier3_mut()
                 .ok_or(ApplyError::WrongTierStateForTier3Event)?;
-            tier3_state.apply_event(&event).map_err(|e| match e {
+
+            // ZEB-860: snapshot the out-of-order watermark BEFORE apply — the
+            // apply advances max_applied, so it must be captured first — along
+            // with this event's canonical key. `trigger_kind` is captured here
+            // too since `event` is moved into `self.events` below.
+            let prev_max = tier3_state.max_applied.clone();
+            let ev_key3 = (
+                event.hlc.wall_ms,
+                event.hlc.logical,
+                event.hlc.device_id.clone(),
+            );
+            let trigger_kind = matches!(
+                event.kind,
+                PollEventKindCode::SortitionSelection
+                    | PollEventKindCode::MiniPublicDecline
+                    | PollEventKindCode::DeliberationStatement
+                    | PollEventKindCode::DeliberationVote
+            );
+
+            let outcome = tier3_state.apply_event(&event).map_err(|e| match e {
                 crate::community_voting_tier3::ApplyError::InvalidKindForTier3(_) => {
                     ApplyError::InvalidKindForTier3
                 }
@@ -457,22 +514,46 @@ impl VotingLog {
             // Cluster K fix: sync PollMeta.lifecycle from tier3 stage after a
             // terminal transition (Finalized / Failed).  Must happen BEFORE
             // pushing the event so archive_finalized_polls() sees the synced state.
-            match tier3_state.stage {
-                crate::community_voting_tier3::Stage::Finalized => {
-                    state.meta.lifecycle = Lifecycle::Finalized;
-                    // Stamp finalized_at_ms so archive_finalized_polls() can age it.
-                    state.meta.finalized_at_ms = Some(event.hlc.wall_ms);
-                }
-                crate::community_voting_tier3::Stage::Failed => {
-                    // No Lifecycle::Failed variant; Closed is the closest match
-                    // and prevents the poll from appearing Open after failure.
-                    state.meta.lifecycle = Lifecycle::Closed;
-                }
-                _ => {} // Non-terminal stages: lifecycle stays Open.
-            }
+            sync_lifecycle_from_stage(state);
 
             state.events.push(event.clone());
             self.events.push(event);
+
+            // ZEB-860: an out-of-order arrival of an order-dependent
+            // Deliberation-family event that WAS applied can retroactively
+            // change other events' outcomes (a late kd=ds unblocks a dropped
+            // kd=dv; a backdated kd=dv must be re-dropped). When the trigger
+            // holds, re-materialize this poll's projection as a deterministic
+            // fold of its per-poll events in canonical order.
+            //
+            // Trigger = ALL of: (1) the event was out-of-order — its key is
+            // <= the watermark captured BEFORE this apply; (2) apply accepted
+            // it (Applied, not silently Dropped — a dropped stranger event must
+            // never force a rebuild, a DoS guard); (3) the kind is
+            // order-dependent (ss / md / ds / dv, captured above).
+            let out_of_order = prev_max.as_ref().is_some_and(|m| ev_key3 <= *m);
+            if out_of_order
+                && outcome == crate::community_voting_tier3::ApplyOutcome::Applied
+                && trigger_kind
+            {
+                let state = self
+                    .polls
+                    .get_mut(&poll_id)
+                    .expect("poll present (just appended)");
+                // Split-borrow: `events` (immut) and `tier_state` (mut) are
+                // disjoint fields. `mem::take` sidesteps the borrow conflict
+                // between `&state.events` and the `&mut` rebuild without cloning
+                // the whole Vec; the events already contain the just-appended
+                // triggering event AND the applied ss.
+                let events = std::mem::take(&mut state.events);
+                if let Some(t3) = state.tier_state.as_tier3_mut() {
+                    t3.rebuild_from_events(&events);
+                }
+                state.events = events;
+                // The rebuild can move the stage (e.g. a canonical re-fold that
+                // finalizes) — re-sync the lifecycle from the rebuilt stage.
+                sync_lifecycle_from_stage(state);
+            }
             return Ok(poll_id);
         }
 
@@ -1581,8 +1662,9 @@ mod archive_tests {
 mod tier3_dispatch_tests {
     use super::*;
     use crate::community_voting_core::{
-        Eligibility, MiniPublicDeclinePayload, SortitionFailedPayload, SortitionSelectionPayload,
-        Tier, Tier3PollConfigPayload,
+        DeliberationStatementPayload, DeliberationVotePayload, Eligibility,
+        MiniPublicDeclinePayload, SortitionFailedPayload, SortitionSelectionPayload, Tier,
+        Tier3PollConfigPayload,
     };
     use crate::community_voting_tier3::{NoBeaconOracle, Stage, VerifyError};
     use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
@@ -2673,5 +2755,191 @@ mod tier3_dispatch_tests {
             None,
             "Unknown poll_id must return None"
         );
+    }
+
+    // ── ZEB-860 Task 3: out-of-order canonical rebuild trigger ──────────────────
+    //
+    // These drive order-dependent Deliberation-family events (kd=ds, kd=dv)
+    // through `apply` (which delegates to `apply_with_snapshot`) and assert the
+    // out-of-order rebuild trigger fires iff the event was applied AND arrived at
+    // or below the poll's pre-apply `max_applied` watermark AND is in the
+    // order-dependent kind set. A cross-lane out-of-order arrival (a late kd=ds
+    // from actor A while actor B's later-stamped kd=dv already dispatched) passes
+    // the per-(actor,device) monotonic guard, so it reaches this trigger — the
+    // exact divergence case the canonical rebuild converges.
+
+    /// Build a Tier-3 poll driven into Deliberation with mini-public
+    /// {A=addr(1), B=addr(2)}. Poll is created at wall=1000 with
+    /// deliberation_window_seconds=100, so the deliberation window is
+    /// [2000, 101_000): any event with wall_ms in that range sees
+    /// `Stage::Deliberation`.
+    fn tier3_poll_in_deliberation() -> (VotingLog, PollId) {
+        let mut log = VotingLog::new();
+        let creator = addr(0xaa);
+        let cfg = tier3_config();
+        let create_ev = tier3_create_event(creator, &cfg);
+        let pid = log.apply(create_ev, &cid()).expect("tier3 create");
+
+        // kd=ss puts A and B in the primary mini-public → poll enters Deliberation.
+        let ss_payload = SortitionSelectionPayload {
+            poll_id: pid,
+            primary: vec![addr(1), addr(2)],
+            backup: vec![],
+        };
+        log.apply(
+            tier3_event_with_payload(
+                PollEventKindCode::SortitionSelection,
+                2000,
+                addr(0xfe),
+                encode(&ss_payload),
+            ),
+            &cid(),
+        )
+        .expect("apply kd=ss");
+        (log, pid)
+    }
+
+    /// Build a kd=ds DeliberationStatement event by `author` at `wall_ms`.
+    fn ds_event(pid: PollId, author: OwnerAddr, wall_ms: u64, text: &str) -> SignedVotingEvent {
+        let payload = DeliberationStatementPayload {
+            poll_id: pid,
+            text: text.into(),
+        };
+        tier3_event_with_payload(
+            PollEventKindCode::DeliberationStatement,
+            wall_ms,
+            author,
+            encode(&payload),
+        )
+    }
+
+    /// Build a kd=dv DeliberationVote event by `voter` at `wall_ms` on the
+    /// statement whose signing-bytes hash is `statement_hash` (vote=0, Agree).
+    fn dv_event(
+        pid: PollId,
+        voter: OwnerAddr,
+        wall_ms: u64,
+        statement_hash: [u8; 32],
+    ) -> SignedVotingEvent {
+        let payload = DeliberationVotePayload {
+            poll_id: pid,
+            statement_event_hash: statement_hash,
+            vote: 0, // BridgingVoteCode::Agree
+        };
+        tier3_event_with_payload(
+            PollEventKindCode::DeliberationVote,
+            wall_ms,
+            voter,
+            encode(&payload),
+        )
+    }
+
+    /// The `statement_event_hash` a kd=dv must reference: SHA-256 of the kd=ds
+    /// event's signing bytes. Read off `canonical_key`'s 4th tuple element, which
+    /// IS `sha256_of_signing_bytes(ev)` — guaranteeing it matches the hash
+    /// `apply_event` computes internally.
+    fn statement_hash_of(ev: &SignedVotingEvent) -> [u8; 32] {
+        crate::community_voting_tier3::canonical_key(ev).3
+    }
+
+    #[test]
+    fn live_out_of_order_vote_is_rebuilt() {
+        let (mut log, pid) = tier3_poll_in_deliberation();
+        let ds = ds_event(pid, addr(1), 3000, "let us deliberate");
+        let s_hash = statement_hash_of(&ds);
+        let dv = dv_event(pid, addr(2), 4000, s_hash);
+
+        // Deliver dv BEFORE ds: dv finds no target statement → Dropped. Not
+        // out-of-order (4000 > max_applied 2000) and dropped anyway → no rebuild.
+        log.apply(dv, &cid()).expect("apply dv (dropped, still Ok)");
+        {
+            let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+            assert!(
+                !t3.deliberation.votes.contains_key(&(addr(2), s_hash)),
+                "vote must be absent before its statement arrives"
+            );
+            assert_eq!(t3.rebuild_count, 0, "dropped dv must not rebuild");
+        }
+
+        // ds now arrives out of order (wall 3000 ≤ max_applied 4000) and applies
+        // → triggers the canonical rebuild, which re-folds [ss, ds, dv] in HLC
+        // order and lands dv against its now-present statement.
+        log.apply(ds, &cid())
+            .expect("apply ds (out-of-order, applied)");
+
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert!(
+            t3.deliberation.votes.contains_key(&(addr(2), s_hash)),
+            "vote rebuilt live once its statement arrives"
+        );
+        assert_eq!(t3.rebuild_count, 1);
+    }
+
+    #[test]
+    fn in_order_delivery_does_not_rebuild() {
+        let (mut log, pid) = tier3_poll_in_deliberation();
+        let ds = ds_event(pid, addr(1), 3000, "let us deliberate");
+        let s_hash = statement_hash_of(&ds);
+        let dv = dv_event(pid, addr(2), 4000, s_hash);
+
+        // HLC order: ds (3000) then dv (4000). Each is fresh vs max_applied, so
+        // both apply incrementally and neither triggers a rebuild.
+        log.apply(ds, &cid()).expect("apply ds");
+        log.apply(dv, &cid()).expect("apply dv");
+
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert!(t3.deliberation.votes.contains_key(&(addr(2), s_hash)));
+        assert_eq!(t3.rebuild_count, 0, "in-order fast path must not rebuild");
+    }
+
+    #[test]
+    fn outsider_dropped_vote_does_not_rebuild() {
+        let (mut log, pid) = tier3_poll_in_deliberation();
+        let ds = ds_event(pid, addr(1), 5000, "let us deliberate");
+        let s_hash = statement_hash_of(&ds);
+        // addr(9) is NOT in the mini-public {addr(1), addr(2)}.
+        let outsider_dv = dv_event(pid, addr(9), 3000, s_hash);
+
+        // ds first raises max_applied to 5000...
+        log.apply(ds, &cid()).expect("apply ds");
+        // ...then the outsider dv arrives out of order (3000 ≤ 5000) but is
+        // dropped (actor not in mini-public) → outcome Dropped → NO rebuild
+        // (DoS guard: a stranger's backdated event must not force a rebuild).
+        log.apply(outsider_dv, &cid())
+            .expect("apply outsider dv (dropped, still Ok)");
+
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert!(
+            !t3.deliberation.votes.contains_key(&(addr(9), s_hash)),
+            "outsider vote must never land"
+        );
+        assert_eq!(
+            t3.rebuild_count, 0,
+            "dropped outsider vote must not rebuild"
+        );
+    }
+
+    #[test]
+    fn byzantine_backdated_vote_is_dropped_after_rebuild() {
+        let (mut log, pid) = tier3_poll_in_deliberation();
+        let ds = ds_event(pid, addr(1), 5000, "let us deliberate");
+        let s_hash = statement_hash_of(&ds);
+        // dv is backdated BEFORE ds (3000 < 5000) but delivered [ds, dv].
+        let dv = dv_event(pid, addr(2), 3000, s_hash);
+
+        // ds applies in order. Then dv applies INCREMENTALLY (its statement is
+        // present at delivery time), but is out-of-order vs max_applied
+        // (3000 ≤ 5000) → triggers a rebuild whose canonical order
+        // [dv(3000), ds(5000)] re-drops dv (it precedes its own statement) → the
+        // vote converges to ABSENT despite the incremental accept.
+        log.apply(ds, &cid()).expect("apply ds");
+        log.apply(dv, &cid()).expect("apply dv (backdated)");
+
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert!(
+            !t3.deliberation.votes.contains_key(&(addr(2), s_hash)),
+            "backdated vote must be dropped after canonical rebuild"
+        );
+        assert_eq!(t3.rebuild_count, 1);
     }
 }
