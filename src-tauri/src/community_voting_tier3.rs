@@ -1486,10 +1486,80 @@ pub fn verify_cl(
     }
 }
 
+/// ZEB-858: shared poll-state → expected-result core, used by BOTH [`verify_sr`]
+/// and the memoized `kd=rs` ingest path (`community_voting_log_engine`).
+///
+/// Builds the deterministic ratification candidate ordering (status_quo synth +
+/// `drafting_advancers` + `ratification_candidates_ordering`) and recomputes the
+/// expected STAR result via [`recompute_expected_result`]. This is exactly the
+/// part BOTH callers share; the R1 (close-applied) precondition and the
+/// `payload.result` comparison stay in the callers.
+///
+/// The expensive work lives here: in se-mode the recompute is a threshold
+/// decrypt (`recover_secret_tally` → Lagrange-combine + BSGS dlog). The result
+/// is a **pure function of `poll_state`** (candidates + committee shares +
+/// ratification ballots), so this takes no `event` — which is exactly what lets
+/// the ingest path memoize it on `(poll_id, close_event_hash)` and skip the
+/// recompute on a flood of distinct-signed kd=rs for the same closed poll.
+///
+/// Errors mirror `verify_sr`'s (post-decode) failure modes:
+/// - `StatusQuoNotSynthesized` — poll not yet at/past Drafting open.
+/// - `TallySharesNotReady` — se-mode, fewer than `threshold` committee shares
+///   applied on this node yet (the claim is *unconfirmable here yet*, retryable).
+pub(crate) fn expected_result_from_state(
+    poll_state: &Tier3PollState,
+) -> Result<crate::community_voting_star::StarResult, VerifyError> {
+    // Build candidate list from state (same as the ordered list used at
+    // ratification open). ZEB-850 (Task 2 completion): status_quo is synthesized
+    // on demand and never persisted into `candidates`, so mirror the apply-time
+    // locals (`Tier3PollState::apply_event`, community_voting_tier3.rs:742-743)
+    // and include it before ranking — otherwise `drafting_advancers` returns None
+    // and the caller rejects every legitimate peer kd=rs. Prematurity is caught by
+    // the caller's R1 close-applied / stage checks.
+    let sq = synthesize_status_quo(&poll_state.meta.poll_id);
+    let sq_hash = sq.event_hash;
+    let primary_size = poll_state.meta.config.sortition_size as usize;
+    let mut all_candidates = poll_state.candidates.clone();
+    all_candidates.push(sq);
+    let advancers = drafting_advancers(&all_candidates, primary_size, sq_hash)
+        .ok_or(VerifyError::StatusQuoNotSynthesized)?;
+    let ordered_candidates = ratification_candidates_ordering(&advancers, sq_hash);
+
+    // ZEB-850 (Task 2 completion): recompute the result the SAME way the engine
+    // produces it, per privacy mode. se-mode is a threshold-decrypted tally
+    // (`recover_secret_tally`, mirroring `try_finalize_secret_tally`), NOT a
+    // plaintext STAR tally — `tally_star` skips se-mode ciphertext ballots and
+    // would return an all-zero result. `recover_secret_tally` is deterministic
+    // across replicas (Lagrange invariance), so this is a real authz check.
+    //
+    // ZEB-858: `None` (se-mode, fewer than `threshold` shares applied here) means
+    // this node cannot YET confirm the claim → `TallySharesNotReady` (retryable),
+    // distinct from a forged claim (which the caller maps to `TallyMismatch`).
+    recompute_expected_result(poll_state, &ordered_candidates)
+        .ok_or(VerifyError::TallySharesNotReady)
+}
+
+/// ZEB-858: decode the claimed `StarResult` from a `kd=rs` event payload,
+/// mapping a decode failure to `PayloadDecode` (matching [`verify_sr`]). Exposed
+/// for the memoized ingest path, which compares the claim against the memoized
+/// expected result WITHOUT re-running the recompute.
+pub(crate) fn decode_poll_result_claim(
+    event: &SignedVotingEvent,
+) -> Result<crate::community_voting_star::StarResult, VerifyError> {
+    let payload: Tier3PollResultPayload =
+        decode_payload(&event.payload).map_err(VerifyError::PayloadDecode)?;
+    Ok(payload.result)
+}
+
 /// SR1 verify: `PollResult` tally must be bit-identical to deterministic re-compute.
 ///
 /// R1 prerequisite: `poll_state.close_event_hash` must be `Some` (kd=cl already applied).
-/// R2: re-run `tally_star` over `poll_state.ratification_ballots` and compare.
+/// R2: re-run the per-privacy-mode recompute over `poll_state` and compare.
+///
+/// ZEB-858: the R2 recompute is now shared with the memoized ingest path via
+/// [`expected_result_from_state`]; this verifier's observable behavior is
+/// unchanged (R1 → payload decode → StatusQuoNotSynthesized/TallySharesNotReady
+/// → TallyMismatch, in that order).
 pub fn verify_sr(
     event: &SignedVotingEvent,
     poll_state: &Tier3PollState,
@@ -1503,40 +1573,8 @@ pub fn verify_sr(
     let payload: Tier3PollResultPayload =
         decode_payload(&event.payload).map_err(VerifyError::PayloadDecode)?;
 
-    // Recompute: derive ratification candidates ordering from state, then tally.
-    let sq = synthesize_status_quo(&poll_state.meta.poll_id);
-    let sq_hash = sq.event_hash;
-
-    // Build candidate list from state (same as the ordered list used at ratification open).
-    // ZEB-850 (Task 2 completion): status_quo is synthesized on demand and never
-    // persisted into `candidates`, so mirror the apply-time locals
-    // (`Tier3PollState::apply_event`, community_voting_tier3.rs:742-743) and include
-    // it before ranking — otherwise `drafting_advancers` returns None and this
-    // verifier rejects every legitimate peer kd=rs. Prematurity is already caught
-    // by the R1 close-applied check above.
-    let primary_size = poll_state.meta.config.sortition_size as usize;
-    let mut all_candidates = poll_state.candidates.clone();
-    all_candidates.push(sq);
-    let advancers = drafting_advancers(&all_candidates, primary_size, sq_hash)
-        .ok_or(VerifyError::StatusQuoNotSynthesized)?;
-    let ordered_candidates = ratification_candidates_ordering(&advancers, sq_hash);
-
-    // ZEB-850 (Task 2 completion): recompute the result the SAME way the engine
-    // produces it, per privacy mode. se-mode is a threshold-decrypted tally
-    // (`recover_secret_tally`, mirroring `try_finalize_secret_tally`), NOT a
-    // plaintext STAR tally — `tally_star` skips se-mode ciphertext ballots and
-    // would return an all-zero result, so verify_sr would reject every legitimate
-    // peer se-mode kd=rs. `recover_secret_tally` is deterministic across replicas
-    // (Lagrange invariance), so this is a real authz check, not a weakening.
-    //
-    // ZEB-858: the recompute is now shared via `recompute_expected_result`, and
-    // its two failure modes are disambiguated:
-    // - `None` (se-mode, fewer than `threshold` shares applied here) means this
-    //   node cannot YET confirm the claim → `TallySharesNotReady` (retryable).
-    // - recompute succeeds but differs from the claim → genuine forgery →
-    //   `TallyMismatch`.
-    let expected = recompute_expected_result(poll_state, &ordered_candidates)
-        .ok_or(VerifyError::TallySharesNotReady)?;
+    // R2: recompute via the shared core and compare bit-for-bit.
+    let expected = expected_result_from_state(poll_state)?;
     if expected != payload.result {
         return Err(VerifyError::TallyMismatch);
     }

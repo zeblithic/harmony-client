@@ -162,6 +162,17 @@ const ENGINE_AUTO_LANE_PREFIX: &str = "engine-auto-";
 /// coordinate). Used by the ZEB-718 backfill apply path.
 type VotingEventCoord = (OwnerAddr, String, u64, u32);
 
+/// ZEB-858: hard ceiling on `VotingReplayTracker::verify_sr_memo` entries. Each
+/// entry is one `(poll_id, close_event_hash)` pair; post-ZEB-859 a poll's
+/// `close_event_hash` is `Some` only after a legitimate close (~one value per
+/// poll on this node), and voting volume is sparse + archive-bounded (the same
+/// premise the `seen_coords` set relies on). This cap is a belt-and-suspenders
+/// bound so a long-lived node cannot accumulate memo entries for dead polls
+/// without limit: on overflow the whole memo is cleared (a memo miss merely
+/// recomputes once — the map is a pure optimization, never a correctness
+/// input), so the memo can never hold more than this many live entries.
+const MAX_VERIFY_SR_MEMO_ENTRIES: usize = 1024;
+
 #[derive(Debug, Default)]
 pub struct VotingReplayTracker {
     seen: HashMap<(OwnerAddr, String), (u64, u32)>,
@@ -176,6 +187,20 @@ pub struct VotingReplayTracker {
     /// negligible, and it is deliberately NOT pruned on archive so a
     /// re-broadcast archived event is not resurrected.
     seen_coords: HashSet<VotingEventCoord>,
+    /// ZEB-858: memoized se-mode `verify_sr` recompute, keyed by
+    /// `(poll_id, close_event_hash)`. The cached value is the **recomputed
+    /// `StarResult`** (the expensive threshold-decrypt output), NOT a pass/fail
+    /// bit — a later distinct-signed kd=rs for the same key could carry a
+    /// DIFFERENT forged result, and the ingest path must still compare each
+    /// event's claim against this cached value (caching a pass-bit would be a
+    /// forgery-admitting security bug).
+    ///
+    /// Purely EPHEMERAL: this is an in-memory recompute cache only. It is never
+    /// persisted (community_voting_persist.rs), never replicated, and never
+    /// routed through `notify_dirty`/owner-state. Rebuilt-empty on restart is
+    /// correct — a cold node simply recomputes each expected result once. See
+    /// `MAX_VERIFY_SR_MEMO_ENTRIES` for the size bound.
+    verify_sr_memo: HashMap<(PollId, [u8; 32]), crate::community_voting_star::StarResult>,
 }
 
 impl VotingReplayTracker {
@@ -272,6 +297,36 @@ impl VotingReplayTracker {
         } else {
             self.contains(event)
         }
+    }
+
+    /// ZEB-858: memo lookup for the se-mode `verify_sr` recompute. Returns a
+    /// clone of the cached expected `StarResult` if present. The caller holds
+    /// the tracker lock ONLY for this call (never across the recompute).
+    pub fn verify_sr_memo_get(
+        &self,
+        key: &(PollId, [u8; 32]),
+    ) -> Option<crate::community_voting_star::StarResult> {
+        self.verify_sr_memo.get(key).cloned()
+    }
+
+    /// ZEB-858: memo insert. Idempotent under a double-check race — if another
+    /// caller already computed and inserted the same key while this caller's
+    /// recompute was in flight, the existing entry wins (`or_insert`). Bounded:
+    /// on overflow (a genuinely new key that would exceed
+    /// `MAX_VERIFY_SR_MEMO_ENTRIES`) the whole memo is cleared before insert, so
+    /// it can never grow past the ceiling. The caller holds the tracker lock
+    /// ONLY for this call (never across the recompute).
+    pub fn verify_sr_memo_insert(
+        &mut self,
+        key: (PollId, [u8; 32]),
+        value: crate::community_voting_star::StarResult,
+    ) {
+        if !self.verify_sr_memo.contains_key(&key)
+            && self.verify_sr_memo.len() >= MAX_VERIFY_SR_MEMO_ENTRIES
+        {
+            self.verify_sr_memo.clear();
+        }
+        self.verify_sr_memo.entry(key).or_insert(value);
     }
 }
 
@@ -2841,8 +2896,15 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         // intentionally skips eligibility. For peer-submitted events that
         // create or vote on proposals, we enforce the proposal's eligibility
         // predicate before applying, matching local-IPC parity.
-        inbound_eligibility_check(&event, &snapshot, voting_log, community_id, beacon_oracle)
-            .await?;
+        inbound_eligibility_check(
+            &event,
+            &snapshot,
+            voting_log,
+            community_id,
+            beacon_oracle,
+            tracker,
+        )
+        .await?;
 
         // Apply with the verified snapshot.
         let applied_poll_id: PollId = {
@@ -2982,6 +3044,7 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             &self.voting_log,
             self.community_id,
             beacon_oracle,
+            &self.tracker,
         )
         .await?;
 
@@ -3242,11 +3305,17 @@ where
 ///   proposal-specific eligibility check (membership-V6 sufficient).
 /// - Tier 3 PollCreate: creator must satisfy `Tier3PollConfigPayload.eligibility`.
 /// - Tier 3 peer events carrying a tier-3-specific authz predicate (ZEB-850):
-///   `kd=sf` (verify_sf: proposer-signed + backup pool exhausted), `kd=rs`
-///   (verify_sr: kd=cl applied + tally bit-identical), `kd=md`/`kd=dc`
+///   `kd=sf` (verify_sf: proposer-signed + backup pool exhausted), `kd=md`/`kd=dc`
 ///   (verify_sd: mini-public membership), `kd=da` (verify_sd + referenced
 ///   candidate exists), `kd=rb` (verify_ratification_ballot: B2-B5 electorate
-///   authz). These run the SYNC verifiers via [`with_tier3`]. `kd=ss` is gated
+///   authz). These run the SYNC verifiers via [`with_tier3`]. `kd=rs`
+///   (verify_sr: kd=cl applied + claimed result bit-identical to the
+///   deterministic recompute) does NOT use `with_tier3` — it runs the Task-4
+///   post-finalize early-out + R1 under the log guard, clones the poll_state,
+///   drops the guard, then MEMOIZES the recompute on `(poll_id, close_event_hash)`
+///   (ZEB-858) so the expensive se-mode threshold-decrypt runs at most once for a
+///   closed poll; the claim is still compared against the memoized value every
+///   time. `kd=ss` is gated
 ///   asynchronously (ZEB-850 Task 3) via [`verify_ss`] + a [`BeaconOracle`]:
 ///   the poll state is cloned under the log guard, the guard is DROPPED, then
 ///   the async verify runs (it locks the dfrost log internally — never hold
@@ -3272,6 +3341,10 @@ async fn inbound_eligibility_check(
     voting_log: &Arc<Mutex<VotingLog>>,
     community_id: SpaceId,
     beacon_oracle: Option<&dyn crate::community_voting_tier3::BeaconOracle>,
+    // ZEB-858: ephemeral replay tracker carrying the `verify_sr_memo` — the
+    // kd=rs arm memoizes the expensive se-mode recompute keyed on
+    // `(poll_id, close_event_hash)`. Both call sites already hold the tracker.
+    tracker: &Arc<Mutex<VotingReplayTracker>>,
 ) -> Result<(), String> {
     match event.tier {
         crate::community_voting_core::Tier::Approval => {
@@ -3479,32 +3552,98 @@ async fn inbound_eligibility_check(
                     .await?;
                 }
                 // kd=rs: else a member could forge an arbitrary finalized result.
-                // verify_sr: kd=cl applied + tally bit-identical to recompute.
-                // verify_sr is SYNC (no oracle await), so — unlike the kd=ss arm,
-                // where clone-drop is mandatory to avoid holding voting_log across
-                // the dfrost-log await (ZEB-803 cross-lock class) — it verifies
-                // under the guard, uniform with the other sync verifiers. This
-                // keeps the detached-clone verify (which can go stale before apply,
-                // Greptile PR #586) off the kd=rs path; apply stores the payload
-                // result verbatim, so the verify/apply gap is benign here, and the
-                // se-mode threshold-decrypt lock-hold is addressed properly in
-                // ZEB-858 (post-finalize early-out + memoization), not clone-drop.
+                // Authz = verify_sr's logic (kd=cl applied + claimed result
+                // bit-identical to the deterministic recompute), but MEMOIZED
+                // (ZEB-858) so a flood of distinct-signed kd=rs for one closed poll
+                // runs the expensive se-mode threshold-decrypt at most ONCE.
+                //
+                // Shape: under the log guard, run the Task-4 post-finalize early-out
+                // + R1 (close-applied) check, capture the memo key's
+                // `close_event_hash`, and clone the poll_state; then DROP the guard.
+                // Cloning is cheap relative to the se-mode BSGS decrypt this
+                // memoizes, and it lets the memo lookup + recompute both run with
+                // the log lock released — so there is never a nested log→tracker
+                // lock ordering. The recompute result is a pure function of
+                // (poll_id, close_event_hash) (via `expected_result_from_state`),
+                // so the memo is sound; but the claim is STILL compared against the
+                // memoized value on every event (a memo hit never bypasses the
+                // comparison), so a later distinct-signed forged result is caught.
                 crate::community_voting_core::PollEventKindCode::PollResult => {
                     let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
                         .ok_or_else(|| "kd=rs: undecodable poll id".to_string())?;
-                    with_tier3(voting_log, &pid, "kd=rs", |t3| {
-                        // ZEB-858 post-finalize early-out: a finalized poll's
-                        // result is immutable, so reject a new kd=rs cheaply
-                        // BEFORE verify_sr's se-mode threshold-decrypt
-                        // (`recover_secret_tally`) runs.
+
+                    // Capture the early-out + R1 + memo key + poll_state under the
+                    // log guard, then drop it before touching the memo/recompute.
+                    let (poll_state, close_hash) = {
+                        let log_g = voting_log.lock().await;
+                        let t3 = log_g
+                            .polls
+                            .get(&pid)
+                            .and_then(|ps| ps.tier_state.as_tier3())
+                            .ok_or_else(|| {
+                                format!(
+                                    "kd=rs authz: unknown/non-tier3 poll {}",
+                                    hex::encode(pid.0)
+                                )
+                            })?;
+                        // ZEB-858 post-finalize early-out: a finalized poll's result
+                        // is immutable, so reject cheaply BEFORE any recompute AND
+                        // before the memo (the memo path is only for the pre-finalize
+                        // multi-arrival window).
                         if matches!(t3.stage, crate::community_voting_tier3::Stage::Finalized) {
-                            return Err(
-                                crate::community_voting_tier3::VerifyError::PollAlreadyFinalized,
-                            );
+                            return Err(format!(
+                                "kd=rs authz: {:?}",
+                                crate::community_voting_tier3::VerifyError::PollAlreadyFinalized
+                            ));
                         }
-                        crate::community_voting_tier3::verify_sr(event, t3)
-                    })
-                    .await?;
+                        // R1 (verify_sr's NotInClosedStage): PollClose must be applied
+                        // — and `close_event_hash` is the second half of the memo key.
+                        let close_hash = t3.close_event_hash.ok_or_else(|| {
+                            format!(
+                                "kd=rs authz: {:?}",
+                                crate::community_voting_tier3::VerifyError::NotInClosedStage
+                            )
+                        })?;
+                        (t3.clone(), close_hash)
+                    };
+
+                    // Decode the claimed result (verify_sr's PayloadDecode step).
+                    let claimed = crate::community_voting_tier3::decode_poll_result_claim(event)
+                        .map_err(|e| format!("kd=rs authz: {e:?}"))?;
+
+                    // Memoized recompute. Lock discipline (ZEB-858): the tracker
+                    // (memo) mutex is held ONLY for the get and the insert, NEVER
+                    // across `expected_result_from_state` (which holds the BSGS
+                    // decrypt). On a miss: unlock → recompute → re-lock → insert.
+                    let key = (pid, close_hash);
+                    let expected = {
+                        let hit = {
+                            let g = tracker.lock().await;
+                            g.verify_sr_memo_get(&key)
+                        };
+                        match hit {
+                            Some(v) => v,
+                            None => {
+                                let v = crate::community_voting_tier3::expected_result_from_state(
+                                    &poll_state,
+                                )
+                                .map_err(|e| format!("kd=rs authz: {e:?}"))?;
+                                let mut g = tracker.lock().await;
+                                g.verify_sr_memo_insert(key, v.clone());
+                                v
+                            }
+                        }
+                    };
+
+                    // ALWAYS compare — a memo hit must never bypass this, else a
+                    // later distinct-signed kd=rs could smuggle a forged result
+                    // under the same key.
+                    if expected != claimed {
+                        return Err(format!(
+                            "kd=rs authz: {:?}",
+                            crate::community_voting_tier3::VerifyError::TallyMismatch
+                        ));
+                    }
                 }
                 // kd=md / kd=dc: mini-public membership (verify_sd).
                 crate::community_voting_core::PollEventKindCode::MiniPublicDecline
@@ -7493,7 +7632,8 @@ mod tests {
             9_000_000,
             encode_sf_payload(pid),
         );
-        let res = inbound_eligibility_check(&sf, &snapshot, &log, cid, None).await;
+        let res =
+            inbound_eligibility_check(&sf, &snapshot, &log, cid, None, &fresh_tracker()).await;
         assert!(
             res.is_err(),
             "kd=sf from a non-proposer must be rejected at ingest; got {res:?}"
@@ -7535,7 +7675,8 @@ mod tests {
             9_000_000,
             encode_sf_payload(pid),
         );
-        let res = inbound_eligibility_check(&sf, &snapshot, &log, cid, None).await;
+        let res =
+            inbound_eligibility_check(&sf, &snapshot, &log, cid, None, &fresh_tracker()).await;
         assert!(
             res.is_ok(),
             "proposer-signed kd=sf with an exhausted pool must be admitted; got {res:?}"
@@ -7555,7 +7696,8 @@ mod tests {
             1_500_000,
             encode_md_payload(pid),
         );
-        let res = inbound_eligibility_check(&md, &snapshot, &log, cid, None).await;
+        let res =
+            inbound_eligibility_check(&md, &snapshot, &log, cid, None, &fresh_tracker()).await;
         assert!(
             res.is_err(),
             "kd=md from a non-mini-public actor must be rejected at ingest; got {res:?}"
@@ -7572,7 +7714,8 @@ mod tests {
             1_500_000,
             encode_md_payload(pid),
         );
-        let res = inbound_eligibility_check(&md, &snapshot, &log, cid, None).await;
+        let res =
+            inbound_eligibility_check(&md, &snapshot, &log, cid, None, &fresh_tracker()).await;
         assert!(
             res.is_ok(),
             "kd=md from a mini-public member must be admitted; got {res:?}"
@@ -7591,7 +7734,8 @@ mod tests {
             9_000_000,
             encode_pid_ref(pid),
         );
-        let res = inbound_eligibility_check(&rs, &snapshot, &log, cid, None).await;
+        let res =
+            inbound_eligibility_check(&rs, &snapshot, &log, cid, None, &fresh_tracker()).await;
         assert!(
             res.is_err(),
             "kd=rs before kd=cl must be rejected at ingest; got {res:?}"
@@ -7651,7 +7795,8 @@ mod tests {
         )
         .expect("encode forged Tier3PollResultPayload");
         let rs = tier3_ingest_event(PollEventKindCode::PollResult, member, 9_000_000, body);
-        let res = inbound_eligibility_check(&rs, &snapshot, &log, cid, None).await;
+        let res =
+            inbound_eligibility_check(&rs, &snapshot, &log, cid, None, &fresh_tracker()).await;
         let err = res.expect_err("kd=rs for an already-finalized poll must be rejected");
         assert!(
             err.contains("PollAlreadyFinalized"),
@@ -7674,6 +7819,196 @@ mod tests {
         b
     }
 
+    // ── ZEB-858: memoized se-mode verify_sr recompute ──────────────────────────
+
+    /// A fresh ephemeral replay tracker (carries the ZEB-858 `verify_sr_memo`).
+    /// Most ingest tests don't care about the memo and just need *a* tracker to
+    /// satisfy the `inbound_eligibility_check` signature; the two memo tests
+    /// share one across calls.
+    fn fresh_tracker() -> Arc<Mutex<VotingReplayTracker>> {
+        Arc::new(Mutex::new(VotingReplayTracker::new()))
+    }
+
+    fn encode_rs_payload(
+        pid: PollId,
+        result: &crate::community_voting_star::StarResult,
+    ) -> Vec<u8> {
+        let mut b = Vec::new();
+        ciborium::into_writer(
+            &crate::community_voting_tier3::Tier3PollResultPayload {
+                poll_id: pid,
+                result: result.clone(),
+            },
+            &mut b,
+        )
+        .expect("encode Tier3PollResultPayload");
+        b
+    }
+
+    /// Build a Tier 3 poll that is CLOSED (`close_event_hash = Some`) but NOT
+    /// `Stage::Finalized`, in pu-mode. pu-mode is deliberate: the correct
+    /// expected result is then a cheap, deterministic `tally_star` — no FROST /
+    /// committee-share setup is needed to prime the memo, yet the memoized ingest
+    /// path is privacy-mode-agnostic (it caches whatever `expected_result_from_state`
+    /// returns), so this is a faithful structural exercise of the memo. Returns
+    /// the log, poll id, a member (kd=rs signer), snapshot, community id, the
+    /// fixed close_event_hash (the memo key's second half), and the correct
+    /// expected `StarResult` R.
+    async fn tier3_closed_poll_for_memo() -> (
+        Arc<Mutex<VotingLog>>,
+        PollId,
+        OwnerAddr,
+        crate::community_voting_core::MembershipSnapshot,
+        SpaceId,
+        [u8; 32],
+        crate::community_voting_star::StarResult,
+    ) {
+        let (log, pid, _proposer, member, snapshot, cid) = tier3_ingest_fixture().await;
+        let close_hash = [0x5C; 32];
+        let expected = {
+            let mut g = log.lock().await;
+            let t3 = g
+                .polls
+                .get_mut(&pid)
+                .expect("poll present")
+                .tier_state
+                .as_tier3_mut()
+                .expect("tier3 state");
+            // Close applied (R1 satisfied) but stage left non-terminal so the
+            // Task-4 post-finalize early-out does NOT fire. Fixture is pu-mode.
+            t3.close_event_hash = Some(close_hash);
+            crate::community_voting_tier3::expected_result_from_state(t3)
+                .expect("pu recompute yields a concrete R")
+        };
+        (log, pid, member, snapshot, cid, close_hash, expected)
+    }
+
+    /// The memo must run the expensive recompute at most ONCE for a given
+    /// `(poll, close_event_hash)`. Structural proof (no counter): prime the memo
+    /// with a correct kd=rs, then MUTATE the poll so a *live* recompute would now
+    /// FAIL (flip to se-mode with no committee shares → `recover_secret_tally`
+    /// → None → `TallySharesNotReady`), keeping `close_event_hash` — the memo key
+    /// — UNCHANGED. A second distinct-signed correct kd=rs must still be `Ok`:
+    /// that can only happen if `expected` came from the cache (R), never the
+    /// recompute (which would now error). Asserting `Ok` proves the decrypt did
+    /// not rerun.
+    #[tokio::test]
+    async fn verify_sr_memo_recomputes_once_for_same_close() {
+        let (log, pid, member, snapshot, cid, close_hash, r) = tier3_closed_poll_for_memo().await;
+        let tracker = fresh_tracker();
+
+        // First correct kd=rs (result R) → Ok; memo now holds R for (pid, close_hash).
+        let rs1 = tier3_ingest_event(
+            PollEventKindCode::PollResult,
+            member,
+            9_000_000,
+            encode_rs_payload(pid, &r),
+        );
+        let res1 = inbound_eligibility_check(&rs1, &snapshot, &log, cid, None, &tracker).await;
+        assert!(
+            res1.is_ok(),
+            "first correct kd=rs must be admitted; got {res1:?}"
+        );
+
+        // MUTATE so a LIVE recompute would now fail: flip to se-mode, no shares
+        // (default NullCommitteeOracle) → recover_secret_tally → None →
+        // TallySharesNotReady. The memo key (close_event_hash) is UNCHANGED.
+        {
+            let mut g = log.lock().await;
+            let t3 = g
+                .polls
+                .get_mut(&pid)
+                .expect("poll present")
+                .tier_state
+                .as_tier3_mut()
+                .expect("tier3 state");
+            t3.meta.config.privacy_mode = "se".into();
+            assert_eq!(
+                t3.close_event_hash,
+                Some(close_hash),
+                "the memo key must be unchanged by the mutation"
+            );
+        }
+
+        // Second distinct-signed correct kd=rs (result R). Memo hit → expected = R
+        // (cache) → R == R → Ok. Without the memo, the recompute would rerun on the
+        // now-se-mode shareless state → TallySharesNotReady (Err).
+        let rs2 = tier3_ingest_event(
+            PollEventKindCode::PollResult,
+            member,
+            9_000_001,
+            encode_rs_payload(pid, &r),
+        );
+        let res2 = inbound_eligibility_check(&rs2, &snapshot, &log, cid, None, &tracker).await;
+        assert!(
+            res2.is_ok(),
+            "second kd=rs must be admitted from the memo (the expensive se-mode \
+             recompute must not rerun); got {res2:?}"
+        );
+    }
+
+    /// A memo hit must STILL compare the claim against the cached result — the
+    /// memo caches the recomputed `StarResult`, never a pass/fail bit. Prime the
+    /// memo with the correct R, flip to se-mode (so a live recompute would return
+    /// `TallySharesNotReady`), then submit a distinct-signed kd=rs carrying a
+    /// FORGED R' ≠ R under the SAME key. The result must be `TallyMismatch`:
+    /// not `Ok` (which would mean a pass-bit was cached), and not
+    /// `TallySharesNotReady` (which would mean the recompute reran).
+    #[tokio::test]
+    async fn verify_sr_memo_still_rejects_forged_result() {
+        let (log, pid, member, snapshot, cid, _close_hash, r) = tier3_closed_poll_for_memo().await;
+        let tracker = fresh_tracker();
+
+        // Prime the memo with the correct result R.
+        let rs1 = tier3_ingest_event(
+            PollEventKindCode::PollResult,
+            member,
+            9_000_000,
+            encode_rs_payload(pid, &r),
+        );
+        inbound_eligibility_check(&rs1, &snapshot, &log, cid, None, &tracker)
+            .await
+            .expect("first correct kd=rs primes the memo");
+
+        // Flip to se-mode + no shares so a LIVE recompute would return
+        // TallySharesNotReady — this isolates the memo path.
+        {
+            let mut g = log.lock().await;
+            let t3 = g
+                .polls
+                .get_mut(&pid)
+                .expect("poll present")
+                .tier_state
+                .as_tier3_mut()
+                .expect("tier3 state");
+            t3.meta.config.privacy_mode = "se".into();
+        }
+
+        // Forge a different result R' ≠ R for the SAME (poll, close_hash).
+        let mut forged = r.clone();
+        forged.total_scores = vec![r.total_scores.first().copied().unwrap_or(0) + 1];
+        assert_ne!(forged, r, "forged result must differ from R");
+
+        let rs2 = tier3_ingest_event(
+            PollEventKindCode::PollResult,
+            member,
+            9_000_001,
+            encode_rs_payload(pid, &forged),
+        );
+        let res2 = inbound_eligibility_check(&rs2, &snapshot, &log, cid, None, &tracker).await;
+        let err = res2.expect_err("a forged result under a memoized key must be rejected");
+        assert!(
+            err.contains("TallyMismatch"),
+            "the memo must cache the recomputed result (not a pass-bit) and STILL \
+             compare; expected TallyMismatch, got {err:?}"
+        );
+        assert!(
+            !err.contains("TallySharesNotReady"),
+            "a memo hit must skip the recompute; TallySharesNotReady would mean it \
+             reran; got {err:?}"
+        );
+    }
+
     // kd=rb forge: an actor OUTSIDE the eligible electorate signs a
     // RatificationBallot in the Ratification stage → verify_ratification_ballot's
     // B3 NotInEligibleElectorate must reject at ingest. The event HLC is dated
@@ -7692,7 +8027,8 @@ mod tests {
             20_000_000,
             encode_pid_ref(pid),
         );
-        let res = inbound_eligibility_check(&rb, &snapshot, &log, cid, None).await;
+        let res =
+            inbound_eligibility_check(&rb, &snapshot, &log, cid, None, &fresh_tracker()).await;
         let err = res.expect_err("kd=rb from a non-electorate actor must be rejected at ingest");
         assert!(
             err.contains("NotInEligibleElectorate"),
@@ -7718,7 +8054,8 @@ mod tests {
             1_500_000,
             encode_da_payload(pid, [0xAB; 32]),
         );
-        let res = inbound_eligibility_check(&da, &snapshot, &log, cid, None).await;
+        let res =
+            inbound_eligibility_check(&da, &snapshot, &log, cid, None, &fresh_tracker()).await;
         let err =
             res.expect_err("kd=da referencing an unknown candidate must be rejected at ingest");
         assert!(
@@ -7752,7 +8089,8 @@ mod tests {
             16_000_000,
             encode_pid_ref(pid),
         );
-        let res = inbound_eligibility_check(&cl, &snapshot, &log, cid, None).await;
+        let res =
+            inbound_eligibility_check(&cl, &snapshot, &log, cid, None, &fresh_tracker()).await;
         let err = res.expect_err("a forged premature kd=cl must be rejected at ingest");
         assert!(
             err.contains("CloseConditionNotMet"),
@@ -7772,7 +8110,8 @@ mod tests {
             25_000_000,
             encode_pid_ref(pid),
         );
-        let res = inbound_eligibility_check(&cl, &snapshot, &log, cid, None).await;
+        let res =
+            inbound_eligibility_check(&cl, &snapshot, &log, cid, None, &fresh_tracker()).await;
         assert!(
             res.is_ok(),
             "a legitimate kd=cl at/after the close threshold must be admitted; got {res:?}"
@@ -7960,6 +8299,7 @@ mod tests {
             &log,
             cid,
             Some(&oracle as &dyn crate::community_voting_tier3::BeaconOracle),
+            &fresh_tracker(),
         )
         .await;
         let err = res.expect_err("forged kd=ss must be rejected at ingest");
@@ -7996,6 +8336,7 @@ mod tests {
             &log,
             cid,
             Some(&oracle as &dyn crate::community_voting_tier3::BeaconOracle),
+            &fresh_tracker(),
         )
         .await;
         assert!(
@@ -8021,7 +8362,8 @@ mod tests {
             1_000_002,
             encode_ss_payload(pid, correct.primary, correct.backup),
         );
-        let res = inbound_eligibility_check(&ss, &snapshot, &log, cid, None).await;
+        let res =
+            inbound_eligibility_check(&ss, &snapshot, &log, cid, None, &fresh_tracker()).await;
         let err = res.expect_err("kd=ss with no beacon oracle must be rejected (fail-closed)");
         assert!(
             err.contains("no beacon oracle"),
@@ -8062,6 +8404,7 @@ mod tests {
             &log,
             cid,
             Some(&oracle as &dyn crate::community_voting_tier3::BeaconOracle),
+            &fresh_tracker(),
         )
         .await;
         let err = res
