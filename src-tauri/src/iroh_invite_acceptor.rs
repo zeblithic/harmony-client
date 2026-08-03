@@ -226,7 +226,8 @@ where
     /// NOR exhaust the shared per-source admission budget by opening connections.
     /// Mirrors the friend/v1 acceptor's `rate_limiter` (ZEB-700). Interior
     /// `std::sync::Mutex`, never held across an `.await`. `with_config` seeds the
-    /// production caps; tests inject tiny caps via [`Self::with_open_join_conn_limiter`].
+    /// production caps; the shed behavior is unit-tested against
+    /// `OpenJoinConnLimiter` directly via `with_caps` (see `open_join_admit`).
     open_join_conn_limiter: OpenJoinConnLimiter,
     /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
     /// iroh endpoint id. `None` (tests, pre-boot) — stamping is then a no-op.
@@ -278,9 +279,9 @@ where
             open_join_limiter: TokioMutex::new(OpenJoinRateLimiter::new()),
             // ZEB-853 (B7): production Tier-1 caps by default (like the friend
             // acceptor's `rate_limiter`); the shield is therefore ON in
-            // production with no start_node wiring change. Tests shrink the caps
-            // via `with_open_join_conn_limiter`. Honest single-join peers never
-            // hit them.
+            // production with no start_node wiring change. The shed behavior is
+            // unit-tested against `OpenJoinConnLimiter` directly (`with_caps`).
+            // Honest single-join peers never hit them.
             open_join_conn_limiter: OpenJoinConnLimiter::new(),
             traffic: None,
         }
@@ -294,15 +295,6 @@ where
         traffic: Arc<crate::network_health::PeerTrafficRegistry>,
     ) -> Self {
         self.traffic = Some(traffic);
-        self
-    }
-
-    /// ZEB-853 (B7): override the pre-auth Tier-1 connection shield (tests use
-    /// tiny/zero caps to force a deterministic shed; production keeps the
-    /// `with_config` default). Mirrors the friend acceptor's
-    /// `with_rate_limiter`.
-    pub fn with_open_join_conn_limiter(mut self, limiter: OpenJoinConnLimiter) -> Self {
-        self.open_join_conn_limiter = limiter;
         self
     }
 

@@ -419,6 +419,12 @@ impl VoicePresenceMap {
                 // at 0 on rejoin) — and revives a gravestone.
                 e.owner = beacon.owner;
                 e.muted = beacon.muted;
+                // ZEB-853 D5 (deliberate carry): if the superseding session's
+                // hand is STILL raised, the LOCAL first-observed stamp is
+                // intentionally carried forward. The stamp is local (never
+                // peer-controlled), so it cannot be forged back to epoch to
+                // steal queue position. A genuine leave→rejoin clears it first
+                // via the tombstone's `hand: None`, then re-stamps fresh here.
                 e.hand_first_observed_ms =
                     next_hand_first_observed(e.hand, e.hand_first_observed_ms, beacon.hand, now_ms);
                 e.hand = beacon.hand;
@@ -1129,6 +1135,43 @@ mod tests {
         assert_eq!(cell.load(Ordering::SeqCst), 0);
         // Raise after lower restamps.
         assert_eq!(update_hand_cell(&cell, Some(900)), Some(900));
+    }
+
+    #[test]
+    fn next_hand_first_observed_covers_all_arms() {
+        // ZEB-853 D5: direct coverage of the pure queue-stamp helper (the
+        // supersede-arm apply path only ever routes through these branches).
+        // Local `now_ms` is fixed so the fresh stamp is deterministic.
+        let now = 5_000u64;
+
+        // (1) Incoming lowered → clear, regardless of stored hand/stamp.
+        assert_eq!(
+            next_hand_first_observed(Some(100), Some(200), None, now),
+            None
+        );
+        assert_eq!(next_hand_first_observed(None, None, None, now), None);
+
+        // (2) Incoming raised & stored hand lowered → fresh stamp at `now`.
+        assert_eq!(
+            next_hand_first_observed(None, None, Some(1), now),
+            Some(now)
+        );
+
+        // (3) Incoming raised & stored hand raised WITH an existing stamp →
+        // carry the existing stamp unchanged (stable queue position).
+        assert_eq!(
+            next_hand_first_observed(Some(1), Some(200), Some(1), now),
+            Some(200)
+        );
+
+        // (4) Incoming raised & stored hand raised but stamp MISSING — a
+        // defensive/should-be-unreachable state (every path that sets
+        // `hand = Some` also stamps). The current helper CARRIES the stored
+        // (None) stamp; it does NOT re-stamp to `now`. Asserting the real
+        // return keeps this a no-behavior-change coverage backfill. (The
+        // fixwave brief anticipated Some(now) here — a defensive fresh stamp
+        // the helper does not implement; flagged as a concern, not changed.)
+        assert_eq!(next_hand_first_observed(Some(1), None, Some(1), now), None);
     }
 
     #[test]
