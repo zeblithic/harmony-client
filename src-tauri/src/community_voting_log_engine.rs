@@ -2033,6 +2033,57 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                 None
             };
 
+        // ZEB-857: surgical local-publish authz for the user-originated Tier-3
+        // kinds. These four kinds are forgeable by the AUTHORING node (a member
+        // could locally mint a kd=da for a candidate they may not approve, or a
+        // member who already declined could still submit one), and every peer
+        // runs the SAME sync verifier at ingest (`inbound_eligibility_check`).
+        // Without this gate the author applies locally while every peer rejects
+        // — a silent, permanent divergence (the ZEB-850 `ipc_full_lifecycle`
+        // observation). Running the identical verifiers here (via `with_tier3`,
+        // mirroring the ingest arms, including its Err-string mapping) turns a
+        // self-authored illegitimate event into a clean local `Err` that is
+        // NOT applied.
+        //
+        // The four kinds are DISJOINT from the engine-auto self-mints
+        // (kd=cl/rs/sf/ss/ts), so matching on kind alone excludes every
+        // self-mint — no exemption logic is needed — and leaves creates,
+        // tier1/2, and the ungated ds/dv/ts paths untouched. All verifiers used
+        // here are SYNC (need neither `snapshot` nor a `beacon_oracle`).
+        match event.kind {
+            // kd=md / kd=dc: mini-public membership (verify_sd).
+            PollEventKindCode::MiniPublicDecline | PollEventKindCode::DraftCandidate => {
+                let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                    .ok_or_else(|| "kd=md/dc local publish: undecodable poll id".to_string())?;
+                with_tier3(&self.voting_log, &pid, "kd=md/dc", |t3| {
+                    crate::community_voting_tier3::verify_sd(&event, t3)
+                })
+                .await?;
+            }
+            // kd=da: membership + referenced candidate must exist.
+            PollEventKindCode::DraftApproval => {
+                let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                    .ok_or_else(|| "kd=da local publish: undecodable poll id".to_string())?;
+                with_tier3(&self.voting_log, &pid, "kd=da", |t3| {
+                    crate::community_voting_tier3::verify_sd(&event, t3)?;
+                    crate::community_voting_tier3::verify_da_candidate_exists(&event, t3)
+                })
+                .await?;
+            }
+            // kd=rb: full-electorate B2-B5 ratification authz.
+            PollEventKindCode::RatificationBallot => {
+                let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                    .ok_or_else(|| "kd=rb local publish: undecodable poll id".to_string())?;
+                with_tier3(&self.voting_log, &pid, "kd=rb", |t3| {
+                    crate::community_voting_tier3::verify_ratification_ballot(&event, t3)
+                })
+                .await?;
+            }
+            // Creates, engine-auto (cl/rs/sf/ss/ts), tier1/2, and the ungated
+            // ds/dv/ts kinds are unchanged.
+            _ => {}
+        }
+
         // Apply locally. Capture the returned `PollId` so the engine-auto
         // post-apply hook (ZEB-310 Task 9) can inspect the affected poll's
         // state without re-deriving the id from signing_bytes.
@@ -6918,6 +6969,159 @@ mod tests {
             4,
             "payload must have exactly 4 keys (pollId, communityId, approver, \
              targetEventHash); got {obj:?}"
+        );
+    }
+
+    // ── ZEB-857: local-publish authz for user-action Tier-3 kinds ──────────
+
+    /// `publish_event` must run the kind-specific Tier-3 verifier on the
+    /// LOCAL-publish path for the user-originated forgeable kinds. A
+    /// self-authored illegitimate event — here a `kd=da` DraftApproval whose
+    /// actor is NOT in the mini-public — must become a clean local `Err` that
+    /// is never applied, rather than silently diverging from every peer (the
+    /// ZEB-850 `ipc_full_lifecycle` observation: peers reject the forged event
+    /// at ingest via `verify_sd`, so an ungated local-apply leaves the author's
+    /// approval set permanently ahead of the network). A LEGITIMATE `kd=da`
+    /// from a mini-public member on the same candidate still applies (`Ok`).
+    #[tokio::test]
+    async fn publish_event_rejects_illegitimate_user_action_kd_da() {
+        let (engine, pid, _app_handle, _pub_rx, _sub_tx) = tier3_past_sortition_fixture().await;
+
+        // Fixture mini-public = { seed-0xA1 actor } ∪ electorate[0..18], where
+        // electorate[i] = OwnerAddr([i, 0xF3, 0, …]).
+        let a1_owner = OwnerAddr(
+            harmony_identity::PrivateIdentity::from_seed(&[0xA1u8; 32])
+                .identity
+                .address_hash,
+        );
+        // electorate[0] — a mini-public member (part of the seeded `primary`).
+        let mini_public_member = OwnerAddr({
+            let mut a = [0u8; 16];
+            a[1] = 0xF3;
+            a
+        });
+        // In neither the electorate (a[1] != 0xF3) nor the mini-public.
+        let outsider = OwnerAddr([0xB7; 16]);
+
+        // Step 1: a LEGITIMATE kd=dc by mini-public member 0xA1 creates the
+        // candidate the DraftApprovals will target. (publish_event does not
+        // verify signatures — that is the inbound path — so placeholder sigs
+        // faithfully exercise the kind-based verify block.)
+        let dc_payload = {
+            let s = crate::community_voting_core::DraftCandidatePayload {
+                poll_id: pid,
+                text: "ZEB-857 candidate".into(),
+            };
+            let mut b = Vec::new();
+            ciborium::into_writer(&s, &mut b).expect("encode dc");
+            b
+        };
+        let dc_event = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::DraftCandidate,
+            hlc: Hlc {
+                wall_ms: 1_200_000,
+                logical: 0,
+                device_id: "dev-dc-857".into(),
+            },
+            actor: a1_owner,
+            payload: dc_payload,
+            sig: vec![0u8; 64],
+        };
+        let candidate_hash = crate::community_voting_tier3::event_hash_of(&dc_event);
+        engine
+            .publish_event(dc_event, None)
+            .await
+            .expect("legit kd=dc from mini-public member must apply");
+
+        let da_payload = {
+            let s = crate::community_voting_core::DraftApprovalPayload {
+                poll_id: pid,
+                candidate_event_hash: candidate_hash,
+            };
+            let mut b = Vec::new();
+            ciborium::into_writer(&s, &mut b).expect("encode da");
+            b
+        };
+
+        // Step 2: ILLEGITIMATE kd=da — actor NOT in the mini-public.
+        let da_outsider = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::DraftApproval,
+            hlc: Hlc {
+                wall_ms: 1_300_000,
+                logical: 0,
+                device_id: "dev-da-out".into(),
+            },
+            actor: outsider,
+            payload: da_payload.clone(),
+            sig: vec![0u8; 64],
+        };
+        let res = engine.publish_event(da_outsider, None).await;
+        assert!(
+            res.is_err(),
+            "illegitimate kd=da from a non-mini-public actor must be rejected on \
+             the local publish path; got {res:?}"
+        );
+        let after_reject = {
+            let log = engine.voting_log.lock().await;
+            log.polls
+                .get(&pid)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .and_then(|t3| {
+                    t3.candidates
+                        .iter()
+                        .find(|c| c.event_hash == candidate_hash)
+                        .map(|c| c.approvals.clone())
+                })
+                .expect("candidate present in tier3 state")
+        };
+        assert!(
+            !after_reject.contains(&outsider),
+            "a rejected kd=da must NOT be applied locally (outsider must be absent \
+             from the candidate's approval set)"
+        );
+
+        // Step 3: LEGITIMATE kd=da from a mini-public member on the same
+        // candidate still applies (Ok) and mutates local state.
+        let da_legit = SignedVotingEvent {
+            tag: 'p',
+            version: 1,
+            tier: Tier::Sortition,
+            kind: PollEventKindCode::DraftApproval,
+            hlc: Hlc {
+                wall_ms: 1_400_000,
+                logical: 0,
+                device_id: "dev-da-legit".into(),
+            },
+            actor: mini_public_member,
+            payload: da_payload,
+            sig: vec![0u8; 64],
+        };
+        engine
+            .publish_event(da_legit, None)
+            .await
+            .expect("legit kd=da from a mini-public member must apply");
+        let after_legit = {
+            let log = engine.voting_log.lock().await;
+            log.polls
+                .get(&pid)
+                .and_then(|ps| ps.tier_state.as_tier3())
+                .and_then(|t3| {
+                    t3.candidates
+                        .iter()
+                        .find(|c| c.event_hash == candidate_hash)
+                        .map(|c| c.approvals.clone())
+                })
+                .expect("candidate present in tier3 state")
+        };
+        assert!(
+            after_legit.contains(&mini_public_member),
+            "a legitimate kd=da must be applied locally (member present in approvals)"
         );
     }
 
