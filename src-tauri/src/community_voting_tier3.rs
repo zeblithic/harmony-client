@@ -219,6 +219,11 @@ pub struct Tier3PollState {
     /// events (the T-VOTE-LANE GRIEF-LOCKOUT). Rebuilt by replay; never
     /// serialized (community_voting_persist.rs).
     pub last_received_hlc: std::collections::BTreeMap<(OwnerAddr, String), (u64, u32)>,
+    /// ZEB-860: highest `(wall_ms, logical, device_id)` key dispatched to this
+    /// poll (accepted OR silently dropped). Read by the apply layer to detect
+    /// out-of-order arrival and trigger a canonical-order rebuild. Never
+    /// serialized (like `last_received_hlc`).
+    pub(crate) max_applied: Option<(u64, u32, String)>,
     /// ZEB-295 Phase 6: ballot-secret tally projection. Populated by
     /// `kd=ts` apply (Task 7) and the decrypted-result derivation
     /// (Task 8). Empty in pu-mode polls.
@@ -252,6 +257,7 @@ impl std::fmt::Debug for Tier3PollState {
             .field("deliberation", &self.deliberation)
             .field("last_hlc", &self.last_hlc)
             .field("last_received_hlc", &self.last_received_hlc)
+            .field("max_applied", &self.max_applied)
             .field("secret_tally", &self.secret_tally)
             .field("committee_oracle", &"<oracle>")
             .finish()
@@ -379,7 +385,7 @@ pub fn validate_decline_reason(reason: &Option<String>) -> Result<(), ValidateEr
 
 // ── Apply error type ──────────────────────────────────────────────────────────
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ApplyError {
     #[error("poll is in Failed state")]
     PollInFailedState,
@@ -391,6 +397,41 @@ pub enum ApplyError {
     InvalidKindForTier3(PollEventKindCode),
     #[error("event hlc not monotonic")]
     HlcNotMonotonic,
+}
+
+// ── Apply outcome + canonical order key ───────────────────────────────────────
+
+/// Whether an `apply_event` call changed the projection (`Applied`) or hit a
+/// silent-drop branch (`Dropped`). Used by the apply layer's out-of-order
+/// rebuild trigger to tell a state-changing accept from a no-op drop.
+///
+/// `pub` (not `pub(crate)`) because `apply_event` is a `pub fn` on a `pub`
+/// struct in a `pub mod`: returning a `pub(crate)` type from it would trip the
+/// `private_interfaces` lint under `-D warnings`. Mirrors the sibling
+/// `ApplyError`, which is `pub` for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Applied,
+    Dropped,
+}
+
+/// Canonical total order for replay/rebuild: `(wall_ms, logical, device_id,
+/// event_hash)`. `event_hash` (SHA-256 of signing bytes) is the final
+/// tiebreaker — a strict total order with no ties even if a device reuses an
+/// HLC. Matches the `dv`/`ts` LWW tiebreak.
+///
+/// ZEB-860 Task 1 lays this helper down for the canonical-order rebuild;
+/// its production consumer arrives in Task 2 (out-of-order replay). Until then
+/// it is referenced only by tests, so `allow(dead_code)` keeps the non-test
+/// lib build warning-clean. Remove the attribute when Task 2 wires the caller.
+#[allow(dead_code)]
+pub(crate) fn canonical_key(ev: &SignedVotingEvent) -> (u64, u32, String, [u8; 32]) {
+    (
+        ev.hlc.wall_ms,
+        ev.hlc.logical,
+        ev.hlc.device_id.clone(),
+        sha256_of_signing_bytes(ev),
+    )
 }
 
 // ── Tier3PollState impl ───────────────────────────────────────────────────────
@@ -420,6 +461,7 @@ impl Tier3PollState {
             deliberation: DeliberationState::default(),
             last_hlc: None,
             last_received_hlc: std::collections::BTreeMap::new(),
+            max_applied: None,
             secret_tally: SecretTallyState::default(),
             committee_oracle: std::sync::Arc::new(NullCommitteeOracle),
         }
@@ -440,7 +482,7 @@ impl Tier3PollState {
     ///
     /// Verify rules (SS1, SD1, B1-B5, SF1, SR1) are deferred to Task 6/7
     /// and are NOT enforced here; apply_event is the pure materialize layer.
-    pub fn apply_event(&mut self, ev: &SignedVotingEvent) -> Result<(), ApplyError> {
+    pub fn apply_event(&mut self, ev: &SignedVotingEvent) -> Result<ApplyOutcome, ApplyError> {
         // 1. Reject if terminal state.
         match self.stage {
             Stage::Failed => return Err(ApplyError::PollInFailedState),
@@ -1064,10 +1106,20 @@ impl Tier3PollState {
         if cand > *entry {
             *entry = cand;
         }
+        // ZEB-860: advance the canonical out-of-order watermark on every dispatch
+        // (accept or silent drop), beside the per-lane receive-watermark.
+        let key3 = (ev.hlc.wall_ms, ev.hlc.logical, ev.hlc.device_id.clone());
+        if self.max_applied.as_ref().is_none_or(|m| key3 > *m) {
+            self.max_applied = Some(key3);
+        }
         if advance_last_hlc {
             self.last_hlc = Some(ev.hlc.clone());
         }
-        Ok(())
+        Ok(if advance_last_hlc {
+            ApplyOutcome::Applied
+        } else {
+            ApplyOutcome::Dropped
+        })
     }
 
     /// Highest `(wall_ms, logical)` across all per-(actor,device) receive
@@ -6141,6 +6193,59 @@ mod tests {
         // Finalists: c0 (15) and c1 (6) — c2 (0) excluded.
         assert_eq!(result.finalists.len(), 2);
         assert_eq!(result.winner.event_hash, ordered[0].event_hash);
+    }
+
+    // ── ZEB-860 Task 1: ApplyOutcome / max_applied / canonical_key ────────────
+
+    #[test]
+    fn apply_event_reports_applied_vs_dropped() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage(); // sets mini-public
+                                                           // An accepted statement from a mini-public author (well inside the
+                                                           // deliberation window [0, 10_000)):
+        let s = ds_event_with_text(5_000, addr(1), "hello world statement");
+        assert_eq!(poll.apply_event(&s), Ok(ApplyOutcome::Applied));
+        // A dv from a mini-public member referencing a NON-existent statement is
+        // silently dropped (still inside the window so the drop reason is the
+        // missing statement, not an out-of-stage filter):
+        let missing = [0u8; 32];
+        let v = dv_event(6_000, addr(2), missing, BridgingVoteCode::Agree);
+        assert_eq!(poll.apply_event(&v), Ok(ApplyOutcome::Dropped));
+    }
+
+    #[test]
+    fn max_applied_advances_on_accept_and_drop() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        let s = ds_event_with_text(5_000, addr(1), "a statement here");
+        let _ = poll.apply_event(&s).unwrap();
+        let after_accept = poll.max_applied.clone();
+        assert!(after_accept.is_some());
+        // A dropped event with a HIGHER key still advances max_applied:
+        let dropped = dv_event(20_000, addr(2), [0u8; 32], BridgingVoteCode::Agree); // dropped (no statement)
+        assert_eq!(poll.apply_event(&dropped), Ok(ApplyOutcome::Dropped));
+        assert!(
+            poll.max_applied > after_accept,
+            "drop path must still advance max_applied"
+        );
+    }
+
+    #[test]
+    fn canonical_key_orders_by_hlc_then_hash() {
+        let a = ds_event_with_text(10_000, addr(1), "first statement text");
+        let b = ds_event_with_text(20_000, addr(1), "second statement text");
+        assert!(
+            canonical_key(&a) < canonical_key(&b),
+            "earlier wall_ms sorts first"
+        );
+        // Same (wall,logical,device), different payload → event_hash breaks the
+        // tie deterministically.
+        let c = ds_event_with_text(10_000, addr(1), "zzz different text same time");
+        let (ka, kc) = (canonical_key(&a), canonical_key(&c));
+        assert_eq!((ka.0, ka.1, ka.2.clone()), (kc.0, kc.1, kc.2.clone()));
+        assert_ne!(ka.3, kc.3, "distinct events get distinct hash tiebreakers");
     }
 }
 
