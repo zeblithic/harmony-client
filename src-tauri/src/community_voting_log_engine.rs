@@ -1133,28 +1133,13 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
                     }
                     _ => last_wall, // pre-epoch clock ⇒ apply-all fallback
                 };
-                let now_hlc_cl = Hlc {
-                    wall_ms: last_wall,
-                    logical: 0,
-                    device_id: String::new(),
-                };
-                let stage_now = t3.current_stage_at(&now_hlc_cl);
-                if !matches!(
-                    stage_now,
-                    crate::community_voting_tier3::Stage::Ratification
-                ) {
-                    false
-                } else {
-                    // Total window = deliberation + drafting + ratification.
-                    // Engine fires kd=cl once `last_hlc.wall_ms` (HLC-driven
-                    // "now") is past `created_wall + total_window_ms`.
-                    let total_window_ms: u64 = (t3.meta.config.deliberation_window_seconds as u64
-                        + t3.meta.config.drafting_window_seconds as u64
-                        + t3.meta.config.ratification_window_seconds as u64)
-                        * 1000;
-                    let created_wall = t3.meta.poll_create_hlc.wall_ms;
-                    last_wall >= created_wall.saturating_add(total_window_ms)
-                }
+                // ZEB-859: stage+window predicate extracted to the SHARED
+                // `Tier3PollState::close_condition_met` so the engine trigger and
+                // the ingest-path `verify_cl` verifier evaluate byte-identical
+                // logic. `last_wall` is the receiver-clamped "now" computed
+                // above; the helper builds the `current_stage_at` HLC internally
+                // (Ratification stage + `last_wall >= created + total_window`).
+                t3.close_condition_met(last_wall)
             }
         };
 

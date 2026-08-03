@@ -1120,6 +1120,46 @@ impl Tier3PollState {
         }
     }
 
+    /// ZEB-859: the deterministic engine-auto close condition for a `kd=cl`
+    /// (PollClose) event, evaluated at a caller-supplied wall-clock ms.
+    ///
+    /// This is the SINGLE shared predicate for both:
+    ///   * the engine-auto close trigger (`trigger_kd_cl` in
+    ///     `community_voting_log_engine.rs`), which passes its receiver-clamped
+    ///     `last_hlc.wall_ms`, and
+    ///   * `verify_cl`, which passes the receiver-clamped wall of an INCOMING
+    ///     peer close event.
+    ///
+    /// Keeping the two callers on this one predicate is load-bearing: any drift
+    /// would let a node reject its own legitimately-triggered close (the trigger
+    /// mint would satisfy a condition the verifier then rejects). Do NOT inline
+    /// a second copy of this logic.
+    ///
+    /// The condition is: the poll is in `Ratification` stage at `at_wall_ms` AND
+    /// the full lifecycle window (deliberation + drafting + ratification) has
+    /// elapsed relative to `poll_create_hlc.wall_ms`. Callers are responsible
+    /// for clamping `at_wall_ms` to the receiver's own clock (never a raw peer
+    /// wall) before calling — this method trusts `at_wall_ms` as given.
+    pub fn close_condition_met(&self, at_wall_ms: u64) -> bool {
+        // Mirror the HLC the engine trigger builds: only `wall_ms` is
+        // significant to `current_stage_at`; `logical`/`device_id` are inert.
+        let at_hlc = Hlc {
+            wall_ms: at_wall_ms,
+            logical: 0,
+            device_id: String::new(),
+        };
+        if !matches!(self.current_stage_at(&at_hlc), Stage::Ratification) {
+            return false;
+        }
+        // Total window = deliberation + drafting + ratification.
+        let total_window_ms: u64 = (self.meta.config.deliberation_window_seconds as u64
+            + self.meta.config.drafting_window_seconds as u64
+            + self.meta.config.ratification_window_seconds as u64)
+            * 1000;
+        let created_wall = self.meta.poll_create_hlc.wall_ms;
+        at_wall_ms >= created_wall.saturating_add(total_window_ms)
+    }
+
     /// Compute the current mini-public set at HLC watermark `now`.
     ///
     /// The mini-public is the first `sortition_size` non-declined members from the
@@ -1277,6 +1317,11 @@ pub enum VerifyError {
     /// so a PollResult or RatificationBallot event arriving now is premature.
     #[error("status_quo not yet synthesized (poll not in Drafting/Ratification stage)")]
     StatusQuoNotSynthesized,
+    /// verify_cl (ZEB-859): a PollClose event whose (receiver-clamped) HLC wall
+    /// does not satisfy the engine's deterministic close condition — the poll is
+    /// not in Ratification at that wall, or the total window has not elapsed.
+    #[error("close condition not met at event.hlc (premature PollClose)")]
+    CloseConditionNotMet,
 }
 
 // ── Verify functions ──────────────────────────────────────────────────────────
@@ -1391,6 +1436,42 @@ pub fn verify_sf(
     }
 
     Ok(())
+}
+
+/// CL1 verify (ZEB-859): a peer-supplied `kd=cl` (PollClose) event is legitimate
+/// only if it satisfies the SAME deterministic close condition the engine-auto
+/// close trigger uses — the poll is in `Ratification` and the full lifecycle
+/// window has elapsed. Because `kd=cl` was previously ungated at ingest (any
+/// member with a valid signature could inject a forged early close), a forged
+/// close could prematurely satisfy `verify_sr`'s R1 precondition; this verifier
+/// closes that hole.
+///
+/// The incoming event's `hlc.wall_ms` is a peer-controlled value, so it is
+/// clamped to the receiver's own clock (`receiver_now_ms + MAX_FORWARD_SKEW_MS`)
+/// before the condition is checked — a future-stamped close cannot jump the
+/// window. This mirrors the receiver-now clamp the engine trigger already
+/// applies to `last_hlc.wall_ms` (ZEB-846 Layer 2).
+///
+/// Note: this validates the close *condition*, never a specific
+/// `close_event_hash` — that hash may legitimately diverge across replicas under
+/// reordering and is not in any cross-peer state-root.
+pub fn verify_cl(
+    event: &SignedVotingEvent,
+    poll_state: &Tier3PollState,
+    receiver_now_ms: u64,
+) -> Result<(), VerifyError> {
+    // Never trust the raw peer wall: clamp the event's HLC wall down to at most
+    // receiver_now + MAX_FORWARD_SKEW_MS (a past/present wall passes unchanged).
+    let clamped_wall = crate::clock_trust::clamp_future(
+        event.hlc.wall_ms,
+        receiver_now_ms,
+        crate::clock_trust::MAX_FORWARD_SKEW_MS,
+    );
+    if poll_state.close_condition_met(clamped_wall) {
+        Ok(())
+    } else {
+        Err(VerifyError::CloseConditionNotMet)
+    }
 }
 
 /// SR1 verify: `PollResult` tally must be bit-identical to deterministic re-compute.
@@ -3642,6 +3723,90 @@ mod tests {
         let sq = synthesize_status_quo(&poll.meta.poll_id);
         poll.candidates.push(sq);
         poll
+    }
+
+    // ── ZEB-859: verify_cl + close_condition_met ─────────────────────────────
+    //
+    // `poll_in_ratification()` builds a `pu`-mode poll with create_wall=0 and
+    // deliberation/drafting/ratification windows of 10s each, so:
+    //   * total_window_ms       = (10+10+10)*1000 = 30_000
+    //   * Ratification stage     opens at wall >= dw+fw = 20_000
+    //   * close condition (kd=cl) is met at wall >= create + total = 30_000
+
+    /// A close event whose (clamped) wall is exactly `create + total_window`
+    /// and whose stage is Ratification is a legitimate engine-auto close → Ok.
+    #[test]
+    fn verify_cl_accepts_legitimate_close() {
+        let poll = poll_in_ratification();
+        let close_wall = 30_000; // create(0) + total_window(30_000)
+        let ev = make_event(PollEventKindCode::PollClose, close_wall, addr(7));
+        // receiver_now == event wall ⇒ clamp is a no-op.
+        assert_eq!(verify_cl(&ev, &poll, close_wall), Ok(()));
+    }
+
+    /// A close event whose stage is still before Ratification (here Drafting,
+    /// at create + deliberation) must be rejected regardless of the window math.
+    #[test]
+    fn verify_cl_rejects_premature_stage() {
+        let poll = poll_in_ratification();
+        let drafting_wall = 10_000; // create(0) + deliberation(10_000) ⇒ Drafting
+        let ev = make_event(PollEventKindCode::PollClose, drafting_wall, addr(7));
+        assert_eq!(
+            verify_cl(&ev, &poll, drafting_wall),
+            Err(VerifyError::CloseConditionNotMet)
+        );
+    }
+
+    /// Stage is Ratification but the ratification window has NOT fully elapsed
+    /// (25_000 is past the 20_000 Ratification boundary but below the 30_000
+    /// close threshold) → rejected.
+    #[test]
+    fn verify_cl_rejects_window_not_elapsed() {
+        let poll = poll_in_ratification();
+        let mid_ratification_wall = 25_000; // Ratification (>=20_000) but < 30_000
+        let ev = make_event(PollEventKindCode::PollClose, mid_ratification_wall, addr(7));
+        assert_eq!(
+            verify_cl(&ev, &poll, mid_ratification_wall),
+            Err(VerifyError::CloseConditionNotMet)
+        );
+    }
+
+    /// A future-stamped close event (peer wall = create + total + 10h) whose
+    /// receiver clock says almost no time has passed must be rejected: the
+    /// receiver-now clamp (`event.wall.min(now + MAX_FORWARD_SKEW)`) pulls the
+    /// effective wall below the close threshold. Requires total_window >
+    /// MAX_FORWARD_SKEW so the clamp is decisive, hence the enlarged windows.
+    #[test]
+    fn verify_cl_rejects_future_stamped_wall() {
+        let mut poll = poll_in_ratification();
+        // total_window = (60+60+600)*1000 = 720_000 ms (12 min) > MAX_FORWARD_SKEW (5 min).
+        poll.meta.config.deliberation_window_seconds = 60;
+        poll.meta.config.drafting_window_seconds = 60;
+        poll.meta.config.ratification_window_seconds = 600;
+        let total_window_ms: u64 = 720_000;
+        let ten_hours_ms: u64 = 10 * 60 * 60 * 1000;
+        let future_wall = total_window_ms + ten_hours_ms; // peer claims window elapsed
+        let receiver_now = poll.meta.poll_create_hlc.wall_ms; // == 0: real clock ≈ create
+        let ev = make_event(PollEventKindCode::PollClose, future_wall, addr(7));
+        // Sanity: an UNCLAMPED evaluation at the raw peer wall WOULD pass — proving
+        // the clamp (not the stage/window predicate) is what rejects the forgery.
+        assert!(poll.close_condition_met(future_wall));
+        assert_eq!(
+            verify_cl(&ev, &poll, receiver_now),
+            Err(VerifyError::CloseConditionNotMet)
+        );
+    }
+
+    /// Parity guard: `close_condition_met` fires exactly at the wall where the
+    /// engine's `trigger_kd_cl` predicate fires (create + total_window) and not
+    /// one millisecond before. Any drift here would make a node reject its own
+    /// legitimate engine-auto close.
+    #[test]
+    fn verify_cl_matches_trigger_predicate() {
+        let poll = poll_in_ratification();
+        let close_threshold = 30_000; // create(0) + total_window(30_000)
+        assert!(!poll.close_condition_met(close_threshold - 1));
+        assert!(poll.close_condition_met(close_threshold));
     }
 
     // 16. verify_rb_actor_in_full_electorate_accepted
