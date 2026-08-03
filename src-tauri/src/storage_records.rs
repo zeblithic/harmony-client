@@ -84,20 +84,30 @@ impl RecordOutcome {
 pub struct PledgeListRecord {
     pub pledges: Vec<PledgeEntry>,
     pub updated_at: u64,
-    /// Local receipt clock (ms) — eviction ordering only, no trust meaning
-    /// (mirrors `HostingReportRecord::received_at_ms` and
+    /// Local receipt clock (ms) — no trust meaning (mirrors
+    /// `HostingReportRecord::received_at_ms` and
     /// `StorageSignerPin::pinned_at_ms`). Never the peer `updated_at`.
+    /// Eviction ordering is `seq`, not this (ZEB-863).
     pub received_at_ms: u64,
+    /// Local monotonic insert sequence (ZEB-863) — the SOLE eviction
+    /// ordering key. Peer-independent and immune to wall-clock rollback,
+    /// unlike `received_at_ms`. Local, never serialized.
+    pub seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupSetRecord {
     pub entries: Vec<BackupEntry>,
     pub updated_at: u64,
-    /// Local receipt clock (ms) — eviction ordering only, no trust meaning
-    /// (mirrors `HostingReportRecord::received_at_ms` and
+    /// Local receipt clock (ms) — no trust meaning (mirrors
+    /// `HostingReportRecord::received_at_ms` and
     /// `StorageSignerPin::pinned_at_ms`). Never the peer `updated_at`.
+    /// Eviction ordering is `seq`, not this (ZEB-863).
     pub received_at_ms: u64,
+    /// Local monotonic insert sequence (ZEB-863) — the SOLE eviction
+    /// ordering key. Peer-independent and immune to wall-clock rollback,
+    /// unlike `received_at_ms`. Local, never serialized.
+    pub seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,8 +115,13 @@ pub struct HostingReportRecord {
     pub reports: Vec<HostingReportEntry>,
     pub updated_at: u64,
     /// Local receipt clock (ms) — drives staleness pruning and the
-    /// "report age" surfaced to the UI.
+    /// "report age" surfaced to the UI. NOT the eviction key (that is
+    /// `seq`, ZEB-863) — this stays dual-purpose for staleness/UI.
     pub received_at_ms: u64,
+    /// Local monotonic insert sequence (ZEB-863) — the SOLE eviction
+    /// ordering key. Peer-independent and immune to wall-clock rollback,
+    /// unlike `received_at_ms`. Local, never serialized.
+    pub seq: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,8 +177,13 @@ struct StorageRecordsDiskV1 {
 pub struct StorageSignerPin {
     pub owner_id: [u8; 16],
     pub device_ed25519: [u8; 32],
-    /// Local pin clock (ms) — eviction ordering only, no trust meaning.
+    /// Local pin clock (ms) — no trust meaning; round-trips to disk.
+    /// Eviction ordering is `seq`, not this (ZEB-863).
     pub pinned_at_ms: u64,
+    /// Local monotonic insert sequence (ZEB-863) — the SOLE eviction
+    /// ordering key within a liveness class. Peer-independent and immune
+    /// to wall-clock rollback. Local, never serialized.
+    pub seq: u64,
 }
 
 /// Bounded store of verified remote records, keyed by owner address.
@@ -174,6 +194,11 @@ pub struct StorageRecordStore {
     hosting_reports: HashMap<String, HostingReportRecord>,
     signer_pins: HashMap<String, StorageSignerPin>,
     path: Option<PathBuf>,
+    /// Strictly-increasing local counter stamped onto every inserted record
+    /// as its `seq` (ZEB-863). One store-wide sequence across all record
+    /// families; single-threaded `&mut self` access, so no atomics. Not
+    /// persisted — re-derived on load in disk order.
+    insert_seq: u64,
 }
 
 impl StorageRecordStore {
@@ -187,6 +212,7 @@ impl StorageRecordStore {
             hosting_reports: HashMap::new(),
             signer_pins: HashMap::new(),
             path,
+            insert_seq: 0,
         };
         let Some(p) = store.path.clone() else {
             return store;
@@ -212,15 +238,18 @@ impl StorageRecordStore {
             if row.pledges.len() > MAX_PLEDGES_PER_LIST {
                 continue;
             }
+            // Reloaded rows are "most-established": they get the lowest `seq`
+            // values (stamped here in disk order, before any live ingest), so
+            // a post-restart flood is the newest (highest seq) and self-evicts
+            // first. `received_at_ms: 0` is kept for its receipt-clock meaning.
+            let seq = store.next_insert_seq();
             store.pledge_lists.insert(
                 row.owner,
                 PledgeListRecord {
                     pledges: row.pledges,
                     updated_at: row.updated_at,
-                    // A record that survived to disk is "most-established";
-                    // 0 is older than any live now_ms, so a post-restart
-                    // flood is still the newest and evicts itself first.
                     received_at_ms: 0,
+                    seq,
                 },
             );
         }
@@ -232,15 +261,16 @@ impl StorageRecordStore {
                 tracing::warn!(owner = %row.owner, %reason, "storage_records reload: dropping ineligible backup set");
                 continue;
             }
+            // Reloaded rows are "most-established" — lowest `seq` (disk order),
+            // so a post-restart flood self-evicts first (see pledge reload).
+            let seq = store.next_insert_seq();
             store.backup_sets.insert(
                 row.owner,
                 BackupSetRecord {
                     entries: row.entries,
                     updated_at: row.updated_at,
-                    // A record that survived to disk is "most-established";
-                    // 0 is older than any live now_ms, so a post-restart
-                    // flood is still the newest and evicts itself first.
                     received_at_ms: 0,
+                    seq,
                 },
             );
         }
@@ -255,17 +285,19 @@ impl StorageRecordStore {
                 tracing::warn!(owner = %row.owner, "storage_records reload: dropping malformed signer pin");
                 continue;
             }
+            let seq = store.next_insert_seq();
             store.signer_pins.insert(
                 row.owner,
                 StorageSignerPin {
                     owner_id,
                     device_ed25519: device,
                     pinned_at_ms: row.pinned_at_ms,
+                    seq,
                 },
             );
         }
-        evict_overflow(&mut store.pledge_lists, |r| r.received_at_ms);
-        evict_overflow(&mut store.backup_sets, |r| r.received_at_ms);
+        evict_overflow(&mut store.pledge_lists, |r| r.seq);
+        evict_overflow(&mut store.backup_sets, |r| r.seq);
         evict_pins(
             &mut store.signer_pins,
             &store.pledge_lists,
@@ -273,6 +305,15 @@ impl StorageRecordStore {
             &store.hosting_reports,
         );
         store
+    }
+
+    /// Hand out the next local insert sequence and advance the counter.
+    /// Strictly increasing ⇒ every live record's `seq` is unique, which is
+    /// what lets eviction key on `seq` alone (no peer-controlled tiebreak).
+    fn next_insert_seq(&mut self) -> u64 {
+        let s = self.insert_seq;
+        self.insert_seq += 1;
+        s
     }
 
     fn save(&self) {
@@ -367,12 +408,14 @@ impl StorageRecordStore {
         }
         match self.signer_pins.get(owner_address) {
             None => {
+                let seq = self.next_insert_seq();
                 self.signer_pins.insert(
                     owner_address.to_string(),
                     StorageSignerPin {
                         owner_id: signer.owner_id,
                         device_ed25519: signer.device_ed25519,
                         pinned_at_ms: now_ms,
+                        seq,
                     },
                 );
                 Ok(true)
@@ -428,6 +471,7 @@ impl StorageRecordStore {
                 Ok(changed) => changed,
                 Err(e) => return RecordOutcome::Rejected(e),
             };
+        let seq = self.next_insert_seq();
         let outcome = lww_insert(
             &mut self.pledge_lists,
             list.owner_address,
@@ -435,11 +479,12 @@ impl StorageRecordStore {
                 pledges: list.pledges,
                 updated_at: list.updated_at,
                 received_at_ms: now_ms,
+                seq,
             },
             |r| r.updated_at,
         );
         if outcome.changed() {
-            evict_overflow(&mut self.pledge_lists, |r| r.received_at_ms);
+            evict_overflow(&mut self.pledge_lists, |r| r.seq);
         }
         if pin_changed {
             evict_pins(
@@ -500,6 +545,7 @@ impl StorageRecordStore {
                 Ok(changed) => changed,
                 Err(e) => return RecordOutcome::Rejected(e),
             };
+        let seq = self.next_insert_seq();
         let outcome = lww_insert(
             &mut self.backup_sets,
             set.owner_address,
@@ -507,11 +553,12 @@ impl StorageRecordStore {
                 entries: set.entries,
                 updated_at: set.updated_at,
                 received_at_ms: now_ms,
+                seq,
             },
             |r| r.updated_at,
         );
         if outcome.changed() {
-            evict_overflow(&mut self.backup_sets, |r| r.received_at_ms);
+            evict_overflow(&mut self.backup_sets, |r| r.seq);
         }
         if pin_changed {
             evict_pins(
@@ -567,6 +614,7 @@ impl StorageRecordStore {
                 Ok(changed) => changed,
                 Err(e) => return RecordOutcome::Rejected(e),
             };
+        let seq = self.next_insert_seq();
         let outcome = lww_insert(
             &mut self.hosting_reports,
             report.owner_address,
@@ -574,11 +622,12 @@ impl StorageRecordStore {
                 reports: report.reports,
                 updated_at: report.updated_at,
                 received_at_ms: now_ms,
+                seq,
             },
             |r| r.updated_at,
         );
         if outcome.changed() {
-            evict_overflow(&mut self.hosting_reports, |r| r.received_at_ms);
+            evict_overflow(&mut self.hosting_reports, |r| r.seq);
             // Hosting reports are in-memory only — no save() for them…
         }
         if pin_changed {
@@ -753,8 +802,9 @@ fn lww_insert<R>(
 }
 
 /// Pin-cap overflow: evict pins whose owner has NO live record first
-/// (dead weight), and among those the NEWEST `pinned_at_ms` first
-/// (owner tiebreak). Newest-first makes a pin flood self-limiting (R1,
+/// (dead weight), and among those the NEWEST (highest local `seq`) first
+/// (ZEB-863 — peer-independent, was the `pinned_at_ms`+owner tiebreak).
+/// Newest-first makes a pin flood self-limiting (R1,
 /// CodeRabbit): an attacker minting throwaway addresses evicts their
 /// OWN just-minted pins, while a long-established migrated address's
 /// ratchet pin is never the newest and survives. Legit fresh pins are
@@ -770,16 +820,20 @@ fn evict_pins(
     hosting: &HashMap<String, HostingReportRecord>,
 ) {
     while pins.len() > MAX_SIGNER_PINS {
+        // Evict dead-weight (no live record) first, then the newest (highest
+        // `seq`) within a liveness class (ZEB-863). `!live` makes dead pins
+        // compare greater so `max_by_key` picks them first; `seq` is a unique
+        // local counter, so the max is deterministic with no peer-controlled
+        // `owner` tiebreak and no wall-clock dependence.
         let victim = pins
             .iter()
-            .map(|(owner, pin)| {
+            .max_by_key(|&(owner, pin)| {
                 let live = pledges.contains_key(owner)
                     || backups.contains_key(owner)
                     || hosting.contains_key(owner);
-                (live, std::cmp::Reverse(pin.pinned_at_ms), owner.clone())
+                (!live, pin.seq)
             })
-            .min()
-            .map(|(_, _, owner)| owner);
+            .map(|(owner, _)| owner.clone());
         match victim {
             Some(owner) => {
                 pins.remove(&owner);
@@ -789,18 +843,20 @@ fn evict_pins(
     }
 }
 
-/// Bounded-store overflow: evict the record with the NEWEST local
-/// `received_at_ms` first (owner tiebreak) until within
-/// [`MAX_TRACKED_OWNERS`]. Newest-first makes a flood self-limiting,
+/// Bounded-store overflow: evict the record with the NEWEST local insert
+/// sequence (highest `seq`) first until within [`MAX_TRACKED_OWNERS`].
+/// Newest-first makes a flood self-limiting,
 /// mirroring [`evict_pins`]: an attacker minting throwaway addresses and
 /// publishing far-future `updated_at` evicts their OWN just-received rows,
-/// while an established honest owner's row (older receipt) is never the
-/// newest and survives. Keying on the LOCAL receipt clock — never the
-/// peer-supplied `updated_at` — is what closes the ZEB-851 flood-evict
-/// vector: a peer stamp can no longer choose the eviction victim.
+/// while an established honest owner's row (earlier `seq`) is never the
+/// newest and survives. Keying on the LOCAL insert sequence — never the
+/// peer-supplied `updated_at`, and (ZEB-863) never the peer `owner` address
+/// nor the non-monotonic wall clock — is what closes the ZEB-851 flood-evict
+/// vector: a peer stamp can no longer choose the eviction victim, and a
+/// same-millisecond collision or a local-clock rollback cannot invert the order.
 ///
 /// Consequence: once the map is at [`MAX_TRACKED_OWNERS`] with established
-/// rows, a genuinely NEW honest owner has the newest `received_at_ms` and
+/// rows, a genuinely NEW honest owner has the newest `seq` and
 /// evicts itself — it is NOT admitted until a slot frees (an LWW-replace of
 /// an existing owner, or a revocation purge). The established working set is
 /// frozen. This is inherent to flood resistance: admitting newcomers over
@@ -808,13 +864,17 @@ fn evict_pins(
 /// [`MAX_TRACKED_OWNERS`] (1024) is set well above realistic honest
 /// storage-buddy counts, so honest saturation is not expected; if it ever
 /// becomes real, the mitigation is a higher cap or a liveness distinction.
-fn evict_overflow<R>(map: &mut HashMap<String, R>, received_at_ms: impl Fn(&R) -> u64) {
+fn evict_overflow<R>(map: &mut HashMap<String, R>, seq: impl Fn(&R) -> u64) {
     while map.len() > MAX_TRACKED_OWNERS {
+        // Evict the newest (highest `seq`) first. `seq` is a strictly-
+        // increasing local counter (ZEB-863): unique by construction, so the
+        // max is a single deterministic record — no peer-controlled `owner`
+        // tiebreak in the decision, and immune to wall-clock rollback (unlike
+        // the former `received_at_ms` key).
         let victim = map
             .iter()
-            .map(|(owner, r)| (std::cmp::Reverse(received_at_ms(r)), owner.clone()))
-            .min()
-            .map(|(_, owner)| owner);
+            .max_by_key(|&(_, r)| seq(r))
+            .map(|(owner, _)| owner.clone());
         match victim {
             Some(owner) => {
                 map.remove(&owner);
@@ -1273,18 +1333,61 @@ mod tests {
                     pledges: vec![],
                     updated_at: 1,
                     received_at_ms: i as u64 + 1,
+                    seq: i as u64,
                 },
             );
         }
-        evict_overflow(&mut store.pledge_lists, |r| r.received_at_ms);
+        evict_overflow(&mut store.pledge_lists, |r| r.seq);
         assert_eq!(store.pledge_lists.len(), MAX_TRACKED_OWNERS);
         assert!(
             store
                 .pledge_list(&format!("owner-{MAX_TRACKED_OWNERS:04}"))
                 .is_none(),
-            "newest (max received_at_ms) evicted first"
+            "newest (max seq) evicted first"
         );
         assert!(store.pledge_list("owner-0000").is_some());
+    }
+
+    #[test]
+    fn evict_overflow_same_ms_is_peer_independent() {
+        // ZEB-863 #3: a same-wall-ms flood must not let a peer-chosen owner
+        // address decide the eviction victim. The honest row is received
+        // FIRST but is given the SMALLEST owner address — precisely the
+        // victim under the old `min(owner)` same-ms tiebreak. It must
+        // survive: eviction is ordered by local receipt sequence, not the
+        // peer address.
+        let mut store = StorageRecordStore::new(None);
+        let same_ms = 5_000u64;
+        // Honest, received first (lowest seq), smallest owner address.
+        store.pledge_lists.insert(
+            "owner-0000".into(),
+            PledgeListRecord {
+                pledges: vec![],
+                updated_at: 1,
+                received_at_ms: same_ms,
+                seq: 0,
+            },
+        );
+        // Flood: larger owner addresses, all in the SAME wall ms (so the old
+        // key would tiebreak on owner), received AFTER the honest row so they
+        // carry higher seq. Over cap by one.
+        for i in 1..=MAX_TRACKED_OWNERS {
+            store.pledge_lists.insert(
+                format!("owner-{i:04}"),
+                PledgeListRecord {
+                    pledges: vec![],
+                    updated_at: 1,
+                    received_at_ms: same_ms,
+                    seq: i as u64,
+                },
+            );
+        }
+        evict_overflow(&mut store.pledge_lists, |r| r.seq);
+        assert_eq!(store.pledge_lists.len(), MAX_TRACKED_OWNERS);
+        assert!(
+            store.pledge_list("owner-0000").is_some(),
+            "honest first-received row must survive a same-ms flood regardless of its (smallest) address"
+        );
     }
 
     #[test]
@@ -1572,10 +1675,13 @@ mod tests {
         let mut pledges: HashMap<String, PledgeListRecord> = HashMap::new();
         let backups: HashMap<String, BackupSetRecord> = HashMap::new();
         let hosting: HashMap<String, HostingReportRecord> = HashMap::new();
+        // seq mirrors the pin's arrival order (== pinned_at_ms here), which is
+        // what eviction now orders on (ZEB-863).
         let pin = |t| StorageSignerPin {
             owner_id: [1; 16],
             device_ed25519: [2; 32],
             pinned_at_ms: t,
+            seq: t,
         };
         // One live-backed pin + an OLD established dead ratchet pin +
         // a flood of fresh throwaway pins over the cap (the R1 attack).
@@ -1586,6 +1692,7 @@ mod tests {
                 pledges: vec![],
                 updated_at: 1,
                 received_at_ms: 0,
+                seq: 0,
             },
         );
         pins.insert("established-ratchet".into(), pin(5));
@@ -1619,12 +1726,13 @@ mod tests {
                     pledges: vec![],
                     updated_at: 1,
                     received_at_ms: 1,
+                    seq: i as u64,
                 },
             );
         }
-        // A flood of throwaway owners: far-FUTURE peer updated_at, but freshly
-        // received (received_at_ms = the newest). Under the OLD min(updated_at)
-        // evictor these never lose; the honest rows were evicted instead.
+        // A flood of throwaway owners: far-FUTURE peer updated_at, but received
+        // LAST (highest seq = the newest). Under the OLD min(updated_at) evictor
+        // these never lose; the honest rows were evicted instead.
         for i in 0..16 {
             map.insert(
                 format!("flood-{i:04}"),
@@ -1632,10 +1740,11 @@ mod tests {
                     pledges: vec![],
                     updated_at: u64::MAX,
                     received_at_ms: 10_000,
+                    seq: MAX_TRACKED_OWNERS as u64 + i as u64,
                 },
             );
         }
-        evict_overflow(&mut map, |r| r.received_at_ms);
+        evict_overflow(&mut map, |r| r.seq);
         assert_eq!(map.len(), MAX_TRACKED_OWNERS);
         for i in 0..MAX_TRACKED_OWNERS {
             assert!(
