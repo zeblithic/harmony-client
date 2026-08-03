@@ -1166,13 +1166,17 @@ impl Tier3PollState {
     /// EVERY received event regardless of lane; `engine_auto_hlc_from_base`
     /// synthesizes its own device_id, so the empty one here is never used.
     pub fn max_received_hlc(&self) -> Option<Hlc> {
-        self.last_received_hlc
-            .values()
-            .copied()
-            .max()
-            .map(|(wall_ms, logical)| Hlc {
-                wall_ms,
-                logical,
+        // ZEB-861: O(1). The `(wall_ms, logical)` prefix of `max_applied` is
+        // identical to the max over all per-lane `(wall_ms, logical)` in
+        // `last_received_hlc` — both advance on every dispatch at the same tail,
+        // and `max_applied` orders by `(wall_ms, logical)` first, so its prefix
+        // is the global max. `device_id` is documented-unused by the sole
+        // consumer (the kd=rs mint floor synthesizes its own), so it stays empty.
+        self.max_applied
+            .as_ref()
+            .map(|(wall_ms, logical, _device)| Hlc {
+                wall_ms: *wall_ms,
+                logical: *logical,
                 device_id: String::new(),
             })
     }
@@ -5187,6 +5191,60 @@ mod tests {
             200,
             "max_received_hlc must be the max wall_ms across all lanes"
         );
+    }
+
+    // ZEB-861 T2: the O(1) `max_received_hlc()` (reads `max_applied`) must equal
+    // the old O(lanes) fold over `last_received_hlc` — across accepts,
+    // silent-drops, multiple lanes, and empty — because both watermarks advance
+    // on every dispatch. Pins the equivalence so the swap is behavior-preserving
+    // and the two watermarks can't silently drift in a future edit.
+    #[test]
+    fn max_received_hlc_equals_max_over_lanes_fold() {
+        // Empty poll: no dispatch → both sides None.
+        let empty = Tier3PollState::new_from_create(meta_at(1_000), electorate(20));
+        let old_empty = empty
+            .last_received_hlc
+            .values()
+            .copied()
+            .max();
+        assert_eq!(
+            empty.max_received_hlc().map(|h| (h.wall_ms, h.logical)),
+            old_empty,
+            "empty: O(1) must equal the fold (both None)"
+        );
+        assert!(empty.max_received_hlc().is_none());
+
+        // Populated: accepts on several lanes plus a silently-dropped 6th ds at
+        // the HIGHEST wall (the 5-cap drops it, but its lane watermark still
+        // advances — the ZEB-320/850 property), so the max must reflect it
+        // identically on both sides.
+        let mut poll = build_poll_in_deliberation_stage();
+        let a1 = addr(1);
+        for i in 0..5 {
+            poll.apply_event(&ds_event_with_text(100 + i, a1, &format!("s{i}")))
+                .expect("apply");
+        }
+        poll.apply_event(&ds_event_with_text(300, a1, "sixth"))
+            .expect("Ok (silent drop by 5-cap)");
+        poll.apply_event(&ds_event_with_text(150, addr(2), "other lane"))
+            .expect("apply");
+
+        let old = poll
+            .last_received_hlc
+            .values()
+            .copied()
+            .max();
+        let got = poll.max_received_hlc().map(|h| (h.wall_ms, h.logical));
+        assert_eq!(
+            got, old,
+            "O(1) max_received_hlc must equal the max-over-lanes fold"
+        );
+        assert_eq!(
+            got.unwrap().0,
+            300,
+            "silently-dropped 6th (wall=300) must still set the max watermark"
+        );
+        assert_eq!(poll.max_received_hlc().unwrap().device_id, String::new());
     }
 
     // CodeRabbit PR #154 bot-pass-1 nitpick: cover the remaining gated drop
