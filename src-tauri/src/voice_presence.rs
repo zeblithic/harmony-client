@@ -249,7 +249,17 @@ pub struct PresenceEntry {
     pub owner: [u8; 16],
     pub muted: bool,
     /// ZEB-612: wall-clock ms of the member's raised hand (None = lowered).
+    /// Peer-supplied and attacker-controlled — display-only; NEVER an ordering
+    /// key (see `hand_first_observed_ms`).
     pub hand: Option<u64>,
+    /// ZEB-853 D5: LOCAL monotonic-ms timestamp of when THIS node first observed
+    /// the current raised hand (None = lowered). The peer `hand` wall stamp is
+    /// attacker-controlled — a hostile peer can claim `hand=1` (epoch) to squat
+    /// the front of the speaker queue forever — so the derived queue orders on
+    /// this local stamp instead. Stamped once on the lowered→raised transition,
+    /// stable across heartbeats while raised, cleared on lower, re-stamped on a
+    /// fresh raise.
+    pub hand_first_observed_ms: Option<u64>,
     pub seq: u64,
     pub joined_hlc: Hlc,
     /// Monotonic-ms timestamp of the last applied beacon (injected by caller).
@@ -273,10 +283,15 @@ pub struct RosterEntry {
     #[serde(serialize_with = "ser_hex_32")]
     pub device: [u8; 32],
     pub muted: bool,
-    /// ZEB-612: JSON `handRaisedAt` — wall-clock ms of the raised hand, or
-    /// null when lowered. Drives the derived speaker queue (ordering + the ✋
-    /// badge); never stored, always the latest beacon's value.
+    /// ZEB-612: JSON `handRaisedAt` — peer-supplied wall-clock ms of the raised
+    /// hand, or null when lowered. Display-only (the ✋ badge); the speaker
+    /// queue orders on `hand_first_observed_ms`, not this.
     pub hand_raised_at: Option<u64>,
+    /// ZEB-853 D5: JSON `handFirstObservedMs` — LOCAL first-observed monotonic ms
+    /// of the current raised hand (null when lowered). The derived speaker queue
+    /// orders on THIS (DoS-proof against a squatted `handRaisedAt`), falling back
+    /// to `handRaisedAt` only if somehow absent.
+    pub hand_first_observed_ms: Option<u64>,
 }
 
 /// One row returned by [`VoicePresenceMap::sweep`]: the `(community, channel)`
@@ -288,6 +303,25 @@ pub type SweptEntry = ((SpaceId, ChannelId), [u8; 16], [u8; 32]);
 pub struct VoicePresenceMap {
     // (community, channel) → device → entry
     inner: BTreeMap<(SpaceId, ChannelId), BTreeMap<[u8; 32], PresenceEntry>>,
+}
+
+/// ZEB-853 D5: compute the next `hand_first_observed_ms` for an entry from its
+/// stored hand state and an incoming beacon's hand, using the injected LOCAL
+/// monotonic `now_ms`. Ordering the speaker queue on this local stamp (rather
+/// than the peer-controlled `hand` wall value) makes queue position DoS-proof:
+/// a hostile `hand=1` can no longer pre-date honest raises. Stamp once on
+/// lowered→raised, hold stable while raised, clear on lower.
+fn next_hand_first_observed(
+    stored_hand: Option<u64>,
+    stored_first_observed: Option<u64>,
+    incoming_hand: Option<u64>,
+    now_ms: u64,
+) -> Option<u64> {
+    match incoming_hand {
+        None => None,                                     // lowered → clear
+        Some(_) if stored_hand.is_none() => Some(now_ms), // fresh raise → stamp
+        Some(_) => stored_first_observed,                 // still raised → stable
+    }
 }
 
 impl VoicePresenceMap {
@@ -341,7 +375,13 @@ impl VoicePresenceMap {
                 // Live row → bury it. The roster shrinks, so report a change.
                 Some(e) => {
                     e.muted = beacon.muted;
-                    e.hand = beacon.hand;
+                    // A departed session leaves NO raised-hand stamp behind:
+                    // clear both the hand and its local first-observed stamp so a
+                    // later rejoin re-stamps fresh instead of inheriting the
+                    // gravestone's value (CodeRabbit: a new session is a fresh
+                    // queue entry).
+                    e.hand = None;
+                    e.hand_first_observed_ms = None;
                     e.seq = beacon.seq;
                     e.joined_hlc = beacon.joined_hlc.clone();
                     e.last_seen_ms = now_ms;
@@ -356,7 +396,11 @@ impl VoicePresenceMap {
                         PresenceEntry {
                             owner: beacon.owner,
                             muted: beacon.muted,
-                            hand: beacon.hand,
+                            // A gravestone carries no hand: a departed session's
+                            // raised-hand stamp must never survive to be inherited
+                            // by a rejoin.
+                            hand: None,
+                            hand_first_observed_ms: None,
                             seq: beacon.seq,
                             joined_hlc: beacon.joined_hlc.clone(),
                             last_seen_ms: now_ms,
@@ -373,6 +417,16 @@ impl VoicePresenceMap {
                 // at 0 on rejoin) — and revives a gravestone.
                 e.owner = beacon.owner;
                 e.muted = beacon.muted;
+                // ZEB-853 (CodeRabbit): a new join session is a FRESH queue
+                // entry — a hand raised in the new session is stamped at the
+                // local `now_ms`, never inheriting the prior session's stamp.
+                // (The earlier code deliberately carried the stamp forward; that
+                // decision is reversed — a superseding session must not let a
+                // stale local stamp keep an earlier queue position across the
+                // session boundary, whether or not a tombstone was seen first.)
+                // Passing `None` stored state forces the fresh-raise branch.
+                e.hand_first_observed_ms =
+                    next_hand_first_observed(None, None, beacon.hand, now_ms);
                 e.hand = beacon.hand;
                 e.seq = beacon.seq;
                 e.joined_hlc = beacon.joined_hlc.clone();
@@ -394,6 +448,8 @@ impl VoicePresenceMap {
                 // sees liveness.
                 let visible_changed = e.muted != beacon.muted || e.hand != beacon.hand;
                 e.muted = beacon.muted;
+                e.hand_first_observed_ms =
+                    next_hand_first_observed(e.hand, e.hand_first_observed_ms, beacon.hand, now_ms);
                 e.hand = beacon.hand;
                 e.seq = beacon.seq;
                 e.last_seen_ms = now_ms;
@@ -406,6 +462,12 @@ impl VoicePresenceMap {
                         owner: beacon.owner,
                         muted: beacon.muted,
                         hand: beacon.hand,
+                        hand_first_observed_ms: next_hand_first_observed(
+                            None,
+                            None,
+                            beacon.hand,
+                            now_ms,
+                        ),
                         seq: beacon.seq,
                         joined_hlc: beacon.joined_hlc.clone(),
                         last_seen_ms: now_ms,
@@ -453,6 +515,7 @@ impl VoicePresenceMap {
                         device: *device,
                         muted: e.muted,
                         hand_raised_at: e.hand,
+                        hand_first_observed_ms: e.hand_first_observed_ms,
                     })
                     .collect()
             })
@@ -1075,6 +1138,43 @@ mod tests {
     }
 
     #[test]
+    fn next_hand_first_observed_covers_all_arms() {
+        // ZEB-853 D5: direct coverage of the pure queue-stamp helper (the
+        // supersede-arm apply path only ever routes through these branches).
+        // Local `now_ms` is fixed so the fresh stamp is deterministic.
+        let now = 5_000u64;
+
+        // (1) Incoming lowered → clear, regardless of stored hand/stamp.
+        assert_eq!(
+            next_hand_first_observed(Some(100), Some(200), None, now),
+            None
+        );
+        assert_eq!(next_hand_first_observed(None, None, None, now), None);
+
+        // (2) Incoming raised & stored hand lowered → fresh stamp at `now`.
+        assert_eq!(
+            next_hand_first_observed(None, None, Some(1), now),
+            Some(now)
+        );
+
+        // (3) Incoming raised & stored hand raised WITH an existing stamp →
+        // carry the existing stamp unchanged (stable queue position).
+        assert_eq!(
+            next_hand_first_observed(Some(1), Some(200), Some(1), now),
+            Some(200)
+        );
+
+        // (4) Incoming raised & stored hand raised but stamp MISSING — a
+        // defensive/should-be-unreachable state (every path that sets
+        // `hand = Some` also stamps). The current helper CARRIES the stored
+        // (None) stamp; it does NOT re-stamp to `now`. Asserting the real
+        // return keeps this a no-behavior-change coverage backfill. (The
+        // fixwave brief anticipated Some(now) here — a defensive fresh stamp
+        // the helper does not implement; flagged as a concern, not changed.)
+        assert_eq!(next_hand_first_observed(Some(1), None, Some(1), now), None);
+    }
+
+    #[test]
     fn sign_then_verify_round_trips() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let mut b = beacon(1);
@@ -1227,6 +1327,42 @@ mod map_tests {
         assert_eq!(m.roster(&C, &CH)[0].hand_raised_at, None);
     }
 
+    /// ZEB-853 D5: the raise is stamped by a LOCAL monotonic clock on first
+    /// observation and ordering keys on THAT — not the peer-supplied `hand` wall
+    /// value — so a hostile `hand=1` (epoch) can't squat the front of the queue.
+    /// The stamp is set once on lowered→raised, stable across heartbeats while
+    /// raised, cleared on lower, and re-stamped on a fresh raise.
+    #[test]
+    fn hand_first_observed_is_local_and_stable() {
+        let mut m = VoicePresenceMap::new();
+        // Attacker raises with hand=Some(1) (epoch); we stamp our own now_ms.
+        let mut raise = b(1, 1, 1, true, false);
+        raise.hand = Some(1);
+        assert!(m.apply(&C, &CH, &raise, 5_000));
+        assert_eq!(
+            m.roster(&C, &CH)[0].hand_first_observed_ms,
+            Some(5_000),
+            "stamped with local now_ms, not the peer's epoch"
+        );
+        // Second heartbeat, still raised (same hand), at a later now_ms → stable.
+        let mut still = b(1, 1, 2, true, false);
+        still.hand = Some(1);
+        m.apply(&C, &CH, &still, 6_000);
+        assert_eq!(
+            m.roster(&C, &CH)[0].hand_first_observed_ms,
+            Some(5_000),
+            "stable across heartbeats"
+        );
+        // Lower (hand None) → cleared.
+        assert!(m.apply(&C, &CH, &b(1, 1, 3, true, false), 7_000));
+        assert_eq!(m.roster(&C, &CH)[0].hand_first_observed_ms, None);
+        // Re-raise → re-stamped at the new now_ms.
+        let mut reraise = b(1, 1, 4, true, false);
+        reraise.hand = Some(1);
+        m.apply(&C, &CH, &reraise, 8_000);
+        assert_eq!(m.roster(&C, &CH)[0].hand_first_observed_ms, Some(8_000));
+    }
+
     /// ZEB-612: `RosterEntry` serializes the hand as camelCase `handRaisedAt`
     /// (number when raised, null when lowered) for the JSON event payload.
     #[test]
@@ -1236,15 +1372,26 @@ mod map_tests {
             device: [2; 32],
             muted: false,
             hand_raised_at: Some(777),
+            hand_first_observed_ms: Some(5_000),
         };
         let lowered = RosterEntry {
             hand_raised_at: None,
+            hand_first_observed_ms: None,
             ..raised.clone()
         };
         let jr = serde_json::to_value(&raised).expect("serialize");
         let jl = serde_json::to_value(&lowered).expect("serialize");
         assert_eq!(jr.get("handRaisedAt").and_then(|v| v.as_u64()), Some(777));
         assert!(jl.get("handRaisedAt").expect("key present").is_null());
+        // ZEB-853 D5: the local first-observed stamp rides the same JSON payload.
+        assert_eq!(
+            jr.get("handFirstObservedMs").and_then(|v| v.as_u64()),
+            Some(5_000)
+        );
+        assert!(jl
+            .get("handFirstObservedMs")
+            .expect("key present")
+            .is_null());
     }
 
     #[test]
@@ -1532,6 +1679,65 @@ mod map_tests {
             "a genuinely newer session (H3) revives the gravestone"
         );
         assert_eq!(m.roster(&C, &CH).len(), 1);
+    }
+
+    /// ZEB-853 (CodeRabbit): a departed session's raised-hand stamp must NOT
+    /// carry into a new session. A raised LEAVE beacon buries the member with no
+    /// hand stamp; a raised NEWER session re-stamps fresh at the local now.
+    #[test]
+    fn raised_leave_then_rejoin_restamps_hand_fresh() {
+        let mut m = VoicePresenceMap::new();
+        // Session H1 joins with the hand raised → stamped at now=1_000.
+        let mut raise = bh(1, 1, 1, false, false, h1());
+        raise.hand = Some(1); // forged epoch peer wall stamp
+        assert!(m.apply(&C, &CH, &raise, 1_000));
+        assert_eq!(m.roster(&C, &CH)[0].hand_first_observed_ms, Some(1_000));
+        // Leave (H1) with the hand STILL raised → buried; the gravestone must
+        // carry NO hand stamp (a departed session leaves nothing behind).
+        let mut leave = bh(1, 1, u64::MAX, false, true, h1());
+        leave.hand = Some(1);
+        assert!(
+            m.apply(&C, &CH, &leave, 2_000),
+            "raised leave buries the member"
+        );
+        assert!(m.roster(&C, &CH).is_empty(), "buried → hidden from roster");
+        // Newer session H2 rejoins with the hand raised → FRESH stamp at
+        // now=3_000, NOT the departed session's 1_000.
+        let mut rejoin = bh(1, 1, 0, false, false, h2());
+        rejoin.hand = Some(1);
+        assert!(m.apply(&C, &CH, &rejoin, 3_000), "newer session revives");
+        assert_eq!(
+            m.roster(&C, &CH)[0].hand_first_observed_ms,
+            Some(3_000),
+            "fresh stamp — the departed session's stamp must not carry forward"
+        );
+    }
+
+    /// ZEB-853 (CodeRabbit): even WITHOUT a tombstone in between, a strictly-
+    /// newer join session is a fresh queue entry. A hand still raised across the
+    /// session boundary is re-stamped at the local now, never carrying the prior
+    /// session's stamp (the previously-deliberate carry-forward is reversed).
+    #[test]
+    fn newer_session_supersede_restamps_raised_hand_fresh() {
+        let mut m = VoicePresenceMap::new();
+        // Session H1 raised → stamped at now=1_000.
+        let mut raise = bh(1, 1, 1, false, false, h1());
+        raise.hand = Some(1);
+        assert!(m.apply(&C, &CH, &raise, 1_000));
+        assert_eq!(m.roster(&C, &CH)[0].hand_first_observed_ms, Some(1_000));
+        // Newer session H2 (no tombstone) with the hand still raised directly
+        // supersedes → FRESH stamp at now=3_000, not the carried 1_000.
+        let mut newer = bh(1, 1, 0, false, false, h2());
+        newer.hand = Some(1);
+        assert!(
+            m.apply(&C, &CH, &newer, 3_000),
+            "newer session supersedes the live entry"
+        );
+        assert_eq!(
+            m.roster(&C, &CH)[0].hand_first_observed_ms,
+            Some(3_000),
+            "supersede is a fresh queue entry — no carry-forward of the old stamp"
+        );
     }
 }
 

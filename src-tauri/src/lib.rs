@@ -4666,19 +4666,9 @@ pub async fn start_node_inner(
         // is unreachable from them, so a locally-published row would never be
         // persisted until a peer echoed it back.
         let addrbook_dirty_hub = crate::address_book_sync::AddrbookDirtyHub::new();
-        // ZEB-622: network-health presence last-seen cache. Created here so it can
-        // be (a) wired into the presence map below — every verified beacon's
-        // `apply` feeds it — and (b) installed on the NetworkHealthService at the
-        // boot block far below (`set_presence_source`), which max-merges it into
-        // each peer's `last_seen_ms`. A plain `Arc`; the map holds one clone, the
-        // service another.
-        let network_health_presence_cache =
-            std::sync::Arc::new(crate::network_health::PresenceLastSeenCache::new());
-        let community_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new({
-            let mut m = crate::community_presence::CommunityPresenceMap::new();
-            m.set_last_seen_cache(std::sync::Arc::clone(&network_health_presence_cache));
-            m
-        }));
+        let community_presence_map = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::community_presence::CommunityPresenceMap::new(),
+        ));
         let community_presence_map_for_state = std::sync::Arc::clone(&community_presence_map);
 
         // ── ZEB-323 Phase 2b: pkarr lifted state holders ─────────────────
@@ -12889,11 +12879,6 @@ pub async fn start_node_inner(
                                 crate::network_health::ProdLivenessSnapshot::new(
                                     reachability_resolver.clone(),
                                 ),
-                            ));
-                            // ZEB-622: presence last-seen cache (fed by the
-                            // community-presence subscriber's `apply`).
-                            nh.set_presence_source(std::sync::Arc::clone(
-                                &network_health_presence_cache,
                             ));
                             // ZEB-623: per-peer protocol-compat registry. Share
                             // the SAME Arc NodeState holds (published just above
@@ -47800,7 +47785,10 @@ async fn list_pending_joins(
 
 /// Pure filter: given the raw event log, return PendingJoin DTOs that
 /// have no matching JoinCountersign and are within the 30-day window.
-/// Sorted oldest-first by (wall_ms, logical).
+/// Sorted oldest-first by the full HLC tuple (wall_ms, logical, device_id)
+/// so ties at the same (wall_ms, logical) — e.g. two devices publishing at
+/// the same logical instant — resolve deterministically across replicas
+/// instead of following input/materialization order (E9).
 ///
 /// `now_ms` is the caller-supplied wall-clock time (milliseconds since Unix
 /// epoch). Using the caller's wall clock — rather than max(event.at.wall_ms)
@@ -47858,7 +47846,13 @@ pub fn filter_pending_joins(
         })
         .collect();
 
-    out.sort_by_key(|p| (p.pending_at_hlc.wall_ms, p.pending_at_hlc.logical));
+    out.sort_by(|a, b| {
+        a.pending_at_hlc
+            .wall_ms
+            .cmp(&b.pending_at_hlc.wall_ms)
+            .then(a.pending_at_hlc.logical.cmp(&b.pending_at_hlc.logical))
+            .then(a.pending_at_hlc.device_id.cmp(&b.pending_at_hlc.device_id))
+    });
     out
 }
 
@@ -75630,6 +75624,85 @@ mod pending_join_audit_feed_tests {
         assert_eq!(result[0].countersigned_at_hlc.wall_ms, 500);
         assert_eq!(result[1].countersigned_at_hlc.wall_ms, 400);
         assert_eq!(result[2].countersigned_at_hlc.wall_ms, 300);
+    }
+
+    // ── Test 5 (E9): pending_joins_sort_breaks_ties_by_device_id ──────────
+    //
+    // Two PendingJoin events share the same (wall_ms, logical) HLC but come
+    // from different devices, inserted out of order ("bbb" before "aaa").
+    // Dropping device_id from the sort key makes the output order depend on
+    // input order (nondeterministic across replicas that materialize the
+    // same event set in different sequences). The sort must break ties by
+    // device_id ascending so all replicas converge on the same order.
+    fn make_event_with_hlc(
+        id: [u8; 16],
+        actor: OwnerAddr,
+        wall_ms: u64,
+        logical: u32,
+        device_id: &str,
+        kind: MembershipEventKind,
+        community_id: SpaceId,
+    ) -> SignedMembershipEvent {
+        SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id,
+            community_id,
+            kind,
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical,
+                device_id: device_id.into(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_joins_sort_breaks_ties_by_device_id() {
+        let community_id = SpaceId([0xfa; 16]);
+        let admin = OwnerAddr([0xaa; 16]);
+        let joiner_bbb = OwnerAddr([0x01; 16]);
+        let joiner_aaa = OwnerAddr([0x02; 16]);
+
+        // Inserted out of order: "bbb" first, "aaa" second.
+        let ev_bbb = make_event_with_hlc(
+            [0xb0; 16],
+            joiner_bbb,
+            100,
+            5,
+            "bbb",
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(admin, None),
+            },
+            community_id,
+        );
+        let ev_aaa = make_event_with_hlc(
+            [0xa0; 16],
+            joiner_aaa,
+            100,
+            5,
+            "aaa",
+            MembershipEventKind::PendingJoin {
+                invite_token: make_token(admin, None),
+            },
+            community_id,
+        );
+
+        let events = vec![ev_bbb, ev_aaa];
+        let result = filter_pending_joins(&events, 1_000_000);
+
+        let ids: Vec<&str> = result
+            .iter()
+            .map(|p| p.pending_at_hlc.device_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["aaa", "bbb"],
+            "ties must break by device_id ascending"
+        );
     }
 }
 

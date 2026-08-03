@@ -56,7 +56,9 @@ use crate::community_invite::{self, AppHandleEmit, OpenJoinResponse};
 use crate::community_membership::{EventId, MembershipEventKind, SignedMembershipEvent};
 use crate::community_state_sync::CommunitySyncRegistry;
 use crate::dm_outbox::DmOutbox;
-use crate::open_join_admit::{OpenJoinRateLimiter, OPEN_JOIN_FRESHNESS_WINDOW_MS};
+use crate::open_join_admit::{
+    OpenJoinConnLimiter, OpenJoinRateLimiter, OPEN_JOIN_FRESHNESS_WINDOW_MS,
+};
 use crate::owner_state_crdt::OwnerState;
 
 /// Default per-await IO deadline for the inbound handshake. Each
@@ -217,6 +219,16 @@ where
     /// `verify_and_admit_open_join` call, never across the engine apply
     /// or the response write.
     open_join_limiter: TokioMutex<OpenJoinRateLimiter>,
+    /// ZEB-853 (B7, Half 1): pre-auth Tier-1 connection shield keyed on the
+    /// un-spoofable transport `remote_id`. Gates `handle_invite_handshake_inbound`
+    /// right after `accept_bi` — BEFORE any stream read / decode / crypto — so a
+    /// flooding source can't force unbounded pre-consent ed25519 verification
+    /// NOR exhaust the shared per-source admission budget by opening connections.
+    /// Mirrors the friend/v1 acceptor's `rate_limiter` (ZEB-700). Interior
+    /// `std::sync::Mutex`, never held across an `.await`. `with_config` seeds the
+    /// production caps; the shed behavior is unit-tested against
+    /// `OpenJoinConnLimiter` directly via `with_caps` (see `open_join_admit`).
+    open_join_conn_limiter: OpenJoinConnLimiter,
     /// ZEB-804: per-peer served-traffic registry, keyed by the FULL 32-byte
     /// iroh endpoint id. `None` (tests, pre-boot) — stamping is then a no-op.
     traffic: Option<Arc<crate::network_health::PeerTrafficRegistry>>,
@@ -265,6 +277,12 @@ where
             pkarr_invite_publisher,
             config,
             open_join_limiter: TokioMutex::new(OpenJoinRateLimiter::new()),
+            // ZEB-853 (B7): production Tier-1 caps by default (like the friend
+            // acceptor's `rate_limiter`); the shield is therefore ON in
+            // production with no start_node wiring change. The shed behavior is
+            // unit-tested against `OpenJoinConnLimiter` directly (`with_caps`).
+            // Honest single-join peers never hit them.
+            open_join_conn_limiter: OpenJoinConnLimiter::new(),
             traffic: None,
         }
     }
@@ -320,6 +338,50 @@ where
                 deadline_ms: self.config.io_deadline.as_millis() as u64,
             })?
             .map_err(|e| HandshakeAcceptError::AcceptBi(e.to_string()))?;
+
+        // ZEB-853 (B7, Half 1) — pre-auth Tier-1 connection shield. Shed a
+        // flooding endpoint BEFORE any stream read, decode, or crypto — so a
+        // caller holding only the PUBLIC open-invite link can't force unbounded
+        // pre-consent ed25519 verification (cert-verify + envelope-sig inside
+        // `verify_and_admit_open_join`) simply by opening connections, and can't
+        // exhaust the shared per-source admission budget on the far side of it.
+        // Keyed on the connecting endpoint's authenticated `remote_id` —
+        // un-spoofable. This gate sits above the `0x10` invite / `0x11`
+        // open-join split, so it shields BOTH arms.
+        //
+        // RESPONSE-BYTE EQUIVALENCE: the gate runs pre-decode, so the packet
+        // type isn't yet known and there is no single typed reply that fits both
+        // arms. On a shed we LOG ("no silent truncation") and write NOTHING —
+        // returning `ConnectionShed`, which `handle_connection` treats exactly
+        // like the acceptor's existing benign no-response outcomes
+        // (`CountersignTimeout`, `CommunityNotFound`): warn-log + `conn.closed()`,
+        // ZERO response bytes. A shed therefore emits the SAME zero response
+        // bytes as those benign outcomes — no rejection-CONTENT oracle — and it
+        // leaks nothing, with ZERO state effect (nothing read, decoded, verified,
+        // or applied).
+        //
+        // NOT timing-indistinguishable: this is the fast path — the shed returns
+        // IMMEDIATELY (pre-decode), whereas `CountersignTimeout` only returns
+        // after its deadline elapses, so the two remain separable by RESPONSE
+        // LATENCY. We deliberately do NOT attempt uniform-timing here; closing
+        // that timing side-channel is out of scope for this shield and tracked
+        // separately.
+        //
+        // An honest peer that trips the cap self-heals by re-dialing after the
+        // window. ZEB-711: the limiter timeline is the limiter's OWN monotonic
+        // clock, never wall time (a wall step would distort the window).
+        let limiter_now_ms = self.open_join_conn_limiter.monotonic_now_ms();
+        if let Err(reason) = self
+            .open_join_conn_limiter
+            .admit_connection(*conn.remote_id().as_bytes(), limiter_now_ms)
+        {
+            tracing::warn!(
+                reason,
+                remote_id = ?conn.remote_id(),
+                "ZEB-853: open-join/invite handshake shed by pre-auth connection shield"
+            );
+            return Err(HandshakeAcceptError::ConnectionShed);
+        }
 
         // Read [u32 LE length-prefix][packet].
         let mut len_buf = [0u8; 4];
@@ -620,6 +682,10 @@ where
                 now_ms,
                 OPEN_JOIN_FRESHNESS_WINDOW_MS,
                 limiter_now_ms,
+                // ZEB-853 (B7, Half 2): key the admission budget on the
+                // un-spoofable transport `remote_id` so one flooding source
+                // can't exhaust every open-joiner's shared budget.
+                *conn.remote_id().as_bytes(),
                 &mut limiter,
             )
         };
@@ -790,6 +856,17 @@ pub enum HandshakeAcceptError {
     CommunityNotFound {
         community_id: crate::owner_state_types::SpaceId,
     },
+    /// ZEB-853 (B7, Half 1): the inbound connection was shed by the pre-auth
+    /// Tier-1 connection shield BEFORE any stream read / decode / crypto. No
+    /// response was written — the SAME zero response bytes as the benign
+    /// no-response outcomes (`CountersignTimeout` / `CommunityNotFound`), so
+    /// there is no rejection-CONTENT oracle. It is NOT timing-indistinguishable,
+    /// though: the shed is the fast path (returns immediately, pre-decode) while
+    /// `CountersignTimeout` returns only after its deadline — uniform-timing is
+    /// out of scope for this shield and tracked separately. The trait dispatch
+    /// just warn-logs this and closes the connection.
+    #[error("connection shed by pre-auth Tier-1 connection shield")]
+    ConnectionShed,
     /// An inbound open-join (`0x11`) request failed
     /// [`crate::open_join_admit::verify_and_admit_open_join`]. The typed
     /// `OpenJoinResponse::Rejected` was already written to the dialer; this

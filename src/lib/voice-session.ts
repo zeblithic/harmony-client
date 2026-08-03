@@ -31,27 +31,44 @@ export interface RosterMember {
   avatarUrl?: string;   // resolved from member card (Task 5)
   modMuted: boolean;    // server-muted by a moderator (distinct from self-mute `muted`)
   power: number;        // moderation power level (for FE control gating)
-  /** ZEB-612: wall-clock ms of this member's raised hand; null = lowered. */
+  /** ZEB-612: peer-supplied wall-clock ms of this member's raised hand; null =
+   *  lowered. Display-only; the speaker queue orders on `handFirstObservedMs`. */
   handRaisedAt: number | null;
+  /** ZEB-853 D5: LOCAL first-observed monotonic ms of this member's raised hand
+   *  (null = lowered). The peer `handRaisedAt` is attacker-controlled, so the
+   *  speaker queue orders on THIS (DoS-proof). When it is absent the queue sorts
+   *  the entry LAST — it NEVER falls back to the peer `handRaisedAt` value (that
+   *  reopens the epoch-squat D5 fixes). */
+  handFirstObservedMs: number | null;
   /** ZEB-612: holds an unexpired invite-to-speak from a moderator. */
   invited: boolean;
 }
 
 /**
- * ZEB-612: the derived speaker queue — raised hands ordered by raise time
- * (oldest first), owner-hex tiebreak, device-hex final tiebreak (the roster is
- * device-keyed, so two rows CAN share an owner — the device leg makes the
- * comparator total, satisfying the sort contract; Qodo PR #442). Deterministic
- * on every client; no store, no sync protocol (spec §5). Exported for
- * TownHallView (S5).
+ * ZEB-612 / ZEB-853 D5: the derived speaker queue — raised hands ordered by
+ * LOCAL first-observed time (oldest first), owner-hex tiebreak, device-hex final
+ * tiebreak (the roster is device-keyed, so two rows CAN share an owner — the
+ * device leg makes the comparator total, satisfying the sort contract; Qodo
+ * PR #442). Deterministic on every client; no store, no sync protocol (spec §5).
+ * Exported for TownHallView (S5).
+ *
+ * The FILTER still keys on `handRaisedAt` (a peer must assert intent to be
+ * queued), but the SORT keys on `handFirstObservedMs` — the local monotonic
+ * stamp taken when we first saw the raise — so a hostile peer that forges
+ * `handRaisedAt=1` (epoch) can't squat the front of the queue. An entry that is
+ * raised but has no local stamp yet sorts LAST (`Number.MAX_SAFE_INTEGER`),
+ * never using the attacker-controlled peer value as a fallback.
  */
 export function speakerQueue(roster: RosterMember[]): RosterMember[] {
   const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  // Missing local stamp ⇒ sort LAST; do NOT fall back to the peer-controlled
+  // `handRaisedAt` (a forged epoch there would re-squat the queue front).
+  const key = (m: RosterMember) => m.handFirstObservedMs ?? Number.MAX_SAFE_INTEGER;
   return roster
     .filter((m) => m.handRaisedAt !== null)
     .sort(
       (a, b) =>
-        a.handRaisedAt! - b.handRaisedAt! ||
+        key(a) - key(b) ||
         cmp(a.ownerHex, b.ownerHex) ||
         cmp(a.deviceHex, b.deviceHex),
     );
@@ -115,7 +132,8 @@ function rostersEqual(a: RosterMember[], b: RosterMember[]): boolean {
       x.muted !== y.muted || x.speaking !== y.speaking ||
       x.displayName !== y.displayName || x.avatarUrl !== y.avatarUrl ||
       x.modMuted !== y.modMuted || x.power !== y.power ||
-      x.handRaisedAt !== y.handRaisedAt || x.invited !== y.invited
+      x.handRaisedAt !== y.handRaisedAt ||
+      x.handFirstObservedMs !== y.handFirstObservedMs || x.invited !== y.invited
     ) {
       return false;
     }
@@ -271,7 +289,8 @@ export class VoiceSession {
 
   private lastSelfSpeaking = false;
   private lastRoster: {
-    ownerHex: string; deviceHex: string; muted: boolean; handRaisedAt: number | null;
+    ownerHex: string; deviceHex: string; muted: boolean;
+    handRaisedAt: number | null; handFirstObservedMs: number | null;
   }[] = [];
 
   private modMutedOwners = new Set<string>();
@@ -578,11 +597,12 @@ export class VoiceSession {
     const un = await this.deps.listen('voice-presence-changed', (e) => {
       const p = e.payload as { community: string; channel: string;
         roster: { owner: string; device: string; muted: boolean;
-          handRaisedAt?: number | null }[] };
+          handRaisedAt?: number | null; handFirstObservedMs?: number | null }[] };
       if (p.community !== this.community || p.channel !== this.channel) return;
       this.lastRoster = p.roster.map((r) => ({
         ownerHex: r.owner, deviceHex: r.device, muted: r.muted,
         handRaisedAt: r.handRaisedAt ?? null,
+        handFirstObservedMs: r.handFirstObservedMs ?? null,
       }));
       this.deps.onRosterOwners?.(this.lastRoster.map((r) => r.ownerHex));
       this.refreshRoster();
@@ -671,6 +691,7 @@ export class VoiceSession {
           modMuted: this.modMutedOwners.has(r.ownerHex),
           power: this.powers[r.ownerHex] ?? 0,
           handRaisedAt: r.handRaisedAt,
+          handFirstObservedMs: r.handFirstObservedMs,
           invited: this.invitedOwners.has(r.ownerHex),
           ...(card?.displayName ? { displayName: card.displayName } : {}),
           ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
