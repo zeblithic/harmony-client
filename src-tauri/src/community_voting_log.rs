@@ -488,6 +488,9 @@ impl VotingLog {
                 event.hlc.logical,
                 event.hlc.device_id.clone(),
             );
+            // ZEB-868: capture the triggering event's own HLC before it is moved
+            // into `self.events`; the rebuild trigger gates on its canonical stage.
+            let ev_hlc = event.hlc.clone();
             let trigger_kind = matches!(
                 event.kind,
                 PollEventKindCode::SortitionSelection
@@ -553,19 +556,33 @@ impl VotingLog {
                     .polls
                     .get_mut(&poll_id)
                     .expect("poll present (just appended)");
-                // Split-borrow: `events` (immut) and `tier_state` (mut) are
-                // disjoint fields. `mem::take` sidesteps the borrow conflict
-                // between `&state.events` and the `&mut` rebuild without cloning
-                // the whole Vec; the events already contain the just-appended
-                // triggering event AND the applied ss.
-                let events = std::mem::take(&mut state.events);
-                if let Some(t3) = state.tier_state.as_tier3_mut() {
-                    t3.rebuild_from_events(&events);
+                // ZEB-868: gate on the triggering event's OWN canonical HLC. A
+                // ss/md whose HLC lands in Ratification+ sorts canonically-last and
+                // cannot change any earlier Deliberation event's outcome
+                // (current_mini_public filters declines by decline.hlc <= now), so
+                // its rebuild is pure waste — and would re-run rb/ts crypto.
+                // Evaluated post-apply so the stage reflects the event just applied.
+                // See the ZEB-868 spec §3.3 for the soundness proof.
+                let should_rebuild = state
+                    .tier_state
+                    .as_tier3()
+                    .map(|t3| t3.current_stage_at(&ev_hlc).is_pre_ratification())
+                    .unwrap_or(false);
+                if should_rebuild {
+                    // Split-borrow: `events` (immut) and `tier_state` (mut) are
+                    // disjoint fields. `mem::take` sidesteps the borrow conflict
+                    // between `&state.events` and the `&mut` rebuild without cloning
+                    // the whole Vec; the events already contain the just-appended
+                    // triggering event AND the applied ss.
+                    let events = std::mem::take(&mut state.events);
+                    if let Some(t3) = state.tier_state.as_tier3_mut() {
+                        t3.rebuild_from_events(&events);
+                    }
+                    state.events = events;
+                    // The rebuild can move the stage (e.g. a canonical re-fold that
+                    // finalizes) — re-sync the lifecycle from the rebuilt stage.
+                    sync_lifecycle_from_stage(state);
                 }
-                state.events = events;
-                // The rebuild can move the stage (e.g. a canonical re-fold that
-                // finalizes) — re-sync the lifecycle from the rebuilt stage.
-                sync_lifecycle_from_stage(state);
             }
             return Ok(poll_id);
         }
@@ -2954,5 +2971,77 @@ mod tier3_dispatch_tests {
             "backdated vote must be dropped after canonical rebuild"
         );
         assert_eq!(t3.rebuild_count, 1);
+    }
+
+    // ── ZEB-868: trigger-gate on the triggering event's OWN-HLC stage ───────────
+    //
+    // The poll in `tier3_poll_in_deliberation` is created at wall=1000 with
+    // dw=fw=rw=100s, so (once sortition is done) current_stage_at reads:
+    //   Deliberation [2000, 101_000) · Drafting [101_000, 201_000) · Ratification ≥201_000.
+    // `md` has no apply-time stage gate and no membership check in apply_event, so
+    // it materializes whenever it decodes and is under the ZEB-861 per-actor cap —
+    // making it the clean probe for the gate.
+
+    /// Build a kd=md MiniPublicDecline event by `author` at `wall_ms`.
+    fn md_event(pid: PollId, author: OwnerAddr, wall_ms: u64) -> SignedVotingEvent {
+        let payload = MiniPublicDeclinePayload {
+            poll_id: pid,
+            reason: None,
+        };
+        tier3_event_with_payload(
+            PollEventKindCode::MiniPublicDecline,
+            wall_ms,
+            author,
+            encode(&payload),
+        )
+    }
+
+    #[test]
+    fn ratification_stamped_md_out_of_order_does_not_rebuild() {
+        let (mut log, pid) = tier3_poll_in_deliberation();
+
+        // Push max_applied into the Ratification era (≥201_000) with an in-order md.
+        log.apply(md_event(pid, addr(1), 210_000), &cid())
+            .expect("apply md1 (in-order, applied)");
+        {
+            let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+            assert_eq!(t3.rebuild_count, 0, "in-order md must not rebuild");
+        }
+
+        // A second md whose OWN hlc is in the Ratification window (205_000 ≥ 201_000)
+        // arrives out-of-order (205_000 ≤ max_applied 210_000) and applies. Its
+        // canonical position is Ratification → it cannot change any earlier
+        // Deliberation event → the gate skips the (pure-waste) rebuild.
+        log.apply(md_event(pid, addr(2), 205_000), &cid())
+            .expect("apply md2 (out-of-order, applied)");
+
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert_eq!(t3.declines.len(), 2, "both declines still materialized");
+        assert_eq!(
+            t3.rebuild_count, 0,
+            "Ratification-stamped out-of-order md must NOT trigger a rebuild (ZEB-868)"
+        );
+    }
+
+    #[test]
+    fn deliberation_stamped_md_delivered_in_ratification_does_rebuild() {
+        let (mut log, pid) = tier3_poll_in_deliberation();
+
+        // Push max_applied into the Ratification era with an in-order md.
+        log.apply(md_event(pid, addr(1), 210_000), &cid())
+            .expect("apply md1 (in-order)");
+
+        // A md whose OWN hlc is in the Deliberation window (50_000 < 101_000)
+        // arrives late (out-of-order vs max_applied 210_000). It can retroactively
+        // change the deliberation mini-public → it MUST still rebuild. This guards
+        // the gate against over-skipping.
+        log.apply(md_event(pid, addr(2), 50_000), &cid())
+            .expect("apply md2 (backdated to Deliberation)");
+
+        let t3 = log.polls[&pid].tier_state.as_tier3().unwrap();
+        assert_eq!(
+            t3.rebuild_count, 1,
+            "Deliberation-stamped md delivered during Ratification MUST rebuild (ZEB-868)"
+        );
     }
 }

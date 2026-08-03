@@ -33,6 +33,20 @@ pub enum Stage {
     Failed,
 }
 
+impl Stage {
+    /// ZEB-868: a trigger-kind (`ss`/`md`/`ds`/`dv`) event whose own HLC lands in
+    /// Ratification or a terminal stage sorts canonically-last and cannot
+    /// retroactively change any earlier Deliberation event's outcome, so it never
+    /// needs a projection rebuild. Only the three pre-Ratification stages can.
+    /// Used by the out-of-order rebuild trigger (`community_voting_log.rs`).
+    pub(crate) fn is_pre_ratification(self) -> bool {
+        matches!(
+            self,
+            Stage::Sortition | Stage::Deliberation | Stage::Drafting
+        )
+    }
+}
+
 // ── Supporting state types ────────────────────────────────────────────────────
 
 /// State for a single draft candidate (kd=dc event).
@@ -2680,6 +2694,18 @@ mod tests {
         poll.apply_event(&ev).expect("apply ss");
         // now=15000ms: ≥ dw threshold (10000) but < dw+fw threshold (20000) → Drafting
         assert_eq!(poll.current_stage_at(&hlc(15_000)), Stage::Drafting);
+    }
+
+    // ── ZEB-868: Stage::is_pre_ratification truth table ───────────────────────
+
+    #[test]
+    fn stage_is_pre_ratification_truth_table() {
+        assert!(Stage::Sortition.is_pre_ratification());
+        assert!(Stage::Deliberation.is_pre_ratification());
+        assert!(Stage::Drafting.is_pre_ratification());
+        assert!(!Stage::Ratification.is_pre_ratification());
+        assert!(!Stage::Finalized.is_pre_ratification());
+        assert!(!Stage::Failed.is_pre_ratification());
     }
 
     // ── Test 6: apply kd=md appends to declines ────────────────────────────────
