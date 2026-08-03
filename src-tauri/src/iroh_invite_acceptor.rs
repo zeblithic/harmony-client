@@ -349,15 +349,24 @@ where
         // un-spoofable. This gate sits above the `0x10` invite / `0x11`
         // open-join split, so it shields BOTH arms.
         //
-        // ORACLE-SAFETY: the gate runs pre-decode, so the packet type isn't yet
-        // known and there is no single typed reply that fits both arms. On a
-        // shed we LOG ("no silent truncation") and write NOTHING — returning
-        // `ConnectionShed`, which `handle_connection` treats exactly like the
-        // acceptor's existing benign no-response outcomes (`CountersignTimeout`,
-        // `CommunityNotFound`): warn-log + `conn.closed()`, zero response bytes.
-        // A shed is therefore byte-identical on the wire to those benign
-        // outcomes — no distinguishable rejection oracle, and it leaks nothing,
-        // with ZERO state effect (nothing read, decoded, verified, or applied).
+        // RESPONSE-BYTE EQUIVALENCE: the gate runs pre-decode, so the packet
+        // type isn't yet known and there is no single typed reply that fits both
+        // arms. On a shed we LOG ("no silent truncation") and write NOTHING —
+        // returning `ConnectionShed`, which `handle_connection` treats exactly
+        // like the acceptor's existing benign no-response outcomes
+        // (`CountersignTimeout`, `CommunityNotFound`): warn-log + `conn.closed()`,
+        // ZERO response bytes. A shed therefore emits the SAME zero response
+        // bytes as those benign outcomes — no rejection-CONTENT oracle — and it
+        // leaks nothing, with ZERO state effect (nothing read, decoded, verified,
+        // or applied).
+        //
+        // NOT timing-indistinguishable: this is the fast path — the shed returns
+        // IMMEDIATELY (pre-decode), whereas `CountersignTimeout` only returns
+        // after its deadline elapses, so the two remain separable by RESPONSE
+        // LATENCY. We deliberately do NOT attempt uniform-timing here; closing
+        // that timing side-channel is out of scope for this shield and tracked
+        // separately.
+        //
         // An honest peer that trips the cap self-heals by re-dialing after the
         // window. ZEB-711: the limiter timeline is the limiter's OWN monotonic
         // clock, never wall time (a wall step would distort the window).
@@ -849,9 +858,13 @@ pub enum HandshakeAcceptError {
     },
     /// ZEB-853 (B7, Half 1): the inbound connection was shed by the pre-auth
     /// Tier-1 connection shield BEFORE any stream read / decode / crypto. No
-    /// response was written (byte-identical to the benign no-response outcomes
-    /// like `CountersignTimeout` / `CommunityNotFound` — no rejection oracle);
-    /// the trait dispatch just warn-logs this and closes the connection.
+    /// response was written — the SAME zero response bytes as the benign
+    /// no-response outcomes (`CountersignTimeout` / `CommunityNotFound`), so
+    /// there is no rejection-CONTENT oracle. It is NOT timing-indistinguishable,
+    /// though: the shed is the fast path (returns immediately, pre-decode) while
+    /// `CountersignTimeout` returns only after its deadline — uniform-timing is
+    /// out of scope for this shield and tracked separately. The trait dispatch
+    /// just warn-logs this and closes the connection.
     #[error("connection shed by pre-auth Tier-1 connection shield")]
     ConnectionShed,
     /// An inbound open-join (`0x11`) request failed

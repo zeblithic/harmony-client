@@ -36,8 +36,9 @@ export interface RosterMember {
   handRaisedAt: number | null;
   /** ZEB-853 D5: LOCAL first-observed monotonic ms of this member's raised hand
    *  (null = lowered). The peer `handRaisedAt` is attacker-controlled, so the
-   *  speaker queue orders on THIS (DoS-proof), falling back to `handRaisedAt`
-   *  only when absent. */
+   *  speaker queue orders on THIS (DoS-proof). When it is absent the queue sorts
+   *  the entry LAST — it NEVER falls back to the peer `handRaisedAt` value (that
+   *  reopens the epoch-squat D5 fixes). */
   handFirstObservedMs: number | null;
   /** ZEB-612: holds an unexpired invite-to-speak from a moderator. */
   invited: boolean;
@@ -54,12 +55,15 @@ export interface RosterMember {
  * The FILTER still keys on `handRaisedAt` (a peer must assert intent to be
  * queued), but the SORT keys on `handFirstObservedMs` — the local monotonic
  * stamp taken when we first saw the raise — so a hostile peer that forges
- * `handRaisedAt=1` (epoch) can't squat the front of the queue. The peer stamp
- * is only a fallback for the (transient) case where the local one is absent.
+ * `handRaisedAt=1` (epoch) can't squat the front of the queue. An entry that is
+ * raised but has no local stamp yet sorts LAST (`Number.MAX_SAFE_INTEGER`),
+ * never using the attacker-controlled peer value as a fallback.
  */
 export function speakerQueue(roster: RosterMember[]): RosterMember[] {
   const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
-  const key = (m: RosterMember) => m.handFirstObservedMs ?? m.handRaisedAt!;
+  // Missing local stamp ⇒ sort LAST; do NOT fall back to the peer-controlled
+  // `handRaisedAt` (a forged epoch there would re-squat the queue front).
+  const key = (m: RosterMember) => m.handFirstObservedMs ?? Number.MAX_SAFE_INTEGER;
   return roster
     .filter((m) => m.handRaisedAt !== null)
     .sort(

@@ -74,9 +74,11 @@ ahead of every honest raise forever. No usable local timestamp exists —
 - `RosterEntry`: add `hand_first_observed_ms` (JSON `handFirstObservedMs`);
   `roster()` copies it.
 - `voice-session.ts` `speakerQueue`: filter on `handRaisedAt !== null` (a peer
-  still asserts intent), but **sort** on `handFirstObservedMs` (falling back to
-  `handRaisedAt` only if the local stamp is somehow absent), then the existing
-  `ownerHex`/`deviceHex` tiebreaks. Peer wall becomes display-only.
+  still asserts intent), but **sort** on `handFirstObservedMs` — an entry with no
+  local stamp sorts **last** (`Number.MAX_SAFE_INTEGER`) and NEVER falls back to
+  the peer `handRaisedAt` value (a forged epoch there would re-open the squat),
+  then the existing `ownerHex`/`deviceHex` tiebreaks. Peer wall becomes
+  display-only.
 
 Ordering is now DoS-proof (attacker cannot pre-date their raise) at the cost of
 per-client order divergence, which is correct for an advisory, non-consensus
@@ -141,6 +143,7 @@ concern only, not a mis-target risk.
 
 **Fix:** extend the key to the full `(wall_ms, logical, device_id)` tuple,
 mirroring the existing ascending pattern at `lib.rs:44266`:
+
 ```rust
 out.sort_by(|a, b| {
     a.pending_at_hlc.wall_ms.cmp(&b.pending_at_hlc.wall_ms)
@@ -239,7 +242,9 @@ isolated first, B7 last as the largest):
   control consumer at the 30-min display tier.
 - Limiters use the monotonic clock (ZEB-711), never wall; shed replies must not
   be an oracle (byte-identical to the benign path).
-- CI parity: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets
-  --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run --locked
-  --workspace --all-targets --features test-fixtures --no-fail-fast`; plus the
-  frontend test suite for the D5 TS change.
+- CI parity (Rust commands from `src-tauri/`): `cargo fmt --all -- --check`;
+  `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D
+  warnings`; `cargo nextest run --locked --workspace --all-targets --features
+  test-fixtures --no-fail-fast`; plus the repo-root frontend gate for the D5 TS
+  change: `npx tsc --noEmit` (type-check) and `npx vitest run` (tests). There is
+  no `npm test` script.

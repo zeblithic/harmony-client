@@ -295,14 +295,17 @@ describe('speakerQueue (ZEB-612 derived queue)', () => {
     modMuted: false, power: 0, handRaisedAt, handFirstObservedMs, invited: false,
   });
 
-  it('orders raised hands by raise time, oldest first', () => {
+  it('orders raised hands by local first-observed time, oldest first', () => {
+    // Post-Fix C: ordering keys on the LOCAL first-observed stamp. Give each a
+    // distinct handFirstObservedMs; the peer handRaisedAt is deliberately out of
+    // order to prove it is not the sort key.
     const q = speakerQueue([
-      member('cc'.repeat(16), 300),
-      member('aa'.repeat(16), 100),
+      member('cc'.repeat(16), 100, 300),
+      member('aa'.repeat(16), 300, 100),
       member('bb'.repeat(16), null), // lowered → excluded
-      member('dd'.repeat(16), 200),
+      member('dd'.repeat(16), 200, 200),
     ]);
-    expect(q.map((m) => m.handRaisedAt)).toEqual([100, 200, 300]);
+    expect(q.map((m) => m.handFirstObservedMs)).toEqual([100, 200, 300]);
   });
 
   it('breaks raise-time ties by owner hex (deterministic on every client)', () => {
@@ -339,6 +342,21 @@ describe('speakerQueue (ZEB-612 derived queue)', () => {
     const honest = { ...member('bb'.repeat(16), 5000, 3000), deviceHex: 'b1'.repeat(32) };
     const q = speakerQueue([attacker, honest]);
     expect(q.map((m) => m.ownerHex)).toEqual(['bb'.repeat(16), 'aa'.repeat(16)]);
+  });
+
+  it('an unstamped-but-raised entry sorts LAST, never using the peer handRaisedAt', () => {
+    // ZEB-853 Fix C: a hostile peer forges handRaisedAt=1 (epoch) AND we have no
+    // local first-observed stamp for it (handFirstObservedMs=null). The old
+    // `?? handRaisedAt` fallback would let that forged epoch jump the queue; the
+    // safe key sorts an unstamped entry LAST (Number.MAX_SAFE_INTEGER) instead of
+    // using the peer value.
+    const attacker = { ...member('aa'.repeat(16), 1, null), deviceHex: 'a1'.repeat(32) };
+    const honest = { ...member('bb'.repeat(16), 5000, 3000), deviceHex: 'b1'.repeat(32) };
+    expect(speakerQueue([attacker, honest]).map((m) => m.ownerHex))
+      .toEqual(['bb'.repeat(16), 'aa'.repeat(16)]);
+    // Order-independent: the unstamped entry sorts last regardless of input order.
+    expect(speakerQueue([honest, attacker]).map((m) => m.ownerHex))
+      .toEqual(['bb'.repeat(16), 'aa'.repeat(16)]);
   });
 });
 
