@@ -3254,13 +3254,17 @@ where
 ///   `beacon_oracle == None` (oracle unwired) or `BeaconNotYetAvailable`
 ///   (beacon not yet indexed) ⇒ reject — liveness-safe because kd=ss is
 ///   engine-auto-derived locally from this node's own beacon.
-/// - Tier 3 engine-auto `kd=cl` (PollClose) has no verifier (no `verify_cl`
-///   exists by design); membership-V6 from `verify_voting_event` is the outer
-///   gate.
+/// - Tier 3 `kd=cl` (PollClose) is gated by [`verify_cl`] (ZEB-859): the
+///   deterministic close condition (Ratification stage + full lifecycle window
+///   elapsed, evaluated at the receiver-clamped peer wall) must hold, else a
+///   forged early close could prematurely satisfy `verify_sr`'s R1 precondition.
+///   Fail-open when the receiver clock is unreadable (`receiver_now_ms == None`),
+///   per the ZEB-846/852 clock-trust contract.
 /// - Tier 3 `kd=ds`/`kd=dv` already inline-check mini-public membership in the
 ///   apply path (`community_voting_tier3.rs`), so no additional check here.
 ///
 /// [`verify_ss`]: crate::community_voting_tier3::verify_ss
+/// [`verify_cl`]: crate::community_voting_tier3::verify_cl
 /// [`BeaconOracle`]: crate::community_voting_tier3::BeaconOracle
 async fn inbound_eligibility_check(
     event: &SignedVotingEvent,
@@ -3408,9 +3412,31 @@ async fn inbound_eligibility_check(
                     )
                     .map_err(|e| format!("Tier 3 PollCreate: creator not eligible: {e:?}"))?;
                 }
-                // kd=cl (PollClose) is engine-auto with no authz verifier
-                // (no verify_cl exists); membership-V6 is the outer gate.
-                crate::community_voting_core::PollEventKindCode::PollClose => {}
+                // kd=cl (PollClose): else a member could inject a forged EARLY
+                // close, prematurely satisfying verify_sr's R1 close-applied
+                // precondition. verify_cl (ZEB-859) recomputes the deterministic
+                // close condition (Ratification stage + full lifecycle window
+                // elapsed) that the engine-auto close trigger uses; the peer wall
+                // is clamped to the receiver clock inside verify_cl.
+                //
+                // Clock fail-open (ZEB-846/852 contract): if the receiver clock is
+                // unreadable, `receiver_now_ms()` is None ⇒ skip the gate (do NOT
+                // reject) — a bad LOCAL clock must never drop honest governance.
+                // When the clock IS available, verify_cl runs under the log guard
+                // via `with_tier3`, uniform with the sync verifiers above;
+                // `with_tier3` also rejects an unknown/non-tier3 poll, matching
+                // the kd=rs/kd=sf arms.
+                crate::community_voting_core::PollEventKindCode::PollClose => {
+                    if let Some(now) = crate::clock_trust::receiver_now_ms() {
+                        let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                            .ok_or_else(|| "kd=cl: undecodable poll id".to_string())?;
+                        with_tier3(voting_log, &pid, "kd=cl", |t3| {
+                            crate::community_voting_tier3::verify_cl(event, t3, now)
+                        })
+                        .await?;
+                    }
+                    // else: receiver clock unavailable → fail-open, do not reject.
+                }
                 // kd=ss (ZEB-850 Task 3): else a member could install a chosen
                 // mini-public, whose forged members then pass the ds/dv inline
                 // checks. verify_ss recomputes the sortition from the VRF beacon.
@@ -7623,6 +7649,58 @@ mod tests {
         assert!(
             err.contains("UnknownCandidate"),
             "reject must come from the candidate-exists leg (member passes verify_sd); got {err:?}"
+        );
+    }
+
+    // ── ZEB-859: kd=cl (PollClose) peer-ingest authz (verify_cl) ───────────────
+    //
+    // The fixture seeds create_wall=1_000_000 with dw=fw=rw=7_200s, so
+    // `current_stage_at` returns Ratification once wall_ms ≥ 15_400_000 and the
+    // engine-auto close condition (`close_condition_met`) is met once
+    // wall_ms ≥ 22_600_000 (create + total_window = 1_000_000 + 21_600_000). The
+    // ingest arm clamps the peer wall to `receiver_now_ms() + MAX_FORWARD_SKEW`;
+    // the real receiver clock (~1.7e12) dwarfs these walls, so the clamp is a
+    // no-op and the event wall drives the predicate.
+
+    // kd=cl forge: a peer injects a PollClose while the poll is in Ratification
+    // but the full lifecycle window has NOT elapsed (a forged EARLY close, which
+    // would otherwise prematurely satisfy verify_sr's R1 close-applied
+    // precondition). verify_cl's CloseConditionNotMet must reject at ingest.
+    #[tokio::test]
+    async fn inbound_kd_cl_rejects_forged_premature_close() {
+        let (log, pid, _proposer, member, snapshot, cid) = tier3_ingest_fixture().await;
+        // 16_000_000 is past the 15_400_000 Ratification boundary but below the
+        // 22_600_000 close threshold — a premature close.
+        let cl = tier3_ingest_event(
+            PollEventKindCode::PollClose,
+            member,
+            16_000_000,
+            encode_pid_ref(pid),
+        );
+        let res = inbound_eligibility_check(&cl, &snapshot, &log, cid, None).await;
+        let err = res.expect_err("a forged premature kd=cl must be rejected at ingest");
+        assert!(
+            err.contains("CloseConditionNotMet"),
+            "reject must reference the unmet close condition; got {err:?}"
+        );
+    }
+
+    // kd=cl control: a PollClose whose wall is at/after the close threshold, with
+    // the poll in Ratification, is a legitimate engine-auto close → admitted.
+    #[tokio::test]
+    async fn inbound_kd_cl_accepts_legitimate_close() {
+        let (log, pid, _proposer, member, snapshot, cid) = tier3_ingest_fixture().await;
+        // 25_000_000 ≥ the 22_600_000 close threshold and in Ratification.
+        let cl = tier3_ingest_event(
+            PollEventKindCode::PollClose,
+            member,
+            25_000_000,
+            encode_pid_ref(pid),
+        );
+        let res = inbound_eligibility_check(&cl, &snapshot, &log, cid, None).await;
+        assert!(
+            res.is_ok(),
+            "a legitimate kd=cl at/after the close threshold must be admitted; got {res:?}"
         );
     }
 
