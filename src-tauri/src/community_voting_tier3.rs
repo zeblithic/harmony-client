@@ -6382,6 +6382,127 @@ mod tests {
         assert_eq!(poll.deliberation.statements, statements_before);
     }
 
+    // ── ZEB-860 spec item 7: 5-cap determinism under canonical rebuild ─────────
+    //
+    // The kd=ds apply arm caps statements at 5 per AUTHOR
+    // (`statements_per_author >= 5 → drop`). WHICH five survive depends on
+    // delivery order: under arrival order the first-5-DELIVERED win; under
+    // canonical order — exactly what `rebuild_from_events` produces — the 5
+    // HLC-EARLIEST win. When delivery is out of order these two sets DIFFER, so
+    // a previously-Applied statement can be retroactively EVICTED by the cap
+    // recomputation after a canonical rebuild (and a previously-dropped,
+    // HLC-earlier statement re-materialized). CodeRabbit (PR #590) flagged this
+    // subtlety plus the "5-cap determinism" test that testing-strategy item 7
+    // committed to but never landed. This pins BOTH eviction directions and the
+    // "two delivery orders converge" guarantee.
+    //
+    // Each of addr(1)'s 6 statements sits on its OWN device lane (dev-0..dev-5)
+    // so the per-(actor, device) monotonic guard (ZEB-850) does not reject the
+    // deliberately-descending arrival order — the same actor across six devices
+    // still shares ONE per-author 5-cap.
+    #[test]
+    fn rebuild_five_cap_keeps_hlc_earliest_deterministically() {
+        // ss seats addr(1) in the mini-public and lifts the poll into
+        // Deliberation; rebuild resets sortition_result via new_from_create, so
+        // the replay slice MUST include ss (see rebuild_rematerializes_dropped_vote).
+        let ss = ss_event(
+            50,
+            vec![addr(1), addr(2), addr(3)],
+            vec![addr(10), addr(11)],
+        );
+
+        // 6 statements from addr(1) at distinct ascending walls (5000..=5005),
+        // each on its own device lane. Capture each event_hash AFTER stamping
+        // device_id — the id is part of the signing bytes.
+        let mut stmts: Vec<SignedVotingEvent> = Vec::new();
+        let mut hashes: Vec<[u8; 32]> = Vec::new();
+        for i in 0u64..6 {
+            let mut ev = ds_event_with_text(5_000 + i, addr(1), &format!("cap statement {i}"));
+            ev.hlc.device_id = format!("dev-{i}");
+            hashes.push(sha256_of_signing_bytes(&ev));
+            stmts.push(ev);
+        }
+
+        // ── Arrival order: deliver DESCENDING [s5,s4,s3,s2,s1,s0]. Distinct
+        // lanes ⇒ no monotonic rejection; the per-author cap keeps the first 5
+        // DELIVERED {s5,s4,s3,s2,s1} and drops s0 — the HLC-EARLIEST, i.e. the
+        // WRONG five relative to canonical order.
+        let mut poll = build_poll_in_deliberation_stage();
+        for ev in stmts.iter().rev() {
+            poll.apply_event(ev)
+                .expect("apply is Ok (cap-drop is a silent drop, not an error)");
+        }
+        assert_eq!(
+            poll.deliberation.statements_per_author[&addr(1)],
+            5,
+            "arrival-order cap holds at 5"
+        );
+        assert!(
+            poll.deliberation.statements.contains_key(&hashes[5]),
+            "arrival order keeps s5 (HLC-latest, delivered first)"
+        );
+        assert!(
+            !poll.deliberation.statements.contains_key(&hashes[0]),
+            "arrival order drops s0 (HLC-earliest, delivered last) — the wrong five"
+        );
+
+        // ── Canonical rebuild: re-fold the SAME set (ss + all 6, scrambled —
+        // rebuild sorts canonically regardless). Canonical order re-derives the
+        // cap survivors as the 5 HLC-EARLIEST {s0..s4} and EVICTS s5. Assert
+        // BOTH directions so the test fails if the rebuild did not re-canonicalize.
+        let slice = vec![
+            ss.clone(),
+            stmts[3].clone(),
+            stmts[0].clone(),
+            stmts[5].clone(),
+            stmts[2].clone(),
+            stmts[4].clone(),
+            stmts[1].clone(),
+        ];
+        poll.rebuild_from_events(&slice);
+
+        assert!(
+            poll.deliberation.statements.contains_key(&hashes[0]),
+            "rebuild RE-MATERIALIZES s0 (HLC-earliest) that arrival order had dropped"
+        );
+        assert!(
+            !poll.deliberation.statements.contains_key(&hashes[5]),
+            "rebuild EVICTS s5 (HLC-latest) that arrival order had kept — retroactive eviction"
+        );
+        assert_eq!(
+            poll.deliberation.statements_per_author[&addr(1)],
+            5,
+            "cap still holds at 5 after rebuild"
+        );
+        let survivors: std::collections::BTreeSet<[u8; 32]> =
+            poll.deliberation.statements.keys().copied().collect();
+        let expected: std::collections::BTreeSet<[u8; 32]> = hashes[0..5].iter().copied().collect();
+        assert_eq!(
+            survivors, expected,
+            "canonical survivor set is exactly the 5 HLC-earliest {{s0..s4}}"
+        );
+
+        // ── Two delivery orders converge (spec item 7): fold a DIFFERENT
+        // arrival order (ascending [s0..s5]) into a fresh poll, rebuild, and
+        // assert the canonical survivor set is IDENTICAL — the rebuild's result
+        // is delivery-order-independent.
+        let mut other = build_poll_in_deliberation_stage();
+        for ev in stmts.iter() {
+            other
+                .apply_event(ev)
+                .expect("apply is Ok (cap-drop is a silent drop, not an error)");
+        }
+        let mut other_slice = vec![ss.clone()];
+        other_slice.extend(stmts.iter().cloned());
+        other.rebuild_from_events(&other_slice);
+        let survivors_other: std::collections::BTreeSet<[u8; 32]> =
+            other.deliberation.statements.keys().copied().collect();
+        assert_eq!(
+            survivors_other, survivors,
+            "two delivery orders converge to the identical canonical survivor set"
+        );
+    }
+
     // ── ZEB-860 Task 4: order-invariance sweep for the non-trigger kinds ───────
     //
     // The canonical rebuild trigger (community_voting_log::apply_with_snapshot)
