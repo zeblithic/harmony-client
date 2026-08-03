@@ -48,6 +48,10 @@ function member(i: number, over: Record<string, unknown> = {}) {
     modMuted: false,
     power: 0,
     handRaisedAt: null,
+    // ZEB-853 D5: local first-observed stamp — the speaker queue orders on
+    // THIS, not the peer-supplied handRaisedAt. Default null (not raised);
+    // tests that raise a hand and assert queue ORDER must set this too.
+    handFirstObservedMs: null,
     invited: false,
     ...over,
   };
@@ -166,12 +170,15 @@ describe('TownHallView (ZEB-612 S5): control bar + raise hand', () => {
 });
 
 describe('TownHallView (ZEB-612 S5): speaker queue', () => {
-  it('orders raised hands by handRaisedAt and numbers the rows', async () => {
+  it('orders raised hands by first-observed time and numbers the rows', async () => {
     await setup({
       phase: 'connected',
       roster: [
-        member(1, { handRaisedAt: 2000 }),
-        member(2, { handRaisedAt: 1000 }),
+        // ZEB-853 D5: the queue orders on the LOCAL handFirstObservedMs, not
+        // the peer-supplied handRaisedAt — stamp both here so the fixture
+        // exercises the real (production) ordering key.
+        member(1, { handRaisedAt: 2000, handFirstObservedMs: 2000 }),
+        member(2, { handRaisedAt: 1000, handFirstObservedMs: 1000 }),
         member(3),
       ],
     });
