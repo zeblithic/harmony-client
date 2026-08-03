@@ -1019,8 +1019,17 @@ impl Tier3PollState {
 
             // kd=cl PollClose: record close_event_hash.
             PollEventKindCode::PollClose => {
-                let hash = sha256_of_signing_bytes(ev);
-                self.close_event_hash = Some(hash);
+                // ZEB-859/858: first-close-wins. close_event_hash is the second half of
+                // the verify_sr memo key; overwriting it on every applied kd=cl would let
+                // an insider churn the key (distinct closes all pass verify_cl in the
+                // pre-finalize window) and bypass the se-mode decrypt DoS bound. Freezing
+                // on the first close per node is consistent with the engine-auto trigger's
+                // `close_event_hash.is_some()` short-circuit and the documented
+                // "close_event_hash may legitimately differ across replicas" tolerance
+                // (each node freezes on its own first-observed close).
+                if self.close_event_hash.is_none() {
+                    self.close_event_hash = Some(sha256_of_signing_bytes(ev));
+                }
             }
 
             // kd=rs PollResult (Tier 3): decode StarResult from payload;
@@ -3991,6 +4000,55 @@ mod tests {
         let close_threshold = 30_000; // create(0) + total_window(30_000)
         assert!(!poll.close_condition_met(close_threshold - 1));
         assert!(poll.close_condition_met(close_threshold));
+    }
+
+    /// ZEB-859/858: `apply_event`'s PollClose arm is first-close-wins. The
+    /// `close_event_hash` (the second half of the verify_sr memo key) freezes on
+    /// the first applied kd=cl; a SECOND distinct kd=cl on a different lane must
+    /// NOT overwrite it. Without this an insider could spam distinct closes (each
+    /// legitimate in the pre-finalize window) to churn the memo key, force memo
+    /// misses, and re-run the expensive se-mode threshold-decrypt — bypassing the
+    /// DoS bound. The post-match watermark tail must STILL run for the second
+    /// event (only the hash assignment is gated), so the second apply returns Ok.
+    #[test]
+    fn apply_kd_cl_first_close_wins_hash_stable() {
+        let mut poll = poll_in_ratification();
+
+        // First close (lane = addr(7)) freezes close_event_hash.
+        let first_cl = make_event(PollEventKindCode::PollClose, 30_000, addr(7));
+        poll.apply_event(&first_cl).expect("first cl applies");
+        let first_hash = poll.close_event_hash.expect("first close records a hash");
+        assert_eq!(
+            first_hash,
+            sha256_of_signing_bytes(&first_cl),
+            "close_event_hash is the first close's signing-bytes hash",
+        );
+
+        // A SECOND distinct close (different signer + wall ⇒ different signing
+        // bytes ⇒ different hash) on its own lane. Fixture sanity: it hashes
+        // differently, so an overwrite would be observable.
+        let second_cl = make_event(PollEventKindCode::PollClose, 31_000, addr(8));
+        assert_ne!(
+            sha256_of_signing_bytes(&second_cl),
+            first_hash,
+            "fixture sanity: the second close hashes differently",
+        );
+        // The apply itself succeeds — the (actor, device) watermark tail still
+        // runs for the second event even though the hash assignment is gated.
+        poll.apply_event(&second_cl)
+            .expect("second cl applies (watermark tail still runs)");
+        assert_eq!(
+            poll.close_event_hash,
+            Some(first_hash),
+            "first-close-wins: close_event_hash unchanged by the second kd=cl",
+        );
+        // And the second event's lane watermark was raised (tail ran).
+        let lane = (second_cl.actor, second_cl.hlc.device_id.clone());
+        assert_eq!(
+            poll.last_received_hlc.get(&lane).copied(),
+            Some((31_000, 0)),
+            "post-match watermark tail ran for the gated second close",
+        );
     }
 
     // 16. verify_rb_actor_in_full_electorate_accepted

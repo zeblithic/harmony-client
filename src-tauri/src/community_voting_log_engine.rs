@@ -3632,6 +3632,14 @@ async fn inbound_eligibility_check(
                 //      ballot staleness is benign: the recompute is cheap and a node
                 //      finalizes from its own engine-auto mint, so a stale/dropped
                 //      peer kd=rs never stalls finalization.
+                // Memo-KEY stability (ZEB-859): `close_event_hash` is now write-once
+                // (first-close-wins in `apply_event`'s PollClose arm), so the
+                // `(poll_id, close_event_hash)` key is stable per poll and cannot be
+                // churned. Before this an insider could spam distinct kd=cl (each
+                // passing verify_cl in the pre-finalize window) to rotate the second
+                // key half, force a memo miss, and re-run the expensive se-mode
+                // threshold-decrypt on every close — bypassing the DoS bound.
+                //
                 // A future change that made the post-close recompute input-dependent
                 // in a NON-invariant way (without rotating `close_event_hash`) would
                 // silently poison this memo — keep invariants (1) and (2) true.
