@@ -224,6 +224,11 @@ pub struct Tier3PollState {
     /// out-of-order arrival and trigger a canonical-order rebuild. Never
     /// serialized (like `last_received_hlc`).
     pub(crate) max_applied: Option<(u64, u32, String)>,
+    /// ZEB-860: cumulative count of canonical-order rebuilds performed on this
+    /// projection via `rebuild_from_events`. Preserved across each rebuild's
+    /// reset and incremented, so it counts total rebuilds over the poll's life
+    /// (not resets to 1). Read by tests/telemetry; never serialized.
+    pub(crate) rebuild_count: u64,
     /// ZEB-295 Phase 6: ballot-secret tally projection. Populated by
     /// `kd=ts` apply (Task 7) and the decrypted-result derivation
     /// (Task 8). Empty in pu-mode polls.
@@ -258,6 +263,7 @@ impl std::fmt::Debug for Tier3PollState {
             .field("last_hlc", &self.last_hlc)
             .field("last_received_hlc", &self.last_received_hlc)
             .field("max_applied", &self.max_applied)
+            .field("rebuild_count", &self.rebuild_count)
             .field("secret_tally", &self.secret_tally)
             .field("committee_oracle", &"<oracle>")
             .finish()
@@ -420,11 +426,9 @@ pub enum ApplyOutcome {
 /// tiebreaker — a strict total order with no ties even if a device reuses an
 /// HLC. Matches the `dv`/`ts` LWW tiebreak.
 ///
-/// ZEB-860 Task 1 lays this helper down for the canonical-order rebuild;
-/// its production consumer arrives in Task 2 (out-of-order replay). Until then
-/// it is referenced only by tests, so `allow(dead_code)` keeps the non-test
-/// lib build warning-clean. Remove the attribute when Task 2 wires the caller.
-#[allow(dead_code)]
+/// ZEB-860 Task 2 wires the production consumer: `rebuild_from_events` sorts a
+/// poll's events by this key before the canonical-order re-fold, so the helper
+/// is live in the non-test lib build (no `allow(dead_code)` needed).
 pub(crate) fn canonical_key(ev: &SignedVotingEvent) -> (u64, u32, String, [u8; 32]) {
     (
         ev.hlc.wall_ms,
@@ -462,6 +466,7 @@ impl Tier3PollState {
             last_hlc: None,
             last_received_hlc: std::collections::BTreeMap::new(),
             max_applied: None,
+            rebuild_count: 0,
             secret_tally: SecretTallyState::default(),
             committee_oracle: std::sync::Arc::new(NullCommitteeOracle),
         }
@@ -473,6 +478,40 @@ impl Tier3PollState {
     /// to short-circuit DKG ceremony setup.
     pub fn install_committee_oracle(&mut self, oracle: std::sync::Arc<dyn CommitteeOracle>) {
         self.committee_oracle = oracle;
+    }
+
+    /// ZEB-860: re-materialize this poll's projection as a deterministic fold of
+    /// `events` in canonical order. Resets only replay-derived fields (via the
+    /// canonical `new_from_create`), preserving `meta` (incl. `community_epoch`),
+    /// `eligible_electorate_snapshot`, and the installed `committee_oracle`.
+    /// Synchronous: `apply_event` reads only stored poll state, so no membership
+    /// resolver is needed. Each `Err` on re-fold is a terminal/monotonic
+    /// rejection, ignored exactly as boot replay ignores un-replayable events.
+    ///
+    /// ZEB-860 Task 2 lands the method + its tests; the production trigger that
+    /// calls it on out-of-order arrival arrives in Task 3. Until then its only
+    /// caller is the test module, so the non-test lib compilation sees it (and
+    /// its `canonical_key` callee) as unused. `allow(dead_code)` keeps that build
+    /// warning-clean; remove it when Task 3 wires the caller.
+    #[allow(dead_code)]
+    pub(crate) fn rebuild_from_events(&mut self, events: &[SignedVotingEvent]) {
+        let meta = self.meta.clone();
+        let electorate = std::mem::take(&mut self.eligible_electorate_snapshot);
+        let oracle = self.committee_oracle.clone();
+        let rebuilds = self.rebuild_count;
+        *self = Tier3PollState::new_from_create(meta, electorate);
+        self.committee_oracle = oracle;
+        self.rebuild_count = rebuilds + 1;
+
+        let mut sorted: Vec<&SignedVotingEvent> = events.iter().collect();
+        // `sort_by_cached_key` over `sort_by(|a,b| key(a).cmp(&key(b)))`:
+        // `canonical_key` hashes the event (SHA-256 signing bytes), so caching one
+        // key per element beats recomputing it on every comparison. Also satisfies
+        // clippy's `unnecessary_sort_by`.
+        sorted.sort_by_cached_key(|a| canonical_key(a));
+        for ev in sorted {
+            let _ = self.apply_event(ev);
+        }
     }
 
     /// Apply a single event to this state, mutating it in place.
@@ -6246,6 +6285,102 @@ mod tests {
         let (ka, kc) = (canonical_key(&a), canonical_key(&c));
         assert_eq!((ka.0, ka.1, ka.2.clone()), (kc.0, kc.1, kc.2.clone()));
         assert_ne!(ka.3, kc.3, "distinct events get distinct hash tiebreakers");
+    }
+
+    // ── ZEB-860 Task 2: rebuild_from_events (canonical mini-restore) ───────────
+
+    #[test]
+    fn rebuild_rematerializes_dropped_vote() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        // addr(1), addr(2) are in the mini-public; window is [0, 10_000).
+        let mut poll = build_poll_in_deliberation_stage();
+        // The sortition event that lifts the poll into Deliberation is part of the
+        // poll's own event set; rebuild resets `sortition_result` via
+        // `new_from_create`, so it must be in the replay slice (matching the
+        // production per-poll `events` Vec) or every ds/dv drops as out-of-stage.
+        let ss = ss_event(
+            50,
+            vec![addr(1), addr(2), addr(3)],
+            vec![addr(10), addr(11)],
+        );
+        let s = ds_event_with_text(5_000, addr(1), "the statement being voted on");
+        let s_hash = sha256_of_signing_bytes(&s);
+        let v = dv_event(6_000, addr(2), s_hash, BridgingVoteCode::Agree); // vote by addr(2) on s
+                                                                           // Deliver the VOTE first (out of order): it drops because the statement is absent.
+        assert_eq!(poll.apply_event(&v), Ok(ApplyOutcome::Dropped));
+        assert_eq!(poll.apply_event(&s), Ok(ApplyOutcome::Applied));
+        assert!(
+            !poll.deliberation.votes.contains_key(&(addr(2), s_hash)),
+            "arrival-order fold drops the early vote"
+        );
+        // Rebuild from the same set → canonical order (ss@50 < s@5000 < v@6000)
+        // re-materializes the vote.
+        poll.rebuild_from_events(&[v.clone(), s.clone(), ss.clone()]);
+        assert!(
+            poll.deliberation.votes.contains_key(&(addr(2), s_hash)),
+            "canonical rebuild applies the vote (ds precedes dv by HLC)"
+        );
+        assert_eq!(poll.rebuild_count, 1);
+    }
+
+    #[test]
+    fn rebuild_preserves_non_replay_state() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let epoch_before = poll.meta.community_epoch;
+        let electorate_before = poll.eligible_electorate_snapshot.clone();
+        // Install a non-null oracle. MockCommitteeOracle answers (latest_epoch =>
+        // Some) where the constructor's default NullCommitteeOracle returns None.
+        let oracle_state =
+            ts_apply_helpers::snapshot_of(&ts_apply_helpers::fake_committee_2_of_3());
+        poll.install_committee_oracle(std::sync::Arc::new(ts_apply_helpers::MockCommitteeOracle {
+            state: oracle_state,
+            latest: 0,
+        }));
+        let s = ds_event_with_text(5_000, addr(1), "some statement text here");
+        poll.rebuild_from_events(&[s]);
+        assert_eq!(
+            poll.meta.community_epoch, epoch_before,
+            "community_epoch preserved"
+        );
+        assert_eq!(
+            poll.eligible_electorate_snapshot, electorate_before,
+            "electorate preserved"
+        );
+        // Oracle preserved: a MockCommitteeOracle answers where NullCommitteeOracle
+        // returns None. `latest_epoch().is_some()` proves it is NOT the default
+        // NullCommitteeOracle that `new_from_create` would otherwise install.
+        assert!(
+            poll.committee_oracle.latest_epoch().is_some(),
+            "installed committee_oracle survived the rebuild reset"
+        );
+    }
+
+    #[test]
+    fn rebuild_is_monotone_additive_for_in_order_set() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        // ss (sortition) event is part of the poll's replay set — see the note in
+        // `rebuild_rematerializes_dropped_vote`.
+        let ss = ss_event(
+            50,
+            vec![addr(1), addr(2), addr(3)],
+            vec![addr(10), addr(11)],
+        );
+        let s = ds_event_with_text(5_000, addr(1), "statement one text");
+        let s_hash = sha256_of_signing_bytes(&s);
+        let v = dv_event(6_000, addr(2), s_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&s).unwrap();
+        poll.apply_event(&v).unwrap();
+        let votes_before = poll.deliberation.votes.clone();
+        let statements_before = poll.deliberation.statements.clone();
+        poll.rebuild_from_events(&[ss, s, v]);
+        assert_eq!(
+            poll.deliberation.votes, votes_before,
+            "in-order set unchanged by rebuild"
+        );
+        assert_eq!(poll.deliberation.statements, statements_before);
     }
 }
 
