@@ -142,6 +142,11 @@ pub type BeaconRequester = Arc<
 /// lane at its own receive watermark. See `is_inbound_duplicate`.
 const ENGINE_AUTO_LANE_PREFIX: &str = "engine-auto-";
 
+/// Max byte-length of an accepted voting-event `hlc.device_id`. Canonical
+/// ids are 32-hex (16-byte identity hash); engine-auto lanes are shorter.
+/// 64 = 2x margin + 256-bit-hash headroom. Rejects decode-time key bloat.
+pub(crate) const MAX_DEVICE_ID_LEN: usize = 64;
+
 /// Dedup table keyed on `(actor, device_id)` → max HLC `(wall_ms, logical)`
 /// tuple seen.
 ///
@@ -2890,6 +2895,18 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         let event: SignedVotingEvent =
             ciborium::from_reader(packet).map_err(|e| format!("decode: {e}"))?;
 
+        // ZEB-861 (Component 1): reject a voting event whose free-form
+        // `hlc.device_id` is over-length before it is tracked, applied, or
+        // re-gossiped — an unbounded key would otherwise bloat the replay
+        // tracker and re-broadcast frames. Byte-length, not char count.
+        if event.hlc.device_id.len() > MAX_DEVICE_ID_LEN {
+            return Err(format!(
+                "voting event device_id length {} exceeds MAX_DEVICE_ID_LEN {}",
+                event.hlc.device_id.len(),
+                MAX_DEVICE_ID_LEN
+            ));
+        }
+
         // ZEB-846 (Layer 1): reject an implausibly-future voting event
         // before it can be applied, observed into the adoption floor, or
         // re-gossiped. `receiver_now_ms` is this node's own trusted wall
@@ -3035,6 +3052,19 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         let event: SignedVotingEvent =
             ciborium::from_reader(packet).map_err(|e| format!("decode: {e}"))?;
 
+        // ZEB-861 (Component 1, sibling admission route): the same
+        // `device_id` length cap as `process_inbound` — backfill-pull is a
+        // second, independent decode route by which a NEW event is applied,
+        // so the `process_inbound` guard alone does not cover it. Byte-length,
+        // not char count.
+        if event.hlc.device_id.len() > MAX_DEVICE_ID_LEN {
+            return Err(format!(
+                "voting event device_id length {} exceeds MAX_DEVICE_ID_LEN {}",
+                event.hlc.device_id.len(),
+                MAX_DEVICE_ID_LEN
+            ));
+        }
+
         // ZEB-846 (Layer 1, sibling admission route): `process_inbound`'s
         // forward-skew reject does not automatically cover this path —
         // backfill-pull is a second, independent route by which a NEW
@@ -3171,6 +3201,18 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             if self.app_handle.is_some() {
                 match ciborium::from_reader::<SignedVotingEvent, _>(packet) {
                     Ok(pre_event) => {
+                        // ZEB-861: reject an over-length device_id at this first
+                        // (GUI-path) decode, so a flood of over-length frames does
+                        // not also pay the second decode inside `process_inbound`.
+                        // `process_inbound` carries the same guard for the headless
+                        // and backfill routes (which have no pre-decode).
+                        if pre_event.hlc.device_id.len() > MAX_DEVICE_ID_LEN {
+                            return Err(format!(
+                                "voting event device_id length {} exceeds MAX_DEVICE_ID_LEN {}",
+                                pre_event.hlc.device_id.len(),
+                                MAX_DEVICE_ID_LEN
+                            ));
+                        }
                         if pre_event.tier == Tier::Sortition
                             && pre_event.kind != PollEventKindCode::PollCreate
                         {
@@ -5920,6 +5962,218 @@ mod tests {
             now_ms,
             "a future-rejected backfilled event must NOT feed the adoption floor"
         );
+    }
+
+    /// ZEB-861 (Task 1): `process_inbound` rejects a voting event whose
+    /// `hlc.device_id` exceeds `MAX_DEVICE_ID_LEN` bytes, at decode time —
+    /// before the forward-skew block or any apply. Mirrors
+    /// `process_inbound_rejects_far_future_voting_event`'s harness.
+    #[tokio::test]
+    async fn process_inbound_rejects_over_length_device_id() {
+        let community_id = SpaceId([0xE5; 16]);
+        let (keypair, actor, pub_64) = fixture_identity_engine(0xE5);
+
+        let resolvers = Arc::new(FixedTestResolvers {
+            identity: HashMap::from([(actor, pub_64)]),
+            snapshot: MembershipSnapshot {
+                members: HashMap::from([(
+                    actor,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )]),
+            },
+        });
+        let id_resolver: Arc<dyn crate::community_voting_core::VotingIdentityResolver> =
+            resolvers.clone();
+        let mem_resolver: Arc<dyn crate::community_voting_log::MembershipSnapshotResolver> =
+            resolvers;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // device_id one byte past the cap: rejected at decode time.
+        let over_len_device = "a".repeat(MAX_DEVICE_ID_LEN + 1);
+        let event = crate::community_voting_core::build_signed_poll_create_tier1(
+            &keypair,
+            actor,
+            &good_tier1_config(),
+            Hlc {
+                wall_ms: now_ms,
+                logical: 0,
+                device_id: over_len_device,
+            },
+        )
+        .expect("build event");
+        let packet = encode_event(&event);
+
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let tracker = Arc::new(Mutex::new(VotingReplayTracker::new()));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+
+        let result = VotingLogEngine::<tauri::test::MockRuntime>::process_inbound(
+            community_id,
+            &voting_log,
+            &tracker,
+            Some(&id_resolver),
+            Some(&mem_resolver),
+            &floor,
+            None, // beacon_oracle — kd=ss authz not exercised here
+            &packet,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "an over-length device_id must be rejected at admission; got Ok"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("device_id length") && err.contains("exceeds"),
+            "error must mention the device_id length cap; got: {err:?}"
+        );
+
+        // Must not have been applied into the log: neither a poll projection
+        // NOR an entry in the global events log (rejection precedes append).
+        {
+            let log = voting_log.lock().await;
+            assert!(
+                log.polls.is_empty(),
+                "a length-rejected event must not create a poll"
+            );
+            assert!(
+                log.events.is_empty(),
+                "a length-rejected event must not be appended to the events log"
+            );
+        }
+    }
+
+    /// ZEB-861 (Task 1, sibling admission route): `apply_backfilled_event`
+    /// carries the same `device_id` length cap as `process_inbound` — it is
+    /// a second, independent decode route by which a NEW voting event is
+    /// verified + applied, so the `process_inbound` guard alone does not
+    /// cover it. Mirrors `apply_backfilled_event_rejects_far_future_voting_event`.
+    #[tokio::test]
+    async fn apply_backfilled_rejects_over_length_device_id() {
+        let community_id = SpaceId([0xE6; 16]);
+        let (key, owner, pub64) = fixture_identity_engine(0xE6);
+        let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+        let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let engine = start_backfill_test_engine(
+            community_id,
+            owner,
+            pub64,
+            Arc::clone(&voting_log),
+            floor.clone(),
+        )
+        .await;
+
+        let over_len_device = "a".repeat(MAX_DEVICE_ID_LEN + 1);
+        let packet = encode_event(&signed_poll_create(&key, owner, &over_len_device, 1_000));
+
+        let result = engine.apply_backfilled_event(&packet).await;
+        assert!(
+            result.is_err(),
+            "an over-length device_id must be rejected at admission; got {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("device_id length") && err.contains("exceeds"),
+            "error must mention the device_id length cap; got: {err:?}"
+        );
+
+        {
+            let log = voting_log.lock().await;
+            assert!(
+                log.polls.is_empty(),
+                "a length-rejected backfilled event must not create a poll"
+            );
+            assert!(
+                log.events.is_empty(),
+                "a length-rejected backfilled event must not be appended to the events log"
+            );
+        }
+    }
+
+    /// ZEB-861 (Task 1): a canonical 32-hex-char `device_id` and a boundary
+    /// exactly-`MAX_DEVICE_ID_LEN` (64-char) `device_id` both pass the length
+    /// guard — neither is rejected with the length error (they may still be
+    /// gated by later checks, but never by the byte-length cap). Guards
+    /// against an off-by-one that would reject at the boundary.
+    #[tokio::test]
+    async fn process_inbound_accepts_max_length_device_id() {
+        let community_id = SpaceId([0xE7; 16]);
+        let (keypair, actor, pub_64) = fixture_identity_engine(0xE7);
+
+        let resolvers = Arc::new(FixedTestResolvers {
+            identity: HashMap::from([(actor, pub_64)]),
+            snapshot: MembershipSnapshot {
+                members: HashMap::from([(
+                    actor,
+                    MemberAttrs {
+                        power: 1,
+                        vouching_depth: 0,
+                    },
+                )]),
+            },
+        });
+        let id_resolver: Arc<dyn crate::community_voting_core::VotingIdentityResolver> =
+            resolvers.clone();
+        let mem_resolver: Arc<dyn crate::community_voting_log::MembershipSnapshotResolver> =
+            resolvers;
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Canonical 32-hex-char id, and a boundary exactly-64-char id.
+        let canonical_32 = "a".repeat(32);
+        let boundary_64 = "b".repeat(MAX_DEVICE_ID_LEN);
+        assert_eq!(boundary_64.len(), MAX_DEVICE_ID_LEN);
+
+        for device_id in [canonical_32, boundary_64] {
+            let event = crate::community_voting_core::build_signed_poll_create_tier1(
+                &keypair,
+                actor,
+                &good_tier1_config(),
+                Hlc {
+                    wall_ms: now_ms,
+                    logical: 0,
+                    device_id: device_id.clone(),
+                },
+            )
+            .expect("build event");
+            let packet = encode_event(&event);
+
+            let voting_log = Arc::new(Mutex::new(VotingLog::new()));
+            let tracker = Arc::new(Mutex::new(VotingReplayTracker::new()));
+            let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+
+            let result = VotingLogEngine::<tauri::test::MockRuntime>::process_inbound(
+                community_id,
+                &voting_log,
+                &tracker,
+                Some(&id_resolver),
+                Some(&mem_resolver),
+                &floor,
+                None, // beacon_oracle — kd=ss authz not exercised here
+                &packet,
+            )
+            .await;
+
+            // The length guard must NOT be what rejects these in-bounds ids.
+            if let Err(err) = &result {
+                assert!(
+                    !err.contains("device_id length"),
+                    "device_id of length {} must not trip the length cap; got: {err:?}",
+                    device_id.len()
+                );
+            }
+        }
     }
 
     // ── ZEB-298 Task 5: maybe_emit_delegate_on_behalf ──────────────────────
