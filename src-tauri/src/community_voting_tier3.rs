@@ -1019,8 +1019,17 @@ impl Tier3PollState {
 
             // kd=cl PollClose: record close_event_hash.
             PollEventKindCode::PollClose => {
-                let hash = sha256_of_signing_bytes(ev);
-                self.close_event_hash = Some(hash);
+                // ZEB-859/858: first-close-wins. close_event_hash is the second half of
+                // the verify_sr memo key; overwriting it on every applied kd=cl would let
+                // an insider churn the key (distinct closes all pass verify_cl in the
+                // pre-finalize window) and bypass the se-mode decrypt DoS bound. Freezing
+                // on the first close per node is consistent with the engine-auto trigger's
+                // `close_event_hash.is_some()` short-circuit and the documented
+                // "close_event_hash may legitimately differ across replicas" tolerance
+                // (each node freezes on its own first-observed close).
+                if self.close_event_hash.is_none() {
+                    self.close_event_hash = Some(sha256_of_signing_bytes(ev));
+                }
             }
 
             // kd=rs PollResult (Tier 3): decode StarResult from payload;
@@ -1118,6 +1127,46 @@ impl Tier3PollState {
             // Per spec §6 degenerate path: always Ratification (status_quo always present).
             Stage::Ratification
         }
+    }
+
+    /// ZEB-859: the deterministic engine-auto close condition for a `kd=cl`
+    /// (PollClose) event, evaluated at a caller-supplied wall-clock ms.
+    ///
+    /// This is the SINGLE shared predicate for both:
+    ///   * the engine-auto close trigger (`trigger_kd_cl` in
+    ///     `community_voting_log_engine.rs`), which passes its receiver-clamped
+    ///     `last_hlc.wall_ms`, and
+    ///   * `verify_cl`, which passes the receiver-clamped wall of an INCOMING
+    ///     peer close event.
+    ///
+    /// Keeping the two callers on this one predicate is load-bearing: any drift
+    /// would let a node reject its own legitimately-triggered close (the trigger
+    /// mint would satisfy a condition the verifier then rejects). Do NOT inline
+    /// a second copy of this logic.
+    ///
+    /// The condition is: the poll is in `Ratification` stage at `at_wall_ms` AND
+    /// the full lifecycle window (deliberation + drafting + ratification) has
+    /// elapsed relative to `poll_create_hlc.wall_ms`. Callers are responsible
+    /// for clamping `at_wall_ms` to the receiver's own clock (never a raw peer
+    /// wall) before calling — this method trusts `at_wall_ms` as given.
+    pub fn close_condition_met(&self, at_wall_ms: u64) -> bool {
+        // Mirror the HLC the engine trigger builds: only `wall_ms` is
+        // significant to `current_stage_at`; `logical`/`device_id` are inert.
+        let at_hlc = Hlc {
+            wall_ms: at_wall_ms,
+            logical: 0,
+            device_id: String::new(),
+        };
+        if !matches!(self.current_stage_at(&at_hlc), Stage::Ratification) {
+            return false;
+        }
+        // Total window = deliberation + drafting + ratification.
+        let total_window_ms: u64 = (self.meta.config.deliberation_window_seconds as u64
+            + self.meta.config.drafting_window_seconds as u64
+            + self.meta.config.ratification_window_seconds as u64)
+            * 1000;
+        let created_wall = self.meta.poll_create_hlc.wall_ms;
+        at_wall_ms >= created_wall.saturating_add(total_window_ms)
     }
 
     /// Compute the current mini-public set at HLC watermark `now`.
@@ -1262,6 +1311,12 @@ pub enum VerifyError {
     BackupPoolNotExhausted { declined: usize, capacity: usize },
     #[error("PollResult tally mismatch: recomputed differs from claimed")]
     TallyMismatch,
+    /// se-mode `verify_sr`: fewer than `threshold` committee tally shares have
+    /// been applied on this node, so the secret tally cannot yet be recomputed.
+    /// Distinct from `TallyMismatch` — the claim is *unconfirmable here yet*, not
+    /// forged (a later share may make it verifiable). Fail-closed, but retryable.
+    #[error("tally shares not yet available to confirm result (below threshold)")]
+    TallySharesNotReady,
     #[error("payload decode failed: {0}")]
     PayloadDecode(String),
     #[error("ballot validation failed: {0}")]
@@ -1277,6 +1332,17 @@ pub enum VerifyError {
     /// so a PollResult or RatificationBallot event arriving now is premature.
     #[error("status_quo not yet synthesized (poll not in Drafting/Ratification stage)")]
     StatusQuoNotSynthesized,
+    /// verify_cl (ZEB-859): a PollClose event whose (receiver-clamped) HLC wall
+    /// does not satisfy the engine's deterministic close condition — the poll is
+    /// not in Ratification at that wall, or the total window has not elapsed.
+    #[error("close condition not met at event.hlc (premature PollClose)")]
+    CloseConditionNotMet,
+    /// verify_sr (ZEB-858): a kd=rs PollResult targeting a poll already in the
+    /// terminal `Stage::Finalized`. The early-out rejects it BEFORE the se-mode
+    /// threshold-decrypt (`recover_secret_tally`) runs — a finalized poll's
+    /// result is immutable, so any further kd=rs is spurious or a forgery.
+    #[error("poll already finalized; kd=rs is terminal-rejected")]
+    PollAlreadyFinalized,
 }
 
 // ── Verify functions ──────────────────────────────────────────────────────────
@@ -1393,10 +1459,116 @@ pub fn verify_sf(
     Ok(())
 }
 
+/// CL1 verify (ZEB-859): a peer-supplied `kd=cl` (PollClose) event is legitimate
+/// only if it satisfies the SAME deterministic close condition the engine-auto
+/// close trigger uses — the poll is in `Ratification` and the full lifecycle
+/// window has elapsed. Because `kd=cl` was previously ungated at ingest (any
+/// member with a valid signature could inject a forged early close), a forged
+/// close could prematurely satisfy `verify_sr`'s R1 precondition; this verifier
+/// closes that hole.
+///
+/// The incoming event's `hlc.wall_ms` is a peer-controlled value, so it is
+/// clamped to the receiver's own clock (`receiver_now_ms + MAX_FORWARD_SKEW_MS`)
+/// before the condition is checked — a future-stamped close cannot jump the
+/// window. This mirrors the receiver-now clamp the engine trigger already
+/// applies to `last_hlc.wall_ms` (ZEB-846 Layer 2).
+///
+/// Note: this validates the close *condition*, never a specific
+/// `close_event_hash` — that hash may legitimately diverge across replicas under
+/// reordering and is not in any cross-peer state-root.
+pub fn verify_cl(
+    event: &SignedVotingEvent,
+    poll_state: &Tier3PollState,
+    receiver_now_ms: u64,
+) -> Result<(), VerifyError> {
+    // Never trust the raw peer wall: clamp the event's HLC wall down to at most
+    // receiver_now + MAX_FORWARD_SKEW_MS (a past/present wall passes unchanged).
+    let clamped_wall = crate::clock_trust::clamp_future(
+        event.hlc.wall_ms,
+        receiver_now_ms,
+        crate::clock_trust::MAX_FORWARD_SKEW_MS,
+    );
+    if poll_state.close_condition_met(clamped_wall) {
+        Ok(())
+    } else {
+        Err(VerifyError::CloseConditionNotMet)
+    }
+}
+
+/// ZEB-858: shared poll-state → expected-result core, used by BOTH [`verify_sr`]
+/// and the memoized `kd=rs` ingest path (`community_voting_log_engine`).
+///
+/// Builds the deterministic ratification candidate ordering (status_quo synth +
+/// `drafting_advancers` + `ratification_candidates_ordering`) and recomputes the
+/// expected STAR result via [`recompute_expected_result`]. This is exactly the
+/// part BOTH callers share; the R1 (close-applied) precondition and the
+/// `payload.result` comparison stay in the callers.
+///
+/// The expensive work lives here: in se-mode the recompute is a threshold
+/// decrypt (`recover_secret_tally` → Lagrange-combine + BSGS dlog). The result
+/// is a **pure function of `poll_state`** (candidates + committee shares +
+/// ratification ballots), so this takes no `event` — which is exactly what lets
+/// the ingest path memoize it on `(poll_id, close_event_hash)` and skip the
+/// recompute on a flood of distinct-signed kd=rs for the same closed poll.
+///
+/// Errors mirror `verify_sr`'s (post-decode) failure modes:
+/// - `StatusQuoNotSynthesized` — poll not yet at/past Drafting open.
+/// - `TallySharesNotReady` — se-mode, fewer than `threshold` committee shares
+///   applied on this node yet (the claim is *unconfirmable here yet*, retryable).
+pub(crate) fn expected_result_from_state(
+    poll_state: &Tier3PollState,
+) -> Result<crate::community_voting_star::StarResult, VerifyError> {
+    // Build candidate list from state (same as the ordered list used at
+    // ratification open). ZEB-850 (Task 2 completion): status_quo is synthesized
+    // on demand and never persisted into `candidates`, so mirror the apply-time
+    // locals (`Tier3PollState::apply_event`, community_voting_tier3.rs:742-743)
+    // and include it before ranking — otherwise `drafting_advancers` returns None
+    // and the caller rejects every legitimate peer kd=rs. Prematurity is caught by
+    // the caller's R1 close-applied / stage checks.
+    let sq = synthesize_status_quo(&poll_state.meta.poll_id);
+    let sq_hash = sq.event_hash;
+    let primary_size = poll_state.meta.config.sortition_size as usize;
+    let mut all_candidates = poll_state.candidates.clone();
+    all_candidates.push(sq);
+    let advancers = drafting_advancers(&all_candidates, primary_size, sq_hash)
+        .ok_or(VerifyError::StatusQuoNotSynthesized)?;
+    let ordered_candidates = ratification_candidates_ordering(&advancers, sq_hash);
+
+    // ZEB-850 (Task 2 completion): recompute the result the SAME way the engine
+    // produces it, per privacy mode. se-mode is a threshold-decrypted tally
+    // (`recover_secret_tally`, mirroring `try_finalize_secret_tally`), NOT a
+    // plaintext STAR tally — `tally_star` skips se-mode ciphertext ballots and
+    // would return an all-zero result. `recover_secret_tally` is deterministic
+    // across replicas (Lagrange invariance), so this is a real authz check.
+    //
+    // ZEB-858: `None` (se-mode, fewer than `threshold` shares applied here) means
+    // this node cannot YET confirm the claim → `TallySharesNotReady` (retryable),
+    // distinct from a forged claim (which the caller maps to `TallyMismatch`).
+    recompute_expected_result(poll_state, &ordered_candidates)
+        .ok_or(VerifyError::TallySharesNotReady)
+}
+
+/// ZEB-858: decode the claimed `StarResult` from a `kd=rs` event payload,
+/// mapping a decode failure to `PayloadDecode` (matching [`verify_sr`]). Exposed
+/// for the memoized ingest path, which compares the claim against the memoized
+/// expected result WITHOUT re-running the recompute.
+pub(crate) fn decode_poll_result_claim(
+    event: &SignedVotingEvent,
+) -> Result<crate::community_voting_star::StarResult, VerifyError> {
+    let payload: Tier3PollResultPayload =
+        decode_payload(&event.payload).map_err(VerifyError::PayloadDecode)?;
+    Ok(payload.result)
+}
+
 /// SR1 verify: `PollResult` tally must be bit-identical to deterministic re-compute.
 ///
 /// R1 prerequisite: `poll_state.close_event_hash` must be `Some` (kd=cl already applied).
-/// R2: re-run `tally_star` over `poll_state.ratification_ballots` and compare.
+/// R2: re-run the per-privacy-mode recompute over `poll_state` and compare.
+///
+/// ZEB-858: the R2 recompute is now shared with the memoized ingest path via
+/// [`expected_result_from_state`]; this verifier's observable behavior is
+/// unchanged (R1 → payload decode → StatusQuoNotSynthesized/TallySharesNotReady
+/// → TallyMismatch, in that order).
 pub fn verify_sr(
     event: &SignedVotingEvent,
     poll_state: &Tier3PollState,
@@ -1410,41 +1582,9 @@ pub fn verify_sr(
     let payload: Tier3PollResultPayload =
         decode_payload(&event.payload).map_err(VerifyError::PayloadDecode)?;
 
-    // Recompute: derive ratification candidates ordering from state, then tally.
-    let sq = synthesize_status_quo(&poll_state.meta.poll_id);
-    let sq_hash = sq.event_hash;
-
-    // Build candidate list from state (same as the ordered list used at ratification open).
-    // ZEB-850 (Task 2 completion): status_quo is synthesized on demand and never
-    // persisted into `candidates`, so mirror the apply-time locals
-    // (`Tier3PollState::apply_event`, community_voting_tier3.rs:742-743) and include
-    // it before ranking — otherwise `drafting_advancers` returns None and this
-    // verifier rejects every legitimate peer kd=rs. Prematurity is already caught
-    // by the R1 close-applied check above.
-    let primary_size = poll_state.meta.config.sortition_size as usize;
-    let mut all_candidates = poll_state.candidates.clone();
-    all_candidates.push(sq);
-    let advancers = drafting_advancers(&all_candidates, primary_size, sq_hash)
-        .ok_or(VerifyError::StatusQuoNotSynthesized)?;
-    let ordered_candidates = ratification_candidates_ordering(&advancers, sq_hash);
-
-    // ZEB-850 (Task 2 completion): recompute the result the SAME way the engine
-    // produces it, per privacy mode. se-mode is a threshold-decrypted tally
-    // (`recover_secret_tally`, mirroring `try_finalize_secret_tally`), NOT a
-    // plaintext STAR tally — `tally_star` skips se-mode ciphertext ballots and
-    // would return an all-zero result, so verify_sr would reject every legitimate
-    // peer se-mode kd=rs. `recover_secret_tally` is deterministic across replicas
-    // (Lagrange invariance), so this is a real authz check, not a weakening:
-    // a forged result recovers to a different tally → TallyMismatch. `None`
-    // (fewer than `threshold` shares applied) means this node cannot yet confirm
-    // the claim → fail-closed.
-    let recomputed = match poll_state.meta.config.privacy_mode.as_str() {
-        "se" => recover_secret_tally(poll_state, &ordered_candidates)
-            .ok_or(VerifyError::TallyMismatch)?,
-        _ => tally_star(&ordered_candidates, &poll_state.ratification_ballots),
-    };
-
-    if recomputed != payload.result {
+    // R2: recompute via the shared core and compare bit-for-bit.
+    let expected = expected_result_from_state(poll_state)?;
+    if expected != payload.result {
         return Err(VerifyError::TallyMismatch);
     }
 
@@ -1763,6 +1903,32 @@ pub fn recover_secret_tally(
         ));
     }
     None
+}
+
+/// Recompute the PollResult a legitimate producer would claim, per privacy mode.
+///
+/// This is the single deterministic tally-recompute shared by `verify_sr` (and,
+/// from ZEB-857/859, the ingest arm). It mirrors the engine's own result
+/// production:
+/// - `se`: threshold-decrypted secret tally (`recover_secret_tally`). Returns
+///   `None` when fewer than `threshold` committee shares have been applied on
+///   this node — the tally is not yet recoverable here (retryable), which the
+///   caller must distinguish from a genuine mismatch.
+/// - otherwise (`pu`): plaintext STAR tally (`tally_star`), always `Some`.
+///
+/// `ordered_candidates` must be the canonical ratification ordering
+/// (`ratification_candidates_ordering`); its length is the spec's `n`.
+fn recompute_expected_result(
+    poll_state: &Tier3PollState,
+    ordered_candidates: &[crate::community_voting_star::CandidateRef],
+) -> Option<crate::community_voting_star::StarResult> {
+    match poll_state.meta.config.privacy_mode.as_str() {
+        "se" => recover_secret_tally(poll_state, ordered_candidates),
+        _ => Some(tally_star(
+            ordered_candidates,
+            &poll_state.ratification_ballots,
+        )),
+    }
 }
 
 /// LWW-dedup helper for se-mode ratification ballots. Phase 6 v1 ships a
@@ -3617,6 +3783,114 @@ mod tests {
         assert_eq!(verify_sr(&ev, &poll), Err(VerifyError::TallyMismatch));
     }
 
+    // 15b. ZEB-858: se-mode poll whose committee tally shares are below
+    // threshold — `recover_secret_tally` returns `None`, so this node cannot
+    // yet confirm the claimed result. verify_sr must surface the DISTINCT
+    // `TallySharesNotReady` (retryable), NOT `TallyMismatch` (forgery).
+    #[test]
+    fn verify_sr_shares_not_ready_returns_distinct_error() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // One real ballot + one real tally share. Committee threshold is 2,
+        // so a single share leaves the secret tally unrecoverable (None).
+        let ballot = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        let rb_ev = ts_apply_helpers::rb_event_at_with_actor(
+            RATIFICATION_OPEN_MS,
+            committee.member_addrs[0],
+            &ballot,
+        );
+        state.apply_event(&rb_ev).expect("rb ok");
+        let share = ts_apply_helpers::build_real_tally_share_payload(&state, &committee, 0, 0);
+        let ts_ev = ts_apply_helpers::ts_event_at_with_actor(
+            RATIFICATION_END_MS,
+            committee.member_addrs[0],
+            &share,
+        );
+        state.apply_event(&ts_ev).expect("ts apply");
+        // Satisfy R1: a kd=cl on its own (proposer) lane records close_event_hash.
+        let cl_ev = make_event(
+            PollEventKindCode::PollClose,
+            RATIFICATION_END_MS + 1000,
+            addr(0xff),
+        );
+        state.apply_event(&cl_ev).expect("cl");
+        // Any claimed result — the recompute is unavailable, so it is unconfirmable.
+        let payload = Tier3PollResultPayload {
+            poll_id: poll_id(),
+            result: star_result(),
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::PollResult,
+            RATIFICATION_END_MS + 2000,
+            addr(0xfe),
+            encode(&payload),
+        );
+        assert_eq!(
+            verify_sr(&ev, &state),
+            Err(VerifyError::TallySharesNotReady)
+        );
+    }
+
+    // 15c. ZEB-858: se-mode poll with a FULLY recoverable tally (threshold
+    // shares applied) but a deliberately wrong claimed result. The recompute
+    // succeeds and differs from the claim → genuine forgery → `TallyMismatch`
+    // (the split must NOT weaken forgery detection).
+    #[test]
+    fn verify_sr_forgery_returns_tally_mismatch() {
+        let (mut state, committee) =
+            ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
+        // Three ballots so the recompute yields non-zero score sums.
+        let ballots = [[5u64, 1, 0], [5, 2, 0], [5, 3, 0]];
+        for (i, scores) in ballots.iter().enumerate() {
+            let payload = ts_apply_helpers::build_real_se_ballot_payload(&committee, scores);
+            let ev = ts_apply_helpers::rb_event_at_with_actor(
+                RATIFICATION_OPEN_MS + i as u64,
+                committee.member_addrs[i],
+                &payload,
+            );
+            state.apply_event(&ev).expect("rb apply");
+        }
+        // Two valid shares (threshold = 2-of-3) → recover_secret_tally is Some.
+        for member_idx in [0, 1] {
+            let ts_payload =
+                ts_apply_helpers::build_real_tally_share_payload(&state, &committee, member_idx, 0);
+            let ev = ts_apply_helpers::ts_event_at_with_actor(
+                RATIFICATION_END_MS + member_idx as u64,
+                committee.member_addrs[member_idx],
+                &ts_payload,
+            );
+            state.apply_event(&ev).expect("ts apply");
+        }
+        // Satisfy R1.
+        let cl_ev = make_event(
+            PollEventKindCode::PollClose,
+            RATIFICATION_END_MS + 1000,
+            addr(0xff),
+        );
+        state.apply_event(&cl_ev).expect("cl");
+        // Deliberately wrong result: real recompute yields non-zero total_scores.
+        let wrong_result = StarResult {
+            winner: crate::community_voting_star::CandidateRef {
+                event_hash: [0x00; 32],
+                approval_count: 0,
+            },
+            finalists: vec![],
+            total_scores: vec![0, 0, 0],
+            runoff_votes: vec![0],
+        };
+        let payload = Tier3PollResultPayload {
+            poll_id: poll_id(),
+            result: wrong_result,
+        };
+        let ev = make_event_with_payload(
+            PollEventKindCode::PollResult,
+            RATIFICATION_END_MS + 2000,
+            addr(0xfe),
+            encode(&payload),
+        );
+        assert_eq!(verify_sr(&ev, &state), Err(VerifyError::TallyMismatch));
+    }
+
     // ── verify_ratification_ballot tests ─────────────────────────────────────
 
     /// Build a poll that is in Stage::Ratification with status_quo + 1 real candidate.
@@ -3642,6 +3916,139 @@ mod tests {
         let sq = synthesize_status_quo(&poll.meta.poll_id);
         poll.candidates.push(sq);
         poll
+    }
+
+    // ── ZEB-859: verify_cl + close_condition_met ─────────────────────────────
+    //
+    // `poll_in_ratification()` builds a `pu`-mode poll with create_wall=0 and
+    // deliberation/drafting/ratification windows of 10s each, so:
+    //   * total_window_ms       = (10+10+10)*1000 = 30_000
+    //   * Ratification stage     opens at wall >= dw+fw = 20_000
+    //   * close condition (kd=cl) is met at wall >= create + total = 30_000
+
+    /// A close event whose (clamped) wall is exactly `create + total_window`
+    /// and whose stage is Ratification is a legitimate engine-auto close → Ok.
+    #[test]
+    fn verify_cl_accepts_legitimate_close() {
+        let poll = poll_in_ratification();
+        let close_wall = 30_000; // create(0) + total_window(30_000)
+        let ev = make_event(PollEventKindCode::PollClose, close_wall, addr(7));
+        // receiver_now == event wall ⇒ clamp is a no-op.
+        assert_eq!(verify_cl(&ev, &poll, close_wall), Ok(()));
+    }
+
+    /// A close event whose stage is still before Ratification (here Drafting,
+    /// at create + deliberation) must be rejected regardless of the window math.
+    #[test]
+    fn verify_cl_rejects_premature_stage() {
+        let poll = poll_in_ratification();
+        let drafting_wall = 10_000; // create(0) + deliberation(10_000) ⇒ Drafting
+        let ev = make_event(PollEventKindCode::PollClose, drafting_wall, addr(7));
+        assert_eq!(
+            verify_cl(&ev, &poll, drafting_wall),
+            Err(VerifyError::CloseConditionNotMet)
+        );
+    }
+
+    /// Stage is Ratification but the ratification window has NOT fully elapsed
+    /// (25_000 is past the 20_000 Ratification boundary but below the 30_000
+    /// close threshold) → rejected.
+    #[test]
+    fn verify_cl_rejects_window_not_elapsed() {
+        let poll = poll_in_ratification();
+        let mid_ratification_wall = 25_000; // Ratification (>=20_000) but < 30_000
+        let ev = make_event(PollEventKindCode::PollClose, mid_ratification_wall, addr(7));
+        assert_eq!(
+            verify_cl(&ev, &poll, mid_ratification_wall),
+            Err(VerifyError::CloseConditionNotMet)
+        );
+    }
+
+    /// A future-stamped close event (peer wall = create + total + 10h) whose
+    /// receiver clock says almost no time has passed must be rejected: the
+    /// receiver-now clamp (`event.wall.min(now + MAX_FORWARD_SKEW)`) pulls the
+    /// effective wall below the close threshold. Requires total_window >
+    /// MAX_FORWARD_SKEW so the clamp is decisive, hence the enlarged windows.
+    #[test]
+    fn verify_cl_rejects_future_stamped_wall() {
+        let mut poll = poll_in_ratification();
+        // total_window = (60+60+600)*1000 = 720_000 ms (12 min) > MAX_FORWARD_SKEW (5 min).
+        poll.meta.config.deliberation_window_seconds = 60;
+        poll.meta.config.drafting_window_seconds = 60;
+        poll.meta.config.ratification_window_seconds = 600;
+        let total_window_ms: u64 = 720_000;
+        let ten_hours_ms: u64 = 10 * 60 * 60 * 1000;
+        let future_wall = total_window_ms + ten_hours_ms; // peer claims window elapsed
+        let receiver_now = poll.meta.poll_create_hlc.wall_ms; // == 0: real clock ≈ create
+        let ev = make_event(PollEventKindCode::PollClose, future_wall, addr(7));
+        // Sanity: an UNCLAMPED evaluation at the raw peer wall WOULD pass — proving
+        // the clamp (not the stage/window predicate) is what rejects the forgery.
+        assert!(poll.close_condition_met(future_wall));
+        assert_eq!(
+            verify_cl(&ev, &poll, receiver_now),
+            Err(VerifyError::CloseConditionNotMet)
+        );
+    }
+
+    /// Parity guard: `close_condition_met` fires exactly at the wall where the
+    /// engine's `trigger_kd_cl` predicate fires (create + total_window) and not
+    /// one millisecond before. Any drift here would make a node reject its own
+    /// legitimate engine-auto close.
+    #[test]
+    fn verify_cl_matches_trigger_predicate() {
+        let poll = poll_in_ratification();
+        let close_threshold = 30_000; // create(0) + total_window(30_000)
+        assert!(!poll.close_condition_met(close_threshold - 1));
+        assert!(poll.close_condition_met(close_threshold));
+    }
+
+    /// ZEB-859/858: `apply_event`'s PollClose arm is first-close-wins. The
+    /// `close_event_hash` (the second half of the verify_sr memo key) freezes on
+    /// the first applied kd=cl; a SECOND distinct kd=cl on a different lane must
+    /// NOT overwrite it. Without this an insider could spam distinct closes (each
+    /// legitimate in the pre-finalize window) to churn the memo key, force memo
+    /// misses, and re-run the expensive se-mode threshold-decrypt — bypassing the
+    /// DoS bound. The post-match watermark tail must STILL run for the second
+    /// event (only the hash assignment is gated), so the second apply returns Ok.
+    #[test]
+    fn apply_kd_cl_first_close_wins_hash_stable() {
+        let mut poll = poll_in_ratification();
+
+        // First close (lane = addr(7)) freezes close_event_hash.
+        let first_cl = make_event(PollEventKindCode::PollClose, 30_000, addr(7));
+        poll.apply_event(&first_cl).expect("first cl applies");
+        let first_hash = poll.close_event_hash.expect("first close records a hash");
+        assert_eq!(
+            first_hash,
+            sha256_of_signing_bytes(&first_cl),
+            "close_event_hash is the first close's signing-bytes hash",
+        );
+
+        // A SECOND distinct close (different signer + wall ⇒ different signing
+        // bytes ⇒ different hash) on its own lane. Fixture sanity: it hashes
+        // differently, so an overwrite would be observable.
+        let second_cl = make_event(PollEventKindCode::PollClose, 31_000, addr(8));
+        assert_ne!(
+            sha256_of_signing_bytes(&second_cl),
+            first_hash,
+            "fixture sanity: the second close hashes differently",
+        );
+        // The apply itself succeeds — the (actor, device) watermark tail still
+        // runs for the second event even though the hash assignment is gated.
+        poll.apply_event(&second_cl)
+            .expect("second cl applies (watermark tail still runs)");
+        assert_eq!(
+            poll.close_event_hash,
+            Some(first_hash),
+            "first-close-wins: close_event_hash unchanged by the second kd=cl",
+        );
+        // And the second event's lane watermark was raised (tail ran).
+        let lane = (second_cl.actor, second_cl.hlc.device_id.clone());
+        assert_eq!(
+            poll.last_received_hlc.get(&lane).copied(),
+            Some((31_000, 0)),
+            "post-match watermark tail ran for the gated second close",
+        );
     }
 
     // 16. verify_rb_actor_in_full_electorate_accepted
