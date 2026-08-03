@@ -29,14 +29,28 @@ use crate::community_membership::{
     bootstrap_admit_open_publisher, enrolled_key_from_cert, prior_state_at_hlc, MemberStatus,
     SignedMembershipEvent,
 };
+use crate::friend_intro::KeyedSlidingWindow;
 use crate::open_join_auth::verify_epoch_auth;
 use crate::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 /// Max admissions accepted per rolling window before excess is shed.
 pub const OPEN_JOIN_RATE_LIMIT_PER_WINDOW: usize = 20;
 /// Rolling rate-limit window, in milliseconds.
 pub const OPEN_JOIN_RATE_LIMIT_WINDOW_MS: u64 = 60_000;
+
+/// ZEB-853 (B7): pre-auth Tier-1 per-connection-endpoint cap over
+/// [`OPEN_JOIN_CONN_WINDOW_MS`]. Generous — one iroh endpoint may legitimately
+/// retry a join (dial → resolve → re-dial) — but a genuine single-endpoint
+/// flood is still shed BEFORE any packet read or pre-consent crypto. Mirrors
+/// `friend_intro::FRIEND_HANDSHAKE_PER_CONNECTION_MAX`.
+pub const OPEN_JOIN_CONN_MAX: usize = 40;
+/// ZEB-853 (B7): sliding window for the Tier-1 connection shield (1h, matching
+/// the friend/v1 shield). Distinct from the per-source ADMISSION budget
+/// ([`OPEN_JOIN_RATE_LIMIT_WINDOW_MS`], 60s) — the shield paces raw connection
+/// attempts before decode, the budget paces successful admissions after crypto.
+pub const OPEN_JOIN_CONN_WINDOW_MS: u64 = 60 * 60 * 1000;
 
 /// How old an [`OpenJoinRequest`]'s `created_at` may be (relative to the
 /// beacon's wall clock) before it is rejected as `Stale`. Distinct from the
@@ -88,12 +102,19 @@ pub struct OpenJoinAdmitOk {
     pub member_events_snapshot: Vec<SignedMembershipEvent>,
 }
 
-/// Per-window admission limiter + nonce-replay cache. The window is coarse
-/// (a count per rolling window); the nonce cache rejects exact-replay within
-/// the retention horizon and is bounded by eviction.
+/// Per-source admission limiter + nonce-replay cache. The admission budget is
+/// keyed PER-SOURCE (ZEB-853, keyed on the connecting `remote_id`) so one
+/// flooding source can't exhaust the shared budget; the nonce cache rejects
+/// exact-replay within the retention horizon and is bounded by eviction.
 pub struct OpenJoinRateLimiter {
-    window_start_ms: u64,
-    count_in_window: usize,
+    /// ZEB-853 (B7, Half 2): per-source admission windows, keyed on the
+    /// connecting `remote_id`. This was a single global `window_start_ms` /
+    /// `count_in_window` counter — one source could exhaust the whole 20/60s
+    /// budget and lock out every legitimate open-joiner. Each source now gets
+    /// its OWN 20/60s window, and the map is bounded against rotating-key floods
+    /// by [`KeyedSlidingWindow`]'s `MAX_WINDOW_KEYS` eviction (the same audited
+    /// primitive the friend/pex/intro shields use).
+    windows: KeyedSlidingWindow<[u8; 32]>,
     seen_nonces: HashSet<[u8; 16]>,
     nonce_seen_at: HashMap<[u8; 16], u64>,
     /// ZEB-711: monotonic epoch for the production limiter timeline. `allow` /
@@ -113,8 +134,10 @@ impl OpenJoinRateLimiter {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
-            window_start_ms: 0,
-            count_in_window: 0,
+            windows: KeyedSlidingWindow::new(
+                OPEN_JOIN_RATE_LIMIT_PER_WINDOW,
+                OPEN_JOIN_RATE_LIMIT_WINDOW_MS,
+            ),
             seen_nonces: HashSet::new(),
             nonce_seen_at: HashMap::new(),
             epoch: tokio::time::Instant::now(),
@@ -129,32 +152,15 @@ impl OpenJoinRateLimiter {
         self.epoch.elapsed().as_millis() as u64
     }
 
-    /// Returns true if a request is allowed; rolls the window over when it has
-    /// elapsed. Mutates the in-window counter only when allowing.
-    fn allow(&mut self, limiter_now_ms: u64) -> bool {
-        // Anchor the window on the FIRST request of a window, not on limiter
-        // construction. ZEB-711 moved the timeline to a monotonic epoch that
-        // starts at construction, so a fresh limiter has `window_start_ms == 0`
-        // while `limiter_now_ms` is small elapsed-ms. The old wall-clock code
-        // always rolled from the 0 sentinel on the first call (Unix-epoch ms >>
-        // window), which anchored the window at the first request; without this
-        // an acceptor that idles before the first open-join gets a shortened
-        // first window and sheds early (Qodo, PR #580). `count_in_window == 0`
-        // holds only before a window's first request — every admit leaves it
-        // >= 1, and a rollover resets to 0 then re-increments in the same call.
-        if self.count_in_window == 0 {
-            self.window_start_ms = limiter_now_ms;
-        } else if limiter_now_ms.saturating_sub(self.window_start_ms)
-            >= OPEN_JOIN_RATE_LIMIT_WINDOW_MS
-        {
-            self.window_start_ms = limiter_now_ms;
-            self.count_in_window = 0;
-        }
-        if self.count_in_window >= OPEN_JOIN_RATE_LIMIT_PER_WINDOW {
-            return false;
-        }
-        self.count_in_window += 1;
-        true
+    /// Returns true if a request from `source` is allowed within THAT source's
+    /// own rolling window; records the admission when allowed. ZEB-853 (B7):
+    /// keyed per-source (the connecting `remote_id`) so one flooding source
+    /// can't spend another's budget. [`KeyedSlidingWindow::admit`] timestamps
+    /// actual requests, so an idle-before-first-request acceptor gets its full
+    /// first window with no separate anchor bookkeeping (the wall-vs-monotonic
+    /// and idle-anchor guarantees are pinned by the tests below).
+    fn allow(&mut self, source: [u8; 32], limiter_now_ms: u64) -> bool {
+        self.windows.admit(source, limiter_now_ms)
     }
 
     /// Returns true if `nonce` was already seen within the retention horizon.
@@ -187,6 +193,84 @@ impl OpenJoinRateLimiter {
     }
 }
 
+/// ZEB-853 (B7): pre-auth Tier-1 connection shield for the open-join / invite
+/// handshake ALPN — the ZEB-700 `FriendRateLimiter` posture applied to the
+/// `IrohInviteHandshakeAcceptor`. Keyed on the connecting endpoint's
+/// authenticated `remote_id` (un-spoofable), it sheds a flooding source BEFORE
+/// the acceptor reads or decodes the packet and BEFORE the two ed25519
+/// verifications inside [`verify_and_admit_open_join`] — bounding the unbounded
+/// pre-consent crypto anyone holding the public open-invite link could otherwise
+/// force by opening connections. Its budget is disjoint from the friend / pex /
+/// intro shields (its own instance).
+///
+/// Deliberately NOT an authorization decision — it only sheds volume; the
+/// acceptor LOGS every shed and answers with the SAME benign no-response close
+/// its existing benign outcomes (countersign-timeout, community-not-found)
+/// produce, so a shed is network-indistinguishable (no oracle). Since the gate
+/// runs pre-decode (the packet type — invite `0x10` vs open-join `0x11` — is not
+/// yet known) there is no single typed reply that fits both arms; a silent
+/// close IS the benign-equivalent here (unlike friend/pex, whose single-arm
+/// protocols always reply). `admit_connection` never `.await`s, so the
+/// `std::sync::Mutex` is never held across a suspension point, and the tracked
+/// map is bounded by [`KeyedSlidingWindow`]'s `MAX_WINDOW_KEYS` eviction so a
+/// rotating-`remote_id` flood can't turn this shield into a memory-DoS of its
+/// own.
+pub struct OpenJoinConnLimiter {
+    conn: Mutex<KeyedSlidingWindow<[u8; 32]>>,
+    /// ZEB-711: monotonic epoch — the admit timeline is the limiter's OWN
+    /// monotonic clock, never wall time (a wall step would distort the window:
+    /// forward → a flood gets a fresh budget; backward → an honest shed peer
+    /// stays shed). `tokio::time::Instant` also honors the paused test clock.
+    epoch: tokio::time::Instant,
+}
+
+impl OpenJoinConnLimiter {
+    /// Production shield with the default caps ([`OPEN_JOIN_CONN_MAX`] over
+    /// [`OPEN_JOIN_CONN_WINDOW_MS`]).
+    pub fn new() -> Self {
+        Self::with_caps(OPEN_JOIN_CONN_MAX, OPEN_JOIN_CONN_WINDOW_MS)
+    }
+
+    /// Test/tuning constructor — deterministic tiny caps in unit tests.
+    pub fn with_caps(conn_max: usize, window_ms: u64) -> Self {
+        Self {
+            conn: Mutex::new(KeyedSlidingWindow::new(conn_max, window_ms)),
+            epoch: tokio::time::Instant::now(),
+        }
+    }
+
+    /// ZEB-711: production timeline for this limiter's admit calls — ms since
+    /// construction, from the monotonic (and test-pausable) tokio clock.
+    pub fn monotonic_now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// Poison-tolerant lock: a panic elsewhere must not wedge the acceptor — the
+    /// guarded state is plain counters, safe to keep using.
+    fn lock(&self) -> std::sync::MutexGuard<'_, KeyedSlidingWindow<[u8; 32]>> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Tier 1 — pre-auth. Key = the connecting endpoint's authenticated
+    /// `remote_id`. `Ok(())` admits (and records); `Err` sheds without
+    /// recording. Runs BEFORE any read / decode / signature verification.
+    pub fn admit_connection(&self, remote_id: [u8; 32], now_ms: u64) -> Result<(), &'static str> {
+        if self.lock().admit(remote_id, now_ms) {
+            Ok(())
+        } else {
+            Err("per-connection cap")
+        }
+    }
+}
+
+impl Default for OpenJoinConnLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Verify a tokenless open-join request and, if valid, admit the joiner.
 ///
 /// `signed_bytes` MUST be the exact bytes the joiner signed (= the
@@ -199,9 +283,11 @@ impl OpenJoinRateLimiter {
 /// `limiter_now_ms` is the limiter's OWN monotonic clock (rate-limit window +
 /// nonce horizon, ZEB-711 — never the wall clock, so a wall step cannot reset
 /// the rate limit); `freshness_window_ms` bounds how old `created_at` may be.
-/// `current_events` is the beacon engine's signed membership log (assumed
-/// already verified — `prior_state_at_hlc`/`materialize` do not re-verify
-/// signatures).
+/// `source_id` is the connecting endpoint's un-spoofable transport `remote_id`
+/// (ZEB-853, B7) — the admission budget is keyed on it so one flooding source
+/// can't exhaust another's window. `current_events` is the beacon engine's
+/// signed membership log (assumed already verified — `prior_state_at_hlc` /
+/// `materialize` do not re-verify signatures).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_admit_open_join(
     req: &OpenJoinRequest,
@@ -214,6 +300,7 @@ pub fn verify_and_admit_open_join(
     wall_now_ms: u64,
     freshness_window_ms: u64,
     limiter_now_ms: u64,
+    source_id: [u8; 32],
     limiter: &mut OpenJoinRateLimiter,
 ) -> Result<OpenJoinAdmitOk, OpenJoinReject> {
     // 1. Community scope.
@@ -289,7 +376,7 @@ pub fn verify_and_admit_open_join(
     if limiter.is_replay(&req.nonce, limiter_now_ms) {
         return Err(OpenJoinReject::Replay);
     }
-    if !limiter.allow(limiter_now_ms) {
+    if !limiter.allow(source_id, limiter_now_ms) {
         return Err(OpenJoinReject::RateLimited);
     }
     limiter.record_nonce(&req.nonce, limiter_now_ms);
@@ -347,6 +434,12 @@ mod tests {
 
     const COMMUNITY: SpaceId = SpaceId([0x42; 16]);
     const FRESHNESS: u64 = 60_000;
+    /// ZEB-853: a single fixed source key for the tests that exercise the
+    /// per-request checks or the single-source rate window — their behavior is
+    /// unchanged by the per-source keying because every call uses the SAME
+    /// source. The cross-source isolation is proven by
+    /// `open_join_rate_limit_is_per_source` / `open_join_tier1_sheds_one_source_not_others`.
+    const TEST_SOURCE: [u8; 32] = [0u8; 32];
 
     /// A self-contained, real-mint open-join fixture: a community admin, a
     /// joiner with a valid Master EnrollmentCert and a self-signed open Join,
@@ -580,6 +673,7 @@ mod tests {
             f.now_ms,
             FRESHNESS,
             f.now_ms,
+            TEST_SOURCE,
             &mut lim,
         )
         .expect("valid open join should be admitted");
@@ -608,6 +702,7 @@ mod tests {
                 f.now_ms,
                 FRESHNESS,
                 f.now_ms,
+                TEST_SOURCE,
                 &mut lim,
             )
             .unwrap_err(),
@@ -636,6 +731,7 @@ mod tests {
                 f.now_ms,
                 FRESHNESS,
                 f.now_ms,
+                TEST_SOURCE,
                 &mut lim,
             )
             .unwrap_err(),
@@ -660,6 +756,7 @@ mod tests {
                 f.now_ms,
                 FRESHNESS,
                 f.now_ms,
+                TEST_SOURCE,
                 &mut lim,
             )
             .unwrap_err(),
@@ -685,6 +782,7 @@ mod tests {
                 f.now_ms + 10_000_000,
                 FRESHNESS,
                 f.now_ms + 10_000_000,
+                TEST_SOURCE,
                 &mut lim,
             )
             .unwrap_err(),
@@ -717,6 +815,7 @@ mod tests {
                 f.now_ms,
                 FRESHNESS,
                 f.now_ms,
+                TEST_SOURCE,
                 &mut lim,
             )
             .unwrap_err(),
@@ -747,6 +846,7 @@ mod tests {
             f.now_ms,
             FRESHNESS,
             f.now_ms,
+            TEST_SOURCE,
             &mut lim,
         )
         .expect("join_event.at.wall_ms exactly at the skew boundary must admit");
@@ -769,6 +869,7 @@ mod tests {
             f.now_ms,
             FRESHNESS,
             f.now_ms,
+            TEST_SOURCE,
             &mut lim,
         )
         .expect("first ok");
@@ -784,6 +885,7 @@ mod tests {
                 f.now_ms,
                 FRESHNESS,
                 f.now_ms,
+                TEST_SOURCE,
                 &mut lim,
             )
             .unwrap_err(),
@@ -809,6 +911,7 @@ mod tests {
                 f.now_ms,
                 FRESHNESS,
                 f.now_ms,
+                TEST_SOURCE,
                 &mut lim,
             )
             .map(|_| ());
@@ -837,6 +940,7 @@ mod tests {
                 f.now_ms,
                 FRESHNESS,
                 f.now_ms,
+                TEST_SOURCE,
                 &mut lim,
             )
             .expect("in-window requests admit");
@@ -855,6 +959,7 @@ mod tests {
                 f.now_ms,
                 FRESHNESS,
                 f.now_ms,
+                TEST_SOURCE,
                 &mut lim,
             )
             .unwrap_err(),
@@ -876,6 +981,7 @@ mod tests {
             // the later wall clock (the rate-limit window > default freshness).
             OPEN_JOIN_RATE_LIMIT_WINDOW_MS * 4,
             later,
+            TEST_SOURCE,
             &mut lim,
         )
         .expect("a previously rate-limited nonce is admissible after the window");
@@ -906,6 +1012,7 @@ mod tests {
                 wall,
                 FRESHNESS,
                 0,
+                TEST_SOURCE,
                 &mut lim,
             )
             .expect("in-window requests admit");
@@ -925,6 +1032,7 @@ mod tests {
                 wall,
                 FRESHNESS,
                 0,
+                TEST_SOURCE,
                 &mut lim,
             )
             .unwrap_err(),
@@ -947,9 +1055,60 @@ mod tests {
             wall,
             FRESHNESS,
             OPEN_JOIN_RATE_LIMIT_WINDOW_MS + 1,
+            TEST_SOURCE,
             &mut lim,
         )
         .expect("window rolled on the monotonic limiter clock, so this admits");
+    }
+
+    /// ZEB-853 (B7, Half 2): the admission budget is PER-SOURCE, keyed on the
+    /// connecting `remote_id`. One source exhausting its own 20/60s window must
+    /// NOT shed a different source — the pre-fix global counter let a single
+    /// flooder lock out every legitimate open-joiner. Exercises the re-keyed
+    /// `allow(source, now)` directly (the behavioral guarantee lives in the
+    /// per-key `KeyedSlidingWindow`).
+    #[test]
+    fn open_join_rate_limit_is_per_source() {
+        let mut rl = OpenJoinRateLimiter::new();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let now = 0u64;
+        for _ in 0..OPEN_JOIN_RATE_LIMIT_PER_WINDOW {
+            assert!(rl.allow(a, now), "A's own window admits up to the cap");
+        }
+        assert!(!rl.allow(a, now), "A exhausted its own window");
+        assert!(
+            rl.allow(b, now),
+            "B unaffected by A — no shared-budget lockout"
+        );
+    }
+
+    /// ZEB-853 (B7, Half 1): the pre-auth Tier-1 connection shield is keyed on
+    /// the un-spoofable `remote_id`. One flooding source is shed past its
+    /// per-connection cap while a fresh source is still admitted — so a single
+    /// endpoint can't force unbounded pre-consent crypto NOR lock out others
+    /// before any packet is even read. The gate in the acceptor is a thin
+    /// wrapper over this; the behavioral guarantee lives in `KeyedSlidingWindow`.
+    #[test]
+    fn open_join_tier1_sheds_one_source_not_others() {
+        let lim = OpenJoinConnLimiter::with_caps(3, 60_000);
+        let a = [0xAAu8; 32];
+        let b = [0xBBu8; 32];
+        let now = 1_000u64;
+        for _ in 0..3 {
+            assert!(
+                lim.admit_connection(a, now).is_ok(),
+                "source A admitted up to its per-connection cap"
+            );
+        }
+        assert!(
+            lim.admit_connection(a, now).is_err(),
+            "source A shed past its per-connection cap"
+        );
+        assert!(
+            lim.admit_connection(b, now).is_ok(),
+            "fresh source B still admitted (no cross-source lockout)"
+        );
     }
 
     #[test]
@@ -975,6 +1134,7 @@ mod tests {
                 f.now_ms,
                 FRESHNESS,
                 first,
+                TEST_SOURCE,
                 &mut lim,
             )
             .expect("first-window requests admit");
@@ -996,6 +1156,7 @@ mod tests {
                 f.now_ms,
                 FRESHNESS,
                 first + 40_000,
+                TEST_SOURCE,
                 &mut lim,
             )
             .unwrap_err(),
@@ -1016,6 +1177,7 @@ mod tests {
             f.now_ms,
             FRESHNESS,
             first + OPEN_JOIN_RATE_LIMIT_WINDOW_MS + 1,
+            TEST_SOURCE,
             &mut lim,
         )
         .expect("window rolls 60 s after the first request");

@@ -604,14 +604,19 @@ const MAX_WINDOW_KEYS: usize = 8192;
 /// A per-key sliding-window counter, bounded to `MAX_WINDOW_KEYS` distinct keys.
 /// Extracted from the ZEB-376 `IntroRateLimiter` so both the pre-auth connection
 /// shield and the post-auth owner quotas share one audited implementation.
-struct KeyedSlidingWindow<K> {
+///
+/// ZEB-853: `pub(crate)` (with `new`/`admit`) so the open-join limiters in
+/// `open_join_admit` reuse this same bounded-eviction primitive rather than
+/// re-implementing a per-source window — a keyed limiter MUST be memory-bounded
+/// against rotating-key floods, and that discipline lives here.
+pub(crate) struct KeyedSlidingWindow<K> {
     max: usize,
     window_ms: u64,
     windows: HashMap<K, VecDeque<u64>>,
 }
 
 impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
-    fn new(max: usize, window_ms: u64) -> Self {
+    pub(crate) fn new(max: usize, window_ms: u64) -> Self {
         Self {
             max,
             window_ms,
@@ -620,7 +625,7 @@ impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
     }
 
     /// `true` if admitted (recorded), `false` if the key is at its in-window cap.
-    fn admit(&mut self, key: K, now_ms: u64) -> bool {
+    pub(crate) fn admit(&mut self, key: K, now_ms: u64) -> bool {
         if self.max == 0 {
             return false; // a zero cap admits nothing; avoid inserting an unbounded empty entry
         }
