@@ -1328,6 +1328,12 @@ pub enum VerifyError {
     /// not in Ratification at that wall, or the total window has not elapsed.
     #[error("close condition not met at event.hlc (premature PollClose)")]
     CloseConditionNotMet,
+    /// verify_sr (ZEB-858): a kd=rs PollResult targeting a poll already in the
+    /// terminal `Stage::Finalized`. The early-out rejects it BEFORE the se-mode
+    /// threshold-decrypt (`recover_secret_tally`) runs — a finalized poll's
+    /// result is immutable, so any further kd=rs is spurious or a forgery.
+    #[error("poll already finalized; kd=rs is terminal-rejected")]
+    PollAlreadyFinalized,
 }
 
 // ── Verify functions ──────────────────────────────────────────────────────────

@@ -3493,6 +3493,15 @@ async fn inbound_eligibility_check(
                     let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
                         .ok_or_else(|| "kd=rs: undecodable poll id".to_string())?;
                     with_tier3(voting_log, &pid, "kd=rs", |t3| {
+                        // ZEB-858 post-finalize early-out: a finalized poll's
+                        // result is immutable, so reject a new kd=rs cheaply
+                        // BEFORE verify_sr's se-mode threshold-decrypt
+                        // (`recover_secret_tally`) runs.
+                        if matches!(t3.stage, crate::community_voting_tier3::Stage::Finalized) {
+                            return Err(
+                                crate::community_voting_tier3::VerifyError::PollAlreadyFinalized,
+                            );
+                        }
                         crate::community_voting_tier3::verify_sr(event, t3)
                     })
                     .await?;
@@ -7586,6 +7595,72 @@ mod tests {
         assert!(
             res.is_err(),
             "kd=rs before kd=cl must be rejected at ingest; got {res:?}"
+        );
+    }
+
+    // kd=rs post-finalize early-out (ZEB-858): a kd=rs targeting an
+    // already-`Stage::Finalized` poll must be rejected CHEAPLY — before
+    // `verify_sr` runs its se-mode threshold-decrypt (`recover_secret_tally`).
+    //
+    // Distinguishing construction: drive the fixture poll into se-mode +
+    // `Stage::Finalized` with a PollClose applied (so `verify_sr`'s R1 passes)
+    // but NO committee tally shares present. A *live* `verify_sr` on this state
+    // would decode the payload, synthesize status_quo, then reach
+    // `recompute_expected_result` → `recover_secret_tally` (no shares) → `None`
+    // → `TallySharesNotReady`. Asserting `PollAlreadyFinalized` instead —
+    // NOT `TallySharesNotReady` — proves the early-out fired first, so the
+    // expensive `recover_secret_tally` never ran.
+    #[tokio::test]
+    async fn inbound_kd_rs_finalized_poll_skips_verify_sr() {
+        let (log, pid, _proposer, member, snapshot, cid) = tier3_ingest_fixture().await;
+        // Force the poll into a finalized se-mode state: close applied, stage
+        // terminal, but committee tally shares absent (secret_tally empty).
+        {
+            let mut g = log.lock().await;
+            let t3 = g
+                .polls
+                .get_mut(&pid)
+                .expect("poll present")
+                .tier_state
+                .as_tier3_mut()
+                .expect("tier3 state");
+            t3.meta.config.privacy_mode = "se".into();
+            t3.close_event_hash = Some([0x5C; 32]);
+            t3.stage = crate::community_voting_tier3::Stage::Finalized;
+        }
+        // A well-formed kd=rs carrying a forged result for the finalized poll,
+        // signed by a distinct member. The result value is irrelevant to what
+        // this test discriminates — a live `verify_sr` would bail at
+        // `recover_secret_tally` before ever comparing it.
+        let forged_result = crate::community_voting_star::StarResult {
+            winner: crate::community_voting_star::CandidateRef {
+                event_hash: [0xAB; 32],
+                approval_count: 0,
+            },
+            finalists: vec![],
+            total_scores: vec![],
+            runoff_votes: vec![],
+        };
+        let mut body = Vec::new();
+        ciborium::into_writer(
+            &crate::community_voting_tier3::Tier3PollResultPayload {
+                poll_id: pid,
+                result: forged_result,
+            },
+            &mut body,
+        )
+        .expect("encode forged Tier3PollResultPayload");
+        let rs = tier3_ingest_event(PollEventKindCode::PollResult, member, 9_000_000, body);
+        let res = inbound_eligibility_check(&rs, &snapshot, &log, cid, None).await;
+        let err = res.expect_err("kd=rs for an already-finalized poll must be rejected");
+        assert!(
+            err.contains("PollAlreadyFinalized"),
+            "expected the post-finalize early-out (PollAlreadyFinalized); got {err:?} — \
+             a TallySharesNotReady/TallyMismatch would mean verify_sr ran first"
+        );
+        assert!(
+            !err.contains("TallySharesNotReady") && !err.contains("TallyMismatch"),
+            "verify_sr's recompute must NOT run for a finalized poll; got {err:?}"
         );
     }
 
