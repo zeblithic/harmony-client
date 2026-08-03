@@ -200,6 +200,15 @@ pub struct Tier3PollState {
     pub candidates: Vec<DraftCandidateState>,
     /// Ratification ballots from kd=rb events.
     pub ratification_ballots: Vec<RatificationBallotPayload>,
+    /// ZEB-861 per-actor materialization caps: count of materialized kd=md /
+    /// kd=dc / kd=rb events per actor, guarding the unbounded `declines` /
+    /// `candidates` / `ratification_ballots` pushes (mirrors the `ds`
+    /// `statements_per_author` counter). Replay-derived: reset by
+    /// `new_from_create`, never serialized. `ballots_per_actor` is required
+    /// (not derivable) because `RatificationBallotPayload` carries no actor tag.
+    pub declines_per_actor: std::collections::BTreeMap<OwnerAddr, u8>,
+    pub candidates_per_actor: std::collections::BTreeMap<OwnerAddr, u8>,
+    pub ballots_per_actor: std::collections::BTreeMap<OwnerAddr, u8>,
     /// SHA-256 of signing_bytes of the kd=cl PollClose event, if applied.
     pub close_event_hash: Option<[u8; 32]>,
     /// Set by kd=rs PollResult event (StarResult decoded from payload).
@@ -460,6 +469,9 @@ impl Tier3PollState {
             declines: Vec::new(),
             candidates: Vec::new(),
             ratification_ballots: Vec::new(),
+            declines_per_actor: std::collections::BTreeMap::new(),
+            candidates_per_actor: std::collections::BTreeMap::new(),
+            ballots_per_actor: std::collections::BTreeMap::new(),
             close_event_hash: None,
             result: None,
             deliberation: DeliberationState::default(),
@@ -571,7 +583,19 @@ impl Tier3PollState {
                 // Decode payload to validate it parses correctly; reason field unused at materialize level.
                 let _payload: MiniPublicDeclinePayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
-                self.declines.push((ev.actor, ev.hlc.clone()));
+                // ZEB-861: per-actor decline cap (divergence-safe; mirrors ds 5-cap).
+                let prior = self.declines_per_actor.get(&ev.actor).copied().unwrap_or(0);
+                if prior >= MAX_DECLINES_PER_ACTOR {
+                    advance_last_hlc = false;
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=md drop: per-actor decline cap reached"
+                    );
+                } else {
+                    self.declines.push((ev.actor, ev.hlc.clone()));
+                    *self.declines_per_actor.entry(ev.actor).or_insert(0) += 1;
+                }
             }
 
             // kd=ds DeliberationStatement: materialize per spec §2.3 apply rules.
@@ -757,15 +781,31 @@ impl Tier3PollState {
             PollEventKindCode::DraftCandidate => {
                 let payload: DraftCandidatePayload =
                     decode_payload(&ev.payload).map_err(ApplyError::PayloadDecode)?;
-                let event_hash = sha256_of_signing_bytes(ev);
-                let mut approvals = HashSet::new();
-                approvals.insert(ev.actor); // implicit self-approval per spec §6
-                self.candidates.push(DraftCandidateState {
-                    event_hash,
-                    text: payload.text,
-                    proposer: Some(ev.actor),
-                    approvals,
-                });
+                // ZEB-861: per-actor draft-candidate cap (divergence-safe; mirrors ds 5-cap).
+                let prior = self
+                    .candidates_per_actor
+                    .get(&ev.actor)
+                    .copied()
+                    .unwrap_or(0);
+                if prior >= MAX_DRAFT_CANDIDATES_PER_ACTOR {
+                    advance_last_hlc = false;
+                    tracing::debug!(
+                        poll_id = %hex::encode(self.meta.poll_id.0),
+                        actor = %hex::encode(ev.actor.0),
+                        "kd=dc drop: per-actor candidate cap reached"
+                    );
+                } else {
+                    let event_hash = sha256_of_signing_bytes(ev);
+                    let mut approvals = HashSet::new();
+                    approvals.insert(ev.actor); // implicit self-approval per spec §6
+                    self.candidates.push(DraftCandidateState {
+                        event_hash,
+                        text: payload.text,
+                        proposer: Some(ev.actor),
+                        approvals,
+                    });
+                    *self.candidates_per_actor.entry(ev.actor).or_insert(0) += 1;
+                }
             }
 
             // kd=da DraftApproval: add actor to the named candidate's approvals (idempotent).
@@ -909,10 +949,35 @@ impl Tier3PollState {
                             "kd=rb se-mode drop: NIZK verify failed"
                         );
                     } else {
-                        self.ratification_ballots.push(payload);
+                        // ZEB-861: per-actor ballot cap (keyed on ev.actor — the
+                        // payload carries no actor tag). Divergence-safe; mirrors ds 5-cap.
+                        let prior = self.ballots_per_actor.get(&ev.actor).copied().unwrap_or(0);
+                        if prior >= MAX_RATIFICATION_BALLOTS_PER_ACTOR {
+                            advance_last_hlc = false;
+                            tracing::debug!(
+                                poll_id = %hex::encode(self.meta.poll_id.0),
+                                actor = %hex::encode(ev.actor.0),
+                                "kd=rb drop: per-actor ballot cap reached"
+                            );
+                        } else {
+                            self.ratification_ballots.push(payload);
+                            *self.ballots_per_actor.entry(ev.actor).or_insert(0) += 1;
+                        }
                     }
                 } else {
-                    self.ratification_ballots.push(payload);
+                    // ZEB-861: per-actor ballot cap (pu-mode push site).
+                    let prior = self.ballots_per_actor.get(&ev.actor).copied().unwrap_or(0);
+                    if prior >= MAX_RATIFICATION_BALLOTS_PER_ACTOR {
+                        advance_last_hlc = false;
+                        tracing::debug!(
+                            poll_id = %hex::encode(self.meta.poll_id.0),
+                            actor = %hex::encode(ev.actor.0),
+                            "kd=rb drop: per-actor ballot cap reached"
+                        );
+                    } else {
+                        self.ratification_ballots.push(payload);
+                        *self.ballots_per_actor.entry(ev.actor).or_insert(0) += 1;
+                    }
                 }
             }
 
@@ -1740,6 +1805,22 @@ pub fn verify_ratification_ballot(
 /// guaranteed status_quo slot). Hard cap per design spec §9.
 pub const MAX_RATIFICATION_CANDIDATES: usize = 5;
 
+// ZEB-861: per-actor materialization caps — divergence-safe anti-spam bounds on
+// the unbounded per-actor `Vec` pushes in `apply_event` (same class as the
+// `ds` 5-statement cap). Deliberately generous (≥ any legitimate per-actor
+// volume): the goal is to convert "unbounded" into "O(members × constant)",
+// not to rate-limit honest use. Evaluated in canonical HLC order (re-run by
+// `rebuild_from_events` + boot-restore), so the materialized set is a pure
+// function of the event set — identical on every replica after any rebuild.
+/// Max `kd=md` declines materialized per actor (a member declines once; +1 margin).
+pub(crate) const MAX_DECLINES_PER_ACTOR: u8 = 2;
+/// Max `kd=dc` draft candidates materialized per actor (matches the ds cap; ≤4
+/// non-status-quo advance anyway).
+pub(crate) const MAX_DRAFT_CANDIDATES_PER_ACTOR: u8 = 5;
+/// Max `kd=rb` ratification ballots materialized per actor (one ballot per
+/// member; +1 LWW-resubmit margin).
+pub(crate) const MAX_RATIFICATION_BALLOTS_PER_ACTOR: u8 = 2;
+
 /// Homomorphic aggregate of accepted se-mode ballots. Returns a
 /// `Vec<EncCiphertext>` of length `n + C(n,2)` — `n` score-sum aggregates
 /// first, then `C(n,2)` indicator-sum aggregates in unordered-pair
@@ -2026,12 +2107,16 @@ fn recompute_expected_result(
 }
 
 /// LWW-dedup helper for se-mode ratification ballots. Phase 6 v1 ships a
-/// pass-through: the apply path already enforces 1-per-actor via
-/// `current_mini_public` membership + monotonic-HLC discipline. A real
-/// dedup would walk `ratification_ballots` newest-first by HLC and keep
-/// the latest entry per actor — but the current Vec preserves arrival
-/// order with no actor tag (the actor is on the SignedVotingEvent, not
-/// the payload). v1 treats accepted payloads as canonical.
+/// pass-through. Per-actor ballot VOLUME is bounded at apply time by the
+/// ZEB-861 `ballots_per_actor` cap (≤ `MAX_RATIFICATION_BALLOTS_PER_ACTOR`),
+/// keyed on the `SignedVotingEvent`'s actor — the kernel does NOT enforce
+/// strict 1-per-actor here (the earlier claim of `current_mini_public` +
+/// monotonic-HLC dedup was inaccurate: the rb arm performs no mini-public
+/// check, and the monotonic guard is per-`(actor, device_id)` ordering, not
+/// a count). A real LWW dedup would walk `ratification_ballots` newest-first
+/// by HLC and keep the latest entry per actor — but the Vec preserves arrival
+/// order with no actor tag (the actor is on the `SignedVotingEvent`, not the
+/// payload), so v1 treats accepted payloads as canonical.
 fn lww_dedup_se_ballots(
     ballots: &[crate::community_voting_core::RatificationBallotPayload],
 ) -> Vec<crate::community_voting_core::RatificationBallotPayload> {
@@ -2800,6 +2885,123 @@ mod tests {
         assert_eq!(poll.ratification_ballots.len(), 2);
         assert_eq!(poll.ratification_ballots[0].scores, Some(vec![3, 1, 5]));
         assert_eq!(poll.ratification_ballots[1].scores, Some(vec![0, 5, 2]));
+    }
+
+    // ── ZEB-861: per-actor materialization caps (md / dc / rb) ────────────────
+    // Each of the three unbounded per-actor `Vec` pushes gets a divergence-safe
+    // cap mirroring the `ds` 5-statement cap: an actor submitting LIMIT+1 events
+    // materializes exactly LIMIT; the excess is a silent drop; other actors are
+    // unaffected; and the cap is a pure function of the canonical event set.
+
+    #[test]
+    fn md_cap_limits_declines_per_actor() {
+        let mut poll = new_poll(0);
+        let a = addr(1);
+        // LIMIT + 1 declines from one actor, strictly increasing HLC (same lane).
+        for i in 0..(MAX_DECLINES_PER_ACTOR as u64 + 1) {
+            poll.apply_event(&md_event(100 + i, a))
+                .expect("Ok (accept or cap-drop)");
+        }
+        assert_eq!(
+            poll.declines.iter().filter(|(x, _)| *x == a).count(),
+            MAX_DECLINES_PER_ACTOR as usize,
+            "md cap must limit materialized declines per actor"
+        );
+        assert_eq!(
+            poll.declines_per_actor.get(&a),
+            Some(&MAX_DECLINES_PER_ACTOR)
+        );
+        // A different actor is unaffected.
+        let b = addr(2);
+        poll.apply_event(&md_event(500, b)).expect("md b");
+        assert_eq!(poll.declines.iter().filter(|(x, _)| *x == b).count(), 1);
+    }
+
+    #[test]
+    fn dc_cap_limits_candidates_per_actor() {
+        let mut poll = new_poll(0);
+        let a = addr(1);
+        for i in 0..(MAX_DRAFT_CANDIDATES_PER_ACTOR as u64 + 1) {
+            poll.apply_event(&dc_event(100 + i, a, &format!("cand {i}")))
+                .expect("Ok (accept or cap-drop)");
+        }
+        assert_eq!(
+            poll.candidates
+                .iter()
+                .filter(|c| c.proposer == Some(a))
+                .count(),
+            MAX_DRAFT_CANDIDATES_PER_ACTOR as usize,
+            "dc cap must limit materialized candidates per actor"
+        );
+        assert_eq!(
+            poll.candidates_per_actor.get(&a),
+            Some(&MAX_DRAFT_CANDIDATES_PER_ACTOR)
+        );
+        let b = addr(2);
+        poll.apply_event(&dc_event(500, b, "other")).expect("dc b");
+        assert_eq!(
+            poll.candidates
+                .iter()
+                .filter(|c| c.proposer == Some(b))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rb_cap_limits_ballots_per_actor() {
+        // Mirror `apply_kd_rb_appends_to_ratification_ballots`: pu-mode poll,
+        // status_quo advances so n>=1, scores.is_some() satisfies B5.
+        let mut poll = new_poll(0);
+        poll.apply_event(&ss_event(100, vec![addr(1)], vec![]))
+            .expect("ss");
+        let a = addr(1);
+        for i in 0..(MAX_RATIFICATION_BALLOTS_PER_ACTOR as u64 + 1) {
+            poll.apply_event(&rb_event(200 + i, a, vec![3, 1, 5]))
+                .expect("Ok (accept or cap-drop)");
+        }
+        // Ballots carry no actor tag; the per-actor counter is the ground truth.
+        assert_eq!(
+            poll.ballots_per_actor.get(&a),
+            Some(&MAX_RATIFICATION_BALLOTS_PER_ACTOR)
+        );
+        assert_eq!(
+            poll.ratification_ballots.len(),
+            MAX_RATIFICATION_BALLOTS_PER_ACTOR as usize,
+            "rb cap must limit materialized ballots for a single actor"
+        );
+        let b = addr(2);
+        poll.apply_event(&rb_event(500, b, vec![3, 1, 5]))
+            .expect("rb b");
+        assert_eq!(poll.ballots_per_actor.get(&b), Some(&1));
+    }
+
+    // Divergence-safety: the cap is a pure function of the canonical event SET,
+    // so two delivery orders of an over-cap sequence converge to the identical
+    // materialized projection after a canonical rebuild.
+    #[test]
+    fn per_actor_caps_converge_across_delivery_orders() {
+        let a = addr(1);
+        let events = vec![md_event(100, a), md_event(101, a), md_event(102, a)];
+
+        let mut p1 = new_poll(0);
+        p1.rebuild_from_events(&events);
+
+        let mut reversed = events.clone();
+        reversed.reverse();
+        let mut p2 = new_poll(0);
+        p2.rebuild_from_events(&reversed);
+
+        assert_eq!(
+            p1.declines, p2.declines,
+            "canonical rebuild must be order-independent under the cap"
+        );
+        assert_eq!(p1.declines_per_actor, p2.declines_per_actor);
+        assert_eq!(
+            p1.declines.len(),
+            MAX_DECLINES_PER_ACTOR as usize,
+            "the canonically-first LIMIT declines materialize"
+        );
     }
 
     // ── Test 17: apply kd=ds is scaffold no-op (accepts event) ───────────────
@@ -5202,11 +5404,7 @@ mod tests {
     fn max_received_hlc_equals_max_over_lanes_fold() {
         // Empty poll: no dispatch → both sides None.
         let empty = Tier3PollState::new_from_create(meta_at(1_000), electorate(20));
-        let old_empty = empty
-            .last_received_hlc
-            .values()
-            .copied()
-            .max();
+        let old_empty = empty.last_received_hlc.values().copied().max();
         assert_eq!(
             empty.max_received_hlc().map(|h| (h.wall_ms, h.logical)),
             old_empty,
@@ -5229,11 +5427,7 @@ mod tests {
         poll.apply_event(&ds_event_with_text(150, addr(2), "other lane"))
             .expect("apply");
 
-        let old = poll
-            .last_received_hlc
-            .values()
-            .copied()
-            .max();
+        let old = poll.last_received_hlc.values().copied().max();
         let got = poll.max_received_hlc().map(|h| (h.wall_ms, h.logical));
         assert_eq!(
             got, old,
