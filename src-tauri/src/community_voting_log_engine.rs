@@ -3614,11 +3614,31 @@ async fn inbound_eligibility_check(
                 // Cloning is cheap relative to the se-mode BSGS decrypt this
                 // memoizes, and it lets the memo lookup + recompute both run with
                 // the log lock released — so there is never a nested log→tracker
-                // lock ordering. The recompute result is a pure function of
-                // (poll_id, close_event_hash) (via `expected_result_from_state`),
-                // so the memo is sound; but the claim is STILL compared against the
-                // memoized value on every event (a memo hit never bypasses the
-                // comparison), so a later distinct-signed forged result is caught.
+                // lock ordering.
+                //
+                // Memo soundness (ZEB-858) rests on TWO invariants — NOT on the
+                // recompute being a literal function of the key (it is a function of
+                // the whole `poll_state`, which keeps mutating after close):
+                //   1. A not-ready / failed recompute is NEVER cached: the `?` on
+                //      `expected_result_from_state` below short-circuits before the
+                //      insert, so `TallySharesNotReady` / `StatusQuoNotSynthesized`
+                //      can never poison the memo with a non-result.
+                //   2. se-mode (the DoS target) is Lagrange-invariant: committee
+                //      shares beyond `threshold` and any late ratification ballots do
+                //      NOT change the recovered aggregate, so the cached value stays
+                //      correct even though `poll_state` can keep accruing shares /
+                //      ballots after close (kd=rb apply is NOT close-gated — the
+                //      inputs are invariant, not literally frozen). pu-mode late-
+                //      ballot staleness is benign: the recompute is cheap and a node
+                //      finalizes from its own engine-auto mint, so a stale/dropped
+                //      peer kd=rs never stalls finalization.
+                // A future change that made the post-close recompute input-dependent
+                // in a NON-invariant way (without rotating `close_event_hash`) would
+                // silently poison this memo — keep invariants (1) and (2) true.
+                //
+                // The claim is STILL compared against the memoized value on every
+                // event (a memo hit never bypasses the comparison), so a later
+                // distinct-signed forged result is always caught.
                 crate::community_voting_core::PollEventKindCode::PollResult => {
                     let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
                         .ok_or_else(|| "kd=rs: undecodable poll id".to_string())?;
