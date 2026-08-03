@@ -6390,7 +6390,12 @@ mod tests {
     // set-insert into a candidate's approvals) are order-INDEPENDENT: their
     // projection is identical regardless of delivery order (every downstream
     // consumer — `drafting_advancers` — re-sorts, so the raw append order of
-    // `candidates` never reaches a result). This guards that contract: fold a
+    // `candidates` never reaches a result). Caveat for kd=da: this holds because
+    // the ingest gate (`verify_da_candidate_exists`, run on the local-publish,
+    // inbound, and backfill paths) guarantees a da's referenced dc is applied
+    // (hence appended) BEFORE the da — so a da-before-dc is rejected-before-append
+    // and never sits stranded in the log. This test keeps da's candidate present
+    // in both orders to exercise that in-gate reality. This guards that contract: fold a
     // representative dc/dc/da set in two delivery orders — one delivering the
     // lower-HLC dc LAST, i.e. genuinely out of order — and assert (a) the
     // semantic candidate/approval projection is identical, and (b) neither poll

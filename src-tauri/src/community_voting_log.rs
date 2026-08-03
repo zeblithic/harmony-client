@@ -531,6 +531,19 @@ impl VotingLog {
             // it (Applied, not silently Dropped — a dropped stranger event must
             // never force a rebuild, a DoS guard); (3) the kind is
             // order-dependent (ss / md / ds / dv, captured above).
+            //
+            // Two bounded cost properties (neither is a divergence — the rebuild
+            // reproduces exactly what boot-restore computes):
+            //   * `max_applied` advances on DROPS too (load-bearing: a late ds must
+            //     lift the watermark so a still-dropped dv is reconsidered). So a
+            //     future-dated *dropped* trigger-kind event could poison the
+            //     watermark and make later honest events rebuild — but both
+            //     peer-facing ingest paths reject wall > now + MAX_FORWARD_SKEW_MS
+            //     (ZEB-846), capping the poison to a self-healing ~5-min window.
+            //   * ds/dv self-gate to Deliberation (dropped elsewhere ⇒ not Applied),
+            //     but ss/md do NOT, so a backdated ss/md arriving in Ratification can
+            //     rebuild and re-run rb/ts crypto — insider-only, bounded by event
+            //     count, ZEB-846-limited. Trigger-tightening tracked in ZEB-868.
             let out_of_order = prev_max.as_ref().is_some_and(|m| ev_key3 <= *m);
             if out_of_order
                 && outcome == crate::community_voting_tier3::ApplyOutcome::Applied

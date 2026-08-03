@@ -52,7 +52,7 @@ After the existing `apply_event` call and lifecycle sync and append, fire a rebu
 2. `apply_event` returned **`Applied`** (a silently-dropped event introduces no prerequisite and cannot change another event's outcome — this also denies an outsider spamming dropped `dv`s any rebuild leverage), and
 3. the event kind is in the **order-dependent Deliberation family `{ss, md, ds, dv}`** — the only kinds whose acceptance can retroactively change another event's accept/drop outcome (`ss`/`md` gate stage & mini-public; `ds` is the vote prerequisite; `dv` covers the Byzantine-backdated case where an incremental accept must be re-dropped).
 
-All four trigger kinds are **pre-Ratification** and crypto-free in apply, and their accepted volume is bounded by sortition parameters (mini-public ≤ 300, `ds` ≤ 5/author), so rebuilds are cheap and bounded — no memoization needed. Order-independent kinds (`rb`, `ts`, `da`, `dc`, `rs`, `cl`) arriving out of order need no rebuild; their incremental apply is already canonical.
+The trigger kinds' accepted volume is bounded by sortition parameters (mini-public ≤ 300, `ds` ≤ 5/author), so rebuilds are bounded — no memoization needed. `ds`/`dv` **self-gate** to Deliberation (dropped elsewhere ⇒ not `Applied` ⇒ never trigger), so their rebuilds are crypto-free. `ss`/`md` have **no** apply-time stage gate, so a backdated `ss`/`md` arriving during Ratification *can* fire a rebuild that re-runs `rb`/`ts` crypto — bounded, insider-only, ZEB-846-capped, and **non-divergent** (the rebuild reproduces what restore computes); tightening the trigger to `current_stage_at(event.hlc) < Ratification` for `ss`/`md` is tracked as **ZEB-868**. Order-independent kinds (`rb`, `ts`, `da`, `dc`, `rs`, `cl`) arriving out of order need no rebuild; their incremental apply is already canonical.
 
 ### 5. Rebuild = a synchronous mini-restore scoped to one poll
 
@@ -68,7 +68,7 @@ Restore (`reconcile_voting_from_state`) needs **no change**: it replays through 
 
 ## Order-invariance obligations (the acceptance contract, verified by tests)
 
-- **Set-insert, idempotent** (`ds` statements, `dc` candidates, `da` approvals, `md` declines): keyed by `event_hash`; canonical order does not change the set.
+- **Set-insert, idempotent** (`ds` statements, `dc` candidates, `da` approvals, `md` declines): keyed by `event_hash`; canonical order does not change the set. (The `candidates` Vec is stored in arrival order and is *not* re-canonicalized, but its order is **non-observable**: the tally indexes ballots against `ratification_candidates_ordering` — a re-sort by `(approval_count DESC, event_hash ASC)` — and the projection is never serialized, so only the set/approvals matter.)
 - **LWW by HLC** (`dv` value once accepted, `ts` upsert, `ss` overwrite): resolution already uses the HLC key; canonical order is consistent with it.
 - **Same-actor accumulation** (`ds` 5-statement cap): becomes deterministic (HLC-earliest 5) — an intended improvement.
 - **The fix** (`ss`/`md`/`ds`/`dv` accept/drop): the family whose accepted set changes under canonical order — the divergence closes.
