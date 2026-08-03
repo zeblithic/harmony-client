@@ -411,6 +411,42 @@ impl ActiveModeration {
         }
     }
 
+    /// ZEB-853 C2 ingest gate: reject a directive stamped implausibly far in the
+    /// receiver's *future* before it can touch the LWW slot, then [`apply`]. This
+    /// is the anti-freeze boundary — a same-slot `strictly_newer` LWW means a
+    /// far-future `issued_hlc.wall_ms` wins forever and permanently freezes the
+    /// `(community, channel, target, class)` slot (FAIL-OPEN). Mirrors the
+    /// ZEB-846/847 forward-skew bounds in `community_membership.rs`.
+    ///
+    /// `now_wall_ms` is the receiver's own *wall-epoch* clock
+    /// ([`crate::clock_trust::receiver_now_ms`]), used ONLY for the skew reject.
+    /// `None` (unreadable / pre-epoch local clock) ⇒ apply-all (skip the gate): a
+    /// bad LOCAL clock must never drop an honest directive. `now_ms` / `ttl_ms`
+    /// are the *monotonic* liveness clock + TTL threaded straight into `apply` —
+    /// never compared against the wall stamp.
+    ///
+    /// A directive whose `issued_hlc.wall_ms` exceeds
+    /// [`crate::clock_trust::MAX_FORWARD_SKEW_MS`] (control tier, 5 min) beyond
+    /// `now_wall_ms` is dropped: not applied, slot not advanced, returning
+    /// `false` (apply's "no flip"). The gate runs BEFORE the `strictly_newer`
+    /// comparison so poison never advances the slot.
+    ///
+    /// [`apply`]: ActiveModeration::apply
+    pub fn apply_gated(
+        &mut self,
+        c: &SpaceId,
+        ch: &ChannelId,
+        d: &VoiceModerationDirective,
+        now_ms: u64,
+        ttl_ms: u64,
+        now_wall_ms: Option<u64>,
+    ) -> bool {
+        if crate::clock_trust::wall_exceeds_forward_skew(d.issued_hlc.wall_ms, now_wall_ms) {
+            return false;
+        }
+        self.apply(c, ch, d, now_ms, ttl_ms)
+    }
+
     fn is(
         &self,
         c: &SpaceId,
@@ -579,6 +615,96 @@ mod tests {
             },
             seq: 1,
         }
+    }
+
+    /// A directive with a chosen `issued_hlc.wall_ms`, `seq`, and action (default
+    /// actor/target/device). Drives the ZEB-853 C2 forward-skew-gate tests.
+    fn directive_fixture(wall_ms: u64, seq: u64, action: ModAction) -> VoiceModerationDirective {
+        let mut d = directive(action, [0u8; 32]);
+        d.issued_hlc = Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "x".into(),
+        };
+        d.seq = seq;
+        d
+    }
+
+    /// Mirrors the real ingest call path (reject-then-apply): `now` is the
+    /// receiver's *wall-epoch* clock feeding the skew gate (`Some(now)`); it also
+    /// doubles as the monotonic TTL clock here since flip semantics are
+    /// TTL-independent.
+    fn apply_with_skew_gate(
+        am: &mut ActiveModeration,
+        d: &VoiceModerationDirective,
+        now: u64,
+    ) -> bool {
+        am.apply_gated(&C, &CH, d, now, ENFORCE_TTL_MS, Some(now))
+    }
+
+    /// ZEB-853 C2: a directive stamped past the control-tier forward-skew ceiling
+    /// is REJECTED at ingest — it must neither apply nor advance (freeze) the
+    /// slot. Without the gate a far-future `issued_hlc.wall_ms` wins the
+    /// `strictly_newer` LWW forever, and a subsequent honest in-window directive
+    /// is stale-ignored (the FAIL-OPEN freeze this fix bounds).
+    #[test]
+    fn future_dated_directive_rejected_does_not_freeze_slot() {
+        let now = 1_700_000_000_000u64;
+        let mut active = ActiveModeration::default();
+        // 1) attacker directive stamped one ms past the 5-min control ceiling.
+        let attacker = directive_fixture(
+            now + crate::clock_trust::MAX_FORWARD_SKEW_MS + 1,
+            1,
+            ModAction::Mute,
+        );
+        let flipped = apply_with_skew_gate(&mut active, &attacker, now);
+        assert!(
+            !flipped,
+            "future-dated directive must be rejected, not applied"
+        );
+        // 2) an honest later directive (in-window, smaller wall) still applies —
+        //    proof the slot was never frozen by the rejected attacker stamp.
+        let honest = directive_fixture(now, 2, ModAction::Mute);
+        let flipped2 = apply_with_skew_gate(&mut active, &honest, now);
+        assert!(
+            flipped2,
+            "honest in-window directive must apply (slot was not frozen)"
+        );
+        assert!(
+            active.is_muted(&C, &CH, &[0xBB; 16], now),
+            "enforcement is live after the honest apply"
+        );
+    }
+
+    /// ZEB-853 C2: the control-tier ceiling is inclusive — a stamp EXACTLY at
+    /// `now + MAX_FORWARD_SKEW_MS` is accepted (matches `reject_future`).
+    #[test]
+    fn directive_at_exact_skew_ceiling_is_accepted() {
+        let now = 1_700_000_000_000u64;
+        let mut active = ActiveModeration::default();
+        let d = directive_fixture(
+            now + crate::clock_trust::MAX_FORWARD_SKEW_MS,
+            1,
+            ModAction::Mute,
+        );
+        assert!(
+            apply_with_skew_gate(&mut active, &d, now),
+            "inclusive ceiling: exactly-at-tolerance applies"
+        );
+    }
+
+    /// ZEB-853 C2: `receiver_now_ms() == None` (unreadable local clock) ⇒
+    /// apply-all — a bad LOCAL clock must never drop an honest directive, even a
+    /// far-future one. Pins the fail-open half of the gate.
+    #[test]
+    fn none_receiver_clock_applies_all() {
+        let now_mono = 1_000u64;
+        let mut active = ActiveModeration::default();
+        let d = directive_fixture(u64::MAX, 1, ModAction::Mute);
+        assert!(
+            active.apply_gated(&C, &CH, &d, now_mono, ENFORCE_TTL_MS, None),
+            "None receiver clock must apply-all (fail-open), not drop"
+        );
     }
 
     #[test]

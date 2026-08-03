@@ -5692,12 +5692,24 @@ pub async fn run(
                                                 let now = (ctrl_now_ms)();
                                                 let changed = {
                                                     let mut g = ctrl_mod_map.lock().await;
-                                                    g.apply(
+                                                    // ZEB-853 C2: forward-skew reject at the
+                                                    // ingest boundary. `now` above is the
+                                                    // MONOTONIC liveness clock (voice_now_ms =
+                                                    // start.elapsed) — unusable against the
+                                                    // attacker-controlled wall stamp — so the
+                                                    // gate reads the receiver's own WALL clock
+                                                    // (receiver_now_ms(); None ⇒ apply-all).
+                                                    // Drops a directive whose issued_hlc.wall_ms
+                                                    // is >5 min ahead, which would otherwise win
+                                                    // the strictly_newer LWW forever and freeze
+                                                    // the slot (FAIL-OPEN).
+                                                    g.apply_gated(
                                                         &ctrl_community,
                                                         &ctrl_channel,
                                                         &signed.directive,
                                                         now,
                                                         crate::voice_moderation::ENFORCE_TTL_MS,
+                                                        crate::clock_trust::receiver_now_ms(),
                                                     )
                                                 };
                                                 // ZEB-358: refresh the self-kicked flag
