@@ -286,9 +286,13 @@ describe('VoiceSession raise-hand + invite-to-speak (ZEB-612)', () => {
 });
 
 describe('speakerQueue (ZEB-612 derived queue)', () => {
-  const member = (ownerHex: string, handRaisedAt: number | null): RosterMember => ({
+  const member = (
+    ownerHex: string,
+    handRaisedAt: number | null,
+    handFirstObservedMs: number | null = null,
+  ): RosterMember => ({
     ownerHex, deviceHex: ownerHex, muted: true, speaking: false,
-    modMuted: false, power: 0, handRaisedAt, invited: false,
+    modMuted: false, power: 0, handRaisedAt, handFirstObservedMs, invited: false,
   });
 
   it('orders raised hands by raise time, oldest first', () => {
@@ -323,6 +327,18 @@ describe('speakerQueue (ZEB-612 derived queue)', () => {
 
   it('returns empty for a roster with no raised hands', () => {
     expect(speakerQueue([member('aa'.repeat(16), null)])).toEqual([]);
+  });
+
+  it('orders the speaker queue by local first-observed, not peer handRaisedAt', () => {
+    // ZEB-853 D5: the attacker claims handRaisedAt=1 (epoch) to squat the front
+    // of the queue, but we FIRST observed their raise late (9000). The honest
+    // member raised "later" by peer wall clock (5000) yet we observed their raise
+    // early (3000). Ordering must key on the LOCAL first-observed stamp, so the
+    // attacker's forged epoch can't pre-date the honest raise.
+    const attacker = { ...member('aa'.repeat(16), 1, 9000), deviceHex: 'a1'.repeat(32) };
+    const honest = { ...member('bb'.repeat(16), 5000, 3000), deviceHex: 'b1'.repeat(32) };
+    const q = speakerQueue([attacker, honest]);
+    expect(q.map((m) => m.ownerHex)).toEqual(['bb'.repeat(16), 'aa'.repeat(16)]);
   });
 });
 
