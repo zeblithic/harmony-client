@@ -219,6 +219,16 @@ pub struct Tier3PollState {
     /// events (the T-VOTE-LANE GRIEF-LOCKOUT). Rebuilt by replay; never
     /// serialized (community_voting_persist.rs).
     pub last_received_hlc: std::collections::BTreeMap<(OwnerAddr, String), (u64, u32)>,
+    /// ZEB-860: highest `(wall_ms, logical, device_id)` key dispatched to this
+    /// poll (accepted OR silently dropped). Read by the apply layer to detect
+    /// out-of-order arrival and trigger a canonical-order rebuild. Never
+    /// serialized (like `last_received_hlc`).
+    pub(crate) max_applied: Option<(u64, u32, String)>,
+    /// ZEB-860: cumulative count of canonical-order rebuilds performed on this
+    /// projection via `rebuild_from_events`. Preserved across each rebuild's
+    /// reset and incremented, so it counts total rebuilds over the poll's life
+    /// (not resets to 1). Read by tests/telemetry; never serialized.
+    pub(crate) rebuild_count: u64,
     /// ZEB-295 Phase 6: ballot-secret tally projection. Populated by
     /// `kd=ts` apply (Task 7) and the decrypted-result derivation
     /// (Task 8). Empty in pu-mode polls.
@@ -252,6 +262,8 @@ impl std::fmt::Debug for Tier3PollState {
             .field("deliberation", &self.deliberation)
             .field("last_hlc", &self.last_hlc)
             .field("last_received_hlc", &self.last_received_hlc)
+            .field("max_applied", &self.max_applied)
+            .field("rebuild_count", &self.rebuild_count)
             .field("secret_tally", &self.secret_tally)
             .field("committee_oracle", &"<oracle>")
             .finish()
@@ -379,7 +391,7 @@ pub fn validate_decline_reason(reason: &Option<String>) -> Result<(), ValidateEr
 
 // ── Apply error type ──────────────────────────────────────────────────────────
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ApplyError {
     #[error("poll is in Failed state")]
     PollInFailedState,
@@ -391,6 +403,39 @@ pub enum ApplyError {
     InvalidKindForTier3(PollEventKindCode),
     #[error("event hlc not monotonic")]
     HlcNotMonotonic,
+}
+
+// ── Apply outcome + canonical order key ───────────────────────────────────────
+
+/// Whether an `apply_event` call changed the projection (`Applied`) or hit a
+/// silent-drop branch (`Dropped`). Used by the apply layer's out-of-order
+/// rebuild trigger to tell a state-changing accept from a no-op drop.
+///
+/// `pub` (not `pub(crate)`) because `apply_event` is a `pub fn` on a `pub`
+/// struct in a `pub mod`: returning a `pub(crate)` type from it would trip the
+/// `private_interfaces` lint under `-D warnings`. Mirrors the sibling
+/// `ApplyError`, which is `pub` for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Applied,
+    Dropped,
+}
+
+/// Canonical total order for replay/rebuild: `(wall_ms, logical, device_id,
+/// event_hash)`. `event_hash` (SHA-256 of signing bytes) is the final
+/// tiebreaker — a strict total order with no ties even if a device reuses an
+/// HLC. Matches the `dv`/`ts` LWW tiebreak.
+///
+/// ZEB-860 Task 2 wires the production consumer: `rebuild_from_events` sorts a
+/// poll's events by this key before the canonical-order re-fold, so the helper
+/// is live in the non-test lib build (no `allow(dead_code)` needed).
+pub(crate) fn canonical_key(ev: &SignedVotingEvent) -> (u64, u32, String, [u8; 32]) {
+    (
+        ev.hlc.wall_ms,
+        ev.hlc.logical,
+        ev.hlc.device_id.clone(),
+        sha256_of_signing_bytes(ev),
+    )
 }
 
 // ── Tier3PollState impl ───────────────────────────────────────────────────────
@@ -420,6 +465,8 @@ impl Tier3PollState {
             deliberation: DeliberationState::default(),
             last_hlc: None,
             last_received_hlc: std::collections::BTreeMap::new(),
+            max_applied: None,
+            rebuild_count: 0,
             secret_tally: SecretTallyState::default(),
             committee_oracle: std::sync::Arc::new(NullCommitteeOracle),
         }
@@ -433,6 +480,39 @@ impl Tier3PollState {
         self.committee_oracle = oracle;
     }
 
+    /// ZEB-860: re-materialize this poll's projection as a deterministic fold of
+    /// `events` in canonical order. Resets only replay-derived fields (via the
+    /// canonical `new_from_create`), preserving `meta` (incl. `community_epoch`),
+    /// `eligible_electorate_snapshot`, and the installed `committee_oracle`.
+    /// Synchronous: `apply_event` reads only stored poll state, so no membership
+    /// resolver is needed. Each `Err` on re-fold is a terminal/monotonic
+    /// rejection, ignored exactly as boot replay ignores un-replayable events.
+    ///
+    /// ZEB-860 Task 2 lands the method + its tests; Task 3 wires the production
+    /// trigger in `VotingLog::apply_with_snapshot`, which calls this on
+    /// out-of-order arrival of an order-dependent Deliberation-family event —
+    /// so the helper (and its `canonical_key` callee) is now live in the
+    /// non-test lib build.
+    pub(crate) fn rebuild_from_events(&mut self, events: &[SignedVotingEvent]) {
+        let meta = self.meta.clone();
+        let electorate = std::mem::take(&mut self.eligible_electorate_snapshot);
+        let oracle = self.committee_oracle.clone();
+        let rebuilds = self.rebuild_count;
+        *self = Tier3PollState::new_from_create(meta, electorate);
+        self.committee_oracle = oracle;
+        self.rebuild_count = rebuilds + 1;
+
+        let mut sorted: Vec<&SignedVotingEvent> = events.iter().collect();
+        // `sort_by_cached_key` over `sort_by(|a,b| key(a).cmp(&key(b)))`:
+        // `canonical_key` hashes the event (SHA-256 signing bytes), so caching one
+        // key per element beats recomputing it on every comparison. Also satisfies
+        // clippy's `unnecessary_sort_by`.
+        sorted.sort_by_cached_key(|a| canonical_key(a));
+        for ev in sorted {
+            let _ = self.apply_event(ev);
+        }
+    }
+
     /// Apply a single event to this state, mutating it in place.
     ///
     /// Dispatches on `ev.kind` per design spec §6 per-event apply table.
@@ -440,7 +520,7 @@ impl Tier3PollState {
     ///
     /// Verify rules (SS1, SD1, B1-B5, SF1, SR1) are deferred to Task 6/7
     /// and are NOT enforced here; apply_event is the pure materialize layer.
-    pub fn apply_event(&mut self, ev: &SignedVotingEvent) -> Result<(), ApplyError> {
+    pub fn apply_event(&mut self, ev: &SignedVotingEvent) -> Result<ApplyOutcome, ApplyError> {
         // 1. Reject if terminal state.
         match self.stage {
             Stage::Failed => return Err(ApplyError::PollInFailedState),
@@ -1064,10 +1144,20 @@ impl Tier3PollState {
         if cand > *entry {
             *entry = cand;
         }
+        // ZEB-860: advance the canonical out-of-order watermark on every dispatch
+        // (accept or silent drop), beside the per-lane receive-watermark.
+        let key3 = (ev.hlc.wall_ms, ev.hlc.logical, ev.hlc.device_id.clone());
+        if self.max_applied.as_ref().is_none_or(|m| key3 > *m) {
+            self.max_applied = Some(key3);
+        }
         if advance_last_hlc {
             self.last_hlc = Some(ev.hlc.clone());
         }
-        Ok(())
+        Ok(if advance_last_hlc {
+            ApplyOutcome::Applied
+        } else {
+            ApplyOutcome::Dropped
+        })
     }
 
     /// Highest `(wall_ms, logical)` across all per-(actor,device) receive
@@ -6141,6 +6231,371 @@ mod tests {
         // Finalists: c0 (15) and c1 (6) — c2 (0) excluded.
         assert_eq!(result.finalists.len(), 2);
         assert_eq!(result.winner.event_hash, ordered[0].event_hash);
+    }
+
+    // ── ZEB-860 Task 1: ApplyOutcome / max_applied / canonical_key ────────────
+
+    #[test]
+    fn apply_event_reports_applied_vs_dropped() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage(); // sets mini-public
+                                                           // An accepted statement from a mini-public author (well inside the
+                                                           // deliberation window [0, 10_000)):
+        let s = ds_event_with_text(5_000, addr(1), "hello world statement");
+        assert_eq!(poll.apply_event(&s), Ok(ApplyOutcome::Applied));
+        // A dv from a mini-public member referencing a NON-existent statement is
+        // silently dropped (still inside the window so the drop reason is the
+        // missing statement, not an out-of-stage filter):
+        let missing = [0u8; 32];
+        let v = dv_event(6_000, addr(2), missing, BridgingVoteCode::Agree);
+        assert_eq!(poll.apply_event(&v), Ok(ApplyOutcome::Dropped));
+    }
+
+    #[test]
+    fn max_applied_advances_on_accept_and_drop() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        let s = ds_event_with_text(5_000, addr(1), "a statement here");
+        let _ = poll.apply_event(&s).unwrap();
+        let after_accept = poll.max_applied.clone();
+        assert!(after_accept.is_some());
+        // A dropped event with a HIGHER key still advances max_applied:
+        let dropped = dv_event(20_000, addr(2), [0u8; 32], BridgingVoteCode::Agree); // dropped (no statement)
+        assert_eq!(poll.apply_event(&dropped), Ok(ApplyOutcome::Dropped));
+        assert!(
+            poll.max_applied > after_accept,
+            "drop path must still advance max_applied"
+        );
+    }
+
+    #[test]
+    fn canonical_key_orders_by_hlc_then_hash() {
+        let a = ds_event_with_text(10_000, addr(1), "first statement text");
+        let b = ds_event_with_text(20_000, addr(1), "second statement text");
+        assert!(
+            canonical_key(&a) < canonical_key(&b),
+            "earlier wall_ms sorts first"
+        );
+        // Same (wall,logical,device), different payload → event_hash breaks the
+        // tie deterministically.
+        let c = ds_event_with_text(10_000, addr(1), "zzz different text same time");
+        let (ka, kc) = (canonical_key(&a), canonical_key(&c));
+        assert_eq!((ka.0, ka.1, ka.2.clone()), (kc.0, kc.1, kc.2.clone()));
+        assert_ne!(ka.3, kc.3, "distinct events get distinct hash tiebreakers");
+    }
+
+    // ── ZEB-860 Task 2: rebuild_from_events (canonical mini-restore) ───────────
+
+    #[test]
+    fn rebuild_rematerializes_dropped_vote() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        // addr(1), addr(2) are in the mini-public; window is [0, 10_000).
+        let mut poll = build_poll_in_deliberation_stage();
+        // The sortition event that lifts the poll into Deliberation is part of the
+        // poll's own event set; rebuild resets `sortition_result` via
+        // `new_from_create`, so it must be in the replay slice (matching the
+        // production per-poll `events` Vec) or every ds/dv drops as out-of-stage.
+        let ss = ss_event(
+            50,
+            vec![addr(1), addr(2), addr(3)],
+            vec![addr(10), addr(11)],
+        );
+        let s = ds_event_with_text(5_000, addr(1), "the statement being voted on");
+        let s_hash = sha256_of_signing_bytes(&s);
+        let v = dv_event(6_000, addr(2), s_hash, BridgingVoteCode::Agree); // vote by addr(2) on s
+                                                                           // Deliver the VOTE first (out of order): it drops because the statement is absent.
+        assert_eq!(poll.apply_event(&v), Ok(ApplyOutcome::Dropped));
+        assert_eq!(poll.apply_event(&s), Ok(ApplyOutcome::Applied));
+        assert!(
+            !poll.deliberation.votes.contains_key(&(addr(2), s_hash)),
+            "arrival-order fold drops the early vote"
+        );
+        // Rebuild from the same set → canonical order (ss@50 < s@5000 < v@6000)
+        // re-materializes the vote.
+        poll.rebuild_from_events(&[v.clone(), s.clone(), ss.clone()]);
+        assert!(
+            poll.deliberation.votes.contains_key(&(addr(2), s_hash)),
+            "canonical rebuild applies the vote (ds precedes dv by HLC)"
+        );
+        assert_eq!(poll.rebuild_count, 1);
+    }
+
+    #[test]
+    fn rebuild_preserves_non_replay_state() {
+        let mut poll = build_poll_in_deliberation_stage();
+        let epoch_before = poll.meta.community_epoch;
+        let electorate_before = poll.eligible_electorate_snapshot.clone();
+        // Install a non-null oracle. MockCommitteeOracle answers (latest_epoch =>
+        // Some) where the constructor's default NullCommitteeOracle returns None.
+        let oracle_state =
+            ts_apply_helpers::snapshot_of(&ts_apply_helpers::fake_committee_2_of_3());
+        poll.install_committee_oracle(std::sync::Arc::new(ts_apply_helpers::MockCommitteeOracle {
+            state: oracle_state,
+            latest: 0,
+        }));
+        let s = ds_event_with_text(5_000, addr(1), "some statement text here");
+        poll.rebuild_from_events(&[s]);
+        assert_eq!(
+            poll.meta.community_epoch, epoch_before,
+            "community_epoch preserved"
+        );
+        assert_eq!(
+            poll.eligible_electorate_snapshot, electorate_before,
+            "electorate preserved"
+        );
+        // Oracle preserved: a MockCommitteeOracle answers where NullCommitteeOracle
+        // returns None. `latest_epoch().is_some()` proves it is NOT the default
+        // NullCommitteeOracle that `new_from_create` would otherwise install.
+        assert!(
+            poll.committee_oracle.latest_epoch().is_some(),
+            "installed committee_oracle survived the rebuild reset"
+        );
+    }
+
+    #[test]
+    fn rebuild_is_monotone_additive_for_in_order_set() {
+        use crate::community_voting_core::BridgingVoteCode;
+
+        let mut poll = build_poll_in_deliberation_stage();
+        // ss (sortition) event is part of the poll's replay set — see the note in
+        // `rebuild_rematerializes_dropped_vote`.
+        let ss = ss_event(
+            50,
+            vec![addr(1), addr(2), addr(3)],
+            vec![addr(10), addr(11)],
+        );
+        let s = ds_event_with_text(5_000, addr(1), "statement one text");
+        let s_hash = sha256_of_signing_bytes(&s);
+        let v = dv_event(6_000, addr(2), s_hash, BridgingVoteCode::Agree);
+        poll.apply_event(&s).unwrap();
+        poll.apply_event(&v).unwrap();
+        let votes_before = poll.deliberation.votes.clone();
+        let statements_before = poll.deliberation.statements.clone();
+        poll.rebuild_from_events(&[ss, s, v]);
+        assert_eq!(
+            poll.deliberation.votes, votes_before,
+            "in-order set unchanged by rebuild"
+        );
+        assert_eq!(poll.deliberation.statements, statements_before);
+    }
+
+    // ── ZEB-860 spec item 7: 5-cap determinism under canonical rebuild ─────────
+    //
+    // The kd=ds apply arm caps statements at 5 per AUTHOR
+    // (`statements_per_author >= 5 → drop`). WHICH five survive depends on
+    // delivery order: under arrival order the first-5-DELIVERED win; under
+    // canonical order — exactly what `rebuild_from_events` produces — the 5
+    // HLC-EARLIEST win. When delivery is out of order these two sets DIFFER, so
+    // a previously-Applied statement can be retroactively EVICTED by the cap
+    // recomputation after a canonical rebuild (and a previously-dropped,
+    // HLC-earlier statement re-materialized). CodeRabbit (PR #590) flagged this
+    // subtlety plus the "5-cap determinism" test that testing-strategy item 7
+    // committed to but never landed. This pins BOTH eviction directions and the
+    // "two delivery orders converge" guarantee.
+    //
+    // Each of addr(1)'s 6 statements sits on its OWN device lane (dev-0..dev-5)
+    // so the per-(actor, device) monotonic guard (ZEB-850) does not reject the
+    // deliberately-descending arrival order — the same actor across six devices
+    // still shares ONE per-author 5-cap.
+    #[test]
+    fn rebuild_five_cap_keeps_hlc_earliest_deterministically() {
+        // ss seats addr(1) in the mini-public and lifts the poll into
+        // Deliberation; rebuild resets sortition_result via new_from_create, so
+        // the replay slice MUST include ss (see rebuild_rematerializes_dropped_vote).
+        let ss = ss_event(
+            50,
+            vec![addr(1), addr(2), addr(3)],
+            vec![addr(10), addr(11)],
+        );
+
+        // 6 statements from addr(1) at distinct ascending walls (5000..=5005),
+        // each on its own device lane. Capture each event_hash AFTER stamping
+        // device_id — the id is part of the signing bytes.
+        let mut stmts: Vec<SignedVotingEvent> = Vec::new();
+        let mut hashes: Vec<[u8; 32]> = Vec::new();
+        for i in 0u64..6 {
+            let mut ev = ds_event_with_text(5_000 + i, addr(1), &format!("cap statement {i}"));
+            ev.hlc.device_id = format!("dev-{i}");
+            hashes.push(sha256_of_signing_bytes(&ev));
+            stmts.push(ev);
+        }
+
+        // ── Arrival order: deliver DESCENDING [s5,s4,s3,s2,s1,s0]. Distinct
+        // lanes ⇒ no monotonic rejection; the per-author cap keeps the first 5
+        // DELIVERED {s5,s4,s3,s2,s1} and drops s0 — the HLC-EARLIEST, i.e. the
+        // WRONG five relative to canonical order.
+        let mut poll = build_poll_in_deliberation_stage();
+        for ev in stmts.iter().rev() {
+            poll.apply_event(ev)
+                .expect("apply is Ok (cap-drop is a silent drop, not an error)");
+        }
+        assert_eq!(
+            poll.deliberation.statements_per_author[&addr(1)],
+            5,
+            "arrival-order cap holds at 5"
+        );
+        assert!(
+            poll.deliberation.statements.contains_key(&hashes[5]),
+            "arrival order keeps s5 (HLC-latest, delivered first)"
+        );
+        assert!(
+            !poll.deliberation.statements.contains_key(&hashes[0]),
+            "arrival order drops s0 (HLC-earliest, delivered last) — the wrong five"
+        );
+
+        // ── Canonical rebuild: re-fold the SAME set (ss + all 6, scrambled —
+        // rebuild sorts canonically regardless). Canonical order re-derives the
+        // cap survivors as the 5 HLC-EARLIEST {s0..s4} and EVICTS s5. Assert
+        // BOTH directions so the test fails if the rebuild did not re-canonicalize.
+        let slice = vec![
+            ss.clone(),
+            stmts[3].clone(),
+            stmts[0].clone(),
+            stmts[5].clone(),
+            stmts[2].clone(),
+            stmts[4].clone(),
+            stmts[1].clone(),
+        ];
+        poll.rebuild_from_events(&slice);
+
+        assert!(
+            poll.deliberation.statements.contains_key(&hashes[0]),
+            "rebuild RE-MATERIALIZES s0 (HLC-earliest) that arrival order had dropped"
+        );
+        assert!(
+            !poll.deliberation.statements.contains_key(&hashes[5]),
+            "rebuild EVICTS s5 (HLC-latest) that arrival order had kept — retroactive eviction"
+        );
+        assert_eq!(
+            poll.deliberation.statements_per_author[&addr(1)],
+            5,
+            "cap still holds at 5 after rebuild"
+        );
+        let survivors: std::collections::BTreeSet<[u8; 32]> =
+            poll.deliberation.statements.keys().copied().collect();
+        let expected: std::collections::BTreeSet<[u8; 32]> = hashes[0..5].iter().copied().collect();
+        assert_eq!(
+            survivors, expected,
+            "canonical survivor set is exactly the 5 HLC-earliest {{s0..s4}}"
+        );
+
+        // ── Two delivery orders converge (spec item 7): fold a DIFFERENT
+        // arrival order (ascending [s0..s5]) into a fresh poll, rebuild, and
+        // assert the canonical survivor set is IDENTICAL — the rebuild's result
+        // is delivery-order-independent.
+        let mut other = build_poll_in_deliberation_stage();
+        for ev in stmts.iter() {
+            other
+                .apply_event(ev)
+                .expect("apply is Ok (cap-drop is a silent drop, not an error)");
+        }
+        let mut other_slice = vec![ss.clone()];
+        other_slice.extend(stmts.iter().cloned());
+        other.rebuild_from_events(&other_slice);
+        let survivors_other: std::collections::BTreeSet<[u8; 32]> =
+            other.deliberation.statements.keys().copied().collect();
+        assert_eq!(
+            survivors_other, survivors,
+            "two delivery orders converge to the identical canonical survivor set"
+        );
+    }
+
+    // ── ZEB-860 Task 4: order-invariance sweep for the non-trigger kinds ───────
+    //
+    // The canonical rebuild trigger (community_voting_log::apply_with_snapshot)
+    // fires only for the order-DEPENDENT Deliberation family {ss, md, ds, dv}.
+    // The drafting-family kinds kd=dc (append a candidate) and kd=da (idempotent
+    // set-insert into a candidate's approvals) are order-INDEPENDENT: their
+    // projection is identical regardless of delivery order (every downstream
+    // consumer — `drafting_advancers` — re-sorts, so the raw append order of
+    // `candidates` never reaches a result). Caveat for kd=da: this holds because
+    // the ingest gate (`verify_da_candidate_exists`, run on the local-publish,
+    // inbound, and backfill paths) guarantees a da's referenced dc is applied
+    // (hence appended) BEFORE the da — so a da-before-dc is rejected-before-append
+    // and never sits stranded in the log. This test keeps da's candidate present
+    // in both orders to exercise that in-gate reality. This guards that contract: fold a
+    // representative dc/dc/da set in two delivery orders — one delivering the
+    // lower-HLC dc LAST, i.e. genuinely out of order — and assert (a) the
+    // semantic candidate/approval projection is identical, and (b) neither poll
+    // self-triggered a rebuild (`rebuild_count` stays 0; `apply_event` is the
+    // pure materialize layer and never routes through `rebuild_from_events`, so
+    // this also pins that these kinds can never enter the rebuild path).
+    //
+    // kd=rb (append to `ratification_ballots`) and kd=ts (LWW-keyed, exactly the
+    // class as kd=dv within its own key) are order-independent by those SAME
+    // append / last-writer-wins classes; reaching them needs a Ratification-stage
+    // poll plus committee/NIZK crypto setup, so they are covered by class here
+    // rather than duplicating that heavy fixture — they too are absent from the
+    // {ss, md, ds, dv} trigger set.
+    #[test]
+    fn order_independent_kinds_converge_without_rebuild() {
+        // Semantic projection of the drafting family: candidate identity
+        // (event_hash) → its approver-address set. Delivery-order-independent by
+        // construction (BTree containers), unlike the arrival-ordered
+        // `candidates` Vec.
+        fn candidate_projection(
+            poll: &Tier3PollState,
+        ) -> std::collections::BTreeMap<[u8; 32], std::collections::BTreeSet<[u8; 16]>> {
+            poll.candidates
+                .iter()
+                .map(|c| (c.event_hash, c.approvals.iter().map(|a| a.0).collect()))
+                .collect()
+        }
+
+        // Two DraftCandidates by distinct proposers + one DraftApproval by a
+        // third actor on the FIRST candidate. HLCs: dc_a@200 < dc_b@300 < da@400.
+        let dc_a = dc_event(200, addr(1), "alpha proposal");
+        let dc_b = dc_event(300, addr(2), "beta proposal");
+        let dc_a_hash = sha256_of_signing_bytes(&dc_a);
+        let da = da_event(400, addr(3), dc_a_hash);
+
+        // Order 1 (in HLC order): dc_a, dc_b, da.
+        let mut poll_in_order = new_poll(0);
+        for ev in [&dc_a, &dc_b, &da] {
+            poll_in_order.apply_event(ev).expect("apply (in order)");
+        }
+
+        // Order 2 (out of order: the lower-HLC dc_a delivered AFTER dc_b). da is
+        // still delivered after its candidate dc_a in BOTH orders, so it Applies
+        // per the ingest rule "approval requires its candidate present". Each
+        // event is on a distinct (actor, device) lane, so the per-lane monotonic
+        // guard never rejects the reorder.
+        let mut poll_reordered = new_poll(0);
+        for ev in [&dc_b, &dc_a, &da] {
+            poll_reordered.apply_event(ev).expect("apply (reordered)");
+        }
+
+        // (a) The semantic projection converges despite the reorder.
+        assert_eq!(
+            candidate_projection(&poll_in_order),
+            candidate_projection(&poll_reordered),
+            "dc/da projection must be identical regardless of delivery order"
+        );
+        // Concretely: candidate A carries {addr(1) self-approval, addr(3) da};
+        // candidate B carries {addr(2) self-approval}.
+        let proj = candidate_projection(&poll_in_order);
+        let expected_a: std::collections::BTreeSet<[u8; 16]> =
+            [addr(1).0, addr(3).0].into_iter().collect();
+        assert_eq!(
+            proj.get(&dc_a_hash),
+            Some(&expected_a),
+            "candidate A approved by its proposer and the da actor"
+        );
+
+        // (b) Neither poll self-rebuilt: dc/da are absent from the
+        // {ss, md, ds, dv} trigger set, so folding them — even out of order —
+        // must never trigger a canonical rebuild.
+        assert_eq!(
+            poll_in_order.rebuild_count, 0,
+            "in-order dc/da fold must not rebuild"
+        );
+        assert_eq!(
+            poll_reordered.rebuild_count, 0,
+            "out-of-order dc/da delivery must NOT trigger a canonical rebuild"
+        );
     }
 }
 
