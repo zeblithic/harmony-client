@@ -563,7 +563,14 @@ impl Tier3TestHarness {
         log.apply_with_snapshot(cl_event, &community_id, None)
             .expect("apply kd=cl");
 
-        // kd=rs: winner = A, runner-up = B. Both finalists present.
+        // kd=rs finalize. ZEB-867: for pu polls, apply_event RECOMPUTES the result
+        // from the ratification-ballot set at apply time (this harness casts no
+        // ballots, so the tally is all-zero over the REAL ratification set:
+        // candidate A, candidate B, and the synthesized status_quo — 3 candidates).
+        // The crafted StarResult below is therefore only the finalize TRIGGER; the
+        // exposed finalists are the 3 real ratification candidates, not this
+        // 2-entry craft. runner_up is still reported (>= 2 finalists), which is what
+        // this harness exercises.
         let star_result = StarResult {
             winner: CandidateRef {
                 event_hash: dc_a_hash,
@@ -818,11 +825,14 @@ async fn get_tier3_poll_two_finalist_finalized_exposes_runner_up() {
         winner, runner_up,
         "runner_up must differ from winner: winner={winner}, runner_up={runner_up}"
     );
-    // ratification_candidates exposes both finalists with their text.
+    // ratification_candidates exposes the real ratification set. ZEB-867: pu
+    // finalize recomputes over the ballot set, so the authoritative finalists are
+    // the two named candidates PLUS the synthesized status_quo (3 total), not the
+    // harness's 2-entry crafted result.
     assert_eq!(
         export.ratification_candidates.len(),
-        2,
-        "finalists projection must include both candidates"
+        3,
+        "finalists projection includes both named candidates + status_quo"
     );
     let texts: Vec<&str> = export
         .ratification_candidates
@@ -831,6 +841,10 @@ async fn get_tier3_poll_two_finalist_finalized_exposes_runner_up() {
         .collect();
     assert!(texts.contains(&"Winner candidate text"));
     assert!(texts.contains(&"Runner-up candidate text"));
+    assert!(
+        texts.contains(&"<status quo>"),
+        "status_quo is a real ratification candidate: {texts:?}"
+    );
 }
 
 #[tokio::test]
