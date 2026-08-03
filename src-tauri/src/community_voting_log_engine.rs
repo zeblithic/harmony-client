@@ -1943,11 +1943,72 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
         let mut packet = Vec::new();
         ciborium::into_writer(&event, &mut packet).map_err(|e| format!("encode: {e}"))?;
 
+        // ZEB-857: surgical local-publish authz for the user-originated Tier-3
+        // kinds. These four kinds are forgeable by the AUTHORING node (a member
+        // could locally mint a kd=da for a candidate they may not approve, or a
+        // member who already declined could still submit one), and every peer
+        // runs the SAME sync verifier at ingest (`inbound_eligibility_check`).
+        // Without this gate the author applies locally while every peer rejects
+        // — a silent, permanent divergence (the ZEB-850 `ipc_full_lifecycle`
+        // observation). Running the identical verifiers here (via `with_tier3`,
+        // mirroring the ingest arms, including its Err-string mapping) turns a
+        // self-authored illegitimate event into a clean local `Err` that is
+        // NOT applied.
+        //
+        // The four kinds are DISJOINT from the engine-auto self-mints
+        // (kd=cl/rs/sf/ss/ts), so matching on kind alone excludes every
+        // self-mint — no exemption logic is needed — and leaves creates,
+        // tier1/2, and the ungated ds/dv/ts paths untouched. All verifiers used
+        // here are SYNC (need neither `snapshot` nor a `beacon_oracle`).
+        //
+        // ORDERING (CodeRabbit, ZEB-857 reorder): this verify block runs BEFORE
+        // `tracker.record` (below) so a REJECTED local publish never advances the
+        // replay tracker's self-loopback high-water for an event that is never
+        // applied nor broadcast. It depends only on `event.kind` + the poll_state
+        // (via `with_tier3`), both available here, so it moves up cleanly; the
+        // ZEB-270 record→broadcast ordering is preserved (record still precedes
+        // `publisher_tx.send`). Accepted events are unaffected (verify passes →
+        // record → apply → broadcast).
+        match event.kind {
+            // kd=md / kd=dc: mini-public membership (verify_sd).
+            PollEventKindCode::MiniPublicDecline | PollEventKindCode::DraftCandidate => {
+                let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                    .ok_or_else(|| "kd=md/dc local publish: undecodable poll id".to_string())?;
+                with_tier3(&self.voting_log, &pid, "kd=md/dc", |t3| {
+                    crate::community_voting_tier3::verify_sd(&event, t3)
+                })
+                .await?;
+            }
+            // kd=da: membership + referenced candidate must exist.
+            PollEventKindCode::DraftApproval => {
+                let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                    .ok_or_else(|| "kd=da local publish: undecodable poll id".to_string())?;
+                with_tier3(&self.voting_log, &pid, "kd=da", |t3| {
+                    crate::community_voting_tier3::verify_sd(&event, t3)?;
+                    crate::community_voting_tier3::verify_da_candidate_exists(&event, t3)
+                })
+                .await?;
+            }
+            // kd=rb: full-electorate B2-B5 ratification authz.
+            PollEventKindCode::RatificationBallot => {
+                let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
+                    .ok_or_else(|| "kd=rb local publish: undecodable poll id".to_string())?;
+                with_tier3(&self.voting_log, &pid, "kd=rb", |t3| {
+                    crate::community_voting_tier3::verify_ratification_ballot(&event, t3)
+                })
+                .await?;
+            }
+            // Creates, engine-auto (cl/rs/sf/ss/ts), tier1/2, and the ungated
+            // ds/dv/ts kinds are unchanged.
+            _ => {}
+        }
+
         // (2) Record BEFORE publishing — self-loopback fix.
         //
         // Self-mint path: the caller already reserved an HLC strictly
         // newer than any previously-recorded one on this (actor, device)
-        // lane, so this is an unconditional high-water bump.
+        // lane, so this is an unconditional high-water bump. Runs only after
+        // the ZEB-857 verify block above accepts the event.
         {
             let mut tracker = self.tracker.lock().await;
             tracker.record(&event);
@@ -2032,57 +2093,6 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             } else {
                 None
             };
-
-        // ZEB-857: surgical local-publish authz for the user-originated Tier-3
-        // kinds. These four kinds are forgeable by the AUTHORING node (a member
-        // could locally mint a kd=da for a candidate they may not approve, or a
-        // member who already declined could still submit one), and every peer
-        // runs the SAME sync verifier at ingest (`inbound_eligibility_check`).
-        // Without this gate the author applies locally while every peer rejects
-        // — a silent, permanent divergence (the ZEB-850 `ipc_full_lifecycle`
-        // observation). Running the identical verifiers here (via `with_tier3`,
-        // mirroring the ingest arms, including its Err-string mapping) turns a
-        // self-authored illegitimate event into a clean local `Err` that is
-        // NOT applied.
-        //
-        // The four kinds are DISJOINT from the engine-auto self-mints
-        // (kd=cl/rs/sf/ss/ts), so matching on kind alone excludes every
-        // self-mint — no exemption logic is needed — and leaves creates,
-        // tier1/2, and the ungated ds/dv/ts paths untouched. All verifiers used
-        // here are SYNC (need neither `snapshot` nor a `beacon_oracle`).
-        match event.kind {
-            // kd=md / kd=dc: mini-public membership (verify_sd).
-            PollEventKindCode::MiniPublicDecline | PollEventKindCode::DraftCandidate => {
-                let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
-                    .ok_or_else(|| "kd=md/dc local publish: undecodable poll id".to_string())?;
-                with_tier3(&self.voting_log, &pid, "kd=md/dc", |t3| {
-                    crate::community_voting_tier3::verify_sd(&event, t3)
-                })
-                .await?;
-            }
-            // kd=da: membership + referenced candidate must exist.
-            PollEventKindCode::DraftApproval => {
-                let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
-                    .ok_or_else(|| "kd=da local publish: undecodable poll id".to_string())?;
-                with_tier3(&self.voting_log, &pid, "kd=da", |t3| {
-                    crate::community_voting_tier3::verify_sd(&event, t3)?;
-                    crate::community_voting_tier3::verify_da_candidate_exists(&event, t3)
-                })
-                .await?;
-            }
-            // kd=rb: full-electorate B2-B5 ratification authz.
-            PollEventKindCode::RatificationBallot => {
-                let pid = crate::community_voting_log::decode_poll_id_ref(&event.payload)
-                    .ok_or_else(|| "kd=rb local publish: undecodable poll id".to_string())?;
-                with_tier3(&self.voting_log, &pid, "kd=rb", |t3| {
-                    crate::community_voting_tier3::verify_ratification_ballot(&event, t3)
-                })
-                .await?;
-            }
-            // Creates, engine-auto (cl/rs/sf/ss/ts), tier1/2, and the ungated
-            // ds/dv/ts kinds are unchanged.
-            _ => {}
-        }
 
         // Apply locally. Capture the returned `PollId` so the engine-auto
         // post-apply hook (ZEB-310 Task 9) can inspect the affected poll's
@@ -7089,12 +7099,29 @@ mod tests {
             payload: da_payload.clone(),
             sig: vec![0u8; 64],
         };
-        let res = engine.publish_event(da_outsider, None).await;
+        let res = engine.publish_event(da_outsider.clone(), None).await;
         assert!(
             res.is_err(),
             "illegitimate kd=da from a non-mini-public actor must be rejected on \
              the local publish path; got {res:?}"
         );
+
+        // ZEB-857 reorder (CodeRabbit): the kind-specific verify block now runs
+        // BEFORE `tracker.record`, so a REJECTED local publish must NEVER advance
+        // the self-loopback replay tracker for an event that is never applied nor
+        // broadcast. Assert the rejected event's lane/coordinate is untouched.
+        // Before the reorder (record-then-verify) both checks would be `true`.
+        {
+            let tracker = engine.tracker.lock().await;
+            assert!(
+                !tracker.is_inbound_duplicate(&da_outsider),
+                "a rejected local publish must not advance the replay high-water",
+            );
+            assert!(
+                !tracker.seen_coord(&da_outsider),
+                "a rejected local publish must not record the event's coordinate",
+            );
+        }
         let after_reject = {
             let log = engine.voting_log.lock().await;
             log.polls
