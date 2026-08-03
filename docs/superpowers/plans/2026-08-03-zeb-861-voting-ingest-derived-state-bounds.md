@@ -15,7 +15,7 @@
 - **No change** to the ZEB-860 rebuild trigger set (`{ss,md,ds,dv}`), to `last_received_hlc`'s advance-on-every-dispatch invariant (ZEB-850), or to `last_hlc`'s advance-on-accept-only invariant (ZEB-320).
 - The Component-1 length guard MUST appear in BOTH ingest routes (`process_inbound` and `apply_backfilled_event`) — parity requirement.
 - Line numbers below are as of 2026-08-03 recon and may have drifted; locate by symbol name.
-- Iterative gates may use `scripts/test-select --context task`; the FINAL pre-PR sweep is the full `--workspace --all-targets` command above.
+- Iterative gates may use `scripts/test-select --context task`; the FINAL pre-PR sweep is the full `--workspace --all-targets` command above. When you use `scripts/test-select`, copy its printed `round=… bucket=…` summary line into the task report so the selection is auditable.
 
 ---
 

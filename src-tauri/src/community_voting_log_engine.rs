@@ -3201,6 +3201,18 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             if self.app_handle.is_some() {
                 match ciborium::from_reader::<SignedVotingEvent, _>(packet) {
                     Ok(pre_event) => {
+                        // ZEB-861: reject an over-length device_id at this first
+                        // (GUI-path) decode, so a flood of over-length frames does
+                        // not also pay the second decode inside `process_inbound`.
+                        // `process_inbound` carries the same guard for the headless
+                        // and backfill routes (which have no pre-decode).
+                        if pre_event.hlc.device_id.len() > MAX_DEVICE_ID_LEN {
+                            return Err(format!(
+                                "voting event device_id length {} exceeds MAX_DEVICE_ID_LEN {}",
+                                pre_event.hlc.device_id.len(),
+                                MAX_DEVICE_ID_LEN
+                            ));
+                        }
                         if pre_event.tier == Tier::Sortition
                             && pre_event.kind != PollEventKindCode::PollCreate
                         {
@@ -6024,12 +6036,17 @@ mod tests {
             "error must mention the device_id length cap; got: {err:?}"
         );
 
-        // Must not have been applied into the log.
+        // Must not have been applied into the log: neither a poll projection
+        // NOR an entry in the global events log (rejection precedes append).
         {
             let log = voting_log.lock().await;
             assert!(
                 log.polls.is_empty(),
                 "a length-rejected event must not create a poll"
+            );
+            assert!(
+                log.events.is_empty(),
+                "a length-rejected event must not be appended to the events log"
             );
         }
     }
@@ -6068,10 +6085,17 @@ mod tests {
             "error must mention the device_id length cap; got: {err:?}"
         );
 
-        assert!(
-            voting_log.lock().await.polls.is_empty(),
-            "a length-rejected backfilled event must not create a poll"
-        );
+        {
+            let log = voting_log.lock().await;
+            assert!(
+                log.polls.is_empty(),
+                "a length-rejected backfilled event must not create a poll"
+            );
+            assert!(
+                log.events.is_empty(),
+                "a length-rejected backfilled event must not be appended to the events log"
+            );
+        }
     }
 
     /// ZEB-861 (Task 1): a canonical 32-hex-char `device_id` and a boundary

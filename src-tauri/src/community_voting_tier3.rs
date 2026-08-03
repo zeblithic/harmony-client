@@ -2977,28 +2977,36 @@ mod tests {
     }
 
     // Divergence-safety: the cap is a pure function of the canonical event SET,
-    // so two delivery orders of an over-cap sequence converge to the identical
-    // materialized projection after a canonical rebuild.
+    // so the LIVE apply path (arrival order) and a canonical rebuild converge to
+    // the identical materialized projection. Exercising the live path — not only
+    // rebuild, which sorts its input — is what catches an arrival-order cap
+    // regression.
     #[test]
     fn per_actor_caps_converge_across_delivery_orders() {
         let a = addr(1);
         let events = vec![md_event(100, a), md_event(101, a), md_event(102, a)];
 
-        let mut p1 = new_poll(0);
-        p1.rebuild_from_events(&events);
+        // Live path: apply via apply_event in arrival order, no rebuild.
+        let mut p_live = new_poll(0);
+        for e in &events {
+            p_live.apply_event(e).expect("Ok (accept or cap-drop)");
+        }
 
+        // Rebuild path: canonical fold from the same SET in reversed input order.
         let mut reversed = events.clone();
         reversed.reverse();
-        let mut p2 = new_poll(0);
-        p2.rebuild_from_events(&reversed);
+        let mut p_rebuild = new_poll(0);
+        p_rebuild.rebuild_from_events(&reversed);
 
+        // Live in-order and canonical rebuild (any input order) must agree, and
+        // both must land on the canonically-first LIMIT declines.
         assert_eq!(
-            p1.declines, p2.declines,
-            "canonical rebuild must be order-independent under the cap"
+            p_live.declines, p_rebuild.declines,
+            "live apply and canonical rebuild must converge under the cap"
         );
-        assert_eq!(p1.declines_per_actor, p2.declines_per_actor);
+        assert_eq!(p_live.declines_per_actor, p_rebuild.declines_per_actor);
         assert_eq!(
-            p1.declines.len(),
+            p_live.declines.len(),
             MAX_DECLINES_PER_ACTOR as usize,
             "the canonically-first LIMIT declines materialize"
         );
