@@ -33,20 +33,6 @@ pub enum Stage {
     Failed,
 }
 
-impl Stage {
-    /// ZEB-868: a trigger-kind (`ss`/`md`/`ds`/`dv`) event whose own HLC lands in
-    /// Ratification or a terminal stage sorts canonically-last and cannot
-    /// retroactively change any earlier Deliberation event's outcome, so it never
-    /// needs a projection rebuild. Only the three pre-Ratification stages can.
-    /// Used by the out-of-order rebuild trigger (`community_voting_log.rs`).
-    pub(crate) fn is_pre_ratification(self) -> bool {
-        matches!(
-            self,
-            Stage::Sortition | Stage::Deliberation | Stage::Drafting
-        )
-    }
-}
-
 // ── Supporting state types ────────────────────────────────────────────────────
 
 /// State for a single draft candidate (kd=dc event).
@@ -268,10 +254,13 @@ pub struct Tier3PollState {
     /// across rebuilds — so a cache hit is provably identical to a fresh verify:
     /// the cache changes *when* the NIZK runs, never *whether* a ballot is
     /// accepted. Ephemeral: never serialized; preserved across each rebuild's
-    /// reset (like `committee_oracle`) so a rebuild re-folds crypto-free. Bounded
-    /// by ZEB-861's per-actor ballot cap × electorate × committee epochs. Only
-    /// `rb` is memoized: the `ts` DLEQ verdict depends on the fold-order-dependent
-    /// ballot aggregate `c1_agg`, so it is not a pure function of `event_hash`.
+    /// reset (like `committee_oracle`) so a rebuild re-folds crypto-free.
+    /// **Admission is bounded**: only ACCEPTED ballots (valid proof AND under the
+    /// per-actor cap) are inserted, so the map is bounded by ZEB-861's per-actor
+    /// ballot cap × electorate × committee epochs — invalid proofs and over-cap
+    /// events (unbounded, attacker-controlled) never grow it. Only `rb` is
+    /// memoized: the `ts` DLEQ verdict depends on the fold-order-dependent ballot
+    /// aggregate `c1_agg`, so it is not a pure function of `event_hash`.
     pub(crate) rb_nizk_verdicts: std::collections::BTreeMap<([u8; 32], u64), bool>,
 }
 
@@ -947,45 +936,42 @@ impl Tier3PollState {
                         "kd=rb drop: B5 encoding-matches-privacy-mode/shape failed"
                     );
                 } else if mode == "se" {
-                    // NIZK verify against committee Y at latest known epoch,
-                    // memoized by (event_hash, epoch) — the verdict's only inputs
-                    // (the committee oracle is external and preserved across
-                    // rebuilds), so a cache hit is provably identical to a fresh
-                    // verify. This makes a projection rebuild re-fold crypto-free
-                    // (ZEB-868). Only the expensive committee-known path is cached;
-                    // `epoch == None` yields a transient, uncached `false`.
+                    // NIZK verify against committee Y at latest known epoch. The
+                    // verdict is a pure function of (event_hash, epoch) — the
+                    // committee oracle is external and preserved across rebuilds —
+                    // so an ACCEPTED ballot's verdict is memoized (below, on the
+                    // accept path only) and a rebuild re-folds it crypto-free
+                    // (ZEB-868). A cache hit here returns exactly what a fresh
+                    // verify would. `epoch == None` (no committee) → transient false.
+                    let ev_hash = sha256_of_signing_bytes(ev);
                     let epoch = self.committee_oracle.latest_epoch();
                     let nizk_ok = match epoch {
                         Some(e) => match self.committee_oracle.committee_at_epoch(e) {
                             Some(cs) => {
-                                let key = (sha256_of_signing_bytes(ev), e);
-                                if let Some(&cached) = self.rb_nizk_verdicts.get(&key) {
+                                if let Some(&cached) = self.rb_nizk_verdicts.get(&(ev_hash, e)) {
                                     cached
                                 } else {
-                                    let verdict =
-                                        match crate::community_voting_tier3_crypto::decompress_point(
-                                            &cs.joint_verifying_key,
-                                        ) {
-                                            Some(y_point) => {
-                                                let proof_ref = payload.proof.as_ref().unwrap();
-                                                let proof_struct =
+                                    match crate::community_voting_tier3_crypto::decompress_point(
+                                        &cs.joint_verifying_key,
+                                    ) {
+                                        Some(y_point) => {
+                                            let proof_ref = payload.proof.as_ref().unwrap();
+                                            let proof_struct =
                                             crate::community_voting_tier3_nizk::BallotBundleProof {
                                                 range_proofs: proof_ref.range_proofs.clone(),
                                                 consistency_proofs: proof_ref
                                                     .consistency_proofs
                                                     .clone(),
                                             };
-                                                crate::community_voting_tier3_nizk::verify_ballot_bundle(
-                                            &y_point,
-                                            payload.ciphertexts_scores.as_ref().unwrap(),
-                                            payload.ciphertexts_indicators.as_ref().unwrap(),
-                                            &proof_struct,
-                                        )
-                                            }
-                                            None => false,
-                                        };
-                                    self.rb_nizk_verdicts.insert(key, verdict);
-                                    verdict
+                                            crate::community_voting_tier3_nizk::verify_ballot_bundle(
+                                                &y_point,
+                                                payload.ciphertexts_scores.as_ref().unwrap(),
+                                                payload.ciphertexts_indicators.as_ref().unwrap(),
+                                                &proof_struct,
+                                            )
+                                        }
+                                        None => false,
+                                    }
                                 }
                             }
                             None => false,
@@ -1013,6 +999,14 @@ impl Tier3PollState {
                         } else {
                             self.ratification_ballots.push(payload);
                             *self.ballots_per_actor.entry(ev.actor).or_insert(0) += 1;
+                            // ZEB-868: memoize the NIZK verdict ONLY for an accepted
+                            // ballot (valid proof AND under the per-actor cap), so the
+                            // cache is bounded by the retained-ballot count — invalid
+                            // proofs and over-cap events never grow it. A later rebuild
+                            // re-verifies this ballot as an O(1) cache hit.
+                            if let Some(e) = epoch {
+                                self.rb_nizk_verdicts.insert((ev_hash, e), true);
+                            }
                         }
                     }
                 } else {
@@ -2731,18 +2725,6 @@ mod tests {
         poll.apply_event(&ev).expect("apply ss");
         // now=15000ms: ≥ dw threshold (10000) but < dw+fw threshold (20000) → Drafting
         assert_eq!(poll.current_stage_at(&hlc(15_000)), Stage::Drafting);
-    }
-
-    // ── ZEB-868: Stage::is_pre_ratification truth table ───────────────────────
-
-    #[test]
-    fn stage_is_pre_ratification_truth_table() {
-        assert!(Stage::Sortition.is_pre_ratification());
-        assert!(Stage::Deliberation.is_pre_ratification());
-        assert!(Stage::Drafting.is_pre_ratification());
-        assert!(!Stage::Ratification.is_pre_ratification());
-        assert!(!Stage::Finalized.is_pre_ratification());
-        assert!(!Stage::Failed.is_pre_ratification());
     }
 
     // ── Test 6: apply kd=md appends to declines ────────────────────────────────
@@ -6006,54 +5988,70 @@ mod tests {
     }
 
     #[test]
-    fn rb_nizk_cache_records_correct_verdict_per_event() {
+    fn rb_nizk_cache_admits_only_accepted_ballots() {
+        // Bounded-admission policy (ZEB-868): only ACCEPTED ballots (valid proof
+        // AND under the per-actor cap) enter the cache, so unlimited invalid proofs
+        // and over-cap ballots cannot grow it.
         let (mut state, committee) =
             ts_apply_helpers::arrange_se_poll_in_ratification_stage_with_real_committee(3);
         let epoch = state
             .committee_oracle
             .latest_epoch()
             .expect("committee epoch present");
+        let actor0 = state.eligible_electorate_snapshot[0];
+        let actor1 = state.eligible_electorate_snapshot[1];
 
-        // Valid ballot → memoizes true and is accepted.
+        // Valid ballot from actor0 → accepted → memoizes true.
         let good = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
-        let good_ev = ts_apply_helpers::rb_event_at_with_actor(
-            RATIFICATION_OPEN_MS,
-            state.eligible_electorate_snapshot[0],
-            &good,
-        );
+        let good_ev = ts_apply_helpers::rb_event_at_with_actor(RATIFICATION_OPEN_MS, actor0, &good);
         state.apply_event(&good_ev).expect("apply ok");
-
-        // Invalid-NIZK ballot (bit-flipped range proof) → memoizes false, dropped.
-        let mut bad = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
-        bad.proof.as_mut().unwrap().range_proofs[0] ^= 0x01;
-        let bad_ev = ts_apply_helpers::rb_event_at_with_actor(
-            RATIFICATION_OPEN_MS,
-            state.eligible_electorate_snapshot[1],
-            &bad,
-        );
-        state.apply_event(&bad_ev).expect("apply ok");
-
         let good_key = (super::sha256_of_signing_bytes(&good_ev), epoch);
-        let bad_key = (super::sha256_of_signing_bytes(&bad_ev), epoch);
         assert_eq!(
             state.rb_nizk_verdicts.get(&good_key),
             Some(&true),
-            "valid ballot memoizes a true verdict (== fresh verify)"
-        );
-        assert_eq!(
-            state.rb_nizk_verdicts.get(&bad_key),
-            Some(&false),
-            "invalid NIZK memoizes a false verdict (== fresh verify)"
-        );
-        assert_eq!(
-            state.ratification_ballots.len(),
-            1,
-            "only the valid ballot accepted; the memoized verdict drives accept/drop"
+            "accepted ballot memoizes a true verdict (== fresh verify)"
         );
 
-        // The key is (event_hash, epoch): a lookup at a different epoch misses, so
-        // a committee rotation forces a recompute rather than serving a stale
-        // verdict (divergence-safety).
+        // Invalid-NIZK ballot from actor1 (bit-flipped range proof) → dropped and
+        // NOT cached: unlimited distinct invalid proofs must never grow the cache.
+        let mut bad = ts_apply_helpers::build_real_se_ballot_payload(&committee, &[5, 3, 1]);
+        bad.proof.as_mut().unwrap().range_proofs[0] ^= 0x01;
+        let bad_ev = ts_apply_helpers::rb_event_at_with_actor(RATIFICATION_OPEN_MS, actor1, &bad);
+        state.apply_event(&bad_ev).expect("apply ok");
+        assert!(
+            !state
+                .rb_nizk_verdicts
+                .contains_key(&(super::sha256_of_signing_bytes(&bad_ev), epoch)),
+            "invalid-NIZK ballot must NOT be cached (bounded admission)"
+        );
+        assert_eq!(
+            state.rb_nizk_verdicts.len(),
+            1,
+            "only the accepted ballot is cached so far"
+        );
+
+        // Two more valid ballots from actor0. MAX_RATIFICATION_BALLOTS_PER_ACTOR is
+        // 2, so with `good` this is 3 valid ballots: the 2nd is accepted, the 3rd is
+        // over-cap → dropped and NOT cached.
+        for scores in [[4u64, 2, 0], [2, 1, 3]] {
+            let extra = ts_apply_helpers::build_real_se_ballot_payload(&committee, &scores);
+            let extra_ev =
+                ts_apply_helpers::rb_event_at_with_actor(RATIFICATION_OPEN_MS, actor0, &extra);
+            state.apply_event(&extra_ev).expect("apply ok");
+        }
+        assert_eq!(
+            state.ballots_per_actor.get(&actor0).copied(),
+            Some(MAX_RATIFICATION_BALLOTS_PER_ACTOR),
+            "actor0 capped at 2 accepted ballots"
+        );
+        assert_eq!(
+            state.rb_nizk_verdicts.len(),
+            MAX_RATIFICATION_BALLOTS_PER_ACTOR as usize,
+            "cache holds only the 2 accepted ballots; the over-cap ballot is NOT cached"
+        );
+
+        // The key is (event_hash, epoch): a lookup at a different epoch misses, so a
+        // committee rotation forces a recompute rather than serving a stale verdict.
         assert!(
             !state
                 .rb_nizk_verdicts
