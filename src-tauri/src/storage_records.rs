@@ -238,10 +238,17 @@ impl StorageRecordStore {
             if row.pledges.len() > MAX_PLEDGES_PER_LIST {
                 continue;
             }
-            // Reloaded rows are "most-established": they get the lowest `seq`
-            // values (stamped here in disk order, before any live ingest), so
-            // a post-restart flood is the newest (highest seq) and self-evicts
-            // first. `received_at_ms: 0` is kept for its receipt-clock meaning.
+            // Reloaded rows get the lowest `seq` values (before any live
+            // ingest), so a post-restart flood is the newest (highest seq) and
+            // self-evicts first. `received_at_ms` is not persisted (reset to 0),
+            // so — unlike the pins below — there is no local clock to order
+            // these by; they are stamped in disk order. That order is
+            // owner-sorted, but a reload-time eviction among them fires ONLY if
+            // the on-disk file is over cap, which an honest save never produces
+            // (every ingest evicts to the cap). It is reachable only via a
+            // tampered/foreign file, where every row is already
+            // attacker-controlled and there is no honest row to protect — so
+            // the owner-derived order is not a peer-steering surface here.
             let seq = store.next_insert_seq();
             store.pledge_lists.insert(
                 row.owner,
@@ -261,8 +268,9 @@ impl StorageRecordStore {
                 tracing::warn!(owner = %row.owner, %reason, "storage_records reload: dropping ineligible backup set");
                 continue;
             }
-            // Reloaded rows are "most-established" — lowest `seq` (disk order),
-            // so a post-restart flood self-evicts first (see pledge reload).
+            // Lowest `seq` (disk order) — like pledge lists above, no persisted
+            // local clock, so reload-time eviction here is tampered-file-only
+            // and not a peer-steering surface (see pledge reload).
             let seq = store.next_insert_seq();
             store.backup_sets.insert(
                 row.owner,
@@ -274,6 +282,14 @@ impl StorageRecordStore {
                 },
             );
         }
+        // Pins DO persist a local clock (`pinned_at_ms`), so — unlike
+        // pledge/backup above — order their `seq` by that clock, NOT the
+        // owner-sorted disk order (ZEB-863 / CodeRabbit). Oldest pin ⇒ lowest
+        // seq ⇒ survives a fresh-pin flood; a peer's owner address can never
+        // steer which pin is evicted after a restart, so an established dead
+        // ratchet pin (whose eviction would re-open the legacy-downgrade
+        // window) is never selected by owner position.
+        let mut pins: Vec<(String, [u8; 16], [u8; 32], u64)> = Vec::new();
         for row in disk.signer_pins {
             let mut owner_id = [0u8; 16];
             let mut device = [0u8; 32];
@@ -285,13 +301,19 @@ impl StorageRecordStore {
                 tracing::warn!(owner = %row.owner, "storage_records reload: dropping malformed signer pin");
                 continue;
             }
+            pins.push((row.owner, owner_id, device, row.pinned_at_ms));
+        }
+        // Stable sort: oldest `pinned_at_ms` first ⇒ lowest seq. Same-ms ties
+        // keep disk order, the same narrow residual the pre-ZEB-863 code had.
+        pins.sort_by_key(|(_, _, _, pinned_at_ms)| *pinned_at_ms);
+        for (owner, owner_id, device, pinned_at_ms) in pins {
             let seq = store.next_insert_seq();
             store.signer_pins.insert(
-                row.owner,
+                owner,
                 StorageSignerPin {
                     owner_id,
                     device_ed25519: device,
-                    pinned_at_ms: row.pinned_at_ms,
+                    pinned_at_ms,
                     seq,
                 },
             );
@@ -1866,6 +1888,60 @@ mod tests {
         assert!(
             !pins.contains_key(&format!("pin-{MAX_SIGNER_PINS:05}")),
             "newest (highest seq) pin evicted"
+        );
+    }
+
+    #[test]
+    fn restart_pin_reload_orders_by_pinned_at_ms_not_owner() {
+        // ZEB-863 (CodeRabbit, Major): after a restart the dead ratchet pin
+        // with the LARGEST owner address must NOT be evicted just because
+        // owner-sorted disk order would hand it the highest seq. Reload orders
+        // pin seq by pinned_at_ms (a local clock), so the genuinely-old ratchet
+        // pin gets the lowest seq and survives; a fresh pin is evicted instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("records.json");
+        let ratchet_owner = "ff".repeat(20); // largest possible 20-byte owner
+        let mut signer_pins = vec![SignerPinOnDisk {
+            owner: ratchet_owner.clone(),
+            owner_id: "00".repeat(16),
+            device_ed25519: "11".repeat(32),
+            pinned_at_ms: 100, // OLDEST — established ratchet
+        }];
+        // Fill to capacity with fresh dead pins: smaller owners, newer pins.
+        for i in 0..MAX_SIGNER_PINS {
+            signer_pins.push(SignerPinOnDisk {
+                owner: format!("{i:040x}"),
+                owner_id: "00".repeat(16),
+                device_ed25519: "11".repeat(32),
+                pinned_at_ms: 1_000 + i as u64,
+            });
+        }
+        // Persist in owner order, exactly as save() would — this is what makes
+        // the old owner-order seq assignment hand the largest-owner ratchet pin
+        // the highest seq (and evict it). The fix re-sorts by pinned_at_ms.
+        signer_pins.sort_by(|a, b| a.owner.cmp(&b.owner));
+        let disk = StorageRecordsDiskV1 {
+            version: RECORDS_FILE_VERSION,
+            pledge_lists: vec![],
+            backup_sets: vec![],
+            signer_pins,
+        };
+        std::fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+
+        // Restart: reload. Over the pin cap by one, so exactly one pin evicts at
+        // load. All pins are dead (no live records), so the victim is the newest
+        // DEAD pin (highest seq) — never the oldest ratchet pin.
+        let store = StorageRecordStore::new(Some(path));
+        assert!(
+            store.signer_pin(&ratchet_owner).is_some(),
+            "old ratchet pin (largest owner, oldest pinned_at_ms) survives restart \
+             eviction — owner order does not select the victim"
+        );
+        assert!(
+            store
+                .signer_pin(&format!("{:040x}", MAX_SIGNER_PINS - 1))
+                .is_none(),
+            "the newest fresh pin (highest seq) is the one evicted"
         );
     }
 

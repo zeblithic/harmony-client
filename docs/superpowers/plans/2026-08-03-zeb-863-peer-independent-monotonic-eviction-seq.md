@@ -16,6 +16,8 @@ disk/wire/CRDT change.
 ## Global Constraints
 
 - Build/test from `src-tauri/`. Iterative gate: `scripts/test-select --context task`.
+  Paste the printed `round=… bucket=…` summary line into the task report so the
+  selection is auditable (per CLAUDE.md's iterative-test-selection convention).
   Final pre-PR sweep: `cargo nextest run --locked --workspace --all-targets --features test-fixtures` + `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings` + `cargo fmt --all -- --check`.
 - `seq` is NOT persisted (no `*OnDisk` struct changes, no `RECORDS_FILE_VERSION` bump).
 - Do not change `received_at_ms` (hosting staleness/UI) or `pinned_at_ms` (disk) semantics.
@@ -53,11 +55,13 @@ disk/wire/CRDT change.
 
 - [ ] **Step 4: Stamp seq at every insert.** Live ingest (pledge :434, backup :506,
   hosting :573): `let seq = self.next_insert_seq();` before the `lww_insert` borrow, set
-  `seq` in the record literal. Pin `None` arm (:372): stamp before the insert (compute
-  before/around the `match self.signer_pins.get(...)` to avoid the borrow conflict;
-  wasting a seq on the no-op arms is harmless). Reload (:217, :237, :260): set
-  `seq: store.insert_seq` then `store.insert_seq += 1` (or a small local helper), in the
-  existing disk order.
+  `seq` in the record literal. Pin `None` arm (:372): stamp before the insert. Reload:
+  stamp `seq` via `store.next_insert_seq()`. **Pins** must be sorted by `pinned_at_ms`
+  (their persisted local clock) BEFORE stamping, so the oldest pin gets the lowest `seq`
+  and an established dead ratchet pin is never evicted by owner position after a restart
+  (CodeRabbit, Major). **Pledge/backup** have no persisted local clock (`received_at_ms`
+  resets to 0), so they are stamped in disk order — a reload-time eviction among them is
+  tampered-file-only (honest saves never exceed the cap), not a peer-steering surface.
 
 - [ ] **Step 5: Key eviction on seq.** `evict_overflow<R>`: rename the closure param to
   `seq`, replace the victim selection with

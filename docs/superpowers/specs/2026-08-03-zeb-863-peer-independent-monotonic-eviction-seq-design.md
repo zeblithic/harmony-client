@@ -81,11 +81,24 @@ record construction:
   `now_ms` on replace.
 - Pin creation: the `None` (first-pin) arm at :372. (Rebind-reject and matching-pin
   arms do not insert.)
-- Reload in `new()`: pledge (:217), backup (:237), pin (:260). Stamped in the existing
-  owner-sorted disk order (`save()` sorts by owner), so the assignment is deterministic
-  and peer-independent. All reloaded rows are "established" and get low seq; a
-  post-restart flood gets higher seq and self-evicts first — preserving the existing
-  post-restart invariant (which today relies on `received_at_ms: 0` on reload).
+- Reload in `new()`: all reloaded rows are "established" and get low `seq` (before any
+  live ingest), so a post-restart flood gets higher `seq` and self-evicts first —
+  preserving the existing post-restart invariant (which today relies on `received_at_ms:
+  0` on reload). The order *within* the reloaded set differs by family:
+  - **Pins** persist a local clock (`pinned_at_ms`), so reload sorts pins by
+    `pinned_at_ms` ascending and stamps `seq` in that order — the genuinely-oldest pin
+    gets the lowest `seq` and survives. This is **peer-independent**: a peer's owner
+    address cannot steer which pin is evicted after a restart, so an established dead
+    ratchet pin (whose eviction re-opens the ZEB-679 legacy-downgrade window) is never
+    selected by owner position. (Corrects the earlier draft, which wrongly stamped pins
+    in owner-sorted disk order — CodeRabbit, PR #594.)
+  - **Pledge/backup** do NOT persist a local clock (`received_at_ms` resets to 0), so
+    there is no signal to order them by; they are stamped in disk order (owner-sorted).
+    A reload-time eviction among them fires ONLY if the on-disk file is over cap, which
+    an honest save never produces (every ingest evicts to the cap) — it is reachable
+    only via a tampered/foreign file, where every row is already attacker-controlled and
+    there is no honest row to protect. So the owner-derived order is **not a
+    peer-steering surface** for these families.
 
 ### 4. Eviction keys on `seq`, owner dropped
 
