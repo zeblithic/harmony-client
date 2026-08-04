@@ -24,3 +24,5 @@ mod community_presence_two_engine_integration;
 mod error_phrasing_regression;
 #[path = "misc/ipc_arg_casing.rs"]
 mod ipc_arg_casing;
+#[path = "misc/open_join_shed_acceptor_harness_integration.rs"]
+mod open_join_shed_acceptor_harness_integration;

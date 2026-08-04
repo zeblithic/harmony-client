@@ -298,6 +298,16 @@ where
         self
     }
 
+    /// ZEB-864: override the pre-auth connection shield's limiter. Production
+    /// wiring never calls this (the default `OpenJoinConnLimiter::new()` carries
+    /// production caps); the acceptor-harness shed test injects a zero-cap
+    /// limiter to force a deterministic shed. Builder-style so it composes with
+    /// the other `with_*` seams.
+    pub fn with_open_join_conn_limiter(mut self, limiter: OpenJoinConnLimiter) -> Self {
+        self.open_join_conn_limiter = limiter;
+        self
+    }
+
     /// Inbound bi-stream handler shared by the trait dispatch and the
     /// integration-test direct-drive helper. Reads the length-prefixed
     /// request packet, runs `handle_unicast`, polls for the auto-
