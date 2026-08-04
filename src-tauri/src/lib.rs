@@ -1741,6 +1741,23 @@ impl NodeState {
         self.thread.is_some()
     }
 
+    /// ZEB-801: classify why an owner-derived handle is absent, for a
+    /// non-destructive user-facing error. Called from the `ok_or_else` at the
+    /// owner-handle guard sites, i.e. only when a handle is already `None`.
+    ///
+    /// The owner handles (`crdt_state`, `dm_outbox`, `community_registry`,
+    /// `dm_self_owner`, …) are installed in one atomic block alongside
+    /// `self.thread` at `start_node` and nulled together, so `thread`
+    /// faithfully separates the two absence causes. Neither warrants the
+    /// destructive "recreate identity" advice ZEB-338 left here.
+    fn owner_not_loaded_msg(&self) -> &'static str {
+        if self.node_is_running() {
+            OWNER_NO_IDENTITY_MSG
+        } else {
+            OWNER_STILL_STARTING_MSG
+        }
+    }
+
     /// ZEB-445: status surface helpers for the API server.
     pub(crate) fn generation_for_status(&self) -> u64 {
         self.generation
@@ -2394,6 +2411,14 @@ pub(crate) fn wall_clock_ms() -> u64 {
         .as_millis() as u64
 }
 
+// ZEB-801: shown when an owner-derived handle is absent because the node has
+// not finished starting (`!node_is_running()`) — the common case.
+pub(crate) const OWNER_STILL_STARTING_MSG: &str =
+    "Owner identity not loaded — the app is still starting. Try again in a moment.";
+// ZEB-801: shown when the node IS running but no owner identity is loaded
+// (pre-mint / absent). Non-destructive — never advises recreating identity.
+pub(crate) const OWNER_NO_IDENTITY_MSG: &str =
+    "Owner identity not loaded — no identity is set up on this device yet.";
 // ZEB-338: the single honest "owner identity not loaded" message. Use this at
 // owner-derived-handle guards so the phrasing can't drift between call sites.
 // (Incremental adoption — applied where edited, not a blanket sweep.)
@@ -14779,9 +14804,13 @@ pub(crate) async fn send_dm_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.dm_transport.clone().ok_or("dm_transport missing")?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
@@ -15264,7 +15293,9 @@ pub(crate) async fn read_dm_thread_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.content_store.clone().ok_or("content_store missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
         )
@@ -15479,8 +15510,12 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
@@ -16030,8 +16065,12 @@ pub(crate) async fn add_space_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
@@ -27283,8 +27322,14 @@ async fn resolve_dm_call_peer(
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        let crdt = g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
-        let outbox = g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let crdt = g
+            .crdt_state
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?;
+        let outbox = g
+            .dm_outbox
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?;
         let owner = g.dm_self_owner.ok_or("dm_self_owner missing")?;
         (crdt, outbox, owner)
     };
@@ -27437,8 +27482,14 @@ async fn resolve_group_call_members(
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        let crdt = g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
-        let outbox = g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let crdt = g
+            .crdt_state
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?;
+        let outbox = g
+            .dm_outbox
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?;
         let owner = g.dm_self_owner.ok_or("dm_self_owner missing")?;
         (crdt, outbox, owner)
     };
@@ -27738,7 +27789,9 @@ async fn decline_group_call(
             let g = state
                 .lock()
                 .map_err(|e| format!("NodeState poisoned: {e}"))?;
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?
         };
         let is_member = {
             let os = crdt_state.lock().await;
@@ -27798,7 +27851,10 @@ async fn get_group_dm_members(
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        let crdt = g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?;
+        let crdt = g
+            .crdt_state
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?;
         let owner = g.dm_self_owner.ok_or("dm_self_owner missing")?;
         (crdt, owner)
     };
@@ -29050,7 +29106,9 @@ pub(crate) async fn list_owner_communities_impl(
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+        g.crdt_state
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?
     };
     let state = crdt_state.lock().await;
     Ok(communities_for_nav(&state))
@@ -29120,7 +29178,9 @@ pub(crate) async fn list_owner_dm_spaces_impl(
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+        g.crdt_state
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?
     };
     let state = crdt_state.lock().await;
     Ok(dm_spaces_for_nav(&state))
@@ -29188,7 +29248,9 @@ pub(crate) async fn list_left_communities_impl(
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+        g.crdt_state
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?
     };
     let state = crdt_state.lock().await;
     Ok(left_communities_for_nav(&state))
@@ -29606,8 +29668,12 @@ pub(crate) async fn list_community_members_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             // ZEB-777. Optional on purpose: an unnamed roster is strictly
             // better than an error, since this is an enrichment.
             g.profile_card_cache.clone(),
@@ -29837,10 +29903,14 @@ async fn list_community_forks(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        let self_owner = g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?;
+        let self_owner = g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             self_owner,
         )
     };
@@ -30024,10 +30094,14 @@ async fn get_community_lineage(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        let self_owner = g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?;
+        let self_owner = g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             self_owner,
         )
     };
@@ -30960,8 +31034,12 @@ pub(crate) async fn create_channel_impl(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
             // ZEB-467: Option — absent only before the node finishes
             // standing up (the eager spawn below skips and the delta
@@ -31307,8 +31385,12 @@ async fn modify_channel(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -31473,9 +31555,15 @@ async fn delete_channel(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -31659,8 +31747,12 @@ pub(crate) async fn list_channels_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
 
@@ -33439,12 +33531,16 @@ pub(crate) async fn list_mentions_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.channel_log_registry
                 .clone()
                 .ok_or_else(|| "channel_log_registry missing — node not running".to_string())?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
     let self_owner_hex = hex::encode(self_owner.0);
@@ -33762,9 +33858,15 @@ pub(crate) async fn generate_invite_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
     // ZEB-339: snapshot the local owner's EnrollmentCert (the inviter is the
@@ -33879,7 +33981,9 @@ pub(crate) async fn generate_invite_impl(
                 .lock()
                 .map_err(|e| format!("NodeState poisoned: {e}"))?;
             (
-                g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+                g.hlc_tracker
+                    .clone()
+                    .ok_or_else(|| g.owner_not_loaded_msg())?,
                 g.hlc_adopt_floor.clone(),
             )
         };
@@ -34834,12 +34938,16 @@ pub(crate) async fn create_community_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
@@ -34847,8 +34955,12 @@ pub(crate) async fn create_community_impl(
             // receiver degrades to a non-re-arming fetch driver rather
             // than failing the IPC.
             g.transport_epoch_rx.clone(),
-            g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.channel_log_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
             g.sync_engine.clone(),
         )
@@ -40313,12 +40425,16 @@ pub(crate) async fn redeem_invite_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
@@ -40326,8 +40442,12 @@ pub(crate) async fn redeem_invite_impl(
             // receiver degrades to a non-re-arming fetch driver rather
             // than failing the IPC.
             g.transport_epoch_rx.clone(),
-            g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.channel_log_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
             g.sync_engine.clone(),
         )
@@ -40599,13 +40719,19 @@ pub(crate) async fn join_open_community_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.library_directory
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
@@ -40613,8 +40739,12 @@ pub(crate) async fn join_open_community_impl(
             // receiver degrades to a non-re-arming fetch driver rather
             // than failing the IPC.
             g.transport_epoch_rx.clone(),
-            g.channel_log_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.channel_log_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
             g.sync_engine.clone(),
         )
@@ -42976,8 +43106,12 @@ async fn list_libraries(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.library_directory
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
     let crdt_g = crdt_state.lock().await;
@@ -43025,8 +43159,12 @@ async fn list_discovered_libraries(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.library_directory
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
 
@@ -43161,11 +43299,19 @@ async fn add_library(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.library_directory
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             // ZEB-709 (audit A3): the owner-state engine — the libraries
             // write below must arm its flush. Option, not ok_or.
             g.sync_engine.clone(),
@@ -43251,11 +43397,19 @@ async fn remove_library(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.library_directory
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             // ZEB-709 (audit A4): the owner-state engine — the tombstone
             // write below must arm its flush. Option, not ok_or.
             g.sync_engine.clone(),
@@ -43329,7 +43483,9 @@ async fn browse_library(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.library_directory.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+        g.library_directory
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?
     };
     let aggregated = match library_addr {
         None => library_directory.snapshot_all().await,
@@ -43387,13 +43543,19 @@ async fn set_space_shared_in_profile(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.profile_broadcast_publisher
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -43514,7 +43676,9 @@ async fn list_shared_in_profile_communities(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+        g.crdt_state
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?
     };
     let g = crdt_state.lock().await;
     let mut ids: Vec<String> = g
@@ -43563,10 +43727,10 @@ pub(crate) async fn subscribe_peer_profile_impl(
         (
             g.profile_broadcast_cache
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.profile_broadcast_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             std::sync::Arc::clone(&g.profile_broadcast_next_subscription_id),
         )
     };
@@ -43615,7 +43779,7 @@ pub(crate) async fn unsubscribe_peer_profile_impl(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         g.profile_broadcast_request_tx
             .clone()
-            .ok_or(OWNER_NOT_LOADED_MSG)?
+            .ok_or_else(|| g.owner_not_loaded_msg())?
     };
     request_tx
         .send(crate::event_loop::ProfileBroadcastRequest::Unsubscribe { subscription_id })
@@ -43647,7 +43811,7 @@ pub(crate) async fn get_cached_peer_profile_impl(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         g.profile_broadcast_cache
             .clone()
-            .ok_or(OWNER_NOT_LOADED_MSG)?
+            .ok_or_else(|| g.owner_not_loaded_msg())?
     };
     Ok(cache.get_cached(subscription_id).await)
 }
@@ -43674,10 +43838,12 @@ pub(crate) async fn subscribe_member_card_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.profile_card_cache.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.profile_card_cache
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.profile_card_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             std::sync::Arc::clone(&g.profile_card_next_subscription_id),
         )
     };
@@ -43724,10 +43890,12 @@ pub(crate) async fn unsubscribe_member_card_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.profile_card_cache.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.profile_card_cache
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.profile_card_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
     // Symmetry with subscribe: if the request channel is closing (event-loop
@@ -43763,7 +43931,9 @@ pub(crate) async fn get_cached_member_card_impl(
         let g = state_lock
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        g.profile_card_cache.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+        g.profile_card_cache
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?
     };
     Ok(cache.get_cached(subscription_id).await)
 }
@@ -43833,7 +44003,7 @@ pub(crate) async fn subscribe_community_presence_impl(
         (
             g.community_presence_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.addrbook_request_tx.clone(),
         )
     };
@@ -43890,7 +44060,7 @@ pub(crate) async fn unsubscribe_community_presence_impl(
         (
             g.community_presence_request_tx
                 .clone()
-                .ok_or(OWNER_NOT_LOADED_MSG)?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.addrbook_request_tx.clone(),
         )
     };
@@ -44090,7 +44260,7 @@ pub(crate) async fn get_community_presence_impl(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         g.community_presence_map
             .clone()
-            .ok_or(OWNER_NOT_LOADED_MSG)?
+            .ok_or_else(|| g.owner_not_loaded_msg())?
     };
     let owners = map
         .lock()
@@ -44654,10 +44824,16 @@ pub(crate) async fn leave_community_impl(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             // ZEB-427 Half B: needed for the post-Leave left_at write.
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             // May be None pre-start_node; the fence below degrades to a
             // loud warn rather than failing the leave (same policy as
             // the redeem/create paths).
@@ -45752,7 +45928,9 @@ pub(crate) async fn remove_space_impl(
         (
             g.dm_self_owner,
             g.community_registry.clone(),
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.sync_engine.clone(),
             g.generation,
         )
@@ -45927,7 +46105,9 @@ pub(crate) async fn clear_space_local_cache_impl(
         (
             g.dm_self_owner,
             g.community_registry.clone(),
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -47034,8 +47214,12 @@ pub(crate) async fn kick_from_community_impl(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -47430,8 +47614,12 @@ async fn set_power_level(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -47627,8 +47815,12 @@ pub(crate) async fn unban_from_community_impl(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -47745,8 +47937,12 @@ pub(crate) async fn list_recent_moderation_events_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
 
@@ -47888,8 +48084,10 @@ pub(crate) async fn list_pending_joins_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
 
@@ -48073,8 +48271,10 @@ pub(crate) async fn list_recent_counter_signs_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
 
@@ -48264,8 +48464,10 @@ async fn get_community_governance(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
 
@@ -48380,8 +48582,10 @@ async fn list_pending_admin_proposals(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
 
@@ -48779,8 +48983,12 @@ pub(crate) async fn countersign_admin_proposal_impl(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -49011,8 +49219,12 @@ async fn propose_change_quorum(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -49208,8 +49420,12 @@ async fn propose_change_thresholds(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -49489,8 +49705,10 @@ pub(crate) async fn get_recovery_state_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
 
@@ -49623,9 +49841,13 @@ pub(crate) async fn set_recovery_designates_impl(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -49829,9 +50051,13 @@ pub(crate) async fn initiate_admin_recovery_impl(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -50042,9 +50268,13 @@ pub(crate) async fn cosign_admin_recovery_impl(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -50215,9 +50445,13 @@ pub(crate) async fn veto_admin_recovery_impl(
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.generation,
         )
     };
@@ -52046,9 +52280,15 @@ async fn voting_create_tier1_poll<R: tauri::Runtime>(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             std::sync::Arc::clone(&g.voting_logs),
             // Tasks 21-23: channel_log_registry is needed for the
             // poll-kind chat-message fanout below. May be absent in
@@ -52202,7 +52442,9 @@ async fn voting_cast_tier1_ballot<R: tauri::Runtime>(
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             std::sync::Arc::clone(&g.voting_logs),
         )
     };
@@ -55092,9 +55334,18 @@ impl VotingEngineNodeHandles {
             adopt_floor: g.hlc_adopt_floor.clone(),
             device_id: g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             self_owner: g.dm_self_owner.ok_or("dm_self_owner missing")?,
-            community_registry: g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            dm_outbox: g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            crdt_state: g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            community_registry: g
+                .community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            dm_outbox: g
+                .dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            crdt_state: g
+                .crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             voting_logs: std::sync::Arc::clone(&g.voting_logs),
             voting_log_engines: std::sync::Arc::clone(&g.voting_log_engines),
             // ZEB-309 Task 11: dfrost handles so newly-created engines get
@@ -55106,7 +55357,9 @@ impl VotingEngineNodeHandles {
                 .clone()
                 .ok_or("voting_log_adapter_request_tx missing")?,
             // Needed to construct the production OwnerDeviceCacheResolver.
-            self_identity_pub_64: g.dm_identity_pub_64.ok_or(OWNER_NOT_LOADED_MSG)?,
+            self_identity_pub_64: g
+                .dm_identity_pub_64
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             // Typed Wry AppHandle captured at start_node so generic IPC
             // handlers never downcast their own `AppHandle<R>`.
             // ZEB-720: no longer required — headless nodes have no AppHandle.
@@ -56972,11 +57225,17 @@ async fn dfrost_initiate_dkg<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_initiate_dkg: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -57310,11 +57569,17 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -57562,7 +57827,9 @@ async fn dfrost_contribute_dkg_round<R: tauri::Runtime>(
             let g = state_lock
                 .lock()
                 .map_err(|e| format!("dfrost_contribute_dkg_round: NodeState poisoned: {e}"))?;
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?
         };
 
         // Snapshot pending state: members (for OwnerAddr↔Identifier
@@ -58099,11 +58366,17 @@ pub(crate) async fn dfrost_request_vrf_beacon_inner(
             .lock()
             .map_err(|e| format!("dfrost_request_vrf_beacon: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -58377,11 +58650,17 @@ async fn dfrost_contribute_threshold_sign<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_contribute_threshold_sign: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             std::sync::Arc::clone(&g.dfrost_logs),
             g.dfrost_log_registry.clone(),
         )
@@ -59045,13 +59324,21 @@ async fn dfrost_propose_refresh<R: tauri::Runtime>(
             .lock()
             .map_err(|e| format!("dfrost_propose_refresh: NodeState poisoned: {e}"))?;
         (
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_self_owner.ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             std::sync::Arc::clone(&g.dfrost_logs),
-            g.community_registry.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.community_registry
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.dfrost_log_registry.clone(),
         )
     };
@@ -63239,8 +63526,12 @@ pub(crate) async fn generate_friend_token_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.dm_outbox.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
             g.pkarr_invite_publisher.clone(),
         )
@@ -63512,7 +63803,9 @@ pub(crate) async fn list_friends_impl(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.connectivity_settings_path.clone(),
         )
     };
@@ -63560,10 +63853,16 @@ async fn unfriend(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.sync_engine.clone(),
             g.pkarr_friend_publisher.clone(),
             g.owner_keytree.clone(),
@@ -63634,10 +63933,16 @@ async fn set_friend_referrable(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
-            g.hlc_tracker.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or(OWNER_NOT_LOADED_MSG)?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.sync_engine.clone(),
         )
     };
@@ -74776,6 +75081,44 @@ mod channel_message_ipc_tests {
             .await
             .expect_err("no request_tx → owner-not-loaded");
         assert_eq!(err, OWNER_NOT_LOADED_MSG);
+    }
+
+    #[test]
+    fn owner_not_loaded_msg_reports_still_starting_when_node_not_running() {
+        // A default NodeState has `thread: None` → node not running → an absent
+        // owner handle means boot hasn't reached the install point, so the
+        // message must be the non-destructive still-starting one.
+        let ns = NodeState::default();
+        assert!(!ns.node_is_running());
+        assert_eq!(ns.owner_not_loaded_msg(), OWNER_STILL_STARTING_MSG);
+    }
+
+    #[test]
+    fn owner_not_loaded_msg_reports_no_identity_when_node_running() {
+        // A running node (thread present) with owner handles absent means the
+        // node is up but no owner identity is loaded (pre-mint / absent). The
+        // `|| {}` thread completes immediately; the handle drops with the
+        // NodeState at end of test (NodeState has no Drop impl).
+        let ns = NodeState {
+            thread: Some(std::thread::spawn(|| {})),
+            ..Default::default()
+        };
+        assert!(ns.node_is_running());
+        assert_eq!(ns.owner_not_loaded_msg(), OWNER_NO_IDENTITY_MSG);
+    }
+
+    #[test]
+    fn owner_not_loaded_msgs_never_advise_recreate() {
+        // ZEB-801 canary: the destructive "recreate identity" / "restart the
+        // app" advice must never reappear at any owner-not-loaded guard.
+        for msg in [OWNER_STILL_STARTING_MSG, OWNER_NO_IDENTITY_MSG] {
+            let low = msg.to_lowercase();
+            assert!(!low.contains("recreate"), "destructive advice in: {msg}");
+            assert!(
+                !low.contains("restart the app"),
+                "destructive advice in: {msg}"
+            );
+        }
     }
 }
 
