@@ -19,19 +19,29 @@
 //! rig), with the test playing the dialer so the exact stream shape is under control.
 //!
 //! **Case A (shed).** A zero-cap `OpenJoinConnLimiter` forces every connection to
-//! shed. The dialer opens a bi-stream, writes a 1-byte stub (enough for the server's
-//! `accept_bi()` to return), and holds it open. The handler must return exactly
-//! `ConnectionShed` — NOT a read/timeout error — proving it shed before attempting
-//! the length-prefix read; and the dialer must receive zero response data bytes.
+//! shed. The dialer opens a bi-stream, writes a 1-byte stub, and finishes the send
+//! half (flushing it so `accept_bi()` returns promptly). The handler must return
+//! exactly `ConnectionShed` — NOT a read/timeout error — proving it shed before
+//! attempting the length-prefix read; and the dialer must receive zero response
+//! data bytes.
 //!
 //! **Case B (control — the regression teeth).** The IDENTICAL dialer against a
 //! permissive limiter: the handler now passes the gate, reaches the length-prefix
-//! read, finds only 1 of 4 bytes on a held-open stream, and returns
-//! `IoTimeout { step: "read length-prefix" }`. Since the only variable between the
-//! cases is the limiter cap, the `ConnectionShed` in Case A is attributable to the
-//! gate at its pre-decode position — not incidentally to the stream shape. Without
-//! this control, an edit moving the gate below the read could still spuriously pass
-//! Case A.
+//! read, and — the dialer having written only 1 of 4 bytes and finished — hits EOF
+//! there, returning `ReadPrefix`. Since the only variable between the cases is the
+//! limiter cap, the `ConnectionShed` in Case A is attributable to the gate at its
+//! pre-decode position — not incidentally to the stream shape. Without this control,
+//! an edit moving the gate below the read could still spuriously pass Case A.
+//!
+//! **Why direct-drive (not the production dispatcher).** ZEB-864 mandates driving
+//! the `pub handle_invite_handshake_inbound` seam directly (mirroring the friend
+//! acceptor's `t7_drive_handshake`) so the handler's return VARIANT — the pre-decode
+//! `ConnectionShed` vs. a read-stage error — is inspectable; the production
+//! `handle_connection` dispatcher only exposes the dialer-observable outcome. That
+//! observable outcome (zero response bytes + close) IS still validated here: the
+//! dialer reads its recv over the real wire and the server task performs the same
+//! bounded `conn.closed()` wait the dispatcher does. Pinning the dispatcher's own
+//! `ConnectionShed`→close mapping end-to-end is tracked separately (ZEB-870).
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -155,9 +165,15 @@ fn build_acceptor(
             None,
             None,
             HandshakeAcceptorConfig {
-                // Short so the control (Case B) times out fast at the length-prefix read.
-                io_deadline: Duration::from_millis(250),
-                poll_deadline: Duration::from_millis(250),
+                // Generous so `accept_bi` never spuriously times out under CI load —
+                // the iroh connect handshake can take seconds under
+                // `nextest --all-targets` saturation (matches the cross-WAN harness's
+                // 10s deadline). Case B does NOT depend on this timeout: the dialer
+                // finishes its send, so the handler's length-prefix read hits EOF
+                // immediately (`ReadPrefix`), keeping the control deterministic
+                // regardless of scheduler load.
+                io_deadline: Duration::from_millis(10_000),
+                poll_deadline: Duration::from_millis(10_000),
                 poll_interval: Duration::from_millis(20),
             },
         )
@@ -167,10 +183,11 @@ fn build_acceptor(
 }
 
 /// Drive one inbound handshake against `acceptor` over a raw iroh loopback pair,
-/// with the test as the dialer. The dialer opens a bi-stream, writes a 1-byte stub
-/// (so the server's `accept_bi()` returns), and holds the stream open. Returns the
-/// handler's authoritative server-side `Result` and the number of response DATA
-/// bytes the dialer received (0 for a shed — reset/EOF, no content).
+/// with the test as the dialer. The dialer opens a bi-stream, writes a 1-byte stub,
+/// and finishes the send half (flushing the byte so the server's `accept_bi()`
+/// returns, and leaving an incomplete-then-EOF length prefix). Returns the handler's
+/// authoritative server-side `Result` and the number of response DATA bytes the
+/// dialer received (0 for a shed — reset/EOF, no content).
 async fn drive(
     acceptor: Arc<IrohInviteHandshakeAcceptor<()>>,
 ) -> (Result<EventId, HandshakeAcceptError>, usize) {
@@ -198,8 +215,11 @@ async fn drive(
     });
 
     // Dialer: connect on the handshake ALPN, open a bi-stream, write a 1-byte stub
-    // (a partial length prefix), and DO NOT finish — hold the stream open so a
-    // permissive acceptor blocks on the 4-byte length-prefix read.
+    // (an incomplete length prefix), and FINISH the send half. write+finish flushes
+    // the byte so the server's `accept_bi()` returns promptly (no reliance on
+    // scheduler timing), and the incomplete-then-EOF stream makes a permissive
+    // acceptor's length-prefix `read_exact` return `UnexpectedEof` immediately →
+    // `ReadPrefix` (Case B), deterministically and without depending on any timeout.
     let conn = client_ep
         .connect(server_addr, alpn::HARMONY_HANDSHAKE_V1)
         .await
@@ -208,10 +228,13 @@ async fn drive(
     send.write_all(&[0u8])
         .await
         .expect("client: write 1-byte stub");
+    send.finish()
+        .expect("client: finish send (flush the stub + FIN)");
 
     // Read any response, bounded. A shed writes nothing (reset/EOF); a permissive
-    // acceptor times out and drops its send half (reset). Either way, count the DATA
-    // bytes received — the oracle property is "zero response content".
+    // acceptor reads the incomplete prefix, hits EOF, and drops its send half.
+    // Either way, count the DATA bytes received — the oracle property is "zero
+    // response content".
     let mut buf = [0u8; 64];
     let data_len = match tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await {
         Ok(Ok(Some(n))) => n,
@@ -248,8 +271,9 @@ async fn open_join_shed_returns_connection_shed_pre_decode_zero_bytes() {
 }
 
 /// Case B (control) — permissive limiter, IDENTICAL dialer: the handler passes the
-/// gate and reaches the length-prefix read, timing out there. Pins that Case A's
-/// shed is caused by the gate at its pre-decode position, not by the stream shape.
+/// gate and reaches the length-prefix read, which hits EOF on the incomplete,
+/// finished stream (`ReadPrefix`). Pins that Case A's shed is caused by the gate at
+/// its pre-decode position, not by the stream shape — the only variable is the cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_join_permissive_limiter_reaches_length_prefix_read() {
     warm_up_iroh_global_init().await;
@@ -257,14 +281,8 @@ async fn open_join_permissive_limiter_reaches_length_prefix_read() {
         let (acceptor, _dir) = build_acceptor(OpenJoinConnLimiter::new());
         let (result, _data_len) = drive(acceptor).await;
         assert!(
-            matches!(
-                result,
-                Err(HandshakeAcceptError::IoTimeout {
-                    step: "read length-prefix",
-                    ..
-                })
-            ),
-            "permissive limiter must pass the gate and time out at the length-prefix read, got {result:?}"
+            matches!(result, Err(HandshakeAcceptError::ReadPrefix(_))),
+            "permissive limiter must pass the gate and reach the length-prefix read (EOF → ReadPrefix), got {result:?}"
         );
     })
     .await
