@@ -36,6 +36,7 @@
     channelMessageService,
     resolveCard,
     resolveNickname,
+    resolveRosterName,
     onOpenCard,
     mentionCandidates = [],
     snapshotMessages = [],
@@ -57,6 +58,7 @@
     channelMessageService: ChannelMessageService;
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
     resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveRosterName?: (ownerIdHex: string) => string | undefined;
     onOpenCard?: (
       payload: {
         ownerIdHex: string;
@@ -465,6 +467,7 @@
               {forkReason}
               {resolveCard}
               {resolveNickname}
+              {resolveRosterName}
               {onOpenCard}
               {mentionCandidates}
               composerPlaceholder="Message the room…"

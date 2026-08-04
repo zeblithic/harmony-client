@@ -59,6 +59,10 @@
      *  precedence over the broadcast profile-card name on message authors,
      *  matching the members roster and the Friends panel. */
     resolveNickname,
+    /** ZEB-774: roster-DTO displayName resolver — the shared-ladder rung below
+     *  the live card, so an author (or inline mention) the roster already named
+     *  degrades to that name rather than raw hex while their card propagates. */
+    resolveRosterName,
     /** ZEB-341: open the owner_id card popover for a message author. */
     onOpenCard,
     /** ZEB-588: roster for the @-mention autocomplete — {ownerId, label} with
@@ -82,6 +86,7 @@
     votingAdapter?: VotingAdapter;
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
     resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveRosterName?: (ownerIdHex: string) => string | undefined;
     onOpenCard?: (
       payload: {
         ownerIdHex: string;
@@ -544,7 +549,7 @@
   // re-render the author label automatically.
   function authorLabel(author: string): string {
     // Shared ladder (ZEB-432/ZEB-588): nickname ► profile-card name ► hex.
-    return resolveMentionLabel(author, resolveNickname, resolveCard);
+    return resolveMentionLabel(author, resolveNickname, resolveCard, resolveRosterName);
   }
 
   // ZEB-536 — is the local member currently reacting with `emoji` on `msg`?
@@ -969,7 +974,7 @@
               <p class="body">{#each tokenizeBody(bodyToText(msg.body)) as seg}{#if seg.type === 'mention'}<span
                     class="mention"
                     class:self={seg.ownerId === ownAddress}
-                    data-testid="mention">@{resolveMentionLabel(seg.ownerId, resolveNickname, resolveCard)}</span>{:else}{seg.text}{/if}{/each}</p>
+                    data-testid="mention">@{resolveMentionLabel(seg.ownerId, resolveNickname, resolveCard, resolveRosterName)}</span>{:else}{seg.text}{/if}{/each}</p>
             {/if}
             {#if msg.attachments && msg.attachments.length > 0}
               <MessageAttachments

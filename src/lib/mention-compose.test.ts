@@ -70,6 +70,29 @@ describe('filterCandidates', () => {
   it('respects the limit', () => {
     expect(filterCandidates(cands, 'ja', 1)).toHaveLength(1);
   });
+
+  // ZEB-774: owner-id hex prefix matching, so a peer still shown as raw hex is
+  // findable by the hex the user can see.
+  it('matches an owner-id hex prefix when no label matches', () => {
+    const hexCands: MentionCandidate[] = [
+      { ownerId: '2e9a2151303c23ed8630301147057e18', label: 'UI Probe' },
+      { ownerId: ID_A, label: 'Jasmine' },
+    ];
+    expect(filterCandidates(hexCands, '2e9a').map((c) => c.label)).toEqual(['UI Probe']);
+  });
+
+  it('ranks name matches ahead of hex-only matches', () => {
+    const rankCands: MentionCandidate[] = [
+      { ownerId: 'deadbeef'.repeat(4), label: 'Alice' }, // hex starts 'dea', label does not match
+      { ownerId: 'f'.repeat(32), label: 'Deandra' }, // label starts 'dea'
+    ];
+    expect(filterCandidates(rankCands, 'dea').map((c) => c.label)).toEqual(['Deandra', 'Alice']);
+  });
+
+  it('does not double-count a candidate matching both its label and its hex', () => {
+    const c: MentionCandidate[] = [{ ownerId: 'abcd'.repeat(8), label: 'abcdef' }];
+    expect(filterCandidates(c, 'abc')).toHaveLength(1);
+  });
 });
 
 describe('reconcileCompose', () => {

@@ -34,4 +34,18 @@ describe('MentionAutocomplete', () => {
     await fireEvent.mouseDown(screen.getByText('Jasmine'));
     expect(onPick).toHaveBeenCalledWith(B);
   });
+
+  // ZEB-774: teach the owner-id handle on named rows so it is discoverable.
+  it('shows the short owner-hex hint on a named row', () => {
+    render(MentionAutocomplete, { props: { candidates: [A], activeIndex: 0, onPick: vi.fn() } });
+    expect(screen.getByTestId('mention-hex-hint').textContent).toBe('aaaaaaaa');
+  });
+
+  it('omits the hint when the label already is the short hex (unresolved row)', () => {
+    const unresolved = { ownerId: 'c'.repeat(32), label: 'cccccccc' };
+    render(MentionAutocomplete, {
+      props: { candidates: [unresolved], activeIndex: 0, onPick: vi.fn() },
+    });
+    expect(screen.queryByTestId('mention-hex-hint')).toBeNull();
+  });
 });

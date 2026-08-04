@@ -38,7 +38,14 @@
             onPick(c);
           }}
         >
-          {c.label}
+          <span class="label">{c.label}</span>
+          {#if c.label !== c.ownerId.slice(0, 8)}
+            <!-- ZEB-774: surface the owner-id handle so a peer is findable by the
+                 hex the user can see, even before/without a resolved name. Hidden
+                 when the label already IS the short hex (unresolved row), to avoid
+                 a doubled "2e9a2151  2e9a2151". -->
+            <span class="hex-hint" data-testid="mention-hex-hint">{c.ownerId.slice(0, 8)}</span>
+          {/if}
         </button>
       </li>
     {/each}
@@ -63,7 +70,10 @@
     min-width: 12rem;
   }
   .option button {
-    display: block;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
     width: 100%;
     text-align: left;
     padding: 0.3rem 0.5rem;
@@ -74,9 +84,26 @@
     cursor: pointer;
     font: inherit;
   }
+  .option .label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hex-hint {
+    flex-shrink: 0;
+    color: var(--text-muted);
+    font-size: 0.8em;
+    font-variant-numeric: tabular-nums;
+  }
   .option.active button,
   .option button:hover {
     background: var(--accent);
     color: var(--on-accent);
+  }
+  /* On the active/hover row, keep the hint legible against the accent fill. */
+  .option.active button .hex-hint,
+  .option button:hover .hex-hint {
+    color: var(--on-accent);
+    opacity: 0.75;
   }
 </style>
