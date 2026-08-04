@@ -134,6 +134,8 @@ Rationale for `Ok(vec![])` over a nicer error string: it fixes scripted/RPC flow
 
 Add the polling contract to the harness/testing notes: after redeem, a channel may be `syncing:true` briefly; scripted flows must poll `list_channels` until the target channel's `syncing` is `false` before asserting on `list_channel_messages`, rather than asserting once.
 
+**Contract nuance:** `syncing:false` proves only that the channel *config* is confirmed (a real `ChannelCreate` materialized), **not** that its message history has finished backfilling — `list_channel_messages` can still return `Ok([])` for a moment after `syncing` flips false while the per-channel log engine spawns and its backfill driver runs. So the two failure modes are distinct: asserting while `syncing:true` is a false negative; treating an empty `Ok([])` as "fully converged" is a false positive. Scripted flows should poll for `syncing:false` **and** wait for the expected message(s) to appear (or explicitly tolerate an empty result).
+
 ## Testing
 
 **Rust (unit, no two-node harness needed):**

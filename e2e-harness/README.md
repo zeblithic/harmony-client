@@ -79,10 +79,15 @@ invite redemption the community's channels are surfaced from the invite's
 `list_channels` until the community root-fetch lands the admin's real
 `ChannelCreate` events (seconds to ~2 min). During that window
 `list_channel_messages` on such a channel returns `Ok([])` — an empty list, **not**
-the `"no engine for …"` error it used to. Scripted flows must therefore poll
-`list_channels` until the target channel's `syncing` is `false` before asserting
-on its messages; asserting once — or treating empty messages as "converged" — is
-the classic false-negative here, in the same family as the ZEB-462 camelCase-key
+the `"no engine for …"` error it used to. Two distinct failure modes follow:
+asserting once while `syncing` is `true` produces a **false negative** (the channel
+isn't findable by name yet), while treating an empty `Ok([])` as "converged"
+produces a **false positive** — `syncing:false` proves only that the channel
+*config* is confirmed, **not** that its message history has finished backfilling,
+so an empty result can still mean "messages are still arriving". Scripted flows
+must therefore poll `list_channels` until the target channel's `syncing` is `false`
+**and** wait for the expected message(s) to actually appear (or explicitly tolerate
+an empty result) — never assert once. Same family as the ZEB-462 camelCase-key
 trap above.
 
 ## CI

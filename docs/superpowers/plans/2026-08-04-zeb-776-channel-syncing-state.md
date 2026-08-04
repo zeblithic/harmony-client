@@ -558,7 +558,7 @@ Expected: PASS.
 
 Append to the ZEB-770 traps note / the agent-testing harness doc (search `docs/` for the ZEB-770 traps list or the harness README that documents join flows; if none is obviously the home, add a short subsection to `docs/superpowers/specs/2026-08-04-zeb-776-channel-syncing-state-design.md` under a new "Operator note" heading):
 
-> After redeeming an invite, a channel may briefly report `syncing: true` from `list_channels` while the community root-fetch is still landing the admin's channel config. Scripted/agent flows must poll `list_channels` until the target channel's `syncing` is `false` before asserting on `list_channel_messages` (which returns `Ok([])`, not an error, for a still-syncing channel) — do not assert once.
+> After redeeming an invite, a channel may briefly report `syncing: true` from `list_channels` while the community root-fetch is still landing the admin's channel config. Scripted/agent flows must poll `list_channels` until the target channel's `syncing` is `false` before asserting on `list_channel_messages` (which returns `Ok([])`, not an error, for a still-syncing channel) — do not assert once. Note `syncing:false` proves config-convergence, not message-history readiness: `list_channel_messages` can still return `Ok([])` briefly after `syncing` flips false while the log engine backfills, so also wait for the expected message(s) (or tolerate an empty result).
 
 - [ ] **Step 6: Commit**
 

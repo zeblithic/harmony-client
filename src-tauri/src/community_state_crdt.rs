@@ -500,9 +500,19 @@ impl CommunityState {
         self.bootstrap_hint
             .lock()
             .ok()
-            .and_then(|g| g.clone())
-            .map(|h| h.channels.into_iter().collect())
+            .and_then(|g| g.as_ref().map(|h| h.channels.clone()))
+            .map(|channels| channels.into_iter().collect())
             .unwrap_or_default()
+    }
+
+    /// ZEB-776: whether the event log has any events yet. The channel read path
+    /// uses this to prefer the cached `materialized()` (log non-empty — the
+    /// post-redeem norm) over the uncached `materialize_now()`, while still
+    /// treating a truly-empty log as "nothing confirmed" so hint channels stay
+    /// `syncing`. Mirrors the `log.is_empty()` half of `materialized()`'s
+    /// hint-substitution guard.
+    pub fn log_is_empty(&self) -> bool {
+        self.log.is_empty()
     }
 
     /// Test-only: build a state whose log is restored from already-trusted

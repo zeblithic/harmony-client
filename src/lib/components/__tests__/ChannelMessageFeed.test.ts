@@ -82,6 +82,32 @@ describe('ChannelMessageFeed', () => {
     expect(queryByTestId('channel-syncing-banner')).toBeNull();
   });
 
+  // ZEB-776: the banner is empty-feed-gated — once messages arrive (live, as the
+  // channel converges) it clears even while channelSyncing is still true, so it
+  // never sits contradictorily above a populated feed.
+  it('clears the syncing banner once a message arrives, even while syncing', async () => {
+    const { adapter, queryByTestId } = await setup({ channelSyncing: true });
+    expect(queryByTestId('channel-syncing-banner')).not.toBeNull();
+    const handler = adapter.listeners.get('channel-message-received')!;
+    handler({
+      payload: {
+        communityId: 'aa'.repeat(16),
+        channelId: 'bb'.repeat(16),
+        message: {
+          messageId: 'm1',
+          communityId: 'aa'.repeat(16),
+          channelId: 'bb'.repeat(16),
+          author: 'cc'.repeat(20),
+          at: { wallMs: 1000, logical: 0, deviceId: 'd' },
+          body: Array.from(new TextEncoder().encode('hi')),
+        },
+      },
+    });
+    await waitFor(() => {
+      expect(queryByTestId('channel-syncing-banner')).toBeNull();
+    });
+  });
+
   it('mounts and calls listMessages on mount', async () => {
     const { adapter } = await setup();
     await waitFor(() => {

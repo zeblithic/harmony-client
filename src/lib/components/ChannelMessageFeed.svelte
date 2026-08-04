@@ -901,7 +901,10 @@
     <span class="name">{channelName}</span>
   </header>
 
-  {#if channelSyncing}
+  {#if channelSyncing && timeline.length === 0}
+    <!-- ZEB-776: only while the feed is genuinely empty — never above already-
+         visible messages (e.g. pre-fork snapshot rows), which would contradict
+         "messages will appear shortly". As messages arrive the banner clears. -->
     <div class="syncing-banner" data-testid="channel-syncing-banner" role="status">
       This channel is still syncing — messages will appear shortly.
     </div>

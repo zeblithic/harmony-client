@@ -31825,15 +31825,24 @@ async fn resolve_confirmed_and_hint(
         )
     })?;
 
-    // ZEB-598/ZEB-776: the hint-blind `materialize_now` is the authoritative
-    // (confirmed) channel set; the bootstrap hint carries the invite's
-    // epoch_snapshot channels that may not have landed as real CRDT events yet.
-    // The caller merges them, labeling hint-only channels `syncing`.
+    // ZEB-598/ZEB-776: `confirmed` is the authoritative CRDT channel set,
+    // hint-blind; the bootstrap hint carries the invite's epoch_snapshot channels
+    // that may not have landed as real CRDT events yet. The caller merges them,
+    // labeling hint-only channels `syncing`.
+    //
+    // Prefer the CACHED `materialized()` when the log has events (the post-redeem
+    // norm) — it is hint-blind there, because the hint only substitutes for a
+    // truly-empty log. When the log IS empty nothing is confirmed yet, so
+    // `confirmed` is empty and every hint channel stays `syncing`. This avoids the
+    // uncached full-materialize `materialize_now` would run under the lock on
+    // every list_channels poll during the join window.
     let g = engine_state.lock().await;
-    Ok((
-        g.materialize_now(admin_addr).channels,
-        g.bootstrap_hint_channels(),
-    ))
+    let confirmed = if g.log_is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        g.materialized(admin_addr).channels
+    };
+    Ok((confirmed, g.bootstrap_hint_channels()))
 }
 
 /// ZEB-445: shared IPC/RPC seam.
@@ -33374,7 +33383,15 @@ pub(crate) async fn list_channel_messages_impl(
             // resolver is the same one list_channels uses, so the two read paths
             // agree on which channels a community knows.
             let (confirmed, hint) = resolve_confirmed_and_hint(state, cid).await?;
-            let known = confirmed.contains_key(&chid) || hint.iter().any(|(c, _)| *c == chid);
+            // ZEB-776: a channel the community knows AND that is not tombstoned is
+            // still-syncing (Ok(empty)). A DELETED channel — `materialize_now`
+            // retains its record with `deleted_at` set, but no log engine is ever
+            // spawned for it — keeps the missing-engine error, so a delete stays
+            // distinguishable from a pre-convergence empty.
+            let known = confirmed.get(&chid).is_some_and(|c| c.deleted_at.is_none())
+                || hint
+                    .iter()
+                    .any(|(c, info)| *c == chid && info.deleted_at.is_none());
             if known {
                 return Ok(Vec::new());
             }
@@ -38480,8 +38497,10 @@ mod list_bootstrap_hint_tests {
         let c_dev = ChannelId([0x33; 16]); // confirmed only
 
         let mut confirmed = BTreeMap::new();
+        // general (0x11) and dev (0x33) share wall_ms=1 so the row order between
+        // them exercises the channel_id secondary sort, not just wall_ms.
         confirmed.insert(c_general, text_channel("general", 1));
-        confirmed.insert(c_dev, text_channel("dev", 3));
+        confirmed.insert(c_dev, text_channel("dev", 1));
 
         let hint = vec![
             (c_general, text_channel("general", 1)),
@@ -38497,25 +38516,36 @@ mod list_bootstrap_hint_tests {
         );
         assert!(!by_name("dev").syncing, "confirmed-only → not syncing");
         assert!(by_name("random").syncing, "hint-only → syncing");
-        // created_at.wall_ms: general=1, random=2, dev=3 → that order.
+        // Sort: general & dev tie on wall_ms=1 → channel_id breaks the tie
+        // (0x11 < 0x33 → general before dev); random (wall_ms=2) sorts last.
         assert_eq!(
             rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-            vec!["general", "random", "dev"],
+            vec!["general", "dev", "random"],
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn list_channel_messages_known_channel_syncing_returns_empty_unknown_errors() {
+    async fn list_channel_messages_known_syncing_empty_unknown_and_deleted_error() {
         // ZEB-776: a channel the community knows (from the invite hint) but whose
-        // log engine hasn't spawned yet returns Ok(empty), not "no engine"; a
-        // genuinely-unknown channel still errors.
+        // log engine hasn't spawned yet returns Ok(empty), not "no engine". A
+        // genuinely-unknown channel AND a deleted (tombstoned) channel both keep
+        // the missing-engine error, so a delete stays distinguishable from a
+        // still-syncing empty.
         let community = SpaceId([0xc0; 16]);
         let admin = OwnerAddr([0xad; 16]);
         let known = ChannelId([0x11; 16]);
         let unknown = ChannelId([0x99; 16]);
+        let deleted = ChannelId([0x55; 16]);
 
         let mut channels = BTreeMap::new();
         channels.insert(known, text_channel("general", 1));
+        let mut deleted_ch = text_channel("old", 1);
+        deleted_ch.deleted_at = Some(Hlc {
+            wall_ms: 2,
+            logical: 0,
+            device_id: "seed".into(),
+        });
+        channels.insert(deleted, deleted_ch);
         let hint = MaterializedMembership {
             channels,
             ..Default::default()
@@ -38524,7 +38554,7 @@ mod list_bootstrap_hint_tests {
         let (node_state, community_hex, registry, dir) =
             seeded_node_state(community, admin, hint).await;
 
-        let msgs = crate::list_channel_messages_impl(
+        let known_msgs = crate::list_channel_messages_impl(
             &node_state,
             community_hex.clone(),
             hex::encode(known.0),
@@ -38534,11 +38564,11 @@ mod list_bootstrap_hint_tests {
         )
         .await
         .expect("known-but-syncing channel must return Ok, not the 'no engine' error");
-        assert!(msgs.is_empty());
+        assert!(known_msgs.is_empty());
 
-        let err = crate::list_channel_messages_impl(
+        let unknown_err = crate::list_channel_messages_impl(
             &node_state,
-            community_hex,
+            community_hex.clone(),
             hex::encode(unknown.0),
             None,
             100,
@@ -38546,7 +38576,19 @@ mod list_bootstrap_hint_tests {
         )
         .await
         .expect_err("unknown channel must still error");
-        assert!(err.contains("no engine for"), "got: {err}");
+        assert!(unknown_err.contains("no engine for"), "got: {unknown_err}");
+
+        let deleted_err = crate::list_channel_messages_impl(
+            &node_state,
+            community_hex,
+            hex::encode(deleted.0),
+            None,
+            100,
+            None,
+        )
+        .await
+        .expect_err("deleted channel must error, not Ok([])");
+        assert!(deleted_err.contains("no engine for"), "got: {deleted_err}");
 
         registry
             .shutdown_all()
