@@ -48,4 +48,12 @@ describe('MentionAutocomplete', () => {
     });
     expect(screen.queryByTestId('mention-hex-hint')).toBeNull();
   });
+
+  it('omits the hint when the label equals the hex only by case (case-insensitive)', () => {
+    const cased = { ownerId: 'c'.repeat(32), label: 'CCCCCCCC' };
+    render(MentionAutocomplete, {
+      props: { candidates: [cased], activeIndex: 0, onPick: vi.fn() },
+    });
+    expect(screen.queryByTestId('mention-hex-hint')).toBeNull();
+  });
 });

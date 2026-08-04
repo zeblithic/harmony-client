@@ -543,12 +543,14 @@
     return new Date(at.wallMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
-  // ZEB-432 label ladder (mirrors MemberRow / FriendsPanel): local friend
-  // nickname (ZEB-419) ► broadcast profile-card name (ZEB-341) ► truncated owner
-  // hex. Read through both resolvers so the reactive nickname map / card Map
-  // re-render the author label automatically.
+  // ZEB-432/ZEB-774 label ladder (mirrors MemberRow / FriendsPanel): local friend
+  // nickname (ZEB-419) ► broadcast profile-card name (ZEB-341) ► roster-DTO
+  // displayName (ZEB-774) ► truncated owner hex. Read through the resolvers so the
+  // reactive nickname map / card Map / roster re-render the author label
+  // automatically.
   function authorLabel(author: string): string {
-    // Shared ladder (ZEB-432/ZEB-588): nickname ► profile-card name ► hex.
+    // Shared ladder (ZEB-432/ZEB-588/ZEB-774): nickname ► profile-card name ►
+    // roster name ► hex.
     return resolveMentionLabel(author, resolveNickname, resolveCard, resolveRosterName);
   }
 
@@ -862,7 +864,8 @@
   });
 
   // ZEB-536 — comma-joined reactor labels for a chip tooltip, reusing the
-  // ZEB-432 author label ladder (nickname ► profile-card name ► short hex).
+  // ZEB-432/ZEB-774 author label ladder (nickname ► profile-card name ► roster
+  // name ► short hex).
   function reactorNames(reactors: string[]): string {
     return reactors.map((addr) => authorLabel(addr)).join(', ');
   }
@@ -944,7 +947,7 @@
           </div>
           <div class="content-col">
             <header class="msg-meta">
-              <!-- ZEB-341/ZEB-432: nickname ► profile-card name ► hex (authorLabel). -->
+              <!-- ZEB-341/ZEB-432/ZEB-774: nickname ► profile-card name ► roster name ► hex (authorLabel). -->
               {#if onOpenCard}
                 <button
                   type="button"

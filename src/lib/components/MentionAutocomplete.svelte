@@ -39,11 +39,12 @@
           }}
         >
           <span class="label">{c.label}</span>
-          {#if c.label !== c.ownerId.slice(0, 8)}
+          {#if c.label.toLowerCase() !== c.ownerId.slice(0, 8).toLowerCase()}
             <!-- ZEB-774: surface the owner-id handle so a peer is findable by the
                  hex the user can see, even before/without a resolved name. Hidden
-                 when the label already IS the short hex (unresolved row), to avoid
-                 a doubled "2e9a2151  2e9a2151". -->
+                 (case-insensitively, since the hex-prefix match is too) when the
+                 label already IS the short hex (unresolved row), to avoid a
+                 doubled "2e9a2151  2e9a2151". -->
             <span class="hex-hint" data-testid="mention-hex-hint">{c.ownerId.slice(0, 8)}</span>
           {/if}
         </button>
@@ -85,6 +86,11 @@
     font: inherit;
   }
   .option .label {
+    /* Consume the remaining row width and allow shrinking; without min-width: 0
+       a flex item's automatic minimum width keeps a long name from shrinking, so
+       the ellipsis never engages and the fixed hex-hint gets pushed out. */
+    flex: 1 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

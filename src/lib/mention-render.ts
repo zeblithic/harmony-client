@@ -71,11 +71,12 @@ const SELF_ADDRESS = 'self';
 /**
  * ZEB-839 — the author-label ladder for a feed `Message.sender`.
  *
- * Same ordering as {@link resolveMentionLabel} (nickname ► broadcast
- * profile-card name ► short hex) with two message-specific rungs: the `self`
- * sentinel short-circuits to the locally-known label, and a wire-supplied
- * `senderName` (channel messages carry one; DMs do not) sits just above the
- * hex fallback.
+ * Shares the {@link resolveMentionLabel} backbone (nickname ► broadcast
+ * profile-card name ► short hex) but carries two message-specific rungs in place
+ * of that ladder's community-roster rung (a DM peer has no community roster): the
+ * `self` sentinel short-circuits to the locally-known label, and a wire-supplied
+ * `senderName` (channel messages carry one; DMs do not) sits just above the hex
+ * fallback.
  *
  * Call this at RENDER time, never at message-arrival time — that is what lets
  * the label fill in as cards and nicknames arrive. DM authors deliberately
