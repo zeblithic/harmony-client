@@ -185,7 +185,9 @@ Add to `fleet_net.rs`'s existing `#[cfg(test)]` module (reuse `row`/`hlc`/
 Gates: `cargo fmt --all --check`, `cargo clippy --locked --all-targets --features
 test-fixtures --no-deps -- -D warnings`, and the `fleet_net` test module (single
 crate). `fleet_net.rs` is lib code, so the touched-binary sweep is the lib +
-its test module; a `--full` sweep before PR per house rules.
+its test module; the final pre-PR validation is the full-workspace command
+`cd src-tauri && cargo nextest run --locked --workspace --all-targets --features
+test-fixtures` (NOT `scripts/test-select`, per house rules).
 
 ## Out of scope
 

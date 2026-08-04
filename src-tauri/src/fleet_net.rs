@@ -143,9 +143,10 @@ impl FleetNetDoc {
     }
 
     /// Clock-injected core of [`Self::merge_from`]. `receiver_now` is the
-    /// receiver's own wall clock (`None` ⇒ unreadable ⇒ apply-all); the
-    /// forward-skew bound applies ONLY to the self-stamped device-row `seen_at`
-    /// register (pin/petname stamps are out of this task's scope — ZEB-852 D2).
+    /// receiver's own wall clock (`None` ⇒ unreadable ⇒ apply-all). The
+    /// forward-skew reject guards every stored replicated stamp merged here: the
+    /// self-stamped device-row `seen_at` (ZEB-852 D2) and — since ZEB-856 R3 —
+    /// the owner-stamped `pinned_at` pair and each petname `set_at`.
     fn merge_from_bounded(
         &mut self,
         remote: FleetNetDoc,
@@ -210,8 +211,10 @@ impl FleetNetDoc {
         // Petnames (ZEB-668 S4): per-key LWW by set_at — same shape as the
         // device rows above.
         for (device_id, remote_pn) in remote.petnames {
-            // ZEB-856 (R3): drop a petname whose self-stamped set_at is implausibly
-            // future — same stored-register freeze hazard as the pin and seen_at.
+            // ZEB-856 (R3): drop a petname whose set_at is implausibly future —
+            // same stored-register freeze hazard as the pin and seen_at. (Petnames
+            // are owner-assigned about a device, not self-stamped by the subject —
+            // still a stored LWW register a future stamp can freeze.)
             // Reject-not-clamp; `receiver_now == None` ⇒ apply-all.
             if crate::clock_trust::wall_exceeds_forward_skew(remote_pn.set_at.wall_ms, receiver_now)
             {
@@ -296,8 +299,8 @@ pub fn butler_set_order(doc: &FleetNetDoc, stale_before_ms: u64) -> Vec<(String,
     // devices share the same CRDT state). The primary key is CLAMPED to `now`
     // (ZEB-852): a still-in-window but future-dated sibling must not out-rank an
     // honest present row purely by its inflated wall_ms — `min(wall_ms, now)`
-    // collapses any future stamp to `now`, after which the honest logical /
-    // device-id tiebreak decides.
+    // collapses any future stamp to `now`, after which the device-id tiebreak
+    // decides (ZEB-856 R2 removed the peer-inflatable `logical` axis here).
     let clamp = |wall_ms: u64| wall_ms.min(now);
     fresh.sort_by(|(id_a, row_a), (id_b, row_b)| {
         // Primary: descending wall_ms (clamped to now)
@@ -311,9 +314,11 @@ pub fn butler_set_order(doc: &FleetNetDoc, stale_before_ms: u64) -> Vec<(String,
         // cross-device meaning, and it is peer-self-stamped (a sibling could set
         // `logical = u32::MAX` to win a clamped-wall tie for butler slot 0). The
         // remaining key `(clamp(wall_ms), device_id)` is fully bounded/fixed:
-        // clamped-wall is receiver-capped (ZEB-852) and `device_id` is an
-        // identity-bound hash (not freely grindable) that is unique per row → a
-        // strict total order, so determinism is preserved. `logical` stays in
+        // clamped-wall is receiver-capped (ZEB-852) and `device_id` is the
+        // identity-bound device id (the fleet-net map key = hex of the device's
+        // ed25519 verifying key), which a peer cannot cheaply set to an arbitrary
+        // value, and is unique per row → a strict total order, so determinism is
+        // preserved. `logical` stays in
         // `Hlc::is_strictly_newer_than` for the merge LWW, where same-device
         // causality legitimately needs it. `selection_view` delegates here, so it
         // inherits this policy (there is exactly one sort site).

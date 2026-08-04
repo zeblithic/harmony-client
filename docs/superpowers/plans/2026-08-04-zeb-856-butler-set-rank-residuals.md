@@ -21,7 +21,7 @@
 - Fmt: `cd src-tauri && cargo fmt --all -- --check`
 - Single-crate test during dev: `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(fleet_net)'`
 - Clippy (before PR): `cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`
-- Final pre-PR: `scripts/test-select --full` (CI-parity full sweep) — `fleet_net.rs` is lib code, so a lib change relinks integration binaries; the full sweep is the backstop.
+- Final pre-PR (final validation — full workspace, NOT `scripts/test-select`): `cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures` — `fleet_net.rs` is lib code, so a lib change relinks integration binaries; the full sweep is the backstop.
 
 ---
 
@@ -478,9 +478,9 @@ git commit -m "ZEB-856 (R1): document accepted near-future clamp residual + pin-
 Run: `cd src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`
 Expected: no warnings.
 
-- [ ] **Step 2: CI-parity full sweep**
+- [ ] **Step 2: CI-parity full sweep (final validation — full workspace, NOT `scripts/test-select`)**
 
-Run: `scripts/test-select --full`
+Run: `cd src-tauri && cargo nextest run --locked --workspace --all-targets --features test-fixtures`
 Expected: green (lib change relinks integration binaries; this is the backstop). Paste the summary line into the PR/report.
 
 - [ ] **Step 3: Push + open PR (fire CodeRabbit once)**
