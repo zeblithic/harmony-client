@@ -1371,14 +1371,18 @@ mod tests {
         let now: u64 = 2_000_000_000_000;
         let six_min = 6 * 60 * 1000;
 
-        let mut local = FleetNetDoc::default();
-        local.pinned = Some("dev-p0".into());
-        local.pinned_at = hlc(now, "owner");
+        let mut local = FleetNetDoc {
+            pinned: Some("dev-p0".into()),
+            pinned_at: hlc(now, "owner"),
+            ..Default::default()
+        };
 
         // Far-future (> 5-min control tier) stamp: must be rejected, not win the LWW.
-        let mut poison = FleetNetDoc::default();
-        poison.pinned = Some("dev-evil".into());
-        poison.pinned_at = hlc(now + six_min, "owner");
+        let poison = FleetNetDoc {
+            pinned: Some("dev-evil".into()),
+            pinned_at: hlc(now + six_min, "owner"),
+            ..Default::default()
+        };
         local.merge_from_bounded(poison, Some(now));
         assert_eq!(
             local.pinned.as_deref(),
@@ -1387,9 +1391,11 @@ mod tests {
         );
 
         // Register must remain LIVE (not frozen): an honest later pin still wins.
-        let mut honest = FleetNetDoc::default();
-        honest.pinned = Some("dev-p2".into());
-        honest.pinned_at = hlc(now + 1000, "owner");
+        let honest = FleetNetDoc {
+            pinned: Some("dev-p2".into()),
+            pinned_at: hlc(now + 1000, "owner"),
+            ..Default::default()
+        };
         local.merge_from_bounded(honest, Some(now + 2000));
         assert_eq!(
             local.pinned.as_deref(),
@@ -1403,13 +1409,17 @@ mod tests {
         let now: u64 = 2_000_000_000_000;
         let four_min = 4 * 60 * 1000;
 
-        let mut local = FleetNetDoc::default();
-        local.pinned = Some("dev-p0".into());
-        local.pinned_at = hlc(now, "owner");
+        let mut local = FleetNetDoc {
+            pinned: Some("dev-p0".into()),
+            pinned_at: hlc(now, "owner"),
+            ..Default::default()
+        };
 
-        let mut near = FleetNetDoc::default();
-        near.pinned = Some("dev-p1".into());
-        near.pinned_at = hlc(now + four_min, "owner");
+        let near = FleetNetDoc {
+            pinned: Some("dev-p1".into()),
+            pinned_at: hlc(now + four_min, "owner"),
+            ..Default::default()
+        };
         local.merge_from_bounded(near, Some(now));
         assert_eq!(
             local.pinned.as_deref(),
@@ -1458,18 +1468,22 @@ mod tests {
         let one_year: u64 = 365 * 24 * 60 * 60 * 1000;
         let key = "dev-x".to_string();
 
-        let mut local = FleetNetDoc::default();
-        local.pinned = Some("dev-p0".into());
-        local.pinned_at = hlc(now, "owner");
+        let mut local = FleetNetDoc {
+            pinned: Some("dev-p0".into()),
+            pinned_at: hlc(now, "owner"),
+            ..Default::default()
+        };
         local
             .petnames
             .insert(key.clone(), petname("orig", hlc(now, "owner")));
 
         // Unreadable local clock (None) ⇒ apply-all: a bad LOCAL clock must never
         // drop honest pin/petname updates, even far-future ones.
-        let mut remote = FleetNetDoc::default();
-        remote.pinned = Some("dev-far".into());
-        remote.pinned_at = hlc(now + one_year, "owner");
+        let mut remote = FleetNetDoc {
+            pinned: Some("dev-far".into()),
+            pinned_at: hlc(now + one_year, "owner"),
+            ..Default::default()
+        };
         remote
             .petnames
             .insert(key.clone(), petname("far", hlc(now + one_year, "owner")));
