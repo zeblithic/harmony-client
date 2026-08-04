@@ -33364,10 +33364,23 @@ pub(crate) async fn list_channel_messages_impl(
             .clone()
     };
 
-    let engine = registry
-        .engine(&cid, &chid)
-        .await
-        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+    let engine = match registry.engine(&cid, &chid).await {
+        Some(engine) => engine,
+        None => {
+            // ZEB-776: distinguish "channel known to this community but its log
+            // engine hasn't spawned yet" (still converging after a fresh join →
+            // Ok(empty), NOT the misleading "no engine" error) from a genuinely
+            // unknown channel (not joined / bad id → keep the error). The shared
+            // resolver is the same one list_channels uses, so the two read paths
+            // agree on which channels a community knows.
+            let (confirmed, hint) = resolve_confirmed_and_hint(state, cid).await?;
+            let known = confirmed.contains_key(&chid) || hint.iter().any(|(c, _)| *c == chid);
+            if known {
+                return Ok(Vec::new());
+            }
+            return Err(format!("no engine for {community_id}/{channel_id}"));
+        }
+    };
 
     let since_hlc = since.map(|h| crate::owner_state_types::Hlc {
         wall_ms: h.wall_ms,
@@ -38358,9 +38371,30 @@ mod list_bootstrap_hint_tests {
         );
         let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
 
+        // ZEB-776: an empty channel-log registry so list_channel_messages_impl
+        // reaches its engine-miss (None) path instead of failing on a missing
+        // registry. No engine is ever spawned, so its adapter bridge is never
+        // used and a no-op FanoutSink suffices.
+        let (adapter_request_tx, _adapter_request_rx) = mpsc::unbounded_channel();
+        let channel_log_registry = crate::community_channel_log_engine::ChannelLogRegistry::new(
+            crate::community_channel_log_engine::ChannelLogRegistryConfig {
+                adapter_request_tx,
+                sink: Arc::new(crate::node_event_sink::FanoutSink(vec![])),
+                identity_dir: dir.path().to_path_buf(),
+                self_owner: admin,
+                self_device_id: "test-dev".to_string(),
+                signing_key: Arc::new(SigningKey::from_bytes(&[0x42; 32])),
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+                engine_config: Default::default(),
+                transport_epoch_rx: None,
+                presence_resync_rx: None,
+            },
+        );
+
         let node_state = std::sync::Mutex::new(crate::NodeState {
             crdt_state: Some(crdt_state),
             community_registry: Some(Arc::clone(&registry)),
+            channel_log_registry: Some(channel_log_registry),
             ..crate::NodeState::default()
         });
 
@@ -38468,6 +38502,57 @@ mod list_bootstrap_hint_tests {
             rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             vec!["general", "random", "dev"],
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_channel_messages_known_channel_syncing_returns_empty_unknown_errors() {
+        // ZEB-776: a channel the community knows (from the invite hint) but whose
+        // log engine hasn't spawned yet returns Ok(empty), not "no engine"; a
+        // genuinely-unknown channel still errors.
+        let community = SpaceId([0xc0; 16]);
+        let admin = OwnerAddr([0xad; 16]);
+        let known = ChannelId([0x11; 16]);
+        let unknown = ChannelId([0x99; 16]);
+
+        let mut channels = BTreeMap::new();
+        channels.insert(known, text_channel("general", 1));
+        let hint = MaterializedMembership {
+            channels,
+            ..Default::default()
+        };
+
+        let (node_state, community_hex, registry, dir) =
+            seeded_node_state(community, admin, hint).await;
+
+        let msgs = crate::list_channel_messages_impl(
+            &node_state,
+            community_hex.clone(),
+            hex::encode(known.0),
+            None,
+            100,
+            None,
+        )
+        .await
+        .expect("known-but-syncing channel must return Ok, not the 'no engine' error");
+        assert!(msgs.is_empty());
+
+        let err = crate::list_channel_messages_impl(
+            &node_state,
+            community_hex,
+            hex::encode(unknown.0),
+            None,
+            100,
+            None,
+        )
+        .await
+        .expect_err("unknown channel must still error");
+        assert!(err.contains("no engine for"), "got: {err}");
+
+        registry
+            .shutdown_all()
+            .await
+            .expect("shutdown community registry");
+        drop(dir);
     }
 }
 
