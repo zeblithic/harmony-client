@@ -644,6 +644,23 @@ impl<K: Copy + Eq + Hash> KeyedSlidingWindow<K> {
         true
     }
 
+    /// `true` if `key` would be admitted right now WITHOUT recording — the
+    /// non-mutating companion to `admit` (same `key: K` by-value signature).
+    /// For composing two gates where the second must not leave a phantom record
+    /// if the first sheds (ZEB-865's aggregate ceiling peeks before the
+    /// per-source window records). Counts only in-window (non-stale) entries; a
+    /// zero cap never admits.
+    pub(crate) fn would_admit(&self, key: K, now_ms: u64) -> bool {
+        if self.max == 0 {
+            return false;
+        }
+        let cutoff = now_ms.saturating_sub(self.window_ms);
+        match self.windows.get(&key) {
+            None => true,
+            Some(dq) => dq.iter().filter(|&&t| t >= cutoff).count() < self.max,
+        }
+    }
+
     fn evict(&mut self, now_ms: u64) {
         if self.windows.len() <= MAX_WINDOW_KEYS {
             return;
@@ -1889,6 +1906,28 @@ mod tests {
             w.windows.is_empty(),
             "a zero cap must not insert map entries"
         );
+    }
+
+    #[test]
+    fn keyed_sliding_window_would_admit_does_not_record() {
+        let mut w: KeyedSlidingWindow<u64> = KeyedSlidingWindow::new(2, 60_000);
+        let k = 7u64;
+        let now = 1_000u64;
+        // A fresh key is admissible, and peeking never consumes capacity.
+        assert!(w.would_admit(k, now));
+        assert!(
+            w.would_admit(k, now),
+            "peek must be idempotent — records nothing"
+        );
+        // Two real admits fill the cap.
+        assert!(w.admit(k, now));
+        assert!(w.admit(k, now));
+        // At cap: both peek and admit report full.
+        assert!(!w.would_admit(k, now), "peek reflects a full window");
+        assert!(!w.admit(k, now));
+        // A zero-cap window never admits, via peek either.
+        let z: KeyedSlidingWindow<u64> = KeyedSlidingWindow::new(0, 60_000);
+        assert!(!z.would_admit(k, now));
     }
 
     // ── ZEB-694 Task A2: KeyedDedupe<K> primitive. ───────────────────────────
