@@ -274,20 +274,18 @@ pub fn butler_set_order(doc: &FleetNetDoc, stale_before_ms: u64) -> Vec<(String,
         if w != std::cmp::Ordering::Equal {
             return w;
         }
-        // Secondary: descending logical.
-        // KNOWN RESIDUAL (ZEB-856): `logical` is a peer-self-stamped HLC counter, so
-        // after the wall clamp a future-dated sibling can set `logical = u32::MAX` to
-        // win a clamped-wall tie against an honest present row. Left as-is here on
-        // purpose: clamp-to-now is the fail-open-safe choice (it never deprioritizes a
-        // live device), and closing this peer-controlled tiebreak — plus the
-        // near-future clamp-to-top and the pin/petname freeze — is tracked together in
-        // ZEB-856 so the butler-rank residuals are addressed with one coherent policy
-        // rather than piecemeal. (Also applies to the `selection_view` ordering below.)
-        let l = row_b.seen_at.logical.cmp(&row_a.seen_at.logical);
-        if l != std::cmp::Ordering::Equal {
-            return l;
-        }
-        // Tertiary: ascending device_id (deterministic tiebreak)
+        // Final tiebreak: ascending device_id.
+        // ZEB-856 (R2): the descending-`logical` secondary was REMOVED here. In this
+        // cross-device ranking `logical` is a per-device HLC counter with no
+        // cross-device meaning, and it is peer-self-stamped (a sibling could set
+        // `logical = u32::MAX` to win a clamped-wall tie for butler slot 0). The
+        // remaining key `(clamp(wall_ms), device_id)` is fully bounded/fixed:
+        // clamped-wall is receiver-capped (ZEB-852) and `device_id` is an
+        // identity-bound hash (not freely grindable) that is unique per row → a
+        // strict total order, so determinism is preserved. `logical` stays in
+        // `Hlc::is_strictly_newer_than` for the merge LWW, where same-device
+        // causality legitimately needs it. `selection_view` delegates here, so it
+        // inherits this policy (there is exactly one sort site).
         id_a.cmp(id_b)
     });
 
@@ -1272,6 +1270,68 @@ mod tests {
         assert!(
             pos_fresh < pos_stale,
             "honest fresh row must rank ahead of the honest stale row"
+        );
+    }
+
+    #[test]
+    fn butler_rank_logical_inflation_does_not_win_slot_zero() {
+        let window = crate::butler_deposit::BUTLER_SET_FRESHNESS_MS;
+        let now: u64 = 2_000_000_000_000;
+        let stale_before = now - window;
+
+        let mut doc = FleetNetDoc::default();
+        // Honest present row: wall = now, logical = 0, LOWER device-id key.
+        doc.devices.insert(
+            "dev-honest".into(),
+            row(0x01, "relay.honest", hlc(now, "d")),
+        );
+        // Inflation attempt: SAME clamped wall (now), logical = u32::MAX, HIGHER
+        // device-id key. Pre-fix the descending-`logical` secondary ranked this at
+        // slot 0; post-fix (logical dropped) the device-id tiebreak keeps honest ahead.
+        doc.devices.insert(
+            "dev-zzz-evil".into(),
+            row(
+                0x02,
+                "relay.evil",
+                Hlc {
+                    wall_ms: now,
+                    logical: u32::MAX,
+                    device_id: "evil".into(),
+                },
+            ),
+        );
+
+        let order = butler_set_order(&doc, stale_before);
+        assert_eq!(
+            order[0].0, "dev-honest",
+            "a self-inflated `logical` must NOT win butler slot 0 over an honest present row"
+        );
+    }
+
+    #[test]
+    fn butler_rank_clamped_wall_tie_orders_by_device_id_deterministically() {
+        let window = crate::butler_deposit::BUTLER_SET_FRESHNESS_MS;
+        let now: u64 = 2_000_000_000_000;
+        let stale_before = now - window;
+
+        let mut doc = FleetNetDoc::default();
+        // Identical clamped wall and logical → only device-id decides.
+        for key in ["dev-ccc", "dev-aaa", "dev-bbb"] {
+            doc.devices
+                .insert(key.into(), row(0x01, "relay", hlc(now, "d")));
+        }
+        let keys: Vec<String> = butler_set_order(&doc, stale_before)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "dev-aaa".to_string(),
+                "dev-bbb".to_string(),
+                "dev-ccc".to_string()
+            ],
+            "clamped-wall ties must order by ascending device-id, deterministically"
         );
     }
 
