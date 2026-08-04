@@ -185,7 +185,18 @@ impl FleetNetDoc {
         }
 
         // Pin LWW pair: remote strictly newer by pinned_at → take both fields.
-        if remote.pinned_at.is_strictly_newer_than(&self.pinned_at) {
+        // ZEB-856 (R3): reject a future-dated pin stamp before the LWW, mirroring
+        // the seen_at reject above. `pinned_at` is a STORED replicated register, so
+        // a stamp implausibly ahead of the receiver clock would win the LWW and
+        // FREEZE the pin (no honest later pinned_at could be strictly-newer),
+        // pinning butler routing permanently. Reject — never clamp: a clamped
+        // stored value is receiver-dependent and would diverge across peers.
+        // Control tier; `receiver_now == None` ⇒ apply-all (a bad LOCAL clock must
+        // never drop an honest owner pin). `pinned_at` is owner-stamped (vs
+        // `seen_at` self-stamped by the subject sibling) — same freeze hazard.
+        if !crate::clock_trust::wall_exceeds_forward_skew(remote.pinned_at.wall_ms, receiver_now)
+            && remote.pinned_at.is_strictly_newer_than(&self.pinned_at)
+        {
             let pin_changed = self.pinned != remote.pinned;
             self.pinned = remote.pinned;
             self.pinned_at = remote.pinned_at;
@@ -199,6 +210,13 @@ impl FleetNetDoc {
         // Petnames (ZEB-668 S4): per-key LWW by set_at — same shape as the
         // device rows above.
         for (device_id, remote_pn) in remote.petnames {
+            // ZEB-856 (R3): drop a petname whose self-stamped set_at is implausibly
+            // future — same stored-register freeze hazard as the pin and seen_at.
+            // Reject-not-clamp; `receiver_now == None` ⇒ apply-all.
+            if crate::clock_trust::wall_exceeds_forward_skew(remote_pn.set_at.wall_ms, receiver_now)
+            {
+                continue;
+            }
             match self.petnames.get(&device_id) {
                 None => {
                     self.petnames.insert(device_id, remote_pn);
@@ -1332,6 +1350,126 @@ mod tests {
                 "dev-ccc".to_string()
             ],
             "clamped-wall ties must order by ascending device-id, deterministically"
+        );
+    }
+
+    #[test]
+    fn merge_rejects_future_pinned_at_then_honest_later_pin_wins() {
+        let now: u64 = 2_000_000_000_000;
+        let six_min = 6 * 60 * 1000;
+
+        let mut local = FleetNetDoc::default();
+        local.pinned = Some("dev-p0".into());
+        local.pinned_at = hlc(now, "owner");
+
+        // Far-future (> 5-min control tier) stamp: must be rejected, not win the LWW.
+        let mut poison = FleetNetDoc::default();
+        poison.pinned = Some("dev-evil".into());
+        poison.pinned_at = hlc(now + six_min, "owner");
+        local.merge_from_bounded(poison, Some(now));
+        assert_eq!(
+            local.pinned.as_deref(),
+            Some("dev-p0"),
+            "a future-dated pinned_at must be REJECTED, not win the LWW"
+        );
+
+        // Register must remain LIVE (not frozen): an honest later pin still wins.
+        let mut honest = FleetNetDoc::default();
+        honest.pinned = Some("dev-p2".into());
+        honest.pinned_at = hlc(now + 1000, "owner");
+        local.merge_from_bounded(honest, Some(now + 2000));
+        assert_eq!(
+            local.pinned.as_deref(),
+            Some("dev-p2"),
+            "the pin register must stay live after rejecting a poison stamp (not frozen)"
+        );
+    }
+
+    #[test]
+    fn merge_accepts_in_tolerance_future_pinned_at() {
+        let now: u64 = 2_000_000_000_000;
+        let four_min = 4 * 60 * 1000;
+
+        let mut local = FleetNetDoc::default();
+        local.pinned = Some("dev-p0".into());
+        local.pinned_at = hlc(now, "owner");
+
+        let mut near = FleetNetDoc::default();
+        near.pinned = Some("dev-p1".into());
+        near.pinned_at = hlc(now + four_min, "owner");
+        local.merge_from_bounded(near, Some(now));
+        assert_eq!(
+            local.pinned.as_deref(),
+            Some("dev-p1"),
+            "a pin within the 5-min control tier must still be applied (reject is > tier only)"
+        );
+    }
+
+    #[test]
+    fn merge_rejects_future_petname_set_at_then_honest_later_wins() {
+        let now: u64 = 2_000_000_000_000;
+        let six_min = 6 * 60 * 1000;
+        let key = "dev-x".to_string();
+
+        let mut local = FleetNetDoc::default();
+        local
+            .petnames
+            .insert(key.clone(), petname("orig", hlc(now, "owner")));
+
+        let mut poison = FleetNetDoc::default();
+        poison
+            .petnames
+            .insert(key.clone(), petname("evil", hlc(now + six_min, "owner")));
+        local.merge_from_bounded(poison, Some(now));
+        assert_eq!(
+            local.petnames.get(&key).map(|p| p.name.as_str()),
+            Some("orig"),
+            "a future-dated petname set_at must be REJECTED"
+        );
+
+        let mut honest = FleetNetDoc::default();
+        honest
+            .petnames
+            .insert(key.clone(), petname("real", hlc(now + 1000, "owner")));
+        local.merge_from_bounded(honest, Some(now + 2000));
+        assert_eq!(
+            local.petnames.get(&key).map(|p| p.name.as_str()),
+            Some("real"),
+            "the petname register must stay live after rejecting a poison stamp"
+        );
+    }
+
+    #[test]
+    fn merge_none_clock_applies_future_pin_and_petname() {
+        let now: u64 = 2_000_000_000_000;
+        let one_year: u64 = 365 * 24 * 60 * 60 * 1000;
+        let key = "dev-x".to_string();
+
+        let mut local = FleetNetDoc::default();
+        local.pinned = Some("dev-p0".into());
+        local.pinned_at = hlc(now, "owner");
+        local
+            .petnames
+            .insert(key.clone(), petname("orig", hlc(now, "owner")));
+
+        // Unreadable local clock (None) ⇒ apply-all: a bad LOCAL clock must never
+        // drop honest pin/petname updates, even far-future ones.
+        let mut remote = FleetNetDoc::default();
+        remote.pinned = Some("dev-far".into());
+        remote.pinned_at = hlc(now + one_year, "owner");
+        remote
+            .petnames
+            .insert(key.clone(), petname("far", hlc(now + one_year, "owner")));
+        local.merge_from_bounded(remote, None);
+        assert_eq!(
+            local.pinned.as_deref(),
+            Some("dev-far"),
+            "None clock ⇒ apply-all for the pin"
+        );
+        assert_eq!(
+            local.petnames.get(&key).map(|p| p.name.as_str()),
+            Some("far"),
+            "None clock ⇒ apply-all for the petname"
         );
     }
 
