@@ -2547,7 +2547,7 @@ mod tests {
         let reg = build_registry();
 
         // The owner-not-loaded read/subscribe verbs all surface the shared
-        // OWNER_NOT_LOADED_MSG (proves the seam is shared, args parsed).
+        // OWNER_STILL_STARTING_MSG (proves the seam is shared, args parsed).
         for (cmd, args) in [
             (
                 "subscribe_member_card",
@@ -2581,7 +2581,7 @@ mod tests {
             match err {
                 RpcError::Command(msg) => assert_eq!(
                     msg,
-                    crate::OWNER_NOT_LOADED_MSG,
+                    crate::OWNER_STILL_STARTING_MSG,
                     "{cmd} must share the IPC owner-not-loaded error string"
                 ),
                 other => panic!("{cmd}: expected Command, got {other:?}"),
@@ -2642,7 +2642,7 @@ mod tests {
             match err {
                 RpcError::Command(msg) => assert_eq!(
                     msg,
-                    crate::OWNER_NOT_LOADED_MSG,
+                    crate::OWNER_STILL_STARTING_MSG,
                     "{cmd} must share the IPC owner-not-loaded error string"
                 ),
                 other => panic!("{cmd}: expected Command, got {other:?}"),
@@ -2667,7 +2667,7 @@ mod tests {
         match err {
             RpcError::Command(msg) => assert_eq!(
                 msg,
-                crate::OWNER_NOT_LOADED_MSG,
+                crate::OWNER_STILL_STARTING_MSG,
                 "must share the IPC owner-not-loaded error string"
             ),
             other => panic!("expected Command, got {other:?}"),

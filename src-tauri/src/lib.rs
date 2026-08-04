@@ -1767,7 +1767,7 @@ impl NodeState {
     pub(crate) fn owner_id_hex_for_status(&self) -> Option<String> {
         // Hex of the loaded owner identity, if any. `dm_self_owner` is the
         // canonical "owner loaded" handle (captured at start_node alongside
-        // the OWNER_NOT_LOADED_MSG-guarded handles; nulled on identity
+        // the owner-not-loaded-guarded handles; nulled on identity
         // restore). Encoding matches the existing convention everywhere an
         // OwnerAddr crosses to hex (`hex::encode(owner.0)`).
         self.dm_self_owner.map(|o| hex::encode(o.0))
@@ -2419,11 +2419,17 @@ pub(crate) const OWNER_STILL_STARTING_MSG: &str =
 // (pre-mint / absent). Non-destructive — never advises recreating identity.
 pub(crate) const OWNER_NO_IDENTITY_MSG: &str =
     "Owner identity not loaded — no identity is set up on this device yet.";
-// ZEB-338: the single honest "owner identity not loaded" message. Use this at
-// owner-derived-handle guards so the phrasing can't drift between call sites.
-// (Incremental adoption — applied where edited, not a blanket sweep.)
-const OWNER_NOT_LOADED_MSG: &str =
-    "Owner identity not loaded — please restart the app or recreate identity.";
+
+/// ZEB-801: same classification as `NodeState::owner_not_loaded_msg`, for
+/// error-path early-returns where the guard has already been released and only
+/// the `Mutex` is in scope. Re-locks (cold path); a poisoned lock falls back
+/// to the still-starting message (non-destructive).
+fn owner_not_loaded_msg_locked(state: &std::sync::Mutex<NodeState>) -> &'static str {
+    state
+        .lock()
+        .map(|g| g.owner_not_loaded_msg())
+        .unwrap_or(OWNER_STILL_STARTING_MSG)
+}
 
 pub fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
     let node_addr = key_expr.strip_prefix(CAPACITY_PREFIX)?;
@@ -29634,7 +29640,7 @@ mod zeb613_auto_subscribe_tests {
 ///
 /// Errors:
 /// - `Err("invalid community_id hex: ...")` — couldn't parse hex.
-/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — start_node
+/// - `Err(OWNER_STILL_STARTING_MSG)` — start_node
 ///   hasn't wired the registry.
 /// - `Err("no Space for community {hex} in owner-state")` — we
 ///   haven't joined this community (or we left and removed the Space).
@@ -29881,8 +29887,8 @@ pub fn build_fork_descendants(
 /// Errors:
 /// - `Err("invalid community_id hex: ...")` — couldn't parse hex.
 /// - `Err("community_id must be 16 bytes (32 hex chars)")` — wrong length.
-/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — node not started.
-/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — registry missing.
+/// - `Err(OWNER_STILL_STARTING_MSG)` — node not started.
+/// - `Err(OWNER_STILL_STARTING_MSG)` — registry missing.
 /// - `Err("no Space for community {hex} in owner-state")` — community absent.
 /// - `Err("no engine for community {hex} — not joined or not yet started")` —
 ///   engine absent.
@@ -30072,8 +30078,8 @@ pub fn build_community_lineage_dto(
 /// Errors:
 /// - `Err("invalid community_id hex: ...")` — couldn't parse hex.
 /// - `Err("community_id must be 16 bytes (32 hex chars)")` — wrong length.
-/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — node not started.
-/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — registry missing.
+/// - `Err(OWNER_STILL_STARTING_MSG)` — node not started.
+/// - `Err(OWNER_STILL_STARTING_MSG)` — registry missing.
 /// - `Err("no Space for community {hex} in owner-state")` — community absent.
 /// - `Err("no engine for community {hex} — not joined or not yet started")` —
 ///   engine absent.
@@ -31504,8 +31510,8 @@ async fn modify_channel(
 /// - `Err("invalid community_id hex: ...")` / `Err("invalid channel_id hex: ...")`.
 /// - `Err("community_id must be 16 bytes (32 hex chars)")` / same for channel_id.
 /// - `Err("hlc_tracker missing" / "dm_device_id missing" / ...)`.
-/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")`.
-/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")`.
+/// - `Err(OWNER_STILL_STARTING_MSG)`.
+/// - `Err(OWNER_STILL_STARTING_MSG)`.
 /// - `Err("no Space for community {hex} in owner-state")` / kind check.
 /// - `Err("community Space missing admin_addr (corrupt row?)")`.
 /// - `Err("no engine for community {hex} — ...")`.
@@ -33114,7 +33120,7 @@ fn emoji_names_path(state: &std::sync::Mutex<NodeState>) -> Result<std::path::Pa
     let p = g
         .connectivity_settings_path
         .clone()
-        .ok_or_else(|| OWNER_NOT_LOADED_MSG.to_string())?;
+        .ok_or_else(|| g.owner_not_loaded_msg().to_string())?;
     Ok(p.with_file_name("emoji_names.json"))
 }
 
@@ -33495,7 +33501,7 @@ pub struct MentionScanDto {
 /// - `Err("limit {N} exceeds max 1000")` — same cap as
 ///   `list_channel_messages`.
 /// - `Err("invalid community_id hex: ...")` when the filter is malformed.
-/// - `Err(OWNER_NOT_LOADED_MSG)` / `Err("channel_log_registry missing …")`.
+/// - `Err(OWNER_STILL_STARTING_MSG)` / `Err("channel_log_registry missing …")`.
 #[tauri::command]
 async fn list_mentions(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
@@ -33816,7 +33822,7 @@ fn resolve_invite_expiry_ms(ttl_ms: Option<u64>, now_ms: u64) -> u64 {
 ///
 /// Errors:
 /// - `Err("invalid community_id hex: ...")` — bad hex.
-/// - `Err("Owner identity not loaded — please restart the app or recreate identity.")` — registry not
+/// - `Err(OWNER_STILL_STARTING_MSG)` — registry not
 ///   wired (start_node hasn't run).
 /// - `Err("no Space for community {hex} in owner-state")` — the
 ///   community isn't in our local owner-state (we haven't joined or
@@ -62427,7 +62433,7 @@ pub(crate) async fn connectivity_set_identity_discoverable_impl(
     // dependency — keep their failure messages distinct so a missing settings
     // path doesn't misdirect the user toward recreating their identity.
     let Some(id_pub) = id_pub else {
-        return Err(OWNER_NOT_LOADED_MSG.into());
+        return Err(owner_not_loaded_msg_locked(state).into());
     };
     let Some(path) = settings_path else {
         return Err("connectivity_settings_path missing".into());
@@ -63500,7 +63506,7 @@ fn friend_token_publish_guard(
 /// acceptor's `self_display = None` convention (lib.rs:4470). It's only a UX
 /// hint on the redeemer's side.
 ///
-/// Errors: `OWNER_NOT_LOADED_MSG` when the node isn't booted; the mint /
+/// Errors: `OWNER_STILL_STARTING_MSG` when the node isn't booted; the mint /
 /// encode error string otherwise.
 #[tauri::command]
 async fn generate_friend_token(
@@ -63699,7 +63705,7 @@ pub(crate) async fn redeem_friend_token_impl(
         revoked_device_projection,
     )
     else {
-        return Err(OWNER_NOT_LOADED_MSG.into());
+        return Err(owner_not_loaded_msg_locked(state).into());
     };
 
     // The redeemer signs its FriendLinkRequest with its enrolled device-#2 key
@@ -64144,7 +64150,7 @@ async fn browse_friend_referrals(
         revoked_device_projection,
     )
     else {
-        return Err(OWNER_NOT_LOADED_MSG.into());
+        return Err(owner_not_loaded_msg_locked(&state).into());
     };
 
     // The SELF device-#2 signing key + SELF EnrollmentCert live on the DmOutbox
@@ -64437,7 +64443,7 @@ async fn request_introduction(
         dm_outbox,
     )
     else {
-        return Err(OWNER_NOT_LOADED_MSG.into());
+        return Err(owner_not_loaded_msg_locked(&state).into());
     };
 
     // The SELF device-#2 signing key + SELF EnrollmentCert live on the DmOutbox
@@ -65248,7 +65254,7 @@ pub(crate) async fn accept_friend_request_impl(
         )
     };
     let Some(store) = store else {
-        return Err(OWNER_NOT_LOADED_MSG.into());
+        return Err(owner_not_loaded_msg_locked(state).into());
     };
 
     // ZEB-376 AskMe: an `IntroductionOffer` runs the introducee self-dial. A plain
@@ -65306,7 +65312,7 @@ pub(crate) async fn accept_friend_request_impl(
         )
         else {
             crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
-            return Err(OWNER_NOT_LOADED_MSG.into());
+            return Err(owner_not_loaded_msg_locked(state).into());
         };
 
         let (device2_key, enrollment_cert) = {
@@ -65392,7 +65398,7 @@ pub(crate) async fn decline_friend_request_impl(
             .clone()
     };
     let Some(store) = store else {
-        return Err(OWNER_NOT_LOADED_MSG.into());
+        return Err(owner_not_loaded_msg_locked(state).into());
     };
     store.decline(&addr);
     crate::node_event_sink::emit_ser(sink.as_ref(), "friend-list-changed", &());
@@ -65540,7 +65546,7 @@ pub(crate) async fn accept_dm_invite_impl(
         )
     };
     let (Some(store), Some(crdt_state), Some(device_id)) = (store, crdt_state, device_id) else {
-        return Err(OWNER_NOT_LOADED_MSG.into());
+        return Err(owner_not_loaded_msg_locked(state).into());
     };
     let Some(staged) = store.take(&space_id) else {
         return Err("no pending DM invite for space".into());
@@ -65693,7 +65699,7 @@ pub(crate) async fn decline_dm_invite_impl(
             .clone()
     };
     let Some(store) = store else {
-        return Err(OWNER_NOT_LOADED_MSG.into());
+        return Err(owner_not_loaded_msg_locked(state).into());
     };
     if store.decline(&space_id).is_none() {
         return Err("no pending DM invite for space".into());
@@ -65971,7 +65977,7 @@ async fn set_friend_nickname(
         (g.crdt_state.clone(), g.connectivity_settings_path.clone())
     };
     let (Some(crdt_state), Some(path)) = (crdt_state, path) else {
-        return Err(OWNER_NOT_LOADED_MSG.into());
+        return Err(owner_not_loaded_msg_locked(&state).into());
     };
 
     // Scope: nicknames are an ACTIVE-friend-only feature (the UI only offers the
@@ -66950,7 +66956,7 @@ pub(crate) async fn add_friend_by_key_with_origin(
         revoked_device_projection,
     )
     else {
-        return Err(OWNER_NOT_LOADED_MSG.into());
+        return Err(owner_not_loaded_msg_locked(state).into());
     };
 
     let (device2_key, enrollment_cert) = {
@@ -75070,7 +75076,7 @@ mod channel_message_ipc_tests {
         let err = get_community_presence(state, "ab".repeat(16))
             .await
             .expect_err("no presence map → owner-not-loaded");
-        assert_eq!(err, OWNER_NOT_LOADED_MSG);
+        assert_eq!(err, OWNER_STILL_STARTING_MSG);
     }
 
     #[tokio::test]
@@ -75080,7 +75086,7 @@ mod channel_message_ipc_tests {
         let err = subscribe_community_presence(state, "ab".repeat(16))
             .await
             .expect_err("no request_tx → owner-not-loaded");
-        assert_eq!(err, OWNER_NOT_LOADED_MSG);
+        assert_eq!(err, OWNER_STILL_STARTING_MSG);
     }
 
     #[test]
