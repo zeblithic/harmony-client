@@ -1883,6 +1883,55 @@ impl NodeState {
         }
     }
 
+    /// ZEB-828: abort the background *driver* task handles and clear their
+    /// slots in one place. Called from BOTH `stop_inner` and the identity-
+    /// rebuild path inside `start_node` — extracting prevents the two sites
+    /// from drifting, which is the exact bug this fixes: the rebuild path
+    /// aborted only the publisher and silently leaked the other five as
+    /// *detached* tasks (dropping a `JoinHandle` detaches, it does not abort),
+    /// which then ticked forever against a dead node generation, pinning the
+    /// retired registry/resolver/pkarr `Arc`s.
+    ///
+    /// These six are the plain-`Option<JoinHandle>` drivers whose spawn sites
+    /// do a bare `field = opt.take()` with NO abort-of-prior, so they depend
+    /// entirely on the teardown path aborting them before the next generation
+    /// overwrites the slot. The three `Mutex<Option<JoinHandle>>` drivers
+    /// (voting-tick, liveness-heartbeat, friend-link-retry) are deliberately
+    /// NOT here: they self-guard by aborting any prior handle at their own
+    /// spawn site (`slot.replace(handle)` → `old.abort()`), so no teardown
+    /// path can leak them.
+    ///
+    /// (A third abort site — the `start_node` failure-cleanup path — operates
+    /// on pre-install local `*_for_cleanup` carriers, not `NodeState` fields,
+    /// so it can't share this helper; it keeps its own list, which already
+    /// covers all six.)
+    fn clear_driver_handles(&mut self) {
+        // ZEB-458 P4B: community-relay publisher.
+        if let Some(h) = self.community_relay_publisher_handle.take() {
+            h.abort();
+        }
+        // ZEB-458 P4B: community-relay pull driver.
+        if let Some(h) = self.community_relay_pull_driver_handle.take() {
+            h.abort();
+        }
+        // ZEB-458 P4B: community-relay GC sweep.
+        if let Some(h) = self.community_relay_gc_handle.take() {
+            h.abort();
+        }
+        // ZEB-458 P4B: joined-communities relay refresher.
+        if let Some(h) = self.community_relay_refresher_handle.take() {
+            h.abort();
+        }
+        // ZEB-811 Task 8: vine pull driver.
+        if let Some(h) = self.vine_pull_driver_handle.take() {
+            h.abort();
+        }
+        // ZEB-824: gateway-dial driver.
+        if let Some(h) = self.gateway_dial_driver_handle.take() {
+            h.abort();
+        }
+    }
+
     /// ZEB-311: test-only helper to set dm_self_owner for integration tests
     /// that exercise IPC paths requiring a caller identity. Only available
     /// under the `test-fixtures` feature (never compiled into production).
@@ -2843,34 +2892,16 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         guard.relay_optin_tracker = None;
         guard.community_relay_resolver = None;
         guard.community_relay_publisher_force = None;
-        if let Some(h) = guard.community_relay_publisher_handle.take() {
-            h.abort();
-        }
-        if let Some(h) = guard.community_relay_pull_driver_handle.take() {
-            h.abort();
-        }
-        if let Some(h) = guard.community_relay_gc_handle.take() {
-            h.abort();
-        }
-        if let Some(h) = guard.community_relay_refresher_handle.take() {
-            h.abort();
-        }
-        // ZEB-811 Task 8: abort the vine-pull driver task (None until Task 8's
-        // spawn site populates it, so this is a correct no-op pre-boot) and
-        // drop the wake handle so a restart rebuilds a fresh one.
-        if let Some(h) = guard.vine_pull_driver_handle.take() {
-            h.abort();
-        }
+        // ZEB-828: abort the six background driver task handles (publisher,
+        // pull driver, GC, refresher, vine-pull, gateway-dial) via the shared
+        // helper — each take+abort is a correct no-op until its spawn site
+        // populates the slot. Extracting this list keeps the stop path and the
+        // start_node identity-rebuild teardown from drifting.
+        guard.clear_driver_handles();
+        // ZEB-811 Task 8/9: drop the vine-pull wake + driver Arcs so a restart
+        // rebuilds fresh ones alongside the handle aborted above.
         guard.vine_pull_wake = None;
-        // ZEB-811 Task 9: drop the driver Arc too — a restart rebuilds a
-        // fresh one alongside the handle + wake above.
         guard.vine_pull_driver = None;
-        // ZEB-824: abort the gateway-dial driver task (None until the boot
-        // wiring's spawn site populates it, so this is a correct no-op
-        // pre-boot).
-        if let Some(h) = guard.gateway_dial_driver_handle.take() {
-            h.abort();
-        }
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -3945,14 +3976,15 @@ pub async fn start_node_inner(
         // running would collide the new endpoint with the ghost.
         old_iroh_endpoint = guard.iroh_endpoint.clone();
         guard.clear_iroh_handles();
-        // ZEB-458 P4B: the community-relay publisher handle is NOT covered by
-        // `clear_iroh_handles`, and this rebuild path only overwrites the slot
-        // with the new identity's handle further down — so without this abort
-        // the previous identity's publisher task survives the rebuild. Mirrors
-        // stop_inner, which already aborts it.
-        if let Some(h) = guard.community_relay_publisher_handle.take() {
-            h.abort();
-        }
+        // ZEB-828: abort ALL six background driver task handles via the shared
+        // helper. This path previously aborted ONLY the publisher, silently
+        // leaking the other five (pull driver, GC, refresher, vine-pull,
+        // gateway-dial): a same-key restart overwrites their slots further down
+        // (dropping a `JoinHandle` detaches, it does not abort), so the retired
+        // drivers ticked forever against the dead node generation, pinning the
+        // old registry/resolver/pkarr `Arc`s. Sharing the helper with stop_inner
+        // prevents this abort list from drifting again.
+        guard.clear_driver_handles();
         tup
     };
 
@@ -77929,6 +77961,108 @@ mod start_node_race_tests {
             } => {}
             other => panic!("unexpected error: {:?}", other),
         }
+    }
+
+    // ZEB-828: the identity-rebuild teardown must abort ALL six plain-Option
+    // background driver handles, not just the publisher. `clear_driver_handles`
+    // is the shared helper both `stop_inner` and the rebuild path call; this
+    // pins that it aborts every one and clears its slot.
+    #[tokio::test]
+    async fn clear_driver_handles_aborts_all_six_driver_tasks() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        use std::sync::Arc;
+
+        // Fires its flag when the task's future is dropped — i.e. when the
+        // task is aborted (the future is cancelled and dropped) rather than
+        // merely detached (which would leave it running and the flag unset).
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, SeqCst);
+            }
+        }
+
+        let started: Vec<Arc<AtomicBool>> =
+            (0..6).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let dropped: Vec<Arc<AtomicBool>> =
+            (0..6).map(|_| Arc::new(AtomicBool::new(false))).collect();
+
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        for i in 0..6 {
+            let s = started[i].clone();
+            let d = dropped[i].clone();
+            handles.push(tokio::spawn(async move {
+                let _flag = DropFlag(d);
+                s.store(true, SeqCst);
+                std::future::pending::<()>().await;
+            }));
+        }
+
+        let node = fresh_node_state();
+        {
+            let mut g = node.lock().unwrap();
+            g.community_relay_publisher_handle = Some(handles.remove(0));
+            g.community_relay_pull_driver_handle = Some(handles.remove(0));
+            g.community_relay_gc_handle = Some(handles.remove(0));
+            g.community_relay_refresher_handle = Some(handles.remove(0));
+            g.vine_pull_driver_handle = Some(handles.remove(0));
+            g.gateway_dial_driver_handle = Some(handles.remove(0));
+        }
+
+        // Ensure every task has been polled to its await point so its DropFlag
+        // exists before we abort (a task aborted before its first poll would
+        // never construct the flag). Bounded yields, no wall-clock waiting.
+        for _ in 0..1000 {
+            if started.iter().all(|f| f.load(SeqCst)) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            started.iter().all(|f| f.load(SeqCst)),
+            "all six driver tasks reached their await point"
+        );
+
+        {
+            let mut g = node.lock().unwrap();
+            g.clear_driver_handles();
+            assert!(g.community_relay_publisher_handle.is_none());
+            assert!(g.community_relay_pull_driver_handle.is_none());
+            assert!(g.community_relay_gc_handle.is_none());
+            assert!(g.community_relay_refresher_handle.is_none());
+            assert!(g.vine_pull_driver_handle.is_none());
+            assert!(g.gateway_dial_driver_handle.is_none());
+        }
+
+        // The aborts cancel + drop each task's future → each DropFlag fires.
+        for _ in 0..1000 {
+            if dropped.iter().all(|f| f.load(SeqCst)) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for (i, f) in dropped.iter().enumerate() {
+            assert!(
+                f.load(SeqCst),
+                "driver task {i} was not aborted by clear_driver_handles (detached, not aborted)"
+            );
+        }
+    }
+
+    // ZEB-828: pre-boot / already-stopped teardown — every slot is None, so the
+    // helper must be a safe no-op (mirrors the stop_inner comments that each
+    // take+abort is a correct no-op until a spawn site populates the slot).
+    #[test]
+    fn clear_driver_handles_is_a_noop_on_empty_slots() {
+        let node = fresh_node_state();
+        let mut g = node.lock().unwrap();
+        g.clear_driver_handles();
+        assert!(g.community_relay_publisher_handle.is_none());
+        assert!(g.community_relay_pull_driver_handle.is_none());
+        assert!(g.community_relay_gc_handle.is_none());
+        assert!(g.community_relay_refresher_handle.is_none());
+        assert!(g.vine_pull_driver_handle.is_none());
+        assert!(g.gateway_dial_driver_handle.is_none());
     }
 }
 
