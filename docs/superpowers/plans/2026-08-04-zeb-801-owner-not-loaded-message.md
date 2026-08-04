@@ -174,9 +174,17 @@ EOF
 
 ---
 
-## Task 2: Companion free function + remaining sweep + delete old constant
+## Task 2: Remaining sweep + delete old constant
 
-Adds the re-locking free function and finishes every remaining reference: the 1 `.ok_or_else(.to_string())` site, the 11 `return Err(...into())` early-returns, the 5 test asserts, the 4 comments, and deletes the old constant. Ends with `grep` returning nothing and the full suite green.
+> **Superseded during PR #603 convergence:** the re-locking free function
+> `owner_not_loaded_msg_locked` described below was replaced by a **same-locked-
+> snapshot capture** at each early-return (CodeRabbit flagged the re-lock as a
+> `thread` TOCTOU). See the design spec §2b for the shipped approach; the steps
+> below are kept as the original recipe. `set_friend_nickname` additionally
+> splits its `crdt_state`/`path` check so a missing settings path is not reported
+> as owner-not-loaded.
+
+Finishes every remaining reference: the 1 `.ok_or_else(.to_string())` site, the 11 `return Err(...into())` early-returns, the 5 test asserts, the 4 comments, and deletes the old constant. Ends with `grep` returning nothing and the full suite green.
 
 **Files:**
 - Modify: `src-tauri/src/lib.rs` — add free fn; sweep the 12 remaining production sites; update 2 asserts + 3 comments; delete old const.

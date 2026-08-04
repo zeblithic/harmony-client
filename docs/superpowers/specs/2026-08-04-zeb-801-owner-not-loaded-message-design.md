@@ -103,7 +103,7 @@ sites + 5 test asserts + 4 comments + the definition):
 | -- | -- | -- | -- |
 | `.ok_or(OWNER_NOT_LOADED_MSG)` (guard held, receiver `g`) | 163 | `lib.rs` | `.ok_or_else(\|\| g.owner_not_loaded_msg())` |
 | `.ok_or_else(\|\| OWNER_NOT_LOADED_MSG.to_string())` (guard `g` held) | 1 | `lib.rs:33025` | `.ok_or_else(\|\| g.owner_not_loaded_msg().to_string())` |
-| `return Err(OWNER_NOT_LOADED_MSG.into())` (guard **released**; `state` in scope) | 11 | `lib.rs:62143, 63411, 63842, 64135, 64946, 65004, 65090, 65238, 65391, 65669, 66648` | `return Err(owner_not_loaded_msg_locked(state).into())` |
+| `return Err(OWNER_NOT_LOADED_MSG.into())` (guard **released**) | 11 | `lib.rs:62143, 63411, 63842, 64135, 64946, 65004, 65090, 65238, 65391, 65669, 66648` | capture `not_loaded_msg` in the extraction block; `return Err(not_loaded_msg.into())` (§2b) |
 | `assert_eq!(err, OWNER_NOT_LOADED_MSG)` (default node ⇒ not running) | 2 | `lib.rs:74768, 74778` | `assert_eq!(err, OWNER_STILL_STARTING_MSG)` |
 | `assert_eq!(msg, crate::OWNER_NOT_LOADED_MSG)` (pre-node ⇒ not running) | 3 | `rpc.rs:2584, 2645, 2670` | `crate::OWNER_STILL_STARTING_MSG` |
 | Prose comment naming the constant | 4 | `lib.rs:1753, 33406, 63216`; `rpc.rs:2550` | reworded to the new names |
@@ -162,29 +162,34 @@ Private method (guard sites are in the crate-root module, so private is
 sufficient and keeps the surface minimal). Returns `&'static str` — the same
 Err type the guards produce today.
 
-### 2b. Companion free function for guard-released early-returns
+### 2b. Same-locked-snapshot capture for guard-released early-returns
 
 The 11 `return Err(OWNER_NOT_LOADED_MSG.into())` sites extract their handles
 inside a `{ let g = state.lock()…; (g.field.clone(), …) }` block and **drop the
-guard** before the `else { return Err(..) }`. So `g` is gone at the return, but
-the `&Mutex<NodeState>` (`state`) is still in scope. Re-locking there is safe —
-the guard is released, no deadlock — and these are cold error paths:
+guard** before the `else { return Err(..) }`. An earlier draft re-locked from a
+small free function at the return — but `thread` can flip between the two locks
+(node start/stop), so a handle observed as `None` under lock #1 could be
+classified against a *different* `thread` under lock #2 (CodeRabbit, PR #603).
+
+**Capture the classified message in the SAME locked snapshot as the handle
+read.** In each extraction block, bind the message while the guard is held and
+return it — no second lock, no TOCTOU:
 
 ```rust
-/// ZEB-801: same classification as `NodeState::owner_not_loaded_msg`, for
-/// error-path early-returns where the guard has already been released and
-/// only the `Mutex` is in scope. Re-locks (cold path); a poisoned lock falls
-/// back to the still-starting message (non-destructive).
-fn owner_not_loaded_msg_locked(state: &std::sync::Mutex<NodeState>) -> &'static str {
-    state
-        .lock()
-        .map(|g| g.owner_not_loaded_msg())
-        .unwrap_or(OWNER_STILL_STARTING_MSG)
-}
+let not_loaded_msg;
+let (handle_a, handle_b, …) = {
+    let g = state.lock().map_err(|e| format!("NodeState poisoned: {e}"))?;
+    not_loaded_msg = g.owner_not_loaded_msg(); // same snapshot as the handles
+    (g.handle_a.clone(), g.handle_b.clone(), …)
+};
+let (Some(a), …) = (handle_a, …) else {
+    return Err(not_loaded_msg.into());
+};
 ```
 
-Both entry points share the one classification rule, so no production site is a
-hard-coded default — the sweep is genuinely full.
+`not_loaded_msg` is definitely-assigned before its only use (the block runs to
+completion, or `?` returns the poison error first). No free function; the method
+is the single classification rule at every site.
 
 ### 3. Sweep the sites (per the reference inventory)
 
@@ -199,9 +204,16 @@ Two mechanical families plus the early-return family:
 - **1 `.ok_or_else(|| OWNER_NOT_LOADED_MSG.to_string())` site** (`lib.rs:33025`,
   guard `g` held) → `.ok_or_else(|| g.owner_not_loaded_msg().to_string())`.
 - **11 `return Err(OWNER_NOT_LOADED_MSG.into())` sites** (guard released) →
-  `return Err(owner_not_loaded_msg_locked(state).into())`, passing the in-scope
-  `&Mutex<NodeState>`. (One site, `65004`, emits a `friend-list-changed` event
-  before the return — leave that line, change only the `Err`.)
+  capture `not_loaded_msg = g.owner_not_loaded_msg()` in the extraction block
+  and `return Err(not_loaded_msg.into())` (§2b). Two of these are twins
+  (`redeem_friend_token_impl` / `add_friend_by_key_with_origin`, identical
+  extraction blocks); one (`accept_friend_request_impl`) has two returns off one
+  block sharing a single capture; two use an inline `state.lock()?.field.clone()`
+  temporary, rebound to a named guard so the message can be captured.
+  `set_friend_nickname` additionally splits its combined `crdt_state`/`path`
+  check so a missing `connectivity_settings_path` returns
+  `"connectivity_settings_path missing"`, not the owner-not-loaded message
+  (CodeRabbit).
 
 ## Data flow (unchanged shape)
 
@@ -209,10 +221,9 @@ Guard reads `g.<handle>`; when `None`, `ok_or_else` consults `g.thread`
 (already under the held `NodeState` lock) and returns the classified
 `&'static str`; `?` coerces `&'static str → String` for Tauri commands exactly
 as `ok_or(OWNER_NOT_LOADED_MSG)` did. No new state, no disk I/O, no wire-format
-or signature change, no async. The only added work is at the 11 error-path
-early-returns, where `owner_not_loaded_msg_locked` takes the lock once more —
-on a cold, already-failing path, after the original guard was dropped (no
-deadlock, no hot-path cost).
+or signature change, no async, and no extra lock — the early-return sites
+classify from the message captured in their existing extraction lock (§2b), so
+`thread` and the handle are always read from the same snapshot.
 
 ## Borrow / type notes
 
@@ -245,11 +256,14 @@ Add to `lib.rs`'s existing `#[cfg(test)] mod tests`:
    thread liveness). Struct-update literal accesses private fields, which the
    crate-root test module can do.
 3. **Canary — no destructive verb.** Assert neither `OWNER_STILL_STARTING_MSG`
-   nor `OWNER_NO_IDENTITY_MSG` contains `"recreate"`. Pins the fix so a future
-   edit cannot silently reintroduce the destructive advice.
+   nor `OWNER_NO_IDENTITY_MSG` contains `"recreate"` **or** `"restart the app"`
+   (both banned phrases). Pins the fix so a future edit cannot silently
+   reintroduce the destructive advice. A companion source-scan test
+   (`no_destructive_recreate_identity_advice_in_lib_rs`) asserts the full
+   pre-fix sentence is absent from `lib.rs` entirely.
 
-4. **Guard-site behavior (existing tests, retargeted).** Both node-state
-   guards and the free function resolve to the still-starting message on a
+4. **Guard-site behavior (existing tests, retargeted).** The node-state guards
+   resolve to the still-starting message on a
    non-running node, so the existing pre-node assertions become the regression
    coverage for the sweep:
    - `lib.rs:74768`, `:74778` (`get_community_presence` /
@@ -260,9 +274,9 @@ Add to `lib.rs`'s existing `#[cfg(test)] mod tests`:
      invariant still holds — they all classify to the still-starting message
      pre-node.
 
-The free function needs no separate unit test: it delegates to the method
-(covered by tests 1–2) and its only added behavior is the poisoned-lock
-fallback, which is not worth synthesizing a poisoned `Mutex` for.
+The early-return sites need no separate unit test: they capture the same
+`owner_not_loaded_msg()` the method tests (1–2) already cover, from the same
+locked snapshot as the handle they gate on.
 
 Gates: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets
 --features test-fixtures --no-deps -- -D warnings`; final validation is the

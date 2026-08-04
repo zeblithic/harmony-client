@@ -67,37 +67,52 @@ fn no_destructive_recreate_identity_advice_in_lib_rs() {
 #[test]
 fn owner_not_loaded_messages_only_inlined_in_const_or_docs() {
     // PR #169 (CodeRabbit + Greptile) + ZEB-801: every *code* site must reach
-    // the owner-not-loaded message through NodeState::owner_not_loaded_msg /
-    // owner_not_loaded_msg_locked (which read the two constants below), never an
-    // inline copy of the value, so the phrasing can't drift across call sites.
-    // Each literal is permitted only in (a) its const definition and (b) `///`
-    // doc-comments documenting the returned error text.
-    const LITERALS: [&str; 2] = [
-        "Owner identity not loaded — the app is still starting. Try again in a moment.",
-        "Owner identity not loaded — no identity is set up on this device yet.",
+    // the owner-not-loaded message through `NodeState::owner_not_loaded_msg`,
+    // never an inline copy of the value, so the phrasing can't drift across
+    // call sites. Each literal is permitted only in (a) ITS OWN const
+    // definition and (b) `///` doc-comments documenting the returned error text.
+    //
+    // Each literal is bound to its specific constant (CodeRabbit): a swapped
+    // definition, or one whose literal was removed, fails `defined` below —
+    // a check that accepts either name for either literal would not catch that.
+    const PAIRS: [(&str, &str); 2] = [
+        (
+            "OWNER_STILL_STARTING_MSG",
+            "Owner identity not loaded — the app is still starting. Try again in a moment.",
+        ),
+        (
+            "OWNER_NO_IDENTITY_MSG",
+            "Owner identity not loaded — no identity is set up on this device yet.",
+        ),
     ];
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
         .expect("read src/lib.rs");
 
-    let mut prev = "";
-    let mut offenders = Vec::new();
-    for (idx, line) in src.lines().enumerate() {
-        let is_doc = line.trim_start().starts_with("///");
-        // Tolerate both the two-line const form (name on the previous line) and
-        // a future same-line reformat (name + literal together).
-        let is_const_def = line.contains("const OWNER_STILL_STARTING_MSG")
-            || prev.contains("const OWNER_STILL_STARTING_MSG")
-            || line.contains("const OWNER_NO_IDENTITY_MSG")
-            || prev.contains("const OWNER_NO_IDENTITY_MSG");
-        if LITERALS.iter().any(|lit| line.contains(lit)) && !is_doc && !is_const_def {
-            offenders.push(idx + 1);
+    for (const_name, literal) in PAIRS {
+        let needle = format!("const {const_name}");
+        let mut defined = false;
+        let mut offenders = Vec::new();
+        let mut prev = "";
+        for (idx, line) in src.lines().enumerate() {
+            if line.contains(literal) {
+                // This literal's OWN const definition — tolerate the two-line
+                // form (name on the previous line) and a same-line reformat.
+                if line.contains(&needle) || prev.contains(&needle) {
+                    defined = true;
+                } else if !line.trim_start().starts_with("///") {
+                    offenders.push(idx + 1);
+                }
+            }
+            prev = line;
         }
-        prev = line;
+        assert!(
+            defined,
+            "{const_name} has no matching `const {const_name}` definition holding its own literal"
+        );
+        assert!(
+            offenders.is_empty(),
+            "inline copies of {const_name} at lib.rs lines {offenders:?} — \
+             route through owner_not_loaded_msg so the text stays single-sourced"
+        );
     }
-
-    assert!(
-        offenders.is_empty(),
-        "inline copies of an owner-not-loaded message at lib.rs lines {offenders:?} — \
-         route through owner_not_loaded_msg[_locked] so the text stays single-sourced"
-    );
 }
