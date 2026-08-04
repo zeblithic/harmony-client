@@ -30798,6 +30798,7 @@ fn parse_channel_kind(
 fn channel_info_dto(
     channel_id: &crate::community_membership::ChannelId,
     info: &crate::community_membership::ChannelInfo,
+    syncing: bool,
 ) -> ChannelInfoDto {
     ChannelInfoDto {
         channel_id: hex::encode(channel_id.0),
@@ -30810,7 +30811,41 @@ fn channel_info_dto(
         },
         created_at: info.created_at.clone(),
         deleted_at: info.deleted_at.clone(),
+        syncing,
     }
+}
+
+/// ZEB-776: build channel rows from the two sources. Confirmed channels (real
+/// CRDT, from `materialize_now`) are `syncing:false` and always win; a hint
+/// channel not among them is `syncing:true`. Sorted by created_at.wall_ms,
+/// then logical, then channel_id (the same order list_channels always used).
+fn merge_channel_rows(
+    confirmed: &std::collections::BTreeMap<
+        crate::community_membership::ChannelId,
+        crate::community_membership::ChannelInfo,
+    >,
+    hint: &[(
+        crate::community_membership::ChannelId,
+        crate::community_membership::ChannelInfo,
+    )],
+) -> Vec<ChannelInfoDto> {
+    let mut rows: Vec<ChannelInfoDto> = confirmed
+        .iter()
+        .map(|(cid, info)| channel_info_dto(cid, info, false))
+        .collect();
+    for (cid, info) in hint {
+        if !confirmed.contains_key(cid) {
+            rows.push(channel_info_dto(cid, info, true));
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.created_at
+            .wall_ms
+            .cmp(&b.created_at.wall_ms)
+            .then_with(|| a.created_at.logical.cmp(&b.created_at.logical))
+            .then_with(|| a.channel_id.cmp(&b.channel_id))
+    });
+    rows
 }
 
 /// Tauri IPC: create a new channel in a community we currently
@@ -31725,18 +31760,28 @@ async fn list_channels(
     list_channels_impl(state_lock.inner(), community_id).await
 }
 
-/// ZEB-445: shared IPC/RPC seam.
-pub(crate) async fn list_channels_impl(
+/// ZEB-776: shared resolution for the two channel read paths. From a joined
+/// community's owner-state + community engine, returns (confirmed channels from
+/// the hint-blind materialize, epoch-snapshot hint channels). Both
+/// `list_channels_impl` and `list_channel_messages_impl` use it so they agree on
+/// which channels a community "knows". Errors mirror the prior
+/// `list_channels_impl` resolution.
+async fn resolve_confirmed_and_hint(
     state: &std::sync::Mutex<NodeState>,
-    community_id: String,
-) -> Result<Vec<ChannelInfoDto>, String> {
-    let id_bytes: [u8; 16] = hex::decode(&community_id)
-        .map_err(|e| format!("invalid community_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
-    let space_id = crate::owner_state_types::SpaceId(id_bytes);
-
+    space_id: crate::owner_state_types::SpaceId,
+) -> Result<
+    (
+        std::collections::BTreeMap<
+            crate::community_membership::ChannelId,
+            crate::community_membership::ChannelInfo,
+        >,
+        Vec<(
+            crate::community_membership::ChannelId,
+            crate::community_membership::ChannelInfo,
+        )>,
+    ),
+    String,
+> {
     let (crdt_state, registry) = {
         let g = state
             .lock()
@@ -31780,33 +31825,44 @@ pub(crate) async fn list_channels_impl(
         )
     })?;
 
-    // ZEB-598: hint-AWARE materialize. A freshly-redeemed invite embeds its
-    // channel configs in `bootstrap_hint` (no CRDT events yet); the hint-blind
-    // `materialize_now` would return an empty channel list until real events
-    // happen to land locally (which may never happen for a quiet channel).
-    // `materialized` returns the hint while the event log is empty and is
-    // superseded by the authoritative CRDT thereafter.
-    let materialized = {
-        let g = engine_state.lock().await;
-        g.materialized(admin_addr)
+    // ZEB-598/ZEB-776: `confirmed` is the authoritative CRDT channel set,
+    // hint-blind; the bootstrap hint carries the invite's epoch_snapshot channels
+    // that may not have landed as real CRDT events yet. The caller merges them,
+    // labeling hint-only channels `syncing`.
+    //
+    // Prefer the CACHED `materialized()` when the log has events (the post-redeem
+    // norm) — it is hint-blind there, because the hint only substitutes for a
+    // truly-empty log. When the log IS empty nothing is confirmed yet, so
+    // `confirmed` is empty and every hint channel stays `syncing`. This avoids the
+    // uncached full-materialize `materialize_now` would run under the lock on
+    // every list_channels poll during the join window.
+    let g = engine_state.lock().await;
+    let confirmed = if g.log_is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        g.materialized(admin_addr).channels
     };
+    Ok((confirmed, g.bootstrap_hint_channels()))
+}
 
-    let mut rows: Vec<ChannelInfoDto> = materialized
-        .channels
-        .iter()
-        .map(|(channel_id, info)| channel_info_dto(channel_id, info))
-        .collect();
-    // Sort by created_at ascending so #general (auto-created first in
-    // Task 7's create_community extension) is always at the top of the
-    // list. Tie-break on logical, then channel_id, for determinism.
-    rows.sort_by(|a, b| {
-        a.created_at
-            .wall_ms
-            .cmp(&b.created_at.wall_ms)
-            .then_with(|| a.created_at.logical.cmp(&b.created_at.logical))
-            .then_with(|| a.channel_id.cmp(&b.channel_id))
-    });
-    Ok(rows)
+/// ZEB-445: shared IPC/RPC seam.
+pub(crate) async fn list_channels_impl(
+    state: &std::sync::Mutex<NodeState>,
+    community_id: String,
+) -> Result<Vec<ChannelInfoDto>, String> {
+    let id_bytes: [u8; 16] = hex::decode(&community_id)
+        .map_err(|e| format!("invalid community_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "community_id must be 16 bytes (32 hex chars)".to_string())?;
+    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+
+    // ZEB-776: surface confirmed channels (real CRDT, syncing:false) merged with
+    // the invite's epoch_snapshot hint channels not yet confirmed (syncing:true),
+    // so a freshly-redeemed community shows its channels immediately instead of
+    // waiting out the root-fetch convergence window.
+    let (confirmed, hint) = resolve_confirmed_and_hint(state, space_id).await?;
+    Ok(merge_channel_rows(&confirmed, &hint))
 }
 
 // ── ZEB-270 Phase 3: channel-message IPCs ────────────────────────────
@@ -33317,10 +33373,31 @@ pub(crate) async fn list_channel_messages_impl(
             .clone()
     };
 
-    let engine = registry
-        .engine(&cid, &chid)
-        .await
-        .ok_or_else(|| format!("no engine for {community_id}/{channel_id}"))?;
+    let engine = match registry.engine(&cid, &chid).await {
+        Some(engine) => engine,
+        None => {
+            // ZEB-776: distinguish "channel known to this community but its log
+            // engine hasn't spawned yet" (still converging after a fresh join →
+            // Ok(empty), NOT the misleading "no engine" error) from a genuinely
+            // unknown channel (not joined / bad id → keep the error). The shared
+            // resolver is the same one list_channels uses, so the two read paths
+            // agree on which channels a community knows.
+            let (confirmed, hint) = resolve_confirmed_and_hint(state, cid).await?;
+            // ZEB-776: a channel the community knows AND that is not tombstoned is
+            // still-syncing (Ok(empty)). A DELETED channel — `materialize_now`
+            // retains its record with `deleted_at` set, but no log engine is ever
+            // spawned for it — keeps the missing-engine error, so a delete stays
+            // distinguishable from a pre-convergence empty.
+            let known = confirmed.get(&chid).is_some_and(|c| c.deleted_at.is_none())
+                || hint
+                    .iter()
+                    .any(|(c, info)| *c == chid && info.deleted_at.is_none());
+            if known {
+                return Ok(Vec::new());
+            }
+            return Err(format!("no engine for {community_id}/{channel_id}"));
+        }
+    };
 
     let since_hlc = since.map(|h| crate::owner_state_types::Hlc {
         wall_ms: h.wall_ms,
@@ -38311,9 +38388,30 @@ mod list_bootstrap_hint_tests {
         );
         let crdt_state = Arc::new(tokio::sync::Mutex::new(owner_state));
 
+        // ZEB-776: an empty channel-log registry so list_channel_messages_impl
+        // reaches its engine-miss (None) path instead of failing on a missing
+        // registry. No engine is ever spawned, so its adapter bridge is never
+        // used and a no-op FanoutSink suffices.
+        let (adapter_request_tx, _adapter_request_rx) = mpsc::unbounded_channel();
+        let channel_log_registry = crate::community_channel_log_engine::ChannelLogRegistry::new(
+            crate::community_channel_log_engine::ChannelLogRegistryConfig {
+                adapter_request_tx,
+                sink: Arc::new(crate::node_event_sink::FanoutSink(vec![])),
+                identity_dir: dir.path().to_path_buf(),
+                self_owner: admin,
+                self_device_id: "test-dev".to_string(),
+                signing_key: Arc::new(SigningKey::from_bytes(&[0x42; 32])),
+                adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+                engine_config: Default::default(),
+                transport_epoch_rx: None,
+                presence_resync_rx: None,
+            },
+        );
+
         let node_state = std::sync::Mutex::new(crate::NodeState {
             crdt_state: Some(crdt_state),
             community_registry: Some(Arc::clone(&registry)),
+            channel_log_registry: Some(channel_log_registry),
             ..crate::NodeState::default()
         });
 
@@ -38360,6 +38458,11 @@ mod list_bootstrap_hint_tests {
             vec!["general", "random"],
             "list_channels must return the bootstrap hint's channels, ordered by created_at"
         );
+        // ZEB-776: hint-only channels (no confirmed CRDT event yet) are syncing.
+        assert!(
+            listed_channels.iter().all(|c| c.syncing),
+            "hint-only channels must be flagged syncing:true"
+        );
 
         // list_community_members: pre-fix (materialize_now, empty events) →
         // near-empty; the hint's three members must surface.
@@ -38382,6 +38485,115 @@ mod list_bootstrap_hint_tests {
             .expect("shutdown community registry");
         // Remove the tempdir only after the engine's final flush completes, so
         // the persist paths never vanish mid-write.
+        drop(dir);
+    }
+
+    #[test]
+    fn merge_channel_rows_labels_hint_only_syncing_confirmed_not_and_dedups() {
+        // ZEB-776: confirmed channels (real CRDT) are not syncing and shadow any
+        // same-id hint entry; a hint-only channel is syncing; no duplicate rows.
+        let c_general = ChannelId([0x11; 16]); // in both confirmed + hint
+        let c_random = ChannelId([0x22; 16]); // hint only
+        let c_dev = ChannelId([0x33; 16]); // confirmed only
+
+        let mut confirmed = BTreeMap::new();
+        // general (0x11) and dev (0x33) share wall_ms=1 so the row order between
+        // them exercises the channel_id secondary sort, not just wall_ms.
+        confirmed.insert(c_general, text_channel("general", 1));
+        confirmed.insert(c_dev, text_channel("dev", 1));
+
+        let hint = vec![
+            (c_general, text_channel("general", 1)),
+            (c_random, text_channel("random", 2)),
+        ];
+
+        let rows = crate::merge_channel_rows(&confirmed, &hint);
+        assert_eq!(rows.len(), 3, "c_general must not be duplicated");
+        let by_name = |n: &str| rows.iter().find(|r| r.name == n).expect("row present");
+        assert!(
+            !by_name("general").syncing,
+            "confirmed shadows hint → not syncing"
+        );
+        assert!(!by_name("dev").syncing, "confirmed-only → not syncing");
+        assert!(by_name("random").syncing, "hint-only → syncing");
+        // Sort: general & dev tie on wall_ms=1 → channel_id breaks the tie
+        // (0x11 < 0x33 → general before dev); random (wall_ms=2) sorts last.
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["general", "dev", "random"],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_channel_messages_known_syncing_empty_unknown_and_deleted_error() {
+        // ZEB-776: a channel the community knows (from the invite hint) but whose
+        // log engine hasn't spawned yet returns Ok(empty), not "no engine". A
+        // genuinely-unknown channel AND a deleted (tombstoned) channel both keep
+        // the missing-engine error, so a delete stays distinguishable from a
+        // still-syncing empty.
+        let community = SpaceId([0xc0; 16]);
+        let admin = OwnerAddr([0xad; 16]);
+        let known = ChannelId([0x11; 16]);
+        let unknown = ChannelId([0x99; 16]);
+        let deleted = ChannelId([0x55; 16]);
+
+        let mut channels = BTreeMap::new();
+        channels.insert(known, text_channel("general", 1));
+        let mut deleted_ch = text_channel("old", 1);
+        deleted_ch.deleted_at = Some(Hlc {
+            wall_ms: 2,
+            logical: 0,
+            device_id: "seed".into(),
+        });
+        channels.insert(deleted, deleted_ch);
+        let hint = MaterializedMembership {
+            channels,
+            ..Default::default()
+        };
+
+        let (node_state, community_hex, registry, dir) =
+            seeded_node_state(community, admin, hint).await;
+
+        let known_msgs = crate::list_channel_messages_impl(
+            &node_state,
+            community_hex.clone(),
+            hex::encode(known.0),
+            None,
+            100,
+            None,
+        )
+        .await
+        .expect("known-but-syncing channel must return Ok, not the 'no engine' error");
+        assert!(known_msgs.is_empty());
+
+        let unknown_err = crate::list_channel_messages_impl(
+            &node_state,
+            community_hex.clone(),
+            hex::encode(unknown.0),
+            None,
+            100,
+            None,
+        )
+        .await
+        .expect_err("unknown channel must still error");
+        assert!(unknown_err.contains("no engine for"), "got: {unknown_err}");
+
+        let deleted_err = crate::list_channel_messages_impl(
+            &node_state,
+            community_hex,
+            hex::encode(deleted.0),
+            None,
+            100,
+            None,
+        )
+        .await
+        .expect_err("deleted channel must error, not Ok([])");
+        assert!(deleted_err.contains("no engine for"), "got: {deleted_err}");
+
+        registry
+            .shutdown_all()
+            .await
+            .expect("shutdown community registry");
         drop(dir);
     }
 }
@@ -50645,6 +50857,14 @@ pub struct ChannelInfoDto {
     pub created_at: crate::owner_state_types::Hlc,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<crate::owner_state_types::Hlc>,
+    /// ZEB-776: true when this channel is known only from the invite's
+    /// epoch_snapshot bootstrap hint and has not yet been confirmed by a real
+    /// ChannelCreate CRDT event (the community root-fetch hasn't landed the
+    /// admin's channel config yet). Flips to false on convergence. Always
+    /// emitted so JS and scripted (RPC/api) callers get an unambiguous
+    /// "still converging" signal instead of inferring it from an empty list
+    /// plus a raw "no engine" error.
+    pub syncing: bool,
 }
 
 /// Action discriminator for a `channel-config-updated` Tauri event.
@@ -73859,12 +74079,15 @@ mod create_channel_delta_tests {
             created_at,
             deleted_at: None,
         };
-        let dto_voice = channel_info_dto(&ChannelId([0x42; 16]), &voice);
-        let dto_text = channel_info_dto(&ChannelId([0x43; 16]), &text);
-        let dto_townhall = channel_info_dto(&ChannelId([0x44; 16]), &townhall);
+        let dto_voice = channel_info_dto(&ChannelId([0x42; 16]), &voice, false);
+        let dto_text = channel_info_dto(&ChannelId([0x43; 16]), &text, true);
+        let dto_townhall = channel_info_dto(&ChannelId([0x44; 16]), &townhall, false);
         assert_eq!(dto_voice.kind, "voice");
         assert_eq!(dto_text.kind, "text");
         assert_eq!(dto_townhall.kind, "townhall");
+        assert!(!dto_voice.syncing);
+        assert!(dto_text.syncing, "syncing arg must map onto the DTO field");
+        assert!(!dto_townhall.syncing);
 
         // Always emitted (not skipped): the serialized JSON carries `kind`.
         let json = serde_json::to_value(&dto_text).expect("serialize dto");

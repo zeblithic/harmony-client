@@ -71,6 +71,25 @@ with that exact diagnosis; it flips green for free once the DM-Space carrier lan
 (`docs/playbooks/e2e-two-agent-suite.md`, ZEB-444) — a co-located pass does not
 prove cross-WAN re-peering.
 
+## Gotchas
+
+**Channels are `syncing` briefly after a fresh join (ZEB-776).** Right after an
+invite redemption the community's channels are surfaced from the invite's
+`epoch_snapshot` immediately, but each is flagged `syncing: true` in
+`list_channels` until the community root-fetch lands the admin's real
+`ChannelCreate` events (seconds to ~2 min). During that window
+`list_channel_messages` on such a channel returns `Ok([])` — an empty list, **not**
+the `"no engine for …"` error it used to. Two distinct failure modes follow:
+asserting once while `syncing` is `true` produces a **false negative** (the channel
+isn't findable by name yet), while treating an empty `Ok([])` as "converged"
+produces a **false positive** — `syncing:false` proves only that the channel
+*config* is confirmed, **not** that its message history has finished backfilling,
+so an empty result can still mean "messages are still arriving". Scripted flows
+must therefore poll `list_channels` until the target channel's `syncing` is `false`
+**and** wait for the expected message(s) to actually appear (or explicitly tolerate
+an empty result) — never assert once. Same family as the ZEB-462 camelCase-key
+trap above.
+
 ## CI
 
 This suite is its own deliberately-invoked CI job, **not** run on every push (it

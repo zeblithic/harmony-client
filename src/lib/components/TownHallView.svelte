@@ -28,6 +28,7 @@
     channelName,
     communityId,
     channelId,
+    channelSyncing = false,
     onBeforeJoin,
     ownAddress,
     myPower,
@@ -49,6 +50,7 @@
     channelName: string;
     communityId: string;
     channelId: string;
+    channelSyncing?: boolean;
     onBeforeJoin?: () => Promise<void>;
     ownAddress: string;
     myPower: number;
@@ -457,6 +459,7 @@
               {communityId}
               {channelId}
               {channelName}
+              {channelSyncing}
               {channelMessageService}
               {votingAdapter}
               {ownAddress}

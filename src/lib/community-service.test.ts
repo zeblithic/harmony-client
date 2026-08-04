@@ -38,6 +38,19 @@ describe('CommunityService.getCachedChannelName (ZEB-662)', () => {
   });
 });
 
+describe('CommunityService.listChannels syncing flag (ZEB-776)', () => {
+  it('surfaces the syncing flag from the backend', async () => {
+    const svc = new CommunityService();
+    await svc.connectAdapter(
+      mockAdapter([
+        { channelId: 'ch1', name: 'general', writePower: 0, kind: 'text', createdAt: HLC, syncing: true },
+      ]),
+    );
+    const channels = await svc.listChannels('c1');
+    expect(channels[0].syncing).toBe(true);
+  });
+});
+
 describe('CommunityService.listLeftCommunities (ZEB-435)', () => {
   it('invokes list_left_communities and returns the DTO rows verbatim', async () => {
     const rows = [
