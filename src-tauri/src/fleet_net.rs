@@ -250,6 +250,19 @@ impl FleetNetDoc {
 /// could silently drop or mis-rank valid rows. All current callers — the lib.rs pkarr
 /// blob builder and `selection_view` — satisfy this.
 ///
+/// **Accepted residual (ZEB-856 R1 — near-future clamp-to-top).** The ranking
+/// key is peer-self-stamped and this function has no independent liveness
+/// signal, so a sibling that stamps `seen_at.wall_ms = now` leads honest
+/// siblings sitting at `now − Δ` (their stamp ages up to one
+/// `BUTLER_SET_REFRESH_MS` between refreshes). Left UNFIXED by decision:
+/// `wall = now` is indistinguishable from an honestly-just-refreshed device,
+/// and any structural demotion is fail-open — it could push a mildly
+/// clock-skewed honest device below a stale one and route butler deposits to a
+/// dead device. The exposure is bounded (the clamp caps inflation at `now`, R2
+/// removed the `logical` axis, `device_id` is fixed) and the sanctioned
+/// override is the owner's PIN, which ZEB-856 R3 makes un-freezable. Pinned by
+/// the `butler_rank_r1_now_stamper_leads_then_pin_overrides` canary test.
+///
 /// This is the heart of the fleet-net-v1 contribution: it maps the
 /// replicated `FleetNetDoc` to an ordered advisory butler-set for the
 /// pkarr advertisement.
@@ -1470,6 +1483,45 @@ mod tests {
             local.petnames.get(&key).map(|p| p.name.as_str()),
             Some("far"),
             "None clock ⇒ apply-all for the petname"
+        );
+    }
+
+    #[test]
+    fn butler_rank_r1_now_stamper_leads_then_pin_overrides() {
+        let window = crate::butler_deposit::BUTLER_SET_FRESHNESS_MS;
+        let refresh = crate::butler_deposit::BUTLER_SET_REFRESH_MS;
+        let now: u64 = 2_000_000_000_000;
+        let stale_before = now - window;
+
+        let mut doc = FleetNetDoc::default();
+        // A "now"-stamper (a sibling always claiming maximum freshness).
+        doc.devices.insert(
+            "dev-nowstamper".into(),
+            row(0x01, "relay.ns", hlc(now, "d")),
+        );
+        // An honest device, one refresh interval stale.
+        doc.devices.insert(
+            "dev-honest".into(),
+            row(0x02, "relay.h", hlc(now - refresh, "d")),
+        );
+
+        // (a) ACCEPTED RESIDUAL (ZEB-856 R1): the fresher self-stamp leads. This is
+        // deliberately UNFIXED — a demotion here would be fail-open (could route
+        // deposits to a dead device). Canary: if a future change alters ranking so
+        // the now-stamper no longer leads, this trips and forces a fresh decision.
+        let order = butler_set_order(&doc, stale_before);
+        assert_eq!(
+            order[0].0, "dev-nowstamper",
+            "R1: the freshest self-stamp leads (accepted residual)"
+        );
+
+        // (b) MITIGATION: the owner's pin overrides freshness ranking (and R3 keeps
+        // the pin un-freezable). Pinning the honest device puts it at slot 0.
+        doc.pinned = Some("dev-honest".into());
+        let order = butler_set_order(&doc, stale_before);
+        assert_eq!(
+            order[0].0, "dev-honest",
+            "R1 mitigation: the owner pin overrides freshness ranking"
         );
     }
 
