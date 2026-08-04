@@ -413,6 +413,51 @@ describe('FriendsPanel — outbound requests (ZEB-784 / ZEB-783)', () => {
   });
 });
 
+describe('FriendsPanel — teardown-guarded failure paths (ZEB-793)', () => {
+  it('surfaces a pending-requests refresh failure in the section error', async () => {
+    // Locks the MOUNTED failure path the ZEB-793 guard touches: the `catch`
+    // must still surface the error while the panel is alive (the guard only
+    // suppresses writes AFTER teardown). Regression guard against over-guarding.
+    const listPendingRequests = vi.fn().mockRejectedValue(new Error('pending boom'));
+    const service = mockService({ listPendingRequests });
+    const { findByTestId } = render(FriendsPanel, { props: { service } });
+    const err = await findByTestId('pending-error');
+    expect(err.textContent).toContain('pending boom');
+  });
+
+  it('does not warn or throw when a pending fetch rejects after unmount', async () => {
+    // ZEB-793 teardown smoke test. NOTE: the guard's actual effect — skipping
+    // the `pendingError`/`pendingLoading` writes after teardown — has no
+    // external observable (Svelte 5 neither throws nor warns on a post-unmount
+    // $state write; verified by removing the guard and watching this stay
+    // green). That property is covered structurally by parity with the
+    // already-merged `refreshOutbound` guard (ZEB-784) and its family teardown
+    // test above. This test pins the weaker-but-real property: a late rejection
+    // settling after unmount escapes as neither a throw nor an unhandled
+    // rejection warning.
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let rejectPending: (e: unknown) => void = () => {};
+    const listPendingRequests = vi.fn().mockReturnValue(
+      new Promise((_r, rej) => {
+        rejectPending = rej as (e: unknown) => void;
+      }),
+    );
+    const service = mockService({ listPendingRequests });
+    const { unmount } = render(FriendsPanel, { props: { service } });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Tear down while the pending-list fetch is in flight, THEN reject it.
+    unmount();
+    rejectPending(new Error('late boom'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  });
+});
+
 describe('FriendsPanel — owner names + nicknames (ZEB-419)', () => {
   const ID = (b: string) => b.repeat(32); // 16-byte owner_id = 32 hex chars
 

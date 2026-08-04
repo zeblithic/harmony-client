@@ -14046,11 +14046,23 @@ pub async fn start_node_inner(
             // routing at admin_quorum>1; the resulting membership events
             // propagate cross-peer over the already-wired state-root log.
             {
+                // ZEB-793: hold the `NodeState` guard ACROSS the tick spawn AND
+                // the handle-install, mirroring the friend-link-retry block below
+                // and the liveness-heartbeat block above. `stop_inner` takes this
+                // same lock before it reaches the handle slots, so a `stop_node`
+                // racing us runs entirely before or entirely after this block —
+                // never in the window between `spawn_voting_tick` and the slot
+                // write. Dropping the guard there (as this used to) let a stop
+                // abort an EMPTY slot while the freshly-spawned tick survived,
+                // running Tier-1 auto-close, Tier-2 threshold/finalize, the
+                // archive sweep, and `apply_auto_exec_set_power` governance
+                // effects against a node the user had stopped. `tokio::spawn`
+                // never awaits, so holding a std guard over it is safe, and the
+                // lock ORDER matches stop_inner (state → slot), so the two cannot
+                // deadlock.
                 let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
                 if guard.generation == our_gen {
                     let voting_logs_clone = std::sync::Arc::clone(&guard.voting_logs);
-                    let tick_handle_slot = std::sync::Arc::clone(&guard.voting_tick_handle);
-                    drop(guard);
 
                     let app_for_emit = app.clone();
                     let emit_fn: crate::community_voting_tick::EmitFn =
@@ -14090,14 +14102,16 @@ pub async fn start_node_inner(
                     );
                     let handle =
                         crate::community_voting_tick::spawn_voting_tick(tick_ctx, tick_interval);
-                    // Replace any prior handle (a leftover from a racing
-                    // start_node would already have been aborted by
-                    // stop_inner; this is defense-in-depth).
-                    let prev = match tick_handle_slot.lock() {
-                        Ok(mut slot) => slot.replace(handle),
-                        Err(_) => None,
-                    };
-                    if let Some(old) = prev {
+                    // Install under the still-held `guard` (ZEB-793). Recover a
+                    // poisoned slot (into_inner) so a failed lock can't leave the
+                    // just-spawned task untracked (leaked). Any prior handle (a
+                    // leftover from a racing start_node) is aborted here; stop_inner
+                    // aborts it too.
+                    let mut slot = guard
+                        .voting_tick_handle
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(old) = slot.replace(handle) {
                         old.abort();
                     }
                 }

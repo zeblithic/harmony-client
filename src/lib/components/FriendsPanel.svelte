@@ -216,9 +216,14 @@
         [...referralsError].filter(([ownerIdHex]) => activeIds.has(ownerIdHex)),
       );
     } catch (e) {
+      // ZEB-793: guard the FAILURE path too — listFriends can reject after the
+      // panel unmounts, and writing $state on a destroyed component is exactly
+      // what the success path above (and refreshOutbound) is careful to avoid.
+      if (destroyed) return;
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      // `return` inside catch still runs finally, so guard this write on its own.
+      if (!destroyed) loading = false;
     }
   }
 
@@ -229,9 +234,12 @@
       pendingRequests = next;
       pendingError = null;
     } catch (e) {
+      // ZEB-793: no post-teardown $state writes (see refresh()/refreshOutbound).
+      if (destroyed) return;
       pendingError = e instanceof Error ? e.message : String(e);
     } finally {
-      pendingLoading = false;
+      // `return` inside catch still runs finally, so guard this write on its own.
+      if (!destroyed) pendingLoading = false;
     }
   }
 
@@ -245,6 +253,8 @@
       dmInvites = next;
       dmInviteError = null;
     } catch (e) {
+      // ZEB-793: no post-teardown $state writes (see refresh()/refreshOutbound).
+      if (destroyed) return;
       dmInviteError = e instanceof Error ? e.message : String(e);
     }
   }
