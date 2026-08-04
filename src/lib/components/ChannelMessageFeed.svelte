@@ -70,6 +70,10 @@
      *  → the autocomplete never opens (feature degrades to plain text). */
     mentionCandidates = [],
     composerPlaceholder,
+    /** ZEB-776: true while this channel is still converging after a fresh join
+     *  (known from the invite hint, not yet confirmed by a real ChannelCreate).
+     *  Shows a "still syncing" banner so an empty feed doesn't read as broken. */
+    channelSyncing = false,
   }: {
     communityId: string;
     channelId: string;
@@ -102,6 +106,7 @@
     /** ZEB-612 S5: override for the composer placeholder (TownHallView passes
      *  "Message the room…"). Absent → the long-standing `Message #name`. */
     composerPlaceholder?: string;
+    channelSyncing?: boolean;
   } = $props();
 
   // Local mirror of service.byChannel cache for this channel.
@@ -896,6 +901,12 @@
     <span class="name">{channelName}</span>
   </header>
 
+  {#if channelSyncing}
+    <div class="syncing-banner" data-testid="channel-syncing-banner" role="status">
+      This channel is still syncing — messages will appear shortly.
+    </div>
+  {/if}
+
   <div
     class="messages-scroll"
     bind:this={scrollEl}
@@ -1319,6 +1330,13 @@
     clip: rect(0 0 0 0);
     white-space: nowrap;
     border: 0;
+  }
+  .syncing-banner {
+    padding: 6px 12px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    background: var(--surface-raised);
+    border-bottom: 1px solid var(--border);
   }
   .reaction-error {
     display: flex;

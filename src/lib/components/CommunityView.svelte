@@ -494,6 +494,7 @@
             channelName={activeChannel.name}
             {communityId}
             channelId={activeChannel.channelId}
+            channelSyncing={activeChannel.syncing ?? false}
             onBeforeJoin={onBeforeVoiceJoin}
             {ownAddress}
             {myPower}
@@ -527,6 +528,7 @@
           {communityId}
           channelId={activeChannel.channelId}
           channelName={activeChannel.name}
+          channelSyncing={activeChannel.syncing ?? false}
           {channelMessageService}
           {votingAdapter}
           {ownAddress}

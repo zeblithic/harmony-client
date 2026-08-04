@@ -68,6 +68,20 @@ describe('ChannelMessageFeed', () => {
     vi.useRealTimers();
   });
 
+  // ZEB-776: a channel still converging after a fresh join shows a "still
+  // syncing" banner so an empty feed doesn't read as broken.
+  it('shows the syncing banner when channelSyncing is true', async () => {
+    const { queryByTestId } = await setup({ channelSyncing: true });
+    await waitFor(() => {
+      expect(queryByTestId('channel-syncing-banner')).not.toBeNull();
+    });
+  });
+
+  it('hides the syncing banner when channelSyncing is false', async () => {
+    const { queryByTestId } = await setup({ channelSyncing: false });
+    expect(queryByTestId('channel-syncing-banner')).toBeNull();
+  });
+
   it('mounts and calls listMessages on mount', async () => {
     const { adapter } = await setup();
     await waitFor(() => {
