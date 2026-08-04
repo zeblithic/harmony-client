@@ -37,17 +37,28 @@ export function tokenizeBody(text: string): BodySegment[] {
 }
 
 /** The single shared resolution ladder: local nickname → broadcast profile
- *  displayName → `ownerId.slice(0, 8)`. Empty/whitespace values count as absent
- *  (via the shared `nonEmpty`, same as `ChannelMessageFeed.authorLabel` — ZEB-432).
+ *  displayName → roster-DTO displayName → `ownerId.slice(0, 8)`. Empty/whitespace
+ *  values count as absent (via the shared `nonEmpty`, same as
+ *  `ChannelMessageFeed.authorLabel` and `MemberRow` — ZEB-432/ZEB-774).
+ *
+ *  The optional `resolveRosterName` rung (ZEB-774) lets a member the roster
+ *  already named (via `list_community_members`' `displayName`, ZEB-777) degrade
+ *  to that name rather than raw hex while the profile card is still propagating.
+ *  It sits below the live card so a fresher broadcast name always wins; it
+ *  mirrors the 4-rung ladder in `MemberRow.svelte`. Callers that don't thread it
+ *  keep the original 3-rung behavior.
+ *
  *  Returns the BARE label (no leading '@'); the mention render template adds it. */
 export function resolveMentionLabel(
   ownerId: string,
   resolveNickname?: (id: string) => string | undefined,
   resolveCard?: (id: string) => { displayName: string } | undefined,
+  resolveRosterName?: (id: string) => string | undefined,
 ): string {
   return (
     nonEmpty(resolveNickname?.(ownerId)) ??
     nonEmpty(resolveCard?.(ownerId)?.displayName) ??
+    nonEmpty(resolveRosterName?.(ownerId)) ??
     ownerId.slice(0, 8)
   );
 }
@@ -60,11 +71,12 @@ const SELF_ADDRESS = 'self';
 /**
  * ZEB-839 — the author-label ladder for a feed `Message.sender`.
  *
- * Same ordering as {@link resolveMentionLabel} (nickname ► broadcast
- * profile-card name ► short hex) with two message-specific rungs: the `self`
- * sentinel short-circuits to the locally-known label, and a wire-supplied
- * `senderName` (channel messages carry one; DMs do not) sits just above the
- * hex fallback.
+ * Shares the {@link resolveMentionLabel} backbone (nickname ► broadcast
+ * profile-card name ► short hex) but carries two message-specific rungs in place
+ * of that ladder's community-roster rung (a DM peer has no community roster): the
+ * `self` sentinel short-circuits to the locally-known label, and a wire-supplied
+ * `senderName` (channel messages carry one; DMs do not) sits just above the hex
+ * fallback.
  *
  * Call this at RENDER time, never at message-arrival time — that is what lets
  * the label fill in as cards and nicknames arrive. DM authors deliberately

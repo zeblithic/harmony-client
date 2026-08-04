@@ -102,8 +102,13 @@ export function shiftTrackedSpans(
   return out;
 }
 
-/** Filter+rank the roster: case-insensitive substring on label; prefix matches
- *  first (stable partition); capped to `limit`. */
+/** Filter+rank the roster for the dropdown. Matches, in rank order:
+ *  (1) label prefix, (2) label substring, (3) owner-id hex prefix — ZEB-774, so
+ *  a peer still shown as raw hex (`@2e9a…`) is findable by the hex the user can
+ *  see, not just by a name that hasn't propagated yet. The partition is mutually
+ *  exclusive: a candidate matched by its label is never re-surfaced as a hex
+ *  match, so name matches keep their exact prior order and hex-only matches are
+ *  purely additive. Case-insensitive; capped to `limit`. */
 export function filterCandidates(
   candidates: MentionCandidate[],
   query: string,
@@ -111,10 +116,16 @@ export function filterCandidates(
 ): MentionCandidate[] {
   const q = query.trim().toLowerCase();
   if (q === '') return candidates.slice(0, limit);
-  const matches = candidates.filter((c) => c.label.toLowerCase().includes(q));
-  const prefix = matches.filter((c) => c.label.toLowerCase().startsWith(q));
-  const rest = matches.filter((c) => !c.label.toLowerCase().startsWith(q));
-  return [...prefix, ...rest].slice(0, limit);
+  const labelPrefix: MentionCandidate[] = [];
+  const labelSubstr: MentionCandidate[] = [];
+  const hexPrefix: MentionCandidate[] = [];
+  for (const c of candidates) {
+    const label = c.label.toLowerCase();
+    if (label.startsWith(q)) labelPrefix.push(c);
+    else if (label.includes(q)) labelSubstr.push(c);
+    else if (c.ownerId.toLowerCase().startsWith(q)) hexPrefix.push(c);
+  }
+  return [...labelPrefix, ...labelSubstr, ...hexPrefix].slice(0, limit);
 }
 
 /** Reconcile the textarea text + picks into the wire payload. Each pick owns the

@@ -156,6 +156,18 @@
     new Set<string>(navService.nodes.filter((n) => n.type === 'community').map((n) => n.id)),
   );
 
+  // ZEB-774: roster-DTO displayName resolver (list_community_members' displayName,
+  // ZEB-777) threaded into the shared mention ladder as the rung below the live
+  // card — so a peer the roster already named degrades to that name rather than
+  // raw hex while their profile card is still propagating. Same source the member
+  // panel uses (MemberRow's `member.displayName`). Recomputes with the roster;
+  // callers read it inside their own reactive contexts, so labels re-resolve as
+  // names arrive.
+  let rosterNameByOwner = $derived(new Map(members.map((m) => [m.address, m.displayName])));
+  function resolveRosterName(ownerId: string): string | undefined {
+    return rosterNameByOwner.get(ownerId) ?? undefined;
+  }
+
   // ZEB-612 S5 (CodeRabbit #443): memoized mention-candidate list shared by
   // the text feed and the townhall backchannel — recomputes only when the
   // member roster (or a resolver) changes, not on every re-render.
@@ -164,7 +176,7 @@
       .filter((m) => m.status === 'joined')
       .map((m) => ({
         ownerId: m.address,
-        label: resolveMentionLabel(m.address, resolveNickname, resolveCard),
+        label: resolveMentionLabel(m.address, resolveNickname, resolveCard, resolveRosterName),
       })),
   );
 
@@ -490,6 +502,7 @@
             {channelMessageService}
             {resolveCard}
             {resolveNickname}
+            {resolveRosterName}
             {onOpenCard}
             snapshotMessages={preForkSnapshot?.channelLog?.[activeChannel.channelId] ?? []}
             originalCommunityName={preForkSnapshot?.originalCommunityName ?? ''}
@@ -524,6 +537,7 @@
           forkReason={preForkSnapshot?.forkReason ?? null}
           {resolveCard}
           {resolveNickname}
+          {resolveRosterName}
           {onOpenCard}
           mentionCandidates={joinedMentionCandidates}
         />

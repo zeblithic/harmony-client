@@ -38,7 +38,15 @@
             onPick(c);
           }}
         >
-          {c.label}
+          <span class="label">{c.label}</span>
+          {#if c.label.toLowerCase() !== c.ownerId.slice(0, 8).toLowerCase()}
+            <!-- ZEB-774: surface the owner-id handle so a peer is findable by the
+                 hex the user can see, even before/without a resolved name. Hidden
+                 (case-insensitively, since the hex-prefix match is too) when the
+                 label already IS the short hex (unresolved row), to avoid a
+                 doubled "2e9a2151  2e9a2151". -->
+            <span class="hex-hint" data-testid="mention-hex-hint">{c.ownerId.slice(0, 8)}</span>
+          {/if}
         </button>
       </li>
     {/each}
@@ -63,7 +71,10 @@
     min-width: 12rem;
   }
   .option button {
-    display: block;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
     width: 100%;
     text-align: left;
     padding: 0.3rem 0.5rem;
@@ -74,9 +85,31 @@
     cursor: pointer;
     font: inherit;
   }
+  .option .label {
+    /* Consume the remaining row width and allow shrinking; without min-width: 0
+       a flex item's automatic minimum width keeps a long name from shrinking, so
+       the ellipsis never engages and the fixed hex-hint gets pushed out. */
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .hex-hint {
+    flex-shrink: 0;
+    color: var(--text-muted);
+    font-size: 0.8em;
+    font-variant-numeric: tabular-nums;
+  }
   .option.active button,
   .option button:hover {
     background: var(--accent);
     color: var(--on-accent);
+  }
+  /* On the active/hover row, keep the hint legible against the accent fill. */
+  .option.active button .hex-hint,
+  .option button:hover .hex-hint {
+    color: var(--on-accent);
+    opacity: 0.75;
   }
 </style>

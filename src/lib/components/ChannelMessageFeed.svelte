@@ -59,6 +59,10 @@
      *  precedence over the broadcast profile-card name on message authors,
      *  matching the members roster and the Friends panel. */
     resolveNickname,
+    /** ZEB-774: roster-DTO displayName resolver — the shared-ladder rung below
+     *  the live card, so an author (or inline mention) the roster already named
+     *  degrades to that name rather than raw hex while their card propagates. */
+    resolveRosterName,
     /** ZEB-341: open the owner_id card popover for a message author. */
     onOpenCard,
     /** ZEB-588: roster for the @-mention autocomplete — {ownerId, label} with
@@ -82,6 +86,7 @@
     votingAdapter?: VotingAdapter;
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
     resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveRosterName?: (ownerIdHex: string) => string | undefined;
     onOpenCard?: (
       payload: {
         ownerIdHex: string;
@@ -538,13 +543,15 @@
     return new Date(at.wallMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
-  // ZEB-432 label ladder (mirrors MemberRow / FriendsPanel): local friend
-  // nickname (ZEB-419) ► broadcast profile-card name (ZEB-341) ► truncated owner
-  // hex. Read through both resolvers so the reactive nickname map / card Map
-  // re-render the author label automatically.
+  // ZEB-432/ZEB-774 label ladder (mirrors MemberRow / FriendsPanel): local friend
+  // nickname (ZEB-419) ► broadcast profile-card name (ZEB-341) ► roster-DTO
+  // displayName (ZEB-774) ► truncated owner hex. Read through the resolvers so the
+  // reactive nickname map / card Map / roster re-render the author label
+  // automatically.
   function authorLabel(author: string): string {
-    // Shared ladder (ZEB-432/ZEB-588): nickname ► profile-card name ► hex.
-    return resolveMentionLabel(author, resolveNickname, resolveCard);
+    // Shared ladder (ZEB-432/ZEB-588/ZEB-774): nickname ► profile-card name ►
+    // roster name ► hex.
+    return resolveMentionLabel(author, resolveNickname, resolveCard, resolveRosterName);
   }
 
   // ZEB-536 — is the local member currently reacting with `emoji` on `msg`?
@@ -857,7 +864,8 @@
   });
 
   // ZEB-536 — comma-joined reactor labels for a chip tooltip, reusing the
-  // ZEB-432 author label ladder (nickname ► profile-card name ► short hex).
+  // ZEB-432/ZEB-774 author label ladder (nickname ► profile-card name ► roster
+  // name ► short hex).
   function reactorNames(reactors: string[]): string {
     return reactors.map((addr) => authorLabel(addr)).join(', ');
   }
@@ -939,7 +947,7 @@
           </div>
           <div class="content-col">
             <header class="msg-meta">
-              <!-- ZEB-341/ZEB-432: nickname ► profile-card name ► hex (authorLabel). -->
+              <!-- ZEB-341/ZEB-432/ZEB-774: nickname ► profile-card name ► roster name ► hex (authorLabel). -->
               {#if onOpenCard}
                 <button
                   type="button"
@@ -969,7 +977,7 @@
               <p class="body">{#each tokenizeBody(bodyToText(msg.body)) as seg}{#if seg.type === 'mention'}<span
                     class="mention"
                     class:self={seg.ownerId === ownAddress}
-                    data-testid="mention">@{resolveMentionLabel(seg.ownerId, resolveNickname, resolveCard)}</span>{:else}{seg.text}{/if}{/each}</p>
+                    data-testid="mention">@{resolveMentionLabel(seg.ownerId, resolveNickname, resolveCard, resolveRosterName)}</span>{:else}{seg.text}{/if}{/each}</p>
             {/if}
             {#if msg.attachments && msg.attachments.length > 0}
               <MessageAttachments

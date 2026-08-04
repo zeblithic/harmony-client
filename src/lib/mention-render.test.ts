@@ -66,4 +66,23 @@ describe('resolveMentionLabel', () => {
     expect(resolveMentionLabel(ID_A, () => '  ', () => ({ displayName: '' }))).toBe('aaaaaaaa');
     expect(resolveMentionLabel(ID_A, () => '   ', () => ({ displayName: 'Real' }))).toBe('Real');
   });
+
+  // ZEB-774: roster-DTO displayName rung, between the live card and short hex.
+  const roster = (id: string) => (id === ID_B ? 'RosterB' : undefined);
+
+  it('falls back to the roster-DTO name when nickname and card are absent', () => {
+    expect(resolveMentionLabel(ID_B, undefined, undefined, roster)).toBe('RosterB');
+  });
+
+  it('prefers nickname and card over the roster-DTO name', () => {
+    // ID_A has a nickname (NickA) and a card (CardA); the roster rung must lose.
+    expect(resolveMentionLabel(ID_A, nick, card, () => 'RosterA')).toBe('NickA');
+    // A card but no nickname: card still wins over roster.
+    expect(resolveMentionLabel(ID_B, undefined, card, () => 'RosterB')).toBe('CardB');
+  });
+
+  it('falls back to short hex when the roster name is also absent/blank', () => {
+    expect(resolveMentionLabel(ID_A, undefined, undefined, () => undefined)).toBe('aaaaaaaa');
+    expect(resolveMentionLabel(ID_A, undefined, undefined, () => '  ')).toBe('aaaaaaaa');
+  });
 });
