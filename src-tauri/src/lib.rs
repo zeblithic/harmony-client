@@ -30798,6 +30798,7 @@ fn parse_channel_kind(
 fn channel_info_dto(
     channel_id: &crate::community_membership::ChannelId,
     info: &crate::community_membership::ChannelInfo,
+    syncing: bool,
 ) -> ChannelInfoDto {
     ChannelInfoDto {
         channel_id: hex::encode(channel_id.0),
@@ -30810,6 +30811,7 @@ fn channel_info_dto(
         },
         created_at: info.created_at.clone(),
         deleted_at: info.deleted_at.clone(),
+        syncing,
     }
 }
 
@@ -31794,7 +31796,7 @@ pub(crate) async fn list_channels_impl(
     let mut rows: Vec<ChannelInfoDto> = materialized
         .channels
         .iter()
-        .map(|(channel_id, info)| channel_info_dto(channel_id, info))
+        .map(|(channel_id, info)| channel_info_dto(channel_id, info, false))
         .collect();
     // Sort by created_at ascending so #general (auto-created first in
     // Task 7's create_community extension) is always at the top of the
@@ -50645,6 +50647,14 @@ pub struct ChannelInfoDto {
     pub created_at: crate::owner_state_types::Hlc,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<crate::owner_state_types::Hlc>,
+    /// ZEB-776: true when this channel is known only from the invite's
+    /// epoch_snapshot bootstrap hint and has not yet been confirmed by a real
+    /// ChannelCreate CRDT event (the community root-fetch hasn't landed the
+    /// admin's channel config yet). Flips to false on convergence. Always
+    /// emitted so JS and scripted (RPC/api) callers get an unambiguous
+    /// "still converging" signal instead of inferring it from an empty list
+    /// plus a raw "no engine" error.
+    pub syncing: bool,
 }
 
 /// Action discriminator for a `channel-config-updated` Tauri event.
@@ -73859,12 +73869,15 @@ mod create_channel_delta_tests {
             created_at,
             deleted_at: None,
         };
-        let dto_voice = channel_info_dto(&ChannelId([0x42; 16]), &voice);
-        let dto_text = channel_info_dto(&ChannelId([0x43; 16]), &text);
-        let dto_townhall = channel_info_dto(&ChannelId([0x44; 16]), &townhall);
+        let dto_voice = channel_info_dto(&ChannelId([0x42; 16]), &voice, false);
+        let dto_text = channel_info_dto(&ChannelId([0x43; 16]), &text, true);
+        let dto_townhall = channel_info_dto(&ChannelId([0x44; 16]), &townhall, false);
         assert_eq!(dto_voice.kind, "voice");
         assert_eq!(dto_text.kind, "text");
         assert_eq!(dto_townhall.kind, "townhall");
+        assert!(!dto_voice.syncing);
+        assert!(dto_text.syncing, "syncing arg must map onto the DTO field");
+        assert!(!dto_townhall.syncing);
 
         // Always emitted (not skipped): the serialized JSON carries `kind`.
         let json = serde_json::to_value(&dto_text).expect("serialize dto");
