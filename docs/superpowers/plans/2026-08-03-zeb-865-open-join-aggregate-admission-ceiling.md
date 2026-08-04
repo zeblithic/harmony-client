@@ -88,8 +88,8 @@ Expected: PASS.
 
 - [ ] **Step 5: Clippy the touched crate + commit**
 
-Run: `cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings 2>&1 | tail -5 && cargo fmt --all`
-Expected: no warnings; fmt clean.
+Run: `cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings && cargo fmt --all`
+Expected: no warnings; fmt clean. (No `| tail` on the clippy command — a pipe would mask its exit status so `&& cargo fmt` could run after a clippy failure.)
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client && git add src-tauri/src/friend_intro.rs && git commit -m "ZEB-865: add KeyedSlidingWindow::would_admit non-mutating peek
@@ -114,7 +114,7 @@ Claude-Session: https://claude.ai/code/session_01DUvg7gyEHqXrVU85Eg2D8D"
 - Produces:
   - `pub const OPEN_JOIN_GLOBAL_ADMIT_MAX: usize = 1024;`
   - `OpenJoinReject::NodeCapacity` (unit variant).
-  - `pub fn OpenJoinRateLimiter::with_caps(per_source_max: usize, global_max: usize, window_ms: u64) -> Self`
+  - `pub fn OpenJoinRateLimiter::with_caps(per_source_max: usize, global_max: usize) -> Self` (window fixed at `OPEN_JOIN_RATE_LIMIT_WINDOW_MS` — see Step 3d)
   - `fn admit_source(&mut self, source: [u8; 32], nonce: &[u8; 16], limiter_now_ms: u64) -> Result<(), OpenJoinReject>`
 
 - [ ] **Step 1: Write the failing tests**
@@ -127,7 +127,7 @@ Add these to the `#[cfg(test)] mod tests` block in `src-tauri/src/open_join_admi
     /// each admit once (global cap 3 fills), a fourth is shed NodeCapacity.
     #[test]
     fn global_ceiling_bounds_aggregate_across_distinct_sources() {
-        let mut rl = OpenJoinRateLimiter::with_caps(20, 3, 60_000);
+        let mut rl = OpenJoinRateLimiter::with_caps(20, 3);
         let now = 0u64;
         for i in 0..3u8 {
             assert_eq!(
@@ -148,7 +148,7 @@ Add these to the `#[cfg(test)] mod tests` block in `src-tauri/src/open_join_admi
     /// (not NodeCapacity), and a different source still admits.
     #[test]
     fn global_ceiling_does_not_relock_single_source() {
-        let mut rl = OpenJoinRateLimiter::with_caps(20, 1024, 60_000);
+        let mut rl = OpenJoinRateLimiter::with_caps(20, 1024);
         let a = [0xAA; 32];
         let now = 0u64;
         for i in 0..20u8 {
@@ -173,7 +173,7 @@ Add these to the `#[cfg(test)] mod tests` block in `src-tauri/src/open_join_admi
     /// drained the ceiling would leave only 5 (30 - 25).
     #[test]
     fn single_source_shed_does_not_drain_global_ceiling() {
-        let mut rl = OpenJoinRateLimiter::with_caps(20, 30, 60_000);
+        let mut rl = OpenJoinRateLimiter::with_caps(20, 30);
         let a = [0xAA; 32];
         let now = 0u64;
         for i in 0..20u8 {
@@ -205,7 +205,7 @@ Add these to the `#[cfg(test)] mod tests` block in `src-tauri/src/open_join_admi
     /// resume.
     #[test]
     fn global_ceiling_keys_on_monotonic_clock() {
-        let mut rl = OpenJoinRateLimiter::with_caps(20, 2, 60_000);
+        let mut rl = OpenJoinRateLimiter::with_caps(20, 2);
         for i in 0..2u8 {
             assert_eq!(rl.admit_source([i; 32], &[i; 16], 0), Ok(()));
         }
@@ -230,7 +230,6 @@ Add these to the `#[cfg(test)] mod tests` block in `src-tauri/src/open_join_admi
         let mut lim = OpenJoinRateLimiter::with_caps(
             OPEN_JOIN_RATE_LIMIT_PER_WINDOW,
             1, // global cap 1 → the second distinct source is ceiling-shed
-            OPEN_JOIN_RATE_LIMIT_WINDOW_MS,
         );
         let src_a = [0x01; 32];
         let src_b = [0x02; 32];
@@ -340,19 +339,19 @@ with:
     /// Fresh limiter with production caps, its monotonic epoch anchored now.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self::with_caps(
-            OPEN_JOIN_RATE_LIMIT_PER_WINDOW,
-            OPEN_JOIN_GLOBAL_ADMIT_MAX,
-            OPEN_JOIN_RATE_LIMIT_WINDOW_MS,
-        )
+        Self::with_caps(OPEN_JOIN_RATE_LIMIT_PER_WINDOW, OPEN_JOIN_GLOBAL_ADMIT_MAX)
     }
 
-    /// Test/tuning constructor — deterministic tiny caps for the per-source and
-    /// aggregate windows (mirrors [`OpenJoinConnLimiter::with_caps`]).
-    pub fn with_caps(per_source_max: usize, global_max: usize, window_ms: u64) -> Self {
+    /// Test/tuning constructor — deterministic tiny CAPS for the per-source and
+    /// aggregate windows. The window itself is NOT a parameter: both windows AND
+    /// the nonce-replay horizon in `is_replay` (defined as 4× the window) share
+    /// the single protocol constant `OPEN_JOIN_RATE_LIMIT_WINDOW_MS`. Exposing
+    /// `window_ms` would let a caller desync replay retention from the admission
+    /// window (Qodo, PR #596) — so only the caps vary.
+    pub fn with_caps(per_source_max: usize, global_max: usize) -> Self {
         Self {
-            windows: KeyedSlidingWindow::new(per_source_max, window_ms),
-            global: KeyedSlidingWindow::new(global_max, window_ms),
+            windows: KeyedSlidingWindow::new(per_source_max, OPEN_JOIN_RATE_LIMIT_WINDOW_MS),
+            global: KeyedSlidingWindow::new(global_max, OPEN_JOIN_RATE_LIMIT_WINDOW_MS),
             seen_nonces: HashSet::new(),
             nonce_seen_at: HashMap::new(),
             epoch: tokio::time::Instant::now(),
@@ -445,8 +444,8 @@ Expected: PASS — the whole `open_join_admit::tests` module: the 5 new tests pl
 
 - [ ] **Step 5: Clippy `--all-targets` + fmt + commit**
 
-Run: `cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings 2>&1 | tail -5 && cargo fmt --all -- --check`
-Expected: no warnings; fmt clean. (If fmt reports diffs, run `cargo fmt --all` and re-stage.)
+Run: `cd /Users/zeblith/work/zeblithic/harmony-client/src-tauri && cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings && cargo fmt --all -- --check`
+Expected: no warnings; fmt clean. (No `| tail` on the clippy command — a pipe would mask its exit status. If fmt reports diffs, run `cargo fmt --all` and re-stage.)
 
 ```bash
 cd /Users/zeblith/work/zeblithic/harmony-client && git add src-tauri/src/open_join_admit.rs && git commit -m "ZEB-865: node-wide aggregate open-join admission ceiling (1024/60s)

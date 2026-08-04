@@ -135,19 +135,20 @@ fn record_global(&mut self, limiter_now_ms: u64) {
 Mirror `OpenJoinConnLimiter`: `new()` uses production consts; `with_caps`
 injects tiny caps for deterministic tests.
 
+The window is **not** a `with_caps` parameter: both windows and the nonce-replay
+horizon in `is_replay` (defined as 4× the window) share the single protocol
+constant `OPEN_JOIN_RATE_LIMIT_WINDOW_MS`. Exposing `window_ms` would let a caller
+desync replay retention from the admission window, so only the caps vary.
+
 ```rust
 pub fn new() -> Self {
-    Self::with_caps(
-        OPEN_JOIN_RATE_LIMIT_PER_WINDOW,
-        OPEN_JOIN_GLOBAL_ADMIT_MAX,
-        OPEN_JOIN_RATE_LIMIT_WINDOW_MS,
-    )
+    Self::with_caps(OPEN_JOIN_RATE_LIMIT_PER_WINDOW, OPEN_JOIN_GLOBAL_ADMIT_MAX)
 }
 
-pub fn with_caps(per_source_max: usize, global_max: usize, window_ms: u64) -> Self {
+pub fn with_caps(per_source_max: usize, global_max: usize) -> Self {
     Self {
-        windows: KeyedSlidingWindow::new(per_source_max, window_ms),
-        global: KeyedSlidingWindow::new(global_max, window_ms),
+        windows: KeyedSlidingWindow::new(per_source_max, OPEN_JOIN_RATE_LIMIT_WINDOW_MS),
+        global: KeyedSlidingWindow::new(global_max, OPEN_JOIN_RATE_LIMIT_WINDOW_MS),
         seen_nonces: HashSet::new(),
         nonce_seen_at: HashMap::new(),
         epoch: tokio::time::Instant::now(),
@@ -247,7 +248,7 @@ has already proven capability to reach this layer.
 
 **`open_join_admit.rs` (direct limiter methods — cheap, no crypto):**
 
-1. `global_ceiling_bounds_aggregate_across_sources` — `with_caps(20, 3, 60_000)`:
+1. `global_ceiling_bounds_aggregate_across_sources` — `with_caps(20, 3)`:
    three *distinct* sources each admit once (fills the ceiling), a fourth
    distinct source that is well within its own per-source budget is shed
    `NodeCapacity`. Proves the aggregate bound and that it sheds under-budget
@@ -256,7 +257,7 @@ has already proven capability to reach this layer.
    fills its own 20/60 s → `RateLimited` (not `NodeCapacity`); source B still
    admits. No regression of B7's anti-lockout property.
 3. `single_source_shed_does_not_drain_global_ceiling` — the discriminating test:
-   `with_caps(20, 30, 60_000)`, source A makes 25 attempts (20 admit + 5 shed
+   `with_caps(20, 30)`, source A makes 25 attempts (20 admit + 5 shed
    `RateLimited`). Correct behavior: A consumed exactly 20 global tokens (its
    admits, not its sheds), so exactly **10** further distinct sources admit and
    the 11th is `NodeCapacity`. A bug where per-source sheds drained the ceiling
@@ -270,7 +271,7 @@ has already proven capability to reach this layer.
 
 **`friend_intro.rs`:**
 
-6. `keyed_sliding_window_would_admit_does_not_record` — `would_admit` returns the
+1. `keyed_sliding_window_would_admit_does_not_record` — `would_admit` returns the
    same result on repeated calls and never advances the count; a following
    `admit` still succeeds; a full window's `would_admit` returns false; a
    zero-cap window's `would_admit` returns false.

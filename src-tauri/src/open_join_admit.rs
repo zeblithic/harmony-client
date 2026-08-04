@@ -156,19 +156,19 @@ impl OpenJoinRateLimiter {
     /// Fresh limiter with production caps, its monotonic epoch anchored now.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self::with_caps(
-            OPEN_JOIN_RATE_LIMIT_PER_WINDOW,
-            OPEN_JOIN_GLOBAL_ADMIT_MAX,
-            OPEN_JOIN_RATE_LIMIT_WINDOW_MS,
-        )
+        Self::with_caps(OPEN_JOIN_RATE_LIMIT_PER_WINDOW, OPEN_JOIN_GLOBAL_ADMIT_MAX)
     }
 
-    /// Test/tuning constructor — deterministic tiny caps for the per-source and
-    /// aggregate windows (mirrors [`OpenJoinConnLimiter::with_caps`]).
-    pub fn with_caps(per_source_max: usize, global_max: usize, window_ms: u64) -> Self {
+    /// Test/tuning constructor — deterministic tiny CAPS for the per-source and
+    /// aggregate windows. The window itself is NOT a parameter: both windows AND
+    /// the nonce-replay horizon in `is_replay` (defined as 4× the window) share
+    /// the single protocol constant [`OPEN_JOIN_RATE_LIMIT_WINDOW_MS`]. Exposing
+    /// `window_ms` here would let a caller desync replay retention from the
+    /// admission window (Qodo, PR #596) — so only the caps vary.
+    pub fn with_caps(per_source_max: usize, global_max: usize) -> Self {
         Self {
-            windows: KeyedSlidingWindow::new(per_source_max, window_ms),
-            global: KeyedSlidingWindow::new(global_max, window_ms),
+            windows: KeyedSlidingWindow::new(per_source_max, OPEN_JOIN_RATE_LIMIT_WINDOW_MS),
+            global: KeyedSlidingWindow::new(global_max, OPEN_JOIN_RATE_LIMIT_WINDOW_MS),
             seen_nonces: HashSet::new(),
             nonce_seen_at: HashMap::new(),
             epoch: tokio::time::Instant::now(),
@@ -1254,7 +1254,7 @@ mod tests {
     /// each admit once (global cap 3 fills), a fourth is shed NodeCapacity.
     #[test]
     fn global_ceiling_bounds_aggregate_across_distinct_sources() {
-        let mut rl = OpenJoinRateLimiter::with_caps(20, 3, 60_000);
+        let mut rl = OpenJoinRateLimiter::with_caps(20, 3);
         let now = 0u64;
         for i in 0..3u8 {
             assert_eq!(
@@ -1275,7 +1275,7 @@ mod tests {
     /// (not NodeCapacity), and a different source still admits.
     #[test]
     fn global_ceiling_does_not_relock_single_source() {
-        let mut rl = OpenJoinRateLimiter::with_caps(20, 1024, 60_000);
+        let mut rl = OpenJoinRateLimiter::with_caps(20, 1024);
         let a = [0xAA; 32];
         let now = 0u64;
         for i in 0..20u8 {
@@ -1300,7 +1300,7 @@ mod tests {
     /// drained the ceiling would leave only 5 (30 - 25).
     #[test]
     fn single_source_shed_does_not_drain_global_ceiling() {
-        let mut rl = OpenJoinRateLimiter::with_caps(20, 30, 60_000);
+        let mut rl = OpenJoinRateLimiter::with_caps(20, 30);
         let a = [0xAA; 32];
         let now = 0u64;
         for i in 0..20u8 {
@@ -1332,7 +1332,7 @@ mod tests {
     /// resume.
     #[test]
     fn global_ceiling_keys_on_monotonic_clock() {
-        let mut rl = OpenJoinRateLimiter::with_caps(20, 2, 60_000);
+        let mut rl = OpenJoinRateLimiter::with_caps(20, 2);
         for i in 0..2u8 {
             assert_eq!(rl.admit_source([i; 32], &[i; 16], 0), Ok(()));
         }
@@ -1357,7 +1357,6 @@ mod tests {
         let mut lim = OpenJoinRateLimiter::with_caps(
             OPEN_JOIN_RATE_LIMIT_PER_WINDOW,
             1, // global cap 1 → the second distinct source is ceiling-shed
-            OPEN_JOIN_RATE_LIMIT_WINDOW_MS,
         );
         let src_a = [0x01; 32];
         let src_b = [0x02; 32];
