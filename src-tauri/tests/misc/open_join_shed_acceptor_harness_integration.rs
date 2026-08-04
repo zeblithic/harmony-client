@@ -44,6 +44,7 @@
 //! `ConnectionShed`→close mapping end-to-end is tracked separately (ZEB-870).
 
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -312,16 +313,38 @@ async fn open_join_permissive_limiter_reaches_length_prefix_read() {
 // yield "zero response bytes", but via different code and with a different
 // close discipline, which the two tests pin distinctly.
 
-/// A no-op dispatcher for the friend / friend-PEX slots this harness never
-/// routes to (the dialer always negotiates `HARMONY_HANDSHAKE_V1`, which
-/// `route_handshake_alpn` maps to the invite slot). Present only to satisfy the
-/// multiplexer's three-arm constructor; if one were ever reached it drops the
-/// connection.
+/// A no-op inner dispatcher used behind a `RecordingDispatcher` on the friend /
+/// friend-PEX slots this harness never routes to (the dialer always negotiates
+/// `HARMONY_HANDSHAKE_V1`, which `route_handshake_alpn` maps to the invite
+/// slot). Present only to satisfy the multiplexer's three-arm constructor; if
+/// one were ever reached it drops the connection — which is exactly why the
+/// wrapping `RecordingDispatcher` is needed: a bare drop yields the same
+/// zero-byte outcome as a legitimate shed, so a routing regression could
+/// otherwise pass silently.
 struct NoopDispatcher;
 
 #[async_trait::async_trait]
 impl IrohHandshakeDispatcher for NoopDispatcher {
     async fn handle_connection(&self, _conn: Connection) {}
+}
+
+/// Wraps an inner dispatcher and records — via a shared flag — whether the
+/// multiplexer ever routed a connection to it, then delegates. Lets a test
+/// assert WHICH ALPN route was actually taken. Without this, a misroute to a
+/// connection-dropping stub produces the same zero response bytes as a genuine
+/// shed, so an ALPN-routing regression would slip past a bare zero-byte
+/// assertion.
+struct RecordingDispatcher {
+    entered: Arc<AtomicBool>,
+    inner: Arc<dyn IrohHandshakeDispatcher>,
+}
+
+#[async_trait::async_trait]
+impl IrohHandshakeDispatcher for RecordingDispatcher {
+    async fn handle_connection(&self, conn: Connection) {
+        self.entered.store(true, Ordering::SeqCst);
+        self.inner.handle_connection(conn).await;
+    }
 }
 
 /// An inner dispatcher that signals the moment a connection reaches it — i.e.
@@ -364,6 +387,14 @@ fn dialable_addr(server_ep: &Endpoint) -> EndpointAddr {
 /// pair, with the test as the dialer using the same partial-stream shape as the
 /// direct-drive harness above (open bi, write a 1-byte stub, finish). Returns
 /// the number of response DATA bytes the dialer received (0 for a shed).
+///
+/// A shed drops the acceptor's `accept_bi` streams, which resets/closes the
+/// dialer's stream PROMPTLY — so the dialer read must resolve to reset/EOF, not
+/// a timeout. A timeout is treated as a FAILURE (panic): it would mean the
+/// server neither wrote nor tore down the stream, i.e. no server-initiated shed
+/// was observed. This check runs BEFORE the dialer closes the connection, so a
+/// hung / misrouted / non-responsive dispatcher cannot be "released" by the
+/// test's own cleanup and still satisfy the zero-byte assertion.
 async fn drive_via_dispatcher(dispatcher: Arc<MultiplexHandshakeDispatcher>) -> usize {
     let server_ep = loopback_endpoint().await;
     let client_ep = loopback_endpoint().await;
@@ -394,14 +425,18 @@ async fn drive_via_dispatcher(dispatcher: Arc<MultiplexHandshakeDispatcher>) -> 
 
     let mut buf = [0u8; 64];
     let data_len = match tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await {
-        Ok(Ok(Some(n))) => n,
-        Ok(Ok(None)) => 0,    // clean EOF
-        Ok(Err(_reset)) => 0, // stream reset — no data
-        Err(_elapsed) => 0,   // nothing arrived within the bound
+        Ok(Ok(Some(n))) => n, // server wrote bytes — a shed must NOT (caller asserts == 0)
+        Ok(Ok(None)) => 0,    // clean EOF — server closed the stream (shed observed)
+        Ok(Err(_reset)) => 0, // stream reset — server dropped the stream (shed observed)
+        Err(_elapsed) => panic!(
+            // no reset/EOF within the bound → no server-initiated shed
+            "dialer read timed out: the server neither wrote nor reset/closed the stream \
+             within 3s — a hung or misrouted dispatcher must not pass as a zero-byte shed"
+        ),
     };
 
-    // Tier-1 shed leaves the close to the dialer (the acceptor only waits on
-    // `conn.closed()`), so drive it here to let the server task complete.
+    // The server has already torn down its stream (observed above); now close
+    // from the dialer so the acceptor's `conn.closed()` wait completes.
     conn.close(0u32.into(), b"zeb870-done");
     server_task.await.expect("server task join");
     data_len
@@ -422,17 +457,42 @@ async fn dispatcher_tier1_shed_writes_zero_bytes() {
     warm_up_iroh_global_init().await;
     tokio::time::timeout(Duration::from_secs(60), async {
         let (invite, _dir) = build_acceptor(OpenJoinConnLimiter::with_caps(0, 60_000));
+        // Record which route the multiplexer actually takes: the invite acceptor
+        // MUST be entered and the friend / friend-PEX routes MUST NOT be — else a
+        // routing regression that drops the connection on a wrong route would
+        // also yield zero bytes and pass (CodeAnt).
+        let invite_entered = Arc::new(AtomicBool::new(false));
+        let misrouted = Arc::new(AtomicBool::new(false));
         // Production gate caps (via `new`) so the gate ADMITS the single
         // connection and the Tier-1 shed — not the gate — is what fires.
         let dispatcher = Arc::new(MultiplexHandshakeDispatcher::new(
-            invite,
-            Arc::new(NoopDispatcher),
-            Arc::new(NoopDispatcher),
+            Arc::new(RecordingDispatcher {
+                entered: Arc::clone(&invite_entered),
+                inner: invite,
+            }),
+            Arc::new(RecordingDispatcher {
+                entered: Arc::clone(&misrouted),
+                inner: Arc::new(NoopDispatcher),
+            }),
+            Arc::new(RecordingDispatcher {
+                entered: Arc::clone(&misrouted),
+                inner: Arc::new(NoopDispatcher),
+            }),
         ));
+        // `drive_via_dispatcher` panics if the dialer never observes a
+        // server-initiated stream teardown (no shed → not a passing zero).
         let data_len = drive_via_dispatcher(dispatcher).await;
         assert_eq!(
             data_len, 0,
             "a Tier-1 shed routed through the dispatcher must write zero response bytes"
+        );
+        assert!(
+            invite_entered.load(Ordering::SeqCst),
+            "HARMONY_HANDSHAKE_V1 must route to the invite acceptor (the Tier-1 shed path)"
+        );
+        assert!(
+            !misrouted.load(Ordering::SeqCst),
+            "no connection may reach the friend / friend-PEX routes"
         );
     })
     .await
@@ -510,15 +570,22 @@ async fn dispatcher_inflight_gate_shed_closes_with_reason_zero_bytes() {
             .connect(server_addr.clone(), alpn::HARMONY_HANDSHAKE_V1)
             .await
             .expect("B: dial");
-        let (mut send_b, mut recv_b) = conn_b.open_bi().await.expect("B: open_bi");
-        let _ = send_b.write_all(&[0u8]).await;
-        let _ = send_b.finish();
-        let mut buf = [0u8; 64];
-        let data_len =
-            match tokio::time::timeout(Duration::from_secs(3), recv_b.read(&mut buf)).await {
-                Ok(Ok(Some(n))) => n,
-                _ => 0,
-            };
+        // The gate may close conn_b BEFORE or AFTER `open_bi()` resolves; an
+        // already-closed connection makes `open_bi()` return Err. Treat that as
+        // the zero-byte case rather than panicking (CodeRabbit/Qodo) — the
+        // discriminating check is the close reason asserted just below.
+        let data_len = match conn_b.open_bi().await {
+            Ok((mut send_b, mut recv_b)) => {
+                let _ = send_b.write_all(&[0u8]).await;
+                let _ = send_b.finish();
+                let mut buf = [0u8; 64];
+                match tokio::time::timeout(Duration::from_secs(3), recv_b.read(&mut buf)).await {
+                    Ok(Ok(Some(n))) => n,
+                    _ => 0,
+                }
+            }
+            Err(_closed) => 0, // gate closed the connection before a stream opened
+        };
         assert_eq!(
             data_len, 0,
             "in-flight-gate shed must write zero response bytes"
