@@ -406,15 +406,28 @@ impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for MultiplexHandshake
                 called: AtomicBool::new(false),
             })
         };
-        let mux = MultiplexHandshakeDispatcher::with_gate_caps(stub(), stub(), stub(), 2, 100);
+        // Distinct caps (per_source=2, global=3) so a swapped-argument bug in
+        // with_gate_caps is detectable: both limits are exercised separately.
+        let mux = MultiplexHandshakeDispatcher::with_gate_caps(stub(), stub(), stub(), 2, 3);
         let gate = mux.gate_for_test();
-        let mut key = [0u8; 32];
-        key[0] = 7;
-        let _g1 = gate.try_acquire(key).expect("1st admits");
-        let _g2 = gate.try_acquire(key).expect("2nd admits (at per-source cap)");
+        let key = |n: u8| {
+            let mut k = [0u8; 32];
+            k[0] = n;
+            k
+        };
+        let _a1 = gate.try_acquire(key(1)).expect("A 1st admits");
+        let _a2 = gate.try_acquire(key(1)).expect("A 2nd admits (at per-source cap 2)");
         assert!(
-            gate.try_acquire(key).is_none(),
-            "the dispatcher's gate enforces the per-source cap it was constructed with"
+            gate.try_acquire(key(1)).is_none(),
+            "A 3rd shed by the per-source cap (=2)"
+        );
+        // A distinct source still admits (anti-lockout) and takes global to 3/3…
+        let _b1 = gate.try_acquire(key(2)).expect("B admits — distinct source, global now 3/3");
+        // …so a further distinct source is shed by the GLOBAL cap (=3), proving
+        // the second argument is wired as the global limit, not the per-source one.
+        assert!(
+            gate.try_acquire(key(3)).is_none(),
+            "C shed by the global cap (=3) despite being a brand-new source"
         );
     }
 ```
@@ -427,12 +440,14 @@ Expected: the new `multiplex_dispatcher_gate_enforces_configured_caps` + existin
 - [ ] **Step 7: Full CI-parity gate (authoritative — the gate is now wired, no dead-code).**
 
 Run each, reading each command's own exit (no pipes):
+
 ```bash
 cd src-tauri
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 cargo nextest run --locked --workspace --all-targets --features test-fixtures
 ```
+
 Expected: fmt clean; clippy clean (`-D warnings`); full suite green (baseline 5626 + this branch's new tests; 0 failures).
 
 - [ ] **Step 8: Commit.**
