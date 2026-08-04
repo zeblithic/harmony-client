@@ -1883,14 +1883,15 @@ impl NodeState {
         }
     }
 
-    /// ZEB-828: abort the background *driver* task handles and clear their
-    /// slots in one place. Called from BOTH `stop_inner` and the identity-
-    /// rebuild path inside `start_node` — extracting prevents the two sites
-    /// from drifting, which is the exact bug this fixes: the rebuild path
-    /// aborted only the publisher and silently leaked the other five as
-    /// *detached* tasks (dropping a `JoinHandle` detaches, it does not abort),
-    /// which then ticked forever against a dead node generation, pinning the
-    /// retired registry/resolver/pkarr `Arc`s.
+    /// ZEB-828: abort the background *driver* task handles, clear their slots,
+    /// and drop the companion Arcs/Notify those drivers own — all in one place.
+    /// Called from BOTH `stop_inner` and the identity-rebuild path inside
+    /// `start_node` — extracting prevents the two sites from drifting, which is
+    /// the exact bug this fixes: the rebuild path aborted only the publisher and
+    /// silently leaked the other five as *detached* tasks (dropping a
+    /// `JoinHandle` detaches, it does not abort), which then ticked forever
+    /// against a dead node generation, pinning the retired registry/resolver/
+    /// pkarr `Arc`s.
     ///
     /// These six are the plain-`Option<JoinHandle>` drivers whose spawn sites
     /// do a bare `field = opt.take()` with NO abort-of-prior, so they depend
@@ -1930,6 +1931,18 @@ impl NodeState {
         if let Some(h) = self.gateway_dial_driver_handle.take() {
             h.abort();
         }
+        // Drop the companion Arcs/Notify these drivers own so NEITHER teardown
+        // path leaves retired driver state reachable. A restart rebuilds fresh
+        // ones; a FAILED rebuild — which returns before the new-generation
+        // install block runs — leaves clean `None`s instead of stale Arcs that
+        // an in-flight IPC could still read (the retired vine-pull driver /
+        // wake, the retired relay resolver / publisher-force notify). `stop_inner`
+        // nulled these inline; folding them in keeps the rebuild path from
+        // drifting on the companion state, not just the handle aborts.
+        self.community_relay_resolver = None;
+        self.community_relay_publisher_force = None;
+        self.vine_pull_wake = None;
+        self.vine_pull_driver = None;
     }
 
     /// ZEB-311: test-only helper to set dm_self_owner for integration tests
@@ -2890,18 +2903,12 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         relay_optin_sync_for_shutdown = guard.relay_optin_sync.take();
         guard.relay_optin_doc = None;
         guard.relay_optin_tracker = None;
-        guard.community_relay_resolver = None;
-        guard.community_relay_publisher_force = None;
-        // ZEB-828: abort the six background driver task handles (publisher,
-        // pull driver, GC, refresher, vine-pull, gateway-dial) via the shared
-        // helper — each take+abort is a correct no-op until its spawn site
-        // populates the slot. Extracting this list keeps the stop path and the
-        // start_node identity-rebuild teardown from drifting.
+        // ZEB-828: abort the six background driver task handles and drop their
+        // companion Arcs (relay resolver / publisher-force, vine-pull wake /
+        // driver) via the shared helper — each take+abort is a correct no-op
+        // until its spawn site populates the slot. Sharing this list with the
+        // start_node identity-rebuild teardown keeps the two paths from drifting.
         guard.clear_driver_handles();
-        // ZEB-811 Task 8/9: drop the vine-pull wake + driver Arcs so a restart
-        // rebuilds fresh ones alongside the handle aborted above.
-        guard.vine_pull_wake = None;
-        guard.vine_pull_driver = None;
         // ZEB-321 Phase 1 Task 8: clear iroh handles so a restart re-binds
         // cleanly. The endpoint Arc drops here — the link manager's
         // accept loop ends when the endpoint shuts down naturally on its
@@ -78007,6 +78014,12 @@ mod start_node_race_tests {
             g.community_relay_refresher_handle = Some(handles.remove(0));
             g.vine_pull_driver_handle = Some(handles.remove(0));
             g.gateway_dial_driver_handle = Some(handles.remove(0));
+            // ZEB-828 (CodeAnt finding): the helper must also drop the companion
+            // Arcs these drivers own, so a failed rebuild can't leave retired
+            // driver state reachable. Seed the two cheaply-constructible ones.
+            g.vine_pull_wake = Some(std::sync::Arc::new(tokio::sync::Notify::new()));
+            g.community_relay_publisher_force =
+                Some(std::sync::Arc::new(tokio::sync::Notify::new()));
         }
 
         // Ensure every task has been polled to its await point so its DropFlag
@@ -78032,6 +78045,9 @@ mod start_node_race_tests {
             assert!(g.community_relay_refresher_handle.is_none());
             assert!(g.vine_pull_driver_handle.is_none());
             assert!(g.gateway_dial_driver_handle.is_none());
+            // Companion Arcs cleared too (ZEB-828 / CodeAnt).
+            assert!(g.vine_pull_wake.is_none());
+            assert!(g.community_relay_publisher_force.is_none());
         }
 
         // The aborts cancel + drop each task's future → each DropFlag fires.
