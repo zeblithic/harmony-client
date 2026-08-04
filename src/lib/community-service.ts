@@ -109,6 +109,11 @@ export interface ChannelInfo {
   kind: 'text' | 'voice' | 'townhall';
   createdAt: { wallMs: number; logical: number; deviceId: string };
   deletedAt?: { wallMs: number; logical: number; deviceId: string };
+  /** ZEB-776: true while this channel is known only from the invite's
+   *  epoch_snapshot (not yet confirmed by a real ChannelCreate). The Rust
+   *  ChannelInfoDto always emits it; optional here so pre-existing test
+   *  fixtures that omit it still type-check (absence is treated as false). */
+  syncing?: boolean;
 }
 
 /**
