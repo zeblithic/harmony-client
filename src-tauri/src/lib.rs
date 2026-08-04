@@ -202,6 +202,7 @@ pub mod friend_token;
 pub mod hlc_adopt_floor;
 pub mod identity;
 pub mod identity_commands;
+pub mod inflight_handshake_gate;
 pub mod invite_mint;
 pub mod iroh_butler_acceptor;
 pub mod iroh_community_relay_acceptor;

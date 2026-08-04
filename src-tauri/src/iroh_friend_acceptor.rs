@@ -29,6 +29,9 @@
 //! Requester → acceptor: [`FriendLinkRequest`].
 //! Acceptor → requester: [`FriendLinkAccepted`].
 
+use crate::inflight_handshake_gate::{
+    InFlightHandshakeGate, HANDSHAKE_INFLIGHT_GLOBAL_MAX, HANDSHAKE_INFLIGHT_PER_SOURCE_MAX,
+};
 use crate::owner_state_types::{
     deserialize_bytes_from_bstr, serialize_bytes_as_bstr, DeviceIdentityHash, OwnerAddr,
 };
@@ -2537,20 +2540,51 @@ pub struct MultiplexHandshakeDispatcher {
     friend: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
     /// ZEB-375: receives `harmony/friend-pex/v1` connections (referral catalog).
     pex: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+    /// ZEB-866: per-source + node-wide concurrency gate consulted before
+    /// delegating, bounding in-flight handshakes against a pre-`accept_bi`
+    /// slowloris. Shared node-wide.
+    gate: Arc<InFlightHandshakeGate>,
 }
 
 impl MultiplexHandshakeDispatcher {
-    /// Build a multiplexer over the invite + friend + friend-PEX acceptors.
+    /// Build a multiplexer over the invite + friend + friend-PEX acceptors,
+    /// with the production in-flight gate caps.
     pub fn new(
         invite: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
         friend: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
         pex: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
     ) -> Self {
+        Self::with_gate_caps(
+            invite,
+            friend,
+            pex,
+            HANDSHAKE_INFLIGHT_PER_SOURCE_MAX,
+            HANDSHAKE_INFLIGHT_GLOBAL_MAX,
+        )
+    }
+
+    /// Test/tuning constructor — same as `new` but with explicit in-flight gate
+    /// caps so tests can drive the concurrency ceiling deterministically with
+    /// tiny values.
+    pub fn with_gate_caps(
+        invite: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+        friend: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+        pex: Arc<dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher>,
+        per_source_max: usize,
+        global_max: usize,
+    ) -> Self {
         Self {
             invite,
             friend,
             pex,
+            gate: Arc::new(InFlightHandshakeGate::with_caps(per_source_max, global_max)),
         }
+    }
+
+    /// Test-only accessor for the installed gate (proves the wiring caps).
+    #[cfg(test)]
+    pub(crate) fn gate_for_test(&self) -> &Arc<InFlightHandshakeGate> {
+        &self.gate
     }
 }
 
@@ -2575,6 +2609,27 @@ impl MultiplexHandshakeDispatcher {
 #[async_trait]
 impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for MultiplexHandshakeDispatcher {
     async fn handle_connection(&self, conn: Connection) {
+        // ZEB-866: bound concurrent in-flight handshakes BEFORE delegating to
+        // the inner acceptor (whose first await is `accept_bi`, up to
+        // `io_deadline`). `remote_id()` is available pre-`accept_bi` (ZEB-616).
+        // The permit is held across the whole handshake and released when
+        // `_guard` drops; shedding here — before `accept_bi` — is what stops a
+        // stalled / withheld-stream flood from pinning handler tasks.
+        let source = *conn.remote_id().as_bytes();
+        let _guard = match self.gate.try_acquire(source) {
+            Some(g) => g,
+            None => {
+                tracing::warn!(
+                    remote_id = ?conn.remote_id(),
+                    "ZEB-866: in-flight handshake gate shed (per-source or global cap reached)"
+                );
+                // Clean CONNECTION_CLOSE, zero response-stream bytes — the same
+                // benign, retryable shape as the Tier-1 post-`accept_bi` shed
+                // (mirrors the boot-queue close at zenoh_iroh_transport.rs:544).
+                conn.close(0u32.into(), b"zeb866-inflight-cap");
+                return;
+            }
+        };
         // Re-read the negotiated ALPN the accept loop already matched and
         // delegate the owned connection to the selected acceptor.
         self.select_for_alpn(conn.alpn())
@@ -4379,6 +4434,46 @@ mod tests {
         assert!(
             Arc::ptr_eq(mux.select_for_alpn(alpn::HARMONY_FRIEND_PEX_V1), &pex),
             "friend-pex ALPN must select the PEX acceptor"
+        );
+    }
+
+    #[test]
+    fn multiplex_dispatcher_gate_enforces_configured_caps() {
+        // ZEB-866: the dispatcher's `handle_connection` gate wiring can't be
+        // unit-driven (no in-process `Connection`), so prove the seam a
+        // different way — that `with_gate_caps` installs a live gate enforcing
+        // exactly those caps.
+        let stub = || -> Arc<dyn IrohHandshakeDispatcher> {
+            Arc::new(RecordingDispatcher {
+                called: AtomicBool::new(false),
+            })
+        };
+        // Distinct caps (per_source=2, global=3) so a swapped-argument bug in
+        // `with_gate_caps` is detectable: both limits are exercised separately.
+        let mux = MultiplexHandshakeDispatcher::with_gate_caps(stub(), stub(), stub(), 2, 3);
+        let gate = mux.gate_for_test();
+        let key = |n: u8| {
+            let mut k = [0u8; 32];
+            k[0] = n;
+            k
+        };
+        let _a1 = gate.try_acquire(key(1)).expect("A 1st admits");
+        let _a2 = gate
+            .try_acquire(key(1))
+            .expect("A 2nd admits (at per-source cap 2)");
+        assert!(
+            gate.try_acquire(key(1)).is_none(),
+            "A 3rd shed by the per-source cap (=2)"
+        );
+        // A distinct source still admits (anti-lockout) and takes global to 3/3…
+        let _b1 = gate
+            .try_acquire(key(2))
+            .expect("B admits — distinct source, global now 3/3");
+        // …so a further distinct source is shed by the GLOBAL cap (=3), proving
+        // the second argument is wired as the global limit, not the per-source one.
+        assert!(
+            gate.try_acquire(key(3)).is_none(),
+            "C shed by the global cap (=3) despite being a brand-new source"
         );
     }
 
