@@ -211,6 +211,7 @@ pub mod iroh_framing;
 pub mod iroh_friend_acceptor;
 pub mod iroh_invite_acceptor;
 pub mod iroh_pex_acceptor;
+pub mod iroh_transport_lifecycle;
 pub mod iroh_tunnel_acceptor;
 pub mod iroh_tunnel_dm_transport;
 pub mod library_directory;
@@ -1607,6 +1608,14 @@ pub struct NodeState {
     /// (one leaked task + endpoint per `stop_node`→`start_node` restart cycle).
     /// Mirrors `iroh_publisher_handle` teardown exactly.
     pub iroh_resume_detector_handle: Option<tokio::task::JoinHandle<()>>,
+    /// ZEB-834: `JoinHandle` of the bounded relay-health observer spawned on the
+    /// main runtime after a successful endpoint bind. The observer is bounded
+    /// (it samples over a fixed settling window then returns), but its handle is
+    /// still held so `clear_iroh_handles` can `abort()` it on stop — otherwise a
+    /// mid-window stop would leave it pinning the old `Arc<IrohEndpoint>` clone
+    /// across a restart, the very leaked-task class ZEB-834 fixes. `None` when
+    /// iroh boot failed (no endpoint to observe).
+    pub iroh_relay_observer_handle: Option<tokio::task::JoinHandle<()>>,
 
     // ── ZEB-323 Phase 2b: pkarr policy handles ───────────────────────────
     //
@@ -1792,6 +1801,14 @@ impl NodeState {
         // Arc forever, and fires `network_change()` on it every wake — one
         // leaked task + endpoint per restart cycle.
         if let Some(h) = self.iroh_resume_detector_handle.take() {
+            h.abort();
+        }
+        // ZEB-834: abort the relay-health observer. It is bounded (self-
+        // terminates after its settling window), but a mid-window stop would
+        // otherwise leave it pinning the old `Arc<IrohEndpoint>` clone across a
+        // restart — the same leaked-task class the resume-detector abort above
+        // guards against.
+        if let Some(h) = self.iroh_relay_observer_handle.take() {
             h.abort();
         }
         // ZEB-368: clear the process-global iroh session ctx so a restart
@@ -2132,6 +2149,7 @@ impl Default for NodeState {
             // ZEB-621 Task 6: resume detector handle stays None until
             // start_node wires it; cleared + aborted in clear_iroh_handles.
             iroh_resume_detector_handle: None,
+            iroh_relay_observer_handle: None,
             // ZEB-323 Phase 2b: pkarr policy handles stay None until
             // start_node wires them; cleared + aborted in stop_inner.
             pkarr_publisher: None,
@@ -2432,6 +2450,11 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     let profile_broadcast_publisher_for_shutdown: Option<
         std::sync::Arc<crate::profile_broadcast::ProfileBroadcastPublisher>,
     >;
+    // ZEB-834: outer-scope snapshot of the iroh endpoint `Arc`, taken inside the
+    // lock block below BEFORE `clear_iroh_handles` nulls the field, so the
+    // bounded `close()` after the event-loop thread joins can reap the relay
+    // actor (see the close block near the end of this fn).
+    let iroh_endpoint_for_shutdown: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>;
     // ZEB-341: sibling outer-scope binding for the self profile-card
     // publisher, shut down on the same ephemeral runtime below.
     let profile_card_publisher_for_shutdown: Option<
@@ -2860,6 +2883,14 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // forever and keeps firing if-watch events across restart cycles
         // (Qodo + CodeAnt findings); `clear_iroh_handles` also drops the
         // endpoint/resolver Arcs and the publisher force Notify.
+        //
+        // ZEB-834: snapshot the endpoint `Arc` BEFORE `clear_iroh_handles`
+        // nulls the field. A bare `Arc`-drop does NOT tear iroh's relay actor
+        // down — only `Endpoint::close()` does — so we drive a bounded close on
+        // this snapshot after the event-loop thread joins below (closing here,
+        // before the final engine publishes, would kill the transport out from
+        // under them).
+        iroh_endpoint_for_shutdown = guard.iroh_endpoint.clone();
         guard.clear_iroh_handles();
         tup
     };
@@ -3274,6 +3305,44 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         shutdown_fleet_sync_blocking(relay_optin_engine, "relay-optin");
     }
     stop_handles(shutdown_tx, thread);
+    // ZEB-834: close the iroh endpoint LAST — after every engine has flushed its
+    // final publish over the still-live iroh transport and the event-loop thread
+    // has joined (dropping the zenoh session's endpoint clones). Only
+    // `Endpoint::close()` reaps iroh's relay actor; the prior bare `Arc`-drop
+    // left the relay connection leaked on the persistent main runtime, so the
+    // next `start_node` — re-binding the SAME persisted secret key / EndpointId —
+    // collided with the ghost ("Another endpoint connected with same endpoint
+    // id"), producing home-relay flapping + MultipathNotNegotiated dial failures
+    // that only a full process restart cleared. Bounded by a timeout so a wedged
+    // close can't hang `stop_node`. `stop_inner` is sync but `shutdown()` is
+    // async — same `thread::scope` + ephemeral current-thread runtime pattern as
+    // the registry shutdowns above.
+    if let Some(endpoint) = iroh_endpoint_for_shutdown {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        let outcome =
+                            rt.block_on(crate::iroh_transport_lifecycle::close_iroh_endpoint(
+                                endpoint,
+                                crate::iroh_transport_lifecycle::ENDPOINT_CLOSE_TIMEOUT,
+                            ));
+                        tracing::debug!(?outcome, "ZEB-834: iroh endpoint close on stop complete");
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "ZEB-834: could not build ephemeral tokio runtime for iroh \
+                             endpoint close — relay actor may linger until process exit"
+                        );
+                    }
+                }
+            });
+        });
+    }
     had_node
 }
 
@@ -4760,6 +4829,9 @@ pub async fn start_node_inner(
         // Zenoh's transport stack lands when Task 10's two-engine test
         // sign-off arrives.
         let iroh_endpoint_arc: Option<std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>>;
+        // ZEB-834: handle of the relay-health observer spawned at bind success
+        // below; moved into NodeState (for abort-on-stop) once the node is up.
+        let mut iroh_relay_observer_handle: Option<tokio::task::JoinHandle<()>> = None;
         let reachability_resolver: crate::reachability_resolver::ReachabilityResolver;
         // ZEB-329: synchronous OwnerAddr→communities projection consumed by
         // ProdMembership (Network Health peer scoping). Declared here — alongside
@@ -4931,6 +5003,20 @@ pub async fn start_node_inner(
                             );
                             crate::iroh_zenoh_registration::ensure_iroh_factory_registered();
                             iroh_endpoint_arc = Some(std::sync::Arc::clone(&ep_arc));
+                            // ZEB-834: spawn the bounded, log-only relay-health
+                            // observer on this (main, persistent) runtime — the
+                            // same runtime the relay actor lives on. It samples
+                            // the home relay over a settling window and WARNs if
+                            // it never connects, flaps, or errors persistently
+                            // (the same-EndpointId collision symptom this ticket
+                            // fixes). The handle is moved into NodeState below so
+                            // clear_iroh_handles aborts it on stop.
+                            iroh_relay_observer_handle = Some(
+                                crate::iroh_transport_lifecycle::spawn_relay_health_observer(
+                                    std::sync::Arc::clone(&ep_arc),
+                                    crate::iroh_transport_lifecycle::RelayObserveConfig::default(),
+                                ),
+                            );
                             // ZEB-325 Phase 2c: clone the link manager
                             // Arc for the post-owner-load handshake
                             // dispatcher install below.
@@ -12724,6 +12810,9 @@ pub async fn start_node_inner(
                         // NodeState so clear_iroh_handles aborts it alongside
                         // the publisher/accept tasks. `.take()` — single owner.
                         guard.iroh_resume_detector_handle = iroh_resume_detector_handle.take();
+                        // ZEB-834: move the relay-health observer handle into
+                        // NodeState so clear_iroh_handles aborts it on stop.
+                        guard.iroh_relay_observer_handle = iroh_relay_observer_handle.take();
                         // ZEB-323 Phase 2b: stash pkarr policy handles.
                         guard.pkarr_publisher = pkarr_publisher_for_state.take();
                         guard.pkarr_friend_publisher = pkarr_friend_publisher_for_state.take();
@@ -77708,6 +77797,7 @@ mod start_node_race_tests {
             iroh_accept_handle: None,
             // ZEB-621 Task 6: resume detector handle unused in race tests.
             iroh_resume_detector_handle: None,
+            iroh_relay_observer_handle: None,
             // ZEB-323 Phase 2b: pkarr handles unused in race tests.
             pkarr_publisher: None,
             pkarr_friend_publisher: None,
