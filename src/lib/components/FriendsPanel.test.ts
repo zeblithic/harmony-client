@@ -448,6 +448,11 @@ describe('FriendsPanel — teardown-guarded failure paths (ZEB-793)', () => {
     const { unmount } = render(FriendsPanel, { props: { service } });
     await vi.advanceTimersByTimeAsync(0);
 
+    // Prove the in-flight fetch actually started before teardown, so the
+    // late-rejection path below is genuinely exercised and this can't pass
+    // vacuously if a refactor stops calling listPendingRequests on mount.
+    expect(listPendingRequests).toHaveBeenCalled();
+
     // Tear down while the pending-list fetch is in flight, THEN reject it.
     unmount();
     rejectPending(new Error('late boom'));
