@@ -44,6 +44,7 @@
 //! `ConnectionShed`→close mapping end-to-end is tracked separately (ZEB-870).
 
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,16 +56,18 @@ use harmony_app::community_state_sync::{
 use harmony_app::content_store::{CasOp, ContentStore, RuntimeContentStore};
 use harmony_app::dm_outbox::DmOutbox;
 use harmony_app::iroh_endpoint::{alpn, warm_up_iroh_global_init};
+use harmony_app::iroh_friend_acceptor::MultiplexHandshakeDispatcher;
 use harmony_app::iroh_invite_acceptor::{
-    HandshakeAcceptError, HandshakeAcceptorConfig, IrohInviteHandshakeAcceptor,
+    HandshakeAcceptError, HandshakeAcceptorConfig, IrohHandshakeDispatcher,
+    IrohInviteHandshakeAcceptor,
 };
 use harmony_app::open_join_admit::OpenJoinConnLimiter;
 use harmony_app::owner_state_crdt::OwnerState;
 use harmony_app::owner_state_types::{DeviceIdentityHash, OwnerAddr};
 use harmony_identity::PrivateIdentity;
-use iroh::endpoint::{presets, Endpoint, RelayMode};
+use iroh::endpoint::{presets, Connection, Endpoint, RelayMode};
 use iroh::{EndpointAddr, SecretKey};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{mpsc, Mutex as TokioMutex, Notify};
 
 /// The acceptor never resolves an identity before the shed (or before the
 /// length-prefix read in the control), so a null resolver suffices.
@@ -284,6 +287,326 @@ async fn open_join_permissive_limiter_reaches_length_prefix_read() {
             matches!(result, Err(HandshakeAcceptError::ReadPrefix(_))),
             "permissive limiter must pass the gate and reach the length-prefix read (EOF → ReadPrefix), got {result:?}"
         );
+    })
+    .await
+    .expect("test completed within budget");
+}
+
+// ---------------------------------------------------------------------------
+// ZEB-870: dispatcher-path (`MultiplexHandshakeDispatcher::handle_connection`)
+// coverage for BOTH pre-`accept_bi` shed reasons, over a real iroh loopback.
+//
+// ZEB-864 (above) drives the invite acceptor's `handle_invite_handshake_inbound`
+// seam DIRECTLY so the return VARIANT (`ConnectionShed` vs. a read-stage error)
+// is inspectable — but that bypasses two production layers whose regressions
+// would escape it:
+//
+//   1. the invite acceptor's own `IrohHandshakeDispatcher::handle_connection`
+//      (maps a handler `Err(ConnectionShed)` to a warn-log + silent
+//      `conn.closed()` wait — NOT an error response), and
+//   2. the `MultiplexHandshakeDispatcher::handle_connection` chokepoint, which
+//      first runs the ZEB-866 in-flight gate and only then routes by ALPN.
+//
+// These two tests drive the full `MultiplexHandshakeDispatcher::handle_connection`
+// dispatch path and assert the dialer-observable outcome (the only thing the
+// dispatcher exposes — it returns `()`), one test per shed reason. Both reasons
+// yield "zero response bytes", but via different code and with a different
+// close discipline, which the two tests pin distinctly.
+
+/// A no-op inner dispatcher used behind a `RecordingDispatcher` on the friend /
+/// friend-PEX slots this harness never routes to (the dialer always negotiates
+/// `HARMONY_HANDSHAKE_V1`, which `route_handshake_alpn` maps to the invite
+/// slot). Present only to satisfy the multiplexer's three-arm constructor; if
+/// one were ever reached it drops the connection — which is exactly why the
+/// wrapping `RecordingDispatcher` is needed: a bare drop yields the same
+/// zero-byte outcome as a legitimate shed, so a routing regression could
+/// otherwise pass silently.
+struct NoopDispatcher;
+
+#[async_trait::async_trait]
+impl IrohHandshakeDispatcher for NoopDispatcher {
+    async fn handle_connection(&self, _conn: Connection) {}
+}
+
+/// Wraps an inner dispatcher and records — via a shared flag — whether the
+/// multiplexer ever routed a connection to it, then delegates. Lets a test
+/// assert WHICH ALPN route was actually taken. Without this, a misroute to a
+/// connection-dropping stub produces the same zero response bytes as a genuine
+/// shed, so an ALPN-routing regression would slip past a bare zero-byte
+/// assertion.
+struct RecordingDispatcher {
+    entered: Arc<AtomicBool>,
+    inner: Arc<dyn IrohHandshakeDispatcher>,
+}
+
+#[async_trait::async_trait]
+impl IrohHandshakeDispatcher for RecordingDispatcher {
+    async fn handle_connection(&self, conn: Connection) {
+        self.entered.store(true, Ordering::SeqCst);
+        self.inner.handle_connection(conn).await;
+    }
+}
+
+/// An inner dispatcher that signals the moment a connection reaches it — i.e.
+/// the moment the multiplexer's gate has ADMITTED it and the surrounding
+/// `handle_connection` is holding that connection's in-flight permit — and then
+/// parks until the test releases it. This holds the sole global permit occupied
+/// deterministically while a second connection is driven into the gate, with no
+/// reliance on `accept_bi` timing (the real slowloris the gate defends against
+/// would hold the permit by stalling in `accept_bi`; parking here stands in for
+/// that, race-free). Mirrors the stub-dispatcher approach the in-crate
+/// `MultiplexHandshakeDispatcher` unit tests already use.
+struct BlockingDispatcher {
+    entered: mpsc::Sender<()>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl IrohHandshakeDispatcher for BlockingDispatcher {
+    async fn handle_connection(&self, conn: Connection) {
+        // Signal "past the gate, holding a permit" BEFORE parking. The permit
+        // (the dispatcher's RAII `_guard`) is released only when this returns.
+        let _ = self.entered.send(()).await;
+        self.release.notified().await;
+        // Release cleanly so the held connection tears down without a reset.
+        conn.close(0u32.into(), b"zeb870-release");
+    }
+}
+
+/// Register `server_ep`'s bound loopback sockets into a dialable `EndpointAddr`.
+fn dialable_addr(server_ep: &Endpoint) -> EndpointAddr {
+    let mut addr = EndpointAddr::new(server_ep.id());
+    for sock in server_ep.bound_sockets() {
+        addr = addr.with_ip_addr(sock);
+    }
+    addr
+}
+
+/// Drive one inbound connection through the REAL production dispatcher
+/// (`MultiplexHandshakeDispatcher::handle_connection`) over a raw iroh loopback
+/// pair, with the test as the dialer using the same partial-stream shape as the
+/// direct-drive harness above (open bi, write a 1-byte stub, finish). Returns
+/// the number of response DATA bytes the dialer received (0 for a shed).
+///
+/// A shed drops the acceptor's `accept_bi` streams, which resets/closes the
+/// dialer's stream PROMPTLY — so the dialer read must resolve to reset/EOF, not
+/// a timeout. A timeout is treated as a FAILURE (panic): it would mean the
+/// server neither wrote nor tore down the stream, i.e. no server-initiated shed
+/// was observed. This check runs BEFORE the dialer closes the connection, so a
+/// hung / misrouted / non-responsive dispatcher cannot be "released" by the
+/// test's own cleanup and still satisfy the zero-byte assertion.
+async fn drive_via_dispatcher(dispatcher: Arc<MultiplexHandshakeDispatcher>) -> usize {
+    let server_ep = loopback_endpoint().await;
+    let client_ep = loopback_endpoint().await;
+    let server_addr = dialable_addr(&server_ep);
+
+    // Server: accept one connection and run the FULL production dispatch path
+    // (gate admit → ALPN route → invite acceptor `handle_connection`), then let
+    // that path own the connection lifecycle exactly as production does.
+    let server_task = tokio::spawn(async move {
+        let incoming = server_ep
+            .accept()
+            .await
+            .expect("server: incoming connection");
+        let conn = incoming.await.expect("server: accept→connect");
+        dispatcher.handle_connection(conn).await;
+    });
+
+    let conn = client_ep
+        .connect(server_addr, alpn::HARMONY_HANDSHAKE_V1)
+        .await
+        .expect("client: dial");
+    let (mut send, mut recv) = conn.open_bi().await.expect("client: open_bi");
+    send.write_all(&[0u8])
+        .await
+        .expect("client: write 1-byte stub");
+    send.finish()
+        .expect("client: finish send (flush the stub + FIN)");
+
+    let mut buf = [0u8; 64];
+    let data_len = match tokio::time::timeout(Duration::from_secs(3), recv.read(&mut buf)).await {
+        Ok(Ok(Some(n))) => n, // server wrote bytes — a shed must NOT (caller asserts == 0)
+        Ok(Ok(None)) => 0,    // clean EOF — server closed the stream (shed observed)
+        Ok(Err(_reset)) => 0, // stream reset — server dropped the stream (shed observed)
+        Err(_elapsed) => panic!(
+            // no reset/EOF within the bound → no server-initiated shed
+            "dialer read timed out: the server neither wrote nor reset/closed the stream \
+             within 3s — a hung or misrouted dispatcher must not pass as a zero-byte shed"
+        ),
+    };
+
+    // The server has already torn down its stream (observed above); now close
+    // from the dialer so the acceptor's `conn.closed()` wait completes.
+    conn.close(0u32.into(), b"zeb870-done");
+    server_task.await.expect("server task join");
+    data_len
+}
+
+/// ZEB-870 Case 1 — Tier-1 `ConnectionShed` through the production dispatcher.
+/// A zero-cap `OpenJoinConnLimiter` forces the invite acceptor to shed; the
+/// dispatcher admits under production gate caps, routes by ALPN to the invite
+/// acceptor, whose `handle_connection` maps the `ConnectionShed` to a silent
+/// close-wait (no error response). The dialer must therefore receive ZERO
+/// response bytes — pinning both wrapper layers ZEB-864's direct-drive test
+/// bypasses. (The shed-vs-read-stage VARIANT distinction the dispatcher hides
+/// stays covered by ZEB-864; this pins the dispatcher's zero-byte outcome and
+/// that the path neither writes a response nor hangs the handler task.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dispatcher_tier1_shed_writes_zero_bytes() {
+    // ZEB-374: pre-pay iroh's first-bind global init OUTSIDE the asserted budget.
+    warm_up_iroh_global_init().await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (invite, _dir) = build_acceptor(OpenJoinConnLimiter::with_caps(0, 60_000));
+        // Record which route the multiplexer actually takes: the invite acceptor
+        // MUST be entered and the friend / friend-PEX routes MUST NOT be — else a
+        // routing regression that drops the connection on a wrong route would
+        // also yield zero bytes and pass (CodeAnt).
+        let invite_entered = Arc::new(AtomicBool::new(false));
+        let misrouted = Arc::new(AtomicBool::new(false));
+        // Production gate caps (via `new`) so the gate ADMITS the single
+        // connection and the Tier-1 shed — not the gate — is what fires.
+        let dispatcher = Arc::new(MultiplexHandshakeDispatcher::new(
+            Arc::new(RecordingDispatcher {
+                entered: Arc::clone(&invite_entered),
+                inner: invite,
+            }),
+            Arc::new(RecordingDispatcher {
+                entered: Arc::clone(&misrouted),
+                inner: Arc::new(NoopDispatcher),
+            }),
+            Arc::new(RecordingDispatcher {
+                entered: Arc::clone(&misrouted),
+                inner: Arc::new(NoopDispatcher),
+            }),
+        ));
+        // `drive_via_dispatcher` panics if the dialer never observes a
+        // server-initiated stream teardown (no shed → not a passing zero).
+        let data_len = drive_via_dispatcher(dispatcher).await;
+        assert_eq!(
+            data_len, 0,
+            "a Tier-1 shed routed through the dispatcher must write zero response bytes"
+        );
+        assert!(
+            invite_entered.load(Ordering::SeqCst),
+            "HARMONY_HANDSHAKE_V1 must route to the invite acceptor (the Tier-1 shed path)"
+        );
+        assert!(
+            !misrouted.load(Ordering::SeqCst),
+            "no connection may reach the friend / friend-PEX routes"
+        );
+    })
+    .await
+    .expect("test completed within budget");
+}
+
+/// ZEB-870 Case 2 — ZEB-866 in-flight-gate shed through the production
+/// dispatcher. With a GLOBAL in-flight cap of 1, the first connection is
+/// admitted and parked holding the sole permit (via `BlockingDispatcher`, so
+/// the hold is deterministic and independent of `accept_bi` timing). A second
+/// connection then reaches the gate, which must close it with
+/// `zeb866-inflight-cap` and zero response bytes BEFORE it is routed to any
+/// inner acceptor. The dialer-observed close reason distinguishes this shed
+/// from any other zero-byte outcome.
+///
+/// The GLOBAL ceiling is driven (two distinct loopback endpoints → two
+/// unambiguous, independently-closeable connections) rather than the per-source
+/// ceiling: both ceilings trigger the identical `try_acquire → None → close`
+/// branch, and the per-source-vs-global DECISION is unit-covered in
+/// `inflight_handshake_gate.rs`. Using two endpoints avoids any dependence on
+/// iroh's same-endpoint connection-reuse semantics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dispatcher_inflight_gate_shed_closes_with_reason_zero_bytes() {
+    warm_up_iroh_global_init().await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (entered_tx, mut entered_rx) = mpsc::channel::<()>(1);
+        let release = Arc::new(Notify::new());
+        let dispatcher = Arc::new(MultiplexHandshakeDispatcher::with_gate_caps(
+            Arc::new(BlockingDispatcher {
+                entered: entered_tx,
+                release: Arc::clone(&release),
+            }),
+            Arc::new(NoopDispatcher),
+            Arc::new(NoopDispatcher),
+            8, // per-source cap — high; not the ceiling under test
+            1, // GLOBAL cap = 1: the second connection is shed node-wide
+        ));
+
+        let server_ep = loopback_endpoint().await;
+        let server_addr = dialable_addr(&server_ep);
+
+        // Accept loop: spawn each `handle_connection` so the parked conn #1 does
+        // not block accepting conn #2 (mirrors the production accept loop, which
+        // spawns per connection).
+        let disp = Arc::clone(&dispatcher);
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Some(incoming) = server_ep.accept().await else {
+                    break;
+                };
+                let Ok(conn) = incoming.await else { continue };
+                let d = Arc::clone(&disp);
+                tokio::spawn(async move { d.handle_connection(conn).await });
+            }
+        });
+
+        // Conn #1 (source A): the gate admits it (global 1/1) and routes it to
+        // the blocking dispatcher, which signals `entered` and parks holding the
+        // sole global permit.
+        let ep_a = loopback_endpoint().await;
+        let conn_a = ep_a
+            .connect(server_addr.clone(), alpn::HARMONY_HANDSHAKE_V1)
+            .await
+            .expect("A: dial");
+        tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+            .await
+            .expect("A reached the inner dispatcher (holds the global permit)")
+            .expect("entered channel stayed open");
+
+        // Conn #2 (source B, a distinct endpoint): the global ceiling is now
+        // full, so the dispatcher must shed it pre-route with a clean
+        // CONNECTION_CLOSE and zero response bytes.
+        let ep_b = loopback_endpoint().await;
+        let conn_b = ep_b
+            .connect(server_addr.clone(), alpn::HARMONY_HANDSHAKE_V1)
+            .await
+            .expect("B: dial");
+        // The gate may close conn_b BEFORE or AFTER `open_bi()` resolves; an
+        // already-closed connection makes `open_bi()` return Err. Treat that as
+        // the zero-byte case rather than panicking (CodeRabbit/Qodo) — the
+        // discriminating check is the close reason asserted just below.
+        let data_len = match conn_b.open_bi().await {
+            Ok((mut send_b, mut recv_b)) => {
+                let _ = send_b.write_all(&[0u8]).await;
+                let _ = send_b.finish();
+                let mut buf = [0u8; 64];
+                match tokio::time::timeout(Duration::from_secs(3), recv_b.read(&mut buf)).await {
+                    Ok(Ok(Some(n))) => n,
+                    _ => 0,
+                }
+            }
+            Err(_closed) => 0, // gate closed the connection before a stream opened
+        };
+        assert_eq!(
+            data_len, 0,
+            "in-flight-gate shed must write zero response bytes"
+        );
+
+        // The gate closes the connection application-side with its reason; the
+        // dialer observes exactly that. This is the discriminating assertion —
+        // it separates a genuine gate shed from any incidental zero-byte close.
+        let close_err = tokio::time::timeout(Duration::from_secs(5), conn_b.closed())
+            .await
+            .expect("B: server-initiated close observed within bound");
+        let shown = format!("{close_err:?}");
+        assert!(
+            shown.contains("zeb866-inflight-cap"),
+            "conn #2 must be closed by the in-flight gate with its reason, got: {shown}"
+        );
+
+        // Release conn #1 so its permit frees and the server drains, then stop.
+        release.notify_one();
+        conn_a.close(0u32.into(), b"zeb870-a-done");
+        server_task.abort();
     })
     .await
     .expect("test completed within budget");
