@@ -486,6 +486,25 @@ impl CommunityState {
         }
     }
 
+    /// ZEB-776: the channels the bootstrap hint knows about (from the invite's
+    /// epoch_snapshot), regardless of the `materialized()` log-empty guard.
+    /// Empty when no hint was seeded. Clones out under the brief hint mutex —
+    /// the read path merges these with the hint-blind materialize to label
+    /// still-converging channels `syncing`.
+    pub fn bootstrap_hint_channels(
+        &self,
+    ) -> Vec<(
+        crate::community_membership::ChannelId,
+        crate::community_membership::ChannelInfo,
+    )> {
+        self.bootstrap_hint
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|h| h.channels.into_iter().collect())
+            .unwrap_or_default()
+    }
+
     /// Test-only: build a state whose log is restored from already-trusted
     /// events, mirroring the deserialize path (`from_verified_events`) —
     /// including its ZEB-813 supersession compaction.
@@ -837,6 +856,41 @@ mod tests {
                 .any(|(k, _): &(ciborium::Value, ciborium::Value)| k.as_text() == Some("ff")),
             "forked_from=Some should appear in CBOR encoding"
         );
+    }
+
+    #[test]
+    fn bootstrap_hint_channels_returns_seeded_channels_and_empty_without_hint() {
+        use crate::community_membership::{ChannelId, ChannelInfo, ChannelKind};
+        use crate::owner_state_types::Hlc;
+        // ZEB-776: the accessor surfaces the seeded hint's channels regardless
+        // of the materialized() log-empty guard, and is empty without a hint.
+        let state = CommunityState::new(SpaceId([0x01; 16]));
+        assert!(state.bootstrap_hint_channels().is_empty());
+
+        let mut channels = std::collections::BTreeMap::new();
+        channels.insert(
+            ChannelId([0x11; 16]),
+            ChannelInfo {
+                name: "general".into(),
+                write_power: 0,
+                kind: ChannelKind::Text,
+                created_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "seed".into(),
+                },
+                deleted_at: None,
+            },
+        );
+        state.seed_bootstrap_hint(MaterializedMembership {
+            channels: channels.clone(),
+            ..Default::default()
+        });
+
+        let got = state.bootstrap_hint_channels();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, ChannelId([0x11; 16]));
+        assert_eq!(got[0].1.name, "general");
     }
 }
 
