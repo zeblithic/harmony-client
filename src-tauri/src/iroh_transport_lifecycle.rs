@@ -5,20 +5,26 @@
 //!
 //! `stop_node` used to release the running `IrohEndpoint` by dropping its `Arc`
 //! (`self.iroh_endpoint = None`) without ever calling `Endpoint::close()`.
-//! `iroh::Endpoint` is an `Arc`-style handle whose relay/QUIC actor is reaped
-//! **only** by an explicit graceful `close()` — a bare `Arc`-drop does not tear
-//! it down. So the stale relay connection leaked onto the persistent main
-//! runtime, and because `start_node` re-binds the **same persisted secret key**
-//! (hence the same `EndpointId`), the freshly-bound endpoint collided with the
-//! leaked ghost ("Another endpoint connected with same endpoint id"), producing
-//! home-relay flapping + `MultipathNotNegotiated` dial failures that only a full
-//! process restart cleared.
+//! `iroh::Endpoint` is an `Arc`-style handle: dropping the field released only
+//! *one* clone, while background tasks (the publisher / accept loops, the zenoh
+//! session) retained others, so the endpoint's final-clone drop never happened
+//! at stop and the relay/QUIC actor kept running. And even that final-clone
+//! drop is only an *ungraceful abort* — iroh's `Drop` logs "Endpoint dropped
+//! without calling `Endpoint::close`. Aborting ungracefully." — not a graceful
+//! teardown. Either way the stale relay connection leaked onto the persistent
+//! main runtime, and because `start_node` re-binds the **same persisted secret
+//! key** (hence the same `EndpointId`), the freshly-bound endpoint collided
+//! with the leaked ghost ("Another endpoint connected with same endpoint id"),
+//! producing home-relay flapping + `MultipathNotNegotiated` dial failures that
+//! only a full process restart cleared. `Endpoint::close()` is the graceful,
+//! deterministic teardown, and driving it is the fix.
 //!
 //! This module provides the two halves of the fix:
 //!
 //! * [`close_iroh_endpoint`] — drive `IrohEndpoint::shutdown()` (idempotent
-//!   `Endpoint::close`) bounded by a timeout, so `stop_node` reaps the relay
-//!   actor in-process. Called from `stop_inner` on an ephemeral runtime.
+//!   `Endpoint::close`) to completion so every teardown path reaps the relay
+//!   actor in-process. Called from `stop_inner` (on an ephemeral runtime) and
+//!   from the `start_node` restart/identity-rebuild teardown (awaited directly).
 //! * [`spawn_relay_health_observer`] — a bounded, **log-only** task that samples
 //!   the endpoint's `home_relay_status()` over a settling window after start and
 //!   emits an actionable `WARN` if the home relay never connects, flaps, or
@@ -38,11 +44,6 @@ use std::time::Duration;
 
 use crate::iroh_endpoint::IrohEndpoint;
 
-/// Timeout bounding the endpoint close on node stop. `close()` is normally
-/// near-instant (it CONNECTION_CLOSEs open streams and stops the actor); the
-/// bound only guards against a wedged close hanging `stop_node`.
-pub(crate) const ENDPOINT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Interval between relay-status samples in the start-time settling window.
 pub(crate) const RELAY_OBSERVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Number of samples taken across the settling window (6 × 5s ≈ 30s).
@@ -54,41 +55,54 @@ pub(crate) const RELAY_MIN_SAMPLES: usize = 3;
 /// churn) at or above this count over the window are judged `Flapping`.
 pub(crate) const RELAY_FLAP_THRESHOLD: usize = 4;
 
-/// Outcome of a bounded endpoint close. Returned (rather than `()`) so the sync
-/// call site can log which path it took, and so [`close_iroh_endpoint`] is
-/// observable at the `IrohEndpoint::from_endpoint_for_test` seam in unit tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CloseOutcome {
-    /// `shutdown()` completed within the timeout.
-    Closed,
-    /// The timeout elapsed before `shutdown()` returned. Teardown proceeds; the
-    /// relay actor may linger until process exit (strictly better than the
-    /// pre-ZEB-834 behavior, which never closed at all).
-    TimedOut,
+/// Gracefully close the endpoint, awaiting `IrohEndpoint::shutdown()`
+/// (`iroh::Endpoint::close`) to completion. Idempotent — safe on an
+/// already-closed endpoint. Takes the `Arc` by value: `close()` shuts down the
+/// shared underlying actor regardless of how many other clones remain live, and
+/// consuming the caller's snapshot documents that this is that handle's teardown.
+///
+/// Deliberately **not** wrapped in an external `tokio::time::timeout`. iroh's
+/// `close()` cancels its `at_close_start` token — making `is_closing()` true —
+/// *before* it awaits `wait_all_draining()`, and BOTH the endpoint's `Drop`
+/// impl and `abort()` early-return once `is_closing()` is set. So cancelling a
+/// timed-out `close()` future would leave the endpoint half-closed with its
+/// relay/QUIC actors still running and no path left to reap them — reproducing
+/// the exact leak this ticket fixes, in precisely the slow-close case a timeout
+/// was meant to handle. `close()` is already internally bounded
+/// (`wait_all_draining` caps at the transport probe timeout, ~3s; the actor
+/// await has an explicit 100ms cap), and every sibling shutdown in `stop_inner`
+/// likewise awaits fully — so we await it here too.
+pub(crate) async fn close_iroh_endpoint(endpoint: Arc<IrohEndpoint>) {
+    endpoint.shutdown().await;
 }
 
-/// Drive `endpoint.shutdown()` (idempotent `iroh::Endpoint::close`) bounded by
-/// `timeout`.
+/// Aborts the wrapped task on drop unless first disarmed via [`Self::disarm`].
 ///
-/// `shutdown()` is idempotent, so calling this on an already-closed endpoint is
-/// safe and returns [`CloseOutcome::Closed`] immediately. Takes the `Arc` by
-/// value: closing works regardless of how many other clones remain live
-/// (`close()` shuts down the shared underlying actor), and consuming the caller's
-/// snapshot documents that this is the teardown of that handle.
-pub(crate) async fn close_iroh_endpoint(
-    endpoint: Arc<IrohEndpoint>,
-    timeout: Duration,
-) -> CloseOutcome {
-    match tokio::time::timeout(timeout, endpoint.shutdown()).await {
-        Ok(()) => CloseOutcome::Closed,
-        Err(_elapsed) => {
-            tracing::warn!(
-                timeout_ms = timeout.as_millis() as u64,
-                "ZEB-834: iroh endpoint close() did not complete within the timeout \
-                 on node stop; proceeding with teardown (the relay actor may linger \
-                 until process exit)"
-            );
-            CloseOutcome::TimedOut
+/// Guards the relay observer between the moment `start_node` spawns it and the
+/// moment its `JoinHandle` is stored on `NodeState` (from where
+/// `clear_iroh_handles` can abort it). A fallible `?` in that window would
+/// otherwise drop the bare `JoinHandle`, which *detaches* the task rather than
+/// aborting it — leaving it holding an `Arc<IrohEndpoint>` clone alive past a
+/// failed start (the leaked-task class this ticket addresses). On the success
+/// path the handle is `disarm`ed out and moved into `NodeState`.
+pub(crate) struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    pub(crate) fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Take the handle out without aborting — call once ownership transfers to
+    /// a longer-lived owner (`NodeState`).
+    pub(crate) fn disarm(mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.0.take()
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
         }
     }
 }
@@ -402,16 +416,45 @@ mod tests {
     #[tokio::test]
     async fn close_endpoint_closes_and_is_idempotent() {
         let ep = hermetic_disabled_endpoint().await;
-        assert_eq!(
-            close_iroh_endpoint(Arc::clone(&ep), Duration::from_secs(5)).await,
-            CloseOutcome::Closed
+        // Completes without hanging; a second close on an already-closed
+        // endpoint still returns promptly (iroh's close is idempotent).
+        close_iroh_endpoint(Arc::clone(&ep)).await;
+        close_iroh_endpoint(ep).await;
+    }
+
+    // ── AbortOnDrop guard ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn abort_on_drop_aborts_when_not_disarmed() {
+        let handle = tokio::spawn(async { std::future::pending::<()>().await });
+        let abort_handle = handle.abort_handle();
+        drop(AbortOnDrop::new(handle)); // undisarmed → aborts the task
+                                        // Let the abort take effect.
+        for _ in 0..100 {
+            if abort_handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            abort_handle.is_finished(),
+            "task must be aborted when the guard drops undisarmed"
         );
-        // `Endpoint::close` is idempotent — a second close on an already-closed
-        // endpoint still returns promptly.
-        assert_eq!(
-            close_iroh_endpoint(ep, Duration::from_secs(5)).await,
-            CloseOutcome::Closed
-        );
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_disarm_preserves_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = Arc::clone(&ran);
+        let handle = tokio::spawn(async move {
+            ran2.store(true, Ordering::SeqCst);
+        });
+        let disarmed = AbortOnDrop::new(handle)
+            .disarm()
+            .expect("disarmed handle is present");
+        disarmed.await.expect("disarmed task runs to completion");
+        assert!(ran.load(Ordering::SeqCst));
     }
 
     // ── observer pipeline (sampling + projection + judgment) ─────────────────
