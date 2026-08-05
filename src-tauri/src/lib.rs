@@ -3657,6 +3657,203 @@ mod build_auto_exec_fn_tests {
     }
 }
 
+// ── ZEB-803: relay-acceptor watchdog wiring ────────────────────────────────
+
+/// Process-global watchdog escalation state (see [`crate::relay_acceptor_watchdog`]).
+/// Deliberately NOT a `NodeState` field: a Tier-2 remediation re-runs
+/// `start_node_inner`, which re-spawns the watchdog fresh. If the counters lived
+/// in `NodeState` they would reset to zero every restart, the max-restart cap
+/// would never trip, and the watchdog would restart forever. A `static` survives
+/// the in-process restart.
+static WATCHDOG_MEMORY: std::sync::OnceLock<
+    std::sync::Arc<Mutex<crate::relay_acceptor_watchdog::WatchdogMemory>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn watchdog_memory(
+) -> std::sync::Arc<Mutex<crate::relay_acceptor_watchdog::WatchdogMemory>> {
+    WATCHDOG_MEMORY
+        .get_or_init(|| {
+            std::sync::Arc::new(Mutex::new(
+                crate::relay_acceptor_watchdog::WatchdogMemory::default(),
+            ))
+        })
+        .clone()
+}
+
+/// Production sensor: reads live serving telemetry + connected-peer count.
+struct ProdWatchdogSensor {
+    telemetry: std::sync::Arc<crate::network_health::CommunityRelayServingTelemetry>,
+    resolver: crate::reachability_resolver::ReachabilityResolver,
+}
+
+impl crate::relay_acceptor_watchdog::ServingSensor for ProdWatchdogSensor {
+    fn sample(&self, now_ms: u64) -> crate::relay_acceptor_watchdog::WatchdogInputs {
+        let last_served_ms = self.telemetry.last_served_ms();
+        let connected_peers = self
+            .resolver
+            .supervisor()
+            .map(|h| crate::network_health::count_peer_states(&h.states_snapshot()).connected)
+            .unwrap_or(0);
+        crate::relay_acceptor_watchdog::WatchdogInputs {
+            now_ms,
+            last_served_ms,
+            connected_peers,
+        }
+    }
+}
+
+/// A reusable async factory for the gen-guarded full-node restart.
+type WatchdogRestartFn =
+    std::sync::Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// Production actuator: Tier-1 in-place probe + Tier-2 full-node restart.
+struct ProdWatchdogActuator {
+    endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
+    restart: WatchdogRestartFn,
+}
+
+#[async_trait::async_trait]
+impl crate::relay_acceptor_watchdog::RemediationActuator for ProdWatchdogActuator {
+    async fn probe_network(&self) {
+        // Tier 1: same in-place re-probe the sleep/wake resume detector uses.
+        self.endpoint.network_change().await;
+    }
+    async fn restart_node(&self) {
+        // Tier 2: gen-guarded full-node restart. The watchdog task is NOT stored
+        // in `NodeState`, so this `stop_inner` does not abort the caller; the run
+        // loop exits cooperatively on the shutdown watch after the restart.
+        (self.restart)().await;
+    }
+}
+
+/// Build the gen-guarded restart closure. Exactly one of `owned_state`
+/// (headless) / `wry_handle` (GUI) is `Some`, mirroring the mint restart
+/// (`owner_commands.rs`) and the beacon-requester dual-path. On a generation
+/// mismatch (another restart already ran) the stop is a no-op and we skip the
+/// start; on a start failure we mark the watchdog escalated.
+fn build_watchdog_restart_fn(
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
+    owned_state: Option<std::sync::Arc<Mutex<NodeState>>>,
+) -> WatchdogRestartFn {
+    std::sync::Arc::new(move || {
+        let sink = sink.clone();
+        let wry_handle = wry_handle.clone();
+        let owned_state = owned_state.clone();
+        Box::pin(async move {
+            if let Some(owned) = owned_state {
+                let state: &Mutex<NodeState> = &owned;
+                let gen = state.lock().expect("NodeState mutex poisoned").generation;
+                if !stop_inner(state, Some(gen)) {
+                    tracing::warn!("ZEB-803 watchdog: restart skipped — generation changed");
+                    return;
+                }
+                if let Err(e) = start_node_inner(
+                    None,
+                    sink.clone(),
+                    wry_handle.clone(),
+                    state,
+                    Some(owned.clone()),
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "ZEB-803 watchdog: restart start_node_inner failed — escalating");
+                    watchdog_memory()
+                        .lock()
+                        .expect("watchdog memory poisoned")
+                        .phase = crate::relay_acceptor_watchdog::Phase::Escalated;
+                }
+            } else if let Some(app) = wry_handle {
+                use tauri::Manager as _;
+                let st = app.state::<Mutex<NodeState>>();
+                let state: &Mutex<NodeState> = &st;
+                let gen = state.lock().expect("NodeState mutex poisoned").generation;
+                if !stop_inner(state, Some(gen)) {
+                    tracing::warn!("ZEB-803 watchdog: restart skipped — generation changed");
+                    return;
+                }
+                if let Err(e) =
+                    start_node_inner(None, sink.clone(), Some(app.clone()), state, None).await
+                {
+                    tracing::error!(error = %e, "ZEB-803 watchdog: restart start_node_inner failed — escalating");
+                    watchdog_memory()
+                        .lock()
+                        .expect("watchdog memory poisoned")
+                        .phase = crate::relay_acceptor_watchdog::Phase::Escalated;
+                }
+            } else {
+                tracing::error!(
+                    "ZEB-803 watchdog: no NodeState handle for restart (neither owned_state nor wry_handle)"
+                );
+            }
+        })
+    })
+}
+
+/// Spawn the relay-acceptor watchdog on the acceptor-install success path. The
+/// task is detached and self-terminates on the node's shutdown watch — so a
+/// stop/restart ends it without a `NodeState` handle (which would otherwise
+/// abort the task mid-restart).
+fn spawn_relay_acceptor_watchdog(
+    telemetry: std::sync::Arc<crate::network_health::CommunityRelayServingTelemetry>,
+    endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
+    resolver: crate::reachability_resolver::ReachabilityResolver,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
+    owned_state: Option<std::sync::Arc<Mutex<NodeState>>>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    use crate::relay_acceptor_watchdog::*;
+    let cadence_ms = crate::community_relay_pull_driver::COMMUNITY_RELAY_PULL_INTERVAL_MS;
+    let cfg = WatchdogConfig {
+        cadence_ms,
+        stale_multiplier: 3,
+        eval_interval_ms: cadence_ms / 3,
+        tier1_cooldown_ms: cadence_ms.saturating_mul(2),
+        tier2_cooldown_ms: cadence_ms.saturating_mul(2),
+        max_restarts: 3,
+    };
+    let sensor = ProdWatchdogSensor {
+        telemetry,
+        resolver,
+    };
+    let actuator = ProdWatchdogActuator {
+        endpoint,
+        restart: build_watchdog_restart_fn(sink, wry_handle, owned_state),
+    };
+    struct SystemClock;
+    impl Clock for SystemClock {
+        fn now_ms(&self) -> u64 {
+            crate::network_health::now_ms()
+        }
+    }
+    let wd = RelayAcceptorWatchdog::new(cfg, watchdog_memory(), sensor, actuator, SystemClock);
+    tokio::spawn(wd.run(shutdown_rx));
+}
+
+#[cfg(test)]
+mod watchdog_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn sensor_reports_last_served_and_maps_zero_to_none() {
+        use crate::relay_acceptor_watchdog::ServingSensor;
+        let tel = std::sync::Arc::new(crate::network_health::CommunityRelayServingTelemetry::new());
+        let sensor = ProdWatchdogSensor {
+            telemetry: tel.clone(),
+            resolver: crate::reachability_resolver::ReachabilityResolver::new(),
+        };
+        // Never served yet → None; no supervisor wired → connected 0.
+        let s0 = sensor.sample(42);
+        assert_eq!(s0.last_served_ms, None);
+        assert_eq!(s0.connected_peers, 0);
+        // A recorded serve makes it Some (the 0 → None sentinel lifts).
+        tel.record_served(&[7u8; 32]);
+        let s1 = sensor.sample(99);
+        assert!(s1.last_served_ms.is_some());
+    }
+}
+
 /// ZEB-338: extracted body of `start_node`. Callable from any caller that
 /// holds a `NodeEventSink` and `&Mutex<NodeState>` (the command wrapper
 /// above, `mint_owner_identity`'s node-restart phase, and — ZEB-445 — the
@@ -3664,6 +3861,7 @@ mod build_auto_exec_fn_tests {
 /// handle for the few seams that genuinely need Tauri (managed-state
 /// lookup in the VRF beacon requester, `NodeState.app_handle_wry` for the
 /// dfrost/voting IPCs); `None` in serve mode.
+///
 /// Public for the serve path and the api_server integration test (ZEB-445).
 pub async fn start_node_inner(
     endpoint: Option<String>,
@@ -3685,6 +3883,11 @@ pub async fn start_node_inner(
     // prevents concurrent start_node calls from racing on identity
     // generation or orphaning threads.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // ZEB-803: a fn-body-level clone for the relay-acceptor watchdog, taken here
+    // because `shutdown_rx` is moved into `event_loop::run` well before the
+    // watchdog spawn point. The watchdog exits cooperatively when a stop signals
+    // this channel (it holds no NodeState handle that could abort it).
+    let watchdog_shutdown_rx = shutdown_rx.clone();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (publish_tx, publish_rx) = tokio::sync::mpsc::channel(64);
     let (fetch_tx, fetch_rx) = tokio::sync::mpsc::channel(64);
@@ -13160,6 +13363,22 @@ pub async fn start_node_inner(
                             // collapsing the two would hide it.
                             if let Some(t) = community_relay_serving_telemetry_for_state.as_ref() {
                                 nh.set_community_relay_serving_source(std::sync::Arc::clone(t));
+                                // ZEB-803: spawn the self-healing watchdog on the
+                                // same success path (relay serving wired + iroh
+                                // endpoint bound). Reads this telemetry + the
+                                // resolver's connected-peer count; remediates via
+                                // network_change() then a full-node restart.
+                                if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
+                                    spawn_relay_acceptor_watchdog(
+                                        std::sync::Arc::clone(t),
+                                        std::sync::Arc::clone(ep_arc),
+                                        reachability_resolver.clone(),
+                                        app.clone(),
+                                        wry_handle.clone(),
+                                        owned_state.clone(),
+                                        watchdog_shutdown_rx.clone(),
+                                    );
+                                }
                             }
                             if let Some(t) = community_relay_pull_telemetry_for_state.as_ref() {
                                 nh.set_community_relay_pull_source(std::sync::Arc::clone(t));

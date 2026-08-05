@@ -2688,8 +2688,17 @@ impl NetworkHealthService {
                     pulling: pulling.map(|p| p.summary()).unwrap_or_default(),
                 }),
             },
-            // ZEB-803: populated live in the watchdog-wiring task; None until then.
-            relay_acceptor_watchdog: None,
+            // ZEB-803: present iff the relay serving path is wired (parity with
+            // `community_relay`). `phase`/counters come from the process-global
+            // watchdog memory; `staleness_ms`/`connected_peers` are live.
+            relay_acceptor_watchdog: self.community_relay_serving.as_ref().map(|tel| {
+                let mem = *crate::watchdog_memory()
+                    .lock()
+                    .expect("watchdog memory poisoned");
+                let staleness_ms = tel.last_served_ms().map(|ms| now_ms().saturating_sub(ms));
+                let connected = count_peer_states(&peer_states).connected;
+                RelayAcceptorWatchdogHealth::from_parts(&mem, staleness_ms, connected)
+            }),
             // ZEB-811 Task 8: same present-iff-wired, unwired-side-zeroed
             // shape as `community_relay` above — see that field's match arm
             // doc for the rationale.
