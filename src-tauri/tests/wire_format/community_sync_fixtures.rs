@@ -8,7 +8,13 @@
 use harmony_app::community_invite::{
     CommunityInvitePayload, InviteEpochSnapshot, MaterializedCommunityState,
 };
-use harmony_app::community_membership::{MembershipEventKind, RecipientCiphertext};
+use harmony_app::community_membership::{
+    MembershipEventKind, RecipientCiphertext, SignedMembershipEvent,
+};
+use harmony_app::community_state_segments::{
+    EventBoundary, ManifestCleartext, SealedEntry, SegmentCleartext, SegmentIndex, SegmentRef,
+    MANIFEST_CLEARTEXT_V1, MANIFEST_FORMAT_V1,
+};
 use harmony_app::community_state_sync::{
     CommunityRootPublishPayload, CommunityRootSignedPayload, EncryptedEnvelope,
 };
@@ -244,4 +250,180 @@ fn invite_payload_with_epoch_snapshot_wire_bytes_pinned() {
         hex::encode(&bytes),
         hex::encode(&expected)
     );
+}
+
+// ── ZEB-814: segmented-root wire fixtures ──────────────────────────────────
+
+/// Deterministic minimal event for the segment/manifest fixtures. Not
+/// cryptographically valid — the segment layer never verifies signatures.
+fn pin_event() -> SignedMembershipEvent {
+    SignedMembershipEvent {
+        id: [0x11; 16],
+        community_id: SpaceId([0x22; 16]),
+        kind: MembershipEventKind::Leave,
+        actor: OwnerAddr([0x33; 16]),
+        at: Hlc {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "dv".into(),
+        },
+        sig: [0x44; 64],
+        countersig: None,
+        enrollment: None,
+        signer_certs: Vec::new(),
+    }
+}
+
+fn pin_seg_ref() -> SegmentRef {
+    SegmentRef {
+        segment_cid: ContentId::from_bytes([0x55; 32]),
+        lo: EventBoundary {
+            wall_ms: 1000,
+            logical: 0,
+            device_id: "dv".into(),
+            id: [0x11; 16],
+        },
+        hi: EventBoundary {
+            wall_ms: 2000,
+            logical: 0,
+            device_id: "dv".into(),
+            id: [0x99; 16],
+        },
+        count: 2,
+        k_s: [0x66; 32],
+    }
+}
+
+/// ZEB-814: the `"mf"` discriminator on a segmented signed payload. Keys encode
+/// in struct-declaration order (rc, pa, at, mf), matching the legacy fixtures.
+#[test]
+fn community_root_signed_payload_manifest_format_pinned() {
+    let p = CommunityRootSignedPayload {
+        root_cid: ContentId::from_bytes([0xAA; 32]),
+        publisher_addr: OwnerAddr([0xBB; 16]),
+        at: Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 7,
+            device_id: "d1".into(),
+        },
+        manifest_format: Some(MANIFEST_FORMAT_V1),
+    };
+    let bytes = canonical_cbor_encode(&p).expect("encode");
+    let expected_hex = "a46272635820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa62706150bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb626174a361771b0000018bcfe56800616c076164626431626d6601";
+    let expected = hex::decode(expected_hex).unwrap_or_else(|_| {
+        eprintln!("\nACTUAL signed(mf) bytes:\n  {}\n", hex::encode(&bytes));
+        panic!("update PLACEHOLDER");
+    });
+    assert_eq!(bytes, expected, "drifted: {}", hex::encode(&bytes));
+    let decoded: CommunityRootSignedPayload = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, p);
+}
+
+/// ZEB-814: the `"mf"` discriminator on a segmented publish payload.
+#[test]
+fn community_root_publish_payload_manifest_format_pinned() {
+    let p = CommunityRootPublishPayload {
+        root_cid: ContentId::from_bytes([0xAA; 32]),
+        publisher_addr: OwnerAddr([0xBB; 16]),
+        at: Hlc {
+            wall_ms: 1_700_000_000_000,
+            logical: 7,
+            device_id: "d1".into(),
+        },
+        publisher_sig: [0xCC; 64],
+        epoch: Some(3),
+        manifest_format: Some(MANIFEST_FORMAT_V1),
+    };
+    let bytes = canonical_cbor_encode(&p).expect("encode");
+    let expected_hex = "a66272635820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa62706150bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb626174a361771b0000018bcfe56800616c0761646264316270735840cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc62657003626d6601";
+    let expected = hex::decode(expected_hex).unwrap_or_else(|_| {
+        eprintln!("\nACTUAL publish(mf) bytes:\n  {}\n", hex::encode(&bytes));
+        panic!("update PLACEHOLDER");
+    });
+    assert_eq!(bytes, expected, "drifted: {}", hex::encode(&bytes));
+    let decoded: CommunityRootPublishPayload = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, p);
+}
+
+/// SegmentCleartext (encrypted under `K_s` in production) — the segment wire
+/// body. One `Leave` event.
+#[test]
+fn segment_cleartext_wire_bytes_pinned() {
+    let seg = SegmentCleartext {
+        version: MANIFEST_CLEARTEXT_V1,
+        community_id: SpaceId([0x22; 16]),
+        events: vec![pin_event()],
+    };
+    let bytes = canonical_cbor_encode(&seg).expect("encode");
+    let expected_hex = "a362766e01626369502222222222222222222222222222222262657681a662696450111111111111111111111111111111116263695022222222222222222222222222222222626b6ea1627467616c6261635033333333333333333333333333333333626174a361771903e8616c006164626476627367584044444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444";
+    let expected = hex::decode(expected_hex).unwrap_or_else(|_| {
+        eprintln!(
+            "\nACTUAL SegmentCleartext bytes:\n  {}\n",
+            hex::encode(&bytes)
+        );
+        panic!("update PLACEHOLDER");
+    });
+    assert_eq!(bytes, expected, "drifted: {}", hex::encode(&bytes));
+    let decoded: SegmentCleartext = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, seg);
+}
+
+/// ManifestCleartext (the root, encrypted under the epoch key) — one
+/// `SegmentRef` (so `SegmentRef`'s wire form is pinned transitively) + one tail
+/// event.
+#[test]
+fn manifest_cleartext_wire_bytes_pinned() {
+    let manifest = ManifestCleartext {
+        version: MANIFEST_CLEARTEXT_V1,
+        community_id: SpaceId([0x22; 16]),
+        segments: vec![pin_seg_ref()],
+        tail: vec![pin_event()],
+    };
+    let bytes = canonical_cbor_encode(&manifest).expect("encode");
+    let expected_hex = "a462766e01626369502222222222222222222222222222222262736781a562736358205555555555555555555555555555555555555555555555555555555555555555626c6fa462776d1903e8626c67006264766264766269645011111111111111111111111111111111626869a462776d1907d0626c67006264766264766269645099999999999999999999999999999999626e6e02626b735820666666666666666666666666666666666666666666666666666666666666666662746c81a662696450111111111111111111111111111111116263695022222222222222222222222222222222626b6ea1627467616c6261635033333333333333333333333333333333626174a361771903e8616c006164626476627367584044444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444444";
+    let expected = hex::decode(expected_hex).unwrap_or_else(|_| {
+        eprintln!(
+            "\nACTUAL ManifestCleartext bytes:\n  {}\n",
+            hex::encode(&bytes)
+        );
+        panic!("update PLACEHOLDER");
+    });
+    assert_eq!(bytes, expected, "drifted: {}", hex::encode(&bytes));
+    let decoded: ManifestCleartext = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, manifest);
+}
+
+/// SegmentIndex — the local sidecar format (never on the wire, but pinning it
+/// documents the persisted shape).
+#[test]
+fn segment_index_wire_bytes_pinned() {
+    let idx = SegmentIndex {
+        version: 1,
+        sealed: vec![SealedEntry {
+            lo: EventBoundary {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "dv".into(),
+                id: [0x11; 16],
+            },
+            hi: EventBoundary {
+                wall_ms: 2000,
+                logical: 0,
+                device_id: "dv".into(),
+                id: [0x99; 16],
+            },
+            count: 2,
+            k_s: [0x66; 32],
+            segment_cid: ContentId::from_bytes([0x55; 32]),
+        }],
+    };
+    let bytes = canonical_cbor_encode(&idx).expect("encode");
+    let expected_hex = "a262766e0162736781a5626c6fa462776d1903e8626c67006264766264766269645011111111111111111111111111111111626869a462776d1907d0626c67006264766264766269645099999999999999999999999999999999626e6e02626b735820666666666666666666666666666666666666666666666666666666666666666662736358205555555555555555555555555555555555555555555555555555555555555555";
+    let expected = hex::decode(expected_hex).unwrap_or_else(|_| {
+        eprintln!("\nACTUAL SegmentIndex bytes:\n  {}\n", hex::encode(&bytes));
+        panic!("update PLACEHOLDER");
+    });
+    assert_eq!(bytes, expected, "drifted: {}", hex::encode(&bytes));
+    let decoded: SegmentIndex = canonical_cbor_decode(&bytes).expect("decode");
+    assert_eq!(decoded, idx);
 }
