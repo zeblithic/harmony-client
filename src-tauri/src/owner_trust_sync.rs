@@ -62,11 +62,22 @@ impl CanonicalPayload for OwnerState {}
 /// this stays correct regardless of which individual `add_*` calls were
 /// idempotent no-ops vs. real inserts.
 pub fn merge_trust_remote_into_local(local: &mut OwnerState, remote: OwnerState) -> MergeOutcome {
-    let before = harmony_owner::cbor::to_canonical(&*local).ok();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    merge_trust_remote_into_local_at(local, remote, now)
+}
+
+/// Clock-injectable inner of [`merge_trust_remote_into_local`] (ZEB-854 test
+/// seam). `now` is epoch **seconds**; `0` marks an unreadable/pre-epoch local
+/// clock (fail-open at the liveness forward-skew bound below).
+fn merge_trust_remote_into_local_at(
+    local: &mut OwnerState,
+    remote: OwnerState,
+    now: u64,
+) -> MergeOutcome {
+    let before = harmony_owner::cbor::to_canonical(&*local).ok();
     let OwnerState {
         owner_id: _,
         enrollments,
@@ -106,6 +117,19 @@ pub fn merge_trust_remote_into_local(local: &mut OwnerState, remote: OwnerState)
         }
     }
     for (id, cert) in liveness {
+        // ZEB-854: harmony-owner's freshness reads (trust.rs / state.rs) are
+        // one-sided lower bounds, so a sibling cert stamped in our future reads
+        // as "active"/"fresh" forever. Reject a beyond-tolerance future stamp at
+        // this ingest funnel — the sibling-side mirror of the ZEB-721 self-cert
+        // ClockRegressed guard, extending the ZEB-847 reject-at-ingest pattern to
+        // this (trust) merge. Fail-open when our own clock is unreadable (now == 0).
+        if crate::clock_trust::secs_exceeds_forward_skew(cert.timestamp, now) {
+            tracing::warn!(
+                skew_secs = cert.timestamp.saturating_sub(now),
+                "trust merge: sibling liveness cert rejected (future-stamped beyond skew tolerance)"
+            );
+            continue;
+        }
         let known_newer = local
             .liveness
             .get(&id)
@@ -476,6 +500,96 @@ mod tests {
 
         assert!(local.is_revoked(d2));
         assert!(!local.liveness.contains_key(&d2));
+    }
+
+    #[test]
+    fn merge_rejects_future_stamped_sibling_liveness() {
+        // ZEB-854: a sibling cert stamped far in our future must NOT enter
+        // local.liveness — else it reads "active"/"fresh" forever in
+        // harmony-owner's one-sided freshness checks.
+        let now = 1_700_000_000u64;
+        let (mut local, artifact, _sk1) = test_mint(now);
+        let (sk2, cert2) = test_enroll_second_device(&artifact, &local, now + 10);
+        let d2 = cert2.device_id;
+        local
+            .add_enrollment(cert2, now + 10, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        let owner_id = local.owner_id;
+
+        let mut remote = local.clone();
+        remote
+            .add_liveness(test_liveness(&sk2, owner_id, now + 3600)) // +1h ≫ 5-min tol
+            .unwrap();
+
+        merge_trust_remote_into_local_at(&mut local, remote, now);
+        assert!(!local.liveness.contains_key(&d2));
+    }
+
+    #[test]
+    fn merge_accepts_in_window_sibling_liveness() {
+        let now = 1_700_000_000u64;
+        let (mut local, artifact, _sk1) = test_mint(now);
+        let (sk2, cert2) = test_enroll_second_device(&artifact, &local, now + 10);
+        let d2 = cert2.device_id;
+        local
+            .add_enrollment(cert2, now + 10, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        let owner_id = local.owner_id;
+
+        let mut remote = local.clone();
+        remote
+            .add_liveness(test_liveness(&sk2, owner_id, now + 60)) // within 5-min tol
+            .unwrap();
+
+        merge_trust_remote_into_local_at(&mut local, remote, now);
+        assert!(local.liveness.contains_key(&d2));
+    }
+
+    #[test]
+    fn merge_fails_open_on_unreadable_local_clock() {
+        // now == 0 (pre-epoch/unreadable) ⇒ apply-all: even a future cert is
+        // accepted, so a bad LOCAL clock never drops honest sibling state.
+        let now = 1_700_000_000u64;
+        let (mut local, artifact, _sk1) = test_mint(now);
+        let (sk2, cert2) = test_enroll_second_device(&artifact, &local, now + 10);
+        let d2 = cert2.device_id;
+        local
+            .add_enrollment(cert2, now + 10, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        let owner_id = local.owner_id;
+
+        let mut remote = local.clone();
+        remote
+            .add_liveness(test_liveness(&sk2, owner_id, now + 3600))
+            .unwrap();
+
+        merge_trust_remote_into_local_at(&mut local, remote, 0);
+        assert!(local.liveness.contains_key(&d2));
+    }
+
+    #[test]
+    fn merge_reject_does_not_clobber_stored_honest_liveness() {
+        // A stored honest cert must survive an incoming future cert for the same
+        // signer (reject fires before the LWW branch).
+        let now = 1_700_000_000u64;
+        let (mut local, artifact, _sk1) = test_mint(now);
+        let (sk2, cert2) = test_enroll_second_device(&artifact, &local, now + 10);
+        let d2 = cert2.device_id;
+        local
+            .add_enrollment(cert2, now + 10, DEFAULT_ACTIVE_WINDOW_SECS)
+            .unwrap();
+        let owner_id = local.owner_id;
+        local
+            .add_liveness(test_liveness(&sk2, owner_id, now + 30)) // stored honest cert
+            .unwrap();
+
+        let mut remote = local.clone();
+        remote
+            .add_liveness(test_liveness(&sk2, owner_id, now + 3600)) // future overwrite attempt
+            .unwrap();
+
+        merge_trust_remote_into_local_at(&mut local, remote, now);
+        assert_eq!(local.liveness.get(&d2).unwrap().timestamp, now + 30);
     }
 
     #[test]
