@@ -432,6 +432,69 @@ pub fn build_butler_set(
     out
 }
 
+/// Aggregate the creator's active devices into a vine relay set (max
+/// [`crate::pkarr_vines::VINE_RELAY_SET_MAX`]). The vines analogue of
+/// [`build_butler_set`], minus the `vk_lookup` layer: a `VineRelayEntry`
+/// carries only `iroh_endpoint_id` + `home_relay`, both present directly in
+/// `FleetNetRow`, so no per-device verify-key resolution is needed.
+///
+/// `self_entry` is the publishing device's own live transport data (it is
+/// online by definition at publish time) and appears exactly once: when self's
+/// snapshot row is in the fresh ordering it is replaced by `self_entry`'s
+/// fresher data; when self's row is stale/missing or fresh siblings filled the
+/// cap, `self_entry` is force-inserted at the front, evicting the
+/// lowest-priority entry if the set is full.
+///
+/// Sibling ordering, staleness filtering, and the ZEB-852/856 peer-inflation
+/// hardening all come from reusing [`butler_set_order`]. `now_ms` is the
+/// receiver clock; the freshness window is `BUTLER_SET_FRESHNESS_MS`, and the
+/// `stale_before_ms` inversion `butler_set_order` expects is computed HERE so
+/// no caller can get it wrong.
+///
+/// Pin promotion is inherited but invisible: `butler_set_order` may lead with
+/// the owner's pinned device, but `VineRelayEntry` has no `pinned` field, so
+/// that affects only ORDER (a dialing-preference hint), never what a follower
+/// observes.
+pub fn build_vine_relay_set(
+    doc: &FleetNetDoc,
+    self_device_id: &str,
+    self_entry: crate::pkarr_vines::VineRelayEntry,
+    now_ms: u64,
+) -> Vec<crate::pkarr_vines::VineRelayEntry> {
+    use crate::pkarr_vines::{VineRelayEntry, VINE_RELAY_SET_MAX};
+
+    let stale_before_ms = now_ms.saturating_sub(crate::butler_deposit::BUTLER_SET_FRESHNESS_MS);
+
+    let mut out: Vec<VineRelayEntry> = Vec::new();
+    let mut saw_self = false;
+    for (dev_id, row) in butler_set_order(doc, stale_before_ms) {
+        if out.len() >= VINE_RELAY_SET_MAX {
+            break;
+        }
+        if dev_id == self_device_id {
+            // Self appears once: replace its snapshot row with the fresher live
+            // transport data captured at blob-build time.
+            saw_self = true;
+            out.push(self_entry.clone());
+            continue;
+        }
+        out.push(VineRelayEntry {
+            iroh_endpoint_id: row.iroh_endpoint_id,
+            home_relay: row.home_relay.clone(),
+        });
+    }
+    if !saw_self {
+        // Self's row is stale/missing, or fresh siblings filled the cap. The
+        // publisher is online NOW (it is publishing this record), so force its
+        // live entry in, evicting the lowest-priority sibling if the set is full.
+        if out.len() >= VINE_RELAY_SET_MAX {
+            out.pop();
+        }
+        out.insert(0, self_entry);
+    }
+    out
+}
+
 /// Selection-relevant projection of the fleet-net doc (ZEB-418 P2, D16):
 /// the advertised prefix's (device-id, endpoint, relay, pinned) tuples.
 /// Deliberately EXCLUDES `seen_at` — stamp-only refreshes (the periodic
@@ -1926,5 +1989,136 @@ mod tests {
         assert!(!frame.is_empty(), "published wire frame must be non-empty");
 
         let _ = engine.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod vine_relay_set_tests {
+    use super::*;
+    use crate::butler_deposit::BUTLER_SET_FRESHNESS_MS;
+    use crate::owner_state_types::Hlc;
+    use crate::pkarr_vines::{VineRelayEntry, VINE_RELAY_SET_MAX};
+
+    const SELF_ID: &str = "self-device";
+    const SELF_EP: [u8; 32] = [0xEE; 32];
+
+    fn row(ep: u8, relay: &str, wall_ms: u64) -> FleetNetRow {
+        FleetNetRow {
+            iroh_endpoint_id: [ep; 32],
+            home_relay: relay.to_string(),
+            seen_at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: String::new(),
+            },
+            feed_binding: None,
+        }
+    }
+
+    fn self_entry() -> VineRelayEntry {
+        VineRelayEntry {
+            iroh_endpoint_id: SELF_EP,
+            home_relay: "https://self.example".to_string(),
+        }
+    }
+
+    fn doc_with(rows: &[(&str, FleetNetRow)]) -> FleetNetDoc {
+        let mut d = FleetNetDoc::default();
+        for (id, r) in rows {
+            d.devices.insert((*id).to_string(), r.clone());
+        }
+        d
+    }
+
+    #[test]
+    fn empty_doc_yields_self_only() {
+        let now = BUTLER_SET_FRESHNESS_MS * 10;
+        let out = build_vine_relay_set(&FleetNetDoc::default(), SELF_ID, self_entry(), now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].iroh_endpoint_id, SELF_EP);
+    }
+
+    #[test]
+    fn self_snapshot_row_replaced_by_live_entry() {
+        let now = BUTLER_SET_FRESHNESS_MS * 10;
+        // self's snapshot row carries STALE transport (ep 0x11); must be dropped
+        // in favor of self_entry's live ep 0xEE.
+        let doc = doc_with(&[
+            (SELF_ID, row(0x11, "https://old-self.example", now)),
+            ("bb", row(0x22, "https://b.example", now)),
+        ]);
+        let out = build_vine_relay_set(&doc, SELF_ID, self_entry(), now);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out.iter().filter(|e| e.iroh_endpoint_id == SELF_EP).count(),
+            1
+        );
+        assert!(
+            out.iter().all(|e| e.iroh_endpoint_id != [0x11; 32]),
+            "stale self row must be replaced"
+        );
+        assert!(out.iter().any(|e| e.iroh_endpoint_id == [0x22; 32]));
+    }
+
+    #[test]
+    fn caps_at_max_with_self_forced() {
+        let now = BUTLER_SET_FRESHNESS_MS * 10;
+        // 6 fresh siblings, self NOT among them → self force-included, capped.
+        let rows: Vec<(&str, FleetNetRow)> = vec![
+            ("s0", row(0x30, "https://s.example", now)),
+            ("s1", row(0x31, "https://s.example", now)),
+            ("s2", row(0x32, "https://s.example", now)),
+            ("s3", row(0x33, "https://s.example", now)),
+            ("s4", row(0x34, "https://s.example", now)),
+            ("s5", row(0x35, "https://s.example", now)),
+        ];
+        let out = build_vine_relay_set(&doc_with(&rows), SELF_ID, self_entry(), now);
+        assert_eq!(out.len(), VINE_RELAY_SET_MAX);
+        assert_eq!(
+            out.iter().filter(|e| e.iroh_endpoint_id == SELF_EP).count(),
+            1
+        );
+        assert_eq!(
+            out[0].iroh_endpoint_id, SELF_EP,
+            "force-inserted self leads"
+        );
+    }
+
+    #[test]
+    fn stale_sibling_excluded() {
+        let now = BUTLER_SET_FRESHNESS_MS * 10;
+        let doc = doc_with(&[
+            ("bb", row(0x22, "https://b.example", now)),
+            (
+                "cc",
+                row(0x33, "https://c.example", now - BUTLER_SET_FRESHNESS_MS - 1),
+            ),
+        ]);
+        let out = build_vine_relay_set(&doc, SELF_ID, self_entry(), now);
+        assert_eq!(out.len(), 2, "self (forced) + fresh bb; stale cc excluded");
+        assert!(out.iter().any(|e| e.iroh_endpoint_id == [0x22; 32]));
+        assert!(out.iter().all(|e| e.iroh_endpoint_id != [0x33; 32]));
+    }
+
+    #[test]
+    fn future_skewed_sibling_does_not_outrank_present() {
+        // Inherits the ZEB-852 clamp from butler_set_order: an in-window but
+        // future-dated sibling must not out-rank an honest present row. Both are
+        // clamped to `now`, then the ascending device-id tiebreak decides.
+        let now = BUTLER_SET_FRESHNESS_MS * 10;
+        let doc = doc_with(&[
+            ("bb-honest", row(0x22, "https://b.example", now)),
+            (
+                "zz-skewed",
+                row(0x33, "https://z.example", now + BUTLER_SET_FRESHNESS_MS / 2),
+            ),
+        ]);
+        // self force-inserts at front; assert honest bb precedes skewed zz.
+        let out = build_vine_relay_set(&doc, SELF_ID, self_entry(), now);
+        let pos = |ep: [u8; 32]| out.iter().position(|e| e.iroh_endpoint_id == ep).unwrap();
+        assert!(
+            pos([0x22; 32]) < pos([0x33; 32]),
+            "clamped honest row must precede future-skewed row"
+        );
     }
 }
