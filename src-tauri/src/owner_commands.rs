@@ -1972,20 +1972,22 @@ pub(crate) fn reset_local_identity_inner(
 }
 
 /// Remove every direct child of `dir` whose file name is not in `excluded`,
-/// recursively for subdirectories. Best-effort: a child that cannot be removed
-/// is logged and skipped so one locked entry can't abort the whole wipe
-/// (ZEB-842). A missing `dir` is a clean no-op.
+/// recursively for subdirectories. Attempts EVERY child even when some fail, so
+/// one un-removable entry can't abort the wipe — then returns the collected
+/// failures (joined) so the caller can report a truthful partial result instead
+/// of a false "clean" (ZEB-842; CWE-459). A missing `dir` is a clean no-op.
 fn remove_dir_children_except(dir: &Path, excluded: &[&str]) -> Result<(), String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(format!("read dir {}: {e}", dir.display())),
     };
+    let mut failures: Vec<String> = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!(dir = %dir.display(), error = %e, "erase: skipping unreadable dir entry");
+                failures.push(format!("read entry in {}: {e}", dir.display()));
                 continue;
             }
         };
@@ -2002,26 +2004,47 @@ fn remove_dir_children_except(dir: &Path, excluded: &[&str]) -> Result<(), Strin
             std::fs::remove_file(&path)
         };
         if let Err(e) = removed {
-            tracing::warn!(path = %path.display(), error = %e, "erase: could not remove entry — skipping");
+            failures.push(format!("{}: {e}", path.display()));
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
-/// Names excluded from the [`erase_all_local_data`] wipe: `profiles/` keeps
-/// sibling identities/profiles isolated (ZEB-586); `logs/` is the live tracing
-/// sink the webview-only reload keeps open, so deleting it just races the
-/// appender (diagnostic, not user content).
-const ERASE_EXCLUDED: &[&str] = &["profiles", "logs"];
+/// Names kept when wiping the **identity** dir: `profiles/` isolates sibling
+/// identities (ZEB-586); `identity.enc.lock` is the cross-process lock the wipe
+/// itself holds via [`crate::identity::with_identity_dir_write_guard`] — deleting
+/// the held path lets another process lock a *replacement* file mid-wipe on Unix,
+/// silently breaking the exclusion (CodeRabbit). It is a zero-byte lock,
+/// recreated on next boot.
+const IDENTITY_ERASE_EXCLUDED: &[&str] = &["profiles", "identity.enc.lock"];
+
+/// Names kept when wiping the **app-data** dir: `profiles/` isolates sibling
+/// profiles (ZEB-586); `logs/` is the live tracing sink the webview-only reload
+/// keeps open, so deleting it just races the appender (diagnostic, not user
+/// content); `api/` holds the cross-process profile lock a running `serve` /
+/// GUI-API server holds (`api::lock::acquire(app_data_dir/api)`) — deleting it
+/// mid-hold breaks the lock on Unix and fails on Windows (Qodo). None of the
+/// three carry the active profile's private user content.
+const APP_DATA_ERASE_EXCLUDED: &[&str] = &["profiles", "logs", "api"];
 
 /// ZEB-842 clean-slate: hard-delete the active profile's identity dir and
-/// app-data dir children (minus [`ERASE_EXCLUDED`]) and best-effort clear the
+/// app-data dir children (minus the exclusions above) and best-effort clear the
 /// keychain. No snapshot — the recovery phrase is the identity backup (contrast
 /// [`reset_local_identity_inner`], which snapshots-then-moves to recover a
 /// bricked boot). Held under [`OWNER_STATE_WRITE_LOCK`] + the identity
 /// write-guard like the reset, so a straggler write can't race the wipe.
-/// `keychain` is injected (ZEB-428): production passes [`prod_keychain`], tests
-/// pass `None`.
+///
+/// Returns `Err` if any child could not be removed: a partial wipe must not read
+/// as success, or the frontend would reload into a false clean slate while
+/// private content remains (CodeRabbit, CWE-459). It still attempts BOTH dirs and
+/// the keychain before reporting — a failure in one does not skip the rest. A
+/// failure to acquire the identity write-guard aborts before anything is deleted
+/// (another process is mid-identity-write). `keychain` is injected (ZEB-428):
+/// production passes [`prod_keychain`], tests pass `None`.
 pub(crate) fn erase_all_local_data_inner(
     identity_dir: &Path,
     app_data_dir: &Path,
@@ -2031,14 +2054,26 @@ pub(crate) fn erase_all_local_data_inner(
         .lock()
         .unwrap_or_else(|p| p.into_inner());
 
-    // Same cross-process exclusion the identity writers take (Greptile #571), so
-    // a wipe fails fast rather than racing another harmony process sharing this
-    // identity dir. The app-data removal needs no such guard — its writers are
-    // the node engines, quiesced by the caller's stop_inner before we get here.
+    let mut failures: Vec<String> = Vec::new();
+
+    // Identity dir under the same cross-process write guard the identity writers
+    // take (Greptile #571). A guard-acquisition failure aborts the whole wipe —
+    // deleting nothing beats racing another process's identity write. Removal
+    // failures inside are collected (not fatal here) so app-data + keychain
+    // cleanup still run and the final result is truthful.
     crate::identity::with_identity_dir_write_guard(identity_dir, || {
-        remove_dir_children_except(identity_dir, ERASE_EXCLUDED)
+        if let Err(e) = remove_dir_children_except(identity_dir, IDENTITY_ERASE_EXCLUDED) {
+            failures.push(e);
+        }
+        Ok::<(), String>(())
     })?;
-    remove_dir_children_except(app_data_dir, ERASE_EXCLUDED)?;
+
+    // App-data dir: no cross-process guard exists; the caller's stop_inner
+    // quiesced THIS process's engines. `api/` is excluded so a separately running
+    // serve process's held profile lock is not yanked.
+    if let Err(e) = remove_dir_children_except(app_data_dir, APP_DATA_ERASE_EXCLUDED) {
+        failures.push(e);
+    }
 
     // Best-effort clear the OS keychain owner secrets. A failure warns but must
     // NOT fail the wipe — the on-disk owner_state.cbor removal is the
@@ -2052,19 +2087,41 @@ pub(crate) fn erase_all_local_data_inner(
             );
         }
     }
-    Ok(())
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "erase incomplete — {} item(s) could not be removed: {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+    }
+}
+
+/// Backend confirmation gate for [`erase_all_local_data`]: the typed-confirm is
+/// re-checked server-side so a stray or compromised IPC invoke can't trigger an
+/// irreversible wipe without the literal confirmation — the frontend gate alone
+/// is not a security boundary (Qodo, defense-in-depth).
+fn erase_all_confirmed(confirm: &str) -> bool {
+    confirm == "ERASE"
 }
 
 /// ZEB-842: user-confirmed clean-slate wipe (typed-confirm on the GUI). Removes
 /// this device's identity AND every per-profile app-data cache (mail, avatars,
 /// follows, card store, …) for the active profile — the "Erase all local data"
-/// action in Settings and the boot-failure modal. Stops the node FIRST so its
-/// engines cannot rewrite a cache into the gap (mirrors `reset_local_identity`),
-/// then wipes. `None` = stop unconditionally.
+/// action in Settings and the boot-failure modal. `confirm` must equal the
+/// literal `"ERASE"` (re-validated here, not only in the frontend). Stops the
+/// node FIRST so its engines cannot rewrite a cache into the gap (mirrors
+/// `reset_local_identity`), then wipes. `None` = stop unconditionally.
 #[tauri::command]
 pub async fn erase_all_local_data(
+    confirm: String,
     state: tauri::State<'_, Mutex<crate::NodeState>>,
 ) -> Result<(), String> {
+    if !erase_all_confirmed(&confirm) {
+        return Err("erase_all_local_data requires confirm = \"ERASE\"".to_string());
+    }
     let identity_dir = resolve_identity_dir()?;
     let app_data_dir = crate::resolve_app_data_dir()?;
     crate::stop_inner(state.inner(), None);
@@ -2203,7 +2260,8 @@ mod tests {
         // ZEB-842: erase-all is wholesale (unlike reset's curated snapshot) — it
         // hard-deletes EVERY child of the identity dir and app-data dir,
         // including identity.key and any prior `_reset-backup-*` snapshot, minus
-        // the excluded `profiles/` / `logs/`. Keychain injected `None` (ZEB-428).
+        // the per-dir exclusions (covered by the preservation test below).
+        // Keychain injected `None` (ZEB-428).
         let id_tmp = tempfile::tempdir().unwrap();
         let ad_tmp = tempfile::tempdir().unwrap();
         let id = id_tmp.path();
@@ -2220,7 +2278,7 @@ mod tests {
         )
         .unwrap();
 
-        // app-data dir: the full per-profile cache spread (Appendix A).
+        // app-data dir: the full per-profile cache spread (design Appendix A).
         std::fs::create_dir_all(ad.join("mail")).unwrap();
         std::fs::write(ad.join("mail").join("blob"), b"dm").unwrap();
         std::fs::create_dir_all(ad.join("avatars")).unwrap();
@@ -2231,7 +2289,10 @@ mod tests {
         std::fs::create_dir_all(ad.join("mint")).unwrap();
         std::fs::write(ad.join("mint").join("x"), b"m").unwrap();
         std::fs::write(ad.join("storage_records.json"), b"{}").unwrap();
+        std::fs::write(ad.join("storage_ledger.json"), b"{}").unwrap();
         std::fs::write(ad.join("connectivity-settings.json"), b"{}").unwrap();
+        std::fs::write(ad.join("vine_pull.cbor"), b"v").unwrap();
+        std::fs::write(ad.join("last_backup.json"), b"{}").unwrap();
 
         erase_all_local_data_inner(id, ad, None).expect("erase must succeed");
 
@@ -2247,7 +2308,10 @@ mod tests {
             ad.join("profile_cards.deadbeef.cbor"),
             ad.join("mint"),
             ad.join("storage_records.json"),
+            ad.join("storage_ledger.json"),
             ad.join("connectivity-settings.json"),
+            ad.join("vine_pull.cbor"),
+            ad.join("last_backup.json"),
         ] {
             assert!(!p.exists(), "{} must be erased", p.display());
         }
@@ -2256,16 +2320,18 @@ mod tests {
     }
 
     #[test]
-    fn erase_all_local_data_inner_preserves_profiles_and_logs() {
-        // ZEB-586 isolation + live-sink: the default-profile wipe deletes
-        // children EXCEPT `profiles/` (sibling identities/profiles) and `logs/`
-        // (the tracing sink the webview-only reload keeps open). Exercises the
-        // "delete children except X" path on BOTH the identity and app-data root.
+    fn erase_all_local_data_inner_preserves_isolation_and_infra() {
+        // The per-dir exclusions: the identity wipe keeps `profiles/` (ZEB-586)
+        // and the held `identity.enc.lock` (CodeRabbit — deleting the lock the
+        // wipe holds breaks cross-process exclusion). The app-data wipe keeps
+        // `profiles/`, the live `logs/` sink, and the `api/` profile-lock dir a
+        // running serve/GUI-API holds (Qodo). Everything else goes.
         let id_tmp = tempfile::tempdir().unwrap();
         let ad_tmp = tempfile::tempdir().unwrap();
         let id = id_tmp.path();
         let ad = ad_tmp.path();
 
+        // Common to both roots: a sibling profile (survives) + a removable sibling.
         for root in [id, ad] {
             std::fs::create_dir_all(root.join("profiles").join("other")).unwrap();
             std::fs::write(
@@ -2273,11 +2339,15 @@ mod tests {
                 b"sibling",
             )
             .unwrap();
-            std::fs::create_dir_all(root.join("logs")).unwrap();
-            std::fs::write(root.join("logs").join("app.log"), b"log").unwrap();
-            // A removable sibling that MUST go.
             std::fs::write(root.join("removable"), b"x").unwrap();
         }
+        // Identity dir: the held cross-process lock must survive.
+        std::fs::write(id.join("identity.enc.lock"), b"").unwrap();
+        // App-data dir: the live tracing sink and the api/ profile-lock dir survive.
+        std::fs::create_dir_all(ad.join("logs")).unwrap();
+        std::fs::write(ad.join("logs").join("app.log"), b"log").unwrap();
+        std::fs::create_dir_all(ad.join("api")).unwrap();
+        std::fs::write(ad.join("api").join("serve.lock"), b"").unwrap();
 
         erase_all_local_data_inner(id, ad, None).expect("erase must succeed");
 
@@ -2291,26 +2361,95 @@ mod tests {
                 root.display()
             );
             assert!(
-                root.join("logs").join("app.log").exists(),
-                "logs/ under {} must survive",
-                root.display()
-            );
-            assert!(
                 !root.join("removable").exists(),
                 "removable sibling under {} must be erased",
                 root.display()
             );
         }
+        assert!(
+            id.join("identity.enc.lock").exists(),
+            "identity.enc.lock must survive so the cross-process guard isn't broken"
+        );
+        assert!(
+            ad.join("logs").join("app.log").exists(),
+            "logs/ must survive (live tracing sink)"
+        );
+        assert!(
+            ad.join("api").join("serve.lock").exists(),
+            "api/ (profile-lock dir) must survive"
+        );
     }
 
     #[test]
     fn erase_all_local_data_inner_is_a_clean_noop_on_empty_dirs() {
-        // A reset on already-clean dirs is a successful no-op (idempotent).
+        // A wipe on already-clean dirs is a successful no-op (idempotent) and
+        // creates no user data (CodeRabbit: assert the roots end clean). The
+        // identity write-guard leaves its own (excluded) `identity.enc.lock`
+        // behind — that lone zero-byte lock is the only permitted residue.
         let id_tmp = tempfile::tempdir().unwrap();
         let ad_tmp = tempfile::tempdir().unwrap();
         erase_all_local_data_inner(id_tmp.path(), ad_tmp.path(), None)
             .expect("no-op erase must be Ok");
-        assert!(id_tmp.path().exists() && ad_tmp.path().exists());
+        assert_eq!(
+            std::fs::read_dir(ad_tmp.path()).unwrap().count(),
+            0,
+            "app-data root must end empty"
+        );
+        for entry in std::fs::read_dir(id_tmp.path()).unwrap() {
+            assert_eq!(
+                entry.unwrap().file_name(),
+                std::ffi::OsStr::new("identity.enc.lock"),
+                "identity root may retain only the guard's lock file"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn erase_all_local_data_inner_reports_err_on_partial_failure() {
+        // CWE-459: a child that cannot be removed must make the wipe return Err,
+        // so the frontend surfaces it instead of reloading into a false clean
+        // slate — while still attempting the other entries (best-effort).
+        use std::os::unix::fs::PermissionsExt;
+        let id_tmp = tempfile::tempdir().unwrap();
+        let ad_tmp = tempfile::tempdir().unwrap();
+        let ad = ad_tmp.path();
+
+        // A read-only subdir: its child can't be unlinked, so remove_dir_all of
+        // the subdir fails and the failure must propagate.
+        let locked = ad.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("blob"), b"stuck").unwrap();
+        std::fs::write(ad.join("removable"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Root bypasses DAC, so detect whether the perms actually bite here; only
+        // then can we assert the failure path (CI runners are non-root).
+        let perms_enforced = std::fs::write(locked.join("probe"), b"p").is_err();
+
+        let result = erase_all_local_data_inner(id_tmp.path(), ad, None);
+
+        // Restore write perms so tempdir Drop can clean up regardless of outcome.
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+        // The removable sibling is still attempted even though `locked` fails.
+        assert!(
+            !ad.join("removable").exists(),
+            "best-effort: other entries are still removed after a failure"
+        );
+        if perms_enforced {
+            assert!(result.is_err(), "a partial wipe must not report success");
+        }
+    }
+
+    #[test]
+    fn erase_all_confirmed_requires_the_exact_literal() {
+        // Backend defense-in-depth gate: only the exact literal passes.
+        assert!(erase_all_confirmed("ERASE"));
+        assert!(!erase_all_confirmed("erase"));
+        assert!(!erase_all_confirmed("ERASE "));
+        assert!(!erase_all_confirmed(""));
+        assert!(!erase_all_confirmed("ERASE ALL"));
     }
 
     #[test]

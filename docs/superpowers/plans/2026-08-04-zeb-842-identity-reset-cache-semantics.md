@@ -171,4 +171,13 @@
 
 - **Spec coverage:** new `erase_all_local_data` command (T1), wholesale-minus-`profiles/`/`logs/` scrub + default-profile trap (T1 helper + preserve test), hard-delete no-snapshot (T1), both surfaces (T2/T3), honest recovery copy (T2), `ERASE` typed-confirm (T2/T3), locking/keychain reuse (T1), test matrix incl. per-profile isolation + no-op (T1), gates (T4). ✓
 - **Placeholders:** none — backend code is concrete; frontend steps name exact state, gates, and command strings.
-- **Type consistency:** `erase_all_local_data_inner(identity_dir, app_data_dir, keychain)` and the `ERASE` literal are identical across tasks; `ERASE_EXCLUDED = ["profiles","logs"]` used by both dir removals. ✓
+- **Type consistency:** `erase_all_local_data_inner(identity_dir, app_data_dir, keychain)` and the `ERASE` literal are identical across tasks. ✓
+
+## Convergence refinements (review round 1, PR #607)
+
+The as-built implementation refines this plan per the first bot review (see the design doc's matching section for rationale):
+
+- **Per-dir exclusions:** identity dir keeps `["profiles", "identity.enc.lock"]` (the held cross-process lock — deleting it breaks the guard); app-data dir keeps `["profiles", "logs", "api"]` (`api/` holds the serve/GUI-API profile lock). Not the single `ERASE_EXCLUDED = ["profiles","logs"]` sketched above.
+- **Truthful partial result:** `remove_dir_children_except` collects removal failures and returns `Err`; `erase_all_local_data_inner` attempts both dirs + keychain, then returns `Err` if anything remained (CWE-459) — the guard-acquisition failure still aborts first.
+- **Backend confirm gate:** the command takes `confirm: String` and requires the literal `"ERASE"`; both surfaces pass the typed text.
+- **Tests:** the preservation test also asserts `identity.enc.lock` + `api/` survive; the wipe fixture covers `storage_ledger.json` / `last_backup.json` / `vine_pull.cbor`; added a partial-failure→`Err` test (unix) and an `erase_all_confirmed` gate test.

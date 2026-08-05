@@ -149,14 +149,15 @@ describe('StartupRecoveryOptions (ZEB-835 / ZEB-836)', () => {
     await fireEvent.input(input, { target: { value: 'erase' } });
     expect(go.disabled).toBe(true);
     await fireEvent.click(go);
-    expect(invoke).not.toHaveBeenCalledWith('erase_all_local_data');
+    expect(invoke).not.toHaveBeenCalledWith('erase_all_local_data', expect.anything());
 
     // Exactly ERASE enables it.
     await fireEvent.input(input, { target: { value: 'ERASE' } });
     expect(go.disabled).toBe(false);
     await fireEvent.click(go);
 
-    expect(invoke).toHaveBeenCalledWith('erase_all_local_data');
+    // Passes the typed text so the backend can re-validate the confirmation.
+    expect(invoke).toHaveBeenCalledWith('erase_all_local_data', { confirm: 'ERASE' });
     expect(reload).toHaveBeenCalledTimes(1);
   });
 

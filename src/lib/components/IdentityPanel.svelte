@@ -97,9 +97,11 @@
     if (wizardState.kind !== 'erase' || wizardState.typedText !== 'ERASE' || wizardState.erasing) {
       return;
     }
+    const confirm = wizardState.typedText;
     wizardState = { ...wizardState, erasing: true, error: null };
     try {
-      await invoke('erase_all_local_data');
+      // Backend re-validates `confirm === 'ERASE'` (defense-in-depth).
+      await invoke('erase_all_local_data', { confirm });
       reload();
     } catch (e) {
       wizardState = { kind: 'erase', typedText: 'ERASE', erasing: false, error: extractError(e) };
@@ -1150,9 +1152,10 @@
   <section class="identity-panel" aria-label="Identity">
     <h3 class="section-title">Erase all local data</h3>
     <p class="warning-text">
-      This permanently erases this device's identity and all cached data for this
-      profile — messages, avatars, follows, and more. Your recovery phrase still
-      restores your identity, but the cached content cannot be recovered.
+      This permanently erases this device's identity and all of this profile's cached
+      data — messages, avatars, follows, and more. Other profiles on this device and
+      diagnostic logs are not affected. Your recovery phrase still restores your
+      identity, but the cached content cannot be recovered.
     </p>
     <label class="field-label">
       Type <strong>ERASE</strong> to confirm:

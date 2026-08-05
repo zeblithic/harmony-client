@@ -103,7 +103,8 @@
     mode = 'erasing';
     eraseError = null;
     try {
-      await invoke('erase_all_local_data');
+      // Backend re-validates `confirm === 'ERASE'` (defense-in-depth).
+      await invoke('erase_all_local_data', { confirm: eraseText });
       // Identity + caches gone → next boot classifies as `missing` → onboarding.
       reload();
     } catch (e) {
@@ -167,9 +168,9 @@
               Recover this device's onboarding. Your current identity is backed up
               to a folder on this device first, then set aside so the app starts
               fresh. Cached content (messages, avatars) stays on this device — use
-              “Erase all local data” below to remove everything. You'll lose access
-              to communities you joined here unless you have your recovery phrase.
-              This can't be undone from the app.
+              “Erase all local data” below to also clear this profile's cached data.
+              You'll lose access to communities you joined here unless you have your
+              recovery phrase. This can't be undone from the app.
             </span>
           </label>
           {#if resetError}
@@ -200,10 +201,11 @@
         <div class="erase-confirm-block">
           <p class="erase-lead">
             This permanently erases this device's identity <strong
-              >and all cached data</strong
+              >and all of this profile's cached data</strong
             >
-            for this profile — messages, avatars, and more. Your recovery phrase still
-            restores your identity, but the cached content can't be recovered.
+            — messages, avatars, follows, and more. Other profiles on this device and
+            diagnostic logs are not affected. Your recovery phrase still restores your
+            identity, but the cached content can't be recovered.
           </p>
           <label class="erase-confirm">
             <span>Type <strong>ERASE</strong> to confirm</span>

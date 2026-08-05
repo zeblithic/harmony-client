@@ -1981,7 +1981,9 @@ describe('IdentityPanel — erase all local data (ZEB-842)', () => {
     expect(go.disabled).toBe(false);
     await fireEvent.click(go);
 
-    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('erase_all_local_data'));
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith('erase_all_local_data', { confirm: 'ERASE' }),
+    );
     expect(reload).toHaveBeenCalledTimes(1);
   });
 

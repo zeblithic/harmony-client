@@ -54,7 +54,7 @@ Rationale vs. an explicit allowlist (like the existing `OWNER_RESET_FILES`): a m
 - *Named* profile: `identity_dir` = `~/.harmony/profiles/<name>/`, `app_data_dir` = `…/net.zeblith.harmony/profiles/<name>/`. Self-contained subtrees; wiping the whole dir is safe. (`profiles/` won't appear inside them, so the exclusion is a no-op here; `logs/` still applies.)
 - *Default* profile: `identity_dir` = `~/.harmony/`, `app_data_dir` = `…/net.zeblith.harmony/`. Both **contain** `profiles/` (sibling named identities/profiles). A `remove_dir_all` of the dir itself would destroy siblings. So the operation iterates the dir's entries and deletes each **except** `profiles/` and `logs/`.
 
-This is uniform across both cases: "for each child entry of `dir`, if its file name is not `profiles/` or `logs/`, remove it (recursively for dirs)." A shared helper `remove_dir_children_except(dir, &excluded)` implements it.
+This is uniform across both cases: "for each child entry of `dir`, if its file name is not excluded, remove it (recursively for dirs)." A shared helper `remove_dir_children_except(dir, &excluded)` implements it, with **per-dir exclusion sets** (see Convergence refinements below): the identity dir also keeps its held `identity.enc.lock`, and the app-data dir also keeps `logs/` and the `api/` profile-lock dir.
 
 **Reused machinery (mirrors `reset_local_identity`):**
 - Stop the node first (`crate::stop_inner(state, None)`) so no engine (liveness refresher, mail persist, fleet sync) rewrites a cache into the gap.
@@ -132,6 +132,16 @@ Rust: `cargo nextest run --locked --workspace --all-targets --features test-fixt
 - **Logs are retained by design** (live sink); not a security regression — they are diagnostic, and a full log wipe needs a process restart the webview `reload()` doesn't provide.
 
 ---
+
+## Convergence refinements (review round 1, PR #607)
+
+Three correctness/safety changes landed after the first bot review:
+
+1. **Per-dir exclusions, not one shared set.** The identity wipe keeps `["profiles", "identity.enc.lock"]`; the app-data wipe keeps `["profiles", "logs", "api"]`.
+   - `identity.enc.lock` — the cross-process lock the wipe itself holds via `with_identity_dir_write_guard`. Deleting the held path lets another process lock a *replacement* file mid-wipe on Unix, silently breaking the exclusion (CodeRabbit, Critical). It's a zero-byte lock, recreated on next boot; the identity dir legitimately retains only this after a wipe.
+   - `api/` — the app-data dir holds the cross-process profile lock a running `serve`/GUI-API server takes (`api::lock::acquire(app_data_dir/api)`). Deleting it mid-hold breaks the lock on Unix and fails on Windows (Qodo). Excluded like `logs/` — live coordination state, not user content. We do **not** acquire the serve lock before wiping (the GUI holds its own `api/` lock → self-deadlock); erase-all keeps reset's single-process posture.
+2. **Truthful partial result (CWE-459).** `remove_dir_children_except` now attempts every child, collects failures, and returns `Err` if any remained; `erase_all_local_data_inner` attempts both dirs + the keychain before reporting, and returns `Err` if anything could not be removed — so the frontend surfaces the failure instead of reloading into a false clean slate (CodeRabbit, Major). A failure to acquire the identity write-guard still aborts before deleting anything.
+3. **Backend confirmation gate (defense-in-depth).** The `erase_all_local_data` command takes `confirm: String` and rejects anything but the literal `"ERASE"` before doing work; both surfaces pass the typed text. The frontend gate alone is not a security boundary for an irreversible action (Qodo).
 
 ## Appendix A — verified app-data inventory (per-profile `…/net.zeblith.harmony[/profiles/<name>]`)
 
