@@ -42,11 +42,12 @@ Each of the four steps currently reads (identical shape):
 
 ```yaml
       - name: Install mold linker (ZEB-498)
-        # ZEB-800: mold is a pure speed optimization. The action runs shell:bash
-        # (-eo pipefail), so a failed wget|tar download aborts before its
-        # `ln -sf … /usr/bin/ld` line — a failed install leaves the distro-default
-        # linker and a byte-identical (slower) build. Never let a transient
-        # network blip red a required gate.
+        # ZEB-800: mold is a pure speed optimization. The pinned action runs
+        # shell:bash (-eo pipefail), so a failed wget|tar download aborts before
+        # its `ln -sf /usr/local/bin/mold "$(realpath /usr/bin/ld)"` line, so a
+        # failed install keeps the distro-default linker and yields a
+        # functionally equivalent (slower) build. Do not let a transient network
+        # blip red a required gate.
         continue-on-error: true
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
         with:
@@ -68,8 +69,8 @@ Expected: no output (clean exit 0).
 
 - [ ] **Step 4: Sanity-check the pins and knobs are untouched.**
 
-Run: `git diff .github/workflows/ | grep -E 'setup-mold@|mold-version|make-default'`
-Expected: no lines (those lines are unchanged, so they don't appear in the diff).
+Run: `git diff --unified=0 -- .github/workflows/ | grep -E '^[+-][^+-].*(setup-mold@|mold-version|make-default)'`
+Expected: no output. `--unified=0` drops unchanged context lines (a plain `git diff` keeps them, so those pin lines — which sit next to the edited step — would match even when untouched); the `^[+-][^+-]` anchor matches only added/removed content, not the `+++`/`---` file headers. Any match therefore means a pin, `mold-version`, or `make-default` line actually changed.
 
 - [ ] **Step 5: Commit.**
 

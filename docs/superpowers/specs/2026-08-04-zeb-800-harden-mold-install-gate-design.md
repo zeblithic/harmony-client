@@ -11,7 +11,9 @@ The `Install mold linker (ZEB-498)` step runs the pinned composite action
 `rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444` (v1). mold is a
 **pure speed optimization** — `make-default: true` symlinks `/usr/bin/ld` →
 mold, so nothing in the build references it and a job that never installs mold
-produces a **byte-identical** result, only slower. Yet the step can **red a
+produces a **functionally equivalent** result (a correct build that passes the
+same gates — not necessarily byte-for-byte identical, since the distro linker
+and mold can lay out a binary differently), only slower. Yet the step can **red a
 required gate** on a transient network blip: on PR #554's head `4df11152`
 (run 30186565183, 2026-07-26) the runner failed to resolve `github.com`, the
 action's `wget` failed, and the job exited non-zero — while every job that
@@ -84,6 +86,17 @@ The ticket's caveat — "could a partial extract leave a truncated
    step aborts before the symlink line. The `ln` is only reached when the
    pipeline **succeeded**, i.e. mold is fully installed.
 
+The symlink step itself cannot strand a build on a broken linker either. It runs
+only after a successful extract, so its target `/usr/local/bin/mold` provably
+exists — `ln -sf` cannot create a *dangling* link. And the line is
+`test … && ln … ; true`: an `ln` that fails (e.g. a read-only target) is
+swallowed by the trailing `; true`, leaving `/usr/bin/ld` at the distro default.
+So across every reachable outcome — download failure, extract failure, or a
+failed symlink — `/usr/bin/ld` resolves to a working linker; no build ever runs
+against a missing or dangling one. (This is the postcondition a restore-`ld`
+wrapper would assert; the analysis shows it already holds, so the assertion is
+redundant.)
+
 Therefore bare `continue-on-error: true` is provably safe for the observed
 failure and all realistic streaming-pipe failures. The restore-`ld` wrapper the
 ticket floats as a fallback guards a case the pipe makes unreachable.
@@ -95,15 +108,17 @@ one-line comment stating the safety invariant (this is the **first**
 `continue-on-error` in the repo, so the rationale must travel with the code).
 
 `continue-on-error` governs only **failure** handling; the success path is
-byte-for-byte unchanged. When the network is healthy, mold installs and the
-symlink is created exactly as today.
+unchanged. When the network is healthy, mold installs and the symlink is created
+exactly as today.
 
 ### Rejected alternatives
 
 - **B — restore-`ld` wrapper step.** Reimplement/guard the install and, on
-  failure, explicitly reset `/usr/bin/ld`. Guards a case `errexit` + the
-  streaming pipe already make unreachable; adds a bespoke step and drifts from
-  the upstream action. YAGNI.
+  failure, explicitly reset `/usr/bin/ld`. Guards a state the safety analysis
+  above shows is unreachable — a failed download aborts before the symlink, a
+  successful one leaves a valid mold, and a failed `ln` leaves the distro
+  default — so `/usr/bin/ld` always resolves to a working linker without it. Adds
+  a bespoke step and drifts from the upstream action. YAGNI.
 - **C — drop mold.** Out of scope. ZEB-498 measured mold's benefit and the
   rust-test sharding depends on the compile/link time it buys.
 
@@ -142,3 +157,29 @@ linter, the semantic argument, and the subsequent live run.
   beyond the mold step (ZEB-764).
 - Any change to mold's version, the SHA pin, or the decision to use mold.
 - Broader CI retry/resilience work (ZEB-499 family).
+
+## Convergence refinement (PR #610, review round 1)
+
+CodeRabbit (3 actionable) + Qodo (2 bugs) landed; CodeAnt clean; Greptile
+author-excluded. Four distinct findings, all on prose/plan text (the functional
+`continue-on-error` change was LGTM'd):
+
+1. **Overstated "byte-identical"** (CodeRabbit Minor). The fallback uses the
+   distro linker, the success path mold — different linkers need not emit
+   byte-identical binaries. Reworded to **functionally equivalent** here, in the
+   plan, and in all four workflow comments; the claim is now "a correct build
+   that passes the same gates."
+2. **Misquoted symlink target** (Qodo Strong). The four comments quoted
+   `ln -sf … /usr/bin/ld`; the action links over `"$(realpath /usr/bin/ld)"`.
+   Comments corrected to the exact form.
+3. **Plan Step 4 diff-grep false positive** (Qodo Strong + CodeRabbit Minor,
+   duplicate). A plain `git diff | grep` includes unchanged context, so the pin
+   lines match even when untouched. Step 4 now uses
+   `git diff --unified=0 … | grep -E '^[+-][^+-]…'` (changed lines only).
+4. **"Validate or roll back the symlink" — declined** (CodeRabbit Major). This
+   is the Option-B restore-`ld` wrapper. The added safety paragraph above proves
+   no reachable outcome leaves a missing/dangling linker (failed download aborts
+   pre-symlink; a reached `ln` has a provably-extracted target; a failed `ln` is
+   swallowed, leaving the distro default). Guarding an unreachable state is the
+   YAGNI the design already rejected — so the analysis was strengthened rather
+   than the code.

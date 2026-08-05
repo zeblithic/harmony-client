@@ -87,9 +87,10 @@ jobs:
       - name: Install mold linker (ZEB-498)
         # ZEB-800: mold is a pure speed optimization. The pinned action runs
         # shell:bash (-eo pipefail), so a failed wget|tar download aborts before
-        # its `ln -sf /usr/local/bin/mold /usr/bin/ld` line -- a failed install
-        # keeps the distro-default linker and yields a byte-identical (slower)
-        # build. Do not let a transient network blip red a required gate.
+        # its `ln -sf /usr/local/bin/mold "$(realpath /usr/bin/ld)"` line, so a
+        # failed install keeps the distro-default linker and yields a
+        # functionally equivalent (slower) build. Do not let a transient network
+        # blip red a required gate.
         continue-on-error: true
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
         with:
@@ -262,9 +263,10 @@ jobs:
       - name: Install mold linker (ZEB-498)
         # ZEB-800: mold is a pure speed optimization. The pinned action runs
         # shell:bash (-eo pipefail), so a failed wget|tar download aborts before
-        # its `ln -sf /usr/local/bin/mold /usr/bin/ld` line -- a failed install
-        # keeps the distro-default linker and yields a byte-identical (slower)
-        # build. Do not let a transient network blip red a required gate.
+        # its `ln -sf /usr/local/bin/mold "$(realpath /usr/bin/ld)"` line, so a
+        # failed install keeps the distro-default linker and yields a
+        # functionally equivalent (slower) build. Do not let a transient network
+        # blip red a required gate.
         continue-on-error: true
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
         with:
@@ -419,9 +421,10 @@ jobs:
       - name: Install mold linker (ZEB-498)
         # ZEB-800: mold is a pure speed optimization. The pinned action runs
         # shell:bash (-eo pipefail), so a failed wget|tar download aborts before
-        # its `ln -sf /usr/local/bin/mold /usr/bin/ld` line -- a failed install
-        # keeps the distro-default linker and yields a byte-identical (slower)
-        # build. Do not let a transient network blip red a required gate.
+        # its `ln -sf /usr/local/bin/mold "$(realpath /usr/bin/ld)"` line, so a
+        # failed install keeps the distro-default linker and yields a
+        # functionally equivalent (slower) build. Do not let a transient network
+        # blip red a required gate.
         continue-on-error: true
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
         with:
