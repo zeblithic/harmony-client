@@ -1004,32 +1004,47 @@ pub fn refresh_self_liveness(
     }
 }
 
-/// Load a 32-byte secret from keychain primary, encrypted-file fallback.
-/// Returns `Ok(None)` when neither source has the secret.
+/// ZEB-830: which backend a persisted owner secret actually loaded from — the
+/// ground truth `identity_store_backend` reports, as opposed to mere keychain
+/// *availability*. Absence of a secret is a third, neutral state (un-minted /
+/// inconclusive), represented at the call boundary as `Option::None` rather
+/// than a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedBackend {
+    /// Loaded from the OS keychain vault slot.
+    Keychain,
+    /// Loaded from the `HARMONY_PASSPHRASE` encrypted file.
+    EncryptedFile,
+}
+
+/// The single implementation of the keychain→file load precedence, tagging
+/// which backend the secret loaded from. Both [`load_secret`] and the ZEB-830
+/// [`owner_master_seed_backend`] probe derive from this, so the reported
+/// backend can never drift from where a real load would find the secret.
 ///
-/// Returns `Zeroizing<[u8; 32]>` so the secret zeros on drop through the
-/// entire call chain — matches the discipline applied elsewhere in this
-/// module and in `crate::identity`.
+/// Returns `Zeroizing<[u8; 32]>` so the secret zeros on drop through the entire
+/// call chain — matches the discipline applied elsewhere in this module and in
+/// `crate::identity`.
 ///
 /// Keychain errors other than `NoEntry` (locked keychain, permission denied,
 /// flaky backend) fall through to the encrypted-file fallback rather than
-/// hard-failing — matches the pattern in `crate::identity` which made
-/// keychain integration robust on partially-broken systems.
+/// hard-failing; but if the keychain read failed AND no file fallback is
+/// configured, the error propagates rather than masking a locked keychain as an
+/// un-minted state.
 ///
 /// `use_os_keychain` (ZEB-189) gates the OS-keychain attempt: `true` tries the
 /// consolidated `harmony`/`identity` vault slot (via
 /// `crate::identity::vault_load_slot`, which owns its own `KeychainStore`)
 /// before the encrypted-file fallback; `false` goes straight to the file. Tests
 /// pass `false` — the ZEB-428 isolation gate — so the real credential store is
-/// never touched. (Previously an `Option<KeychainStore>` used only as a boolean
-/// sentinel: the injected value was never delegated to.)
-fn load_secret(
+/// never touched.
+fn locate_secret(
     use_os_keychain: bool,
     slot: VaultSlot,
     keychain_name: &str,
     identity_dir: &Path,
     fallback_filename: &str,
-) -> Result<Option<Zeroizing<[u8; 32]>>, String> {
+) -> Result<Option<(SeedBackend, Zeroizing<[u8; 32]>)>, String> {
     // Track non-NoEntry keychain errors so we can propagate them rather
     // than silently masking a locked/permission-denied keychain as an
     // un-minted state when no encrypted-file fallback is configured.
@@ -1042,7 +1057,7 @@ fn load_secret(
         let legacy = keyring::Entry::new(KEYCHAIN_OWNER_SERVICE, keychain_name)
             .map_err(|e| format!("keychain entry creation for {keychain_name}: {e}"))?;
         match crate::identity::vault_load_slot(slot, &legacy) {
-            Ok(Some(key)) => return Ok(Some(key)),
+            Ok(Some(key)) => return Ok(Some((SeedBackend::Keychain, key))),
             Ok(None) => {}
             Err(e) => {
                 // Don't hard-fail: a flaky/locked keychain shouldn't break load
@@ -1071,9 +1086,50 @@ fn load_secret(
         }
     };
     match store.load() {
-        Ok(seed_bytes) => Ok(seed_bytes), // already Option<Zeroizing<[u8; 32]>>
+        Ok(Some(seed)) => Ok(Some((SeedBackend::EncryptedFile, seed))),
+        Ok(None) => Ok(None),
         Err(e) => Err(format!("read {fallback_filename}: {e}")),
     }
+}
+
+/// Load a 32-byte secret from keychain primary, encrypted-file fallback.
+/// Returns `Ok(None)` when neither source has the secret. Thin wrapper over
+/// [`locate_secret`], discarding the backend tag.
+fn load_secret(
+    use_os_keychain: bool,
+    slot: VaultSlot,
+    keychain_name: &str,
+    identity_dir: &Path,
+    fallback_filename: &str,
+) -> Result<Option<Zeroizing<[u8; 32]>>, String> {
+    Ok(locate_secret(
+        use_os_keychain,
+        slot,
+        keychain_name,
+        identity_dir,
+        fallback_filename,
+    )?
+    .map(|(_, bytes)| bytes))
+}
+
+/// ZEB-830: report which backend the persisted `OwnerMasterSeed` actually
+/// loaded from (ground truth), mirroring `load_secret`'s precedence via the
+/// shared [`locate_secret`]. `Ok(None)` = the seed is in neither store
+/// (un-minted / inconclusive) → the caller uses backend-neutral copy. The
+/// secret bytes are read and immediately dropped (`Zeroizing`, zeroized on
+/// drop); only the location is returned.
+pub fn owner_master_seed_backend(
+    use_os_keychain: bool,
+    identity_dir: &Path,
+) -> Result<Option<SeedBackend>, String> {
+    Ok(locate_secret(
+        use_os_keychain,
+        VaultSlot::OwnerMasterSeed,
+        KEYCHAIN_MASTER_SEED,
+        identity_dir,
+        "master_seed.enc",
+    )?
+    .map(|(backend, _bytes)| backend))
 }
 
 // `use_os_keychain` (ZEB-189) gates the OS-keychain attempt: `true` writes the
@@ -1501,6 +1557,45 @@ mod persistence_tests {
         )
         .expect("load via file");
         assert_eq!(loaded.as_deref().copied(), Some(secret));
+    }
+
+    /// ZEB-830: the ground-truth probe reports `EncryptedFile` when the owner
+    /// seed loaded from the encrypted file. `use_os_keychain = false` keeps this
+    /// on the file branch (the ZEB-428 isolation gate) — the only branch CI can
+    /// exercise; the keychain branch is validated on a real macOS keychain.
+    #[test]
+    #[serial]
+    fn owner_master_seed_backend_reports_encrypted_file_when_seed_in_file() {
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "zeb830-file-branch-pp");
+        let dir = tempdir().unwrap();
+        let seed = [0x7Cu8; 32];
+        save_secret(
+            false,
+            VaultSlot::OwnerMasterSeed,
+            KEYCHAIN_MASTER_SEED,
+            dir.path(),
+            "master_seed.enc",
+            &seed,
+        )
+        .expect("save seed via file");
+        assert_eq!(
+            owner_master_seed_backend(false, dir.path()).expect("probe"),
+            Some(SeedBackend::EncryptedFile),
+        );
+    }
+
+    /// ZEB-830: the probe reports `None` (neutral / un-minted) when no owner
+    /// seed exists in either store — the case the frontend renders as
+    /// backend-neutral copy.
+    #[test]
+    #[serial]
+    fn owner_master_seed_backend_reports_none_when_no_seed_anywhere() {
+        let _guard = EnvVarGuard::set("HARMONY_PASSPHRASE", "zeb830-neutral-branch-pp");
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            owner_master_seed_backend(false, dir.path()).expect("probe"),
+            None,
+        );
     }
 
     /// ZEB-492 carry-forward #3: a corrupt `fleet_keytree.enc` (garbage, not a
