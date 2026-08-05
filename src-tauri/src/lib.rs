@@ -9754,6 +9754,20 @@ pub async fn start_node_inner(
                             iroh_endpoint_arc.clone(),
                             std::sync::Arc::clone(&vine_share_publicly_gate),
                             has_own_vines,
+                            // ZEB-820: the SP1 64-hex fleet-net device id (same
+                            // value the butler blob builder passes to
+                            // build_butler_set) + a fresh FleetNetDoc snapshot
+                            // reader, so each publish aggregates self + siblings.
+                            device_id.clone(),
+                            {
+                                let fs = std::sync::Arc::clone(&fleet_net_snapshot);
+                                std::sync::Arc::new(move || {
+                                    fs.read().unwrap_or_else(|p| p.into_inner()).clone()
+                                })
+                                    as std::sync::Arc<
+                                        dyn Fn() -> crate::fleet_net::FleetNetDoc + Send + Sync,
+                                    >
+                            },
                         ));
                     if vine_settings_loaded.share_vines_publicly {
                         pkarr_vines_pub.enable().await;
