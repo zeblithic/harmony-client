@@ -37,6 +37,11 @@
 /// rejected or clamped. 5 min matches `harmony_pkarr::record::FUTURE_TOLERANCE_MS`.
 pub const MAX_FORWARD_SKEW_MS: u64 = 5 * 60 * 1000;
 
+/// [`MAX_FORWARD_SKEW_MS`] in whole seconds, for control-tier stamps whose
+/// native unit is epoch-seconds (e.g. a `LivenessCert.timestamp`). Mirrors
+/// [`DISPLAY_SKEW_TOLERANCE_SECS`] for the control tier.
+pub const MAX_FORWARD_SKEW_SECS: u64 = MAX_FORWARD_SKEW_MS / 1000;
+
 /// Looser forward-skew tolerance for pure display / discovery ordering, where a
 /// future-dated stamp can only mis-sort a list and never bypasses a control.
 /// 30 min matches the governance/discovery house default.
@@ -138,6 +143,17 @@ pub fn wall_exceeds_forward_skew(wall_ms: u64, receiver_now_ms: Option<u64>) -> 
     receiver_now_ms.is_some_and(|rn| reject_future(wall_ms, rn, MAX_FORWARD_SKEW_MS))
 }
 
+/// `true` iff a control-tier epoch-**seconds** `stamp_secs` is implausibly far in
+/// the receiver's future (> [`MAX_FORWARD_SKEW_SECS`] ahead of `now_secs`).
+/// `now_secs == 0` (unreadable / pre-epoch local clock) ⇒ `false` (apply-all): a
+/// bad LOCAL clock must never drop honest state. Seconds-native sibling of
+/// [`wall_exceeds_forward_skew`] (which is ms/`Option`-now); boundary inclusive.
+/// Distinct from [`wall_exceeds_forward_skew_secs`], whose *stamp* is ms.
+#[inline]
+pub fn secs_exceeds_forward_skew(stamp_secs: u64, now_secs: u64) -> bool {
+    now_secs != 0 && reject_future(stamp_secs, now_secs, MAX_FORWARD_SKEW_SECS)
+}
+
 /// Seconds-domain sibling of [`wall_exceeds_forward_skew`] for callers whose
 /// receiver clock is epoch-**seconds** (e.g.
 /// `crate::iroh_friend_acceptor::wall_now_secs` = `wall_now_ms()/1000` with
@@ -186,6 +202,37 @@ mod tests {
         );
         assert!(
             reject_future(now + MAX_FORWARD_SKEW_MS + 1, now, MAX_FORWARD_SKEW_MS),
+            "one past the ceiling is rejected"
+        );
+    }
+
+    #[test]
+    fn max_forward_skew_secs_is_five_minutes() {
+        assert_eq!(MAX_FORWARD_SKEW_SECS, 300);
+        assert_eq!(MAX_FORWARD_SKEW_SECS * 1000, MAX_FORWARD_SKEW_MS);
+    }
+
+    #[test]
+    fn secs_exceeds_forward_skew_zero_now_is_apply_all() {
+        // Unreadable/pre-epoch local clock ⇒ never reject (fail-open).
+        assert!(!secs_exceeds_forward_skew(u64::MAX, 0));
+        assert!(!secs_exceeds_forward_skew(0, 0));
+    }
+
+    #[test]
+    fn secs_exceeds_forward_skew_honors_the_inclusive_ceiling() {
+        let now = 1_700_000_000u64;
+        assert!(!secs_exceeds_forward_skew(now, now), "present accepted");
+        assert!(
+            !secs_exceeds_forward_skew(now - 10_000, now),
+            "past accepted"
+        );
+        assert!(
+            !secs_exceeds_forward_skew(now + MAX_FORWARD_SKEW_SECS, now),
+            "exactly at the ceiling is accepted"
+        );
+        assert!(
+            secs_exceeds_forward_skew(now + MAX_FORWARD_SKEW_SECS + 1, now),
             "one past the ceiling is rejected"
         );
     }
