@@ -85,6 +85,13 @@ jobs:
       # retrying wget — deliberately NOT apt, to stay off the mirror-flaky
       # install-linux-tauri-deps step (ZEB-498 P0 / PR #289).
       - name: Install mold linker (ZEB-498)
+        # ZEB-800: mold is a pure speed optimization. The pinned action runs
+        # shell:bash (-eo pipefail), so a failed wget|tar download aborts before
+        # its `ln -sf /usr/local/bin/mold "$(realpath /usr/bin/ld)"` line, so a
+        # failed install keeps the distro-default linker and yields a
+        # functionally equivalent (slower) build. Do not let a transient network
+        # blip red a required gate.
+        continue-on-error: true
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
         with:
           mold-version: '2.41.0'
@@ -254,6 +261,13 @@ jobs:
       # binaries, so it benefits most. make-default:true → no RUSTFLAGS → the
       # rust-cache key stays intact.
       - name: Install mold linker (ZEB-498)
+        # ZEB-800: mold is a pure speed optimization. The pinned action runs
+        # shell:bash (-eo pipefail), so a failed wget|tar download aborts before
+        # its `ln -sf /usr/local/bin/mold "$(realpath /usr/bin/ld)"` line, so a
+        # failed install keeps the distro-default linker and yields a
+        # functionally equivalent (slower) build. Do not let a transient network
+        # blip red a required gate.
+        continue-on-error: true
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
         with:
           mold-version: '2.41.0'
@@ -405,6 +419,13 @@ jobs:
       # version is irrelevant. make-default:true → no RUSTFLAGS → rust-cache
       # key intact.
       - name: Install mold linker (ZEB-498)
+        # ZEB-800: mold is a pure speed optimization. The pinned action runs
+        # shell:bash (-eo pipefail), so a failed wget|tar download aborts before
+        # its `ln -sf /usr/local/bin/mold "$(realpath /usr/bin/ld)"` line, so a
+        # failed install keeps the distro-default linker and yields a
+        # functionally equivalent (slower) build. Do not let a transient network
+        # blip red a required gate.
+        continue-on-error: true
         uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444  # v1
         with:
           mold-version: '2.41.0'
