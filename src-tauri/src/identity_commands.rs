@@ -21,6 +21,7 @@ use zeroize::Zeroizing;
 
 use crate::identity;
 use crate::identity::KeychainStore;
+use crate::owner_state::{owner_master_seed_backend, SeedBackend};
 use crate::recovery_cli;
 use crate::recovery_policy::{MAX_RECOVERY_COMMENT_BYTES, MIN_RECOVERY_PASSPHRASE_LEN};
 
@@ -563,44 +564,52 @@ pub async fn export_mnemonic_words() -> Result<Vec<String>, String> {
         .await
 }
 
-/// ZEB-768: the string contract for [`identity_store_backend`]. The GUI
+/// ZEB-768/830: the string contract for [`identity_store_backend`]. The GUI
 /// onboarding copy branches on these exact values, so pin them here.
-fn identity_store_backend_label(keychain_available: bool) -> &'static str {
-    if keychain_available {
-        "keychain"
-    } else {
-        "encrypted-file"
+fn identity_store_backend_label(backend: Option<SeedBackend>) -> &'static str {
+    match backend {
+        Some(SeedBackend::Keychain) => "keychain",
+        Some(SeedBackend::EncryptedFile) => "encrypted-file",
+        None => "unknown",
     }
 }
 
-/// ZEB-768: report which identity-store backend onboarding copy should
+/// ZEB-768/830: report which identity-store backend onboarding copy should
 /// describe, so the backup step tells the truth instead of unconditionally
 /// asserting the OS keychain.
 ///
-/// This reports keychain **availability** — whether a `KeychainStore`
-/// constructs here. `HARMONY_DISABLE_KEYCHAIN`, a named profile, and hosts
-/// with no keyring provider all make it refuse → `encrypted-file`. That is a
-/// strict improvement over the old unconditional keychain claim and covers
-/// ZEB-768's observed repro (kill-switch + passphrase file).
+/// ZEB-830: this reports **ground truth** — the backend the persisted
+/// `OwnerMasterSeed` actually loaded from, via `owner_state::load_secret`'s
+/// keychain→file precedence (shared through `owner_master_seed_backend`) — not
+/// mere keychain *availability*. `KeychainStore::new().is_ok()` (the old
+/// signal) only says a handle constructs; the seed can still land in the
+/// encrypted file when the keychain *write* falls through, because `keyring` v3
+/// constructs `Entry` handles lazily (the backend lookup happens at read/write,
+/// not at `Entry::new`). Querying the real load location closes that overclaim.
 ///
-/// It is NOT proven persistence location, and callers must not read it as
-/// such: the mint (`owner_state::save_secret`) still falls through to the
-/// encrypted-file store when the keychain *write* fails even though the
-/// handle constructed (`vault_save_slot` → `Ok(false)`/`Err`), and this
-/// getter is queried before mint. Replacing it with a post-mint ground-truth
-/// probe (mirroring `load_secret`'s keychain→file precedence) + a re-query
-/// after mint is ZEB-830 — deferred because that probe's keychain branch is
-/// only verifiable against a real OS keychain (the ZEB-428 isolation gate
-/// blocks `KeychainStore::new()` in every test build, so CI cannot exercise
-/// it).
+/// `use_os_keychain` is gated on `KeychainStore::new().is_ok()` — the same
+/// decision mint makes (`use_os_keychain = keychain.is_some()`, where entry
+/// points pass `KeychainStore::new().ok()`), so the probe looks where mint
+/// would have written.
 ///
-/// Returns `"keychain"` or `"encrypted-file"`; the frontend falls back to
-/// backend-neutral wording on any value it doesn't recognize or on error,
-/// never an unearned keychain claim.
+/// Returns `"keychain"`, `"encrypted-file"`, or `"unknown"` (no identity yet /
+/// inconclusive probe). The frontend renders `"unknown"` — and any value it
+/// doesn't recognize — as backend-neutral wording, never an unearned keychain
+/// claim. Never returns `Err`: an inconclusive probe (locked keychain /
+/// unreadable file) collapses to `"unknown"` rather than surfacing an IPC error.
 #[tauri::command]
 pub async fn identity_store_backend() -> Result<String, String> {
-    run_blocking(move || Ok(identity_store_backend_label(KeychainStore::new().is_ok()).to_string()))
-        .await
+    let identity_path = identity::resolve_path(None)?;
+    run_blocking(move || {
+        let use_os_keychain = KeychainStore::new().is_ok();
+        let backend =
+            owner_master_seed_backend(use_os_keychain, &identity_path).unwrap_or_else(|e| {
+                tracing::debug!("identity_store_backend probe inconclusive: {e}");
+                None
+            });
+        Ok(identity_store_backend_label(backend).to_string())
+    })
+    .await
 }
 
 /// Return the identity hash that would result from restoring the given
@@ -801,12 +810,20 @@ mod tests {
 
     #[test]
     fn identity_store_backend_label_pins_the_frontend_string_contract() {
-        // The GUI branches on these exact literals; a keychain-available
-        // node reads "keychain", the file-store fallback reads
-        // "encrypted-file". Anything else would make WelcomeModal fall back
-        // to backend-neutral wording, so these two are the whole contract.
-        assert_eq!(identity_store_backend_label(true), "keychain");
-        assert_eq!(identity_store_backend_label(false), "encrypted-file");
+        // The GUI branches on these exact literals: keychain-backed reads
+        // "keychain", the file store reads "encrypted-file", and the neutral /
+        // inconclusive case (no seed in either store) reads "unknown" — which
+        // WelcomeModal renders as backend-neutral wording. These three are the
+        // whole contract (ZEB-830 replaced the old bool availability signal).
+        assert_eq!(
+            identity_store_backend_label(Some(SeedBackend::Keychain)),
+            "keychain"
+        );
+        assert_eq!(
+            identity_store_backend_label(Some(SeedBackend::EncryptedFile)),
+            "encrypted-file"
+        );
+        assert_eq!(identity_store_backend_label(None), "unknown");
     }
 
     // ── current_identity_hash_helper ─────────────────────────────────────
