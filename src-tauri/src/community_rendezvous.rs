@@ -225,6 +225,15 @@ struct IdentifiedSlotResolver {
     /// "no beacon published" (proof-shaped absence) apart from "resolve
     /// infrastructure failing" (no information) — review r1 finding 2.
     resolve_errors: Arc<AtomicUsize>,
+    /// ZEB-827: this community's id (the vouch binds it) and the union of
+    /// Joined (non-self) members' effective enrolled device keys — the set a
+    /// beacon's vouch key must belong to.
+    community_id: crate::owner_state_types::SpaceId,
+    enrolled_keys: Arc<std::collections::HashSet<[u8; 32]>>,
+    /// Beacons that verified transport+epoch but failed the membership vouch
+    /// (missing, malformed, stale, bad sig, or device not enrolled). Read as an
+    /// empty slot so the batch driver widens — mirrors `resolve_errors`.
+    membership_rejects: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -250,9 +259,33 @@ impl harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> for IdentifiedSlo
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         rec.verify_freshness(now_ms).ok()?;
-        let payload: ReachabilityAnnouncePayload =
-            ciborium::from_reader(rec.routing_blob.as_slice()).ok()?;
+        let (payload, vouch) = decode_rendezvous_blob(rec.routing_blob.as_slice())?;
         if payload.iroh_node_id == self.self_endpoint_id {
+            return None;
+        }
+        // ZEB-827 strict: a beacon must carry a vouch that (a) verifies under a
+        // member's enrolled device key and (b) binds THIS record's transport
+        // identity + community. A failure reads as an EMPTY slot so the
+        // escalating batch driver widens to the other slots (same shape as the
+        // self-filter above), while `membership_rejects` records that a beacon
+        // WAS present — the caller maps that to `rejectedNonMember`.
+        let ok = vouch.as_ref().is_some_and(|v| {
+            crate::membership_vouch::verify_membership_vouch(
+                v,
+                self.community_id,
+                &rec.harmony_identity_pub,
+                &self.enrolled_keys,
+                now_ms,
+            )
+        });
+        if !ok {
+            self.membership_rejects.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                slot = slot_index,
+                node_id = %hex::encode(&payload.iroh_node_id[..8]),
+                has_vouch = vouch.is_some(),
+                "ZEB-827: rendezvous beacon rejected — no valid membership vouch"
+            );
             return None;
         }
         Some(IdentifiedBeacon {
@@ -269,29 +302,44 @@ impl harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> for IdentifiedSlo
 pub struct IdentifiedResolve {
     pub outcome: RendezvousResolveOutcome<IdentifiedBeacon>,
     pub resolve_errors: usize,
+    /// ZEB-827: beacons present but rejected for lacking a valid membership
+    /// vouch. Nonzero with an empty outcome means "a beacon was here but is not
+    /// a member" (→ `rejectedNonMember`), distinct from proof-shaped absence.
+    pub membership_rejects: usize,
 }
 
 /// ZEB-824 production entry point: like [`resolve_rendezvous`], but yields an
 /// [`IdentifiedBeacon`] and treats our own record as an empty slot. The
 /// pkarr-layer probe-error count rides along in [`IdentifiedResolve`].
+///
+/// ZEB-827: `community_id` + `enrolled_keys` drive the strict membership-vouch
+/// check inside each slot probe (a beacon lacking a valid vouch reads as an
+/// empty slot so the escalating batch driver widens past it).
 pub async fn resolve_rendezvous_identified(
     pkarr: &Arc<PkarrResolver>,
     epoch_key: &EpochKey,
     self_endpoint_id: [u8; 32],
+    community_id: crate::owner_state_types::SpaceId,
+    enrolled_keys: Arc<std::collections::HashSet<[u8; 32]>>,
     now_ms: u64,
     cfg: &RendezvousResolveConfig,
 ) -> IdentifiedResolve {
     let resolve_errors = Arc::new(AtomicUsize::new(0));
+    let membership_rejects = Arc::new(AtomicUsize::new(0));
     let resolver = IdentifiedSlotResolver {
         pkarr: Arc::clone(pkarr),
         epoch_key_bytes: Zeroizing::new(epoch_key.as_bytes().to_vec()),
         self_endpoint_id,
         resolve_errors: Arc::clone(&resolve_errors),
+        community_id,
+        enrolled_keys,
+        membership_rejects: Arc::clone(&membership_rejects),
     };
     let outcome = resolve_rendezvous_with(&resolver, now_ms, cfg).await;
     IdentifiedResolve {
         outcome,
         resolve_errors: resolve_errors.load(Ordering::Relaxed),
+        membership_rejects: membership_rejects.load(Ordering::Relaxed),
     }
 }
 

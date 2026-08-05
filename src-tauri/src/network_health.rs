@@ -1340,14 +1340,14 @@ pub enum GatewayBootstrapOutcome {
     /// resolve infrastructure.
     ResolveError,
     BeaconSeeded,
-    /// Historically the membership-gate rejection. That gate is gone (ZEB-824
-    /// fix round 2 / spec §5c — it compared the beacon's composite
-    /// device-address hash against master-flavored member keys, two
-    /// non-convergent notions, so it rejected every beacon and made the feature
-    /// a no-op). Its ONLY remaining source is a beacon whose identity bytes
-    /// fail to decode, which is a wire-format or publisher bug rather than an
-    /// admission decision — the name is kept for wire compatibility. Nonzero
-    /// here now means "malformed record", not "stranger turned away".
+    /// ZEB-827 strict: the primary membership-rejection signal. A beacon
+    /// verified transport+epoch but carried no valid membership vouch — missing,
+    /// malformed, stale, bad signature, or a device key not in any Joined
+    /// member's enrolled set (`resolve_slot` reads such a beacon as an empty
+    /// slot and the resolve returns `RejectedNonMember`). Also still covers the
+    /// rarer "identity bytes fail to decode" wire/publisher bug. Nonzero here now
+    /// means "a beacon was present but is not a member", exactly the case the
+    /// ZEB-824 §5c interim posture accepted and this binding closes.
     RejectedNonMember,
     /// Nobody else in the community — skipped by design, nothing to dial. Row
     /// only, no counter: this is a steady state, not an event worth totalling.
