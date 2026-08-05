@@ -1971,6 +1971,107 @@ pub(crate) fn reset_local_identity_inner(
     Ok(backup_dir)
 }
 
+/// Remove every direct child of `dir` whose file name is not in `excluded`,
+/// recursively for subdirectories. Best-effort: a child that cannot be removed
+/// is logged and skipped so one locked entry can't abort the whole wipe
+/// (ZEB-842). A missing `dir` is a clean no-op.
+fn remove_dir_children_except(dir: &Path, excluded: &[&str]) -> Result<(), String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("read dir {}: {e}", dir.display())),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "erase: skipping unreadable dir entry");
+                continue;
+            }
+        };
+        if excluded
+            .iter()
+            .any(|x| std::ffi::OsStr::new(x) == entry.file_name())
+        {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(e) = removed {
+            tracing::warn!(path = %path.display(), error = %e, "erase: could not remove entry — skipping");
+        }
+    }
+    Ok(())
+}
+
+/// Names excluded from the [`erase_all_local_data`] wipe: `profiles/` keeps
+/// sibling identities/profiles isolated (ZEB-586); `logs/` is the live tracing
+/// sink the webview-only reload keeps open, so deleting it just races the
+/// appender (diagnostic, not user content).
+const ERASE_EXCLUDED: &[&str] = &["profiles", "logs"];
+
+/// ZEB-842 clean-slate: hard-delete the active profile's identity dir and
+/// app-data dir children (minus [`ERASE_EXCLUDED`]) and best-effort clear the
+/// keychain. No snapshot — the recovery phrase is the identity backup (contrast
+/// [`reset_local_identity_inner`], which snapshots-then-moves to recover a
+/// bricked boot). Held under [`OWNER_STATE_WRITE_LOCK`] + the identity
+/// write-guard like the reset, so a straggler write can't race the wipe.
+/// `keychain` is injected (ZEB-428): production passes [`prod_keychain`], tests
+/// pass `None`.
+pub(crate) fn erase_all_local_data_inner(
+    identity_dir: &Path,
+    app_data_dir: &Path,
+    keychain: Option<KeychainStore>,
+) -> Result<(), String> {
+    let _guard = OWNER_STATE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    // Same cross-process exclusion the identity writers take (Greptile #571), so
+    // a wipe fails fast rather than racing another harmony process sharing this
+    // identity dir. The app-data removal needs no such guard — its writers are
+    // the node engines, quiesced by the caller's stop_inner before we get here.
+    crate::identity::with_identity_dir_write_guard(identity_dir, || {
+        remove_dir_children_except(identity_dir, ERASE_EXCLUDED)
+    })?;
+    remove_dir_children_except(app_data_dir, ERASE_EXCLUDED)?;
+
+    // Best-effort clear the OS keychain owner secrets. A failure warns but must
+    // NOT fail the wipe — the on-disk owner_state.cbor removal is the
+    // authoritative onboarding gate (mirrors reset_local_identity_inner).
+    if let Some(kc) = keychain {
+        for (item, err) in kc.delete_all() {
+            tracing::warn!(
+                keychain_item = item,
+                error = %err,
+                "erase_all_local_data: could not clear keychain item — manual cleanup may be needed"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// ZEB-842: user-confirmed clean-slate wipe (typed-confirm on the GUI). Removes
+/// this device's identity AND every per-profile app-data cache (mail, avatars,
+/// follows, card store, …) for the active profile — the "Erase all local data"
+/// action in Settings and the boot-failure modal. Stops the node FIRST so its
+/// engines cannot rewrite a cache into the gap (mirrors `reset_local_identity`),
+/// then wipes. `None` = stop unconditionally.
+#[tauri::command]
+pub async fn erase_all_local_data(
+    state: tauri::State<'_, Mutex<crate::NodeState>>,
+) -> Result<(), String> {
+    let identity_dir = resolve_identity_dir()?;
+    let app_data_dir = crate::resolve_app_data_dir()?;
+    crate::stop_inner(state.inner(), None);
+    run_blocking(move || erase_all_local_data_inner(&identity_dir, &app_data_dir, prod_keychain()))
+        .await
+}
+
 /// Read this device's persisted owner-id (hex), or `null` if no `owner_state.cbor`
 /// exists. Read-only and key-free (delegates to the same
 /// [`crate::owner_state::read_persisted_owner_id`] the restore overwrite-guard
@@ -2095,6 +2196,121 @@ mod tests {
             .join("other")
             .join("owner_state.cbor")
             .exists());
+    }
+
+    #[test]
+    fn erase_all_local_data_inner_wipes_identity_and_app_data() {
+        // ZEB-842: erase-all is wholesale (unlike reset's curated snapshot) — it
+        // hard-deletes EVERY child of the identity dir and app-data dir,
+        // including identity.key and any prior `_reset-backup-*` snapshot, minus
+        // the excluded `profiles/` / `logs/`. Keychain injected `None` (ZEB-428).
+        let id_tmp = tempfile::tempdir().unwrap();
+        let ad_tmp = tempfile::tempdir().unwrap();
+        let id = id_tmp.path();
+        let ad = ad_tmp.path();
+
+        // identity dir: owner files + network identity + a prior reset snapshot.
+        std::fs::write(id.join("owner_state.cbor"), b"owner").unwrap();
+        std::fs::write(id.join("master_seed.enc"), b"seed").unwrap();
+        std::fs::write(id.join("identity.key"), b"network").unwrap();
+        std::fs::create_dir_all(id.join("_reset-backup-1700")).unwrap();
+        std::fs::write(
+            id.join("_reset-backup-1700").join("owner_state.cbor"),
+            b"old",
+        )
+        .unwrap();
+
+        // app-data dir: the full per-profile cache spread (Appendix A).
+        std::fs::create_dir_all(ad.join("mail")).unwrap();
+        std::fs::write(ad.join("mail").join("blob"), b"dm").unwrap();
+        std::fs::create_dir_all(ad.join("avatars")).unwrap();
+        std::fs::write(ad.join("avatars").join("a.png"), b"img").unwrap();
+        std::fs::write(ad.join("follows.json"), b"[]").unwrap();
+        std::fs::write(ad.join("content-index.json"), b"{}").unwrap();
+        std::fs::write(ad.join("profile_cards.deadbeef.cbor"), b"cards").unwrap();
+        std::fs::create_dir_all(ad.join("mint")).unwrap();
+        std::fs::write(ad.join("mint").join("x"), b"m").unwrap();
+        std::fs::write(ad.join("storage_records.json"), b"{}").unwrap();
+        std::fs::write(ad.join("connectivity-settings.json"), b"{}").unwrap();
+
+        erase_all_local_data_inner(id, ad, None).expect("erase must succeed");
+
+        for p in [
+            id.join("owner_state.cbor"),
+            id.join("master_seed.enc"),
+            id.join("identity.key"),
+            id.join("_reset-backup-1700"),
+            ad.join("mail"),
+            ad.join("avatars"),
+            ad.join("follows.json"),
+            ad.join("content-index.json"),
+            ad.join("profile_cards.deadbeef.cbor"),
+            ad.join("mint"),
+            ad.join("storage_records.json"),
+            ad.join("connectivity-settings.json"),
+        ] {
+            assert!(!p.exists(), "{} must be erased", p.display());
+        }
+        // The dir roots themselves remain (we delete children, not the dirs).
+        assert!(id.exists() && ad.exists(), "the dir roots remain");
+    }
+
+    #[test]
+    fn erase_all_local_data_inner_preserves_profiles_and_logs() {
+        // ZEB-586 isolation + live-sink: the default-profile wipe deletes
+        // children EXCEPT `profiles/` (sibling identities/profiles) and `logs/`
+        // (the tracing sink the webview-only reload keeps open). Exercises the
+        // "delete children except X" path on BOTH the identity and app-data root.
+        let id_tmp = tempfile::tempdir().unwrap();
+        let ad_tmp = tempfile::tempdir().unwrap();
+        let id = id_tmp.path();
+        let ad = ad_tmp.path();
+
+        for root in [id, ad] {
+            std::fs::create_dir_all(root.join("profiles").join("other")).unwrap();
+            std::fs::write(
+                root.join("profiles").join("other").join("owner_state.cbor"),
+                b"sibling",
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.join("logs")).unwrap();
+            std::fs::write(root.join("logs").join("app.log"), b"log").unwrap();
+            // A removable sibling that MUST go.
+            std::fs::write(root.join("removable"), b"x").unwrap();
+        }
+
+        erase_all_local_data_inner(id, ad, None).expect("erase must succeed");
+
+        for root in [id, ad] {
+            assert!(
+                root.join("profiles")
+                    .join("other")
+                    .join("owner_state.cbor")
+                    .exists(),
+                "sibling profile under {} must survive",
+                root.display()
+            );
+            assert!(
+                root.join("logs").join("app.log").exists(),
+                "logs/ under {} must survive",
+                root.display()
+            );
+            assert!(
+                !root.join("removable").exists(),
+                "removable sibling under {} must be erased",
+                root.display()
+            );
+        }
+    }
+
+    #[test]
+    fn erase_all_local_data_inner_is_a_clean_noop_on_empty_dirs() {
+        // A reset on already-clean dirs is a successful no-op (idempotent).
+        let id_tmp = tempfile::tempdir().unwrap();
+        let ad_tmp = tempfile::tempdir().unwrap();
+        erase_all_local_data_inner(id_tmp.path(), ad_tmp.path(), None)
+            .expect("no-op erase must be Ok");
+        assert!(id_tmp.path().exists() && ad_tmp.path().exists());
     }
 
     #[test]
