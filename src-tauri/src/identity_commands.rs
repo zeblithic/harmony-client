@@ -596,14 +596,26 @@ fn identity_store_backend_label(backend: Option<SeedBackend>) -> &'static str {
 /// inconclusive probe). The frontend renders `"unknown"` — and any value it
 /// doesn't recognize — as backend-neutral wording, never an unearned keychain
 /// claim. Never returns `Err`: an inconclusive probe (locked keychain /
-/// unreadable file) collapses to `"unknown"` rather than surfacing an IPC error.
+/// unreadable file) OR a failed identity-directory resolution both collapse to
+/// `"unknown"` rather than surfacing an IPC error.
 #[tauri::command]
 pub async fn identity_store_backend() -> Result<String, String> {
-    let identity_path = identity::resolve_path(None)?;
+    // The owner secrets (`master_seed.enc` / `owner_state.cbor`) live in the
+    // identity DIRECTORY — the parent of the identity.key path — which is what
+    // the probe's encrypted-file fallback joins `master_seed.enc` onto.
+    // `resolve_path(None)` returns the identity.key FILE path, so resolve the
+    // directory here instead (Qodo, PR #606). A dir-resolution failure (no HOME)
+    // is as inconclusive as a probe failure → collapse to "unknown".
+    let Ok(identity_dir) = crate::owner_commands::resolve_identity_dir() else {
+        tracing::debug!(
+            "identity_store_backend: identity dir resolution failed; reporting unknown"
+        );
+        return Ok("unknown".to_string());
+    };
     run_blocking(move || {
         let use_os_keychain = KeychainStore::new().is_ok();
         let backend =
-            owner_master_seed_backend(use_os_keychain, &identity_path).unwrap_or_else(|e| {
+            owner_master_seed_backend(use_os_keychain, &identity_dir).unwrap_or_else(|e| {
                 tracing::debug!("identity_store_backend probe inconclusive: {e}");
                 None
             });
@@ -824,6 +836,67 @@ mod tests {
             "encrypted-file"
         );
         assert_eq!(identity_store_backend_label(None), "unknown");
+    }
+
+    /// Save/restore an env var across a `#[serial]` test (restores the PRIOR
+    /// value on drop — needed for pre-existing vars like `HOME`, unlike a
+    /// remove-only guard).
+    struct ScopedEnv {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl ScopedEnv {
+        fn set(key: &'static str, val: &Path) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+        fn set_str(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+    }
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Regression (ZEB-830 / Qodo, PR #606): the getter must feed the probe the
+    /// identity DIRECTORY (parent of `identity.key`), not the `identity.key`
+    /// FILE path. With the pre-fix getter (which passed `resolve_path(None)`),
+    /// the encrypted-file probe searched `<identity.key>/master_seed.enc` and
+    /// misreported a real file-store seed as "unknown". Exercises the getter's
+    /// OWN path resolution (the committed probe tests pass a dir directly, so
+    /// they cannot catch this) by planting the seed at the real resolved layout
+    /// `<HOME>/.harmony/master_seed.enc`. The ZEB-428 gate makes the getter's
+    /// `KeychainStore::new()` refuse in test builds, so this stays on the
+    /// file/neutral branches.
+    #[tokio::test]
+    #[serial]
+    async fn identity_store_backend_reads_encrypted_file_from_the_resolved_dir() {
+        use crate::identity::{EncryptedFileStore, KeyStore};
+        let home = tempfile::tempdir().unwrap();
+        let _home = ScopedEnv::set("HOME", home.path());
+        let _pp = ScopedEnv::set_str("HARMONY_PASSPHRASE", "zeb830-getter-dir-pp");
+        let dot_harmony = home.path().join(".harmony");
+        std::fs::create_dir_all(&dot_harmony).unwrap();
+
+        // No seed anywhere yet → neutral, and never an IPC error.
+        assert_eq!(identity_store_backend().await.unwrap(), "unknown");
+
+        // Plant a seed in the encrypted file at the real resolved layout.
+        let store = EncryptedFileStore::from_env(dot_harmony.join("master_seed.enc"))
+            .expect("store construct")
+            .expect("HARMONY_PASSPHRASE configured");
+        store.save(&[0x42u8; 32]).expect("plant seed");
+
+        // The getter must resolve the DIR and find it → "encrypted-file".
+        assert_eq!(identity_store_backend().await.unwrap(), "encrypted-file");
     }
 
     // ── current_identity_hash_helper ─────────────────────────────────────

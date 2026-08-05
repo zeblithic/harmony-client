@@ -156,7 +156,13 @@ fn identity_store_backend_label(backend: Option<owner_state::SeedBackend>) -> &'
 
 #[tauri::command]
 pub async fn identity_store_backend() -> Result<String, String> {
-    let identity_path = identity::resolve_path(None)?;
+    // The owner secrets live in the identity DIRECTORY (parent of identity.key);
+    // `resolve_path(None)` returns the identity.key FILE path, so use the
+    // directory resolver — the probe joins `master_seed.enc` onto it. A failed
+    // dir resolution is as inconclusive as a probe failure → "unknown".
+    let Ok(identity_dir) = crate::owner_commands::resolve_identity_dir() else {
+        return Ok("unknown".to_string());
+    };
     run_blocking(move || {
         // ZEB-189 availability gate — the same decision mint makes for
         // `use_os_keychain` (callers pass `KeychainStore::new().ok()`;
@@ -164,7 +170,7 @@ pub async fn identity_store_backend() -> Result<String, String> {
         let use_os_keychain = KeychainStore::new().is_ok();
         // Inconclusive (locked keychain / unreadable file) → neutral, never an
         // overclaim; log for debuggability rather than surfacing a scary IPC error.
-        let backend = owner_state::owner_master_seed_backend(use_os_keychain, &identity_path)
+        let backend = owner_state::owner_master_seed_backend(use_os_keychain, &identity_dir)
             .unwrap_or_else(|e| {
                 tracing::debug!("identity_store_backend probe inconclusive: {e}");
                 None
@@ -175,8 +181,11 @@ pub async fn identity_store_backend() -> Result<String, String> {
 }
 ```
 
-The getter now **never returns `Err`** — inconclusive collapses to `"unknown"`,
-which `normalizeIdentityStoreBackend` already renders as backend-neutral copy.
+The getter now **never returns `Err`** — both an inconclusive probe and a failed
+identity-directory resolution collapse to `"unknown"`, which
+`normalizeIdentityStoreBackend` already renders as backend-neutral copy. (It must
+resolve the identity **directory**, not the identity.key file path, or the
+encrypted-file probe searches the wrong location — Qodo, PR #606.)
 
 ### Frontend (Svelte)
 

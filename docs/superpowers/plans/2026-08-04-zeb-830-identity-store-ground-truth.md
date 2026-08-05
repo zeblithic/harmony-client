@@ -73,7 +73,7 @@
 ### Task 5: Koya real-Keychain validation (keychain branch) — NOT committed
 
 - [ ] **Step 1 — throwaway test.** Write a `#[ignore]`d test (scratch, gated `HARMONY_ALLOW_REAL_KEYCHAIN=1`) that, against the real macOS keychain: writes a seed to the keychain vault slot (`use_os_keychain=true`) and asserts `owner_master_seed_backend(true, dir) == Some(Keychain)`; clears the slot + writes file-only → `Some(EncryptedFile)`; clears both → `None`. Koya's `harmony/identity` is a disposable dev identity — free to write/clear.
-- [ ] **Step 2 — run on Koya:** `HARMONY_ALLOW_REAL_KEYCHAIN=1 cargo nextest run ... --run-ignored ignored-only -E 'test(zeb830_real_keychain)'`; capture output.
+- [ ] **Step 2 — run on Koya:** `HARMONY_ALLOW_REAL_KEYCHAIN=1 cargo nextest run --locked -p harmony-app --features test-fixtures --run-ignored ignored-only -E 'test(zeb830_real_keychain)'`; capture output.
 - [ ] **Step 3 — revert the throwaway** (`git checkout`/delete) so nothing that writes the global slot is committed. Save the captured output for the PR body.
 
 ### Task 6: PR + converge
