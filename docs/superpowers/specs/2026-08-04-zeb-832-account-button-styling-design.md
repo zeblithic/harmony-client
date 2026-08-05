@@ -80,6 +80,11 @@ token-for-token, and raise the danger rule's specificity so it still wins:
   border-color: var(--danger);
   color: var(--danger);
 }
+.actions button.danger:hover:not(:disabled) {   /* (0,4,1) — see Convergence refinement */
+  background: var(--danger);
+  color: var(--on-accent);
+  border-color: var(--danger);
+}
 ```
 
 ### Why this composes cleanly
@@ -119,6 +124,29 @@ The enforceable guardrails:
 Visual correctness is guaranteed structurally: the treatment is copied
 token-for-token from the already-verified ZEB-773 reference, so matching that
 reference *is* the visual spec.
+
+## Convergence refinement (PR #608, review round 1)
+
+CodeRabbit (Minor) and CodeAnt (Major) independently flagged the same real
+regression the base hover rule introduced: `.actions button:hover:not(:disabled)`
+is `(0,3,1)` — `:not(:disabled)` contributes its `:disabled` argument to the
+score — so it outranks `.actions button.danger` `(0,2,1)` and repainted the
+`Erase all data…` buttons with the *accent* color on hover, stripping their
+danger affordance at the exact moment before an irreversible click. Both
+destructive buttons (idle "Erase all data…" and the erase-wizard confirm) live
+inside `.actions`, so one override fixes both:
+
+```css
+.actions button.danger:hover:not(:disabled) {   /* (0,4,1) beats the (0,3,1) base hover */
+  background: var(--danger);
+  color: var(--on-accent);
+  border-color: var(--danger);
+}
+```
+
+Filled-danger hover mirrors the base fill pattern (semantic color + `--on-accent`
+text) with the danger token; contrast checks out in both themes
+(`--danger`/`--on-accent` = brick-red/white in light, salmon/near-black in dark).
 
 ## Out of scope
 

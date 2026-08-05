@@ -1239,6 +1239,16 @@
   /* ZEB-842 destructive affordance — raised to .actions button.danger (0,2,1)
      so it still beats the .actions button base (0,1,1) regardless of order. */
   .actions button.danger { border-color: var(--danger); color: var(--danger); }
+  /* Destructive buttons keep their danger identity on hover. The base
+     .actions button:hover:not(:disabled) is (0,3,1) — `:not(:disabled)` counts
+     its argument — so without this it would beat .actions button.danger (0,2,1)
+     and repaint Erase with the accent color right before an irreversible click.
+     Filled-danger hover mirrors the base fill pattern with the danger token. */
+  .actions button.danger:hover:not(:disabled) {
+    background: var(--danger);
+    color: var(--on-accent);
+    border-color: var(--danger);
+  }
   .explainer { color: var(--text-secondary); font-size: 0.85em; margin-top: 14px; }
   .error { color: var(--danger); }
   .visually-hidden {
