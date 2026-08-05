@@ -151,6 +151,8 @@ pub mod relay_held_dto;
 pub mod butler_held_dto;
 // ZEB-458 P4 Phase B: on-disk persistence for the two relay fleet datasets.
 pub mod community_state_persist;
+// ZEB-814: segmented community-state root (manifest + immutable CAS segments).
+pub mod community_state_segments;
 pub mod community_state_sync;
 pub mod community_voting_approval;
 pub mod community_voting_conviction;
