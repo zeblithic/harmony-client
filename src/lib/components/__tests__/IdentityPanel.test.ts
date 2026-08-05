@@ -1948,3 +1948,59 @@ describe('Restore wizard — step 2b (fileDecrypted)', () => {
     expect(screen.getByRole('button', { name: /restore/i })).toBeInTheDocument();
   });
 });
+
+describe('IdentityPanel — erase all local data (ZEB-842)', () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  const fullHash = 'a1b2c3d4'.repeat(4);
+
+  it('gates erase on typing ERASE, then invokes erase_all_local_data and reloads', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return fullHash;
+      if (cmd === 'erase_all_local_data') return null;
+      throw new Error(`unexpected invoke: ${cmd}`);
+    });
+    const reload = vi.fn();
+    render(IdentityPanel, { props: { reload } });
+    await screen.findByText(/0xa1b2c3d4/i);
+
+    await fireEvent.click(screen.getByTestId('identity-erase-open'));
+
+    const go = screen.getByTestId('identity-erase-go') as HTMLButtonElement;
+    const input = screen.getByTestId('identity-erase-input') as HTMLInputElement;
+    expect(go.disabled).toBe(true);
+
+    // Wrong text keeps it disabled.
+    await fireEvent.input(input, { target: { value: 'erase' } });
+    expect(go.disabled).toBe(true);
+
+    // Exactly ERASE enables it.
+    await fireEvent.input(input, { target: { value: 'ERASE' } });
+    expect(go.disabled).toBe(false);
+    await fireEvent.click(go);
+
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('erase_all_local_data'));
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failed erase surfaces the error and does NOT reload', async () => {
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'current_identity_hash') return fullHash;
+      if (cmd === 'erase_all_local_data') throw new Error('permission denied');
+      throw new Error(`unexpected invoke: ${cmd}`);
+    });
+    const reload = vi.fn();
+    render(IdentityPanel, { props: { reload } });
+    await screen.findByText(/0xa1b2c3d4/i);
+
+    await fireEvent.click(screen.getByTestId('identity-erase-open'));
+    await fireEvent.input(screen.getByTestId('identity-erase-input'), { target: { value: 'ERASE' } });
+    await fireEvent.click(screen.getByTestId('identity-erase-go'));
+
+    await screen.findByTestId('identity-erase-error');
+    expect(screen.getByTestId('identity-erase-error').textContent).toContain('permission denied');
+    expect(reload).not.toHaveBeenCalled();
+  });
+});

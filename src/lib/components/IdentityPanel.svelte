@@ -6,6 +6,11 @@
   import { MIN_RECOVERY_PASSPHRASE_LEN } from '../recovery-policy';
   import { backupExportRequest } from '../backup-export-request.svelte';
 
+  // ZEB-842: injectable page reload so the erase-all flow can return to first-run
+  // onboarding after the identity + caches are gone. Injected (not called
+  // directly) so unit tests can assert it fires without a real navigation.
+  let { reload = () => window.location.reload() }: { reload?: () => void } = $props();
+
   const svc = new OwnerService();
 
   function assertNever(x: never): never {
@@ -79,9 +84,27 @@
   type WizardState =
     | { kind: 'idle' }
     | { kind: 'backup'; step: BackupStep }
-    | { kind: 'restore'; step: RestoreStep };
+    | { kind: 'restore'; step: RestoreStep }
+    // ZEB-842: clean-slate wipe of identity + all app-data caches. Single screen
+    // (no sub-steps), gated on typing the fixed literal ERASE.
+    | { kind: 'erase'; typedText: string; erasing: boolean; error: string | null };
 
   let wizardState = $state<WizardState>({ kind: 'idle' });
+
+  // ZEB-842: user-confirmed clean-slate. Hard-deletes this device's identity and
+  // every per-profile app-data cache, then reloads into first-run onboarding.
+  async function eraseAllLocalData() {
+    if (wizardState.kind !== 'erase' || wizardState.typedText !== 'ERASE' || wizardState.erasing) {
+      return;
+    }
+    wizardState = { ...wizardState, erasing: true, error: null };
+    try {
+      await invoke('erase_all_local_data');
+      reload();
+    } catch (e) {
+      wizardState = { kind: 'erase', typedText: 'ERASE', erasing: false, error: extractError(e) };
+    }
+  }
 
   // Compile-time exhaustiveness check: the compiler proves this switch is
   // exhaustive over BackupStep / RestoreStep. If a new variant is added in
@@ -670,6 +693,12 @@
         disabled={!hashLoaded}
         onclick={() => (wizardState = { kind: 'restore', step: { phase: 'pickSource' } })}
       >Restore…</button>
+      <button
+        class="danger"
+        data-testid="identity-erase-open"
+        onclick={() =>
+          (wizardState = { kind: 'erase', typedText: '', erasing: false, error: null })}
+      >Erase all data…</button>
     </div>
     <p class="explainer">
       Back up your identity to a 24-word phrase or an encrypted file.
@@ -1117,6 +1146,45 @@
       </div>
     </section>
   {/if}
+{:else if wizardState.kind === 'erase'}
+  <section class="identity-panel" aria-label="Identity">
+    <h3 class="section-title">Erase all local data</h3>
+    <p class="warning-text">
+      This permanently erases this device's identity and all cached data for this
+      profile — messages, avatars, follows, and more. Your recovery phrase still
+      restores your identity, but the cached content cannot be recovered.
+    </p>
+    <label class="field-label">
+      Type <strong>ERASE</strong> to confirm:
+      <input
+        type="text"
+        aria-label="Type ERASE to confirm erasing all local data"
+        placeholder="ERASE"
+        value={wizardState.typedText}
+        oninput={(e) => {
+          if (wizardState.kind === 'erase') {
+            wizardState = { ...wizardState, typedText: (e.target as HTMLInputElement).value };
+          }
+        }}
+        autocomplete="off"
+        autocapitalize="characters"
+        spellcheck={false}
+        data-testid="identity-erase-input"
+      />
+    </label>
+    {#if wizardState.error}
+      <p class="error" role="alert" data-testid="identity-erase-error">{wizardState.error}</p>
+    {/if}
+    <div class="actions">
+      <button onclick={resetToIdle} disabled={wizardState.erasing}>Cancel</button>
+      <button
+        class="danger"
+        data-testid="identity-erase-go"
+        disabled={wizardState.typedText !== 'ERASE' || wizardState.erasing}
+        onclick={eraseAllLocalData}
+      >{wizardState.erasing ? 'Erasing…' : 'Erase all local data'}</button>
+    </div>
+  </section>
 {/if}
 
 <style>
@@ -1138,7 +1206,9 @@
     cursor: pointer;
   }
   .hash-display:hover { background: var(--border); }
-  .actions { display: flex; gap: 8px; margin: 16px 0; }
+  .actions { display: flex; gap: 8px; margin: 16px 0; flex-wrap: wrap; }
+  /* ZEB-842: destructive-action affordance (Erase all local data). */
+  button.danger { border-color: var(--danger); color: var(--danger); }
   .explainer { color: var(--text-secondary); font-size: 0.85em; margin-top: 14px; }
   .error { color: var(--danger); }
   .visually-hidden {
