@@ -12,6 +12,7 @@
 //! env-knob config builder, and the advertiser-set slot assignment.
 
 use crate::community_relay_announce::COMMUNITY_RELAY_ADVERTISERS_MAX;
+use crate::membership_vouch::MembershipVouch;
 use crate::owner_state_types::EpochKey;
 use crate::owner_state_types::OwnerAddr;
 use crate::reachability_record::ReachabilityAnnouncePayload;
@@ -28,6 +29,66 @@ use zeroize::Zeroizing;
 
 /// Number of enumerated rendezvous slots == the relay-advertiser cap.
 pub const RENDEZVOUS_SLOT_COUNT: usize = COMMUNITY_RELAY_ADVERTISERS_MAX;
+
+/// ZEB-827: encode a rendezvous slot's routing blob — a superset of
+/// `ReachabilityAnnouncePayload` carrying an optional membership vouch. A `None`
+/// vouch encodes byte-identically to the bare payload (so already-deployed peers
+/// keep decoding published blobs unchanged); a `Some` vouch is merged into the
+/// payload's CBOR map under the `"mv"` key, which legacy bare-payload decoders
+/// ignore. Uses CBOR-`Value` map-merge rather than `#[serde(flatten)]` — the
+/// latter emits an indefinite-length map and so is NOT byte-compatible with the
+/// definite-length legacy encoding.
+pub fn encode_rendezvous_blob(
+    reachability: &ReachabilityAnnouncePayload,
+    vouch: Option<&MembershipVouch>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Fixed-size/serializable payload — encode cannot fail in practice.
+    let _ = ciborium::into_writer(reachability, &mut out);
+    let Some(v) = vouch else {
+        return out;
+    };
+    // Merge "mv" into the payload's CBOR map without disturbing existing keys.
+    let mut val: ciborium::value::Value = match ciborium::from_reader(&out[..]) {
+        Ok(val) => val,
+        Err(_) => return out,
+    };
+    if let ciborium::value::Value::Map(entries) = &mut val {
+        let mut vbytes = Vec::new();
+        if ciborium::into_writer(v, &mut vbytes).is_ok() {
+            if let Ok(vval) = ciborium::from_reader::<ciborium::value::Value, _>(&vbytes[..]) {
+                entries.push((ciborium::value::Value::Text("mv".to_string()), vval));
+            }
+        }
+    }
+    let mut merged = Vec::new();
+    let _ = ciborium::into_writer(&val, &mut merged);
+    merged
+}
+
+/// Decode a rendezvous routing blob. Tolerates a legacy bare payload (no
+/// vouch → `None`) and a vouch-carrying superset alike.
+pub fn decode_rendezvous_blob(
+    bytes: &[u8],
+) -> Option<(ReachabilityAnnouncePayload, Option<MembershipVouch>)> {
+    let reachability: ReachabilityAnnouncePayload = ciborium::from_reader(bytes).ok()?;
+    let mut vouch = None;
+    if let Ok(ciborium::value::Value::Map(entries)) =
+        ciborium::from_reader::<ciborium::value::Value, _>(bytes)
+    {
+        for (k, v) in entries {
+            if let ciborium::value::Value::Text(t) = &k {
+                if t.as_str() == "mv" {
+                    let mut vb = Vec::new();
+                    if ciborium::into_writer(&v, &mut vb).is_ok() {
+                        vouch = ciborium::from_reader::<MembershipVouch, _>(&vb[..]).ok();
+                    }
+                }
+            }
+        }
+    }
+    Some((reachability, vouch))
+}
 
 /// Domain-separation prefix for rendezvous slot derivation. Length-disjoint
 /// from the 72-byte member-keyed `info`, so rendezvous keys can never alias a
@@ -332,5 +393,83 @@ mod tests {
         assert_eq!(slot_for_advertiser(&set, &addr(1)), Some(0));
         assert_eq!(slot_for_advertiser(&set, &addr(2)), Some(1));
         assert_eq!(slot_for_advertiser(&set, &addr(3)), Some(2));
+    }
+}
+
+#[cfg(test)]
+mod rendezvous_blob_tests {
+    use super::*;
+    use crate::membership_vouch::mint_membership_vouch;
+    use crate::owner_state_types::SpaceId;
+    use crate::reachability_record::ReachabilityAnnouncePayload;
+    use ed25519_dalek::SigningKey;
+
+    fn payload() -> ReachabilityAnnouncePayload {
+        ReachabilityAnnouncePayload {
+            iroh_node_id: [0xAB; 32],
+            home_relay_url: "https://derp.example/".to_string(),
+            direct_addresses: vec![],
+            announced_at_ms: 1_700_000_000_000,
+            identity_signature: [0xCD; 64],
+            butler_set: vec![],
+            bs_at: 0,
+        }
+    }
+
+    #[test]
+    fn roundtrips_with_vouch() {
+        let p = payload();
+        let v = mint_membership_vouch(
+            &SigningKey::from_bytes(&[3; 32]),
+            SpaceId([1; 16]),
+            &[9; 64],
+            1,
+            2,
+        );
+        let bytes = encode_rendezvous_blob(&p, Some(&v));
+        let (dp, dv) = decode_rendezvous_blob(&bytes).expect("decode");
+        assert_eq!(dp, p);
+        assert_eq!(dv, Some(v));
+    }
+
+    #[test]
+    fn vouchless_blob_is_byte_identical_to_bare_payload() {
+        let p = payload();
+        let wrapped = encode_rendezvous_blob(&p, None);
+        let mut bare = Vec::new();
+        ciborium::into_writer(&p, &mut bare).unwrap();
+        assert_eq!(
+            wrapped, bare,
+            "vouchless wrapper must equal legacy bare payload bytes"
+        );
+    }
+
+    #[test]
+    fn legacy_bare_decode_ignores_vouch() {
+        // Back-compat: an OLD resolver decoding a NEW (vouch-carrying) blob as a
+        // bare payload still recovers reachability.
+        let p = payload();
+        let v = mint_membership_vouch(
+            &SigningKey::from_bytes(&[3; 32]),
+            SpaceId([1; 16]),
+            &[9; 64],
+            1,
+            2,
+        );
+        let bytes = encode_rendezvous_blob(&p, Some(&v));
+        let bare: ReachabilityAnnouncePayload =
+            ciborium::from_reader(&bytes[..]).expect("bare decode of wrapped");
+        assert_eq!(bare, p);
+    }
+
+    #[test]
+    fn decode_of_legacy_bare_yields_no_vouch() {
+        // Forward-compat: a NEW resolver decoding an OLD (bare) blob sees no vouch.
+        let p = payload();
+        let mut bare = Vec::new();
+        ciborium::into_writer(&p, &mut bare).unwrap();
+        let (dp, dv) = decode_rendezvous_blob(&bare).expect("decode bare");
+        assert_eq!(dp, p);
+        assert_eq!(dv, None);
     }
 }
