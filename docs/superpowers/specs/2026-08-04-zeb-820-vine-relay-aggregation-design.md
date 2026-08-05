@@ -101,11 +101,13 @@ layer vines don't need — `VineRelayEntry` carries only `iroh_endpoint_id` +
    lowest-priority (last) entry if the set is already full. The publisher is
    online by definition, so its live entry always belongs.
 
-**Pin promotion is inherited but invisible on the wire.** Reusing
-`butler_set_order` means a pinned sibling may lead the ordering, but
-`VineRelayEntry` has no `pinned` field — the pin affects only the *order*
-entries appear in (a benign dialing-preference hint), never what a follower can
-observe. No new coupling to surface.
+**Pin promotion is inherited.** Reusing `butler_set_order` means the owner's
+pinned device leads the ordering. `VineRelayEntry` has no `pinned` field, so no
+pin metadata is transmitted — but the pin is still observable *in effect*: it
+sets the serialized **order** (a dialing-preference hint) and, when there are
+more fresh devices than the cap, **which** devices make the set. When self must
+be force-included, a fresh pinned sibling keeps slot 0 (mirroring
+`build_butler_set`), rather than being displaced by self.
 
 ## Wiring
 
@@ -203,3 +205,36 @@ decoded set the same way. Followers that already parse a multi-entry
 - A vine-specific pin concept (`VineRelayEntry` gains no `pinned` field).
 - Cross-device fleet-doc convergence latency (a `FleetSyncEngine` property, not
   ours to change here).
+
+## Convergence refinement (PR #611, review round 1)
+
+CodeRabbit (1 Minor) + Qodo (3 bugs) + CodeAnt (1 Logic) landed; Greptile
+author-excluded. Four distinct findings addressed, one declined — all
+second-order consequences of "reuse `butler_set_order` wholesale":
+
+1. **Silent encode→retraction fallback** (Qodo #1, Action-required) —
+   **fixed.** With aggregation, one toxic oversized sibling `home_relay` could
+   blow `VINES_RECORD_BLOB_MAX_BYTES`, and `build_blob`'s `.ok()` collapsed that
+   to an empty-set retraction — suppressing *every* device's vine serving, not
+   just self's. Replaced `build_blob_or_retraction` with `build_publish_blob`:
+   on aggregated-encode failure it logs a `warn` and retries **self-only**
+   before retracting, so a bad sibling row can never suppress this device's own
+   serving. Pinned by `oversized_sibling_relay_falls_back_to_self_only`.
+2. **Pin promotion mis-documented + force-insert displaces the pin** (Qodo #3
+   Strong + CodeAnt Logic, same root) — **fixed.** The doc claimed pin was
+   "invisible / order-only"; in fact it also decides membership under the cap,
+   and the `!saw_self` branch inserted self at index 0, shoving a pinned sibling
+   out of slot 0 (unlike `build_butler_set`). The force-insert is now pin-aware
+   (keeps a fresh pinned sibling at slot 0); comment + this spec corrected.
+   Pinned by `pinned_sibling_leads_when_self_force_inserted`.
+3. **E2E test didn't assert the live self entry** (CodeRabbit Minor) —
+   **fixed.** `aggregated_set_includes_fresh_siblings` now captures the
+   publisher's endpoint id and asserts the resolved set is exactly 3 entries and
+   contains it.
+4. **`FleetNetDoc` clone per publish tick** (Qodo #2, Performance) —
+   **declined.** Premature: the snapshot is one owner's device roster (a handful
+   of rows) and the publish cadence is hours (core `compute_next_publish_at` +
+   the explicit republish hooks), so it's a few-KB clone off a cold path. The
+   closure abstraction also keeps the publisher decoupled from the lock type and
+   test construction trivial. If profiling ever shows it, the `Arc<RwLock<…>>`
+   read-and-borrow alternative is a drop-in.

@@ -451,10 +451,13 @@ pub fn build_butler_set(
 /// `stale_before_ms` inversion `butler_set_order` expects is computed HERE so
 /// no caller can get it wrong.
 ///
-/// Pin promotion is inherited but invisible: `butler_set_order` may lead with
-/// the owner's pinned device, but `VineRelayEntry` has no `pinned` field, so
-/// that affects only ORDER (a dialing-preference hint), never what a follower
-/// observes.
+/// Pin promotion is inherited from `butler_set_order`, which leads with the
+/// owner's pinned device. `VineRelayEntry` carries no `pinned` field, so no pin
+/// metadata is transmitted — but the pin is still observable in effect: it sets
+/// the serialized ORDER (a dialing-preference hint) and, when more fresh devices
+/// exist than the cap, WHICH devices make the set. When self must be
+/// force-included (below), a fresh pinned sibling keeps slot 0, mirroring
+/// `build_butler_set`.
 pub fn build_vine_relay_set(
     doc: &FleetNetDoc,
     self_device_id: &str,
@@ -464,9 +467,13 @@ pub fn build_vine_relay_set(
     use crate::pkarr_vines::{VineRelayEntry, VINE_RELAY_SET_MAX};
 
     let stale_before_ms = now_ms.saturating_sub(crate::butler_deposit::BUTLER_SET_FRESHNESS_MS);
+    let self_is_pinned = doc.pinned.as_deref() == Some(self_device_id);
 
     let mut out: Vec<VineRelayEntry> = Vec::new();
     let mut saw_self = false;
+    // Whether out[0] is the owner's pinned device (a sibling, not self):
+    // `butler_set_order` promotes a fresh pin to the front, so it lands first.
+    let mut leading_is_pinned_sibling = false;
     for (dev_id, row) in butler_set_order(doc, stale_before_ms) {
         if out.len() >= VINE_RELAY_SET_MAX {
             break;
@@ -477,6 +484,9 @@ pub fn build_vine_relay_set(
             saw_self = true;
             out.push(self_entry.clone());
             continue;
+        }
+        if out.is_empty() && doc.pinned.as_deref() == Some(dev_id.as_str()) {
+            leading_is_pinned_sibling = true;
         }
         out.push(VineRelayEntry {
             iroh_endpoint_id: row.iroh_endpoint_id,
@@ -490,7 +500,14 @@ pub fn build_vine_relay_set(
         if out.len() >= VINE_RELAY_SET_MAX {
             out.pop();
         }
-        out.insert(0, self_entry);
+        // Keep a fresh pinned sibling at slot 0 (pinned-first, mirroring
+        // build_butler_set); otherwise self leads.
+        let idx = if !self_is_pinned && leading_is_pinned_sibling {
+            1
+        } else {
+            0
+        };
+        out.insert(idx.min(out.len()), self_entry);
     }
     out
 }
@@ -2119,6 +2136,31 @@ mod vine_relay_set_tests {
         assert!(
             pos([0x22; 32]) < pos([0x33; 32]),
             "clamped honest row must precede future-skewed row"
+        );
+    }
+
+    #[test]
+    fn pinned_sibling_leads_when_self_force_inserted() {
+        // 4 fresh siblings (cap-filling) with one pinned, self NOT in the doc →
+        // self is force-included, but the pinned sibling must keep slot 0
+        // (pinned-first, mirroring build_butler_set), not be displaced by self.
+        let now = BUTLER_SET_FRESHNESS_MS * 10;
+        let mut doc = doc_with(&[
+            ("bb", row(0x22, "https://b.example", now)),
+            ("cc", row(0x33, "https://c.example", now)),
+            ("dd", row(0x44, "https://d.example", now)),
+            ("ee", row(0x55, "https://e.example", now)),
+        ]);
+        doc.pinned = Some("bb".to_string());
+        let out = build_vine_relay_set(&doc, SELF_ID, self_entry(), now);
+        assert_eq!(out.len(), VINE_RELAY_SET_MAX);
+        assert_eq!(
+            out[0].iroh_endpoint_id, [0x22; 32],
+            "pinned sibling keeps slot 0"
+        );
+        assert_eq!(
+            out[1].iroh_endpoint_id, SELF_EP,
+            "self inserted right after the pin"
         );
     }
 }

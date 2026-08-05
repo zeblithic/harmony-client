@@ -65,19 +65,39 @@ fn build_retraction_blob(now_ms: u64) -> Vec<u8> {
     .unwrap_or_default()
 }
 
-/// What the registered closure actually publishes on every tick: the real
-/// self-entry blob when the gate is open, or the retraction above when it
-/// isn't. Pure — same live-read inputs the closure captures, so a test can
-/// pin "the next closure invocation" behavior without any network/tokio
-/// machinery.
-fn build_blob_or_retraction(
+/// What the registered closure actually publishes on every tick. When sharing
+/// is gated open, the aggregated `relay_set`; if that fails to encode — e.g. a
+/// toxic oversized sibling `home_relay` blowing `VINES_RECORD_BLOB_MAX_BYTES` —
+/// fall back to advertising SELF ONLY so this device keeps serving rather than
+/// silently retracting ALL vine serving (ZEB-820). Gate-closed, or self-only
+/// also failing to encode, yields the empty-set retraction. Pure — same
+/// live-read inputs the closure captures, so a test can pin behavior without
+/// any network/tokio machinery.
+fn build_publish_blob(
     share: bool,
     own_vine_count: usize,
     relay_set: Vec<VineRelayEntry>,
+    self_entry: &VineRelayEntry,
     now_ms: u64,
 ) -> Vec<u8> {
-    build_blob(share, own_vine_count, relay_set, now_ms)
-        .unwrap_or_else(|| build_retraction_blob(now_ms))
+    if let Some(blob) = build_blob(share, own_vine_count, relay_set, now_ms) {
+        return blob;
+    }
+    // `build_blob` returned None: either gated closed (share=false / no vines),
+    // which must retract, or the aggregated set failed to encode, which warrants
+    // a self-only retry so a single toxic sibling row can't suppress this
+    // device's own serving.
+    if share && own_vine_count > 0 {
+        tracing::warn!(
+            "ZEB-820: aggregated vine relay set failed to encode (likely \
+             VINES_RECORD_BLOB_MAX_BYTES from a large sibling home_relay); \
+             falling back to self-only"
+        );
+        if let Some(blob) = build_blob(share, own_vine_count, vec![self_entry.clone()], now_ms) {
+            return blob;
+        }
+    }
+    build_retraction_blob(now_ms)
 }
 
 /// Wall-clock now in ms. Test-only since ZEB-820: production publish ticks are
@@ -280,10 +300,10 @@ impl PkarrVinesPublisher {
                 let relay_set = crate::fleet_net::build_vine_relay_set(
                     &(fleet_snapshot)(),
                     &self_device_id,
-                    self_entry,
+                    self_entry.clone(),
                     at_ms,
                 );
-                let blob = build_blob_or_retraction(share, own_vine_count, relay_set, at_ms);
+                let blob = build_publish_blob(share, own_vine_count, relay_set, &self_entry, at_ms);
                 PkarrRoutingRecord::sign_new(
                     blob,
                     id_pub,
@@ -367,11 +387,15 @@ mod tests {
 
     const TEST_SELF_ENDPOINT: [u8; 32] = [7u8; 32];
 
-    fn self_relay_set() -> Vec<VineRelayEntry> {
-        vec![VineRelayEntry {
+    fn self_entry() -> VineRelayEntry {
+        VineRelayEntry {
             iroh_endpoint_id: TEST_SELF_ENDPOINT,
             home_relay: "https://relay.example".to_string(),
-        }]
+        }
+    }
+
+    fn self_relay_set() -> Vec<VineRelayEntry> {
+        vec![self_entry()]
     }
 
     #[test]
@@ -399,10 +423,11 @@ mod tests {
     /// pins that behavior without any network/tokio machinery.
     #[test]
     fn retraction_blob_when_gate_flips_closed_after_registration() {
-        let blob = build_blob_or_retraction(
+        let blob = build_publish_blob(
             /*share=*/ true,
             /*own_vine_count=*/ 0,
             self_relay_set(),
+            &self_entry(),
             1_000,
         );
         let p: crate::pkarr_vines::VineRelayRecordPayload =
@@ -418,10 +443,36 @@ mod tests {
     /// exactly (the closure's normal-path behavior), not the retraction.
     #[test]
     fn full_blob_when_gate_open() {
-        let blob = build_blob_or_retraction(true, 3, self_relay_set(), 1_000);
+        let blob = build_publish_blob(true, 3, self_relay_set(), &self_entry(), 1_000);
         let p: crate::pkarr_vines::VineRelayRecordPayload =
             ciborium::from_reader(blob.as_slice()).unwrap();
         assert_eq!(p.relay_set.len(), 1);
+        assert_eq!(p.relay_set[0].iroh_endpoint_id, TEST_SELF_ENDPOINT);
+    }
+
+    /// ZEB-820 (Qodo #1): an oversized sibling `home_relay` blows
+    /// `VINES_RECORD_BLOB_MAX_BYTES` for the aggregated set. `build_publish_blob`
+    /// must fall back to self-only rather than silently retracting ALL serving.
+    #[test]
+    fn oversized_sibling_relay_falls_back_to_self_only() {
+        let oversized = VineRelayEntry {
+            iroh_endpoint_id: [0x99; 32],
+            home_relay: "x".repeat(900), // > VINES_RECORD_BLOB_MAX_BYTES (700)
+        };
+        // Premise: the aggregated (self + oversized sibling) set fails to encode.
+        assert!(
+            build_blob(true, 3, vec![self_entry(), oversized.clone()], 1_000).is_none(),
+            "premise: the oversized aggregated set must fail to encode"
+        );
+        // The fallback must publish self-only, NOT an empty-set retraction.
+        let blob = build_publish_blob(true, 3, vec![self_entry(), oversized], &self_entry(), 1_000);
+        let p: crate::pkarr_vines::VineRelayRecordPayload =
+            ciborium::from_reader(blob.as_slice()).unwrap();
+        assert_eq!(
+            p.relay_set.len(),
+            1,
+            "fell back to self-only, not a retraction"
+        );
         assert_eq!(p.relay_set[0].iroh_endpoint_id, TEST_SELF_ENDPOINT);
     }
 
@@ -1096,6 +1147,7 @@ mod tests {
         let resolver = harmony_pkarr::PkarrResolver::new(single_relay_client(&relay));
 
         let endpoint = test_endpoint().await;
+        let self_endpoint_id = *endpoint.node_id().as_bytes();
         let identity = crate::vine_signing::test_identity();
         let addr = crate::vine_signing::signer_address(&identity);
 
@@ -1148,7 +1200,13 @@ mod tests {
                     && relay_set.iter().any(|e| e.iroh_endpoint_id == SIB_B)
                 {
                     // Self is force-included too — the publisher's live endpoint.
-                    assert!(relay_set.len() >= 3, "self + 2 siblings");
+                    assert_eq!(relay_set.len(), 3, "self + 2 siblings");
+                    assert!(
+                        relay_set
+                            .iter()
+                            .any(|e| e.iroh_endpoint_id == self_endpoint_id),
+                        "the live publisher endpoint must be included"
+                    );
                     return;
                 }
             }
