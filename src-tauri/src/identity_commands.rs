@@ -21,6 +21,7 @@ use zeroize::Zeroizing;
 
 use crate::identity;
 use crate::identity::KeychainStore;
+use crate::owner_state::{owner_master_seed_backend, SeedBackend};
 use crate::recovery_cli;
 use crate::recovery_policy::{MAX_RECOVERY_COMMENT_BYTES, MIN_RECOVERY_PASSPHRASE_LEN};
 
@@ -563,44 +564,64 @@ pub async fn export_mnemonic_words() -> Result<Vec<String>, String> {
         .await
 }
 
-/// ZEB-768: the string contract for [`identity_store_backend`]. The GUI
+/// ZEB-768/830: the string contract for [`identity_store_backend`]. The GUI
 /// onboarding copy branches on these exact values, so pin them here.
-fn identity_store_backend_label(keychain_available: bool) -> &'static str {
-    if keychain_available {
-        "keychain"
-    } else {
-        "encrypted-file"
+fn identity_store_backend_label(backend: Option<SeedBackend>) -> &'static str {
+    match backend {
+        Some(SeedBackend::Keychain) => "keychain",
+        Some(SeedBackend::EncryptedFile) => "encrypted-file",
+        None => "unknown",
     }
 }
 
-/// ZEB-768: report which identity-store backend onboarding copy should
+/// ZEB-768/830: report which identity-store backend onboarding copy should
 /// describe, so the backup step tells the truth instead of unconditionally
 /// asserting the OS keychain.
 ///
-/// This reports keychain **availability** — whether a `KeychainStore`
-/// constructs here. `HARMONY_DISABLE_KEYCHAIN`, a named profile, and hosts
-/// with no keyring provider all make it refuse → `encrypted-file`. That is a
-/// strict improvement over the old unconditional keychain claim and covers
-/// ZEB-768's observed repro (kill-switch + passphrase file).
+/// ZEB-830: this reports **ground truth** — the backend the persisted
+/// `OwnerMasterSeed` actually loaded from, via `owner_state::load_secret`'s
+/// keychain→file precedence (shared through `owner_master_seed_backend`) — not
+/// mere keychain *availability*. `KeychainStore::new().is_ok()` (the old
+/// signal) only says a handle constructs; the seed can still land in the
+/// encrypted file when the keychain *write* falls through, because `keyring` v3
+/// constructs `Entry` handles lazily (the backend lookup happens at read/write,
+/// not at `Entry::new`). Querying the real load location closes that overclaim.
 ///
-/// It is NOT proven persistence location, and callers must not read it as
-/// such: the mint (`owner_state::save_secret`) still falls through to the
-/// encrypted-file store when the keychain *write* fails even though the
-/// handle constructed (`vault_save_slot` → `Ok(false)`/`Err`), and this
-/// getter is queried before mint. Replacing it with a post-mint ground-truth
-/// probe (mirroring `load_secret`'s keychain→file precedence) + a re-query
-/// after mint is ZEB-830 — deferred because that probe's keychain branch is
-/// only verifiable against a real OS keychain (the ZEB-428 isolation gate
-/// blocks `KeychainStore::new()` in every test build, so CI cannot exercise
-/// it).
+/// `use_os_keychain` is gated on `KeychainStore::new().is_ok()` — the same
+/// decision mint makes (`use_os_keychain = keychain.is_some()`, where entry
+/// points pass `KeychainStore::new().ok()`), so the probe looks where mint
+/// would have written.
 ///
-/// Returns `"keychain"` or `"encrypted-file"`; the frontend falls back to
-/// backend-neutral wording on any value it doesn't recognize or on error,
-/// never an unearned keychain claim.
+/// Returns `"keychain"`, `"encrypted-file"`, or `"unknown"` (no identity yet /
+/// inconclusive probe). The frontend renders `"unknown"` — and any value it
+/// doesn't recognize — as backend-neutral wording, never an unearned keychain
+/// claim. Never returns `Err`: an inconclusive probe (locked keychain /
+/// unreadable file) OR a failed identity-directory resolution both collapse to
+/// `"unknown"` rather than surfacing an IPC error.
 #[tauri::command]
 pub async fn identity_store_backend() -> Result<String, String> {
-    run_blocking(move || Ok(identity_store_backend_label(KeychainStore::new().is_ok()).to_string()))
-        .await
+    // The owner secrets (`master_seed.enc` / `owner_state.cbor`) live in the
+    // identity DIRECTORY — the parent of the identity.key path — which is what
+    // the probe's encrypted-file fallback joins `master_seed.enc` onto.
+    // `resolve_path(None)` returns the identity.key FILE path, so resolve the
+    // directory here instead (Qodo, PR #606). A dir-resolution failure (no HOME)
+    // is as inconclusive as a probe failure → collapse to "unknown".
+    let Ok(identity_dir) = crate::owner_commands::resolve_identity_dir() else {
+        tracing::debug!(
+            "identity_store_backend: identity dir resolution failed; reporting unknown"
+        );
+        return Ok("unknown".to_string());
+    };
+    run_blocking(move || {
+        let use_os_keychain = KeychainStore::new().is_ok();
+        let backend =
+            owner_master_seed_backend(use_os_keychain, &identity_dir).unwrap_or_else(|e| {
+                tracing::debug!("identity_store_backend probe inconclusive: {e}");
+                None
+            });
+        Ok(identity_store_backend_label(backend).to_string())
+    })
+    .await
 }
 
 /// Return the identity hash that would result from restoring the given
@@ -801,12 +822,81 @@ mod tests {
 
     #[test]
     fn identity_store_backend_label_pins_the_frontend_string_contract() {
-        // The GUI branches on these exact literals; a keychain-available
-        // node reads "keychain", the file-store fallback reads
-        // "encrypted-file". Anything else would make WelcomeModal fall back
-        // to backend-neutral wording, so these two are the whole contract.
-        assert_eq!(identity_store_backend_label(true), "keychain");
-        assert_eq!(identity_store_backend_label(false), "encrypted-file");
+        // The GUI branches on these exact literals: keychain-backed reads
+        // "keychain", the file store reads "encrypted-file", and the neutral /
+        // inconclusive case (no seed in either store) reads "unknown" — which
+        // WelcomeModal renders as backend-neutral wording. These three are the
+        // whole contract (ZEB-830 replaced the old bool availability signal).
+        assert_eq!(
+            identity_store_backend_label(Some(SeedBackend::Keychain)),
+            "keychain"
+        );
+        assert_eq!(
+            identity_store_backend_label(Some(SeedBackend::EncryptedFile)),
+            "encrypted-file"
+        );
+        assert_eq!(identity_store_backend_label(None), "unknown");
+    }
+
+    /// Save/restore an env var across a `#[serial]` test (restores the PRIOR
+    /// value on drop — needed for pre-existing vars like `HOME`, unlike a
+    /// remove-only guard).
+    struct ScopedEnv {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl ScopedEnv {
+        fn set(key: &'static str, val: &Path) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+        fn set_str(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+    }
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Regression (ZEB-830 / Qodo, PR #606): the getter must feed the probe the
+    /// identity DIRECTORY (parent of `identity.key`), not the `identity.key`
+    /// FILE path. With the pre-fix getter (which passed `resolve_path(None)`),
+    /// the encrypted-file probe searched `<identity.key>/master_seed.enc` and
+    /// misreported a real file-store seed as "unknown". Exercises the getter's
+    /// OWN path resolution (the committed probe tests pass a dir directly, so
+    /// they cannot catch this) by planting the seed at the real resolved layout
+    /// `<HOME>/.harmony/master_seed.enc`. The ZEB-428 gate makes the getter's
+    /// `KeychainStore::new()` refuse in test builds, so this stays on the
+    /// file/neutral branches.
+    #[tokio::test]
+    #[serial]
+    async fn identity_store_backend_reads_encrypted_file_from_the_resolved_dir() {
+        use crate::identity::{EncryptedFileStore, KeyStore};
+        let home = tempfile::tempdir().unwrap();
+        let _home = ScopedEnv::set("HOME", home.path());
+        let _pp = ScopedEnv::set_str("HARMONY_PASSPHRASE", "zeb830-getter-dir-pp");
+        let dot_harmony = home.path().join(".harmony");
+        std::fs::create_dir_all(&dot_harmony).unwrap();
+
+        // No seed anywhere yet → neutral, and never an IPC error.
+        assert_eq!(identity_store_backend().await.unwrap(), "unknown");
+
+        // Plant a seed in the encrypted file at the real resolved layout.
+        let store = EncryptedFileStore::from_env(dot_harmony.join("master_seed.enc"))
+            .expect("store construct")
+            .expect("HARMONY_PASSPHRASE configured");
+        store.save(&[0x42u8; 32]).expect("plant seed");
+
+        // The getter must resolve the DIR and find it → "encrypted-file".
+        assert_eq!(identity_store_backend().await.unwrap(), "encrypted-file");
     }
 
     // ── current_identity_hash_helper ─────────────────────────────────────

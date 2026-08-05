@@ -71,21 +71,31 @@
 
   const svc = new OwnerService();
 
+  // ZEB-830: identity_store_backend is queried both onMount (pre-mint) and again
+  // after mint(). Both assign identityBackend, and the pre-mint request can
+  // resolve LATER than the post-mint one (e.g. onMount awaits getVersion first,
+  // or a slow keychain read), which would clobber the post-mint ground truth
+  // with a stale value. Guard with a monotonic generation counter so only the
+  // latest-STARTED query may commit — the post-mint query always wins. On
+  // failure the current value (default 'unknown') stays, never an overclaim.
+  let backendQueryGen = 0;
+  async function refreshIdentityBackend(): Promise<void> {
+    const gen = ++backendQueryGen;
+    try {
+      const backend = normalizeIdentityStoreBackend(await invoke<string>('identity_store_backend'));
+      if (gen === backendQueryGen) identityBackend = backend;
+    } catch (e) {
+      console.debug('[zeb-830] WelcomeModal identity_store_backend failed:', extractError(e));
+    }
+  }
+
   onMount(async () => {
     try {
       appVersion = await getVersion();
     } catch (e) {
       console.debug('[zeb-338] WelcomeModal getVersion failed:', extractError(e));
     }
-    try {
-      // ZEB-768: never leave this asserting the keychain — on failure the
-      // 'unknown' default keeps the backend-neutral wording.
-      identityBackend = normalizeIdentityStoreBackend(
-        await invoke<string>('identity_store_backend'),
-      );
-    } catch (e) {
-      console.debug('[zeb-768] WelcomeModal identity_store_backend failed:', extractError(e));
-    }
+    await refreshIdentityBackend();
   });
 
   // ZEB-338 / PR #169: trap focus inside the hard gate (shared trapFocus util,
@@ -102,6 +112,13 @@
     try {
       const result = await svc.mint();
       mintResult = result;
+      // ZEB-830: onMount queried identity_store_backend before mint, when the
+      // seed's location wasn't yet decided — and mint can fall through to the
+      // encrypted file even with a keychain handle available. Re-query now so
+      // the backup note reflects where the seed ACTUALLY landed; the generation
+      // guard in refreshIdentityBackend ensures this post-mint result wins over
+      // a slow-resolving onMount request.
+      await refreshIdentityBackend();
       stage = 'backup';
     } catch (e) {
       const msg = extractError(e);

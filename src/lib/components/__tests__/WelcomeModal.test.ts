@@ -466,3 +466,90 @@ describe('WelcomeModal identity-store backend copy (ZEB-768)', () => {
     expect(note.toLowerCase()).not.toContain('keychain');
   });
 });
+
+// ZEB-830: onMount queries identity_store_backend BEFORE mint, when the seed's
+// location isn't yet decided; mint can fall through to the encrypted file even
+// with a keychain handle available. The modal must RE-QUERY after mint so the
+// backup note reflects where the seed actually landed, not the stale pre-mint
+// availability guess.
+describe('WelcomeModal post-mint backend re-query (ZEB-830)', () => {
+  const OWNER = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
+
+  it('re-queries after mint so the note reflects the post-mint backend, not the onMount value', async () => {
+    mintMock.mockResolvedValue({
+      state: { ownerId: OWNER, ownerDisplayName: 'x', devices: [], canBackUp: true },
+      recoveryToken: 'deadbeefdeadbeefdeadbeefdeadbeef0123456789abcdef0123456789abcdef',
+    });
+    // onMount (pre-mint, 1st call) reports 'keychain'; the mint falls through to
+    // the file, so the post-mint re-query (2nd call) reports 'encrypted-file'.
+    const replies = ['keychain', 'encrypted-file'];
+    let call = 0;
+    mockCoreInvoke.mockImplementation((cmd: string) =>
+      cmd === 'identity_store_backend'
+        ? Promise.resolve(replies[Math.min(call++, replies.length - 1)])
+        : Promise.resolve(undefined),
+    );
+    const { container, getByTestId } = render(WelcomeModal, {
+      props: { open: true, onMinted: vi.fn() },
+    });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    // The note must settle on the POST-mint (encrypted-file) copy — proving the
+    // re-query overrode the stale onMount 'keychain' value.
+    const expected = identityKeyBackupNote('encrypted-file');
+    await waitFor(() => {
+      const actual = container.querySelector('.keychain-note')?.textContent?.trim() ?? '';
+      expect(actual).toBe(expected);
+    });
+    expect(container.querySelector('.keychain-note')?.textContent?.toLowerCase()).not.toContain(
+      'keychain',
+    );
+    // Queried at least twice: once on mount, once after mint.
+    const backendCalls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === 'identity_store_backend');
+    expect(backendCalls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('a slow pre-mint query resolving AFTER the post-mint query cannot clobber the result', async () => {
+    // The generation guard: onMount (1st call) resolves LATE with a stale
+    // 'keychain'; the post-mint (2nd call) resolves immediately with the real
+    // 'encrypted-file'. Without the guard, the late onMount resolution would
+    // overwrite the note back to keychain — the exact race CodeRabbit/Qodo flagged.
+    mintMock.mockResolvedValue({
+      state: { ownerId: OWNER, ownerDisplayName: 'x', devices: [], canBackUp: true },
+      recoveryToken: 'deadbeefdeadbeefdeadbeefdeadbeef0123456789abcdef0123456789abcdef',
+    });
+    let releaseFirst!: () => void;
+    let call = 0;
+    mockCoreInvoke.mockImplementation((cmd: string) => {
+      if (cmd !== 'identity_store_backend') return Promise.resolve(undefined);
+      call++;
+      if (call === 1) {
+        return new Promise((res) => {
+          releaseFirst = () => res('keychain');
+        });
+      }
+      return Promise.resolve('encrypted-file');
+    });
+    const { container, getByTestId } = render(WelcomeModal, {
+      props: { open: true, onMinted: vi.fn() },
+    });
+    // Ensure the pre-mint (onMount) query is in-flight (call 1, pending) BEFORE
+    // minting, so the post-mint query is deterministically call 2 — onMount
+    // awaits getVersion first, so without this gate the post-mint query could
+    // become the pending call and block handleCreateIdentity.
+    await waitFor(() => expect(call).toBeGreaterThanOrEqual(1));
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    const expected = identityKeyBackupNote('encrypted-file');
+    await waitFor(() => {
+      expect(container.querySelector('.keychain-note')?.textContent?.trim()).toBe(expected);
+    });
+    // Release the stale onMount query LAST — the guard must reject it.
+    releaseFirst();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(container.querySelector('.keychain-note')?.textContent?.trim()).toBe(expected);
+    expect(container.querySelector('.keychain-note')?.textContent?.toLowerCase()).not.toContain(
+      'keychain',
+    );
+  });
+});
