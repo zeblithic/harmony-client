@@ -1210,8 +1210,35 @@
   }
   .hash-display:hover { background: var(--border); }
   .actions { display: flex; gap: 8px; margin: 16px 0; flex-wrap: wrap; }
-  /* ZEB-842: destructive-action affordance (Erase all local data). */
-  button.danger { border-color: var(--danger); color: var(--danger); }
+  /* ZEB-832: base treatment for every button in an .actions row (idle
+     Backup…/Restore…/Erase all data… and the wizard-step actions). Without a
+     base rule the UA default — a 2px black outset bevel — showed through;
+     mirrors the ZEB-773 reference in src/app.css token-for-token. */
+  .actions button {
+    font: inherit;
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .actions button:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--on-accent);
+    border-color: var(--accent);
+  }
+  .actions button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .actions button:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+  /* ZEB-842 destructive affordance — raised to .actions button.danger (0,2,1)
+     so it still beats the .actions button base (0,1,1) regardless of order. */
+  .actions button.danger { border-color: var(--danger); color: var(--danger); }
   .explainer { color: var(--text-secondary); font-size: 0.85em; margin-top: 14px; }
   .error { color: var(--danger); }
   .visually-hidden {
