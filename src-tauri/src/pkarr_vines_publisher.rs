@@ -39,18 +39,14 @@ pub(crate) const HANDLE: &str = "vines";
 fn build_blob(
     share: bool,
     own_vine_count: usize,
-    endpoint_id: [u8; 32],
-    home_relay: String,
+    relay_set: Vec<VineRelayEntry>,
     now_ms: u64,
 ) -> Option<Vec<u8>> {
     if !share || own_vine_count == 0 {
         return None;
     }
     let payload = VineRelayRecordPayload {
-        relay_set: vec![VineRelayEntry {
-            iroh_endpoint_id: endpoint_id,
-            home_relay,
-        }],
+        relay_set,
         issued_at_ms: now_ms,
     };
     build_vines_record_blob(&payload).ok()
@@ -69,22 +65,45 @@ fn build_retraction_blob(now_ms: u64) -> Vec<u8> {
     .unwrap_or_default()
 }
 
-/// What the registered closure actually publishes on every tick: the real
-/// self-entry blob when the gate is open, or the retraction above when it
-/// isn't. Pure — same live-read inputs the closure captures, so a test can
-/// pin "the next closure invocation" behavior without any network/tokio
-/// machinery.
-fn build_blob_or_retraction(
+/// What the registered closure actually publishes on every tick. When sharing
+/// is gated open, the aggregated `relay_set`; if that fails to encode — e.g. a
+/// toxic oversized sibling `home_relay` blowing `VINES_RECORD_BLOB_MAX_BYTES` —
+/// fall back to advertising SELF ONLY so this device keeps serving rather than
+/// silently retracting ALL vine serving (ZEB-820). Gate-closed, or self-only
+/// also failing to encode, yields the empty-set retraction. Pure — same
+/// live-read inputs the closure captures, so a test can pin behavior without
+/// any network/tokio machinery.
+fn build_publish_blob(
     share: bool,
     own_vine_count: usize,
-    endpoint_id: [u8; 32],
-    home_relay: String,
+    relay_set: Vec<VineRelayEntry>,
+    self_entry: &VineRelayEntry,
     now_ms: u64,
 ) -> Vec<u8> {
-    build_blob(share, own_vine_count, endpoint_id, home_relay, now_ms)
-        .unwrap_or_else(|| build_retraction_blob(now_ms))
+    if let Some(blob) = build_blob(share, own_vine_count, relay_set, now_ms) {
+        return blob;
+    }
+    // `build_blob` returned None: either gated closed (share=false / no vines),
+    // which must retract, or the aggregated set failed to encode, which warrants
+    // a self-only retry so a single toxic sibling row can't suppress this
+    // device's own serving.
+    if share && own_vine_count > 0 {
+        tracing::warn!(
+            "ZEB-820: aggregated vine relay set failed to encode (likely \
+             VINES_RECORD_BLOB_MAX_BYTES from a large sibling home_relay); \
+             falling back to self-only"
+        );
+        if let Some(blob) = build_blob(share, own_vine_count, vec![self_entry.clone()], now_ms) {
+            return blob;
+        }
+    }
+    build_retraction_blob(now_ms)
 }
 
+/// Wall-clock now in ms. Test-only since ZEB-820: production publish ticks are
+/// stamped by the core `PkarrPublisher` via the `at_ms` passed into the record
+/// builder, so `reconcile_locked` no longer samples the clock itself.
+#[cfg(test)]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -113,6 +132,14 @@ pub struct PkarrVinesPublisher {
     /// `reconcile`'s doc comment for the full race analysis.
     share: Arc<AtomicBool>,
     has_own_vines: Arc<dyn Fn() -> usize + Send + Sync>,
+    /// SP1 64-hex fleet-net device id of THIS device — the key form used in
+    /// `FleetNetDoc::devices` and passed to `build_vine_relay_set` so self's
+    /// snapshot row is replaced by the live self entry rather than duplicated.
+    self_device_id: String,
+    /// Reads a fresh `FleetNetDoc` snapshot on every publish tick (captures the
+    /// live `Arc<RwLock<FleetNetDoc>>` in prod; `Arc::new(FleetNetDoc::default)`
+    /// in tests → the set collapses to `[self]`, preserving pre-ZEB-820 shape).
+    fleet_snapshot: Arc<dyn Fn() -> crate::fleet_net::FleetNetDoc + Send + Sync>,
     /// Serializes `reconcile()` bodies. Without this, two detached
     /// settings-toggle tasks (or a toggle racing the post-publish
     /// `republish` hook) could interleave their `PkarrPublisher::register`/
@@ -131,6 +158,8 @@ impl PkarrVinesPublisher {
         endpoint: Option<Arc<IrohEndpoint>>,
         share: Arc<AtomicBool>,
         has_own_vines: Arc<dyn Fn() -> usize + Send + Sync>,
+        self_device_id: String,
+        fleet_snapshot: Arc<dyn Fn() -> crate::fleet_net::FleetNetDoc + Send + Sync>,
     ) -> Self {
         Self {
             publisher,
@@ -140,6 +169,8 @@ impl PkarrVinesPublisher {
             endpoint,
             share,
             has_own_vines,
+            self_device_id,
+            fleet_snapshot,
             reconcile_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -238,21 +269,17 @@ impl PkarrVinesPublisher {
             self.publisher.unregister(HANDLE).await;
             return;
         };
-        let now_ms = now_ms();
-        let endpoint_id = *endpoint.node_id().as_bytes();
-        let home_relay = endpoint
-            .home_relay()
-            .map(|r| r.to_string())
-            .unwrap_or_default();
         let share = self.share.load(Ordering::Relaxed);
         let own_vine_count = (self.has_own_vines)();
 
-        if build_blob(share, own_vine_count, endpoint_id, home_relay, now_ms).is_some() {
+        if share && own_vine_count > 0 {
             let id_sk = self.identity_signing_key.clone();
             let id_pub = self.identity_pub;
             let endpoint_for_builder = Arc::clone(&endpoint);
             let share_flag = Arc::clone(&self.share);
             let has_own_vines = Arc::clone(&self.has_own_vines);
+            let fleet_snapshot = Arc::clone(&self.fleet_snapshot);
+            let self_device_id = self.self_device_id.clone();
             let record_builder: RecordBuilder = Arc::new(move |at_ms| {
                 // Fresh read on EVERY publish (never boot-frozen — ZEB-521):
                 // a home relay captured once at register time would go
@@ -264,8 +291,19 @@ impl PkarrVinesPublisher {
                     .unwrap_or_default();
                 let share = share_flag.load(Ordering::Relaxed);
                 let own_vine_count = has_own_vines();
-                let blob =
-                    build_blob_or_retraction(share, own_vine_count, endpoint_id, home_relay, at_ms);
+                // ZEB-820: aggregate self + freshest siblings from a fresh fleet
+                // snapshot instead of advertising only self.
+                let self_entry = VineRelayEntry {
+                    iroh_endpoint_id: endpoint_id,
+                    home_relay,
+                };
+                let relay_set = crate::fleet_net::build_vine_relay_set(
+                    &(fleet_snapshot)(),
+                    &self_device_id,
+                    self_entry.clone(),
+                    at_ms,
+                );
+                let blob = build_publish_blob(share, own_vine_count, relay_set, &self_entry, at_ms);
                 PkarrRoutingRecord::sign_new(
                     blob,
                     id_pub,
@@ -349,30 +387,27 @@ mod tests {
 
     const TEST_SELF_ENDPOINT: [u8; 32] = [7u8; 32];
 
-    fn test_builder(share: bool, own_vine_count: usize) -> impl Fn() -> Option<Vec<u8>> {
-        move || {
-            build_blob(
-                share,
-                own_vine_count,
-                TEST_SELF_ENDPOINT,
-                "https://relay.example".to_string(),
-                1_000,
-            )
+    fn self_entry() -> VineRelayEntry {
+        VineRelayEntry {
+            iroh_endpoint_id: TEST_SELF_ENDPOINT,
+            home_relay: "https://relay.example".to_string(),
         }
+    }
+
+    fn self_relay_set() -> Vec<VineRelayEntry> {
+        vec![self_entry()]
     }
 
     #[test]
     fn blob_absent_when_gate_off_or_no_vines() {
-        let b = test_builder(/*share=*/ false, /*own_vines=*/ 3);
-        assert!(b().is_none());
-        let b = test_builder(true, 0);
-        assert!(b().is_none());
+        assert!(build_blob(false, 3, self_relay_set(), 1_000).is_none());
+        assert!(build_blob(true, 0, self_relay_set(), 1_000).is_none());
     }
 
     #[test]
-    fn blob_contains_self_entry_when_enabled() {
-        let b = test_builder(true, 3);
-        let blob = b().expect("enabled with vines publishes");
+    fn blob_encodes_given_relay_set_when_enabled() {
+        let blob =
+            build_blob(true, 3, self_relay_set(), 1_000).expect("enabled with vines publishes");
         let p: crate::pkarr_vines::VineRelayRecordPayload =
             ciborium::from_reader(blob.as_slice()).unwrap();
         assert_eq!(p.relay_set.len(), 1);
@@ -388,11 +423,11 @@ mod tests {
     /// pins that behavior without any network/tokio machinery.
     #[test]
     fn retraction_blob_when_gate_flips_closed_after_registration() {
-        let blob = build_blob_or_retraction(
+        let blob = build_publish_blob(
             /*share=*/ true,
             /*own_vine_count=*/ 0,
-            TEST_SELF_ENDPOINT,
-            "https://relay.example".to_string(),
+            self_relay_set(),
+            &self_entry(),
             1_000,
         );
         let p: crate::pkarr_vines::VineRelayRecordPayload =
@@ -408,16 +443,36 @@ mod tests {
     /// exactly (the closure's normal-path behavior), not the retraction.
     #[test]
     fn full_blob_when_gate_open() {
-        let blob = build_blob_or_retraction(
-            true,
-            3,
-            TEST_SELF_ENDPOINT,
-            "https://relay.example".to_string(),
-            1_000,
-        );
+        let blob = build_publish_blob(true, 3, self_relay_set(), &self_entry(), 1_000);
         let p: crate::pkarr_vines::VineRelayRecordPayload =
             ciborium::from_reader(blob.as_slice()).unwrap();
         assert_eq!(p.relay_set.len(), 1);
+        assert_eq!(p.relay_set[0].iroh_endpoint_id, TEST_SELF_ENDPOINT);
+    }
+
+    /// ZEB-820 (Qodo #1): an oversized sibling `home_relay` blows
+    /// `VINES_RECORD_BLOB_MAX_BYTES` for the aggregated set. `build_publish_blob`
+    /// must fall back to self-only rather than silently retracting ALL serving.
+    #[test]
+    fn oversized_sibling_relay_falls_back_to_self_only() {
+        let oversized = VineRelayEntry {
+            iroh_endpoint_id: [0x99; 32],
+            home_relay: "x".repeat(900), // > VINES_RECORD_BLOB_MAX_BYTES (700)
+        };
+        // Premise: the aggregated (self + oversized sibling) set fails to encode.
+        assert!(
+            build_blob(true, 3, vec![self_entry(), oversized.clone()], 1_000).is_none(),
+            "premise: the oversized aggregated set must fail to encode"
+        );
+        // The fallback must publish self-only, NOT an empty-set retraction.
+        let blob = build_publish_blob(true, 3, vec![self_entry(), oversized], &self_entry(), 1_000);
+        let p: crate::pkarr_vines::VineRelayRecordPayload =
+            ciborium::from_reader(blob.as_slice()).unwrap();
+        assert_eq!(
+            p.relay_set.len(),
+            1,
+            "fell back to self-only, not a retraction"
+        );
         assert_eq!(p.relay_set[0].iroh_endpoint_id, TEST_SELF_ENDPOINT);
     }
 
@@ -482,6 +537,8 @@ mod tests {
             Some(endpoint),
             Arc::new(AtomicBool::new(false)),
             Arc::new(|| 1),
+            "self-device".to_string(),
+            std::sync::Arc::new(crate::fleet_net::FleetNetDoc::default),
         );
 
         vp.enable().await;
@@ -536,6 +593,8 @@ mod tests {
             Some(endpoint),
             Arc::new(AtomicBool::new(false)),
             Arc::new(|| 1),
+            "self-device".to_string(),
+            std::sync::Arc::new(crate::fleet_net::FleetNetDoc::default),
         );
 
         vp.enable().await;
@@ -614,6 +673,8 @@ mod tests {
             Some(endpoint),
             Arc::new(AtomicBool::new(false)),
             Arc::new(move || count_for_closure.load(Ordering::Relaxed)),
+            "self-device".to_string(),
+            std::sync::Arc::new(crate::fleet_net::FleetNetDoc::default),
         );
 
         // Sharing on with one own vine: the real relay-set record lands.
@@ -719,6 +780,8 @@ mod tests {
             Some(endpoint),
             Arc::new(AtomicBool::new(false)),
             Arc::new(|| 1),
+            "self-device".to_string(),
+            std::sync::Arc::new(crate::fleet_net::FleetNetDoc::default),
         );
 
         // Sharing was already on (an earlier settings state) — establish
@@ -826,6 +889,8 @@ mod tests {
             Some(endpoint),
             Arc::new(AtomicBool::new(false)),
             Arc::new(|| 1),
+            "self-device".to_string(),
+            std::sync::Arc::new(crate::fleet_net::FleetNetDoc::default),
         );
         vp.enable().await;
 
@@ -974,6 +1039,8 @@ mod tests {
             Some(endpoint),
             Arc::new(AtomicBool::new(false)),
             Arc::new(|| 0),
+            "self-device".to_string(),
+            std::sync::Arc::new(crate::fleet_net::FleetNetDoc::default),
         );
 
         vp.enable().await;
@@ -1010,6 +1077,8 @@ mod tests {
             Some(endpoint),
             Arc::new(AtomicBool::new(false)),
             Arc::new(move || count_for_closure.load(Ordering::Relaxed)),
+            "self-device".to_string(),
+            std::sync::Arc::new(crate::fleet_net::FleetNetDoc::default),
         );
 
         vp.enable().await;
@@ -1042,6 +1111,8 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             Arc::new(|| 1),
+            "self-device".to_string(),
+            std::sync::Arc::new(crate::fleet_net::FleetNetDoc::default),
         );
 
         vp.disable().await;
@@ -1060,9 +1131,85 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             Arc::new(|| 3),
+            "self-device".to_string(),
+            std::sync::Arc::new(crate::fleet_net::FleetNetDoc::default),
         );
 
         vp.enable().await;
         assert!(publisher.active_handles().await.is_empty());
+    }
+
+    /// ZEB-820: with a fleet snapshot carrying fresh siblings, the published
+    /// record resolves to the AGGREGATED set (self + siblings), not just self.
+    #[tokio::test]
+    async fn aggregated_set_includes_fresh_siblings() {
+        let (publisher, relay) = test_publisher().await;
+        let resolver = harmony_pkarr::PkarrResolver::new(single_relay_client(&relay));
+
+        let endpoint = test_endpoint().await;
+        let self_endpoint_id = *endpoint.node_id().as_bytes();
+        let identity = crate::vine_signing::test_identity();
+        let addr = crate::vine_signing::signer_address(&identity);
+
+        // Two fresh siblings (ids differ from the publisher's self device id).
+        const SIB_A: [u8; 32] = [0xA1; 32];
+        const SIB_B: [u8; 32] = [0xB2; 32];
+        let fleet = std::sync::Arc::new(move || {
+            let now = now_ms();
+            let mut doc = crate::fleet_net::FleetNetDoc::default();
+            let mk = |ep: [u8; 32], relay: &str| crate::fleet_net::FleetNetRow {
+                iroh_endpoint_id: ep,
+                home_relay: relay.to_string(),
+                seen_at: crate::owner_state_types::Hlc {
+                    wall_ms: now,
+                    logical: 0,
+                    device_id: String::new(),
+                },
+                feed_binding: None,
+            };
+            doc.devices
+                .insert("sib-a".to_string(), mk(SIB_A, "https://a.example"));
+            doc.devices
+                .insert("sib-b".to_string(), mk(SIB_B, "https://b.example"));
+            doc
+        });
+
+        let vp = PkarrVinesPublisher::new(
+            std::sync::Arc::clone(&publisher),
+            addr.clone(),
+            crate::vine_signing::identity_signing_key(&identity),
+            crate::vine_signing::identity_pub_64(&identity),
+            Some(endpoint),
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(|| 1),
+            "self-device".to_string(),
+            fleet,
+        );
+
+        vp.enable().await;
+
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            attempts += 1;
+            assert!(attempts < 80, "aggregated vines publish did not land");
+            if let Ok(relay_set) =
+                crate::pkarr_vines::resolve_vine_relays(&resolver, &addr, now_ms()).await
+            {
+                if relay_set.iter().any(|e| e.iroh_endpoint_id == SIB_A)
+                    && relay_set.iter().any(|e| e.iroh_endpoint_id == SIB_B)
+                {
+                    // Self is force-included too — the publisher's live endpoint.
+                    assert_eq!(relay_set.len(), 3, "self + 2 siblings");
+                    assert!(
+                        relay_set
+                            .iter()
+                            .any(|e| e.iroh_endpoint_id == self_endpoint_id),
+                        "the live publisher endpoint must be included"
+                    );
+                    return;
+                }
+            }
+        }
     }
 }
