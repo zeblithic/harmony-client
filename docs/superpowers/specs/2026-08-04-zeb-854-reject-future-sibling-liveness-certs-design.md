@@ -258,6 +258,16 @@ Full CI-parity sweep before PR: `cargo fmt --all -- --check`; `cargo clippy --lo
   `merge_trust_remote_into_local`; extract `merge_trust_remote_into_local_at(now)`
   test seam; merge tests.
 
+## Convergence refinement (PR #609, review round 1)
+
+Qodo (Minor, observability; Strong relevance, team precedent PR #510/#451) noted the
+reject WARN logged only `skew_secs`, so an operator could not tell which sibling was
+rejected nor the exact timestamps compared. Since this is a trust-boundary reject,
+attributing it is worth the fields. The WARN now carries `device` (hex of the signer
+id), `cert_ts`, and `now` alongside `skew_secs`. `now` is always non-zero in this
+branch (the reject only fires when `now != 0`). CodeRabbit and CodeAnt were clean;
+Greptile is author-excluded.
+
 ## Out of scope / follow-ups
 
 - View-gate / one-time store sweep to neutralize a *pre-fix* stored future cert

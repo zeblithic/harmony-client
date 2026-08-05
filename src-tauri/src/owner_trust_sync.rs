@@ -124,7 +124,12 @@ fn merge_trust_remote_into_local_at(
         // ClockRegressed guard, extending the ZEB-847 reject-at-ingest pattern to
         // this (trust) merge. Fail-open when our own clock is unreadable (now == 0).
         if crate::clock_trust::secs_exceeds_forward_skew(cert.timestamp, now) {
+            // Attribute the reject so an operator can tell WHICH sibling is
+            // misbehaving and by how much (this branch only fires when now != 0).
             tracing::warn!(
+                device = %hex::encode(id),
+                cert_ts = cert.timestamp,
+                now,
                 skew_secs = cert.timestamp.saturating_sub(now),
                 "trust merge: sibling liveness cert rejected (future-stamped beyond skew tolerance)"
             );
