@@ -520,7 +520,8 @@ mod tests {
             &reg.harmony_identity_pub,
             &enrolled,
             reg.announced_at_ms,
-        ));
+        )
+        .is_ok());
     }
 
     #[tokio::test]

@@ -455,6 +455,22 @@ impl CommunityGatewayDialDriver {
                     continue;
                 }
             };
+            // CR-2 (TOCTOU): the vouch was verified against the enrolled snapshot
+            // taken BEFORE the async resolve. Re-validate the beacon's device key
+            // against a FRESH snapshot now — if it was revoked while we resolved,
+            // the stale accept must not reach seed/kick. This narrows the
+            // check→use window to microseconds; revocation propagation itself
+            // remains eventually-consistent, and post-session data is gated by
+            // per-event enrollment checks regardless.
+            let fresh_enrolled = self.ctx.enrolled_device_keys_of(&community).await;
+            if !fresh_enrolled.contains(&hit.membership_device_vk) {
+                self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
+                tracing::debug!(
+                    community = ?community,
+                    "ZEB-827: beacon device key revoked during resolve — not seeding"
+                );
+                continue;
+            }
             let Ok(identity) =
                 harmony_identity::Identity::from_public_bytes(&hit.beacon_identity_pub)
             else {
@@ -585,11 +601,11 @@ mod tests {
             self.keys.lock().unwrap().get(c).cloned()
         }
         async fn enrolled_device_keys_of(&self, _c: &SpaceId) -> HashSet<[u8; 32]> {
-            // The driver-level tests drive resolution through `StubBeacons`
-            // (which ignores the enrolled set), so an empty set suffices here;
-            // the vouch check itself is covered by the resolver/integration
-            // tests and the `membership_vouch` unit tests.
-            HashSet::new()
+            // Resolution is driven by `StubBeacons` (which ignores the pre-resolve
+            // enrolled set), but the driver's post-resolve re-validation (CR-2)
+            // checks the beacon's device key against THIS set, so report the
+            // fixture key the `beacon()` fixture vouches under.
+            std::iter::once(FIXTURE_DEVICE_VK).collect()
         }
     }
 
@@ -673,10 +689,24 @@ mod tests {
         }
     }
 
+    /// Device key the `beacon()` fixture vouches under; `StubCtx` reports it as
+    /// the community's sole enrolled key so the driver's post-resolve
+    /// re-validation (CR-2) passes for seed-path tests.
+    const FIXTURE_DEVICE_VK: [u8; 32] = [0x77; 32];
+
     fn beacon(identity_pub: [u8; 64], node_id: [u8; 32]) -> IdentifiedBeacon {
+        beacon_with_device_vk(identity_pub, node_id, FIXTURE_DEVICE_VK)
+    }
+
+    fn beacon_with_device_vk(
+        identity_pub: [u8; 64],
+        node_id: [u8; 32],
+        device_vk: [u8; 32],
+    ) -> IdentifiedBeacon {
         IdentifiedBeacon {
             payload: test_payload(node_id),
             beacon_identity_pub: identity_pub,
+            membership_device_vk: device_vk,
         }
     }
 
@@ -1647,6 +1677,43 @@ mod tests {
             "the rejected beacon must be counted"
         );
         assert_eq!(s.beacons_seeded, 0, "a rejected beacon must NOT be seeded");
+    }
+
+    // ------------------------------------------------------------------
+    // 10d. CR-2 TOCTOU: a beacon accepted at resolve-time whose device key is
+    //      no longer enrolled at seed-time (revoked during the async resolve)
+    //      must be re-rejected, never seeded.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn beacon_revoked_during_resolve_is_not_seeded() {
+        let community = SpaceId([0x2A; 16]);
+        let (member_pub, member_owner) = test_member(31);
+        // The Found beacon vouches under a device key that is NOT the fixture key
+        // `StubCtx` reports as enrolled — modelling a revoke that lands between
+        // the resolve-time snapshot and the seed-time re-check.
+        let h = harness(
+            community,
+            vec![member_owner],
+            Some(beacon_with_device_vk(member_pub, [0x44; 32], [0xAA; 32])),
+            true,
+            Some(SupervisorHandle::new()),
+        );
+
+        h.driver.run_one_pass().await;
+
+        assert!(
+            h.resolver.resolve_by_node_id(&[0x44; 32]).is_none(),
+            "a beacon revoked during resolve must NOT be seeded"
+        );
+        let s = h.telemetry.summary();
+        assert_eq!(
+            s.rejected_non_member, 1,
+            "the stale accept must be re-rejected"
+        );
+        assert_eq!(
+            s.beacons_seeded, 0,
+            "a revoked-mid-resolve beacon must NOT seed"
+        );
     }
 
     // ------------------------------------------------------------------

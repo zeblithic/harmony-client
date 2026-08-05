@@ -204,6 +204,11 @@ pub struct IdentifiedBeacon {
     /// The outer record's `harmony_identity_pub` (inner-sig-verified by
     /// `PkarrResolver::resolve`): X25519(32) ‖ Ed25519(32).
     pub beacon_identity_pub: [u8; 64],
+    /// ZEB-827: the enrolled device key whose vouch this beacon passed (against
+    /// the resolve-time enrolled snapshot). Carried so the driver can
+    /// re-validate membership after the async resolve, before seeding — closing
+    /// the revoke-during-resolve TOCTOU window (CR-2).
+    pub membership_device_vk: [u8; 32],
 }
 
 /// Client-side [`SlotResolver`] that keeps the outer record's identity and
@@ -259,38 +264,65 @@ impl harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> for IdentifiedSlo
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         rec.verify_freshness(now_ms).ok()?;
-        let (payload, vouch) = decode_rendezvous_blob(rec.routing_blob.as_slice())?;
+        // ZEB-827 strict: a beacon must carry a vouch that (a) verifies under a
+        // member's enrolled device key and (b) binds THIS record's transport
+        // identity + community. Any failure reads as an EMPTY slot so the
+        // escalating batch driver widens to the other slots (same shape as the
+        // self-filter below), while `membership_rejects` records that a beacon
+        // WAS present — the caller maps that to `rejectedNonMember`. A DEBUG log
+        // carries the specific sub-reason so a strict-rollout spike is
+        // diagnosable without an env-var (spec §7).
+        //
+        // CA-1: a fresh, inner-sig-valid record whose blob won't decode is a
+        // malformed beacon (present but unusable), NOT proof-shaped absence — so
+        // it too is a membership rejection, not a miss.
+        let Some((payload, vouch)) = decode_rendezvous_blob(rec.routing_blob.as_slice()) else {
+            self.membership_rejects.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                slot = slot_index,
+                reason = "malformed_blob",
+                "ZEB-827: rendezvous beacon rejected — routing blob did not decode"
+            );
+            return None;
+        };
         if payload.iroh_node_id == self.self_endpoint_id {
             return None;
         }
-        // ZEB-827 strict: a beacon must carry a vouch that (a) verifies under a
-        // member's enrolled device key and (b) binds THIS record's transport
-        // identity + community. A failure reads as an EMPTY slot so the
-        // escalating batch driver widens to the other slots (same shape as the
-        // self-filter above), while `membership_rejects` records that a beacon
-        // WAS present — the caller maps that to `rejectedNonMember`.
-        let ok = vouch.as_ref().is_some_and(|v| {
-            crate::membership_vouch::verify_membership_vouch(
+        let device_vk = match &vouch {
+            None => {
+                self.membership_rejects.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    slot = slot_index,
+                    node_id = %hex::encode(&payload.iroh_node_id[..8]),
+                    reason = "missing_vouch",
+                    "ZEB-827: rendezvous beacon rejected — no membership vouch"
+                );
+                return None;
+            }
+            Some(v) => match crate::membership_vouch::verify_membership_vouch(
                 v,
                 self.community_id,
                 &rec.harmony_identity_pub,
                 &self.enrolled_keys,
                 now_ms,
-            )
-        });
-        if !ok {
-            self.membership_rejects.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                slot = slot_index,
-                node_id = %hex::encode(&payload.iroh_node_id[..8]),
-                has_vouch = vouch.is_some(),
-                "ZEB-827: rendezvous beacon rejected — no valid membership vouch"
-            );
-            return None;
-        }
+            ) {
+                Ok(()) => v.device_vk,
+                Err(reason) => {
+                    self.membership_rejects.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        slot = slot_index,
+                        node_id = %hex::encode(&payload.iroh_node_id[..8]),
+                        reason = reason.as_str(),
+                        "ZEB-827: rendezvous beacon rejected — invalid membership vouch"
+                    );
+                    return None;
+                }
+            },
+        };
         Some(IdentifiedBeacon {
             payload,
             beacon_identity_pub: rec.harmony_identity_pub,
+            membership_device_vk: device_vk,
         })
     }
 }

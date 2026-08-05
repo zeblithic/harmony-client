@@ -68,27 +68,53 @@ pub fn mint_membership_vouch(
     }
 }
 
+/// Why a present vouch failed verification. Carried into the resolver's DEBUG
+/// rejection log so a `rejectedNonMember` spike is diagnosable during strict
+/// rollout without an env-var (spec §7). The "missing vouch" case is the
+/// resolver's own concern (it holds the `Option`), so it is not represented
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VouchReject {
+    UnsupportedVersion,
+    StaleWindow,
+    NotEnrolled,
+    /// Malformed device key or a signature that does not verify.
+    BadSignature,
+}
+
+impl VouchReject {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::StaleWindow => "stale_window",
+            Self::NotEnrolled => "not_enrolled",
+            Self::BadSignature => "bad_signature",
+        }
+    }
+}
+
 /// The full strict check (spec §2.3 steps 2–6). `record_transport_pub` is the
 /// resolving side's `PkarrRoutingRecord::harmony_identity_pub`; `enrolled_keys`
 /// is the union of Joined (non-self) members' effective enrolled device keys.
+/// `Ok(())` = valid; `Err(reason)` carries the sub-reason for the reject log.
 pub fn verify_membership_vouch(
     vouch: &MembershipVouch,
     community_id: SpaceId,
     record_transport_pub: &[u8; 64],
     enrolled_keys: &HashSet<[u8; 32]>,
     now_ms: u64,
-) -> bool {
+) -> Result<(), VouchReject> {
     if vouch.version != MEMBERSHIP_VOUCH_V1 {
-        return false;
+        return Err(VouchReject::UnsupportedVersion);
     }
     if now_ms < vouch.issued_at_ms || now_ms > vouch.valid_until_ms {
-        return false;
+        return Err(VouchReject::StaleWindow);
     }
     if !enrolled_keys.contains(&vouch.device_vk) {
-        return false;
+        return Err(VouchReject::NotEnrolled);
     }
     let Ok(vk) = VerifyingKey::from_bytes(&vouch.device_vk) else {
-        return false;
+        return Err(VouchReject::BadSignature);
     };
     let preimage = vouch_signed_bytes(
         community_id,
@@ -97,7 +123,8 @@ pub fn verify_membership_vouch(
         vouch.valid_until_ms,
     );
     let sig = Signature::from_bytes(&vouch.sig);
-    vk.verify_strict(&preimage, &sig).is_ok()
+    vk.verify_strict(&preimage, &sig)
+        .map_err(|_| VouchReject::BadSignature)
 }
 
 /// serde lacks built-in impls for `[u8; N > 32]`; encode the fixed arrays as
@@ -149,7 +176,7 @@ mod tests {
         let t = tpub(9);
         let v = mint_membership_vouch(&d, cid, &t, 1_000, 2_000);
         let enrolled: HashSet<[u8; 32]> = [dvk].into_iter().collect();
-        assert!(verify_membership_vouch(&v, cid, &t, &enrolled, 1_500));
+        assert!(verify_membership_vouch(&v, cid, &t, &enrolled, 1_500).is_ok());
     }
 
     #[test]
@@ -160,7 +187,10 @@ mod tests {
         let mut v = mint_membership_vouch(&d, cid, &t, 1_000, 2_000);
         v.version = 2;
         let enrolled: HashSet<[u8; 32]> = [d.verifying_key().to_bytes()].into_iter().collect();
-        assert!(!verify_membership_vouch(&v, cid, &t, &enrolled, 1_500));
+        assert_eq!(
+            verify_membership_vouch(&v, cid, &t, &enrolled, 1_500),
+            Err(VouchReject::UnsupportedVersion)
+        );
     }
 
     #[test]
@@ -169,13 +199,11 @@ mod tests {
         let t = tpub(9);
         let v = mint_membership_vouch(&d, SpaceId([7u8; 16]), &t, 1_000, 2_000);
         let enrolled: HashSet<[u8; 32]> = [d.verifying_key().to_bytes()].into_iter().collect();
-        assert!(!verify_membership_vouch(
-            &v,
-            SpaceId([8u8; 16]),
-            &t,
-            &enrolled,
-            1_500
-        ));
+        // Wrong community → the signed preimage no longer matches → BadSignature.
+        assert_eq!(
+            verify_membership_vouch(&v, SpaceId([8u8; 16]), &t, &enrolled, 1_500),
+            Err(VouchReject::BadSignature)
+        );
     }
 
     #[test]
@@ -185,13 +213,10 @@ mod tests {
         let v = mint_membership_vouch(&d, cid, &tpub(9), 1_000, 2_000);
         let enrolled: HashSet<[u8; 32]> = [d.verifying_key().to_bytes()].into_iter().collect();
         // resolver passes the RECORD's transport pub, which differs from the signed one.
-        assert!(!verify_membership_vouch(
-            &v,
-            cid,
-            &tpub(10),
-            &enrolled,
-            1_500
-        ));
+        assert_eq!(
+            verify_membership_vouch(&v, cid, &tpub(10), &enrolled, 1_500),
+            Err(VouchReject::BadSignature)
+        );
     }
 
     #[test]
@@ -201,8 +226,14 @@ mod tests {
         let t = tpub(9);
         let v = mint_membership_vouch(&d, cid, &t, 1_000, 2_000);
         let enrolled: HashSet<[u8; 32]> = [d.verifying_key().to_bytes()].into_iter().collect();
-        assert!(!verify_membership_vouch(&v, cid, &t, &enrolled, 999)); // before issued_at
-        assert!(!verify_membership_vouch(&v, cid, &t, &enrolled, 2_001)); // after valid_until
+        assert_eq!(
+            verify_membership_vouch(&v, cid, &t, &enrolled, 999),
+            Err(VouchReject::StaleWindow)
+        ); // before issued_at
+        assert_eq!(
+            verify_membership_vouch(&v, cid, &t, &enrolled, 2_001),
+            Err(VouchReject::StaleWindow)
+        ); // after valid_until
     }
 
     #[test]
@@ -212,7 +243,10 @@ mod tests {
         let t = tpub(9);
         let v = mint_membership_vouch(&d, cid, &t, 1_000, 2_000);
         let enrolled: HashSet<[u8; 32]> = [sk(2).verifying_key().to_bytes()].into_iter().collect();
-        assert!(!verify_membership_vouch(&v, cid, &t, &enrolled, 1_500));
+        assert_eq!(
+            verify_membership_vouch(&v, cid, &t, &enrolled, 1_500),
+            Err(VouchReject::NotEnrolled)
+        );
     }
 
     #[test]
@@ -223,7 +257,10 @@ mod tests {
         let mut v = mint_membership_vouch(&d, cid, &t, 1_000, 2_000);
         v.sig[0] ^= 0xFF;
         let enrolled: HashSet<[u8; 32]> = [d.verifying_key().to_bytes()].into_iter().collect();
-        assert!(!verify_membership_vouch(&v, cid, &t, &enrolled, 1_500));
+        assert_eq!(
+            verify_membership_vouch(&v, cid, &t, &enrolled, 1_500),
+            Err(VouchReject::BadSignature)
+        );
     }
 
     #[test]
@@ -238,7 +275,10 @@ mod tests {
         let mut v = mint_membership_vouch(&d1, cid, &t, 1_000, 2_000);
         v.device_vk = d2.verifying_key().to_bytes();
         let enrolled: HashSet<[u8; 32]> = [d2.verifying_key().to_bytes()].into_iter().collect();
-        assert!(!verify_membership_vouch(&v, cid, &t, &enrolled, 1_500));
+        assert_eq!(
+            verify_membership_vouch(&v, cid, &t, &enrolled, 1_500),
+            Err(VouchReject::BadSignature)
+        );
     }
 
     #[test]

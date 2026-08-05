@@ -89,20 +89,22 @@ struct MembershipVouch {
     device_vk: [u8; 32],        // D: the beacon's enrolled Ed25519 device verify key
     issued_at_ms: u64,
     valid_until_ms: u64,
-    sig: [u8; 64],              // Ed25519 over the canonical signed tuple below, by D
+    sig: [u8; 64],              // Ed25519 over the raw-byte preimage below, by D
 }
 ```
 
-The signed preimage is a **domain-separated** canonical-CBOR tuple:
+The signed preimage is a **fixed raw-byte layout** (NOT CBOR — determinism
+without any canonicalization concern; this is a signature preimage, not a stored
+wire structure). This is normative: the `MembershipVouch` **struct** is CBOR on
+the wire, but its `sig` covers these exact bytes.
 
 ```
-sig = Ed25519_sign(
-    D_sk,
-    domain_tag = b"harmony.rendezvous.membership-vouch.v1"
-    ‖ canonical_cbor([ community_id: bstr(16),
-                       transport_identity_pub: bstr(64),   // == record.harmony_identity_pub
-                       issued_at_ms: u64,
-                       valid_until_ms: u64 ]) )
+preimage = domain_tag(b"harmony.rendezvous.membership-vouch.v1")
+         ‖ community_id            (16 bytes, raw)
+         ‖ transport_identity_pub  (64 bytes, raw, == record.harmony_identity_pub)
+         ‖ issued_at_ms.to_be_bytes()   (8 bytes, big-endian)
+         ‖ valid_until_ms.to_be_bytes() (8 bytes, big-endian)
+sig = Ed25519_sign(D_sk, preimage)
 ```
 
 - **Domain tag** prevents cross-protocol reuse of `device_signing_key` signatures (the key
