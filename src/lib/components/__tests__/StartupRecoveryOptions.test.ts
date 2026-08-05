@@ -130,4 +130,58 @@ describe('StartupRecoveryOptions (ZEB-835 / ZEB-836)', () => {
     expect(queryByTestId('owner-restore-words')).toBeNull();
     expect(getByTestId('startup-restore-blocked').textContent).toMatch(/Reset/i);
   });
+
+  // ZEB-842: erase-all is the typed-confirm clean-slate escalation beside the
+  // recovery reset — it wipes identity AND every app-data cache for the profile.
+  it('erase-all is gated on typing ERASE, then invokes erase_all_local_data and reloads', async () => {
+    const invoke = makeInvoke({ erase_all_local_data: null });
+    const reload = vi.fn();
+    const { getByTestId } = render(StartupRecoveryOptions, { props: { invoke, reload } });
+
+    await fireEvent.click(getByTestId('startup-still-stuck'));
+    await fireEvent.click(getByTestId('startup-erase'));
+
+    const go = getByTestId('startup-erase-go') as HTMLButtonElement;
+    const input = getByTestId('startup-erase-input') as HTMLInputElement;
+    expect(go.disabled).toBe(true);
+
+    // Wrong text keeps it disabled and clicking is a no-op.
+    await fireEvent.input(input, { target: { value: 'erase' } });
+    expect(go.disabled).toBe(true);
+    await fireEvent.click(go);
+    expect(invoke).not.toHaveBeenCalledWith('erase_all_local_data');
+
+    // Exactly ERASE enables it.
+    await fireEvent.input(input, { target: { value: 'ERASE' } });
+    expect(go.disabled).toBe(false);
+    await fireEvent.click(go);
+
+    expect(invoke).toHaveBeenCalledWith('erase_all_local_data');
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failed erase surfaces the error and does NOT reload', async () => {
+    const invoke = makeInvoke({ erase_all_local_data: new Error('permission denied') });
+    const reload = vi.fn();
+    const { getByTestId } = render(StartupRecoveryOptions, { props: { invoke, reload } });
+
+    await fireEvent.click(getByTestId('startup-still-stuck'));
+    await fireEvent.click(getByTestId('startup-erase'));
+    await fireEvent.input(getByTestId('startup-erase-input'), { target: { value: 'ERASE' } });
+    await fireEvent.click(getByTestId('startup-erase-go'));
+
+    expect(reload).not.toHaveBeenCalled();
+    expect(getByTestId('startup-erase-error').textContent).toContain('permission denied');
+  });
+
+  it('the recovery reset copy says cached content stays (points to Erase all for a full wipe)', async () => {
+    // The honest-copy half of ZEB-842: "reset" must no longer read as a clean
+    // slate — cached content survives a recovery reset.
+    const { getByTestId } = render(StartupRecoveryOptions, {
+      props: { invoke: makeInvoke(), reload: vi.fn() },
+    });
+    await fireEvent.click(getByTestId('startup-still-stuck'));
+    await fireEvent.click(getByTestId('startup-reset'));
+    expect(getByTestId('startup-reset-confirm-copy').textContent).toMatch(/stays on this device/i);
+  });
 });
