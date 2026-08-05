@@ -238,3 +238,20 @@ second-order consequences of "reuse `butler_set_order` wholesale":
    closure abstraction also keeps the publisher decoupled from the lock type and
    test construction trivial. If profiling ever shows it, the `Arc<RwLock<…>>`
    read-and-borrow alternative is a drop-in.
+
+### Round 2 (Greptile, manually triggered)
+
+5. **Fleet changes remained unpublished for ~3.5 days** (Greptile P1) —
+   **fixed.** The aggregated set is fleet-derived, but the vine record's
+   republish triggers only fired on *self*-state changes (share toggle, first/
+   last vine, pkarr cadence). A sibling joining, aging out, or changing its relay
+   was picked up only at the next scheduled pkarr tick — so a device that came
+   online after publish stayed invisible for up to a full cadence, defeating the
+   feature's point. The fleet-net refresh task (`lib.rs`, ZEB-418 P2) already
+   re-publishes the *reachability* record on a `selection_view` (butler top-2)
+   diff; ZEB-820 now hooks a **vine** re-publish into the same task on a
+   `vine_selection_view` (top-4) diff — wider than the butler prefix, so a device
+   entering only the vine set is still caught — with its own debounce so the
+   reachability gate/timing is untouched. New `vine_selection_view` in
+   `fleet_net.rs`, pinned by
+   `vine_selection_view_catches_changes_beyond_the_butler_prefix`.

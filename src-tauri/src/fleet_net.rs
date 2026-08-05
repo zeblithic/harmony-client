@@ -531,6 +531,29 @@ pub fn selection_view(
         .collect()
 }
 
+/// The vines analogue of [`selection_view`] (ZEB-820): the up-to-
+/// `VINE_RELAY_SET_MAX` prefix that `build_vine_relay_set` would publish,
+/// projected to (device-id, endpoint, relay, pinned) and EXCLUDING `seen_at`
+/// for the same reason — so the fleet-change task can debounce a vine
+/// re-publish on a change to the advertised set (a sibling joining, aging out,
+/// or changing its relay) without every heartbeat's stamp churn triggering one.
+/// Self's live entry is constant across ticks, so this sibling/pin prefix is the
+/// change signal that matters. Wider than [`selection_view`] (cap 4 vs 2), so a
+/// device entering only the vine set — not the butler set — is still caught.
+pub fn vine_selection_view(
+    doc: &FleetNetDoc,
+    stale_before_ms: u64,
+) -> Vec<(String, [u8; 32], String, bool)> {
+    butler_set_order(doc, stale_before_ms)
+        .into_iter()
+        .take(crate::pkarr_vines::VINE_RELAY_SET_MAX)
+        .map(|(id, row)| {
+            let pinned = doc.pinned.as_deref() == Some(id.as_str());
+            (id, row.iroh_endpoint_id, row.home_relay, pinned)
+        })
+        .collect()
+}
+
 /// ZEB-510: project a durable fleet-net device row into a dial-target
 /// reachability payload for the [`crate::reachability_resolver::ReachabilityResolver`].
 ///
@@ -2161,6 +2184,35 @@ mod vine_relay_set_tests {
         assert_eq!(
             out[1].iroh_endpoint_id, SELF_EP,
             "self inserted right after the pin"
+        );
+    }
+
+    #[test]
+    fn vine_selection_view_catches_changes_beyond_the_butler_prefix() {
+        // ZEB-820 (Greptile P1): the vine re-publish gate must fire on a change
+        // outside the butler top-2 prefix. Here the 3rd device changes its relay
+        // — the butler selection_view is unchanged, the vine one is not.
+        let now = BUTLER_SET_FRESHNESS_MS * 10;
+        let cutoff = now.saturating_sub(BUTLER_SET_FRESHNESS_MS);
+        let base = doc_with(&[
+            ("aa", row(0x11, "https://a.example", now)),
+            ("bb", row(0x22, "https://b.example", now)),
+            ("cc", row(0x33, "https://c.example", now)),
+        ]);
+        let changed = doc_with(&[
+            ("aa", row(0x11, "https://a.example", now)),
+            ("bb", row(0x22, "https://b.example", now)),
+            ("cc", row(0x99, "https://c2.example", now)),
+        ]);
+        assert_eq!(
+            selection_view(&base, cutoff),
+            selection_view(&changed, cutoff),
+            "butler top-2 view must be unchanged"
+        );
+        assert_ne!(
+            vine_selection_view(&base, cutoff),
+            vine_selection_view(&changed, cutoff),
+            "vine top-4 view must catch the 3rd-device change"
         );
     }
 }

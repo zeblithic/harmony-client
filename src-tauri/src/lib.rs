@@ -10169,6 +10169,12 @@ pub async fn start_node_inner(
                         let task_vk_map = std::sync::Arc::clone(&fleet_vk_map);
                         let task_crdt = std::sync::Arc::clone(&crdt_state);
                         let task_republish = std::sync::Arc::clone(&routing_republish);
+                        // ZEB-820 (Greptile P1): the vine relay set is
+                        // fleet-derived too, so a sibling joining / aging out /
+                        // changing its relay must re-publish it promptly — not
+                        // wait up to a full pkarr cadence (~3.5d). Mirrors the
+                        // routing republish below with its own debounce + gate.
+                        let task_vines = std::sync::Arc::clone(&pkarr_vines_pub);
                         let task_self_owner = self_owner;
                         let task_device_id = device_id.clone();
                         let task_self_vk = butler_self_device_vk;
@@ -10187,6 +10193,10 @@ pub async fn start_node_inner(
                                 .unwrap_or_else(|p| p.into_inner())
                                 .clone();
                             let mut pending: Option<tokio::time::Instant> = None;
+                            // ZEB-820: independent debounce for the vine record so
+                            // the reachability republish gate/timing above is
+                            // unchanged.
+                            let mut pending_vines: Option<tokio::time::Instant> = None;
                             loop {
                                 tokio::select! {
                                     msg = nudge_rx.recv() => {
@@ -10244,6 +10254,14 @@ pub async fn start_node_inner(
                                                 != crate::fleet_net::selection_view(
                                                     &new_doc, cutoff,
                                                 );
+                                        // ZEB-820: the vine set (cap 4) can change
+                                        // even when the butler prefix (cap 2) does
+                                        // not — e.g. a 3rd device joining.
+                                        let vine_changed =
+                                            crate::fleet_net::vine_selection_view(&prev_doc, cutoff)
+                                                != crate::fleet_net::vine_selection_view(
+                                                    &new_doc, cutoff,
+                                                );
                                         *task_snapshot
                                             .write()
                                             .unwrap_or_else(|p| p.into_inner()) =
@@ -10275,6 +10293,18 @@ pub async fn start_node_inner(
                                                     ),
                                             );
                                         }
+                                        if vine_changed && pending_vines.is_none() {
+                                            tracing::debug!(
+                                                "ZEB-820: fleet-net vine selection changed; \
+                                                 debouncing vine-record re-publish"
+                                            );
+                                            pending_vines = Some(
+                                                tokio::time::Instant::now()
+                                                    + std::time::Duration::from_millis(
+                                                        crate::butler_deposit::FLEET_CHANGE_REPUBLISH_DEBOUNCE_MS,
+                                                    ),
+                                            );
+                                        }
                                     }
                                     _ = async {
                                         // `pending.is_some()` guard makes the
@@ -10283,6 +10313,18 @@ pub async fn start_node_inner(
                                     }, if pending.is_some() => {
                                         pending = None;
                                         (task_republish)();
+                                    }
+                                    _ = async {
+                                        // Guarded by `pending_vines.is_some()` —
+                                        // unwrap safe (arm not polled when None).
+                                        tokio::time::sleep_until(pending_vines.unwrap()).await
+                                    }, if pending_vines.is_some() => {
+                                        pending_vines = None;
+                                        // republish() re-registers the vines
+                                        // handle; its builder re-reads a fresh
+                                        // fleet snapshot, so the new aggregate
+                                        // publishes on the next core tick.
+                                        task_vines.republish().await;
                                     }
                                 }
                             }
