@@ -466,3 +466,45 @@ describe('WelcomeModal identity-store backend copy (ZEB-768)', () => {
     expect(note.toLowerCase()).not.toContain('keychain');
   });
 });
+
+// ZEB-830: onMount queries identity_store_backend BEFORE mint, when the seed's
+// location isn't yet decided; mint can fall through to the encrypted file even
+// with a keychain handle available. The modal must RE-QUERY after mint so the
+// backup note reflects where the seed actually landed, not the stale pre-mint
+// availability guess.
+describe('WelcomeModal post-mint backend re-query (ZEB-830)', () => {
+  const OWNER = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
+
+  it('re-queries after mint so the note reflects the post-mint backend, not the onMount value', async () => {
+    mintMock.mockResolvedValue({
+      state: { ownerId: OWNER, ownerDisplayName: 'x', devices: [], canBackUp: true },
+      recoveryToken: 'deadbeefdeadbeefdeadbeefdeadbeef0123456789abcdef0123456789abcdef',
+    });
+    // onMount (pre-mint, 1st call) reports 'keychain'; the mint falls through to
+    // the file, so the post-mint re-query (2nd call) reports 'encrypted-file'.
+    const replies = ['keychain', 'encrypted-file'];
+    let call = 0;
+    mockCoreInvoke.mockImplementation((cmd: string) =>
+      cmd === 'identity_store_backend'
+        ? Promise.resolve(replies[Math.min(call++, replies.length - 1)])
+        : Promise.resolve(undefined),
+    );
+    const { container, getByTestId } = render(WelcomeModal, {
+      props: { open: true, onMinted: vi.fn() },
+    });
+    await fireEvent.click(getByTestId('welcome-create-identity'));
+    // The note must settle on the POST-mint (encrypted-file) copy — proving the
+    // re-query overrode the stale onMount 'keychain' value.
+    const expected = identityKeyBackupNote('encrypted-file');
+    await waitFor(() => {
+      const actual = container.querySelector('.keychain-note')?.textContent?.trim() ?? '';
+      expect(actual).toBe(expected);
+    });
+    expect(container.querySelector('.keychain-note')?.textContent?.toLowerCase()).not.toContain(
+      'keychain',
+    );
+    // Queried at least twice: once on mount, once after mint.
+    const backendCalls = mockCoreInvoke.mock.calls.filter(([cmd]) => cmd === 'identity_store_backend');
+    expect(backendCalls.length).toBeGreaterThanOrEqual(2);
+  });
+});

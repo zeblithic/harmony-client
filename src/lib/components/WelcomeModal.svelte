@@ -102,6 +102,17 @@
     try {
       const result = await svc.mint();
       mintResult = result;
+      // ZEB-830: onMount queried identity_store_backend before mint, when the
+      // seed's location wasn't yet decided — and mint can fall through to the
+      // encrypted file even with a keychain handle available. Re-query now so
+      // the backup note reflects where the seed ACTUALLY landed.
+      try {
+        identityBackend = normalizeIdentityStoreBackend(
+          await invoke<string>('identity_store_backend'),
+        );
+      } catch (e) {
+        console.debug('[zeb-830] post-mint identity_store_backend failed:', extractError(e));
+      }
       stage = 'backup';
     } catch (e) {
       const msg = extractError(e);
