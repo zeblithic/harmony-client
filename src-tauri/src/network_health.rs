@@ -84,6 +84,11 @@ pub struct NetworkHealthSnapshot {
     /// wire type would read as that.
     #[serde(default)]
     pub community_relay: Option<CommunityRelayHealth>,
+    /// ZEB-803: the relay-acceptor watchdog's own state (staleness, phase,
+    /// restart count, escalation). Present iff the watchdog is wired.
+    /// `#[serde(default)]` keeps a pre-ZEB-803-watchdog snapshot forward-compatible.
+    #[serde(default)]
+    pub relay_acceptor_watchdog: Option<RelayAcceptorWatchdogHealth>,
     /// ZEB-811 Task 8: vine-relay serving/pulling health — the same
     /// present-iff-wired, unwired-side-zeroed shape as `community_relay`
     /// (see that field's doc for the incident-state rationale). `#[serde(default)]`
@@ -534,6 +539,49 @@ pub struct CommunityRelayPeerServed {
     pub served_count: u64,
 }
 
+/// ZEB-803: the relay-acceptor watchdog's own state, so its decisions are never
+/// a silent surface. `phase`/counters come from `WatchdogMemory`; `staleness_ms`
+/// and `connected_peers` are computed live at snapshot time.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayAcceptorWatchdogHealth {
+    pub staleness_ms: Option<u64>,
+    pub connected_peers: u32,
+    pub phase: String,
+    pub consecutive_restarts: u32,
+    pub last_action_ms: Option<u64>,
+    pub last_action_tier: Option<String>,
+    pub escalated: bool,
+}
+
+impl RelayAcceptorWatchdogHealth {
+    pub fn from_parts(
+        mem: &crate::relay_acceptor_watchdog::WatchdogMemory,
+        staleness_ms: Option<u64>,
+        connected_peers: u32,
+    ) -> Self {
+        use crate::relay_acceptor_watchdog::{Phase, Tier};
+        let phase = match mem.phase {
+            Phase::Normal => "normal",
+            Phase::Cooldown { .. } => "cooldown",
+            Phase::Escalated => "escalated",
+        };
+        let tier_str = |t: Tier| match t {
+            Tier::Probe => "probe",
+            Tier::Restart => "restart",
+        };
+        Self {
+            staleness_ms,
+            connected_peers,
+            phase: phase.to_string(),
+            consecutive_restarts: mem.consecutive_restarts,
+            last_action_ms: mem.last_action_ms,
+            last_action_tier: mem.last_action_tier.map(|t| tier_str(t).to_string()),
+            escalated: matches!(mem.phase, Phase::Escalated),
+        }
+    }
+}
+
 /// ZEB-803: puller side — [`crate::community_relay_pull_driver`].
 ///
 /// ## Why `passes_run` matters more than the success counters
@@ -893,6 +941,16 @@ pub struct CommunityRelayServingTelemetry {
 impl CommunityRelayServingTelemetry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The process-wide last-served-pull time, `0 → None` (the "never served"
+    /// sentinel), without allocating the full peer summary. Used by the ZEB-803
+    /// watchdog sensor.
+    pub(crate) fn last_served_ms(&self) -> Option<u64> {
+        match self.last_served_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
     }
 
     /// Record one successfully served pull. `peer` is the remote iroh node id;
@@ -1569,6 +1627,7 @@ impl NetworkHealthSnapshot {
             dm_fence: None,
             // ZEB-803: no service ⇒ no relay telemetry source wired.
             community_relay: None,
+            relay_acceptor_watchdog: None,
             // ZEB-811 Task 8: no service ⇒ no vine-relay telemetry wired.
             vine_relay: None,
             // ZEB-824: no service ⇒ no gateway-dial driver telemetry wired.
@@ -2629,6 +2688,8 @@ impl NetworkHealthService {
                     pulling: pulling.map(|p| p.summary()).unwrap_or_default(),
                 }),
             },
+            // ZEB-803: populated live in the watchdog-wiring task; None until then.
+            relay_acceptor_watchdog: None,
             // ZEB-811 Task 8: same present-iff-wired, unwired-side-zeroed
             // shape as `community_relay` above — see that field's match arm
             // doc for the rationale.
@@ -3788,6 +3849,30 @@ pub fn __now_ms_for_ipc() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn watchdog_health_serializes_camel_case() {
+        use crate::relay_acceptor_watchdog::{Phase, Tier, WatchdogMemory};
+        let mem = WatchdogMemory {
+            served_ever: true,
+            phase: Phase::Cooldown {
+                since_ms: 1,
+                tier: Tier::Restart,
+            },
+            consecutive_restarts: 2,
+            baseline_served_ms: Some(1000),
+            last_action_ms: Some(5000),
+            last_action_tier: Some(Tier::Restart),
+        };
+        let h = RelayAcceptorWatchdogHealth::from_parts(&mem, Some(4200), 3);
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(v["phase"], "cooldown");
+        assert_eq!(v["consecutiveRestarts"], 2);
+        assert_eq!(v["lastActionTier"], "restart");
+        assert_eq!(v["stalenessMs"], 4200);
+        assert_eq!(v["connectedPeers"], 3);
+        assert_eq!(v["escalated"], false);
+    }
+
     struct FakeMembership {
         // peer hex addr → list of shared community ids
         table: std::collections::HashMap<[u8; 16], Vec<String>>,
@@ -4335,6 +4420,7 @@ mod tests {
             butler_deposits: None,
             dm_fence: None,
             community_relay: None,
+            relay_acceptor_watchdog: None,
             vine_relay: None,
             gateway_bootstrap: None,
             community_sync: Vec::new(),
