@@ -61,9 +61,9 @@ Consequences:
 
 **Segment** — an immutable, content-addressed blob holding a contiguous (by `event_sort_key`) run of `SignedMembershipEvent`s.
 
-```
+```text
 SegmentCleartext (canonical CBOR):
-  "v"  : u16                        // segment format version (= 1)
+  "vn" : u16                        // segment format version (= 1)
   "ci" : SpaceId                    // community_id (misroute guard, mirrors CommunityState "ci")
   "ev" : Vec<SignedMembershipEvent> // events in event_sort_key ascending order
 ```
@@ -75,25 +75,31 @@ SegmentCleartext (canonical CBOR):
 
 **Manifest** — the new target of `root_cid`; the small, bounded object a receiver fetches first.
 
-```
+```text
 ManifestCleartext (canonical CBOR):
-  "v"  : u16               // manifest format version (= 1)
+  "vn" : u16               // manifest format version (= 1)
   "ci" : SpaceId           // community_id (misroute guard)
-  "sg" : Vec<SegmentRef>   // sealed segments, ascending by range_lo
+  "sg" : Vec<SegmentRef>   // sealed segments, ascending by lo
   "tl" : Vec<SignedMembershipEvent>   // unsealed live tail, event_sort_key order
 
 SegmentRef (canonical CBOR):
-  "sc" : ContentId   // segment_cid
-  "lo" : Hlc         // inclusive range low (first event's HLC in the segment)
-  "hi" : Hlc         // inclusive range high (last event's HLC)
-  "n"  : u32         // event count
-  "ks" : [u8; 32]    // K_s — plaintext INSIDE the epoch-encrypted manifest
+  "sc" : ContentId       // segment_cid
+  "lo" : EventBoundary   // inclusive range low  (first event's boundary in the segment)
+  "hi" : EventBoundary   // inclusive range high (last event's boundary)
+  "nn" : u32             // event count
+  "ks" : [u8; 32]        // K_s — plaintext INSIDE the epoch-encrypted manifest
+
+EventBoundary (canonical CBOR) — an event_sort_key minus its `sig` tail:
+  "wm" : u64      // wall_ms
+  "lg" : u32      // logical
+  "dv" : String   // device_id
+  "id" : [u8; 16] // EventId
 ```
 
 `manifest_ciphertext = encrypt_blob(current_epoch_key, canonical_cbor(ManifestCleartext))`  ← identical primitive/keying as today's root blob
 `root_cid = ContentId::for_book(manifest_ciphertext, { encrypted: true })`
 
-The manifest is bounded by segment count. A `SegmentRef` is ~175 B (`sc` ContentId ~34 B + two `Hlc`s ~45 B each incl. `device_id` + `n` 4 B + `ks` 32 B + CBOR overhead), so 1 MiB ≈ **~5,000–6,000 segments**; at a ~512-event seal threshold that is **~2.5–3M lifetime events** before the manifest itself approaches the cap — a **~400–500× lift** over today's ~6k-event cliff, comfortably past 100k members. (Chunking the manifest — applying the deferred Approach-1 to the small manifest bytes — removes this residual bound entirely and is the documented trivial next lift if ever needed; §7.)
+The manifest is bounded by segment count. A `SegmentRef` is ~175 B (`sc` ContentId ~34 B + two `EventBoundary`s ~45 B each incl. `device_id` and the 16-byte `EventId` + `nn` 4 B + `ks` 32 B + CBOR overhead), so 1 MiB ≈ **~5,000–6,000 segments**; at a ~512-event seal threshold that is **~2.5–3M lifetime events** before the manifest itself approaches the cap — a **~400–500× lift** over today's ~6k-event cliff, comfortably past 100k members. (Chunking the manifest — applying the deferred Approach-1 to the small manifest bytes — removes this residual bound entirely and is the documented trivial next lift if ever needed; §7.)
 
 ### 4.2 Crypto model — envelope via manifest epoch-encryption
 
@@ -107,30 +113,30 @@ Reused verbatim: `encrypt_blob` / `decrypt_blob` (`community_state_sync.rs:167-2
 
 ### 4.3 Seal policy (cascade-free under backdated events)
 
-Boundaries are **absolute `event_sort_key` values**, fixed at seal time and persisted — never positional counts.
+Boundaries are **absolute `EventBoundary` values** (an `event_sort_key` minus its `sig` tail), pinned to the segment's first and last events at seal time and persisted — never positional counts. Each sealed segment records an **inclusive** `[lo, hi]`.
 
-- The **live tail** holds all events with sort key ≥ `last_sealed_boundary` (initially the community genesis, effectively −∞).
-- When the tail reaches the seal threshold — `SEGMENT_SEAL_EVENTS` events **or** `SEGMENT_SEAL_BYTES` cleartext bytes, whichever first — choose `new_boundary` = the sort key just past the last event to include, seal `[last_sealed_boundary, new_boundary)` as a segment (generate `K_s`, encrypt, compute `segment_cid`, append the `SegmentRef` to the sidecar), and advance `last_sealed_boundary = new_boundary`.
-- Sealed ranges are **contiguous and disjoint** by construction: `[g, b1), [b1, b2), …, [b_{k-1}, last_sealed_boundary)`, tail `= [last_sealed_boundary, ∞)`.
-- **Backdated event** (sort key < `last_sealed_boundary`): it falls into exactly one sealed range → re-seal **only that segment** (re-encode with the added event, new `segment_cid`, update that one sidecar entry; the old CID is orphaned and GC-eligible). No later segment shifts — that is the payoff of absolute-HLC boundaries over positional counts.
+- The **live tail** holds all events with sort key **>** the highest sealed `hi` (initially, before any seal, the whole log).
+- When the tail reaches the seal threshold — `SEGMENT_SEAL_EVENTS` events **or** `SEGMENT_SEAL_BYTES` cleartext bytes, whichever first — cut a leading chunk of that size, seal it as a segment with `lo` = its first event's boundary and `hi` = its last event's boundary (generate `K_s`, encrypt, compute `segment_cid`, append the `SegmentRef` to the sidecar), and repeat on the remaining tail until it is below both thresholds.
+- Sealed ranges are **contiguous and disjoint** by construction: each interval's `hi` is strictly below the next interval's `lo`, so an event joins the earliest interval whose `hi` it does not exceed.
+- **Backdated event** (sort key ≤ some sealed `hi`): it falls into exactly one sealed interval → re-seal **only that interval's region** (recollect the interval's events, re-encode, new `segment_cid`, update its sidecar entry; the old CID is orphaned and GC-eligible). If the added event pushes that interval past a seal threshold, it is **split into bounded replacement segments** rather than re-sealed as one oversized blob — so no segment can grow past the threshold. Either way **no later segment shifts** (later intervals are matched by their own pinned `hi`) — that is the payoff of absolute-boundary intervals over positional counts.
 
-Threshold constants (tunable; starting values, to be pinned in the plan): `SEGMENT_SEAL_EVENTS = 512`, `SEGMENT_SEAL_BYTES = 256 * 1024`. A single segment can never approach 1 MiB because the byte threshold caps it well under the cap.
+Threshold constants (pinned): `SEGMENT_SEAL_EVENTS = 512`, `SEGMENT_SEAL_BYTES = 256 * 1024`. **Every** segment — first-sealed or backdated-re-sealed — respects both thresholds, so no single segment can ever approach 1 MiB. (The trade-off: heavy backdating into one already-sealed interval fragments it into extra small segments; those count toward the manifest's own segment cap, whose cliff sits ~400–500× further out. Compacting that fragmentation is a documented non-goal — §7.)
 
 ### 4.4 Sidecar (per-publisher stability)
 
 `communities/{id}/segments.cbor` — the publisher's local segment index, written with the same atomic-rename + quarantine-on-corrupt discipline as `crdt.cbor` (`community_state_persist.rs:213-221`, `:110-113`).
 
-```
+```text
 SegmentIndex (canonical CBOR):
-  "v"  : u16
-  "sg" : Vec<SealedEntry>   // sealed segments, ascending by range_lo
+  "vn" : u16
+  "sg" : Vec<SealedEntry>   // sealed segments, ascending by lo
 
 SealedEntry:
-  "lo" : Hlc          // range low (boundary)
-  "hi" : Hlc          // range high
-  "n"  : u32          // event count
-  "ks" : [u8; 32]     // K_s
-  "sc" : ContentId    // segment_cid (cached; recomputable from the range's events + K_s)
+  "lo" : EventBoundary   // range low  (inclusive boundary)
+  "hi" : EventBoundary   // range high (inclusive boundary)
+  "nn" : u32             // event count
+  "ks" : [u8; 32]        // K_s
+  "sc" : ContentId       // segment_cid (cached; recomputable from the range's events + K_s)
 ```
 
 On publish/serve the publisher loads the sidecar and reuses each `(K_s, segment_cid)` → its manifest keeps referencing the same segment CIDs → CAS dedups its own re-puts → **per-publisher O(delta) publish**. If the sidecar is lost/corrupt, the publisher regenerates `K_s` on next seal → different CIDs → one O(total) re-upload (a recoverable degradation, not a correctness loss; receivers still decode).

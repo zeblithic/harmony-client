@@ -13,7 +13,7 @@ use harmony_app::community_membership::{
 };
 use harmony_app::community_state_segments::{
     EventBoundary, ManifestCleartext, SealedEntry, SegmentCleartext, SegmentIndex, SegmentRef,
-    MANIFEST_CLEARTEXT_V1, MANIFEST_FORMAT_V1,
+    MANIFEST_CLEARTEXT_V1, MANIFEST_FORMAT_V1, SEGMENT_CLEARTEXT_V1, SEGMENT_INDEX_V1,
 };
 use harmony_app::community_state_sync::{
     CommunityRootPublishPayload, CommunityRootSignedPayload, EncryptedEnvelope,
@@ -350,7 +350,7 @@ fn community_root_publish_payload_manifest_format_pinned() {
 #[test]
 fn segment_cleartext_wire_bytes_pinned() {
     let seg = SegmentCleartext {
-        version: MANIFEST_CLEARTEXT_V1,
+        version: SEGMENT_CLEARTEXT_V1,
         community_id: SpaceId([0x22; 16]),
         events: vec![pin_event()],
     };
@@ -398,7 +398,7 @@ fn manifest_cleartext_wire_bytes_pinned() {
 #[test]
 fn segment_index_wire_bytes_pinned() {
     let idx = SegmentIndex {
-        version: 1,
+        version: SEGMENT_INDEX_V1,
         sealed: vec![SealedEntry {
             lo: EventBoundary {
                 wall_ms: 1000,

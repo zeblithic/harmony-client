@@ -672,6 +672,19 @@ pub enum CommunitySyncError {
     /// would misdirect operators chasing format bugs.
     #[error("misrouted blob: expected community_id {expected:?}, got {found:?}")]
     MisroutedBlob { expected: SpaceId, found: SpaceId },
+    /// ZEB-814: an inbound root's `manifest_format` discriminator, or a
+    /// segment/manifest cleartext `version`, is one this build does not
+    /// support. Distinct from `CborDecode` (the bytes parsed cleanly) so an
+    /// operator sees a forward-compat gap rather than a phantom wire-format
+    /// bug, and an old client rejects a future format instead of misparsing it.
+    #[error("unsupported root format: {0}")]
+    UnsupportedRootFormat(String),
+    /// ZEB-814: an inbound manifest declared more segments than
+    /// `MANIFEST_SEGMENT_CAP`. Rejected pre-fetch (pre-mutation) so a joined
+    /// publisher cannot force an unbounded run of budgeted segment fetches —
+    /// CWE-770 resource exhaustion. Carries the offending count and the cap.
+    #[error("oversized manifest: {segments} segments exceeds cap {cap}")]
+    OversizedManifest { segments: usize, cap: usize },
     /// CAS returned `Ok(None)` for the published `root_cid` — the slot
     /// is unpopulated (fetch timed out or admit-rejected). Distinct
     /// from `ContentStore` (which carries an actual transport / disk
@@ -3211,8 +3224,12 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
     //    segments. Reused segments keep their `(K_s, cid)` → per-publisher
     //    O(delta): a republish re-`put`s only the changed tail segment.
     let segments_path = ctx.paths.crdt.with_file_name("segments.cbor");
+    // Map through `map_persist_err`, NOT `CborEncode`: a missing parent dir
+    // (the ZEB-463 concurrent-rollback race) must reach the shutdown-flush
+    // classifier as `PersistDirMissing`/`Persist`, or a benign rollback race
+    // propagates as a hard shutdown-flush failure (CR).
     let prior_index = crate::community_state_persist::load_segment_index(&segments_path)
-        .map_err(|e| CommunitySyncError::CborEncode(format!("segment index load: {e}")))?;
+        .map_err(map_persist_err)?;
     let plan = crate::community_state_segments::plan_segments(
         ctx.community_id,
         &sorted_events,
@@ -3224,14 +3241,15 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
             k
         },
     )
-    .map_err(|e| CommunitySyncError::CborEncode(format!("segment plan: {e}")))?;
+    .map_err(CommunitySyncError::from)?;
 
     // 3. Put newly sealed segments into CAS (serveable). Reused segments are
     //    already present from a prior publish and are NOT re-put — this is
-    //    where the O(delta) upload cost falls out.
-    for (seg_ref, ciphertext) in &plan.newly_sealed {
+    //    where the O(delta) upload cost falls out. Consume the ciphertexts by
+    //    value (up to ~256 KiB each) rather than cloning them (Qodo #4).
+    for (seg_ref, ciphertext) in plan.newly_sealed {
         ctx.content_store
-            .put_serveable(seg_ref.segment_cid, ciphertext.clone())
+            .put_serveable(seg_ref.segment_cid, ciphertext)
             .await?;
     }
 
@@ -3269,8 +3287,10 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
                     community_id = ?ctx.community_id,
                     segments = manifest.segments.len(),
                     segment_cap = MANIFEST_SEGMENT_CAP,
-                    "community state-root manifest at >=80% of its segment cap; \
-                     root publish/serve fails entirely at the cap"
+                    "community state-root manifest at >=80% of its conservative \
+                     segment cap; the manifest's own ContentId is approaching \
+                     MAX_PAYLOAD_SIZE and root publish/serve will start failing \
+                     near the cap"
                 );
                 report_degraded(
                     ctx.error_tx.as_ref(),
@@ -3288,8 +3308,10 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
                     community_id = ?ctx.community_id,
                     segments = manifest.segments.len(),
                     segment_cap = MANIFEST_SEGMENT_CAP,
-                    "community state-root manifest EXCEEDS its segment cap; \
-                     root publish/serve is down until the log shrinks"
+                    "community state-root manifest EXCEEDS its conservative \
+                     segment cap; the manifest's own ContentId is nearing \
+                     MAX_PAYLOAD_SIZE — root publish/serve will fail once \
+                     for_book rejects the manifest blob"
                 );
                 report_degraded(
                     ctx.error_tx.as_ref(),
@@ -3319,7 +3341,11 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
                     format!("state-root manifest exceeds ContentId cap: {e}"),
                 );
             }
-            CommunitySyncError::Crypto(CommunityCryptoError::ContentIdDerivation(e.to_string()))
+            // Preserve the true error class (a `for_book` overflow surfaces as
+            // `SegmentError::ContentId` → `ContentIdDerivation`; an AEAD failure
+            // stays `Crypto`) rather than forcing everything to
+            // `ContentIdDerivation` (Qodo #1).
+            CommunitySyncError::from(e)
         })?;
 
     // Put the manifest (the root) into CAS AND mark it serveable to peers
@@ -3329,8 +3355,16 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
     ctx.content_store
         .put_serveable(root_cid, manifest_ciphertext)
         .await?;
-    crate::community_state_persist::save_segment_index(&segments_path, &plan.index)
-        .map_err(|e| CommunitySyncError::CborEncode(format!("segment index save: {e}")))?;
+    // Persist the sidecar only when the index actually changed. `encode_root_
+    // packet` runs on the query-serve path too (every peer GET), so an
+    // unconditional `write_atomic` here would be one disk write per serve
+    // request even when nothing was (re)sealed (CR). Map through
+    // `map_persist_err` for the same shutdown-race classification as
+    // `crdt.cbor`/`replay.cbor` (CR).
+    if plan.index != prior_index {
+        crate::community_state_persist::save_segment_index(&segments_path, &plan.index)
+            .map_err(map_persist_err)?;
+    }
 
     // 5. Build the SIGNED sub-payload with a strictly-newer HLC. ZEB-814: mark
     //    the root as the segmented (manifest) format, under the signature.
@@ -4199,28 +4233,32 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    which is itself only obtainable by decrypting the epoch-bound manifest,
     //    so the binding holds transitively.)
     let mut resolved: Vec<SignedMembershipEvent> = match payload.manifest_format {
-        Some(_) => {
+        Some(crate::community_state_segments::MANIFEST_FORMAT_V1) => {
             let manifest = match crate::community_state_segments::open_manifest(
                 root_key_used,
                 ctx.community_id,
                 &blob_ciphertext,
             ) {
                 Ok(m) => m,
-                Err(crate::community_state_segments::SegmentError::Misrouted {
-                    expected,
-                    found,
-                }) => {
-                    return IncomingOutcome::ErrPreMutation(CommunitySyncError::MisroutedBlob {
-                        expected,
-                        found,
-                    });
-                }
-                Err(e) => {
-                    return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(
-                        format!("manifest: {e}"),
-                    ));
-                }
+                // `From<SegmentError>` keeps the true class: Misrouted →
+                // MisroutedBlob, an unsupported cleartext version →
+                // UnsupportedRootFormat, crypto/CBOR faults their own variants
+                // (Qodo #1) — no longer all flattened to CborDecode.
+                Err(e) => return IncomingOutcome::ErrPreMutation(e.into()),
             };
+            // Bound the segment count BEFORE any fetch. A joined publisher could
+            // otherwise publish a manifest with an unbounded segment list, each
+            // ref costing a budgeted (STATE_ROOT_FETCH_TIMEOUT_MS) fetch and a
+            // decode append — CWE-770 resource exhaustion. Reject at the same
+            // cap the publish-side watermark uses. (`open_manifest` only checks
+            // community_id, and `seal_manifest` permits manifests far larger
+            // than this cap, so the bound must be re-enforced on receive.)
+            if manifest.segments.len() > MANIFEST_SEGMENT_CAP {
+                return IncomingOutcome::ErrPreMutation(CommunitySyncError::OversizedManifest {
+                    segments: manifest.segments.len(),
+                    cap: MANIFEST_SEGMENT_CAP,
+                });
+            }
             let mut events: Vec<SignedMembershipEvent> = Vec::new();
             for seg_ref in &manifest.segments {
                 // A segment fetch is pre-mutation exactly like the root fetch
@@ -4261,23 +4299,22 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                     &seg_ct,
                 ) {
                     Ok(mut seg_events) => events.append(&mut seg_events),
-                    Err(crate::community_state_segments::SegmentError::Misrouted {
-                        expected,
-                        found,
-                    }) => {
-                        return IncomingOutcome::ErrPreMutation(
-                            CommunitySyncError::MisroutedBlob { expected, found },
-                        );
-                    }
-                    Err(e) => {
-                        return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(
-                            format!("segment: {e}"),
-                        ));
-                    }
+                    // `From<SegmentError>` preserves the class (Misrouted →
+                    // MisroutedBlob, unsupported version → UnsupportedRootFormat,
+                    // crypto/CBOR their own) instead of flattening to CborDecode.
+                    Err(e) => return IncomingOutcome::ErrPreMutation(e.into()),
                 }
             }
             events.extend(manifest.tail);
             events
+        }
+        // A future segmented format this build predates. Reject cleanly instead
+        // of misparsing an unknown layout as V1 (Qodo #2 / CR): the `mf`
+        // discriminator is signed, so a downgrade attacker can't strip it.
+        Some(other) => {
+            return IncomingOutcome::ErrPreMutation(CommunitySyncError::UnsupportedRootFormat(
+                format!("unknown manifest_format discriminator {other}"),
+            ));
         }
         None => {
             let blob_cleartext = match decrypt_blob(root_key_used, &blob_ciphertext) {
@@ -4697,6 +4734,34 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
 /// corrupt the live file. Failures bubble up as
 /// `CommunitySyncError::Persist` so the shutdown arm can surface them
 /// to the caller; the wakeup / merge arms log + continue.
+/// ZEB-814: map a segment/manifest `SegmentError` to the closest
+/// `CommunitySyncError` so crypto, CBOR-encode, CBOR-decode, ContentId,
+/// routing, and unsupported-version failures each keep their true class —
+/// instead of all collapsing into `CborDecode` (receive) or
+/// `ContentIdDerivation` (publish), which would mislead operators and defeat
+/// any error-class-specific handling (Qodo #1).
+impl From<crate::community_state_segments::SegmentError> for CommunitySyncError {
+    fn from(e: crate::community_state_segments::SegmentError) -> Self {
+        use crate::community_state_segments::SegmentError;
+        match e {
+            SegmentError::Crypto(c) => CommunitySyncError::Crypto(c),
+            SegmentError::CborEncode(s) => CommunitySyncError::CborEncode(s),
+            SegmentError::CborDecode(s) => CommunitySyncError::CborDecode(s),
+            SegmentError::ContentId(s) => {
+                CommunitySyncError::Crypto(CommunityCryptoError::ContentIdDerivation(s))
+            }
+            SegmentError::Misrouted { expected, found } => {
+                CommunitySyncError::MisroutedBlob { expected, found }
+            }
+            SegmentError::UnsupportedVersion { kind, found } => {
+                CommunitySyncError::UnsupportedRootFormat(format!(
+                    "unsupported {kind} cleartext version {found}"
+                ))
+            }
+        }
+    }
+}
+
 /// Map a per-community save (`save_crdt`/`save_replay`) `PersistError` to a
 /// `CommunitySyncError`, routing the io-`NotFound` case — a missing parent
 /// directory, i.e. the ZEB-463 rollback race — to `PersistDirMissing` so the
@@ -4954,6 +5019,8 @@ fn classify_incoming_error(err: &CommunitySyncError) -> &'static str {
         CommunitySyncError::Persist(_) => "persist_failed",
         CommunitySyncError::PersistDirMissing(_) => "persist_failed",
         CommunitySyncError::MisroutedBlob { .. } => "misrouted_blob",
+        CommunitySyncError::UnsupportedRootFormat(_) => "unsupported_root_format",
+        CommunitySyncError::OversizedManifest { .. } => "oversized_manifest",
         CommunitySyncError::PublisherNotJoined { .. } => "publisher_not_joined",
         CommunitySyncError::PublisherSigInvalid { .. } => "publisher_sig_invalid",
         CommunitySyncError::PublishRetryExhausted => "publish_retry_exhausted",

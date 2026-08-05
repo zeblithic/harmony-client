@@ -54,11 +54,15 @@ pub const SEGMENT_SEAL_BYTES: usize = 256 * 1024;
 /// root. `None` on the wire ⇒ legacy monolithic root.
 pub const MANIFEST_FORMAT_V1: u8 = 1;
 
-const SEGMENT_CLEARTEXT_V1: u16 = 1;
+/// Segment cleartext format version. `pub` so the receive path can reject an
+/// unsupported version and the wire-format fixtures can pin the right constant.
+pub const SEGMENT_CLEARTEXT_V1: u16 = 1;
 /// Manifest cleartext format version. `pub` so the publish path (Task 3)
 /// stamps new manifests with it.
 pub const MANIFEST_CLEARTEXT_V1: u16 = 1;
-const SEGMENT_INDEX_V1: u16 = 1;
+/// Sidecar segment-index format version. `pub` so the wire-format fixtures can
+/// pin the right constant.
+pub const SEGMENT_INDEX_V1: u16 = 1;
 
 /// A pinned cut point in `event_sort_key` order, minus the `sig` tail.
 ///
@@ -213,6 +217,13 @@ pub enum SegmentError {
     ContentId(String),
     #[error("misrouted segment/manifest: expected {expected:?} found {found:?}")]
     Misrouted { expected: SpaceId, found: SpaceId },
+    /// A `segment`/`manifest` cleartext decoded cleanly but declared a
+    /// `version` this build does not understand. Distinct from `CborDecode`
+    /// (the bytes parsed fine — it is a forward-compat rejection, not a
+    /// malformed blob) so the receive path can report it as an unsupported
+    /// format rather than a decode fault.
+    #[error("unsupported {kind} version {found}")]
+    UnsupportedVersion { kind: &'static str, found: u16 },
 }
 
 /// Encrypt+CID a run of events as a segment under `k_s`. Returns
@@ -253,6 +264,12 @@ pub fn open_segment(
     let bytes = crate::community_state_sync::decrypt_blob(&key, ciphertext)?;
     let cleartext: SegmentCleartext =
         canonical_cbor_decode(&bytes).map_err(|e| SegmentError::CborDecode(e.to_string()))?;
+    if cleartext.version != SEGMENT_CLEARTEXT_V1 {
+        return Err(SegmentError::UnsupportedVersion {
+            kind: "segment",
+            found: cleartext.version,
+        });
+    }
     if cleartext.community_id != expected_community {
         return Err(SegmentError::Misrouted {
             expected: expected_community,
@@ -290,6 +307,12 @@ pub fn open_manifest(
     let bytes = crate::community_state_sync::decrypt_blob(epoch_key, ciphertext)?;
     let manifest: ManifestCleartext =
         canonical_cbor_decode(&bytes).map_err(|e| SegmentError::CborDecode(e.to_string()))?;
+    if manifest.version != MANIFEST_CLEARTEXT_V1 {
+        return Err(SegmentError::UnsupportedVersion {
+            kind: "manifest",
+            found: manifest.version,
+        });
+    }
     if manifest.community_id != expected_community {
         return Err(SegmentError::Misrouted {
             expected: expected_community,
@@ -305,6 +328,97 @@ pub fn open_manifest(
 /// negligible against `SEGMENT_SEAL_BYTES`).
 fn event_bytes(e: &SignedMembershipEvent) -> usize {
     canonical_cbor_encode(e).map(|b| b.len()).unwrap_or(0)
+}
+
+/// Greedily seal threshold-bounded segments from the front of `run` (whose
+/// per-event byte sizes are `sizes`, in the same order). Each sealed segment's
+/// `SegmentRef` is pushed to `refs`, its `SealedEntry` to `sealed`, and its
+/// `(ref, ciphertext)` to `newly_sealed`.
+///
+/// `key_for(chunk_index)` supplies the `K_s` for the Nth chunk cut in THIS
+/// call: the dirty-reseal path reuses the prior interval's key for chunk 0 and
+/// fresh keys for any split-off remainder; the tail path uses a fresh key for
+/// every chunk.
+///
+/// Returns the index into `run` where the unsealed remainder begins:
+/// - `seal_remainder == false` (tail): stops once the remaining run is below
+///   BOTH thresholds, leaving that sub-threshold remainder as the live tail.
+/// - `seal_remainder == true` (dirty re-seal): seals every event — the final,
+///   possibly sub-threshold, chunk is sealed too — so the return is `run.len()`.
+///
+/// Either way every emitted segment respects `SEGMENT_SEAL_EVENTS` /
+/// `SEGMENT_SEAL_BYTES`, so no single segment can approach `MAX_PAYLOAD_SIZE`.
+/// The bound holds uniformly for first-seal AND backdated re-seal: an interval
+/// that grew past a threshold via backdated events is split into bounded
+/// replacement segments rather than re-sealed as one oversized blob (ZEB-814 —
+/// otherwise the payload-cap cliff this module removes could re-emerge).
+///
+/// `remaining_bytes` is maintained incrementally (subtracting each sealed
+/// chunk), so the whole partition is O(run) — not the O(run²) a per-iteration
+/// suffix sum would cost on a large first-seal / sidecar-loss republish.
+#[allow(clippy::too_many_arguments)]
+fn seal_chunks(
+    community_id: SpaceId,
+    run: &[SignedMembershipEvent],
+    sizes: &[usize],
+    seal_remainder: bool,
+    mut key_for: impl FnMut(usize) -> [u8; 32],
+    refs: &mut Vec<SegmentRef>,
+    sealed: &mut Vec<SealedEntry>,
+    newly_sealed: &mut Vec<(SegmentRef, Vec<u8>)>,
+) -> Result<usize, SegmentError> {
+    let n = run.len();
+    let mut remaining_bytes: usize = sizes.iter().sum();
+    let mut j = 0usize;
+    let mut chunk_idx = 0usize;
+    loop {
+        let remaining_len = n - j;
+        if remaining_len == 0 {
+            break;
+        }
+        let over = remaining_len >= SEGMENT_SEAL_EVENTS || remaining_bytes >= SEGMENT_SEAL_BYTES;
+        if !over && !seal_remainder {
+            break;
+        }
+        // Cut a leading chunk: at most SEGMENT_SEAL_EVENTS events, stopping
+        // early once cumulative bytes reach SEGMENT_SEAL_BYTES (always >=1
+        // event). When !over (a seal_remainder final chunk) this takes the
+        // whole sub-threshold remainder.
+        let mut cut = 0usize;
+        let mut acc = 0usize;
+        while cut < remaining_len && cut < SEGMENT_SEAL_EVENTS {
+            acc += sizes[j + cut];
+            cut += 1;
+            if acc >= SEGMENT_SEAL_BYTES {
+                break;
+            }
+        }
+        let chunk = &run[j..j + cut];
+        let k_s = key_for(chunk_idx);
+        let (cid, ct) = seal_segment(community_id, chunk, &k_s)?;
+        let lo = EventBoundary::of(&chunk[0]);
+        let hi = EventBoundary::of(&chunk[chunk.len() - 1]);
+        let r = SegmentRef {
+            segment_cid: cid,
+            lo: lo.clone(),
+            hi: hi.clone(),
+            count: cut as u32,
+            k_s,
+        };
+        sealed.push(SealedEntry {
+            lo,
+            hi,
+            count: cut as u32,
+            k_s,
+            segment_cid: cid,
+        });
+        newly_sealed.push((r.clone(), ct));
+        refs.push(r);
+        j += cut;
+        remaining_bytes -= acc;
+        chunk_idx += 1;
+    }
+    Ok(j)
 }
 
 /// Deterministically (re)partition `sorted_events` against a prior index,
@@ -357,76 +471,47 @@ pub fn plan_segments(
             refs.push(r);
             sealed.push(entry.clone());
         } else {
-            // Re-seal this one interval (a backdated/gap event landed inside).
-            // Keep the same K_s (per-publisher determinism); recompute cid.
-            let (cid, ct) = seal_segment(community_id, run, &entry.k_s)?;
-            let r = SegmentRef {
-                segment_cid: cid,
-                lo: lo.clone(),
-                hi: hi.clone(),
-                count: run.len() as u32,
-                k_s: entry.k_s,
-            };
-            sealed.push(SealedEntry {
-                lo,
-                hi,
-                count: run.len() as u32,
-                k_s: entry.k_s,
-                segment_cid: cid,
-            });
-            newly_sealed.push((r.clone(), ct));
-            refs.push(r);
+            // Re-seal this interval (a backdated/gap event landed inside). It
+            // MUST still respect the seal thresholds: an interval that grew
+            // past SEGMENT_SEAL_* is split into bounded replacement segments so
+            // no single segment can approach the payload cap. The first
+            // replacement reuses the prior `K_s` (per-publisher determinism for
+            // the common single-segment case); any split-off remainder gets
+            // fresh keys. Only this interval's region changes — later sealed
+            // intervals keep their CIDs (no cascade), because `i` has already
+            // advanced past exactly this interval's events. (`lo`/`hi` were
+            // already consumed by the `unchanged` check; `seal_chunks`
+            // recomputes boundaries per replacement chunk.)
+            let sizes: Vec<usize> = run.iter().map(event_bytes).collect();
+            let entry_k_s = entry.k_s;
+            seal_chunks(
+                community_id,
+                run,
+                &sizes,
+                true, // sealed history — the whole run stays sealed, never tail
+                |idx| if idx == 0 { entry_k_s } else { new_k_s() },
+                &mut refs,
+                &mut sealed,
+                &mut newly_sealed,
+            )?;
         }
     }
 
     // 2. The suffix (key > last sealed hi) is the tail candidate. Seal leading
-    //    chunks while it exceeds a threshold; the remainder is the live tail.
+    //    threshold-bounded chunks (each a fresh `K_s`); the sub-threshold
+    //    remainder is the live tail.
     let tail_candidate = &sorted_events[i..];
     let sizes: Vec<usize> = tail_candidate.iter().map(event_bytes).collect();
-    let mut j = 0usize;
-    loop {
-        let remaining_len = tail_candidate.len() - j;
-        let remaining_bytes: usize = sizes[j..].iter().sum();
-        let over_events = remaining_len >= SEGMENT_SEAL_EVENTS;
-        let over_bytes = remaining_bytes >= SEGMENT_SEAL_BYTES;
-        if !over_events && !over_bytes {
-            break;
-        }
-        // Cut a leading chunk: at most SEGMENT_SEAL_EVENTS, and stop early once
-        // cumulative bytes reach SEGMENT_SEAL_BYTES (at least one event).
-        let mut cut = 0usize;
-        let mut acc = 0usize;
-        while cut < remaining_len && cut < SEGMENT_SEAL_EVENTS {
-            acc += sizes[j + cut];
-            cut += 1;
-            if acc >= SEGMENT_SEAL_BYTES {
-                break;
-            }
-        }
-        let chunk = &tail_candidate[j..j + cut];
-        let k_s = new_k_s();
-        let (cid, ct) = seal_segment(community_id, chunk, &k_s)?;
-        let lo = EventBoundary::of(&chunk[0]);
-        let hi = EventBoundary::of(&chunk[chunk.len() - 1]);
-        let r = SegmentRef {
-            segment_cid: cid,
-            lo: lo.clone(),
-            hi: hi.clone(),
-            count: cut as u32,
-            k_s,
-        };
-        sealed.push(SealedEntry {
-            lo,
-            hi,
-            count: cut as u32,
-            k_s,
-            segment_cid: cid,
-        });
-        newly_sealed.push((r.clone(), ct));
-        refs.push(r);
-        j += cut;
-    }
-
+    let j = seal_chunks(
+        community_id,
+        tail_candidate,
+        &sizes,
+        false, // leave the sub-threshold remainder as the live tail
+        |_| new_k_s(),
+        &mut refs,
+        &mut sealed,
+        &mut newly_sealed,
+    )?;
     let tail = tail_candidate[j..].to_vec();
     Ok(SegmentPlan {
         refs,
@@ -515,6 +600,45 @@ mod tests {
     }
 
     #[test]
+    fn open_segment_rejects_unsupported_version() {
+        // A future-versioned segment cleartext must be REJECTED as an
+        // unsupported version, not misparsed or surfaced as a decode error.
+        let k_s = [5u8; 32];
+        let cleartext = SegmentCleartext {
+            version: SEGMENT_CLEARTEXT_V1 + 1,
+            community_id: ci(),
+            events: vec![ev(1, 0, "d", 1)],
+        };
+        let bytes = canonical_cbor_encode(&cleartext).unwrap();
+        let ct = crate::community_state_sync::encrypt_blob(&EpochKey::new(k_s), &bytes).unwrap();
+        let err = open_segment(&k_s, ci(), &ct).unwrap_err();
+        assert!(matches!(
+            err,
+            SegmentError::UnsupportedVersion { kind: "segment", found }
+                if found == SEGMENT_CLEARTEXT_V1 + 1
+        ));
+    }
+
+    #[test]
+    fn open_manifest_rejects_unsupported_version() {
+        let key = EpochKey::new([6u8; 32]);
+        let manifest = ManifestCleartext {
+            version: MANIFEST_CLEARTEXT_V1 + 1,
+            community_id: ci(),
+            segments: Vec::new(),
+            tail: Vec::new(),
+        };
+        let bytes = canonical_cbor_encode(&manifest).unwrap();
+        let ct = crate::community_state_sync::encrypt_blob(&key, &bytes).unwrap();
+        let err = open_manifest(&key, ci(), &ct).unwrap_err();
+        assert!(matches!(
+            err,
+            SegmentError::UnsupportedVersion { kind: "manifest", found }
+                if found == MANIFEST_CLEARTEXT_V1 + 1
+        ));
+    }
+
+    #[test]
     fn plan_empty_log_has_no_segments_only_tail() {
         let evs = sorted(vec![ev(1, 0, "d", 1), ev(2, 0, "d", 2), ev(3, 0, "d", 3)]);
         let plan = plan_segments(ci(), &evs, &SegmentIndex::default(), &mut counter()).unwrap();
@@ -569,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_backdated_event_reseals_one_segment_no_cascade() {
+    fn plan_backdated_event_reseals_affected_interval_no_cascade() {
         // Two full sealed segments + a little tail.
         let mut v = Vec::new();
         for k in 0..(2 * SEGMENT_SEAL_EVENTS as u64 + 4) {
@@ -590,23 +714,100 @@ mod tests {
         let evs2 = sorted(v2);
         let plan2 = plan_segments(ci(), &evs2, &plan1.index, &mut counter()).unwrap();
 
-        assert_ne!(
-            plan2.refs[0].segment_cid, seg0_cid,
+        // Segment 0's region re-seals (its old CID is gone from the manifest).
+        assert!(
+            plan2.refs.iter().all(|r| r.segment_cid != seg0_cid),
             "segment 0 must re-seal"
         );
-        assert_eq!(
-            plan2.refs[1].segment_cid, seg1_cid,
-            "segment 1 must NOT change (no cascade)"
+        // Segment 1 (a LATER interval) is untouched — present, same CID, and NOT
+        // re-`put` to CAS. This is the cascade-free property: a backdated event
+        // re-seals only its own interval's region, never the segments after it.
+        assert!(
+            plan2.refs.iter().any(|r| r.segment_cid == seg1_cid),
+            "segment 1 must still be referenced"
         );
-        assert_eq!(plan2.newly_sealed.len(), 1, "only one segment re-put");
-        assert_eq!(
-            plan2.newly_sealed[0].0.segment_cid,
-            plan2.refs[0].segment_cid
+        assert!(
+            plan2
+                .newly_sealed
+                .iter()
+                .all(|(r, _)| r.segment_cid != seg1_cid),
+            "segment 1 must NOT be re-put (no cascade)"
+        );
+        // Every segment — including the re-sealed region — respects the seal
+        // threshold, so none can approach the payload cap.
+        assert!(
+            plan2
+                .refs
+                .iter()
+                .all(|r| r.count as usize <= SEGMENT_SEAL_EVENTS),
+            "no segment may exceed the event seal threshold"
         );
     }
 
     #[test]
-    fn plan_total_order_is_transport_only() {
+    fn plan_dirty_reseal_stays_under_seal_threshold() {
+        // One sealed segment, then a BURST of events backdated into its
+        // [lo,hi] — enough that a single re-sealed segment would blow past the
+        // threshold. The dirty path must split it into bounded segments (CR:
+        // otherwise the payload-cap cliff re-emerges), and reconstruction must
+        // still recover every event.
+        let mut v = Vec::new();
+        for k in 0..(SEGMENT_SEAL_EVENTS as u64 + 2) {
+            v.push(ev((k + 1) * 1000, 0, "d", (k % 251) as u8));
+        }
+        let evs = sorted(v.clone());
+        let plan1 = plan_segments(ci(), &evs, &SegmentIndex::default(), &mut counter()).unwrap();
+        assert_eq!(plan1.refs.len(), 1, "one sealed segment to start");
+
+        // Backdate ~2 segments' worth of events INTO segment 0's [lo,hi] using
+        // distinct logical clocks so keys stay unique and land inside.
+        let lo_wall = plan1.refs[0].lo.wall_ms;
+        let hi_wall = plan1.refs[0].hi.wall_ms;
+        let mut v2 = v.clone();
+        for k in 0..(2 * SEGMENT_SEAL_EVENTS as u64) {
+            let wall = lo_wall + 1 + (k % (hi_wall - lo_wall - 1).max(1));
+            v2.push(ev(wall, 1000 + k as u32, "d", (k % 251) as u8));
+        }
+        let evs2 = sorted(v2);
+        let plan2 = plan_segments(ci(), &evs2, &plan1.index, &mut counter()).unwrap();
+
+        // The oversized interval was split — no single segment exceeds the cap.
+        assert!(
+            plan2
+                .refs
+                .iter()
+                .all(|r| r.count as usize <= SEGMENT_SEAL_EVENTS),
+            "dirty re-seal must split oversized intervals to stay under the threshold"
+        );
+        assert!(
+            plan2.refs.len() >= 3,
+            "the grown interval must span multiple bounded segments"
+        );
+
+        // Reconstruction parity: opening every segment + the tail recovers the
+        // exact backdated event set.
+        let mut got: Vec<SignedMembershipEvent> = Vec::new();
+        for (r, ct) in &plan2.newly_sealed {
+            got.extend(open_segment(&r.k_s, ci(), ct).unwrap());
+        }
+        // Reused (not re-put) segments contribute nothing new here because the
+        // whole grown interval re-sealed; add the tail and compare to input.
+        got.extend(plan2.tail.clone());
+        got.sort_by(|a, b| {
+            crate::community_membership::event_sort_key(a)
+                .cmp(&crate::community_membership::event_sort_key(b))
+        });
+        assert_eq!(got, evs2, "split segments + tail reconstruct every event");
+    }
+
+    #[test]
+    fn plan_caller_side_resort_is_deterministic() {
+        // `plan_segments` requires ascending, deduped input (see its doc
+        // comment) — callers sort with `event_sort_key`. This pins the
+        // CALLER-SIDE contract: sorting a differently-ordered copy of the same
+        // event set back into `event_sort_key` order reproduces byte-identical
+        // segmentation. (It does not assert the planner sorts internally — it
+        // does not; feeding it unsorted input is a caller bug.)
         let mut v = Vec::new();
         for k in 0..(SEGMENT_SEAL_EVENTS as u64 + 7) {
             v.push(ev(k + 1, 0, "d", (k % 251) as u8));
@@ -614,9 +815,6 @@ mod tests {
         let sorted_in = sorted(v.clone());
         let plan_sorted =
             plan_segments(ci(), &sorted_in, &SegmentIndex::default(), &mut counter()).unwrap();
-        // Shuffle deterministically (reverse) — plan must sort internally? No:
-        // plan_segments requires sorted input, so callers sort. Re-sorting a
-        // reversed vec must reproduce identical output.
         let mut reversed = v;
         reversed.reverse();
         let resorted = sorted(reversed);

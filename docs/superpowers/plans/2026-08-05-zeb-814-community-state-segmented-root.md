@@ -152,11 +152,13 @@ pub enum SegmentError {
 **`plan_segments` algorithm (the load-bearing pure logic):**
 1. Walk `prior.sealed` in order. For each sealed entry, collect from `sorted_events` the contiguous run whose `EventBoundary::of` key is in `[entry.lo.key(), entry.hi.key()]` inclusive.
    - If that run's events are byte-identical to what the entry represents (same count AND same first/last boundary AND no new event fell inside the `[lo,hi]` interval), **reuse** `entry.k_s`/`entry.segment_cid` unchanged → contributes to `refs`, NOT to `newly_sealed`.
-   - If a new event fell inside `[lo,hi]` (count differs), **re-seal that one entry**: keep `entry.lo`/`entry.hi` if they still bound the run else recompute from the run, generate no new key (reuse `entry.k_s`), recompute cid via `seal_segment` → contributes to both `refs` and `newly_sealed`.
-2. The remaining suffix of `sorted_events` (keys strictly greater than the last sealed `hi`) is the **tail candidate**. While it holds `≥ SEGMENT_SEAL_EVENTS` events OR its `SegmentCleartext` cleartext encodes to `≥ SEGMENT_SEAL_BYTES`, cut the leading run at the threshold, `seal_segment` it with a fresh `new_k_s()`, append a `SealedEntry`/`SegmentRef`/`newly_sealed` triple, advance.
+   - If a new event fell inside `[lo,hi]` (count differs), **re-seal that interval's region** through the shared bounded-chunking helper (`seal_chunks`, `seal_remainder = true`): the first replacement chunk reuses `entry.k_s`, and if the interval grew past `SEGMENT_SEAL_EVENTS`/`SEGMENT_SEAL_BYTES` it is **split into bounded replacement segments** (extra chunks get fresh `new_k_s()`) so no single segment can exceed the threshold. Each replacement contributes to both `refs` and `newly_sealed`.
+2. The remaining suffix of `sorted_events` (keys strictly greater than the last sealed `hi`) is the **tail candidate**. Run the same `seal_chunks` helper (`seal_remainder = false`, fresh `new_k_s()` per chunk): it cuts leading threshold-bounded segments while the remaining run is `≥ SEGMENT_SEAL_EVENTS` events OR `≥ SEGMENT_SEAL_BYTES` cleartext bytes, maintaining the running byte total incrementally (O(run), not a per-iteration suffix sum), and leaves the sub-threshold remainder.
 3. Whatever remains is `tail`. Assemble `SegmentPlan { refs, tail, index (rebuilt from refs+keys), newly_sealed }`.
 
-Invariant to preserve: sealed `[lo,hi]` intervals are contiguous and disjoint over the total order; the tail is strictly `> last hi`. A backdated event with a key inside a sealed interval routes to exactly that interval (step 1 re-seal), never shifting later intervals (their `lo`/`hi` are pinned).
+Caller contract: `plan_segments` requires `sorted_events` ascending by `event_sort_key` and deduplicated — callers sort (it does NOT sort internally).
+
+Invariant to preserve: sealed `[lo,hi]` intervals are contiguous and disjoint over the total order; the tail is strictly `> last hi`; **every** sealed segment (first-seal or backdated re-seal) respects the seal thresholds. A backdated event with a key inside a sealed interval routes to exactly that interval (step 1 re-seal, splitting if oversized), never shifting later intervals (their `lo`/`hi` are pinned).
 
 - [ ] **Step 1: Write failing tests** — create `#[cfg(test)] mod tests` in `community_state_segments.rs`. Use a helper `ev(wall_ms, logical, dev, id_byte) -> SignedMembershipEvent` building a minimal signed Leave event (deterministic, no enrollment cert), and a fixed `k_s = [7u8;32]`. Tests:
   - `roundtrip_segment` — `seal_segment` then `open_segment` returns the same events; wrong community_id → `Misrouted`.
@@ -164,8 +166,9 @@ Invariant to preserve: sealed `[lo,hi]` intervals are contiguous and disjoint ov
   - `plan_empty_log_has_no_segments_only_tail` — empty prior + a handful of events under threshold → `refs` empty, `tail` == all events, `newly_sealed` empty.
   - `plan_seals_at_event_threshold` — feed `SEGMENT_SEAL_EVENTS + 5` ascending events, empty prior → exactly one `SegmentRef` of `SEGMENT_SEAL_EVENTS`, tail of 5, one `newly_sealed`.
   - `plan_reuses_prior_segments_cid_stable` — run `plan_segments`, persist its `index`, append 3 new tail events, run again → the prior segment's `segment_cid` is byte-identical and NOT in `newly_sealed` (per-publisher O(delta)).
-  - `plan_backdated_event_reseals_one_segment_no_cascade` — with ≥2 sealed segments, inject an event whose key falls inside segment 0's `[lo,hi]` → only segment 0's cid changes; segment 1's cid is byte-identical; only segment 0 in `newly_sealed`.
-  - `plan_total_order_is_transport_only` — shuffle input order → same `refs`/`tail` (function sorts/derives deterministically from keys, not input order).
+  - `plan_backdated_event_reseals_affected_interval_no_cascade` — with ≥2 sealed segments, inject an event whose key falls inside segment 0's `[lo,hi]` → segment 0's region re-seals (its old cid is gone); a LATER segment keeps its cid and is NOT in `newly_sealed` (cascade-free, asserted by identity since a re-seal may split); every segment ≤ `SEGMENT_SEAL_EVENTS`.
+  - `plan_dirty_reseal_stays_under_seal_threshold` — bulk-backdate ~2 segments' worth of events into one sealed interval → it splits into multiple bounded segments (none over threshold) and reconstruction recovers every event.
+  - `plan_caller_side_resort_is_deterministic` — sorting a differently-ordered copy of the same events back into `event_sort_key` order yields byte-identical `refs`/`tail` (pins the caller-side sort contract; the planner does NOT sort internally).
 
 - [ ] **Step 2: Run tests to verify they fail** — `cd src-tauri && cargo nextest run --locked --features test-fixtures -E 'test(community_state_segments)'` → FAIL (module/functions absent).
 
