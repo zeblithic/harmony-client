@@ -71038,6 +71038,7 @@ pub fn run() {
             owner_commands::preview_owner_mnemonic_identity,
             owner_commands::restore_owner_mnemonic_from_words,
             owner_commands::reset_local_identity,
+            owner_commands::erase_all_local_data,
             owner_commands::owner_id_on_disk,
             owner_commands::revoke_device,
             owner_quorum_commands::request_quorum_revocation,

@@ -42,7 +42,14 @@
     startExpanded?: boolean;
   } = $props();
 
-  type Mode = 'collapsed' | 'options' | 'restore' | 'reset-confirm' | 'resetting';
+  type Mode =
+    | 'collapsed'
+    | 'options'
+    | 'restore'
+    | 'reset-confirm'
+    | 'resetting'
+    | 'erase-confirm'
+    | 'erasing';
   // Starts 'collapsed'; when `startExpanded` the template shows the options panel
   // directly (see the `collapsed && !startExpanded` gate below) without needing
   // the prop in this initializer.
@@ -51,6 +58,14 @@
   let confirmChecked = $state(false);
   let resetError = $state<string | null>(null);
   let restoreBlocked = $state<string | null>(null);
+  // ZEB-842: erase-all clean-slate (typed-confirm). Distinct from the recovery
+  // reset above — this hard-deletes identity AND every app-data cache.
+  let eraseText = $state('');
+  let eraseError = $state<string | null>(null);
+  // Busy-guard: while a destructive op is in flight, no other flow may start —
+  // otherwise a click could issue an overlapping IPC before the pending reset/
+  // erase reloads the page (Qodo).
+  let busy = $derived(mode === 'resetting' || mode === 'erasing');
 
   async function openRestore() {
     restoreBlocked = null;
@@ -81,6 +96,24 @@
     } catch (e) {
       resetError = e instanceof Error ? e.message : String(e);
       mode = 'reset-confirm';
+    }
+  }
+
+  async function doErase() {
+    // Typed-confirm gate: the fixed literal ERASE, matching IdentityPanel's
+    // erase action. Irreversible for non-re-fetchable content (mail), so no
+    // checkbox — the user must type it.
+    if (eraseText !== 'ERASE' || mode === 'erasing') return;
+    mode = 'erasing';
+    eraseError = null;
+    try {
+      // Backend re-validates `confirm === 'ERASE'` (defense-in-depth).
+      await invoke('erase_all_local_data', { confirm: eraseText });
+      // Identity + caches gone → next boot classifies as `missing` → onboarding.
+      reload();
+    } catch (e) {
+      eraseError = e instanceof Error ? e.message : String(e);
+      mode = 'erase-confirm';
     }
   }
 </script>
@@ -118,6 +151,7 @@
         type="button"
         class="recovery-btn restore"
         data-testid="startup-restore"
+        disabled={busy}
         onclick={openRestore}
       >
         Restore from recovery phrase
@@ -135,11 +169,13 @@
               data-testid="startup-reset-confirm"
               disabled={mode === 'resetting'}
             />
-            <span>
-              Start fresh on this device. Your current identity is backed up to a
-              folder on this device first. You'll lose access to communities you
-              joined here unless you have your recovery phrase. This can't be undone
-              from the app.
+            <span data-testid="startup-reset-confirm-copy">
+              Recover this device's onboarding. Your current identity is backed up
+              to a folder on this device first, then set aside so the app starts
+              fresh. Cached content (messages, avatars) stays on this device — use
+              “Erase all local data” below to also clear this profile's cached data.
+              You'll lose access to communities you joined here unless you have your
+              recovery phrase. This can't be undone from the app.
             </span>
           </label>
           {#if resetError}
@@ -160,9 +196,57 @@
           type="button"
           class="recovery-btn reset"
           data-testid="startup-reset"
+          disabled={busy}
           onclick={() => (mode = 'reset-confirm')}
         >
           Reset this device &amp; start fresh
+        </button>
+      {/if}
+
+      {#if mode === 'erase-confirm' || mode === 'erasing'}
+        <div class="erase-confirm-block">
+          <p class="erase-lead">
+            This permanently erases this device's identity <strong
+              >and all of this profile's cached data</strong
+            >
+            — messages, avatars, follows, and more. Other profiles on this device and
+            diagnostic logs are not affected. Your recovery phrase still restores your
+            identity, but the cached content can't be recovered.
+          </p>
+          <label class="erase-confirm">
+            <span>Type <strong>ERASE</strong> to confirm</span>
+            <input
+              type="text"
+              bind:value={eraseText}
+              data-testid="startup-erase-input"
+              disabled={mode === 'erasing'}
+              autocomplete="off"
+              autocapitalize="characters"
+              spellcheck="false"
+            />
+          </label>
+          {#if eraseError}
+            <p class="reset-error" data-testid="startup-erase-error">{eraseError}</p>
+          {/if}
+          <button
+            type="button"
+            class="recovery-btn erase-go"
+            data-testid="startup-erase-go"
+            disabled={eraseText !== 'ERASE' || mode === 'erasing'}
+            onclick={doErase}
+          >
+            {mode === 'erasing' ? 'Erasing…' : 'Erase all local data'}
+          </button>
+        </div>
+      {:else}
+        <button
+          type="button"
+          class="recovery-btn erase"
+          data-testid="startup-erase"
+          disabled={busy}
+          onclick={() => (mode = 'erase-confirm')}
+        >
+          Erase all local data
         </button>
       {/if}
     </div>
@@ -212,7 +296,9 @@
     border-color: var(--accent);
   }
   .recovery-btn.reset,
-  .recovery-btn.reset-go {
+  .recovery-btn.reset-go,
+  .recovery-btn.erase,
+  .recovery-btn.erase-go {
     border-color: var(--danger);
     color: var(--danger);
   }
@@ -242,5 +328,32 @@
     margin: 0;
     font-size: 0.85rem;
     color: var(--danger);
+  }
+
+  .erase-confirm-block {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+  .erase-lead {
+    margin: 0;
+    font-size: 0.85rem;
+    color: var(--text-primary);
+    line-height: 1.35;
+  }
+  .erase-confirm {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    font-size: 0.85rem;
+    color: var(--text-primary);
+  }
+  .erase-confirm input {
+    font: inherit;
+    padding: 0.4rem 0.55rem;
+    border-radius: 6px;
+    border: 1px solid var(--border-default);
+    background: var(--surface-raised);
+    color: var(--text-primary);
   }
 </style>
