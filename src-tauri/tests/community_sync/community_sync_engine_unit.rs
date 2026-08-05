@@ -1230,6 +1230,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
             logical: 0,
             device_id: "alice-dev".into(),
         },
+        manifest_format: None,
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let bad_sig = bob_signing.sign(&signed_bytes).to_bytes();
@@ -1473,6 +1474,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
             logical: 0,
             device_id: "alice-dev".into(),
         },
+        manifest_format: None,
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let valid_sig = alice_signing.sign(&signed_bytes).to_bytes();
@@ -1682,6 +1684,7 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
             logical: 0,
             device_id: "alice-dev".into(),
         },
+        manifest_format: None,
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let sig = alice_signing.sign(&signed_bytes).to_bytes();
