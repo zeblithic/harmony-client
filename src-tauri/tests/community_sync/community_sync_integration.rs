@@ -555,6 +555,7 @@ async fn forged_signature_event_is_rejected_on_receive() {
             logical: 0,
             device_id: "attacker-dev".into(),
         },
+        manifest_format: None,
     };
     let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed");
     let sig = admin_signing.sign(&signed_bytes).to_bytes();
@@ -1416,6 +1417,7 @@ async fn spoofed_publish_does_not_block_real_publisher() {
         root_cid: forged_root_cid,
         publisher_addr: alice_addr,
         at: forged_huge_hlc.clone(),
+        manifest_format: None,
     };
     let forged_signed_bytes = canonical_cbor_encode(&forged_signed).expect("encode signed");
     // THE SPOOF: signature is from Bob, not Alice. This is the only

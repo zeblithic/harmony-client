@@ -29,6 +29,10 @@ fn community_root_signed_payload_wire_bytes_pinned() {
             logical: 7,
             device_id: "d1".into(),
         },
+        // manifest_format: None — ZEB-814 added this with
+        // skip_serializing_if = "Option::is_none", so the legacy (monolithic)
+        // signed bytes below are byte-identical (the "mf" key is absent).
+        manifest_format: None,
     };
 
     let bytes = canonical_cbor_encode(&p).expect("encode");
@@ -66,6 +70,9 @@ fn community_root_publish_payload_wire_bytes_pinned() {
         // epoch: None — this field was added in ZEB-249 §10.6 with
         // skip_serializing_if = "Option::is_none" so legacy wire bytes are unchanged.
         epoch: None,
+        // manifest_format: None — ZEB-814, same skip_serializing_if treatment,
+        // so this legacy monolithic-root payload's bytes are unchanged.
+        manifest_format: None,
     };
 
     let bytes = canonical_cbor_encode(&p).expect("encode");

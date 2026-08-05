@@ -625,4 +625,87 @@ mod tests {
         assert_eq!(plan_sorted.refs, plan_resorted.refs);
         assert_eq!(plan_sorted.tail, plan_resorted.tail);
     }
+
+    #[test]
+    fn rotation_reseals_manifest_not_segments() {
+        // Enough events to seal at least one segment.
+        let mut v = Vec::new();
+        for k in 0..(SEGMENT_SEAL_EVENTS as u64 + 3) {
+            v.push(ev(k + 1, 0, "d", (k % 251) as u8));
+        }
+        let evs = sorted(v);
+        let plan = plan_segments(ci(), &evs, &SegmentIndex::default(), &mut counter()).unwrap();
+        assert!(!plan.refs.is_empty());
+        let seg_cids: Vec<_> = plan.refs.iter().map(|r| r.segment_cid).collect();
+
+        let manifest = ManifestCleartext {
+            version: MANIFEST_CLEARTEXT_V1,
+            community_id: ci(),
+            segments: plan.refs,
+            tail: plan.tail,
+        };
+        // Seal the SAME manifest under two different epoch keys (a rotation).
+        let key_n = EpochKey::new([10u8; 32]);
+        let key_n1 = EpochKey::new([20u8; 32]);
+        let (root_n, ct_n) = seal_manifest(&key_n, &manifest).unwrap();
+        let (root_n1, ct_n1) = seal_manifest(&key_n1, &manifest).unwrap();
+
+        // Rotation re-encrypts the manifest → different root CID + bytes …
+        assert_ne!(root_n, root_n1, "rotation must re-key the manifest");
+        assert_ne!(ct_n, ct_n1);
+        // … but the segments it references are epoch-independent: a member with
+        // EITHER epoch key unwraps the SAME segment set (identical CIDs). This
+        // is what makes rotation O(manifest), not O(history).
+        let m_n = open_manifest(&key_n, ci(), &ct_n).unwrap();
+        let m_n1 = open_manifest(&key_n1, ci(), &ct_n1).unwrap();
+        let cids_n: Vec<_> = m_n.segments.iter().map(|r| r.segment_cid).collect();
+        let cids_n1: Vec<_> = m_n1.segments.iter().map(|r| r.segment_cid).collect();
+        assert_eq!(cids_n, seg_cids);
+        assert_eq!(cids_n1, seg_cids);
+    }
+
+    #[test]
+    fn manifest_receive_parity_reconstructs_all_events() {
+        // >1 sealed segment + a tail.
+        let mut v = Vec::new();
+        for k in 0..(2 * SEGMENT_SEAL_EVENTS as u64 + 9) {
+            v.push(ev(k + 1, 0, "d", (k % 251) as u8));
+        }
+        let evs = sorted(v);
+        let plan = plan_segments(ci(), &evs, &SegmentIndex::default(), &mut counter()).unwrap();
+        // Stand-in CAS: (segment_cid, ciphertext) for every sealed segment.
+        // `ContentId` isn't `Ord`, so use a Vec + linear lookup (PartialEq).
+        let cas: Vec<(harmony_content::cid::ContentId, Vec<u8>)> = plan
+            .newly_sealed
+            .iter()
+            .map(|(r, ct)| (r.segment_cid, ct.clone()))
+            .collect();
+        let manifest = ManifestCleartext {
+            version: MANIFEST_CLEARTEXT_V1,
+            community_id: ci(),
+            segments: plan.refs,
+            tail: plan.tail,
+        };
+
+        // Simulate the receive path: open each segment (by its K_s) from CAS,
+        // append the tail, sort by event_sort_key — must equal the input log.
+        let mut got: Vec<SignedMembershipEvent> = Vec::new();
+        for r in &manifest.segments {
+            let ct = &cas
+                .iter()
+                .find(|(cid, _)| *cid == r.segment_cid)
+                .expect("segment present in CAS")
+                .1;
+            got.extend(open_segment(&r.k_s, ci(), ct).unwrap());
+        }
+        got.extend(manifest.tail);
+        got.sort_by(|a, b| {
+            crate::community_membership::event_sort_key(a)
+                .cmp(&crate::community_membership::event_sort_key(b))
+        });
+        assert_eq!(
+            got, evs,
+            "manifest+segments reconstruct the exact event set"
+        );
+    }
 }

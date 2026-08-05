@@ -254,6 +254,16 @@ pub struct CommunityRootPublishPayload {
     /// back to trying current key then old keys in reverse order.
     #[serde(rename = "ep", skip_serializing_if = "Option::is_none", default)]
     pub epoch: Option<u64>,
+
+    /// ZEB-814: root format discriminator. `None` ⇒ legacy monolithic root
+    /// (`root_cid` addresses a whole encrypted `CommunityState` blob).
+    /// `Some(MANIFEST_FORMAT_V1)` ⇒ segmented root (`root_cid` addresses a
+    /// `ManifestCleartext`). Under the publisher signature (mirrored in
+    /// `CommunityRootSignedPayload`) so a downgrade can't reinterpret
+    /// `root_cid`. `skip_serializing_if None` keeps legacy wire bytes
+    /// byte-identical (the field is absent for pre-814 publishers).
+    #[serde(rename = "mf", skip_serializing_if = "Option::is_none", default)]
+    pub manifest_format: Option<u8>,
 }
 
 impl CanonicalPayloadSealed for CommunityRootPublishPayload {}
@@ -275,6 +285,11 @@ pub struct CommunityRootSignedPayload {
     pub publisher_addr: OwnerAddr,
     #[serde(rename = "at")]
     pub at: Hlc,
+    /// ZEB-814: root format discriminator, under the signature. See
+    /// `CommunityRootPublishPayload::manifest_format`. `skip_serializing_if
+    /// None` keeps the signed bytes byte-identical for legacy publishers.
+    #[serde(rename = "mf", skip_serializing_if = "Option::is_none", default)]
+    pub manifest_format: Option<u8>,
 }
 
 impl CanonicalPayloadSealed for CommunityRootSignedPayload {}
@@ -295,6 +310,7 @@ impl CommunityRootSignedPayload {
             at: self.at,
             publisher_sig,
             epoch,
+            manifest_format: self.manifest_format,
         }
     }
 }
@@ -308,6 +324,9 @@ impl From<&CommunityRootPublishPayload> for CommunityRootSignedPayload {
             root_cid: w.root_cid,
             publisher_addr: w.publisher_addr,
             at: w.at.clone(),
+            // ZEB-814: carry the format discriminator so receive-side verify
+            // reproduces the exact bytes the publisher signed.
+            manifest_format: w.manifest_format,
         }
     }
 }
@@ -3172,119 +3191,155 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
         }
     };
 
-    // 1. Canonical-CBOR encode the CommunityState as the cleartext blob.
-    let blob_cleartext = canonical_cbor_encode(&snapshot)
-        .map_err(|e| CommunitySyncError::CborEncode(e.to_string()))?;
+    // ZEB-814: build a SEGMENTED root — a small manifest referencing immutable,
+    // content-addressed segments — instead of one monolithic ≤1 MiB blob. Both
+    // consumers (publish + query-serve) route through here, so both emit the
+    // segmented format after this change.
+    //
+    // 1. Time-order the log by `event_sort_key`. Segmentation is a transport
+    //    partition only — the receiver re-sorts every event — so a mis-assigned
+    //    event is harmless to correctness.
+    let mut sorted_events: Vec<crate::community_membership::SignedMembershipEvent> =
+        snapshot.events().cloned().collect();
+    sorted_events.sort_by(|a, b| {
+        crate::community_membership::event_sort_key(a)
+            .cmp(&crate::community_membership::event_sort_key(b))
+    });
 
-    // 2. Encrypt with deterministic-nonce blob AEAD so cipher_cid is
-    //    reproducible across replicas (dedup + convergence).
-    //    ZEB-249 §10.6: uses `current_key` (live epoch key) rather than
-    //    the spawn-time `membership_key`.
-    let blob_ciphertext = encrypt_blob(&current_key, &blob_cleartext)?;
+    // 2. Re-derive segments against this publisher's persisted index (the
+    //    `segments.cbor` sidecar beside `crdt.cbor`), sealing only new/dirtied
+    //    segments. Reused segments keep their `(K_s, cid)` → per-publisher
+    //    O(delta): a republish re-`put`s only the changed tail segment.
+    let segments_path = ctx.paths.crdt.with_file_name("segments.cbor");
+    let prior_index = crate::community_state_persist::load_segment_index(&segments_path)
+        .map_err(|e| CommunitySyncError::CborEncode(format!("segment index load: {e}")))?;
+    let plan = crate::community_state_segments::plan_segments(
+        ctx.community_id,
+        &sorted_events,
+        &prior_index,
+        &mut || {
+            use rand::RngCore;
+            let mut k = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut k);
+            k
+        },
+    )
+    .map_err(|e| CommunitySyncError::CborEncode(format!("segment plan: {e}")))?;
 
-    // ZEB-813: surface the size trajectory long before the ContentId cap
-    // detonates. One site covers both consumers — publish and query-serve
-    // both route through encode_root_packet — and emission is latched to
-    // watermark TRANSITIONS (PR #560 round 1), because this function runs
-    // on every query-serve request, not just debounced publishes.
-    let watermark = classify_root_size(blob_ciphertext.len());
+    // 3. Put newly sealed segments into CAS (serveable). Reused segments are
+    //    already present from a prior publish and are NOT re-put — this is
+    //    where the O(delta) upload cost falls out.
+    for (seg_ref, ciphertext) in &plan.newly_sealed {
+        ctx.content_store
+            .put_serveable(seg_ref.segment_cid, ciphertext.clone())
+            .await?;
+    }
+
+    // 4. Build the manifest (the new root). It is encrypted under the CURRENT
+    //    epoch key and carries every segment's `K_s` in plaintext, so segment
+    //    CIDs are epoch-independent (an epoch rotation re-encrypts only this
+    //    small manifest, never the segments) and a joiner needs only the
+    //    current epoch key to unwrap every segment.
+    let manifest = crate::community_state_segments::ManifestCleartext {
+        version: crate::community_state_segments::MANIFEST_CLEARTEXT_V1,
+        community_id: ctx.community_id,
+        segments: plan.refs,
+        tail: plan.tail,
+    };
+
+    // ZEB-813/814: surface the size trajectory long before the cap. The
+    // measured quantity is now the manifest's segment count (a single segment
+    // can never approach the cap — `SEGMENT_SEAL_BYTES` caps it). Emission is
+    // latched to watermark TRANSITIONS because this runs on every serve, not
+    // just debounced publishes.
+    let watermark = classify_manifest_fill(manifest.segments.len());
     if watermark_transitioned(&ctx.root_size_watermark_seen, &watermark) {
         match watermark {
             RootSizeWatermark::Ok => {}
             RootSizeWatermark::NearHalf => {
                 tracing::warn!(
                     community_id = ?ctx.community_id,
-                    blob_bytes = blob_ciphertext.len(),
-                    cap_bytes = harmony_content::cid::MAX_PAYLOAD_SIZE,
-                    "community state-root blob at >=50% of the ContentId cap"
+                    segments = manifest.segments.len(),
+                    segment_cap = MANIFEST_SEGMENT_CAP,
+                    "community state-root manifest at >=50% of its segment cap"
                 );
             }
             RootSizeWatermark::NearCap => {
                 tracing::warn!(
                     community_id = ?ctx.community_id,
-                    blob_bytes = blob_ciphertext.len(),
-                    cap_bytes = harmony_content::cid::MAX_PAYLOAD_SIZE,
-                    "community state-root blob at >=80% of the ContentId cap; \
+                    segments = manifest.segments.len(),
+                    segment_cap = MANIFEST_SEGMENT_CAP,
+                    "community state-root manifest at >=80% of its segment cap; \
                      root publish/serve fails entirely at the cap"
                 );
                 report_degraded(
                     ctx.error_tx.as_ref(),
                     ctx.community_id,
-                    "state_root_near_cap",
+                    "state_root_manifest_near_cap",
                     format!(
-                        "state-root blob {} bytes >= 80% of ContentId cap {}",
-                        blob_ciphertext.len(),
-                        harmony_content::cid::MAX_PAYLOAD_SIZE
+                        "state-root manifest {} segments >= 80% of cap {}",
+                        manifest.segments.len(),
+                        MANIFEST_SEGMENT_CAP
                     ),
                 );
             }
             RootSizeWatermark::OverCap => {
                 tracing::warn!(
                     community_id = ?ctx.community_id,
-                    blob_bytes = blob_ciphertext.len(),
-                    cap_bytes = harmony_content::cid::MAX_PAYLOAD_SIZE,
-                    "community state-root blob EXCEEDS the ContentId cap; \
+                    segments = manifest.segments.len(),
+                    segment_cap = MANIFEST_SEGMENT_CAP,
+                    "community state-root manifest EXCEEDS its segment cap; \
                      root publish/serve is down until the log shrinks"
                 );
                 report_degraded(
                     ctx.error_tx.as_ref(),
                     ctx.community_id,
-                    "state_root_over_cap",
+                    "state_root_manifest_over_cap",
                     format!(
-                        "state-root blob {} bytes exceeds ContentId cap {}",
-                        blob_ciphertext.len(),
-                        harmony_content::cid::MAX_PAYLOAD_SIZE
+                        "state-root manifest {} segments exceeds cap {}",
+                        manifest.segments.len(),
+                        MANIFEST_SEGMENT_CAP
                     ),
                 );
             }
         }
     }
 
-    // 3. Derive structured ContentId for the encrypted blob. Flagged
-    //    `encrypted: true` so the eviction policy classifies it as
-    //    EncryptedDurable (priority 0 — never auto-burns).
-    let root_cid = harmony_content::cid::ContentId::for_book(
-        &blob_ciphertext,
-        harmony_content::cid::ContentFlags {
-            encrypted: true,
-            ..Default::default()
-        },
-    )
-    .map_err(|e| {
-        // ZEB-813: the over-cap failure was previously a silent
-        // warn-and-retry (publish) / withheld reply (serve). The OverCap
-        // transition above normally reported already; this latched
-        // fallback covers a `for_book` rejection the classifier did not
-        // predict (defense in depth — the shared latch prevents a double
-        // report in the normal case).
-        if watermark_transitioned(&ctx.root_size_watermark_seen, &RootSizeWatermark::OverCap) {
-            report_degraded(
-                ctx.error_tx.as_ref(),
-                ctx.community_id,
-                "state_root_over_cap",
-                format!("state-root blob exceeds ContentId cap: {e}"),
-            );
-        }
-        CommunitySyncError::Crypto(CommunityCryptoError::ContentIdDerivation(e.to_string()))
-    })?;
+    // Seal the manifest under the current epoch key → the root CID.
+    let (root_cid, manifest_ciphertext) =
+        crate::community_state_segments::seal_manifest(&current_key, &manifest).map_err(|e| {
+            // Defense in depth: the manifest ContentId cap is far higher than
+            // the segment-count watermark, but a `for_book` rejection here still
+            // reports degraded (the latch prevents a double report).
+            if watermark_transitioned(&ctx.root_size_watermark_seen, &RootSizeWatermark::OverCap) {
+                report_degraded(
+                    ctx.error_tx.as_ref(),
+                    ctx.community_id,
+                    "state_root_manifest_over_cap",
+                    format!("state-root manifest exceeds ContentId cap: {e}"),
+                );
+            }
+            CommunitySyncError::Crypto(CommunityCryptoError::ContentIdDerivation(e.to_string()))
+        })?;
 
-    // 4. Put into ContentStore AND mark this community-root CID serveable to
-    //    peers (ZEB-395). put_serveable admits via CasOp::PutLocal exactly like
-    //    put, then (production RuntimeContentStore only) records root_cid in the
-    //    shared serve-allowlist so the content-serve queryable will serve it
-    //    despite the encrypted flag. Registration completes before the state-
-    //    root envelope announcing root_cid is returned for publish/serve, so
-    //    no peer can request the CID before it is allowlisted.
+    // Put the manifest (the root) into CAS AND mark it serveable to peers
+    // (ZEB-395) — same allowlist contract as the legacy monolithic blob. Then
+    // persist the updated segment index so this publisher's NEXT publish reuses
+    // these segment CIDs (per-publisher O(delta)).
     ctx.content_store
-        .put_serveable(root_cid, blob_ciphertext)
+        .put_serveable(root_cid, manifest_ciphertext)
         .await?;
+    crate::community_state_persist::save_segment_index(&segments_path, &plan.index)
+        .map_err(|e| CommunitySyncError::CborEncode(format!("segment index save: {e}")))?;
 
-    // 5. Build the SIGNED sub-payload with a strictly-newer HLC.
+    // 5. Build the SIGNED sub-payload with a strictly-newer HLC. ZEB-814: mark
+    //    the root as the segmented (manifest) format, under the signature.
     let now = next_hlc(ctx).await;
     let signed = CommunityRootSignedPayload {
         root_cid,
         publisher_addr: ctx.self_owner,
         at: now,
+        manifest_format: Some(crate::community_state_segments::MANIFEST_FORMAT_V1),
     };
 
     // 6. Sign the canonical CBOR of the signed sub-payload. Ed25519
@@ -4129,59 +4184,139 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         }
     };
 
-    // 7. Decrypt blob (deterministic-nonce).
-    //    CR Major (PR #106 R6): blob decryption MUST use the SAME epoch
-    //    key that successfully decrypted the root wire packet. Trying
-    //    independent key sets for root and blob would allow an attacker
-    //    to rewrap the outer layer under any accepted old key while
-    //    substituting a blob encrypted under a different old key —
-    //    breaking the root→blob epoch binding contract.
-    let blob_cleartext = match decrypt_blob(root_key_used, &blob_ciphertext) {
-        Ok(b) => b,
-        Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
-    };
-
-    // 8. Decode CommunityState.
-    let remote: CommunityState = match canonical_cbor_decode(&blob_cleartext) {
-        Ok(s) => s,
-        Err(e) => {
-            return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(e.to_string()))
+    // 7-8. ZEB-814 dual-read: decode the fetched root into a flat event list.
+    //    Two formats — a segmented MANIFEST (`payload.manifest_format` = Some,
+    //    where `blob_ciphertext` is the manifest and each referenced segment is
+    //    fetched + opened) or the LEGACY monolithic `CommunityState` blob
+    //    (`None`). Both feed the identical downstream replay pipeline.
+    //
+    //    CR Major (PR #106 R6): every decrypt below MUST use the SAME epoch key
+    //    (`root_key_used`) that opened the root wire packet — for the manifest
+    //    directly, and for the legacy blob. Trying independent key sets would
+    //    let an attacker rewrap the outer layer under one accepted old key while
+    //    substituting inner content encrypted under another, breaking the
+    //    root→content epoch-binding contract. (Segments carry their own `K_s`,
+    //    which is itself only obtainable by decrypting the epoch-bound manifest,
+    //    so the binding holds transitively.)
+    let mut resolved: Vec<SignedMembershipEvent> = match payload.manifest_format {
+        Some(_) => {
+            let manifest = match crate::community_state_segments::open_manifest(
+                root_key_used,
+                ctx.community_id,
+                &blob_ciphertext,
+            ) {
+                Ok(m) => m,
+                Err(crate::community_state_segments::SegmentError::Misrouted {
+                    expected,
+                    found,
+                }) => {
+                    return IncomingOutcome::ErrPreMutation(CommunitySyncError::MisroutedBlob {
+                        expected,
+                        found,
+                    });
+                }
+                Err(e) => {
+                    return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(
+                        format!("manifest: {e}"),
+                    ));
+                }
+            };
+            let mut events: Vec<SignedMembershipEvent> = Vec::new();
+            for seg_ref in &manifest.segments {
+                // A segment fetch is pre-mutation exactly like the root fetch
+                // (the replay ticket from step 5 is still un-consumed), so a
+                // miss/error hands the frame back for the same bounded retry.
+                let seg_ct = match ctx
+                    .content_store
+                    .get_with_budget(
+                        &seg_ref.segment_cid,
+                        std::time::Duration::from_millis(
+                            crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+                        ),
+                    )
+                    .await
+                {
+                    Ok(Some(b)) => b,
+                    Ok(None) => {
+                        tracing::warn!(
+                            community_id = ?ctx.community_id,
+                            cid = ?seg_ref.segment_cid,
+                            "community state-root segment fetch miss — will retry if budget remains"
+                        );
+                        return IncomingOutcome::FetchMiss(wire);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            community_id = ?ctx.community_id,
+                            cid = ?seg_ref.segment_cid,
+                            error = %e,
+                            "community state-root segment fetch error — will retry if budget remains"
+                        );
+                        return IncomingOutcome::FetchMiss(wire);
+                    }
+                };
+                match crate::community_state_segments::open_segment(
+                    &seg_ref.k_s,
+                    ctx.community_id,
+                    &seg_ct,
+                ) {
+                    Ok(mut seg_events) => events.append(&mut seg_events),
+                    Err(crate::community_state_segments::SegmentError::Misrouted {
+                        expected,
+                        found,
+                    }) => {
+                        return IncomingOutcome::ErrPreMutation(
+                            CommunitySyncError::MisroutedBlob { expected, found },
+                        );
+                    }
+                    Err(e) => {
+                        return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(
+                            format!("segment: {e}"),
+                        ));
+                    }
+                }
+            }
+            events.extend(manifest.tail);
+            events
+        }
+        None => {
+            let blob_cleartext = match decrypt_blob(root_key_used, &blob_ciphertext) {
+                Ok(b) => b,
+                Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
+            };
+            let remote: CommunityState = match canonical_cbor_decode(&blob_cleartext) {
+                Ok(s) => s,
+                Err(e) => {
+                    return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(
+                        e.to_string(),
+                    ))
+                }
+            };
+            // Reject misrouted blob: its community_id must match ours. A
+            // ContentStore collision (vanishingly unlikely with SHA-256) or a
+            // buggy callsite could otherwise surface a foreign community's
+            // events under our key.
+            if remote.community_id != ctx.community_id {
+                return IncomingOutcome::ErrPreMutation(CommunitySyncError::MisroutedBlob {
+                    expected: ctx.community_id,
+                    found: remote.community_id,
+                });
+            }
+            remote.into_events()
         }
     };
 
-    // 8b. Reject misrouted blob: blob's community_id must match the
-    //     engine's expected community_id. Without this, a
-    //     ContentStore-collision (vanishingly unlikely with SHA-256
-    //     but cheap to gate) or buggy callsite could surface a
-    //     foreign community's events under our key.
-    if remote.community_id != ctx.community_id {
-        return IncomingOutcome::ErrPreMutation(CommunitySyncError::MisroutedBlob {
-            expected: ctx.community_id,
-            found: remote.community_id,
-        });
-    }
-
-    // Phase A: order the inner events for replay. ZEB-339 Task 9: the
-    // old per-event resolver pre-resolution (and the owner_id-miss
-    // skip-and-log that wrongly dropped valid remote events) is GONE —
-    // `verify_event` (called by `insert_event` in Phase B) derives every
-    // signer's ed25519 key itself, from the carried EnrollmentCert
-    // (Join/PendingJoin) or the actor's materialized
-    // `enrolled_device_keys` (steady-state). No identity_resolver round
-    // trip remains in the merge path, so the prior lock-order hazard with
-    // owner-state is also eliminated for this phase.
+    // Phase A: order the inner events for replay. ZEB-339 Task 9: the old
+    // per-event resolver pre-resolution is GONE — `verify_event` (called by
+    // `insert_event` in Phase B) derives every signer's ed25519 key itself.
     //
-    // **Replay order matters.** `BTreeMap<EventId, _>::into_values()`
-    // walks in `EventId` byte order, but `insert_event` authorizes
-    // each candidate against `prior_state_at_event` — i.e., everything
-    // already in the local log that strictly precedes the candidate by
-    // `event_sort_key`. If two events arrive in the same blob and the
-    // later-by-replay-order event is processed first, its earlier
-    // predecessor (still pending in our queue) is missing from
-    // prior_state, and a valid event can land as `Rejected`. Sort
-    // explicitly by `event_sort_key` so we merge in the same order
-    // `materialize` would replay.
-    let mut resolved: Vec<SignedMembershipEvent> = remote.into_events();
+    // **Replay order matters.** Events may arrive in EventId (random) or
+    // segment order, but `insert_event` authorizes each candidate against
+    // `prior_state_at_event` — everything already in the local log that
+    // strictly precedes it by `event_sort_key`. If a later-by-replay-order
+    // event is processed before its predecessor (still pending in our queue),
+    // a valid event can land as `Rejected`. Sort explicitly by `event_sort_key`
+    // so we merge in the same order `materialize` would replay.
     resolved.sort_by(|a, b| {
         crate::community_membership::event_sort_key(a)
             .cmp(&crate::community_membership::event_sort_key(b))
@@ -4712,13 +4847,26 @@ pub(crate) enum RootSizeWatermark {
     OverCap,
 }
 
-pub(crate) fn classify_root_size(len: usize) -> RootSizeWatermark {
-    let cap = harmony_content::cid::MAX_PAYLOAD_SIZE;
-    if len > cap {
+/// ZEB-814: the segmented-root analogue of the ContentId payload cap — the max
+/// number of `SegmentRef`s a manifest can carry before the manifest's OWN
+/// ContentId approaches `MAX_PAYLOAD_SIZE`. A `SegmentRef` encodes to ~175 B
+/// (`segment_cid` + two `EventBoundary`s + `count` + `K_s`); 200 B is a
+/// conservative per-ref floor, so this is a safe under-estimate of the true
+/// capacity. At the 512-event seal threshold this puts the manifest's own
+/// cliff millions of events out — a ~400-500× lift over the ~6k-event
+/// monolithic cliff (and removable entirely by chunking the manifest later).
+pub(crate) const MANIFEST_SEGMENT_CAP: usize = harmony_content::cid::MAX_PAYLOAD_SIZE / 200;
+
+/// ZEB-814: watermark classification for the manifest's segment fill (the
+/// segmented-root successor to the old blob-byte classifier). Same 50/80/over
+/// thresholds, measured in segments against [`MANIFEST_SEGMENT_CAP`].
+pub(crate) fn classify_manifest_fill(segments: usize) -> RootSizeWatermark {
+    let cap = MANIFEST_SEGMENT_CAP;
+    if segments > cap {
         RootSizeWatermark::OverCap
-    } else if len >= cap * 4 / 5 {
+    } else if segments >= cap * 4 / 5 {
         RootSizeWatermark::NearCap
-    } else if len >= cap / 2 {
+    } else if segments >= cap / 2 {
         RootSizeWatermark::NearHalf
     } else {
         RootSizeWatermark::Ok
@@ -6812,6 +6960,7 @@ mod tests {
             .expect("cid"),
             publisher_addr: carol_addr,
             at: forged_at,
+            manifest_format: None,
         };
         let forged_payload = forged_signed.into_wire([0u8; 64], None);
         let forged_payload_bytes =
@@ -6855,6 +7004,7 @@ mod tests {
             root_cid: legit_root_cid,
             publisher_addr: dave_addr,
             at: legit_at.clone(),
+            manifest_format: None,
         };
         let legit_signed_bytes = canonical_cbor_encode(&legit_signed).expect("encode legit signed");
         let legit_sig = dave.device_key.sign(&legit_signed_bytes).to_bytes();
@@ -6904,20 +7054,24 @@ mod tests {
     /// ZEB-813: the size-watermark classifier trips at exactly 50% and 80%
     /// of the ContentId payload cap.
     #[test]
-    fn zeb_813_root_size_watermarks_classify_at_boundaries() {
-        use harmony_content::cid::MAX_PAYLOAD_SIZE as CAP;
-        assert_eq!(classify_root_size(0), RootSizeWatermark::Ok);
-        assert_eq!(classify_root_size(CAP / 2 - 1), RootSizeWatermark::Ok);
-        assert_eq!(classify_root_size(CAP / 2), RootSizeWatermark::NearHalf);
+    fn zeb_814_manifest_fill_watermarks_classify_at_boundaries() {
+        // ZEB-814: the boundary logic moved from blob bytes to manifest segment
+        // count (`classify_manifest_fill`), with the same 50/80/over thresholds.
+        let cap = MANIFEST_SEGMENT_CAP;
+        assert_eq!(classify_manifest_fill(0), RootSizeWatermark::Ok);
+        assert_eq!(classify_manifest_fill(cap / 2 - 1), RootSizeWatermark::Ok);
+        assert_eq!(classify_manifest_fill(cap / 2), RootSizeWatermark::NearHalf);
         assert_eq!(
-            classify_root_size(CAP * 4 / 5 - 1),
+            classify_manifest_fill(cap * 4 / 5 - 1),
             RootSizeWatermark::NearHalf
         );
-        assert_eq!(classify_root_size(CAP * 4 / 5), RootSizeWatermark::NearCap);
-        // for_book accepts len == cap, so the cap itself is NearCap; only
-        // strictly above flips to OverCap.
-        assert_eq!(classify_root_size(CAP), RootSizeWatermark::NearCap);
-        assert_eq!(classify_root_size(CAP + 1), RootSizeWatermark::OverCap);
+        assert_eq!(
+            classify_manifest_fill(cap * 4 / 5),
+            RootSizeWatermark::NearCap
+        );
+        // The manifest holds up to `cap` refs; only strictly above flips OverCap.
+        assert_eq!(classify_manifest_fill(cap), RootSizeWatermark::NearCap);
+        assert_eq!(classify_manifest_fill(cap + 1), RootSizeWatermark::OverCap);
     }
 
     /// ZEB-813 (PR #560 round 1): the watermark latch emits once per
@@ -6991,6 +7145,7 @@ mod tests {
                 logical: 0,
                 device_id: "dev-1".to_string(),
             },
+            manifest_format: None,
         };
         let signed_bytes = canonical_cbor_encode(&signed).expect("encode");
         let sig = device_key.sign(&signed_bytes).to_bytes();
