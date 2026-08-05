@@ -1017,6 +1017,11 @@ pub enum SeedBackend {
     EncryptedFile,
 }
 
+/// A located owner secret: which backend it loaded from, paired with the
+/// zeroize-on-drop key bytes. `load_secret` discards the tag; the ZEB-830
+/// probe discards the bytes.
+type LocatedSecret = (SeedBackend, Zeroizing<[u8; 32]>);
+
 /// The single implementation of the keychain→file load precedence, tagging
 /// which backend the secret loaded from. Both [`load_secret`] and the ZEB-830
 /// [`owner_master_seed_backend`] probe derive from this, so the reported
@@ -1044,7 +1049,7 @@ fn locate_secret(
     keychain_name: &str,
     identity_dir: &Path,
     fallback_filename: &str,
-) -> Result<Option<(SeedBackend, Zeroizing<[u8; 32]>)>, String> {
+) -> Result<Option<LocatedSecret>, String> {
     // Track non-NoEntry keychain errors so we can propagate them rather
     // than silently masking a locked/permission-denied keychain as an
     // un-minted state when no encrypted-file fallback is configured.
