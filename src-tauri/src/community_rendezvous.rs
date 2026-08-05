@@ -12,6 +12,7 @@
 //! env-knob config builder, and the advertiser-set slot assignment.
 
 use crate::community_relay_announce::COMMUNITY_RELAY_ADVERTISERS_MAX;
+use crate::membership_vouch::MembershipVouch;
 use crate::owner_state_types::EpochKey;
 use crate::owner_state_types::OwnerAddr;
 use crate::reachability_record::ReachabilityAnnouncePayload;
@@ -28,6 +29,66 @@ use zeroize::Zeroizing;
 
 /// Number of enumerated rendezvous slots == the relay-advertiser cap.
 pub const RENDEZVOUS_SLOT_COUNT: usize = COMMUNITY_RELAY_ADVERTISERS_MAX;
+
+/// ZEB-827: encode a rendezvous slot's routing blob — a superset of
+/// `ReachabilityAnnouncePayload` carrying an optional membership vouch. A `None`
+/// vouch encodes byte-identically to the bare payload (so already-deployed peers
+/// keep decoding published blobs unchanged); a `Some` vouch is merged into the
+/// payload's CBOR map under the `"mv"` key, which legacy bare-payload decoders
+/// ignore. Uses CBOR-`Value` map-merge rather than `#[serde(flatten)]` — the
+/// latter emits an indefinite-length map and so is NOT byte-compatible with the
+/// definite-length legacy encoding.
+pub fn encode_rendezvous_blob(
+    reachability: &ReachabilityAnnouncePayload,
+    vouch: Option<&MembershipVouch>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Fixed-size/serializable payload — encode cannot fail in practice.
+    let _ = ciborium::into_writer(reachability, &mut out);
+    let Some(v) = vouch else {
+        return out;
+    };
+    // Merge "mv" into the payload's CBOR map without disturbing existing keys.
+    let mut val: ciborium::value::Value = match ciborium::from_reader(&out[..]) {
+        Ok(val) => val,
+        Err(_) => return out,
+    };
+    if let ciborium::value::Value::Map(entries) = &mut val {
+        let mut vbytes = Vec::new();
+        if ciborium::into_writer(v, &mut vbytes).is_ok() {
+            if let Ok(vval) = ciborium::from_reader::<ciborium::value::Value, _>(&vbytes[..]) {
+                entries.push((ciborium::value::Value::Text("mv".to_string()), vval));
+            }
+        }
+    }
+    let mut merged = Vec::new();
+    let _ = ciborium::into_writer(&val, &mut merged);
+    merged
+}
+
+/// Decode a rendezvous routing blob. Tolerates a legacy bare payload (no
+/// vouch → `None`) and a vouch-carrying superset alike.
+pub fn decode_rendezvous_blob(
+    bytes: &[u8],
+) -> Option<(ReachabilityAnnouncePayload, Option<MembershipVouch>)> {
+    let reachability: ReachabilityAnnouncePayload = ciborium::from_reader(bytes).ok()?;
+    let mut vouch = None;
+    if let Ok(ciborium::value::Value::Map(entries)) =
+        ciborium::from_reader::<ciborium::value::Value, _>(bytes)
+    {
+        for (k, v) in entries {
+            if let ciborium::value::Value::Text(t) = &k {
+                if t.as_str() == "mv" {
+                    let mut vb = Vec::new();
+                    if ciborium::into_writer(&v, &mut vb).is_ok() {
+                        vouch = ciborium::from_reader::<MembershipVouch, _>(&vb[..]).ok();
+                    }
+                }
+            }
+        }
+    }
+    Some((reachability, vouch))
+}
 
 /// Domain-separation prefix for rendezvous slot derivation. Length-disjoint
 /// from the 72-byte member-keyed `info`, so rendezvous keys can never alias a
@@ -143,6 +204,11 @@ pub struct IdentifiedBeacon {
     /// The outer record's `harmony_identity_pub` (inner-sig-verified by
     /// `PkarrResolver::resolve`): X25519(32) ‖ Ed25519(32).
     pub beacon_identity_pub: [u8; 64],
+    /// ZEB-827: the enrolled device key whose vouch this beacon passed (against
+    /// the resolve-time enrolled snapshot). Carried so the driver can
+    /// re-validate membership after the async resolve, before seeding — closing
+    /// the revoke-during-resolve TOCTOU window (CR-2).
+    pub membership_device_vk: [u8; 32],
 }
 
 /// Client-side [`SlotResolver`] that keeps the outer record's identity and
@@ -164,6 +230,15 @@ struct IdentifiedSlotResolver {
     /// "no beacon published" (proof-shaped absence) apart from "resolve
     /// infrastructure failing" (no information) — review r1 finding 2.
     resolve_errors: Arc<AtomicUsize>,
+    /// ZEB-827: this community's id (the vouch binds it) and the union of
+    /// Joined (non-self) members' effective enrolled device keys — the set a
+    /// beacon's vouch key must belong to.
+    community_id: crate::owner_state_types::SpaceId,
+    enrolled_keys: Arc<std::collections::HashSet<[u8; 32]>>,
+    /// Beacons that verified transport+epoch but failed the membership vouch
+    /// (missing, malformed, stale, bad sig, or device not enrolled). Read as an
+    /// empty slot so the batch driver widens — mirrors `resolve_errors`.
+    membership_rejects: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -189,14 +264,65 @@ impl harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> for IdentifiedSlo
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         rec.verify_freshness(now_ms).ok()?;
-        let payload: ReachabilityAnnouncePayload =
-            ciborium::from_reader(rec.routing_blob.as_slice()).ok()?;
+        // ZEB-827 strict: a beacon must carry a vouch that (a) verifies under a
+        // member's enrolled device key and (b) binds THIS record's transport
+        // identity + community. Any failure reads as an EMPTY slot so the
+        // escalating batch driver widens to the other slots (same shape as the
+        // self-filter below), while `membership_rejects` records that a beacon
+        // WAS present — the caller maps that to `rejectedNonMember`. A DEBUG log
+        // carries the specific sub-reason so a strict-rollout spike is
+        // diagnosable without an env-var (spec §7).
+        //
+        // CA-1: a fresh, inner-sig-valid record whose blob won't decode is a
+        // malformed beacon (present but unusable), NOT proof-shaped absence — so
+        // it too is a membership rejection, not a miss.
+        let Some((payload, vouch)) = decode_rendezvous_blob(rec.routing_blob.as_slice()) else {
+            self.membership_rejects.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                slot = slot_index,
+                reason = "malformed_blob",
+                "ZEB-827: rendezvous beacon rejected — routing blob did not decode"
+            );
+            return None;
+        };
         if payload.iroh_node_id == self.self_endpoint_id {
             return None;
         }
+        let device_vk = match &vouch {
+            None => {
+                self.membership_rejects.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    slot = slot_index,
+                    node_id = %hex::encode(&payload.iroh_node_id[..8]),
+                    reason = "missing_vouch",
+                    "ZEB-827: rendezvous beacon rejected — no membership vouch"
+                );
+                return None;
+            }
+            Some(v) => match crate::membership_vouch::verify_membership_vouch(
+                v,
+                self.community_id,
+                &rec.harmony_identity_pub,
+                &self.enrolled_keys,
+                now_ms,
+            ) {
+                Ok(()) => v.device_vk,
+                Err(reason) => {
+                    self.membership_rejects.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        slot = slot_index,
+                        node_id = %hex::encode(&payload.iroh_node_id[..8]),
+                        reason = reason.as_str(),
+                        "ZEB-827: rendezvous beacon rejected — invalid membership vouch"
+                    );
+                    return None;
+                }
+            },
+        };
         Some(IdentifiedBeacon {
             payload,
             beacon_identity_pub: rec.harmony_identity_pub,
+            membership_device_vk: device_vk,
         })
     }
 }
@@ -208,29 +334,44 @@ impl harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> for IdentifiedSlo
 pub struct IdentifiedResolve {
     pub outcome: RendezvousResolveOutcome<IdentifiedBeacon>,
     pub resolve_errors: usize,
+    /// ZEB-827: beacons present but rejected for lacking a valid membership
+    /// vouch. Nonzero with an empty outcome means "a beacon was here but is not
+    /// a member" (→ `rejectedNonMember`), distinct from proof-shaped absence.
+    pub membership_rejects: usize,
 }
 
 /// ZEB-824 production entry point: like [`resolve_rendezvous`], but yields an
 /// [`IdentifiedBeacon`] and treats our own record as an empty slot. The
 /// pkarr-layer probe-error count rides along in [`IdentifiedResolve`].
+///
+/// ZEB-827: `community_id` + `enrolled_keys` drive the strict membership-vouch
+/// check inside each slot probe (a beacon lacking a valid vouch reads as an
+/// empty slot so the escalating batch driver widens past it).
 pub async fn resolve_rendezvous_identified(
     pkarr: &Arc<PkarrResolver>,
     epoch_key: &EpochKey,
     self_endpoint_id: [u8; 32],
+    community_id: crate::owner_state_types::SpaceId,
+    enrolled_keys: Arc<std::collections::HashSet<[u8; 32]>>,
     now_ms: u64,
     cfg: &RendezvousResolveConfig,
 ) -> IdentifiedResolve {
     let resolve_errors = Arc::new(AtomicUsize::new(0));
+    let membership_rejects = Arc::new(AtomicUsize::new(0));
     let resolver = IdentifiedSlotResolver {
         pkarr: Arc::clone(pkarr),
         epoch_key_bytes: Zeroizing::new(epoch_key.as_bytes().to_vec()),
         self_endpoint_id,
         resolve_errors: Arc::clone(&resolve_errors),
+        community_id,
+        enrolled_keys,
+        membership_rejects: Arc::clone(&membership_rejects),
     };
     let outcome = resolve_rendezvous_with(&resolver, now_ms, cfg).await;
     IdentifiedResolve {
         outcome,
         resolve_errors: resolve_errors.load(Ordering::Relaxed),
+        membership_rejects: membership_rejects.load(Ordering::Relaxed),
     }
 }
 
@@ -332,5 +473,83 @@ mod tests {
         assert_eq!(slot_for_advertiser(&set, &addr(1)), Some(0));
         assert_eq!(slot_for_advertiser(&set, &addr(2)), Some(1));
         assert_eq!(slot_for_advertiser(&set, &addr(3)), Some(2));
+    }
+}
+
+#[cfg(test)]
+mod rendezvous_blob_tests {
+    use super::*;
+    use crate::membership_vouch::mint_membership_vouch;
+    use crate::owner_state_types::SpaceId;
+    use crate::reachability_record::ReachabilityAnnouncePayload;
+    use ed25519_dalek::SigningKey;
+
+    fn payload() -> ReachabilityAnnouncePayload {
+        ReachabilityAnnouncePayload {
+            iroh_node_id: [0xAB; 32],
+            home_relay_url: "https://derp.example/".to_string(),
+            direct_addresses: vec![],
+            announced_at_ms: 1_700_000_000_000,
+            identity_signature: [0xCD; 64],
+            butler_set: vec![],
+            bs_at: 0,
+        }
+    }
+
+    #[test]
+    fn roundtrips_with_vouch() {
+        let p = payload();
+        let v = mint_membership_vouch(
+            &SigningKey::from_bytes(&[3; 32]),
+            SpaceId([1; 16]),
+            &[9; 64],
+            1,
+            2,
+        );
+        let bytes = encode_rendezvous_blob(&p, Some(&v));
+        let (dp, dv) = decode_rendezvous_blob(&bytes).expect("decode");
+        assert_eq!(dp, p);
+        assert_eq!(dv, Some(v));
+    }
+
+    #[test]
+    fn vouchless_blob_is_byte_identical_to_bare_payload() {
+        let p = payload();
+        let wrapped = encode_rendezvous_blob(&p, None);
+        let mut bare = Vec::new();
+        ciborium::into_writer(&p, &mut bare).unwrap();
+        assert_eq!(
+            wrapped, bare,
+            "vouchless wrapper must equal legacy bare payload bytes"
+        );
+    }
+
+    #[test]
+    fn legacy_bare_decode_ignores_vouch() {
+        // Back-compat: an OLD resolver decoding a NEW (vouch-carrying) blob as a
+        // bare payload still recovers reachability.
+        let p = payload();
+        let v = mint_membership_vouch(
+            &SigningKey::from_bytes(&[3; 32]),
+            SpaceId([1; 16]),
+            &[9; 64],
+            1,
+            2,
+        );
+        let bytes = encode_rendezvous_blob(&p, Some(&v));
+        let bare: ReachabilityAnnouncePayload =
+            ciborium::from_reader(&bytes[..]).expect("bare decode of wrapped");
+        assert_eq!(bare, p);
+    }
+
+    #[test]
+    fn decode_of_legacy_bare_yields_no_vouch() {
+        // Forward-compat: a NEW resolver decoding an OLD (bare) blob sees no vouch.
+        let p = payload();
+        let mut bare = Vec::new();
+        ciborium::into_writer(&p, &mut bare).unwrap();
+        let (dp, dv) = decode_rendezvous_blob(&bare).expect("decode bare");
+        assert_eq!(dp, p);
+        assert_eq!(dv, None);
     }
 }

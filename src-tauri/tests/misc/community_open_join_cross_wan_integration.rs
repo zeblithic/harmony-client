@@ -561,6 +561,10 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         Arc::clone(&pkarr_publisher),
         (*alice_sk).clone(),
         alice_pub,
+        // ZEB-827: the ENROLLED community device key mints the membership vouch
+        // (its verify key is what lands in the community's enrolled_device_keys,
+        // so the member-side strict resolve accepts the beacon).
+        Arc::clone(&alice_comm_sk),
         Arc::new(move || alice_routing_blob.clone()),
     );
 
@@ -1325,10 +1329,18 @@ async fn identified_resolve_returns_beacon_identity() {
         assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
         await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
 
+        // ZEB-827: strict resolve needs the community id (the vouch binds it)
+        // and the enrolled device-key set (alice's enrolled community key signed
+        // the beacon's vouch) so the beacon is accepted.
+        let enrolled: std::sync::Arc<std::collections::HashSet<[u8; 32]>> = std::sync::Arc::new(
+            std::iter::once(setup.alice_comm_sk.verifying_key().to_bytes()).collect(),
+        );
         let res = harmony_app::community_rendezvous::resolve_rendezvous_identified(
             &setup.pkarr_resolver,
             &setup.epoch_key,
             [0xEE; 32], // NOT alice's endpoint id — no self-filtering here
+            setup.community_id,
+            enrolled,
             wall_ms(),
             &harmony_app::community_rendezvous::rendezvous_config_from_env(),
         )
@@ -1408,10 +1420,18 @@ async fn identified_resolve_filters_own_endpoint() {
         await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
 
         let cfg = harmony_app::community_rendezvous::rendezvous_config_from_env();
+        // ZEB-827: the self-filter drops alice's own slot before the vouch check,
+        // so the enrolled set is immaterial here — pass alice's enrolled key
+        // anyway to prove the miss is the self-filter, not a membership rejection.
+        let enrolled: std::sync::Arc<std::collections::HashSet<[u8; 32]>> = std::sync::Arc::new(
+            std::iter::once(setup.alice_comm_sk.verifying_key().to_bytes()).collect(),
+        );
         let res = harmony_app::community_rendezvous::resolve_rendezvous_identified(
             &setup.pkarr_resolver,
             &setup.epoch_key,
             *setup.alice_ep.node_id().as_bytes(), // we ARE alice
+            setup.community_id,
+            enrolled,
             wall_ms(),
             &cfg,
         )
@@ -1508,6 +1528,10 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
             community: SpaceId,
             alice: OwnerAddr,
             key: EpochKey,
+            // ZEB-827: alice's enrolled community device verify key — the key
+            // that signed the beacon's membership vouch, so the strict resolve
+            // accepts it.
+            alice_device_vk: [u8; 32],
         }
         #[async_trait::async_trait]
         impl harmony_app::community_gateway_dial_driver::GatewayDialCtx for ItCtx {
@@ -1520,6 +1544,16 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
             }
             async fn epoch_key_of(&self, _c: &SpaceId) -> Option<EpochKey> {
                 Some(self.key.clone())
+            }
+            async fn enrolled_device_keys_of(
+                &self,
+                c: &SpaceId,
+            ) -> std::collections::HashSet<[u8; 32]> {
+                if *c == self.community {
+                    std::iter::once(self.alice_device_vk).collect()
+                } else {
+                    std::collections::HashSet::new()
+                }
             }
         }
 
@@ -1539,6 +1573,7 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
                 community,
                 alice: setup.alice_addr,
                 key: setup.epoch_key.clone(),
+                alice_device_vk: setup.alice_comm_sk.verifying_key().to_bytes(),
             }),
             Arc::new(
                 harmony_app::community_gateway_dial_driver::ProdBeaconResolver {
@@ -1591,6 +1626,96 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
     })
     .await
     .expect("gateway_dial_driver_bootstraps_from_rendezvous_beacon timed out at 60s");
+}
+
+/// ZEB-827 strict: a real published beacon whose vouch device key is NOT in the
+/// community's enrolled set is rejected end-to-end (through `ProdBeaconResolver`
+/// + `resolve_slot`) — never seeded, and recorded as `rejectedNonMember`. The
+/// symmetric proof to the accept test above: same live mock-relay beacon, the
+/// only difference is whether the resolver knows the device as a member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_dial_rejects_beacon_when_device_not_enrolled() {
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let setup = setup_two_party_open_join().await;
+        let slot = setup.publish_rendezvous_slot(vec![setup.alice_addr]).await;
+        assert_eq!(slot, 0, "single advertiser ranks 0 → slot 0");
+        await_rendezvous_slot_visible(&setup.pkarr_resolver, &setup.epoch_key, slot).await;
+        let alice_node_id = *setup.alice_ep.node_id().as_bytes();
+
+        // Ctx whose enrolled set is EMPTY, so alice's real, epoch-valid beacon
+        // fails the strict membership-vouch check.
+        struct RejectCtx {
+            community: SpaceId,
+            alice: OwnerAddr,
+            key: EpochKey,
+        }
+        #[async_trait::async_trait]
+        impl harmony_app::community_gateway_dial_driver::GatewayDialCtx for RejectCtx {
+            async fn members_of(&self, c: &SpaceId) -> Vec<OwnerAddr> {
+                if *c == self.community {
+                    vec![self.alice]
+                } else {
+                    vec![]
+                }
+            }
+            async fn epoch_key_of(&self, _c: &SpaceId) -> Option<EpochKey> {
+                Some(self.key.clone())
+            }
+            async fn enrolled_device_keys_of(
+                &self,
+                _c: &SpaceId,
+            ) -> std::collections::HashSet<[u8; 32]> {
+                std::collections::HashSet::new()
+            }
+        }
+
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let community = setup.community_id;
+        let telemetry = Arc::new(harmony_app::network_health::GatewayBootstrapTelemetry::new());
+        let driver = harmony_app::community_gateway_dial_driver::CommunityGatewayDialDriver::new(
+            Arc::new(RejectCtx {
+                community,
+                alice: setup.alice_addr,
+                key: setup.epoch_key.clone(),
+            }),
+            Arc::new(
+                harmony_app::community_gateway_dial_driver::ProdBeaconResolver {
+                    pkarr: Arc::clone(&setup.pkarr_resolver),
+                    self_endpoint_id: *setup.bob_ep.node_id().as_bytes(),
+                },
+            ),
+            Arc::clone(&resolver),
+            Arc::new(move || vec![community]),
+        )
+        .with_telemetry(Arc::clone(&telemetry));
+
+        driver.run_one_pass().await;
+
+        assert!(
+            resolver.resolve_by_node_id(&alice_node_id).is_none(),
+            "a beacon whose device key is not enrolled must NOT be seeded"
+        );
+        let summary = telemetry.summary();
+        assert_eq!(
+            summary
+                .per_community
+                .iter()
+                .find(|row| row.community_short == hex::encode(&community.0[..4]))
+                .map(|row| row.outcome.as_str()),
+            Some("rejectedNonMember"),
+            "the pass must record the membership rejection"
+        );
+        assert_eq!(summary.rejected_non_member, 1);
+        assert_eq!(summary.beacons_seeded, 0);
+
+        setup.publisher_handle.abort();
+        setup.alice_ep.shutdown().await;
+        setup.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("gateway_dial_rejects_beacon_when_device_not_enrolled timed out at 60s");
 }
 
 // The escalating-batch failover test (Test 2) needs ≥2 slots to widen past a

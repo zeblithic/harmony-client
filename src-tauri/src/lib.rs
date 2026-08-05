@@ -144,6 +144,8 @@ pub mod community_relay_pull_driver;
 pub mod community_relay_resolver;
 pub mod community_rendezvous;
 pub mod community_rendezvous_publisher;
+// ZEB-827: membership vouch — device-key-signed transport-identity binding.
+pub mod membership_vouch;
 // ZEB-487: read-only DTO + mapper for the headless `get_relay_held` RPC.
 pub mod community_state_crdt;
 pub mod relay_held_dto;
@@ -9659,6 +9661,9 @@ pub async fn start_node_inner(
                             std::sync::Arc::clone(&pkarr_publisher_arc),
                             (*signing_key_arc).clone(),
                             identity_pub_64,
+                            // ZEB-827: our enrolled community device key mints the
+                            // membership vouch carried in each rendezvous blob.
+                            std::sync::Arc::new(loaded.device_signing_key.clone()),
                             std::sync::Arc::clone(&blob_builder),
                         ),
                     );

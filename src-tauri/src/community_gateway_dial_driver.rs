@@ -28,7 +28,7 @@ use crate::network_health::{GatewayBootstrapOutcome, GatewayBootstrapTelemetry};
 use crate::owner_state_types::{DeviceIdentityHash, EpochKey, OwnerAddr, SpaceId};
 use crate::reachability_resolver::ReachabilityResolver;
 use crate::reconnect_supervisor::{PeerStateWire, ReconnectTrigger};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -52,6 +52,9 @@ pub trait GatewayDialCtx: Send + Sync {
     /// publisher's key choice (`lib.rs:11298`) — never the live epoch key
     /// (spec §5.3). `None` = engine not registered (transient); skip.
     async fn epoch_key_of(&self, community: &SpaceId) -> Option<EpochKey>;
+    /// ZEB-827: union of Joined (non-self) members' effective enrolled device
+    /// verify keys — the set a beacon's membership-vouch key must belong to.
+    async fn enrolled_device_keys_of(&self, community: &SpaceId) -> HashSet<[u8; 32]>;
 }
 
 /// Outcome of one beacon resolve attempt. `ResolveError` means no beacon was
@@ -69,6 +72,11 @@ pub enum BeaconResolution {
     Found(IdentifiedBeacon),
     NotFound,
     ResolveError,
+    /// ZEB-827: a beacon verified transport+epoch but carried no valid
+    /// membership vouch (missing, malformed, stale, bad sig, or a device key
+    /// not in any Joined member's enrolled set). Distinct from `NotFound` (no
+    /// beacon at all) and `ResolveError` (pkarr/transport trouble).
+    RejectedNonMember,
 }
 
 /// Pure classification of one identified resolve (review r1 finding 2):
@@ -81,9 +89,13 @@ pub enum BeaconResolution {
 fn classify_resolution(
     payload: Option<IdentifiedBeacon>,
     resolve_errors: usize,
+    membership_rejects: usize,
 ) -> BeaconResolution {
     match payload {
         Some(hit) => BeaconResolution::Found(hit),
+        // A beacon that was present but failed the membership vouch is more
+        // informative than a probe error — surface it first (ZEB-827).
+        None if membership_rejects > 0 => BeaconResolution::RejectedNonMember,
         None if resolve_errors > 0 => BeaconResolution::ResolveError,
         None => BeaconResolution::NotFound,
     }
@@ -92,7 +104,13 @@ fn classify_resolution(
 /// The pkarr resolve seam. Prod = [`ProdBeaconResolver`]; tests stub it.
 #[async_trait::async_trait]
 pub trait BeaconResolver: Send + Sync {
-    async fn resolve_beacon(&self, epoch_key: &EpochKey, now_ms: u64) -> BeaconResolution;
+    async fn resolve_beacon(
+        &self,
+        epoch_key: &EpochKey,
+        community_id: SpaceId,
+        enrolled_keys: Arc<HashSet<[u8; 32]>>,
+        now_ms: u64,
+    ) -> BeaconResolution;
 }
 
 /// Production [`BeaconResolver`]: Task 1's identified resolve with the
@@ -104,17 +122,57 @@ pub struct ProdBeaconResolver {
 
 #[async_trait::async_trait]
 impl BeaconResolver for ProdBeaconResolver {
-    async fn resolve_beacon(&self, epoch_key: &EpochKey, now_ms: u64) -> BeaconResolution {
+    async fn resolve_beacon(
+        &self,
+        epoch_key: &EpochKey,
+        community_id: SpaceId,
+        enrolled_keys: Arc<HashSet<[u8; 32]>>,
+        now_ms: u64,
+    ) -> BeaconResolution {
         let res = crate::community_rendezvous::resolve_rendezvous_identified(
             &self.pkarr,
             epoch_key,
             self.self_endpoint_id,
+            community_id,
+            enrolled_keys,
             now_ms,
             &rendezvous_config_from_env(),
         )
         .await;
-        classify_resolution(res.outcome.payload, res.resolve_errors)
+        classify_resolution(
+            res.outcome.payload,
+            res.resolve_errors,
+            res.membership_rejects,
+        )
     }
+}
+
+/// ZEB-827: the union of Joined members' enrolled device verify keys — the set
+/// each beacon's membership vouch is checked against. Extracted as a free
+/// function so the exact filtering is unit-testable without a live registry
+/// (the coverage gap that let the sibling-device bug ship).
+///
+/// The local owner IS included — unlike [`ProdGatewayDialCtx::members_of`],
+/// which drops self because a self-inclusive member set makes a solo community
+/// read as "has members, none connected" and resolve forever. That rationale is
+/// about the *starved* predicate, not this *verification* set. An owner may hold
+/// several enrolled devices (`MemberState::enrolled_device_keys` is a set for
+/// exactly this "eventual state"); a sibling device — same owner, a different
+/// enrolled key — publishes legitimate rendezvous beacons whose vouch must
+/// verify. The resolver already drops THIS device's own beacon at the transport
+/// layer (`self_endpoint_id` in `resolve_slot`), so excluding the owner here
+/// only rejects a sibling's valid vouch as `NotEnrolled` and can strand an
+/// empty-address-book node whose sole reachable beacon is its own other device.
+/// `enrolled_device_keys` is already post-revocation in materialized state, so a
+/// revoked sibling key is absent and still rejected.
+fn enrolled_keys_from_members(
+    members: &BTreeMap<OwnerAddr, crate::community_membership::MemberState>,
+) -> HashSet<[u8; 32]> {
+    members
+        .values()
+        .filter(|m| m.status == crate::community_membership::MemberStatus::Joined)
+        .flat_map(|m| m.enrolled_device_keys.iter().copied())
+        .collect()
 }
 
 /// Production [`GatewayDialCtx`] over the community sync registry.
@@ -152,6 +210,20 @@ impl GatewayDialCtx for ProdGatewayDialCtx {
         // (spec §5.3/§9). A mismatch derives a different slot keypair and
         // silently resolves nothing, forever.
         Some(self.registry.engine_arc(community).await?.membership_key())
+    }
+
+    async fn enrolled_device_keys_of(&self, community: &SpaceId) -> HashSet<[u8; 32]> {
+        // ZEB-827: the union of Joined (non-self) members' enrolled device
+        // verify keys. In materialized state `enrolled_device_keys` is already
+        // post-revocation (materialize replay removes a revoked key), so a
+        // plain membership check against this set needs no subtraction.
+        let Some(engine) = self.registry.engine_arc(community).await else {
+            return HashSet::new();
+        };
+        let state_arc = engine.state();
+        let st = state_arc.lock().await;
+        let mat = st.materialized(engine.admin_addr());
+        enrolled_keys_from_members(&mat.members)
     }
 }
 
@@ -379,8 +451,22 @@ impl CommunityGatewayDialDriver {
             // Ladder semantics are identical for both miss flavors: the rung
             // was already consumed before the resolve, and an errored attempt
             // paces exactly like a missed one.
-            let hit = match self.beacons.resolve_beacon(&epoch_key, now_ms).await {
+            // ZEB-827: fetch this community's enrolled device-key set so the
+            // resolve layer can verify each beacon's membership vouch. A beacon
+            // lacking a valid vouch reads as an empty slot (the batch driver
+            // widens); if a beacon WAS present but rejected, the resolve returns
+            // `RejectedNonMember`.
+            let enrolled_keys = Arc::new(self.ctx.enrolled_device_keys_of(&community).await);
+            let hit = match self
+                .beacons
+                .resolve_beacon(&epoch_key, community, enrolled_keys, now_ms)
+                .await
+            {
                 BeaconResolution::Found(hit) => hit,
+                BeaconResolution::RejectedNonMember => {
+                    self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
+                    continue;
+                }
                 BeaconResolution::NotFound => {
                     self.record(&community, GatewayBootstrapOutcome::NoBeacon);
                     continue;
@@ -390,55 +476,45 @@ impl CommunityGatewayDialDriver {
                     continue;
                 }
             };
+            // CR-2 (TOCTOU): the vouch was verified against the enrolled snapshot
+            // taken BEFORE the async resolve. Re-validate the beacon's device key
+            // against a FRESH snapshot now — if it was revoked while we resolved,
+            // the stale accept must not reach seed/kick. This narrows the
+            // check→use window to microseconds; revocation propagation itself
+            // remains eventually-consistent, and post-session data is gated by
+            // per-event enrollment checks regardless.
+            let fresh_enrolled = self.ctx.enrolled_device_keys_of(&community).await;
+            if !fresh_enrolled.contains(&hit.membership_device_vk) {
+                self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
+                tracing::debug!(
+                    community = ?community,
+                    "ZEB-827: beacon device key revoked during resolve — not seeding"
+                );
+                continue;
+            }
             let Ok(identity) =
                 harmony_identity::Identity::from_public_bytes(&hit.beacon_identity_pub)
             else {
-                // Defensive only on the production path: `PkarrResolver::resolve`
-                // already parsed this same Ed25519 half to verify the record's
-                // inner signature, so a record that reaches here unparseable
-                // cannot have arrived through `ProdBeaconResolver`. Firing means
-                // a wire-format or publisher bug (or a non-prod `BeaconResolver`)
-                // — never an attacker — and it would otherwise present as an
-                // ordinary `rejectedNonMember` tick with no context at all.
+                // Unreachable on the prod path: `PkarrResolver::resolve` already
+                // parsed this same Ed25519 half to verify the inner signature,
+                // so a record reaching here unparseable means a wire/publisher
+                // bug (or a non-prod `BeaconResolver`), never an attacker.
                 tracing::warn!(
                     community = ?community,
                     node_id = %hex::encode(&hit.payload.iroh_node_id[..8]),
-                    "ZEB-824: beacon identity failed to decode — record passed inner-sig verification but its identity bytes are unparseable"
+                    "ZEB-827: beacon identity failed to decode — record passed inner-sig verification but its identity bytes are unparseable"
                 );
                 self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
                 continue;
             };
-            // ── Trust model: epoch-envelope, open-join parity (Jake, spec §5c) ──
-            // There is deliberately NO membership check here, and no owner-level
-            // self-guard. Both would compare `Identity::address_hash` (the
-            // composite X25519‖Ed25519 *device*-address hash, what this record
-            // yields) against community member keys, which are the master
-            // `PubKeyBundle::identity_hash()` (signing-only). Those are the
-            // repo's two non-convergent 16-byte notions, so any such comparison
-            // rejects EVERY beacon — measured, not theorised: a real post-admit
-            // `ProdGatewayDialCtx::members_of` returns the master addr while the
-            // driver derives the composite, differing in every byte.
-            //
-            // So we trust what the envelope proves and nothing more: the writer
-            // holds the community epoch key (outer BEP44 sig) and the claimed
-            // identity's signing key (inner sig, verified inside
-            // `PkarrResolver::resolve`). That is exactly the trust decision
-            // open-join already makes for this same record family. Self-defense
-            // is the resolve-layer endpoint-id filter, which is authoritative
-            // and flavor-free. ZEB-827 carries the principled member binding.
-            //
-            // SEEDING-FLAVOR CONSEQUENCE (deliberate, bounded). The seed lands
-            // under the COMPOSITE device-address owner, while the addrbook row
-            // for the very same node arrives later under the MASTER owner. So
-            // the resolver briefly holds two entries for one node id under two
-            // owners — which is exactly the shape ZEB-704's
-            // `freshest_across_owners` dial view already resolves, so dialing is
-            // unaffected. The cost is that until the addrbook row lands, the
-            // starved predicate cannot link the live session back to a member
-            // (it matches members by master addr), so the community may still
-            // read as starved and burn a few extra resolves. That window is
-            // ladder-throttled (30s→600s) and closed by the addrbook snapshot
-            // that fires at session-up. ZEB-827 removes the split.
+            // ZEB-827: the beacon carried a membership vouch verified in
+            // `resolve_slot` against this community's enrolled device keys, so
+            // it belongs to a Joined member. Seed as before — under the
+            // composite device-address owner with the `[0u8;16]` device-hash
+            // placeholder (invite-path parity). The seed-owner "split" that
+            // ZEB-704's `freshest_across_owners` view already tolerates is a
+            // low-value, ReachabilityResolver-internal follow-up (spec §9), out
+            // of scope for this binding change.
             let beacon_owner = OwnerAddr(identity.address_hash);
             let node_id = hit.payload.iroh_node_id;
             self.reachability
@@ -450,7 +526,7 @@ impl CommunityGatewayDialDriver {
                 sup.kick(node_id, ReconnectTrigger::NewPeer);
             }
             self.record(&community, GatewayBootstrapOutcome::BeaconSeeded);
-            tracing::info!(community = ?community, "ZEB-824: rendezvous beacon seeded — reconnect supervisor kicked");
+            tracing::info!(community = ?community, "ZEB-827: vouch-verified rendezvous beacon seeded — reconnect supervisor kicked");
         }
     }
 
@@ -545,6 +621,13 @@ mod tests {
         async fn epoch_key_of(&self, c: &SpaceId) -> Option<EpochKey> {
             self.keys.lock().unwrap().get(c).cloned()
         }
+        async fn enrolled_device_keys_of(&self, _c: &SpaceId) -> HashSet<[u8; 32]> {
+            // Resolution is driven by `StubBeacons` (which ignores the pre-resolve
+            // enrolled set), but the driver's post-resolve re-validation (CR-2)
+            // checks the beacon's device key against THIS set, so report the
+            // fixture key the `beacon()` fixture vouches under.
+            std::iter::once(FIXTURE_DEVICE_VK).collect()
+        }
     }
 
     struct StubBeacons {
@@ -574,7 +657,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl BeaconResolver for StubBeacons {
-        async fn resolve_beacon(&self, _k: &EpochKey, _now: u64) -> BeaconResolution {
+        async fn resolve_beacon(
+            &self,
+            _k: &EpochKey,
+            _community: SpaceId,
+            _enrolled: Arc<HashSet<[u8; 32]>>,
+            _now: u64,
+        ) -> BeaconResolution {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.resolution.lock().unwrap().clone()
         }
@@ -621,11 +710,96 @@ mod tests {
         }
     }
 
+    /// Device key the `beacon()` fixture vouches under; `StubCtx` reports it as
+    /// the community's sole enrolled key so the driver's post-resolve
+    /// re-validation (CR-2) passes for seed-path tests.
+    const FIXTURE_DEVICE_VK: [u8; 32] = [0x77; 32];
+
     fn beacon(identity_pub: [u8; 64], node_id: [u8; 32]) -> IdentifiedBeacon {
+        beacon_with_device_vk(identity_pub, node_id, FIXTURE_DEVICE_VK)
+    }
+
+    fn beacon_with_device_vk(
+        identity_pub: [u8; 64],
+        node_id: [u8; 32],
+        device_vk: [u8; 32],
+    ) -> IdentifiedBeacon {
         IdentifiedBeacon {
             payload: test_payload(node_id),
             beacon_identity_pub: identity_pub,
+            membership_device_vk: device_vk,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // ZEB-827 (Greptile P1): the vouch-verification key set must retain the
+    // LOCAL OWNER's enrolled device keys. An owner can hold several enrolled
+    // devices (`MemberState::enrolled_device_keys` is a set for exactly this);
+    // a sibling device — same owner, a different key — publishes valid
+    // rendezvous beacons, and its vouch must verify. Excluding the owner here
+    // classifies a sibling's valid vouch as `NotEnrolled` and can strand an
+    // empty-address-book node whose only reachable beacon is its own other
+    // device. Self-loop prevention already lives at the transport layer
+    // (`self_endpoint_id` in `resolve_slot`), never in this key set.
+    // ------------------------------------------------------------------
+    #[test]
+    fn enrolled_keys_retain_local_owner_sibling_devices() {
+        let self_owner = OwnerAddr([0x01; 16]);
+        let peer = OwnerAddr([0x02; 16]);
+        let left = OwnerAddr([0x03; 16]);
+
+        let member = |status, keys: &[[u8; 32]]| crate::community_membership::MemberState {
+            status,
+            joined_at: hlc(1),
+            left_at: None,
+            enrolled_device_keys: keys.iter().copied().collect(),
+            revoked_device_keys: std::collections::BTreeSet::new(),
+        };
+
+        // Local owner: THIS device (0xA1) + an enrolled SIBLING device (0xB2).
+        // A joined peer contributes 0xC3. A Left member's 0xD4 must never count.
+        let mut members = BTreeMap::new();
+        members.insert(
+            self_owner,
+            member(
+                crate::community_membership::MemberStatus::Joined,
+                &[[0xA1; 32], [0xB2; 32]],
+            ),
+        );
+        members.insert(
+            peer,
+            member(
+                crate::community_membership::MemberStatus::Joined,
+                &[[0xC3; 32]],
+            ),
+        );
+        members.insert(
+            left,
+            member(
+                crate::community_membership::MemberStatus::Left,
+                &[[0xD4; 32]],
+            ),
+        );
+
+        let keys = enrolled_keys_from_members(&members);
+
+        assert!(
+            keys.contains(&[0xA1; 32]),
+            "local owner's own device key must be retained"
+        );
+        assert!(
+            keys.contains(&[0xB2; 32]),
+            "local owner's SIBLING device key must be retained (Greptile P1)"
+        );
+        assert!(
+            keys.contains(&[0xC3; 32]),
+            "a joined peer's device key must be retained"
+        );
+        assert!(
+            !keys.contains(&[0xD4; 32]),
+            "a non-Joined member's device key must be excluded"
+        );
+        assert_eq!(keys.len(), 3, "exactly the three Joined-member keys");
     }
 
     /// Everything a pass-level test needs: the driver plus the handles its
@@ -1503,26 +1677,36 @@ mod tests {
     //      only signal separating "nobody published" from "pkarr is failing".
     // ------------------------------------------------------------------
     #[test]
-    fn classify_resolution_covers_all_three_arms() {
+    fn classify_resolution_covers_all_four_arms() {
         let (_identity, identity_pub) = test_identity(21);
         let hit = beacon(identity_pub, [0xAD; 32]);
 
-        // A hit wins outright — even alongside errored probes on other slots.
+        // A hit wins outright — even alongside errored/rejected probes on other slots.
         for errors in [0usize, 3] {
-            match classify_resolution(Some(hit.clone()), errors) {
+            match classify_resolution(Some(hit.clone()), errors, 2) {
                 BeaconResolution::Found(b) => assert_eq!(b.payload.iroh_node_id, [0xAD; 32]),
                 other => panic!("a payload hit must classify as Found, got {other:?}"),
             }
         }
-        // A miss with zero errors is proof-shaped absence.
+        // A miss with zero errors and zero rejects is proof-shaped absence.
         assert!(matches!(
-            classify_resolution(None, 0),
+            classify_resolution(None, 0, 0),
             BeaconResolution::NotFound
         ));
         // A miss with any errored probe carries no information.
         assert!(matches!(
-            classify_resolution(None, 1),
+            classify_resolution(None, 1, 0),
             BeaconResolution::ResolveError
+        ));
+        // ZEB-827: a present-but-rejected beacon is more informative than a
+        // probe error — it wins the precedence.
+        assert!(matches!(
+            classify_resolution(None, 0, 1),
+            BeaconResolution::RejectedNonMember
+        ));
+        assert!(matches!(
+            classify_resolution(None, 2, 1),
+            BeaconResolution::RejectedNonMember
         ));
     }
 
@@ -1551,6 +1735,76 @@ mod tests {
         assert_eq!(
             s.no_beacon, 0,
             "an errored resolve must NOT masquerade as noBeacon"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 10c. ZEB-827 strict: a beacon present but lacking a valid membership
+    //      vouch resolves as `RejectedNonMember` — recorded, never seeded.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn rejected_beacon_records_rejected_non_member_and_does_not_seed() {
+        let community = SpaceId([0x27; 16]);
+        let (_member_pub, member_owner) = test_member(24);
+        let h = harness(
+            community,
+            vec![member_owner],
+            None,
+            true,
+            Some(SupervisorHandle::new()),
+        );
+        h.beacons
+            .set_resolution(BeaconResolution::RejectedNonMember);
+
+        h.driver.run_one_pass().await;
+
+        assert_eq!(h.beacons.calls(), 1, "a starved community must resolve");
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("rejectedNonMember")
+        );
+        let s = h.telemetry.summary();
+        assert_eq!(
+            s.rejected_non_member, 1,
+            "the rejected beacon must be counted"
+        );
+        assert_eq!(s.beacons_seeded, 0, "a rejected beacon must NOT be seeded");
+    }
+
+    // ------------------------------------------------------------------
+    // 10d. CR-2 TOCTOU: a beacon accepted at resolve-time whose device key is
+    //      no longer enrolled at seed-time (revoked during the async resolve)
+    //      must be re-rejected, never seeded.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn beacon_revoked_during_resolve_is_not_seeded() {
+        let community = SpaceId([0x2A; 16]);
+        let (member_pub, member_owner) = test_member(31);
+        // The Found beacon vouches under a device key that is NOT the fixture key
+        // `StubCtx` reports as enrolled — modelling a revoke that lands between
+        // the resolve-time snapshot and the seed-time re-check.
+        let h = harness(
+            community,
+            vec![member_owner],
+            Some(beacon_with_device_vk(member_pub, [0x44; 32], [0xAA; 32])),
+            true,
+            Some(SupervisorHandle::new()),
+        );
+
+        h.driver.run_one_pass().await;
+
+        assert!(
+            h.resolver.resolve_by_node_id(&[0x44; 32]).is_none(),
+            "a beacon revoked during resolve must NOT be seeded"
+        );
+        let s = h.telemetry.summary();
+        assert_eq!(
+            s.rejected_non_member, 1,
+            "the stale accept must be re-rejected"
+        );
+        assert_eq!(
+            s.beacons_seeded, 0,
+            "a revoked-mid-resolve beacon must NOT seed"
         );
     }
 
