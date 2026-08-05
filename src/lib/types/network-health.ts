@@ -224,10 +224,10 @@ export interface NetworkHealthSnapshot {
 export interface RelayAcceptorWatchdogHealth {
   stalenessMs: number | null;
   connectedPeers: number;
-  phase: string;
+  phase: 'normal' | 'cooldown' | 'escalated';
   consecutiveRestarts: number;
   lastActionMs: number | null;
-  lastActionTier: string | null;
+  lastActionTier: 'probe' | 'restart' | null;
   escalated: boolean;
 }
 

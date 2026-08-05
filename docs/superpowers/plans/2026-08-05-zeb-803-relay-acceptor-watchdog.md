@@ -15,7 +15,7 @@
   - `cargo fmt --all -- --check`
   - `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`
   - `cargo nextest run --locked --workspace --all-targets --features test-fixtures`
-- During iterative dev, `scripts/test-select --context task` is acceptable per task; the **final pre-PR sweep must be the full `--workspace --all-targets` nextest run**.
+- During iterative dev, `scripts/test-select --context task` is acceptable per task; the **final pre-PR sweep must be the full `--workspace --all-targets` nextest run**. When you run `scripts/test-select`, paste its emitted `round=… bucket=…` summary line into the task report so the selection is auditable.
 - No new dependencies. No production behavior change beyond the watchdog itself — the acceptor, the accept loop, and the existing telemetry are untouched; the watchdog only *reads* existing signals and *invokes* two existing levers.
 - Confirmed config defaults: `stale_multiplier N = 3`, `max_restarts = 3`, `tier1/tier2_cooldown = 2 × cadence`, `eval_interval = cadence / 3`, `cadence = COMMUNITY_RELAY_PULL_INTERVAL_MS`.
 - Wire structs that cross serde use `#[serde(rename_all = "camelCase")]` (matches the existing health DTOs).
@@ -958,6 +958,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 cargo nextest run --locked --workspace --all-targets --features test-fixtures
 ```
+
 Expected: fmt clean, clippy clean, all tests pass (watchdog unit + harness + sensor + health-shape green; no regressions).
 
 - [ ] **Step 5: Commit**

@@ -140,18 +140,20 @@ Sticky first: `if inputs.last_served_ms.is_some() { mem.served_ever = true }`.
 **Recovery test** (never raw staleness — a successful remedy can't clear staleness
 until the next remote pull, ~1 cadence away):
 
-```
+```text
 recovered = match inputs.last_served_ms {
     Some(c) => mem.baseline_served_ms.map_or(true, |b| c > b),
     None    => false,
 }
 ```
+
 (Post-restart the telemetry Arc is fresh so `last_served_ms` resets to `None`;
 once the rebuilt node serves anyone, its fresh timestamp exceeds the pre-restart
 baseline → recovered. During the None window → not recovered → keep waiting.)
 
 **Stall detection** (Normal phase only — all three gates must hold):
-```
+
+```text
 stall = mem.served_ever
      && inputs.connected_peers > 0
      && match inputs.last_served_ms {
@@ -159,6 +161,7 @@ stall = mem.served_ever
             None     => false,
         }
 ```
+
 The `served_ever` gate is the false-positive guard: a node nobody ever pulls from
 never fires.
 
@@ -177,7 +180,8 @@ never fires.
   record `last_action_*`; return `ProbeNetwork`.
 
 **`fire_restart(cfg, inputs, mem, now)`:**
-```
+
+```text
 if mem.consecutive_restarts >= cfg.max_restarts {
     mem.phase = Escalated;
     return Verdict::Escalate;
@@ -220,7 +224,7 @@ pub struct RelayAcceptorWatchdog<S, A, C> {
 The run loop ticks on `tokio::time::interval(cfg.eval_interval_ms)`
 (`MissedTickBehavior::Skip`), watching a `watch::Receiver<bool>` shutdown:
 
-```
+```text
 loop { select! {
     _ = interval.tick() => self.tick().await,
     _ = shutdown.changed() => break,

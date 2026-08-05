@@ -3680,6 +3680,14 @@ pub(crate) fn watchdog_memory(
         .clone()
 }
 
+/// ZEB-803 (CodeAnt): set true by a watchdog-initiated Tier-2 restart, consumed
+/// by the freshly-spawned watchdog. It lets `spawn_relay_acceptor_watchdog`
+/// PRESERVE the escalation memory across the watchdog's own restart while
+/// RESETTING it on any unrelated node start (first boot, user restart, mint) —
+/// so a new node lifetime never inherits a prior stall's cooldown/escalation.
+static WATCHDOG_TIER2_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Production sensor: reads live serving telemetry + connected-peer count.
 struct ProdWatchdogSensor {
     telemetry: std::sync::Arc<crate::network_health::CommunityRelayServingTelemetry>,
@@ -3726,11 +3734,69 @@ impl crate::relay_acceptor_watchdog::RemediationActuator for ProdWatchdogActuato
     }
 }
 
-/// Build the gen-guarded restart closure. Exactly one of `owned_state`
-/// (headless) / `wry_handle` (GUI) is `Some`, mirroring the mint restart
-/// (`owner_commands.rs`) and the beacon-requester dual-path. On a generation
-/// mismatch (another restart already ran) the stop is a no-op and we skip the
-/// start; on a start failure we mark the watchdog escalated.
+/// Perform one gen-guarded full-node restart. Shared by both the headless
+/// (`owned_state`) and GUI (`wry_handle`) paths so the stop/retry/escalate logic
+/// lives in one place.
+///
+/// - **Generation guard:** if another start already superseded us,
+///   `stop_inner(Some(gen))` is a no-op and we abort (no double-restart).
+/// - **`block_in_place`:** `stop_inner` joins the event-loop thread; running the
+///   blocking join via `block_in_place` keeps it from starving other tasks on
+///   this Tokio worker (Qodo).
+/// - **Bounded retry:** `start_node_inner` is stop-first, so a retry is safe; a
+///   transient failure can clear on the second attempt. A deterministic failure
+///   escalates — the node is left stopped, surfaced via the ERROR log and the
+///   `escalated` health field (the surface for a headless fleet node).
+async fn do_watchdog_node_restart(
+    state: &Mutex<NodeState>,
+    sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
+    wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
+    owned_state: Option<std::sync::Arc<Mutex<NodeState>>>,
+) {
+    use std::sync::atomic::Ordering;
+    let gen = state.lock().expect("NodeState mutex poisoned").generation;
+    // Mark this restart as watchdog-initiated so the freshly-spawned watchdog
+    // preserves the escalation memory (see spawn_relay_acceptor_watchdog).
+    WATCHDOG_TIER2_IN_FLIGHT.store(true, Ordering::SeqCst);
+    let stopped = tokio::task::block_in_place(|| stop_inner(state, Some(gen)));
+    if !stopped {
+        WATCHDOG_TIER2_IN_FLIGHT.store(false, Ordering::SeqCst);
+        tracing::warn!("ZEB-803 watchdog: restart skipped — generation changed");
+        return;
+    }
+    for attempt in 1..=2u32 {
+        // Re-assert per attempt: the first attempt's spawn consumes the flag on
+        // success, so a retry must set it again.
+        WATCHDOG_TIER2_IN_FLIGHT.store(true, Ordering::SeqCst);
+        match start_node_inner(
+            None,
+            sink.clone(),
+            wry_handle.clone(),
+            state,
+            owned_state.clone(),
+        )
+        .await
+        {
+            Ok(_) => return, // the new node's watchdog spawn consumed the flag
+            Err(e) => {
+                tracing::warn!(attempt, error = %e, "ZEB-803 watchdog: restart start_node_inner failed");
+            }
+        }
+    }
+    WATCHDOG_TIER2_IN_FLIGHT.store(false, Ordering::SeqCst);
+    tracing::error!(
+        "ZEB-803 watchdog: node restart failed after retry — escalating; node is stopped and needs attention"
+    );
+    watchdog_memory()
+        .lock()
+        .expect("watchdog memory poisoned")
+        .phase = crate::relay_acceptor_watchdog::Phase::Escalated;
+}
+
+/// Build the restart closure. Exactly one of `owned_state` (headless) /
+/// `wry_handle` (GUI) is `Some`, mirroring the mint restart
+/// (`owner_commands.rs`) and the beacon-requester dual-path; it resolves the
+/// `&Mutex<NodeState>` for the mode and delegates to `do_watchdog_node_restart`.
 fn build_watchdog_restart_fn(
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
@@ -3743,44 +3809,12 @@ fn build_watchdog_restart_fn(
         Box::pin(async move {
             if let Some(owned) = owned_state {
                 let state: &Mutex<NodeState> = &owned;
-                let gen = state.lock().expect("NodeState mutex poisoned").generation;
-                if !stop_inner(state, Some(gen)) {
-                    tracing::warn!("ZEB-803 watchdog: restart skipped — generation changed");
-                    return;
-                }
-                if let Err(e) = start_node_inner(
-                    None,
-                    sink.clone(),
-                    wry_handle.clone(),
-                    state,
-                    Some(owned.clone()),
-                )
-                .await
-                {
-                    tracing::error!(error = %e, "ZEB-803 watchdog: restart start_node_inner failed — escalating");
-                    watchdog_memory()
-                        .lock()
-                        .expect("watchdog memory poisoned")
-                        .phase = crate::relay_acceptor_watchdog::Phase::Escalated;
-                }
+                do_watchdog_node_restart(state, sink, wry_handle, Some(owned.clone())).await;
             } else if let Some(app) = wry_handle {
                 use tauri::Manager as _;
                 let st = app.state::<Mutex<NodeState>>();
                 let state: &Mutex<NodeState> = &st;
-                let gen = state.lock().expect("NodeState mutex poisoned").generation;
-                if !stop_inner(state, Some(gen)) {
-                    tracing::warn!("ZEB-803 watchdog: restart skipped — generation changed");
-                    return;
-                }
-                if let Err(e) =
-                    start_node_inner(None, sink.clone(), Some(app.clone()), state, None).await
-                {
-                    tracing::error!(error = %e, "ZEB-803 watchdog: restart start_node_inner failed — escalating");
-                    watchdog_memory()
-                        .lock()
-                        .expect("watchdog memory poisoned")
-                        .phase = crate::relay_acceptor_watchdog::Phase::Escalated;
-                }
+                do_watchdog_node_restart(state, sink, Some(app.clone()), None).await;
             } else {
                 tracing::error!(
                     "ZEB-803 watchdog: no NodeState handle for restart (neither owned_state nor wry_handle)"
@@ -3804,6 +3838,27 @@ fn spawn_relay_acceptor_watchdog(
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     use crate::relay_acceptor_watchdog::*;
+    use std::sync::atomic::Ordering;
+
+    // ZEB-803 (CodeAnt): the escalation memory is process-global (survives the
+    // watchdog's OWN Tier-2 restart). Consume the in-flight flag: an unrelated
+    // node start (first boot, user restart, mint) clears the flag → reset the
+    // memory so this fresh lifetime does not inherit a prior stall's
+    // cooldown/escalation. A watchdog restart set the flag → preserve.
+    if !WATCHDOG_TIER2_IN_FLIGHT.swap(false, Ordering::SeqCst) {
+        *watchdog_memory().lock().expect("watchdog memory poisoned") = WatchdogMemory::default();
+    }
+
+    // ZEB-803 (Qodo): without a restart capability, Tier-2 would be a silent
+    // no-op that eventually drives the watchdog to Escalated. Don't spawn — the
+    // health field stays null, which honestly reports "no watchdog".
+    if owned_state.is_none() && wry_handle.is_none() {
+        tracing::warn!(
+            "ZEB-803 watchdog: not spawned — no restart capability (neither owned_state nor AppHandle)"
+        );
+        return;
+    }
+
     let cadence_ms = crate::community_relay_pull_driver::COMMUNITY_RELAY_PULL_INTERVAL_MS;
     let cfg = WatchdogConfig {
         cadence_ms,
@@ -3843,13 +3898,16 @@ mod watchdog_wiring_tests {
             telemetry: tel.clone(),
             resolver: crate::reachability_resolver::ReachabilityResolver::new(),
         };
-        // Never served yet → None; no supervisor wired → connected 0.
+        // Never served yet → None (the 0 → None sentinel); no supervisor wired
+        // → connected 0; and the now_ms argument reaches the inputs.
         let s0 = sensor.sample(42);
+        assert_eq!(s0.now_ms, 42);
         assert_eq!(s0.last_served_ms, None);
         assert_eq!(s0.connected_peers, 0);
-        // A recorded serve makes it Some (the 0 → None sentinel lifts).
+        // A recorded serve makes it Some (the sentinel lifts).
         tel.record_served(&[7u8; 32]);
         let s1 = sensor.sample(99);
+        assert_eq!(s1.now_ms, 99);
         assert!(s1.last_served_ms.is_some());
     }
 }
@@ -13377,6 +13435,14 @@ pub async fn start_node_inner(
                                         wry_handle.clone(),
                                         owned_state.clone(),
                                         watchdog_shutdown_rx.clone(),
+                                    );
+                                } else {
+                                    // ZEB-803 (CodeRabbit): relay serving is wired
+                                    // but no iroh endpoint is bound, so no watchdog
+                                    // runs and nothing updates the health fields —
+                                    // make that diagnosable.
+                                    tracing::warn!(
+                                        "ZEB-803 watchdog: not spawned — no iroh endpoint bound"
                                     );
                                 }
                             }

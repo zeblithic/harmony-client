@@ -539,18 +539,37 @@ pub struct CommunityRelayPeerServed {
     pub served_count: u64,
 }
 
+/// ZEB-803: watchdog phase on the wire — a finite vocabulary, so it is an enum
+/// (no per-snapshot allocation, and TypeScript can exhaustively match). Serde
+/// renames preserve the existing string values.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WatchdogPhaseWire {
+    Normal,
+    Cooldown,
+    Escalated,
+}
+
+/// ZEB-803: the tier of the watchdog's last remediation action, on the wire.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WatchdogTierWire {
+    Probe,
+    Restart,
+}
+
 /// ZEB-803: the relay-acceptor watchdog's own state, so its decisions are never
 /// a silent surface. `phase`/counters come from `WatchdogMemory`; `staleness_ms`
 /// and `connected_peers` are computed live at snapshot time.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayAcceptorWatchdogHealth {
     pub staleness_ms: Option<u64>,
     pub connected_peers: u32,
-    pub phase: String,
+    pub phase: WatchdogPhaseWire,
     pub consecutive_restarts: u32,
     pub last_action_ms: Option<u64>,
-    pub last_action_tier: Option<String>,
+    pub last_action_tier: Option<WatchdogTierWire>,
     pub escalated: bool,
 }
 
@@ -562,21 +581,20 @@ impl RelayAcceptorWatchdogHealth {
     ) -> Self {
         use crate::relay_acceptor_watchdog::{Phase, Tier};
         let phase = match mem.phase {
-            Phase::Normal => "normal",
-            Phase::Cooldown { .. } => "cooldown",
-            Phase::Escalated => "escalated",
-        };
-        let tier_str = |t: Tier| match t {
-            Tier::Probe => "probe",
-            Tier::Restart => "restart",
+            Phase::Normal => WatchdogPhaseWire::Normal,
+            Phase::Cooldown { .. } => WatchdogPhaseWire::Cooldown,
+            Phase::Escalated => WatchdogPhaseWire::Escalated,
         };
         Self {
             staleness_ms,
             connected_peers,
-            phase: phase.to_string(),
+            phase,
             consecutive_restarts: mem.consecutive_restarts,
             last_action_ms: mem.last_action_ms,
-            last_action_tier: mem.last_action_tier.map(|t| tier_str(t).to_string()),
+            last_action_tier: mem.last_action_tier.map(|t| match t {
+                Tier::Probe => WatchdogTierWire::Probe,
+                Tier::Restart => WatchdogTierWire::Restart,
+            }),
             escalated: matches!(mem.phase, Phase::Escalated),
         }
     }
@@ -3873,7 +3891,7 @@ mod tests {
             last_action_tier: Some(Tier::Restart),
         };
         let h = RelayAcceptorWatchdogHealth::from_parts(&mem, Some(4200), 3);
-        let v = serde_json::to_value(&h).unwrap();
+        let v = serde_json::to_value(h).unwrap();
         assert_eq!(v["phase"], "cooldown");
         assert_eq!(v["consecutiveRestarts"], 2);
         assert_eq!(v["lastActionTier"], "restart");

@@ -163,6 +163,16 @@ pub fn evaluate(
             if inputs.now_ms.saturating_sub(since_ms) < cooldown_for(cfg, tier) {
                 return Verdict::Hold; // still waiting to see if the remedy took
             }
+            // ZEB-803 (CodeRabbit + CodeAnt): the stall gate is only re-checked
+            // for Tier 1. If every peer disconnected during the cooldown there is
+            // nothing to serve and a disruptive restart cannot help — re-arm
+            // Normal so a fresh stall re-tries the cheap probe first, while
+            // KEEPING `consecutive_restarts` so a genuinely persistent stall still
+            // escalates.
+            if inputs.connected_peers == 0 {
+                mem.phase = Phase::Normal;
+                return Verdict::Hold;
+            }
             // cooldown elapsed, still not recovered → escalate to a restart
             // (tier-1 failure → first restart; tier-2 failure → repeat/Escalate)
             fire_restart(cfg, inputs, mem)
@@ -232,12 +242,31 @@ impl<S: ServingSensor, A: RemediationActuator, C: Clock> RelayAcceptorWatchdog<S
 
     /// Background loop: evaluate every `eval_interval_ms` until shutdown.
     pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut interval = tokio::time::interval(Duration::from_millis(self.cfg.eval_interval_ms));
+        // ZEB-803 (CodeRabbit): if shutdown was already requested before we
+        // started, never act — `watch::changed()` does not observe the initial
+        // value as a change, so check the current value explicitly.
+        if *shutdown.borrow() {
+            return;
+        }
+        // `.max(1)`: `tokio::time::interval` panics on a zero period, which a
+        // reduced cadence (or a tiny test config) could divide down to.
+        let mut interval =
+            tokio::time::interval(Duration::from_millis(self.cfg.eval_interval_ms.max(1)));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _ = interval.tick() => self.tick().await,
+                // `biased`: the shutdown branch wins over the immediately-ready
+                // first tick and over a tick that becomes ready concurrently, so a
+                // stop — including the watchdog's own Tier-2 restart — ends this
+                // task instead of acting on a torn-down node.
+                biased;
                 _ = shutdown.changed() => break,
+                _ = interval.tick() => {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    self.tick().await;
+                }
             }
         }
     }
@@ -670,5 +699,66 @@ mod tests {
         clock2.store(10_500, Ordering::Relaxed); // Δ 500 < 2000 cooldown
         wd2.tick().await; // cooldown → no action
         assert_eq!(*actions2.lock().unwrap(), vec!["probe"]);
+    }
+
+    #[test]
+    fn peers_gone_during_cooldown_rearms_normal_not_restart() {
+        let cfg = test_cfg();
+        let mut m = served_mem();
+        // Stall → Tier 1 probe, enters Cooldown{Probe}.
+        let v0 = evaluate(
+            &cfg,
+            &WatchdogInputs {
+                now_ms: 10_000,
+                last_served_ms: Some(1000),
+                connected_peers: 2,
+            },
+            &mut m,
+        );
+        assert_eq!(v0, Verdict::ProbeNetwork);
+        // Cooldown elapsed, still stale, but ALL peers gone → re-arm Normal, NO restart.
+        let v1 = evaluate(
+            &cfg,
+            &WatchdogInputs {
+                now_ms: 12_500,
+                last_served_ms: Some(1000),
+                connected_peers: 0,
+            },
+            &mut m,
+        );
+        assert_eq!(v1, Verdict::Hold);
+        assert_eq!(m.phase, Phase::Normal);
+        assert_eq!(m.consecutive_restarts, 0);
+        // Peers return, still stale → a fresh PROBE (cheap lever first), not a restart.
+        let v2 = evaluate(
+            &cfg,
+            &WatchdogInputs {
+                now_ms: 20_000,
+                last_served_ms: Some(1000),
+                connected_peers: 2,
+            },
+            &mut m,
+        );
+        assert_eq!(v2, Verdict::ProbeNetwork);
+    }
+
+    #[tokio::test]
+    async fn run_does_not_act_when_shutdown_already_requested() {
+        // `watch::channel(true)` — shutdown already requested at spawn.
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let wd = RelayAcceptorWatchdog::new(
+            test_cfg(),
+            Arc::new(Mutex::new(served_mem())),
+            MockSensor {
+                last_served_ms: Some(1000),
+                connected: 2,
+            }, // would stall
+            RecordingActuator(actions.clone()),
+            MockClock(Arc::new(AtomicU64::new(1_000_000))),
+        );
+        // Returns immediately without ticking.
+        wd.run(rx).await;
+        assert!(actions.lock().unwrap().is_empty());
     }
 }
