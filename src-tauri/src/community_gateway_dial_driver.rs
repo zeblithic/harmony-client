@@ -28,7 +28,7 @@ use crate::network_health::{GatewayBootstrapOutcome, GatewayBootstrapTelemetry};
 use crate::owner_state_types::{DeviceIdentityHash, EpochKey, OwnerAddr, SpaceId};
 use crate::reachability_resolver::ReachabilityResolver;
 use crate::reconnect_supervisor::{PeerStateWire, ReconnectTrigger};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -147,6 +147,34 @@ impl BeaconResolver for ProdBeaconResolver {
     }
 }
 
+/// ZEB-827: the union of Joined members' enrolled device verify keys — the set
+/// each beacon's membership vouch is checked against. Extracted as a free
+/// function so the exact filtering is unit-testable without a live registry
+/// (the coverage gap that let the sibling-device bug ship).
+///
+/// The local owner IS included — unlike [`ProdGatewayDialCtx::members_of`],
+/// which drops self because a self-inclusive member set makes a solo community
+/// read as "has members, none connected" and resolve forever. That rationale is
+/// about the *starved* predicate, not this *verification* set. An owner may hold
+/// several enrolled devices (`MemberState::enrolled_device_keys` is a set for
+/// exactly this "eventual state"); a sibling device — same owner, a different
+/// enrolled key — publishes legitimate rendezvous beacons whose vouch must
+/// verify. The resolver already drops THIS device's own beacon at the transport
+/// layer (`self_endpoint_id` in `resolve_slot`), so excluding the owner here
+/// only rejects a sibling's valid vouch as `NotEnrolled` and can strand an
+/// empty-address-book node whose sole reachable beacon is its own other device.
+/// `enrolled_device_keys` is already post-revocation in materialized state, so a
+/// revoked sibling key is absent and still rejected.
+fn enrolled_keys_from_members(
+    members: &BTreeMap<OwnerAddr, crate::community_membership::MemberState>,
+) -> HashSet<[u8; 32]> {
+    members
+        .values()
+        .filter(|m| m.status == crate::community_membership::MemberStatus::Joined)
+        .flat_map(|m| m.enrolled_device_keys.iter().copied())
+        .collect()
+}
+
 /// Production [`GatewayDialCtx`] over the community sync registry.
 pub struct ProdGatewayDialCtx {
     pub registry: Arc<crate::community_state_sync::CommunitySyncRegistry>,
@@ -195,14 +223,7 @@ impl GatewayDialCtx for ProdGatewayDialCtx {
         let state_arc = engine.state();
         let st = state_arc.lock().await;
         let mat = st.materialized(engine.admin_addr());
-        mat.members
-            .iter()
-            .filter(|(addr, m)| {
-                m.status == crate::community_membership::MemberStatus::Joined
-                    && **addr != self.self_owner
-            })
-            .flat_map(|(_, m)| m.enrolled_device_keys.iter().copied())
-            .collect()
+        enrolled_keys_from_members(&mat.members)
     }
 }
 
@@ -708,6 +729,77 @@ mod tests {
             beacon_identity_pub: identity_pub,
             membership_device_vk: device_vk,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // ZEB-827 (Greptile P1): the vouch-verification key set must retain the
+    // LOCAL OWNER's enrolled device keys. An owner can hold several enrolled
+    // devices (`MemberState::enrolled_device_keys` is a set for exactly this);
+    // a sibling device — same owner, a different key — publishes valid
+    // rendezvous beacons, and its vouch must verify. Excluding the owner here
+    // classifies a sibling's valid vouch as `NotEnrolled` and can strand an
+    // empty-address-book node whose only reachable beacon is its own other
+    // device. Self-loop prevention already lives at the transport layer
+    // (`self_endpoint_id` in `resolve_slot`), never in this key set.
+    // ------------------------------------------------------------------
+    #[test]
+    fn enrolled_keys_retain_local_owner_sibling_devices() {
+        let self_owner = OwnerAddr([0x01; 16]);
+        let peer = OwnerAddr([0x02; 16]);
+        let left = OwnerAddr([0x03; 16]);
+
+        let member = |status, keys: &[[u8; 32]]| crate::community_membership::MemberState {
+            status,
+            joined_at: hlc(1),
+            left_at: None,
+            enrolled_device_keys: keys.iter().copied().collect(),
+            revoked_device_keys: std::collections::BTreeSet::new(),
+        };
+
+        // Local owner: THIS device (0xA1) + an enrolled SIBLING device (0xB2).
+        // A joined peer contributes 0xC3. A Left member's 0xD4 must never count.
+        let mut members = BTreeMap::new();
+        members.insert(
+            self_owner,
+            member(
+                crate::community_membership::MemberStatus::Joined,
+                &[[0xA1; 32], [0xB2; 32]],
+            ),
+        );
+        members.insert(
+            peer,
+            member(
+                crate::community_membership::MemberStatus::Joined,
+                &[[0xC3; 32]],
+            ),
+        );
+        members.insert(
+            left,
+            member(
+                crate::community_membership::MemberStatus::Left,
+                &[[0xD4; 32]],
+            ),
+        );
+
+        let keys = enrolled_keys_from_members(&members);
+
+        assert!(
+            keys.contains(&[0xA1; 32]),
+            "local owner's own device key must be retained"
+        );
+        assert!(
+            keys.contains(&[0xB2; 32]),
+            "local owner's SIBLING device key must be retained (Greptile P1)"
+        );
+        assert!(
+            keys.contains(&[0xC3; 32]),
+            "a joined peer's device key must be retained"
+        );
+        assert!(
+            !keys.contains(&[0xD4; 32]),
+            "a non-Joined member's device key must be excluded"
+        );
+        assert_eq!(keys.len(), 3, "exactly the three Joined-member keys");
     }
 
     /// Everything a pass-level test needs: the driver plus the handles its
