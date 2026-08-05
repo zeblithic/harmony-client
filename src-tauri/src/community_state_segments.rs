@@ -154,6 +154,9 @@ impl CanonicalPayloadSealed for SegmentCleartext {}
 impl CanonicalPayload for SegmentCleartext {}
 impl CanonicalPayloadSealed for ManifestCleartext {}
 impl CanonicalPayload for ManifestCleartext {}
+// The sidecar index is persisted via `canonical_cbor_encode` (Task 2).
+impl CanonicalPayloadSealed for SegmentIndex {}
+impl CanonicalPayload for SegmentIndex {}
 
 /// One entry in the local publisher sidecar (see `community_state_persist`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

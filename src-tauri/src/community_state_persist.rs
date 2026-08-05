@@ -33,6 +33,7 @@
 use std::path::Path;
 
 use crate::community_state_crdt::CommunityState;
+use crate::community_state_segments::SegmentIndex;
 use crate::community_state_sync::CommunityRootHlcTracker;
 use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
 use crate::owner_state_types::SpaceId;
@@ -157,6 +158,46 @@ pub fn load_replay(path: &Path) -> Result<CommunityRootHlcTracker, PersistError>
     }
 }
 
+/// Save the per-publisher segment index (ZEB-814 sidecar `segments.cbor`) via
+/// atomic write. Gives per-publisher segment-CID stability across republishes:
+/// the encoder reuses each sealed segment's `(K_s, cid)` so its own re-publish
+/// re-`put`s only the changed tail segment.
+pub fn save_segment_index(path: &Path, index: &SegmentIndex) -> Result<(), PersistError> {
+    let bytes =
+        canonical_cbor_encode(index).map_err(|e| PersistError::CborEncode(e.to_string()))?;
+    write_atomic(path, &bytes)
+}
+
+/// Load the per-publisher segment index.
+///
+/// - Missing file → `SegmentIndex::default()` (first publish / just-joined —
+///   the encoder will seal from scratch).
+/// - Decode error → quarantine + default. Self-heal is correct and cheap: a
+///   lost/corrupt sidecar only costs one O(total) re-upload of this publisher's
+///   own segments on the next publish (fresh `K_s` → fresh CIDs); receivers
+///   still decode every published manifest+segment regardless.
+///
+/// No `community_id` guard: the sidecar carries no `community_id` (it's a flat
+/// per-publisher index), so the routing check lives on the CRDT side. The path
+/// itself encodes the community via the registry's directory layout — same as
+/// `load_replay`.
+pub fn load_segment_index(path: &Path) -> Result<SegmentIndex, PersistError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SegmentIndex::default());
+        }
+        Err(e) => return Err(PersistError::Io(e)),
+    };
+    match canonical_cbor_decode::<SegmentIndex>(&bytes) {
+        Ok(idx) => Ok(idx),
+        Err(decode_err) => {
+            quarantine_corrupted(path, &decode_err.to_string());
+            Ok(SegmentIndex::default())
+        }
+    }
+}
+
 /// Move a corrupted CBOR file aside under `<path>.corrupt.<unix_ms>` so
 /// the next `write_atomic` can land cleanly while preserving the
 /// original bytes for forensic analysis. Failures here are logged and
@@ -218,4 +259,63 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PersistError> {
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::community_state_segments::{EventBoundary, SealedEntry};
+
+    fn sample_index() -> SegmentIndex {
+        SegmentIndex {
+            version: 1,
+            sealed: vec![SealedEntry {
+                lo: EventBoundary {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "d".into(),
+                    id: [1u8; 16],
+                },
+                hi: EventBoundary {
+                    wall_ms: 9,
+                    logical: 0,
+                    device_id: "d".into(),
+                    id: [9u8; 16],
+                },
+                count: 5,
+                k_s: [7u8; 32],
+                segment_cid: harmony_content::cid::ContentId::for_book(b"x", Default::default())
+                    .unwrap(),
+            }],
+        }
+    }
+
+    #[test]
+    fn segment_index_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segments.cbor");
+        let idx = sample_index();
+        save_segment_index(&path, &idx).unwrap();
+        assert_eq!(load_segment_index(&path).unwrap(), idx);
+    }
+
+    #[test]
+    fn segment_index_missing_file_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.cbor");
+        assert_eq!(load_segment_index(&path).unwrap(), SegmentIndex::default());
+    }
+
+    #[test]
+    fn segment_index_corrupt_quarantines_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segments.cbor");
+        std::fs::write(&path, b"\xff not valid cbor \xff\xff").unwrap();
+        assert_eq!(load_segment_index(&path).unwrap(), SegmentIndex::default());
+        let quarantined = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt."));
+        assert!(quarantined, "corrupt sidecar should be quarantined aside");
+    }
 }
