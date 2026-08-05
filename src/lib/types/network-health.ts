@@ -199,11 +199,36 @@ export interface NetworkHealthSnapshot {
    */
   communityRelay?: CommunityRelayHealth | null;
   /**
+   * ZEB-803: the self-healing relay-acceptor watchdog's own state. Present iff
+   * the relay serving path is wired (parity with `communityRelay`). Absent on
+   * pre-field snapshots (Rust `#[serde(default)]`).
+   */
+  relayAcceptorWatchdog?: RelayAcceptorWatchdogHealth | null;
+  /**
    * ZEB-805: per-community sync-advance health, one row per live community
    * engine. Absent on pre-field snapshots (Rust `#[serde(default)]`); an empty
    * array means no engines are running, which is honest rather than a fault.
    */
   communitySync?: CommunitySyncHealth[];
+}
+
+/**
+ * ZEB-803: the relay-acceptor watchdog's own state (camelCase mirror of Rust
+ * `RelayAcceptorWatchdogHealth`, network_health.rs). Surfaced so a silent
+ * serving stall — and the watchdog's remediation of it — is never invisible.
+ *
+ * `phase` is `"normal" | "cooldown" | "escalated"`; `lastActionTier` is
+ * `"probe" | "restart"`. `escalated` true means the watchdog exhausted its
+ * restart budget and stopped acting (needs a human) rather than looping.
+ */
+export interface RelayAcceptorWatchdogHealth {
+  stalenessMs: number | null;
+  connectedPeers: number;
+  phase: 'normal' | 'cooldown' | 'escalated';
+  consecutiveRestarts: number;
+  lastActionMs: number | null;
+  lastActionTier: 'probe' | 'restart' | null;
+  escalated: boolean;
 }
 
 /**
