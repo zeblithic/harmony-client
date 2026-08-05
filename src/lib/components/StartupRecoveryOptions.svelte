@@ -62,6 +62,10 @@
   // reset above — this hard-deletes identity AND every app-data cache.
   let eraseText = $state('');
   let eraseError = $state<string | null>(null);
+  // Busy-guard: while a destructive op is in flight, no other flow may start —
+  // otherwise a click could issue an overlapping IPC before the pending reset/
+  // erase reloads the page (Qodo).
+  let busy = $derived(mode === 'resetting' || mode === 'erasing');
 
   async function openRestore() {
     restoreBlocked = null;
@@ -147,6 +151,7 @@
         type="button"
         class="recovery-btn restore"
         data-testid="startup-restore"
+        disabled={busy}
         onclick={openRestore}
       >
         Restore from recovery phrase
@@ -191,6 +196,7 @@
           type="button"
           class="recovery-btn reset"
           data-testid="startup-reset"
+          disabled={busy}
           onclick={() => (mode = 'reset-confirm')}
         >
           Reset this device &amp; start fresh
@@ -237,6 +243,7 @@
           type="button"
           class="recovery-btn erase"
           data-testid="startup-erase"
+          disabled={busy}
           onclick={() => (mode = 'erase-confirm')}
         >
           Erase all local data

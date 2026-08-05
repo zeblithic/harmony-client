@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent } from '@testing-library/svelte';
+import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import StartupRecoveryOptions from '../StartupRecoveryOptions.svelte';
 
 // The child OwnerRestoreWizard imports `invoke` directly from the Tauri core;
@@ -184,5 +184,29 @@ describe('StartupRecoveryOptions (ZEB-835 / ZEB-836)', () => {
     await fireEvent.click(getByTestId('startup-still-stuck'));
     await fireEvent.click(getByTestId('startup-reset'));
     expect(getByTestId('startup-reset-confirm-copy').textContent).toMatch(/stays on this device/i);
+  });
+
+  it('locks out Restore/Reset while an erase is in flight (no overlapping flows)', async () => {
+    // Qodo: a mid-erase click could issue an overlapping IPC before the pending
+    // wipe reloads the page. Hold the erase invoke pending and assert the other
+    // destructive controls are disabled.
+    let releaseErase: (v: unknown) => void = () => {};
+    const pending = new Promise((r) => (releaseErase = r));
+    const invoke = vi.fn((cmd: string) =>
+      cmd === 'erase_all_local_data' ? pending : Promise.resolve(null),
+    );
+    const reload = vi.fn();
+    const { getByTestId } = render(StartupRecoveryOptions, { props: { invoke, reload } });
+
+    await fireEvent.click(getByTestId('startup-still-stuck'));
+    await fireEvent.click(getByTestId('startup-erase'));
+    await fireEvent.input(getByTestId('startup-erase-input'), { target: { value: 'ERASE' } });
+    await fireEvent.click(getByTestId('startup-erase-go')); // enters 'erasing', invoke pending
+
+    expect((getByTestId('startup-restore') as HTMLButtonElement).disabled).toBe(true);
+    expect((getByTestId('startup-reset') as HTMLButtonElement).disabled).toBe(true);
+
+    releaseErase(null);
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
   });
 });
