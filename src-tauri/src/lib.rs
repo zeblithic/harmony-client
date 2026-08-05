@@ -9661,6 +9661,9 @@ pub async fn start_node_inner(
                             std::sync::Arc::clone(&pkarr_publisher_arc),
                             (*signing_key_arc).clone(),
                             identity_pub_64,
+                            // ZEB-827: our enrolled community device key mints the
+                            // membership vouch carried in each rendezvous blob.
+                            std::sync::Arc::new(loaded.device_signing_key.clone()),
                             std::sync::Arc::clone(&blob_builder),
                         ),
                     );

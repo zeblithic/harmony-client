@@ -79,6 +79,9 @@ pub struct CommunityRendezvousPublisher {
     sink: Arc<dyn RendezvousSink>,
     identity_signing_key: ed25519_dalek::SigningKey,
     identity_pub: [u8; 64],
+    /// ZEB-827: the node's enrolled community device signing key, used to mint
+    /// the membership vouch carried in the rendezvous blob.
+    device_signing_key: Arc<ed25519_dalek::SigningKey>,
     routing_blob_builder: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
     /// Currently-registered rendezvous slot per community, so a rank change
     /// unregisters the stale slot handle before registering the new one.
@@ -96,12 +99,14 @@ impl CommunityRendezvousPublisher {
         publisher: Arc<PkarrPublisher>,
         identity_signing_key: ed25519_dalek::SigningKey,
         identity_pub: [u8; 64],
+        device_signing_key: Arc<ed25519_dalek::SigningKey>,
         routing_blob_builder: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
     ) -> Self {
         Self::new_with_sink(
             publisher,
             identity_signing_key,
             identity_pub,
+            device_signing_key,
             routing_blob_builder,
         )
     }
@@ -112,12 +117,14 @@ impl CommunityRendezvousPublisher {
         sink: Arc<dyn RendezvousSink>,
         identity_signing_key: ed25519_dalek::SigningKey,
         identity_pub: [u8; 64],
+        device_signing_key: Arc<ed25519_dalek::SigningKey>,
         routing_blob_builder: Arc<dyn Fn() -> Vec<u8> + Send + Sync>,
     ) -> Self {
         Self {
             sink,
             identity_signing_key,
             identity_pub,
+            device_signing_key,
             routing_blob_builder,
             registered_slots: Mutex::new(HashMap::new()),
             observability: RendezvousObservability::default(),
@@ -222,16 +229,36 @@ impl CommunityRendezvousPublisher {
 
             let id_sk = self.identity_signing_key.clone();
             let id_pub = self.identity_pub;
+            let device_sk = Arc::clone(&self.device_signing_key);
+            let vouch_community = community_id;
             let blob_builder = Arc::clone(&self.routing_blob_builder);
             let builder: RecordBuilder = Arc::new(move |at_ms| {
-                PkarrRoutingRecord::sign_new(
-                    blob_builder(),
-                    id_pub,
-                    at_ms,
-                    at_ms + crate::reachability_record::REACHABILITY_RECORD_TTL_MS,
-                    &id_sk,
-                )
-                .expect("sign — fixed-size buffers should not fail")
+                let base = blob_builder();
+                let ttl_at = at_ms + crate::reachability_record::REACHABILITY_RECORD_TTL_MS;
+                // ZEB-827: wrap the reachability payload with a fresh membership
+                // vouch signed by our enrolled community device key. If the base
+                // blob can't be decoded (e.g. empty — no endpoint yet), publish
+                // it unchanged (a vouchless blob; strict resolvers skip it, old
+                // ones still read it).
+                let routing = match ciborium::from_reader::<
+                    crate::reachability_record::ReachabilityAnnouncePayload,
+                    _,
+                >(base.as_slice())
+                {
+                    Ok(reach) => {
+                        let vouch = crate::membership_vouch::mint_membership_vouch(
+                            &device_sk,
+                            vouch_community,
+                            &id_pub,
+                            at_ms,
+                            ttl_at,
+                        );
+                        crate::community_rendezvous::encode_rendezvous_blob(&reach, Some(&vouch))
+                    }
+                    Err(_) => base,
+                };
+                PkarrRoutingRecord::sign_new(routing, id_pub, at_ms, ttl_at, &id_sk)
+                    .expect("sign — fixed-size buffers should not fail")
             });
 
             let handle = Self::slot_handle(&community_id, slot);
@@ -358,7 +385,14 @@ mod tests {
     #[derive(Clone)]
     struct Registration {
         handle: String,
+        // ZEB-827: the built record's inspectable fields (the mock runs the
+        // RecordBuilder at a fixed at_ms so tests can assert the blob/vouch).
+        routing_blob: Vec<u8>,
+        harmony_identity_pub: [u8; 64],
+        announced_at_ms: u64,
     }
+
+    const MOCK_BUILD_AT_MS: u64 = 1_700_000_000_000;
 
     #[derive(Default)]
     struct SpyInner {
@@ -380,6 +414,9 @@ mod tests {
         async fn unregistrations(&self) -> Vec<String> {
             self.inner.lock().await.unregistrations.clone()
         }
+        async fn last_registration(&self) -> Option<Registration> {
+            self.inner.lock().await.registrations.last().cloned()
+        }
     }
 
     #[async_trait::async_trait]
@@ -388,13 +425,17 @@ mod tests {
             &self,
             handle: String,
             _key_builder: EphemeralKeyBuilder,
-            _builder: RecordBuilder,
+            builder: RecordBuilder,
         ) {
-            self.inner
-                .lock()
-                .await
-                .registrations
-                .push(Registration { handle });
+            // Run the RecordBuilder at a fixed instant so tests can inspect the
+            // published record (blob + vouch) deterministically.
+            let rec = builder(MOCK_BUILD_AT_MS);
+            self.inner.lock().await.registrations.push(Registration {
+                handle,
+                routing_blob: rec.routing_blob,
+                harmony_identity_pub: rec.harmony_identity_pub,
+                announced_at_ms: rec.announced_at_ms,
+            });
         }
         async fn unregister(&self, handle: &str) {
             self.inner
@@ -418,8 +459,68 @@ mod tests {
             spy,
             sk,
             id_pub,
+            Arc::new(SigningKey::from_bytes(&[42u8; 32])),
             Arc::new(|| b"routing".to_vec()),
         )
+    }
+
+    /// Build a minimal valid `ReachabilityAnnouncePayload` blob for the routing
+    /// blob builder (so the vouch-wrapping path is exercised, not the fallback).
+    fn reachability_blob() -> Vec<u8> {
+        let p = crate::reachability_record::ReachabilityAnnouncePayload {
+            iroh_node_id: [1u8; 32],
+            home_relay_url: String::new(),
+            direct_addresses: vec![],
+            announced_at_ms: 1_000,
+            identity_signature: [0u8; 64],
+            butler_set: vec![],
+            bs_at: 0,
+        };
+        let mut b = Vec::new();
+        ciborium::into_writer(&p, &mut b).unwrap();
+        b
+    }
+
+    #[tokio::test]
+    async fn refresh_slot_emits_vouch_verifiable_under_device_key() {
+        use crate::community_rendezvous::decode_rendezvous_blob;
+        use crate::membership_vouch::verify_membership_vouch;
+        use std::collections::HashSet;
+
+        let spy = Arc::new(MockPublisher::default());
+        let device_sk = SigningKey::from_bytes(&[42u8; 32]);
+        let id_sk = SigningKey::from_bytes(&[11u8; 32]);
+        let id_pub = build_id_pub(&id_sk);
+        let publisher = CommunityRendezvousPublisher::new_with_sink(
+            spy.clone(),
+            id_sk,
+            id_pub,
+            Arc::new(device_sk.clone()),
+            Arc::new(reachability_blob),
+        );
+
+        let cid = SpaceId([7u8; 16]);
+        let me = OwnerAddr([5u8; 16]);
+        // `me` is the sole advertiser, so it ranks slot 0 and a record is built.
+        publisher
+            .refresh_slot(cid, EpochKey::new([2u8; 32]), vec![me], me)
+            .await;
+
+        let reg = spy
+            .last_registration()
+            .await
+            .expect("a record was registered");
+        let (_payload, vouch) = decode_rendezvous_blob(&reg.routing_blob).expect("blob decodes");
+        let vouch = vouch.expect("vouch present");
+        let enrolled: HashSet<[u8; 32]> =
+            [device_sk.verifying_key().to_bytes()].into_iter().collect();
+        assert!(verify_membership_vouch(
+            &vouch,
+            cid,
+            &reg.harmony_identity_pub,
+            &enrolled,
+            reg.announced_at_ms,
+        ));
     }
 
     #[tokio::test]

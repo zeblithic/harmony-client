@@ -561,6 +561,10 @@ async fn setup_two_party_open_join() -> OpenJoinSetup {
         Arc::clone(&pkarr_publisher),
         (*alice_sk).clone(),
         alice_pub,
+        // ZEB-827: device key that mints the membership vouch. Open-join
+        // resolves via the bare (unidentified) path, which ignores the vouch,
+        // so reusing alice's key here is inert for this test.
+        Arc::clone(&alice_sk),
         Arc::new(move || alice_routing_blob.clone()),
     );
 
