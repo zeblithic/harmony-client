@@ -43,7 +43,7 @@ use harmony_crdt_sync::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
@@ -125,6 +125,192 @@ pub enum SyncError {
     TransportClosed,
     #[error("persist: {0}")]
     Persist(String),
+}
+
+/// ZEB-877: per-engine sync observability, shared (`Arc`) between the engine's
+/// task-side [`Ctx`] and its handle. Non-generic — publish-retry and fetch-retry
+/// state is about the transport and the publish outcome, not the CRDT document
+/// `S` — so one `Arc<FleetSyncStats>` type-erases every `FleetSyncEngine<T>` for
+/// the health registry. All `Relaxed`: a reader (`fleet_sync_raw`) tolerating a
+/// momentarily-torn view is fine for telemetry — the next snapshot corrects it.
+#[derive(Debug, Default)]
+pub(crate) struct FleetSyncStats {
+    /// ZEB-705 observability: retries scheduled / retry frames processed /
+    /// retries dropped because the in-flight cap was saturated / retries that
+    /// exhausted their attempt budget (the publish was permanently lost —
+    /// tracker un-advanced, recovered only by a peer re-publish/re-offer) / peak
+    /// concurrent sleepers observed. Promoted from `cfg(test)` handle clones to
+    /// real telemetry (ZEB-877). `exhausted` is the "am I losing publishes?"
+    /// signal and mirrors the community engine's `fetch_retries_exhausted`.
+    pub(crate) fetch_retries_scheduled: AtomicU64,
+    pub(crate) fetch_retries_run: AtomicU64,
+    pub(crate) fetch_retries_dropped: AtomicU64,
+    pub(crate) fetch_retries_exhausted: AtomicU64,
+    pub(crate) fetch_retry_inflight_peak: AtomicU64,
+    // ZEB-877: publish-side `RetryBackoff` observability — mirrors the community
+    // engine (ZEB-762). Recorded in `settle_publish` at the same `on_failure` /
+    // `clear` points that drive the local `RetryBackoff`, so the observable state
+    // can never drift from the scheduler's.
+    /// Whether an autonomous publish retry is currently owed (last publish failed
+    /// with unreplicated local work). `false` once a publish succeeds.
+    pub(crate) publish_retry_owed: AtomicBool,
+    /// Consecutive failed publish attempts since the last success. Unbounded;
+    /// climbs while the transport stays unhealthy. `0` once a publish succeeds.
+    pub(crate) publish_retry_consecutive_failures: AtomicU64,
+    /// Current backoff interval (ms) — 30 s base doubling to a 600 s cap
+    /// (ZEB-761). `0` once a publish succeeds.
+    pub(crate) publish_retry_backoff_ms: AtomicU64,
+    /// Wall ms of the most recent failed publish; `0` = never. Retained across a
+    /// later success as historical evidence.
+    pub(crate) publish_retry_last_failure_ms: AtomicU64,
+    /// Coarse class of the most recent publish failure, encoded via the shared
+    /// [`crate::network_health::PublishErrorClass`]; `0` = none. Retained across
+    /// a later success.
+    pub(crate) publish_retry_last_error_code: AtomicU8,
+}
+
+impl FleetSyncStats {
+    /// ZEB-877: mirror a just-armed publish retry into the observable stats.
+    /// Called from `settle_publish` right after `RetryBackoff::on_failure`, so
+    /// `backoff_ms` is that call's freshly-escalated `delay_ms()`.
+    fn record_publish_failure(&self, backoff_ms: u64, err: &SyncError, now_wall_ms: u64) {
+        self.publish_retry_owed.store(true, Ordering::Relaxed);
+        self.publish_retry_consecutive_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.publish_retry_backoff_ms
+            .store(backoff_ms, Ordering::Relaxed);
+        self.publish_retry_last_failure_ms
+            .store(now_wall_ms, Ordering::Relaxed);
+        self.publish_retry_last_error_code
+            .store(classify_fleet_publish_error(err) as u8, Ordering::Relaxed);
+    }
+
+    /// ZEB-877: a publish succeeded — clear the ACTIVE-retry state. The
+    /// historical `last_failure_ms` / `last_error_code` are deliberately retained.
+    fn record_publish_success(&self) {
+        self.publish_retry_owed.store(false, Ordering::Relaxed);
+        self.publish_retry_consecutive_failures
+            .store(0, Ordering::Relaxed);
+        self.publish_retry_backoff_ms.store(0, Ordering::Relaxed);
+    }
+}
+
+/// ZEB-877: classify a fleet publish-path failure into the shared
+/// [`crate::network_health::PublishErrorClass`]. The class→label + stable `u8`
+/// codec live in `network_health` (shared with the community engine); this owns
+/// only the fleet-error→class map.
+fn classify_fleet_publish_error(err: &SyncError) -> crate::network_health::PublishErrorClass {
+    use crate::network_health::PublishErrorClass as P;
+    match err {
+        SyncError::TransportClosed => P::TransportClosed,
+        SyncError::ContentStore(_) => P::ContentStore,
+        SyncError::Crypto(_) => P::Crypto,
+        SyncError::CborEncode(_) => P::Encode,
+        _ => P::Other,
+    }
+}
+
+/// ZEB-877: a lightweight collector registry over the ~11 heterogeneous
+/// `FleetSyncEngine<T>` instances. It does NOT own or create the engines (they
+/// are constructed inline in `start_node` with bespoke per-engine config); each
+/// engine pushes its type-erased `Arc<FleetSyncStats>` here at construction,
+/// keyed by a stable [`crate::network_health::FleetDoc`] label. That type
+/// erasure is what lets one registry enumerate 10 different engine `T`s
+/// uniformly — the community side can own a homogeneous engine map, the fleet
+/// side cannot without a large factory refactor. Implements
+/// [`crate::network_health::FleetSyncSource`] so the snapshot reads it exactly
+/// like the community registry.
+/// The lock is a `std::sync::Mutex`, not tokio's: registration is boot-only and
+/// `fleet_sync_raw` does brief atomic loads and never holds the guard across an
+/// `.await`, so a sync mutex keeps `register` sync (no `.await` at the 11 boot
+/// sites) without risking `await_holding_lock`. Both paths poison-recover
+/// (`into_inner`) rather than panic — telemetry degrades, it never takes down
+/// the snapshot.
+#[derive(Default)]
+pub(crate) struct FleetSyncRegistry {
+    engines: std::sync::Mutex<BTreeMap<crate::network_health::FleetDoc, Arc<FleetSyncStats>>>,
+}
+
+impl FleetSyncRegistry {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a live engine's stats handle. Called once per engine at boot;
+    /// re-registering a `FleetDoc` replaces the prior handle (last wins).
+    pub(crate) fn register(
+        &self,
+        doc: crate::network_health::FleetDoc,
+        stats: Arc<FleetSyncStats>,
+    ) {
+        // Recover from a poisoned lock rather than panicking: the map is always
+        // internally consistent (trivial insert/read critical sections), and
+        // telemetry must degrade, never take down the caller. `snapshot()` reads
+        // this on every capture, so a panic here would cascade into snapshot
+        // generation (Qodo #628; team precedent #564/#509/#552).
+        self.engines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(doc, stats);
+    }
+
+    /// Snapshot every registered engine's counters as raw rows (atomic loads
+    /// under the map lock, never held across `.await`). Mirrors
+    /// `CommunitySyncRegistry::community_sync_raw`.
+    pub(crate) fn fleet_sync_raw(
+        &self,
+    ) -> Vec<(
+        crate::network_health::FleetDoc,
+        crate::network_health::FleetSyncRaw,
+    )> {
+        // Poison-recover (see `register`): a snapshot read must never panic.
+        self.engines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(doc, s)| {
+                (
+                    *doc,
+                    crate::network_health::FleetSyncRaw {
+                        fetch_retries_scheduled: s.fetch_retries_scheduled.load(Ordering::Relaxed),
+                        fetch_retries_run: s.fetch_retries_run.load(Ordering::Relaxed),
+                        fetch_retries_dropped: s.fetch_retries_dropped.load(Ordering::Relaxed),
+                        fetch_retries_exhausted: s.fetch_retries_exhausted.load(Ordering::Relaxed),
+                        fetch_retry_inflight_peak: s
+                            .fetch_retry_inflight_peak
+                            .load(Ordering::Relaxed),
+                        publish_retry_owed: s.publish_retry_owed.load(Ordering::Relaxed),
+                        publish_retry_consecutive_failures: s
+                            .publish_retry_consecutive_failures
+                            .load(Ordering::Relaxed),
+                        publish_retry_backoff_ms: s
+                            .publish_retry_backoff_ms
+                            .load(Ordering::Relaxed),
+                        publish_retry_last_failure_ms: s
+                            .publish_retry_last_failure_ms
+                            .load(Ordering::Relaxed),
+                        publish_retry_last_error:
+                            crate::network_health::PublishErrorClass::from_u8(
+                                s.publish_retry_last_error_code.load(Ordering::Relaxed),
+                            )
+                            .map(crate::network_health::PublishErrorClass::label),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::network_health::FleetSyncSource for FleetSyncRegistry {
+    async fn per_fleet(
+        &self,
+    ) -> Vec<(
+        crate::network_health::FleetDoc,
+        crate::network_health::FleetSyncRaw,
+    )> {
+        self.fleet_sync_raw()
+    }
 }
 
 /// Durability sink for the engine. The engine snapshots `state` and
@@ -274,18 +460,12 @@ pub struct FleetSyncEngine<S: Send + 'static> {
     /// to ask the engine for its current root wire when answering a peer's root
     /// GET. Datasets with no queryable never send on it → the serve arm is idle.
     root_serve_tx: mpsc::Sender<RootServeReq>,
-    /// ZEB-705 observability. The task-side (`Ctx`) clones carry the live
-    /// increments; these handle-side clones exist only so the in-crate tests
-    /// can read the counters, hence the `cfg(test)` gate (production never
-    /// reads them off the handle).
-    #[cfg(test)]
-    fetch_retries_scheduled: Arc<AtomicU64>,
-    #[cfg(test)]
-    fetch_retries_run: Arc<AtomicU64>,
-    #[cfg(test)]
-    fetch_retries_dropped: Arc<AtomicU64>,
-    #[cfg(test)]
-    fetch_retry_inflight_peak: Arc<AtomicU64>,
+    /// ZEB-877: per-engine sync observability, shared with the task-side `Ctx`
+    /// (which carries the live increments). Read off the handle by the
+    /// `FleetSyncRegistry` for operator telemetry and by the in-crate tests —
+    /// this replaces the old `cfg(test)`-only handle clones (the counters are
+    /// now real telemetry on `NetworkHealthSnapshot.fleet_sync`).
+    sync_stats: Arc<FleetSyncStats>,
     _s: std::marker::PhantomData<fn() -> S>,
 }
 
@@ -349,10 +529,10 @@ where
         // ZEB-707: root-serve request channel. Small cap — a receiver's fetch
         // driver queries at most on epoch bumps + the hourly floor.
         let (root_serve_tx, root_serve_rx) = mpsc::channel(8);
-        let fetch_retries_scheduled = Arc::new(AtomicU64::new(0));
-        let fetch_retries_run = Arc::new(AtomicU64::new(0));
-        let fetch_retries_dropped = Arc::new(AtomicU64::new(0));
-        let fetch_retry_inflight_peak = Arc::new(AtomicU64::new(0));
+        // ZEB-877: one shared stats struct — fetch + publish-retry counters —
+        // cloned into the task-side Ctx (live writes) and kept on the handle
+        // (registry + test reads).
+        let sync_stats = Arc::new(FleetSyncStats::default());
 
         let replay_tracker = Arc::clone(&config.replay_tracker);
         let sibling_acks = Arc::clone(&config.sibling_acks);
@@ -385,10 +565,7 @@ where
             fetch_retry_tx,
             fetch_retry_rx,
             fetch_retry_sem,
-            fetch_retries_scheduled: Arc::clone(&fetch_retries_scheduled),
-            fetch_retries_run: Arc::clone(&fetch_retries_run),
-            fetch_retries_dropped: Arc::clone(&fetch_retries_dropped),
-            fetch_retry_inflight_peak: Arc::clone(&fetch_retry_inflight_peak),
+            sync_stats: Arc::clone(&sync_stats),
             root_serve_rx,
             adopt_floor: config.adopt_floor,
         }));
@@ -407,40 +584,19 @@ where
             device_id,
             task: Mutex::new(Some(task)),
             root_serve_tx,
-            #[cfg(test)]
-            fetch_retries_scheduled,
-            #[cfg(test)]
-            fetch_retries_run,
-            #[cfg(test)]
-            fetch_retries_dropped,
-            #[cfg(test)]
-            fetch_retry_inflight_peak,
+            sync_stats,
             _s: std::marker::PhantomData,
         }
     }
 
-    /// ZEB-705 test observability: fetch retries scheduled so far.
-    #[cfg(test)]
-    fn fetch_retries_scheduled(&self) -> u64 {
-        self.fetch_retries_scheduled.load(Ordering::Relaxed)
-    }
-
-    /// ZEB-705 test observability: retry frames dequeued and re-processed.
-    #[cfg(test)]
-    fn fetch_retries_run(&self) -> u64 {
-        self.fetch_retries_run.load(Ordering::Relaxed)
-    }
-
-    /// ZEB-705 test observability: retries dropped at the in-flight cap.
-    #[cfg(test)]
-    fn fetch_retries_dropped(&self) -> u64 {
-        self.fetch_retries_dropped.load(Ordering::Relaxed)
-    }
-
-    /// ZEB-705 test observability: peak concurrent retry sleepers observed.
-    #[cfg(test)]
-    fn fetch_retry_inflight_peak(&self) -> u64 {
-        self.fetch_retry_inflight_peak.load(Ordering::Relaxed)
+    /// ZEB-877: the engine's shared sync-observability handle — fetch + publish-
+    /// retry counters. Read by the `FleetSyncRegistry` (operator telemetry) and
+    /// by the in-crate tests. Wrappers (e.g. `owner_state_sync::SyncEngine`)
+    /// delegate to it. `pub(crate)`: all callers are in-crate, and returning the
+    /// `pub(crate)` `FleetSyncStats` from a `pub` fn would leak a crate-private
+    /// type (`private_interfaces`), same as `root_serve_tx`.
+    pub(crate) fn sync_stats(&self) -> Arc<FleetSyncStats> {
+        Arc::clone(&self.sync_stats)
     }
 
     /// ZEB-707: a sender the query-side zenoh adapter uses to ask the engine
@@ -635,13 +791,10 @@ struct Ctx<S> {
     /// ZEB-705: caps concurrent retry sleepers (see `FETCH_RETRY_MAX_INFLIGHT`).
     /// A permit is acquired before spawning and released when the sleeper ends.
     fetch_retry_sem: Arc<Semaphore>,
-    /// ZEB-705 observability: retries scheduled / retry frames processed /
-    /// retries dropped because the in-flight cap was saturated / peak
-    /// concurrent sleepers observed.
-    fetch_retries_scheduled: Arc<AtomicU64>,
-    fetch_retries_run: Arc<AtomicU64>,
-    fetch_retries_dropped: Arc<AtomicU64>,
-    fetch_retry_inflight_peak: Arc<AtomicU64>,
+    /// ZEB-877: shared sync observability (fetch + publish-retry counters),
+    /// cloned from the handle's `sync_stats`. The live fetch increments and the
+    /// `settle_publish` publish-retry records both write here.
+    sync_stats: Arc<FleetSyncStats>,
     /// ZEB-707: root-serve request channel. Yields a peer's pending root query;
     /// the serve arm encodes the current root and replies its wire. The engine
     /// HANDLE holds the matching `root_serve_tx` for the task's whole lifetime
@@ -690,11 +843,26 @@ fn settle_publish<S, T>(
             // it, and on a quiescent dataset nothing ever comes.
             ctx.has_pending_dirty.store(true, Ordering::Release);
             retry.on_failure(now_ms);
+            // ZEB-877: mirror the just-armed retry into observable stats.
+            // `Restore` means the publish failed WITH work owed, so
+            // `pub_result` is `Err`; `delay_ms()` is the freshly-escalated
+            // interval. Recording is gated here (not on "publish failed"):
+            // a failed publish owing nothing settles `Spent` and is not a
+            // replication stall, so it records nothing — same discipline as
+            // the retry schedule itself.
+            if let Err(e) = pub_result {
+                ctx.sync_stats.record_publish_failure(
+                    retry.delay_ms(),
+                    e,
+                    crate::network_health::now_ms(),
+                );
+            }
         }
         DirtySignal::Spent => {}
     }
     if pub_result.is_ok() {
         retry.clear(now_ms);
+        ctx.sync_stats.record_publish_success();
     }
 }
 
@@ -862,7 +1030,7 @@ where
                 // ZEB-705: re-injected retry of a fetch-missed publish. The
                 // frame re-enters the FULL pipeline, so a root that a newer
                 // publish has since superseded dies at the replay check.
-                ctx.fetch_retries_run.fetch_add(1, Ordering::Relaxed);
+                ctx.sync_stats.fetch_retries_run.fetch_add(1, Ordering::Relaxed);
                 process_inbound(&mut ctx, wire, attempts_left).await;
             }
             Some(resp_tx) = ctx.root_serve_rx.recv() => {
@@ -1242,6 +1410,13 @@ where
         }
         Inbound::FetchMiss(wire) => {
             if attempts_left == 0 {
+                // ZEB-877: the publish is permanently lost here (all retries
+                // spent). Count it so `fleet_sync` can distinguish "retries are
+                // working" from "publishes are being dropped" — the community
+                // engine's `fetch_retries_exhausted` (CodeRabbit #628).
+                ctx.sync_stats
+                    .fetch_retries_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     "ZEB-705: state-root blob fetch retries exhausted — publish dropped; \
                      tracker un-advanced, the peer's next publish or re-offer recovers"
@@ -1254,18 +1429,23 @@ where
             // saturation drop the retry (CRDT + epoch re-offer recover); this
             // is the adversarial-flood backstop CodeRabbit/Qodo flagged.
             let Ok(permit) = Arc::clone(&ctx.fetch_retry_sem).try_acquire_owned() else {
-                ctx.fetch_retries_dropped.fetch_add(1, Ordering::Relaxed);
+                ctx.sync_stats
+                    .fetch_retries_dropped
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     "ZEB-705: fetch-retry in-flight cap saturated — dropping retry; \
                      CRDT re-offer / transport-epoch republish recover"
                 );
                 return;
             };
-            ctx.fetch_retries_scheduled.fetch_add(1, Ordering::Relaxed);
+            ctx.sync_stats
+                .fetch_retries_scheduled
+                .fetch_add(1, Ordering::Relaxed);
             // Record peak concurrent sleepers (permits taken = cap - available).
             let inflight =
                 (FETCH_RETRY_MAX_INFLIGHT - ctx.fetch_retry_sem.available_permits()) as u64;
-            ctx.fetch_retry_inflight_peak
+            ctx.sync_stats
+                .fetch_retry_inflight_peak
                 .fetch_max(inflight, Ordering::Relaxed);
             tracing::info!(
                 attempts_left,
@@ -1273,7 +1453,7 @@ where
                 "ZEB-705: state-root blob fetch failed — retry scheduled"
             );
             let tx = ctx.fetch_retry_tx.clone();
-            let dropped = Arc::clone(&ctx.fetch_retries_dropped);
+            let stats = Arc::clone(&ctx.sync_stats);
             tokio::spawn(async move {
                 // Hold the permit for the sleeper's whole lifetime; released
                 // on task end (after enqueue), bounding concurrent retries.
@@ -1289,7 +1469,7 @@ where
                 // counters entirely — already counted as scheduled, never as
                 // dropped. Both drop sites now agree.
                 if tx.try_send((wire, attempts_left - 1)).is_err() {
-                    dropped.fetch_add(1, Ordering::Relaxed);
+                    stats.fetch_retries_dropped.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         "ZEB-705: fetch-retry re-injection channel unavailable — retry dropped"
                     );
@@ -1486,6 +1666,100 @@ mod tests {
         }
     }
 
+    /// ZEB-877: the publish-retry stats escalate on failure and clear the ACTIVE
+    /// state on success while retaining the historical last-failure evidence.
+    /// Mirrors the community `publish_retry_stats_record_escalation...` test.
+    #[test]
+    fn fleet_publish_retry_stats_record_escalation_and_clear() {
+        let stats = FleetSyncStats::default();
+        assert!(!stats.publish_retry_owed.load(Ordering::Relaxed));
+
+        stats.record_publish_failure(30_000, &SyncError::TransportClosed, 111);
+        stats.record_publish_failure(60_000, &SyncError::TransportClosed, 222);
+        assert!(stats.publish_retry_owed.load(Ordering::Relaxed));
+        assert_eq!(
+            stats
+                .publish_retry_consecutive_failures
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            stats.publish_retry_backoff_ms.load(Ordering::Relaxed),
+            60_000
+        );
+        assert_eq!(
+            stats.publish_retry_last_failure_ms.load(Ordering::Relaxed),
+            222
+        );
+        assert_eq!(
+            crate::network_health::PublishErrorClass::from_u8(
+                stats.publish_retry_last_error_code.load(Ordering::Relaxed)
+            )
+            .map(crate::network_health::PublishErrorClass::label),
+            Some("transport_closed"),
+        );
+
+        // A success clears the active state but keeps the historical evidence.
+        stats.record_publish_success();
+        assert!(!stats.publish_retry_owed.load(Ordering::Relaxed));
+        assert_eq!(
+            stats
+                .publish_retry_consecutive_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(stats.publish_retry_backoff_ms.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            stats.publish_retry_last_failure_ms.load(Ordering::Relaxed),
+            222,
+            "historical last-failure stamp retained across recovery"
+        );
+        assert_ne!(
+            stats.publish_retry_last_error_code.load(Ordering::Relaxed),
+            0,
+            "historical error class retained across recovery"
+        );
+    }
+
+    /// ZEB-877: the fleet publish-failure classifier maps `SyncError` variants to
+    /// the shared stable labels, falling through unmapped variants to `other`,
+    /// and the shared `u8` codec round-trips.
+    #[test]
+    fn fleet_publish_error_class_maps_variants() {
+        use crate::network_health::PublishErrorClass as P;
+        assert_eq!(
+            classify_fleet_publish_error(&SyncError::TransportClosed).label(),
+            "transport_closed"
+        );
+        assert_eq!(
+            classify_fleet_publish_error(&SyncError::Crypto("x".into())).label(),
+            "crypto"
+        );
+        assert_eq!(
+            classify_fleet_publish_error(&SyncError::CborEncode("x".into())).label(),
+            "encode"
+        );
+        // Variants with no dedicated class fall through to `other`.
+        assert_eq!(
+            classify_fleet_publish_error(&SyncError::Persist("x".into())).label(),
+            "other"
+        );
+        assert_eq!(
+            classify_fleet_publish_error(&SyncError::CborDecode("x".into())).label(),
+            "other"
+        );
+        for c in [
+            P::TransportClosed,
+            P::ContentStore,
+            P::Crypto,
+            P::Encode,
+            P::Other,
+        ] {
+            assert_eq!(P::from_u8(c as u8), Some(c));
+        }
+        assert_eq!(P::from_u8(0), None, "0 is the none sentinel");
+    }
+
     #[test]
     fn fleet_root_publish_with_empty_seen_is_byte_identical_to_legacy() {
         let cid = fixed_cid();
@@ -1604,6 +1878,65 @@ mod engine_tests {
 
     fn build_engine(device_id: &str, cas: Arc<dyn ContentStore>, publish_seen: bool) -> Built {
         build_engine_with_keys(device_id, cas, publish_seen, FleetKeySet::new(make_kt()))
+    }
+
+    /// ZEB-877: end-to-end — a wedged publisher's escalating backoff must surface
+    /// through the REAL assembly path (`settle_publish` → `FleetSyncStats` →
+    /// `FleetSyncRegistry::fleet_sync_raw` → `network_health::fleet_sync_row`),
+    /// not just off the stats handle. Mirrors the community
+    /// `publish_retry_backoff_surfaces_in_community_sync_row_zeb762` test.
+    #[tokio::test]
+    async fn fleet_publish_retry_backoff_surfaces_in_fleet_sync_row_zeb877() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let b = build_engine("dev-A", cas, false);
+        // Give the engine unreplicated local work.
+        {
+            let mut doc = b.state.lock().await;
+            doc.entries.insert(
+                "k1".to_string(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "v1".to_string(),
+                },
+            );
+        }
+        // Drop the publisher receiver so every publish fails `TransportClosed`.
+        drop(b.out_rx);
+        // Two failed flushes, each with a fresh dirty signal so the failed publish
+        // settles `Restore` (owes work) → arms + records the retry. (A clean
+        // engine's failed publish settles `Spent` and records nothing — the
+        // gating this asserts through.)
+        b.engine.notify_dirty();
+        let _ = b.engine.flush_now().await;
+        b.engine.notify_dirty();
+        let _ = b.engine.flush_now().await;
+
+        // Read back through the real assembly path.
+        let registry = FleetSyncRegistry::new();
+        registry.register(
+            crate::network_health::FleetDoc::Notes,
+            b.engine.sync_stats(),
+        );
+        let raw = registry.fleet_sync_raw();
+        assert_eq!(raw.len(), 1, "one registered engine");
+        let (doc, r) = raw[0];
+        let row = crate::network_health::fleet_sync_row(doc, r);
+        assert_eq!(row.doc, "notes");
+        let pr = row.publish_retry;
+        assert!(pr.owed, "a wedged publisher must report owed");
+        assert!(
+            pr.consecutive_failures >= 2,
+            "two failed publishes must escalate: {}",
+            pr.consecutive_failures
+        );
+        assert!(
+            pr.backoff_ms >= harmony_crdt_sync::RETRY_BASE_MS,
+            "backoff must have escalated off the base: {}",
+            pr.backoff_ms
+        );
+        assert_eq!(pr.last_error.as_deref(), Some("transport_closed"));
+
+        let _ = b.engine.shutdown().await;
     }
 
     fn build_engine_with_keys(
@@ -3132,11 +3465,19 @@ mod engine_tests {
             "B did not converge from the fetch retry (no republish was sent)"
         );
         assert!(
-            b.engine.fetch_retries_scheduled() >= 1,
+            b.engine
+                .sync_stats()
+                .fetch_retries_scheduled
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1,
             "no retry was scheduled for the fetch miss"
         );
         assert!(
-            b.engine.fetch_retries_run() >= 1,
+            b.engine
+                .sync_stats()
+                .fetch_retries_run
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1,
             "no retry frame was re-processed"
         );
 
@@ -3194,7 +3535,10 @@ mod engine_tests {
             "expected {total_attempts} total fetch attempts (initial + retries)"
         );
         assert_eq!(
-            b.engine.fetch_retries_scheduled(),
+            b.engine
+                .sync_stats()
+                .fetch_retries_scheduled
+                .load(std::sync::atomic::Ordering::Relaxed),
             FETCH_RETRY_ATTEMPTS as u64,
             "retry scheduling must stop at the bound"
         );
@@ -3307,8 +3651,13 @@ mod engine_tests {
         // no additional CAS fetch, no state regression.
         let retry_ran = wait_until(
             || {
-                let engine_runs = b.engine.fetch_retries_run.clone();
-                async move { engine_runs.load(std::sync::atomic::Ordering::Relaxed) >= 1 }
+                let engine_stats = b.engine.sync_stats();
+                async move {
+                    engine_stats
+                        .fetch_retries_run
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        >= 1
+                }
             },
             Duration::from_secs(10),
         )
@@ -3372,7 +3721,10 @@ mod engine_tests {
         .await;
         assert!(converged, "valid frame behind the garbage did not apply");
         assert_eq!(
-            b.engine.fetch_retries_scheduled(),
+            b.engine
+                .sync_stats()
+                .fetch_retries_scheduled
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "a deterministic decode failure must not schedule fetch retries"
         );
@@ -3437,7 +3789,11 @@ mod engine_tests {
         let excess = (flood - FETCH_RETRY_MAX_INFLIGHT) as u64;
         let capped = wait_until(
             || {
-                let dropped = b.engine.fetch_retries_dropped();
+                let dropped = b
+                    .engine
+                    .sync_stats()
+                    .fetch_retries_dropped
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 async move { dropped >= excess }
             },
             Duration::from_secs(20),
@@ -3446,17 +3802,24 @@ mod engine_tests {
         assert!(
             capped,
             "in-flight cap never engaged under the flood: dropped={} (want ≥{excess}) scheduled={} peak={}",
-            b.engine.fetch_retries_dropped(),
-            b.engine.fetch_retries_scheduled(),
-            b.engine.fetch_retry_inflight_peak(),
+            b.engine.sync_stats().fetch_retries_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            b.engine.sync_stats().fetch_retries_scheduled.load(std::sync::atomic::Ordering::Relaxed),
+            b.engine.sync_stats().fetch_retry_inflight_peak.load(std::sync::atomic::Ordering::Relaxed),
         );
         // Structural guard: the semaphore hard-caps concurrent sleepers. This
         // can only hold while the permit gate exists (removing it would leave
         // `dropped` at 0 and fail the assertion above).
         assert!(
-            b.engine.fetch_retry_inflight_peak() <= FETCH_RETRY_MAX_INFLIGHT as u64,
+            b.engine
+                .sync_stats()
+                .fetch_retry_inflight_peak
+                .load(std::sync::atomic::Ordering::Relaxed)
+                <= FETCH_RETRY_MAX_INFLIGHT as u64,
             "peak concurrent retry sleepers {} exceeded the cap {}",
-            b.engine.fetch_retry_inflight_peak(),
+            b.engine
+                .sync_stats()
+                .fetch_retry_inflight_peak
+                .load(std::sync::atomic::Ordering::Relaxed),
             FETCH_RETRY_MAX_INFLIGHT
         );
 

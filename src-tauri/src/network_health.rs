@@ -113,6 +113,13 @@ pub struct NetworkHealthSnapshot {
     /// difference directly.
     #[serde(default)]
     pub community_sync: Vec<CommunitySyncHealth>,
+    /// ZEB-877: per-fleet-engine publish-retry + fetch-retry health — the
+    /// self-replication complement to `community_sync` ("am I publishing MY
+    /// state out to my own devices?"). One row per live `FleetSyncEngine`, keyed
+    /// by a stable doc-type label. Empty until the fleet registry is wired.
+    /// `#[serde(default)]` keeps a pre-field cached snapshot forward-compatible.
+    #[serde(default)]
+    pub fleet_sync: Vec<FleetSyncHealth>,
 }
 
 /// ZEB-805: per-community sync-advance health.
@@ -155,7 +162,7 @@ pub struct CommunitySyncHealth {
     /// convention); the frontend decides the visual-alert threshold.
     /// `#[serde(default)]` keeps a pre-field cached snapshot forward-compatible.
     #[serde(default)]
-    pub publish_retry: CommunityPublishRetryHealth,
+    pub publish_retry: PublishRetryHealth,
 }
 
 /// ZEB-762: per-community publish-side retry state, derived from the engine's
@@ -166,7 +173,7 @@ pub struct CommunitySyncHealth {
 /// `tracing::warn!` in the log file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct CommunityPublishRetryHealth {
+pub struct PublishRetryHealth {
     /// Whether an autonomous publish retry is currently owed — the engine has
     /// unreplicated local state and its last publish failed. The direct
     /// "am I actually replicating outward?" bit.
@@ -190,6 +197,48 @@ pub struct CommunityPublishRetryHealth {
     pub last_error: Option<Cow<'static, str>>,
 }
 
+/// ZEB-762 / ZEB-877: coarse class of a publish-path failure, shared by the
+/// community and fleet sync engines. Encoded as a stable `u8` in an atomic
+/// (`0` = none, so the discriminants start at 1). Deliberately coarse: an
+/// operator needs "is publishing failing, and roughly why (transport vs storage
+/// vs crypto vs encode)", not the full `Display`. This enum owns the stable u8
+/// codec and the class→label map; each engine owns its own error→class
+/// classifier (its error type is engine-local) so this module depends on
+/// neither error type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PublishErrorClass {
+    TransportClosed = 1,
+    ContentStore = 2,
+    Crypto = 3,
+    Encode = 4,
+    Other = 5,
+}
+
+impl PublishErrorClass {
+    pub fn from_u8(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::TransportClosed),
+            2 => Some(Self::ContentStore),
+            3 => Some(Self::Crypto),
+            4 => Some(Self::Encode),
+            5 => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    /// Stable snake_case label surfaced on the wire (`lastError`). Stable
+    /// because operators / dashboards key off it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TransportClosed => "transport_closed",
+            Self::ContentStore => "content_store",
+            Self::Crypto => "crypto",
+            Self::Encode => "encode",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// ZEB-805 raw per-community counters, read from the engine registry. Kept
 /// separate from the DTO so tier policy stays here in `network_health` rather
 /// than leaking into the sync engine.
@@ -203,7 +252,7 @@ pub struct CommunitySyncRaw {
     pub fetch_retries_dropped: u64,
     pub fetch_retries_exhausted: u64,
     /// ZEB-762: publish-side `RetryBackoff` state (outbound replication). See
-    /// [`CommunityPublishRetryHealth`] for what each maps to.
+    /// [`PublishRetryHealth`] for what each maps to.
     pub publish_retry_owed: bool,
     pub publish_retry_consecutive_failures: u64,
     pub publish_retry_backoff_ms: u64,
@@ -219,6 +268,105 @@ pub struct CommunitySyncRaw {
 #[async_trait::async_trait]
 pub trait CommunitySyncSource: Send + Sync {
     async fn per_community(&self) -> Vec<(crate::owner_state_types::SpaceId, CommunitySyncRaw)>;
+}
+
+/// ZEB-877: which fleet CRDT dataset a `fleetSync` row describes. The registry
+/// key AND the wire `doc` label — 11 live `FleetSyncEngine` datasets (the two
+/// `OwnerState`-typed ones are distinguished as `OwnerState` vs `OwnerTrust`).
+/// `Ord` so the registry `BTreeMap` enumerates deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FleetDoc {
+    OwnerState,
+    OwnerTrust,
+    Notes,
+    DmInbox,
+    CommunityDeviceIntro,
+    RelayHold,
+    RelayOptIn,
+    DmOuthold,
+    FleetNet,
+    OwnerQuorum,
+    FleetKeys,
+}
+
+impl FleetDoc {
+    /// Stable camelCase label surfaced on the wire (`doc`). Stable because
+    /// operators / dashboards key off it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OwnerState => "ownerState",
+            Self::OwnerTrust => "ownerTrust",
+            Self::Notes => "notes",
+            Self::DmInbox => "dmInbox",
+            Self::CommunityDeviceIntro => "communityDeviceIntro",
+            Self::RelayHold => "relayHold",
+            Self::RelayOptIn => "relayOptIn",
+            Self::DmOuthold => "dmOuthold",
+            Self::FleetNet => "fleetNet",
+            Self::OwnerQuorum => "ownerQuorum",
+            Self::FleetKeys => "fleetKeys",
+        }
+    }
+}
+
+/// ZEB-877 raw per-fleet-engine counters, read from the engine registry. Kept
+/// separate from the DTO so tier policy stays in `network_health` rather than
+/// leaking into the sync engine (mirrors [`CommunitySyncRaw`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FleetSyncRaw {
+    pub fetch_retries_scheduled: u64,
+    pub fetch_retries_run: u64,
+    pub fetch_retries_dropped: u64,
+    /// Retries that exhausted their attempt budget — the publish was permanently
+    /// lost (recovered only by a peer re-publish/re-offer). The "am I losing
+    /// publishes?" counter.
+    pub fetch_retries_exhausted: u64,
+    pub fetch_retry_inflight_peak: u64,
+    /// Publish-side `RetryBackoff` state (outbound replication). See
+    /// [`PublishRetryHealth`] for what each maps to.
+    pub publish_retry_owed: bool,
+    pub publish_retry_consecutive_failures: u64,
+    pub publish_retry_backoff_ms: u64,
+    /// `0` means never.
+    pub publish_retry_last_failure_ms: u64,
+    /// `None` means never. A stable snake_case class label owned by the engine.
+    pub publish_retry_last_error: Option<&'static str>,
+}
+
+/// ZEB-877: per-fleet-engine sync health — the self-replication complement to
+/// [`CommunitySyncHealth`]. Publish-retry answers "am I successfully publishing
+/// MY state out to my own devices?"; the ZEB-705 fetch counters answer "am I
+/// keeping up with inbound fetch retries?". Always present for a live engine
+/// (present-and-zeroed = live, per this snapshot's convention); the frontend
+/// decides the visual-alert threshold.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetSyncHealth {
+    /// Stable camelCase dataset label (`ownerState`, `dmInbox`, …) — which fleet
+    /// engine this row describes. From [`FleetDoc::label`].
+    pub doc: String,
+    /// ZEB-705 bounded fetch-retry counters (promoted to real telemetry by
+    /// ZEB-877). Same reading as the community row's `fetchRetries*`.
+    pub fetch_retries_scheduled: u64,
+    pub fetch_retries_run: u64,
+    pub fetch_retries_dropped: u64,
+    /// Retries that exhausted their attempt budget (publish permanently lost).
+    pub fetch_retries_exhausted: u64,
+    pub fetch_retry_inflight_peak: u64,
+    /// Publish-side `RetryBackoff` health. `owed: true` with `backoffMs` at/near
+    /// the 600 s cap is the sustained-stall incident this surface reveals — a
+    /// node durably holding local state it can no longer replicate to its own
+    /// devices. `#[serde(default)]` keeps a pre-field cached snapshot valid.
+    #[serde(default)]
+    pub publish_retry: PublishRetryHealth,
+}
+
+/// ZEB-877: source of per-fleet-engine sync counters. Implemented by the fleet
+/// engine registry; `None` on the service (rows empty) until boot wires it,
+/// mirroring the [`CommunitySyncSource`] seam.
+#[async_trait::async_trait]
+pub trait FleetSyncSource: Send + Sync {
+    async fn per_fleet(&self) -> Vec<(FleetDoc, FleetSyncRaw)>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1740,6 +1888,8 @@ impl NetworkHealthSnapshot {
             // ZEB-824: no service ⇒ no gateway-dial driver telemetry wired.
             gateway_bootstrap: None,
             community_sync: Vec::new(),
+            // ZEB-877: no service ⇒ no fleet engine registry wired.
+            fleet_sync: Vec::new(),
         }
     }
 }
@@ -1920,12 +2070,36 @@ pub fn community_sync_row(
         fetch_retries_scheduled: raw.fetch_retries_scheduled,
         fetch_retries_dropped: raw.fetch_retries_dropped,
         fetch_retries_exhausted: raw.fetch_retries_exhausted,
-        publish_retry: CommunityPublishRetryHealth {
+        publish_retry: PublishRetryHealth {
             owed: raw.publish_retry_owed,
             consecutive_failures: raw.publish_retry_consecutive_failures,
             backoff_ms: raw.publish_retry_backoff_ms,
             // `0` is the engine's "never" sentinel — same treatment as the
             // inbound/advance stamps above.
+            last_failure_ms: (raw.publish_retry_last_failure_ms != 0)
+                .then_some(raw.publish_retry_last_failure_ms),
+            last_error: raw.publish_retry_last_error.map(Cow::Borrowed),
+        },
+    }
+}
+
+/// ZEB-877: assemble one `fleetSync` row from the registry's raw counters. No
+/// staleness/timestamp derivation — fleet engines expose publish-retry + the
+/// ZEB-705 fetch-retry counters only (unlike the community row's
+/// inbound/advance stamps). Split out from `snapshot` so tests can drive it.
+pub fn fleet_sync_row(doc: FleetDoc, raw: FleetSyncRaw) -> FleetSyncHealth {
+    FleetSyncHealth {
+        doc: doc.label().to_string(),
+        fetch_retries_scheduled: raw.fetch_retries_scheduled,
+        fetch_retries_run: raw.fetch_retries_run,
+        fetch_retries_dropped: raw.fetch_retries_dropped,
+        fetch_retries_exhausted: raw.fetch_retries_exhausted,
+        fetch_retry_inflight_peak: raw.fetch_retry_inflight_peak,
+        publish_retry: PublishRetryHealth {
+            owed: raw.publish_retry_owed,
+            consecutive_failures: raw.publish_retry_consecutive_failures,
+            backoff_ms: raw.publish_retry_backoff_ms,
+            // `0` is the engine's "never" sentinel — map to None.
             last_failure_ms: (raw.publish_retry_last_failure_ms != 0)
                 .then_some(raw.publish_retry_last_failure_ms),
             last_error: raw.publish_retry_last_error.map(Cow::Borrowed),
@@ -2319,6 +2493,10 @@ pub struct NetworkHealthService {
     /// [`set_community_sync_source`](Self::set_community_sync_source). `None`
     /// (rows empty) until boot wires the engine registry.
     community_sync: Option<std::sync::Arc<dyn CommunitySyncSource>>,
+    /// ZEB-877: per-fleet-engine sync counters, set by
+    /// [`set_fleet_sync_source`](Self::set_fleet_sync_source). `None` (rows
+    /// empty) until boot wires the fleet engine registry.
+    fleet_sync: Option<std::sync::Arc<dyn FleetSyncSource>>,
 }
 
 impl NetworkHealthService {
@@ -2354,6 +2532,7 @@ impl NetworkHealthService {
             gateway_bootstrap: None,
             peer_traffic: None,
             community_sync: None,
+            fleet_sync: None,
         }
     }
 
@@ -2474,6 +2653,13 @@ impl NetworkHealthService {
         src: std::sync::Arc<dyn CommunitySyncSource>,
     ) {
         self.community_sync = Some(src);
+    }
+
+    /// ZEB-877: wire the fleet engine registry as the per-fleet-engine sync
+    /// counter source. Until this is called the `fleet_sync` rows are empty,
+    /// which renders as "no engines" rather than as a fault.
+    pub(crate) fn set_fleet_sync_source(&mut self, src: std::sync::Arc<dyn FleetSyncSource>) {
+        self.fleet_sync = Some(src);
     }
 
     /// Spec §5.1: read from all sources, synthesize a snapshot. Never
@@ -2835,6 +3021,15 @@ impl NetworkHealthService {
                     .await
                     .into_iter()
                     .map(|(id, raw)| community_sync_row(id, raw, now))
+                    .collect(),
+                None => Vec::new(),
+            },
+            fleet_sync: match self.fleet_sync.as_ref() {
+                Some(src) => src
+                    .per_fleet()
+                    .await
+                    .into_iter()
+                    .map(|(doc, raw)| fleet_sync_row(doc, raw))
                     .collect(),
                 None => Vec::new(),
             },
@@ -4550,6 +4745,7 @@ mod tests {
             vine_relay: None,
             gateway_bootstrap: None,
             community_sync: Vec::new(),
+            fleet_sync: Vec::new(),
         }
     }
 
@@ -6377,9 +6573,97 @@ mod tests {
         let json = r#"{"communityShort":"abcd0123","lastInboundMs":null,"lastAdvanceMs":null,"staleness":null,"fetchRetriesScheduled":0,"fetchRetriesDropped":0,"fetchRetriesExhausted":0}"#;
         let row: CommunitySyncHealth =
             serde_json::from_str(json).expect("pre-ZEB-762 row still deserializes");
-        assert_eq!(row.publish_retry, CommunityPublishRetryHealth::default());
+        assert_eq!(row.publish_retry, PublishRetryHealth::default());
         assert!(!row.publish_retry.owed);
         assert_eq!(row.publish_retry.last_error, None);
+    }
+
+    /// ZEB-877: the fleet row serializes camelCase, no snake_case key leaks, and
+    /// the shared `PublishRetryHealth` sub-object round-trips (rename guard).
+    #[test]
+    fn fleet_sync_row_serde_is_camel_case() {
+        let row = fleet_sync_row(
+            FleetDoc::OwnerState,
+            FleetSyncRaw {
+                fetch_retries_scheduled: 1,
+                fetch_retries_run: 2,
+                fetch_retries_dropped: 3,
+                fetch_retries_exhausted: 9,
+                fetch_retry_inflight_peak: 4,
+                publish_retry_owed: true,
+                publish_retry_consecutive_failures: 5,
+                publish_retry_backoff_ms: 120_000,
+                publish_retry_last_failure_ms: 8,
+                publish_retry_last_error: Some("transport_closed"),
+            },
+        );
+        assert_eq!(row.doc, "ownerState");
+        let json = serde_json::to_string(&row).expect("serialize");
+        for key in [
+            "doc",
+            "fetchRetriesScheduled",
+            "fetchRetriesRun",
+            "fetchRetriesDropped",
+            "fetchRetriesExhausted",
+            "fetchRetryInflightPeak",
+            "publishRetry",
+            "owed",
+            "consecutiveFailures",
+            "backoffMs",
+            "lastFailureMs",
+            "lastError",
+        ] {
+            assert!(json.contains(key), "missing {key} in {json}");
+        }
+        for leak in [
+            "fetch_retries_scheduled",
+            "fetch_retries_run",
+            "fetch_retries_dropped",
+            "fetch_retries_exhausted",
+            "fetch_retry_inflight_peak",
+            "publish_retry",
+            "consecutive_failures",
+            "backoff_ms",
+            "last_failure_ms",
+            "last_error",
+        ] {
+            assert!(!json.contains(leak), "snake_case leak {leak} in {json}");
+        }
+        let back: FleetSyncHealth = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back, row);
+        assert!(row.publish_retry.owed);
+        assert_eq!(row.publish_retry.backoff_ms, 120_000);
+        assert_eq!(row.publish_retry.last_failure_ms, Some(8));
+        assert_eq!(
+            row.publish_retry.last_error.as_deref(),
+            Some("transport_closed")
+        );
+    }
+
+    /// ZEB-877: a pre-field fleet row (no `publishRetry` key) still deserializes;
+    /// `#[serde(default)]` fills it rather than failing (spec §6.1).
+    #[test]
+    fn fleet_sync_health_tolerates_absent_publish_retry() {
+        let json = r#"{"doc":"ownerState","fetchRetriesScheduled":0,"fetchRetriesRun":0,"fetchRetriesDropped":0,"fetchRetriesExhausted":0,"fetchRetryInflightPeak":0}"#;
+        let row: FleetSyncHealth =
+            serde_json::from_str(json).expect("pre-ZEB-877 fleet row still deserializes");
+        assert_eq!(row.publish_retry, PublishRetryHealth::default());
+        assert!(!row.publish_retry.owed);
+    }
+
+    /// ZEB-877: a pre-field cached snapshot has no `fleetSync` key; `#[serde(
+    /// default)]` fills it with an empty vec rather than failing the whole
+    /// deserialize (spec §6.1: the snapshot never throws).
+    #[test]
+    fn snapshot_tolerates_absent_fleet_sync() {
+        let json = serde_json::to_string(&NetworkHealthSnapshot::empty()).expect("serialize empty");
+        let mut v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        // Simulate a pre-ZEB-877 cached snapshot by dropping the field.
+        v.as_object_mut().unwrap().remove("fleetSync");
+        let stripped = serde_json::to_string(&v).expect("reserialize");
+        let snap: NetworkHealthSnapshot =
+            serde_json::from_str(&stripped).expect("pre-ZEB-877 snapshot still deserializes");
+        assert!(snap.fleet_sync.is_empty());
     }
 
     /// Tier boundaries with an injected `now` (no wall clock): fresh below

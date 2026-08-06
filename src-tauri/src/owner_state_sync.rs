@@ -185,6 +185,14 @@ impl SyncEngine {
         self.inner.root_serve_tx()
     }
 
+    /// ZEB-877: expose the inner engine's shared sync-observability handle so the
+    /// fleet health registry can read this owner-state engine's publish-retry +
+    /// fetch counters. The wrapper isn't a `FleetSyncEngine`, so it delegates
+    /// like the methods around it. See `FleetSyncEngine::sync_stats`.
+    pub(crate) fn sync_stats(&self) -> std::sync::Arc<crate::fleet_sync::FleetSyncStats> {
+        self.inner.sync_stats()
+    }
+
     /// Force an immediate publish, bypassing the debounce window.
     /// Returns when the publish has been written to the outbound
     /// channel and any persistence flush has completed.

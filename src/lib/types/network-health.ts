@@ -210,6 +210,14 @@ export interface NetworkHealthSnapshot {
    * array means no engines are running, which is honest rather than a fault.
    */
   communitySync?: CommunitySyncHealth[];
+  /**
+   * ZEB-877: per-fleet-engine publish-retry + fetch-retry health, one row per
+   * live `FleetSyncEngine` (owner-state, dm-inbox, notes, …). The
+   * self-replication complement to `communitySync`: "am I publishing MY state
+   * out to my own devices?". Absent on pre-field snapshots (Rust
+   * `#[serde(default)]`); an empty array means no engines are running.
+   */
+  fleetSync?: FleetSyncHealth[];
 }
 
 /**
@@ -271,16 +279,17 @@ export interface CommunitySyncHealth {
    * healthy state. Optional here only for forward-compat with a pre-field
    * cached snapshot (Rust `#[serde(default)]`).
    */
-  publishRetry?: CommunityPublishRetryHealth;
+  publishRetry?: PublishRetryHealth;
 }
 
 /**
- * ZEB-762: per-community publish-side retry state (camelCase mirror of Rust
- * `CommunityPublishRetryHealth`, network_health.rs). `owed: true` with
- * `backoffMs` at/near the 600 s cap (ZEB-761) is the sustained-stall incident:
- * a node durably holding local state it can no longer replicate outward.
+ * ZEB-762 / ZEB-877: publish-side RetryBackoff state (camelCase mirror of Rust
+ * `PublishRetryHealth`, network_health.rs). Shared by `CommunitySyncHealth` and
+ * `FleetSyncHealth`. `owed: true` with `backoffMs` at/near the 600 s cap
+ * (ZEB-761) is the sustained-stall incident: a node durably holding local state
+ * it can no longer replicate outward.
  */
-export interface CommunityPublishRetryHealth {
+export interface PublishRetryHealth {
   /** Whether an autonomous publish retry is currently owed. */
   owed: boolean;
   /** Consecutive failed publish attempts since the last success (unbounded). */
@@ -294,6 +303,39 @@ export interface CommunityPublishRetryHealth {
    * `content_store` / `crypto` / `encode` / `other`). `null` if none ever.
    */
   lastError?: string | null;
+}
+
+/**
+ * ZEB-877: per-fleet-engine sync health (camelCase mirror of Rust
+ * `FleetSyncHealth`, network_health.rs) — the self-replication complement to
+ * `CommunitySyncHealth`. `publishRetry` answers "am I successfully publishing MY
+ * state out to my own devices?"; the ZEB-705 `fetchRetries*` counters answer "am
+ * I keeping up with inbound fetch retries?". One row per live fleet engine,
+ * keyed by `doc`.
+ */
+export interface FleetSyncHealth {
+  /**
+   * Stable dataset label — which fleet engine this row describes: `ownerState`,
+   * `ownerTrust`, `notes`, `dmInbox`, `communityDeviceIntro`, `relayHold`,
+   * `relayOptIn`, `dmOuthold`, `fleetNet`, `ownerQuorum`, or `fleetKeys`.
+   */
+  doc: string;
+  /**
+   * ZEB-705 bounded fetch-retry counters. `fetchRetriesExhausted` is the "am I
+   * losing publishes?" signal — retries that spent their whole attempt budget
+   * and dropped the publish (recovered only by a peer re-publish/re-offer).
+   */
+  fetchRetriesScheduled: number;
+  fetchRetriesRun: number;
+  fetchRetriesDropped: number;
+  fetchRetriesExhausted: number;
+  fetchRetryInflightPeak: number;
+  /**
+   * Publish-side RetryBackoff health. Always present for a live engine; `owed:
+   * false` with zero counters is healthy. Optional here only for forward-compat
+   * with a pre-field cached snapshot (Rust `#[serde(default)]`).
+   */
+  publishRetry?: PublishRetryHealth;
 }
 
 /** ZEB-702: process-lifetime butler-deposit decision counters (camelCase
