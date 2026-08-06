@@ -726,10 +726,11 @@ impl VineFeedCache {
         // sorts `created_at` DESC). Reject anything dated further ahead than the
         // display-tier tolerance, mirroring the sibling pull-cursor bound
         // (`vine_pull_driver::VINE_PULL_INVALID_FORWARD_SKEW_SECS`). Seconds domain.
-        if crate::clock_trust::reject_future(
-            descriptor.created_at,
-            now_secs,
-            crate::clock_trust::DISPLAY_SKEW_TOLERANCE_SECS,
+        if crate::clock_trust::reject_future_logged(
+            descriptor.created_at.saturating_mul(1000),
+            now_secs.saturating_mul(1000),
+            crate::clock_trust::DISPLAY_SKEW_TOLERANCE_MS,
+            "vine_feed.descriptor.created_at",
         ) {
             return Some(DescriptorOutcome::Rejected(format!(
                 "descriptor {} is dated further ahead than the plausible clock window",

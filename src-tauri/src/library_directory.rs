@@ -478,10 +478,11 @@ pub fn verify_announce(
 
     // (4) Forward-skew bound on the self-attested `listed_at` (DISPLAY tier).
     if let Some(now) = now_ms {
-        if crate::clock_trust::reject_future(
+        if crate::clock_trust::reject_future_logged(
             announce.listed_at.wall_ms,
             now,
             crate::clock_trust::DISPLAY_SKEW_TOLERANCE_MS,
+            "library_directory.announce.listed_at",
         ) {
             return Err(AnnounceVerifyError::ListedAtTooFarInFuture);
         }
