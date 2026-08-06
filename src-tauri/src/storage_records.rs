@@ -69,12 +69,22 @@ pub enum RecordOutcome {
     Inserted,
     UpdatedNewer,
     IgnoredOlder,
+    /// A valid new-owner sample that was admitted but immediately
+    /// self-evicted because the family was already at
+    /// [`MAX_TRACKED_OWNERS`] (ZEB-869). The insert carried the newest
+    /// `seq`, so [`evict_overflow`] dropped exactly that row under the
+    /// freeze-when-full policy — net state is unchanged. Like
+    /// `IgnoredOlder`, it is NOT a `changed()` outcome, so callers fire
+    /// neither `save()` nor `storage-buddies-updated` for a row that was
+    /// not retained.
+    IgnoredAtCap,
     Rejected(String),
 }
 
 impl RecordOutcome {
     /// True when the store changed — the caller's emit-on-real-change
-    /// signal.
+    /// signal. `IgnoredAtCap` is a net no-op (transient insert+evict), so
+    /// it is deliberately excluded alongside `IgnoredOlder`/`Rejected`.
     pub fn changed(&self) -> bool {
         matches!(self, RecordOutcome::Inserted | RecordOutcome::UpdatedNewer)
     }
@@ -494,6 +504,7 @@ impl StorageRecordStore {
                 Err(e) => return RecordOutcome::Rejected(e),
             };
         let seq = self.next_insert_seq();
+        let owner_key = list.owner_address.clone();
         let outcome = lww_insert(
             &mut self.pledge_lists,
             list.owner_address,
@@ -505,9 +516,7 @@ impl StorageRecordStore {
             },
             |r| r.updated_at,
         );
-        if outcome.changed() {
-            evict_overflow(&mut self.pledge_lists, |r| r.seq);
-        }
+        let outcome = settle_bounded_insert(outcome, &mut self.pledge_lists, &owner_key, |r| r.seq);
         if pin_changed {
             evict_pins(
                 &mut self.signer_pins,
@@ -568,6 +577,7 @@ impl StorageRecordStore {
                 Err(e) => return RecordOutcome::Rejected(e),
             };
         let seq = self.next_insert_seq();
+        let owner_key = set.owner_address.clone();
         let outcome = lww_insert(
             &mut self.backup_sets,
             set.owner_address,
@@ -579,9 +589,7 @@ impl StorageRecordStore {
             },
             |r| r.updated_at,
         );
-        if outcome.changed() {
-            evict_overflow(&mut self.backup_sets, |r| r.seq);
-        }
+        let outcome = settle_bounded_insert(outcome, &mut self.backup_sets, &owner_key, |r| r.seq);
         if pin_changed {
             evict_pins(
                 &mut self.signer_pins,
@@ -637,6 +645,7 @@ impl StorageRecordStore {
                 Err(e) => return RecordOutcome::Rejected(e),
             };
         let seq = self.next_insert_seq();
+        let owner_key = report.owner_address.clone();
         let outcome = lww_insert(
             &mut self.hosting_reports,
             report.owner_address,
@@ -648,10 +657,9 @@ impl StorageRecordStore {
             },
             |r| r.updated_at,
         );
-        if outcome.changed() {
-            evict_overflow(&mut self.hosting_reports, |r| r.seq);
-            // Hosting reports are in-memory only — no save() for them…
-        }
+        let outcome =
+            settle_bounded_insert(outcome, &mut self.hosting_reports, &owner_key, |r| r.seq);
+        // Hosting reports are in-memory only — no record-driven save()…
         if pin_changed {
             evict_pins(
                 &mut self.signer_pins,
@@ -904,6 +912,34 @@ fn evict_overflow<R>(map: &mut HashMap<String, R>, seq: impl Fn(&R) -> u64) {
             None => break,
         }
     }
+}
+
+/// Finalize a bounded-store ingest: run overflow eviction for a `changed`
+/// outcome, then downgrade a brand-new owner that self-evicted at
+/// [`MAX_TRACKED_OWNERS`] to [`RecordOutcome::IgnoredAtCap`] (ZEB-869).
+///
+/// Under the freeze-when-full policy a newcomer at cap carries the newest
+/// `seq`, so [`evict_overflow`] drops exactly the row [`lww_insert`] just
+/// added — a transient insert-then-evict whose net state change is nil. The
+/// downgraded outcome keeps callers from firing `save()` /
+/// `storage-buddies-updated` for a record that was not retained. Only an
+/// `Inserted` can grow the map, so `UpdatedNewer` is never downgraded. The
+/// post-eviction `contains_key` check is robust to the eviction key: it
+/// confirms the newcomer's actual fate rather than assuming it was the
+/// victim.
+fn settle_bounded_insert<R>(
+    outcome: RecordOutcome,
+    map: &mut HashMap<String, R>,
+    owner: &str,
+    seq: impl Fn(&R) -> u64,
+) -> RecordOutcome {
+    if outcome.changed() {
+        evict_overflow(map, seq);
+        if matches!(outcome, RecordOutcome::Inserted) && !map.contains_key(owner) {
+            return RecordOutcome::IgnoredAtCap;
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -1368,6 +1404,104 @@ mod tests {
             "newest (max seq) evicted first"
         );
         assert!(store.pledge_list("owner-0000").is_some());
+    }
+
+    #[test]
+    fn newcomer_at_cap_self_evicts_reports_ignored_not_inserted() {
+        // ZEB-869: a valid NEW-owner sample ingested while the family is
+        // already at MAX_TRACKED_OWNERS transiently inserts then
+        // self-evicts (it carries the newest `seq`, so `evict_overflow`
+        // drops exactly that row). The handler must report the NET outcome
+        // — `IgnoredAtCap`, not `Inserted` — so the caller fires neither
+        // `save()` nor `storage-buddies-updated` for a row it did not
+        // retain (both are gated solely on `.changed()`).
+        let mut store = StorageRecordStore::new(None);
+        // Fill to cap directly; driving 1024 signed ingests would only
+        // re-test signing (mirrors `owner_cap_evicts_overflow_*`).
+        for i in 0..MAX_TRACKED_OWNERS {
+            store.pledge_lists.insert(
+                format!("owner-{i:04}"),
+                PledgeListRecord {
+                    pledges: vec![],
+                    updated_at: 1,
+                    received_at_ms: i as u64 + 1,
+                    seq: i as u64,
+                },
+            );
+        }
+        // Next minted seq is strictly the highest → the newcomer is the
+        // eviction victim.
+        store.insert_seq = MAX_TRACKED_OWNERS as u64;
+        assert_eq!(store.pledge_lists.len(), MAX_TRACKED_OWNERS);
+
+        let id = test_identity();
+        let newcomer = addr_of(&id);
+        assert!(!store.pledge_lists.contains_key(&newcomer));
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("someone", 5)], 10);
+
+        let outcome = store.on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000);
+
+        assert_eq!(
+            outcome,
+            RecordOutcome::IgnoredAtCap,
+            "newcomer at cap self-evicts → net no-op, must not report Inserted"
+        );
+        assert!(
+            !outcome.changed(),
+            "IgnoredAtCap must not drive save()/storage-buddies-updated"
+        );
+        assert!(
+            store.pledge_list(&newcomer).is_none(),
+            "the self-evicted newcomer must not be retained"
+        );
+        assert_eq!(
+            store.pledge_lists.len(),
+            MAX_TRACKED_OWNERS,
+            "freeze-when-full: established working set unchanged"
+        );
+    }
+
+    #[test]
+    fn updated_newer_at_cap_still_reports_updated() {
+        // ZEB-869 scope boundary: an LWW-replace of an EXISTING owner does
+        // not grow the map, so it never self-evicts — the newcomer
+        // downgrade must NOT swallow a legitimate update at cap.
+        let mut store = StorageRecordStore::new(None);
+        let id = test_identity();
+        let owner = addr_of(&id);
+
+        // Seed this owner (v1) through the real ingest path, then fill the
+        // REST of the family to cap with direct rows.
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("someone", 5)], 10);
+        assert_eq!(
+            store.on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000),
+            RecordOutcome::Inserted
+        );
+        for i in 0..(MAX_TRACKED_OWNERS - 1) {
+            store.pledge_lists.insert(
+                format!("owner-{i:04}"),
+                PledgeListRecord {
+                    pledges: vec![],
+                    updated_at: 1,
+                    received_at_ms: i as u64 + 1,
+                    seq: i as u64,
+                },
+            );
+        }
+        assert_eq!(store.pledge_lists.len(), MAX_TRACKED_OWNERS);
+
+        // A strictly-newer sample for the SAME owner (updated_at 10 → 20).
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("someone", 7)], 20);
+        let outcome = store.on_pledge_list_sample(&topic, &bytes, &rvk(), 9_100);
+
+        assert_eq!(
+            outcome,
+            RecordOutcome::UpdatedNewer,
+            "LWW-replace at cap does not grow the map → still a real change"
+        );
+        assert!(outcome.changed());
+        assert_eq!(store.pledge_list(&owner).unwrap().pledges[0].bytes, 7);
+        assert_eq!(store.pledge_lists.len(), MAX_TRACKED_OWNERS);
     }
 
     #[test]

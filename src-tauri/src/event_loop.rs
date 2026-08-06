@@ -7426,8 +7426,22 @@ fn note_storage_record_sample(
         "hosting" => store.on_hosting_report_sample(key_expr, payload, revoked, now),
         _ => return false,
     };
-    if let RecordOutcome::Rejected(reason) = &outcome {
-        tracing::debug!(key = %key_expr, %reason, "storage record rejected");
+    match &outcome {
+        RecordOutcome::Rejected(reason) => {
+            tracing::debug!(key = %key_expr, %reason, "storage record rejected");
+        }
+        // ZEB-869: a valid newcomer dropped by freeze-when-full is a
+        // benign, self-healing no-op (like an honest skewed-clock reject,
+        // ZEB-855) — log at debug so the silent drop is diagnosable, but
+        // do NOT emit `storage-buddies-updated` (`.changed()` is false).
+        RecordOutcome::IgnoredAtCap => {
+            tracing::debug!(
+                key = %key_expr,
+                cap = crate::storage_records::MAX_TRACKED_OWNERS,
+                "storage record dropped at cap: family full, newcomer self-evicted (freeze-when-full)"
+            );
+        }
+        _ => {}
     }
     outcome.changed()
 }
