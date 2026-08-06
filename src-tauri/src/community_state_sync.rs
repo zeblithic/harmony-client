@@ -813,6 +813,21 @@ pub enum LocalInsertError {
     /// error; there is no silent third outcome.
     #[error("community engine is shutting down (node stopped?)")]
     EngineShuttingDown,
+    /// ZEB-875: a claimant-bound single-use invite token already has a
+    /// committed PendingJoin from a *different* actor; a distinct claimant is
+    /// refused before any state mutation. Returned by the
+    /// `NoConflictingClaimantForInvite` precheck under the same `state` lock as
+    /// the append, so the claim is atomic — two racing distinct actors can't
+    /// both pass. `winner` is the actor that already holds the claim.
+    #[error("invite token already claimed by a different actor")]
+    InviteAlreadyClaimed { winner: OwnerAddr },
+    /// ZEB-875: `insert_local_claim_bound_pending_join` was handed an event
+    /// whose kind is not `PendingJoin` — it carries no invite token to bind the
+    /// single-use claim to. Refused rather than silently inserted unclaimed
+    /// (the claim seam must be hard to misuse). Not reachable from the live
+    /// redeem path, which only routes `PendingJoin` events here.
+    #[error("claim-bound insert requires a PendingJoin event (carries no invite token otherwise)")]
+    ClaimBoundEventNotPendingJoin,
 }
 
 /// ZEB-583: an optional check run under the SAME `state` lock guard as the
@@ -828,6 +843,16 @@ enum LocalInsertPrecheck {
     /// (its name `trim().to_lowercase()`-ed) as its name. `display` is the
     /// trimmed name carried for the error message.
     UniqueLiveChannelName { normalized: String, display: String },
+    /// ZEB-875: reject if a committed `PendingJoin` for `invite_token_sig`
+    /// already exists from an actor other than `claimant`. Binds an invite's
+    /// single-use claim to its first actor: a distinct actor is refused, the
+    /// same actor is idempotent (falls through to the usual `AlreadyKnown`).
+    /// Runs under the same `state` lock as the append, so two concurrent
+    /// distinct-actor redeems of one token can't both pass.
+    NoConflictingClaimantForInvite {
+        invite_token_sig: [u8; 64],
+        claimant: OwnerAddr,
+    },
 }
 
 impl LocalInsertPrecheck {
@@ -845,6 +870,29 @@ impl LocalInsertPrecheck {
                     return Err(LocalInsertError::DuplicateChannelName {
                         display: display.clone(),
                     });
+                }
+                Ok(())
+            }
+            LocalInsertPrecheck::NoConflictingClaimantForInvite {
+                invite_token_sig,
+                claimant,
+            } => {
+                // ZEB-875: scan RAW committed events (not the materialized
+                // roster) so the claim is permanent — robust to a later
+                // Leave/Kick and to the 30-day PendingJoin materialize expiry.
+                // The event log is durably persisted + CRDT-synced, so this
+                // verdict survives a host restart with no in-memory index.
+                for ev in state.events() {
+                    if let crate::community_membership::MembershipEventKind::PendingJoin {
+                        invite_token,
+                    } = &ev.kind
+                    {
+                        if invite_token.sig == *invite_token_sig && ev.actor != *claimant {
+                            return Err(LocalInsertError::InviteAlreadyClaimed {
+                                winner: ev.actor,
+                            });
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -1638,6 +1686,53 @@ impl CommunitySyncEngine {
             Some(LocalInsertPrecheck::UniqueLiveChannelName {
                 normalized: normalized_name,
                 display: display_name,
+            }),
+        )
+        .await
+    }
+
+    /// ZEB-875: atomic claimant-bound single-use invite insert. Under the one
+    /// `state` lock, the `NoConflictingClaimantForInvite` precheck refuses the
+    /// insert if a committed PendingJoin for this invite token's `sig` already
+    /// exists from a *different* actor (returns
+    /// `LocalInsertError::InviteAlreadyClaimed`); a same-actor re-insert is the
+    /// usual idempotent `AlreadyKnown`. This binds an invite's single-use to
+    /// its first claimant, so it is enforceable across distinct actors while
+    /// the legitimate joiner can always retry. The claim is a pure function of
+    /// the persisted, CRDT-synced event set (durable across a host restart, no
+    /// in-memory index). Local invite-redeem path only; remote/sync inserts
+    /// never carry a precheck.
+    ///
+    /// The claim key (token sig) and the claimant are derived from the event
+    /// itself, never from separate caller-supplied args (Qodo #1 + CodeAnt,
+    /// Security): a caller passing an inconsistent `(sig, claimant)` — or an
+    /// outer packet token that differs from the event's embedded token — could
+    /// otherwise claim one credential while committing an event for another,
+    /// leaving the redeemed token unclaimed and reusable. A non-`PendingJoin`
+    /// event is refused (`ClaimBoundEventNotPendingJoin`) rather than silently
+    /// applying a token-claim precheck to a shape that carries no token.
+    pub async fn insert_local_claim_bound_pending_join(
+        &self,
+        event: crate::community_membership::SignedMembershipEvent,
+    ) -> Result<crate::community_state_crdt::InsertOutcome, LocalInsertError> {
+        if event.community_id != self.community_id {
+            return Err(LocalInsertError::WrongCommunity {
+                expected: self.community_id,
+                got: event.community_id,
+            });
+        }
+        let invite_token_sig = match &event.kind {
+            crate::community_membership::MembershipEventKind::PendingJoin { invite_token } => {
+                invite_token.sig
+            }
+            _ => return Err(LocalInsertError::ClaimBoundEventNotPendingJoin),
+        };
+        let claimant = event.actor;
+        self.insert_event_with_resolved_pubs(
+            event,
+            Some(LocalInsertPrecheck::NoConflictingClaimantForInvite {
+                invite_token_sig,
+                claimant,
             }),
         )
         .await
@@ -9781,6 +9876,19 @@ mod tests {
         community_id: SpaceId,
         alice: &crate::community_membership::TestOwner,
     ) -> (CommunitySyncEngine, mpsc::Sender<Vec<u8>>) {
+        closing_guard_engine_with_state(dir, community_id, alice, CommunityState::new(community_id))
+    }
+
+    /// Like `closing_guard_engine`, but seeds the engine with a pre-built
+    /// `CommunityState`. Used to stand a "restarted" engine up around a state
+    /// reloaded from disk via `community_state_persist::load_crdt` (ZEB-875
+    /// restart-safety round-trip).
+    fn closing_guard_engine_with_state(
+        dir: &tempfile::TempDir,
+        community_id: SpaceId,
+        alice: &crate::community_membership::TestOwner,
+        state: CommunityState,
+    ) -> (CommunitySyncEngine, mpsc::Sender<Vec<u8>>) {
         let (pub_tx, mut pub_rx) = mpsc::channel::<Vec<u8>>(64);
         let (sub_tx, sub_rx) = mpsc::channel::<Vec<u8>>(64);
         tokio::spawn(async move { while pub_rx.recv().await.is_some() {} });
@@ -9798,7 +9906,7 @@ mod tests {
             device_id: "alice-dev".into(),
             self_owner: alice.owner,
             signing_key: Arc::new(alice.device_key.clone()),
-            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            state: Arc::new(Mutex::new(state)),
             tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
                 alice.owner,
                 "alice-dev".to_string(),
@@ -10064,6 +10172,325 @@ mod tests {
             !countersigned,
             "auto-counter-sign must not insert after shutdown — a JoinCountersign \
              here was signed into engine memory nothing will ever persist or publish"
+        );
+    }
+
+    // ── ZEB-875: claimant-bound atomic single-use invite claim ───────────
+    //
+    // The claim is a `NoConflictingClaimantForInvite` precheck run under the
+    // same `state` lock as the append: the first committed PendingJoin for an
+    // invite token's sig fixes the claimant; a *distinct* actor is refused, the
+    // same actor is idempotent. Tests 1–3 prove the precheck logic
+    // deterministically (the prior claim is staged straight into the log, so
+    // the rejection fires before any verify — no crypto needed); test 4 proves
+    // exactly-one-winner atomicity through the real verifying insert.
+
+    fn zeb875_stub_token(
+        inviter: OwnerAddr,
+        sig: [u8; 64],
+    ) -> crate::community_invite::InviteToken {
+        crate::community_invite::InviteToken {
+            inviter,
+            invitee_hint: None,
+            minted_at: Hlc {
+                wall_ms: 99_000,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            expires_at: None,
+            sig,
+        }
+    }
+
+    /// A real invite token signed by `inviter`'s device key — verifies against
+    /// the inviter's materialized enrolled key (P5), so a PendingJoin carrying
+    /// it inserts cleanly. `nonce` varies `minted_at` so distinct calls yield
+    /// distinct tokens (and thus distinct sigs / claim keys).
+    fn zeb875_signed_token(
+        inviter: &crate::community_membership::TestOwner,
+        nonce: u64,
+    ) -> crate::community_invite::InviteToken {
+        use ed25519_dalek::Signer;
+        let mut token = zeb875_stub_token(inviter.owner, [0u8; 64]);
+        token.minted_at.wall_ms = 99_000 + nonce;
+        let bytes = crate::community_invite::canonical_invite_token_bytes(&token)
+            .expect("canonical token bytes");
+        token.sig = inviter.device_key.sign(&bytes).to_bytes();
+        token
+    }
+
+    fn zeb875_pending_join(
+        community_id: SpaceId,
+        joiner: &crate::community_membership::TestOwner,
+        token: crate::community_invite::InviteToken,
+        event_id: [u8; 16],
+    ) -> crate::community_membership::SignedMembershipEvent {
+        use crate::community_membership::{
+            sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        };
+        let payload = EventPayload {
+            id: event_id,
+            community_id,
+            kind: MembershipEventKind::PendingJoin {
+                invite_token: token,
+            },
+            actor: joiner.owner,
+            at: Hlc {
+                wall_ms: 100_500,
+                logical: 0,
+                device_id: "joiner-dev".into(),
+            },
+        };
+        SignedMembershipEvent {
+            enrollment: Some(joiner.cert.clone()),
+            ..sign_event(&payload, &joiner.device_key).expect("sign pending join")
+        }
+    }
+
+    /// A distinct actor redeeming the same invite token sig is refused by the
+    /// claim precheck, before any insert.
+    #[tokio::test]
+    async fn zeb875_claim_rejects_distinct_actor_on_same_token() {
+        use crate::community_membership::mint_test_owner;
+        let alice = mint_test_owner(0xAA);
+        let bob = mint_test_owner(0xBE);
+        let carol = mint_test_owner(0xCA);
+        let community_id = SpaceId([0x75; 16]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, _sub_tx) = closing_guard_engine(&dir, community_id, &alice);
+
+        let sig = [0x33u8; 64];
+        let token = zeb875_stub_token(alice.owner, sig);
+        // Stage Bob's claim directly — the precheck reads the committed log
+        // regardless of how the event got there.
+        {
+            let state = engine.state();
+            let mut g = state.lock().await;
+            g.insert_verified_for_test(zeb875_pending_join(
+                community_id,
+                &bob,
+                token.clone(),
+                [0x20; 16],
+            ));
+        }
+
+        let res = engine
+            .insert_local_claim_bound_pending_join(zeb875_pending_join(
+                community_id,
+                &carol,
+                token,
+                [0x21; 16],
+            ))
+            .await;
+        assert!(
+            matches!(res, Err(LocalInsertError::InviteAlreadyClaimed { winner }) if winner == bob.owner),
+            "a distinct actor must be refused with the first claimant as winner, got: {res:?}"
+        );
+    }
+
+    /// The same actor (idempotent retry) and an unrelated token both actually
+    /// INSERT — asserting the successful outcomes, not merely the absence of a
+    /// claim rejection (CodeRabbit). Uses signed tokens + a seeded inviter.
+    #[tokio::test]
+    async fn zeb875_claim_allows_same_actor_and_other_tokens() {
+        use crate::community_membership::mint_test_owner;
+        use crate::community_state_crdt::InsertOutcome;
+        let alice = mint_test_owner(0xAA);
+        let bob = mint_test_owner(0xBE);
+        let carol = mint_test_owner(0xCA);
+        let community_id = SpaceId([0x76; 16]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, _sub_tx) = closing_guard_engine(&dir, community_id, &alice);
+        // Alice Joined so the invite-token sig (P5) verifies on the real insert.
+        engine
+            .insert_local_event(closing_guard_bootstrap_join(
+                community_id,
+                &alice,
+                [0x10; 16],
+                0,
+            ))
+            .await
+            .expect("alice bootstrap insert");
+
+        // Bob claims token1 and inserts.
+        let bob_pending = zeb875_pending_join(
+            community_id,
+            &bob,
+            zeb875_signed_token(&alice, 1),
+            [0x20; 16],
+        );
+        let first = engine
+            .insert_local_claim_bound_pending_join(bob_pending.clone())
+            .await;
+        assert!(
+            matches!(first, Ok(InsertOutcome::Inserted)),
+            "bob's first claim must insert, got: {first:?}"
+        );
+
+        // Same actor, same event -> idempotent AlreadyKnown (not a claim reject).
+        let retry = engine
+            .insert_local_claim_bound_pending_join(bob_pending)
+            .await;
+        assert!(
+            matches!(retry, Ok(InsertOutcome::AlreadyKnown)),
+            "bob's same-actor retry must be idempotent AlreadyKnown, got: {retry:?}"
+        );
+
+        // A DIFFERENT token inserts independently of bob's claim.
+        let carol_pending = zeb875_pending_join(
+            community_id,
+            &carol,
+            zeb875_signed_token(&alice, 2),
+            [0x22; 16],
+        );
+        let other = engine
+            .insert_local_claim_bound_pending_join(carol_pending)
+            .await;
+        assert!(
+            matches!(other, Ok(InsertOutcome::Inserted)),
+            "a different token must insert independently of bob's claim, got: {other:?}"
+        );
+    }
+
+    /// The claim verdict is a pure function of the PERSISTED event log: insert a
+    /// PendingJoin, round-trip the state through save_crdt/load_crdt (a real
+    /// restart through crdt.cbor), then a distinct actor is still refused on the
+    /// engine rebuilt around the reloaded state — proving no in-memory claim
+    /// index (CodeRabbit: test an actual restart).
+    #[tokio::test]
+    async fn zeb875_claim_survives_persist_reload_restart() {
+        use crate::community_membership::mint_test_owner;
+        use crate::community_state_crdt::InsertOutcome;
+        let alice = mint_test_owner(0xAA);
+        let bob = mint_test_owner(0xBE);
+        let carol = mint_test_owner(0xCA);
+        let community_id = SpaceId([0x77; 16]);
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Engine #1: alice joined, bob claims a signed token and inserts.
+        let (engine1, _sub_tx1) = closing_guard_engine(&dir, community_id, &alice);
+        engine1
+            .insert_local_event(closing_guard_bootstrap_join(
+                community_id,
+                &alice,
+                [0x10; 16],
+                0,
+            ))
+            .await
+            .expect("alice bootstrap insert");
+        let token = zeb875_signed_token(&alice, 0);
+        let bob_pending = zeb875_pending_join(community_id, &bob, token.clone(), [0x20; 16]);
+        assert!(
+            matches!(
+                engine1
+                    .insert_local_claim_bound_pending_join(bob_pending)
+                    .await,
+                Ok(InsertOutcome::Inserted)
+            ),
+            "bob's claim must insert on engine #1"
+        );
+
+        // Persist -> reload: a real restart through the on-disk crdt.cbor.
+        let crdt_path = dir.path().join("restart-crdt.cbor");
+        {
+            let state = engine1.state();
+            let g = state.lock().await;
+            crate::community_state_persist::save_crdt(&crdt_path, &g).expect("save_crdt");
+        }
+        let reloaded =
+            crate::community_state_persist::load_crdt(&crdt_path, community_id).expect("load_crdt");
+
+        // Engine #2 stands up around the RELOADED state.
+        let dir2 = tempfile::tempdir().expect("tempdir2");
+        let (engine2, _sub_tx2) =
+            closing_guard_engine_with_state(&dir2, community_id, &alice, reloaded);
+
+        // A distinct actor is still refused after the restart.
+        let carol_pending = zeb875_pending_join(community_id, &carol, token, [0x21; 16]);
+        let res = engine2
+            .insert_local_claim_bound_pending_join(carol_pending)
+            .await;
+        assert!(
+            matches!(res, Err(LocalInsertError::InviteAlreadyClaimed { winner }) if winner == bob.owner),
+            "after a persist/reload restart, the claim must still refuse a distinct actor, got: {res:?}"
+        );
+    }
+
+    /// Exactly one of two concurrent distinct-actor claims on one invite token
+    /// wins the insert; the other is refused. Structure ported from
+    /// `pkarr_invite_publisher::try_consume_friend_token_exactly_one_winner`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zeb875_claim_exactly_one_winner_under_concurrency() {
+        use crate::community_membership::mint_test_owner;
+        use crate::community_state_crdt::InsertOutcome;
+        let alice = mint_test_owner(0xAA);
+        let bob = mint_test_owner(0xBE);
+        let carol = mint_test_owner(0xCA);
+        let community_id = SpaceId([0x78; 16]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, _sub_tx) = closing_guard_engine(&dir, community_id, &alice);
+        // Alice Joined so her enrolled key verifies the invite-token sig (P5).
+        engine
+            .insert_local_event(closing_guard_bootstrap_join(
+                community_id,
+                &alice,
+                [0x10; 16],
+                0,
+            ))
+            .await
+            .expect("alice bootstrap insert");
+
+        let token = zeb875_signed_token(&alice, 0);
+        let bob_pending = zeb875_pending_join(community_id, &bob, token.clone(), [0x20; 16]);
+        let carol_pending = zeb875_pending_join(community_id, &carol, token, [0x21; 16]);
+
+        let engine = Arc::new(engine);
+        let ta = {
+            let e = Arc::clone(&engine);
+            tokio::spawn(async move { e.insert_local_claim_bound_pending_join(bob_pending).await })
+        };
+        let tb = {
+            let e = Arc::clone(&engine);
+            tokio::spawn(
+                async move { e.insert_local_claim_bound_pending_join(carol_pending).await },
+            )
+        };
+        let (ra, rb) = tokio::join!(ta, tb);
+        let ra = ra.expect("task a joined");
+        let rb = rb.expect("task b joined");
+
+        let won_a = matches!(ra, Ok(InsertOutcome::Inserted));
+        let won_b = matches!(rb, Ok(InsertOutcome::Inserted));
+        assert!(
+            won_a ^ won_b,
+            "exactly one distinct-actor claim must win the race: a={ra:?} b={rb:?}"
+        );
+        let loser_claim_rejected = matches!(ra, Err(LocalInsertError::InviteAlreadyClaimed { .. }))
+            || matches!(rb, Err(LocalInsertError::InviteAlreadyClaimed { .. }));
+        assert!(
+            loser_claim_rejected,
+            "the loser must be refused by the claim (InviteAlreadyClaimed): a={ra:?} b={rb:?}"
+        );
+    }
+
+    /// A non-PendingJoin event handed to the claim seam is refused (it carries
+    /// no invite token to bind) rather than silently inserted unclaimed — the
+    /// hard-to-misuse contract from deriving the claim key from the event
+    /// (Qodo #1 / CodeAnt).
+    #[tokio::test]
+    async fn zeb875_claim_refuses_non_pending_join_event() {
+        use crate::community_membership::mint_test_owner;
+        let alice = mint_test_owner(0xAA);
+        let community_id = SpaceId([0x79; 16]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, _sub_tx) = closing_guard_engine(&dir, community_id, &alice);
+
+        // A bare bootstrap Join is not a PendingJoin — no invite token to bind.
+        let join = closing_guard_bootstrap_join(community_id, &alice, [0x10; 16], 0);
+        let res = engine.insert_local_claim_bound_pending_join(join).await;
+        assert!(
+            matches!(res, Err(LocalInsertError::ClaimBoundEventNotPendingJoin)),
+            "a non-PendingJoin event must be refused by the claim seam, got: {res:?}"
         );
     }
 }
