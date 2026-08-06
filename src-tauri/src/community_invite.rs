@@ -1370,6 +1370,14 @@ pub enum CommunityInviteVerifyError {
     /// outcome (no wire-protocol change).
     #[error("invite already claimed by another actor")]
     InviteAlreadyClaimed,
+    /// ZEB-875: a legacy bare-`Join` invite redeem reached `handle_unicast`.
+    /// That shape carries no `invite_token`, so it cannot be bound to the
+    /// single-use claim; admitting it would bypass single-use. Refused so
+    /// `PendingJoin` is the only invite-admission shape. No live client emits
+    /// bare-Join into this path (recon-verified) — only a pre-ZEB-254 stale or
+    /// crafted peer.
+    #[error("legacy bare-Join invite redeem is no longer supported (not claim-bound)")]
+    LegacyRedeemUnsupported,
 }
 
 impl CommunityInviteVerifyError {
@@ -1398,6 +1406,7 @@ impl CommunityInviteVerifyError {
                 "community_invite_inviter_enrollment_owner_mismatch"
             }
             Self::InviteAlreadyClaimed => "community_invite_already_claimed",
+            Self::LegacyRedeemUnsupported => "community_invite_legacy_redeem_unsupported",
         }
     }
 }
@@ -2159,17 +2168,16 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         return Err(CommunityInviteVerifyError::EnvelopeSigInvalid);
     };
 
-    // 2. Snapshot self_owner + private_identity + community_signing_key (#2)
-    //    from dm_outbox under its lock; drop the guard before any further
-    //    `.await`. ZEB-339: `verify_packet_pure` step 6 now verifies the
-    //    InviteToken sig against the enrolled device key (#2), consistent
-    //    with `verify_event`'s P5 gate. `self_private_identity` is kept for
-    //    the `countersigner_pub` Reticulum transport field further below.
-    let (self_owner, self_private_identity, community_signing_key) = {
+    // 2. Snapshot self_owner + community_signing_key (#2) from dm_outbox under
+    //    its lock; drop the guard before any further `.await`. ZEB-339:
+    //    `verify_packet_pure` step 6 verifies the InviteToken sig against the
+    //    enrolled device key (#2), consistent with `verify_event`'s P5 gate.
+    //    (ZEB-875 removed the legacy counter-sign branch that also needed
+    //    `private_identity` for its Reticulum `countersigner_pub` field.)
+    let (self_owner, community_signing_key) = {
         let outbox_g = dm_outbox.lock().await;
         (
             outbox_g.self_owner,
-            std::sync::Arc::clone(&outbox_g.private_identity),
             std::sync::Arc::clone(&outbox_g.community_signing_key),
         )
     };
@@ -2302,11 +2310,13 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         // ZEB-875: bind the single-use invite to the FIRST verified claimant.
         // Routing through the engine's claim-checked insert (atomic under the
         // state lock) refuses a *distinct* actor redeeming the same token while
-        // letting the same actor retry idempotently. `join_event` is moved into
-        // the call, so capture the verified claimant first.
+        // letting the same actor retry idempotently. The seam derives the claim
+        // key + claimant from the event itself (Qodo #1 / CodeAnt), so no
+        // separate args can desync from what is committed. Capture the claimant
+        // for the reject-path log before `join_event` is moved into the call.
         let claimant = join_event.actor;
         match engine_arc
-            .insert_local_claim_bound_pending_join(join_event, signed.invite_token.sig, claimant)
+            .insert_local_claim_bound_pending_join(join_event)
             .await
         {
             Ok(crate::community_state_crdt::InsertOutcome::Inserted) => {
@@ -2348,89 +2358,23 @@ pub async fn handle_unicast<H: AppHandleEmit>(
             }
         }
     } else {
-        // ZEB-875: the claimant-bound single-use claim is enforced only on the
-        // PendingJoin shape — the only shape any live minter emits (the lib.rs
-        // redeem builds PendingJoin for invite-only). A bare legacy Join carries
-        // no invite_token, so it cannot be claim-bound; reaching here means a
-        // pre-ZEB-254 stale client. Logged (NOT asserted) because such a client
-        // is rare but legitimate — a debug_assert would panic a real old peer.
+        // ZEB-875 [Qodo #2 + CodeRabbit, Major/Security]: the legacy bare-Join
+        // redeem path CANNOT be claim-bound — a Join carries no `invite_token`,
+        // so admitting it would bypass the single-use claim (two distinct actors
+        // could each redeem one untargeted token via bare-Join, each committing
+        // a tokenless Join the claim scan can never see). No live minter emits
+        // bare-Join into this path (the lib.rs redeem builds PendingJoin for
+        // invite-only — verified); only a pre-ZEB-254 stale or a crafted client
+        // reaches here. Refuse rather than counter-sign, so PendingJoin is the
+        // ONLY invite-admission shape and the claim fully covers it. (Was:
+        // attach_countersig_with_device_key + insert the counter-signed Join.)
         tracing::warn!(
-            "ZEB-875: invite redeem via legacy bare-Join path (no claim binding; pre-ZEB-254 client)"
+            "ZEB-875: refusing legacy bare-Join invite redeem — not claim-bound; \
+             admitting it would bypass the single-use claim"
         );
-        // 6. LEGACY path: Attach countersig with our enrolled device key (#2).
-        //    ZEB-339: the counter-sig MUST be produced with device #2, since
-        //    `verify_countersig` resolves the counter-signer's key from their
-        //    materialized `enrolled_device_keys` (populated from cert-bearing
-        //    Joins). Signing with the Reticulum identity would no longer verify.
-        let counter_signed = match crate::community_membership::attach_countersig_with_device_key(
-            &join_event,
-            self_owner,
-            community_signing_key.as_ref(),
-        ) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(error = %err, "attach_countersig_with_device_key failed");
-                let e = CommunityInviteVerifyError::CounterSignAttachFailed;
-                emit_degraded(app, &signed.community_id, e.reason_tag());
-                return Err(e);
-            }
-        };
-
-        // 7. LEGACY path: Insert via engine using `insert_local_event_with_pubs` — the
-        //    joiner's `joiner_identity_pub` was already verified in
-        //    `verify_packet_pure` step 5 (Path B app-sig binding), and the
-        //    receiver's own identity_pub is known locally. The production
-        //    `OwnerDeviceCacheResolver` won't have the joiner yet (this IS
-        //    the bootstrap that would populate the cache), so we MUST
-        //    bypass it. Skipping the resolver here is the load-bearing fix
-        //    for the bootstrap-by-design case: a counter-signed Join lands
-        //    LOCALLY here regardless of whether the resolver knows the
-        //    joiner; the publish-back path then carries the full
-        //    counter-signed event to peers, who do their own membership-
-        //    state verify against their resolver caches as those caches
-        //    populate.
-        //
-        //    The engine's post-Inserted hook
-        //    (`notify_pending_redemption_in_map`) fires
-        //    `pending_redemptions[event_id]` for the joiner side — this
-        //    wakes the redeemer's `redeem_invite_inner` oneshot wait once
-        //    the counter-signed Join propagates back via Phase 2's
-        //    state-root publish.
-        let countersigner_pub = self_private_identity.identity.to_public_bytes();
-        match engine_arc
-            .insert_local_event_with_pubs(
-                counter_signed,
-                signed.joiner_identity_pub,
-                Some(countersigner_pub),
-            )
-            .await
-        {
-            Ok(crate::community_state_crdt::InsertOutcome::Inserted) => {
-                // ZEB-874: the single-use invite is NO LONGER burned here. The
-                // burn moved to the acceptor, gated behind a successful
-                // countersign-response write, so a post-insert delivery failure
-                // leaves the invite live for retry. See
-                // iroh_invite_acceptor::handle_invite_handshake_inbound.
-                Ok(())
-            }
-            Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
-                // Idempotent retransmit (Reticulum can deliver duplicates).
-                // Treat as success — we've already counter-signed this id.
-                Ok(())
-            }
-            Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
-                tracing::warn!(error = ?verr, "counter-signed Join rejected by engine");
-                let e = CommunityInviteVerifyError::EngineRejected;
-                emit_degraded(app, &signed.community_id, e.reason_tag());
-                Err(e)
-            }
-            Err(local_err) => {
-                tracing::warn!(error = %local_err, "engine.insert_local_event_with_pubs errored");
-                let e = CommunityInviteVerifyError::EngineLocalError;
-                emit_degraded(app, &signed.community_id, e.reason_tag());
-                Err(e)
-            }
-        }
+        let e = CommunityInviteVerifyError::LegacyRedeemUnsupported;
+        emit_degraded(app, &signed.community_id, e.reason_tag());
+        Err(e)
     }
 }
 
