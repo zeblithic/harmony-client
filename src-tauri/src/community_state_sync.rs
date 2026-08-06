@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
@@ -2755,11 +2755,27 @@ fn settle_publish(
             // Restoring the flag alone is the ZEB-761 bug.
             ctx.has_pending_dirty.store(true, Ordering::Release);
             retry.on_failure(now_ms);
+            // ZEB-762: mirror the just-armed retry into the observable stats.
+            // `Restore` is reached only for a FAILED publish that owed work, so
+            // `pub_result` is always `Err` here — the `if let` is a total,
+            // panic-free extraction of the error to classify. `delay_ms()` is
+            // the interval `on_failure` just escalated to.
+            if let Err(e) = pub_result {
+                ctx.sync_stats.record_publish_failure(
+                    retry.delay_ms(),
+                    e,
+                    crate::network_health::now_ms(),
+                );
+            }
         }
         DirtySignal::Spent => {}
     }
     if pub_result.is_ok() {
         retry.clear(now_ms);
+        // ZEB-762: publish landed — clear the active-retry observable state
+        // (mirrors `retry.clear`). A failed publish that owed NOTHING (`Spent`)
+        // is not a replication stall and is deliberately not recorded.
+        ctx.sync_stats.record_publish_success();
     }
 }
 
@@ -3711,6 +3727,108 @@ pub(crate) struct CommunitySyncStats {
     pub(crate) fetch_retries_dropped: AtomicU64,
     pub(crate) fetch_retries_exhausted: AtomicU64,
     pub(crate) fetch_retry_inflight_peak: AtomicU64,
+    // ZEB-762: publish-side `RetryBackoff` observability — the OUTBOUND
+    // complement to `last_inbound`/`last_advance`. `last_advance` answers "am I
+    // receiving?"; these answer "am I successfully publishing MY state out, or
+    // wedged at the 600 s backoff cap replicating nothing?". Recorded in
+    // `settle_publish` at the same `on_failure`/`clear` points that drive the
+    // local `RetryBackoff`, so the observable state can never drift from the
+    // scheduler's. All `Relaxed`: a reader (`community_sync_raw`) tolerating a
+    // momentarily-torn view is fine for telemetry — the next snapshot corrects
+    // it — exactly as the fetch counters above already assume.
+    /// Whether an autonomous publish retry is currently owed (last publish
+    /// failed with unreplicated local work). `false` once a publish succeeds.
+    pub(crate) publish_retry_owed: AtomicBool,
+    /// Consecutive failed publish attempts since the last success. Unbounded;
+    /// climbs while the transport stays unhealthy. `0` once a publish succeeds.
+    pub(crate) publish_retry_consecutive_failures: AtomicU64,
+    /// Current backoff interval (ms) between retries — 30 s base doubling to a
+    /// 600 s cap (ZEB-761). `0` once a publish succeeds.
+    pub(crate) publish_retry_backoff_ms: AtomicU64,
+    /// Wall ms of the most recent failed publish; `0` = never. Retained across
+    /// a later success as historical evidence ("last failed at …").
+    pub(crate) publish_retry_last_failure_ms: AtomicU64,
+    /// Coarse class of the most recent publish failure, encoded via
+    /// [`PublishErrorClass`]; `0` = none. Retained across a later success.
+    pub(crate) publish_retry_last_error_code: AtomicU8,
+}
+
+impl CommunitySyncStats {
+    /// ZEB-762: mirror a just-armed publish retry into the observable stats.
+    /// Called from `settle_publish` right after `RetryBackoff::on_failure`, so
+    /// `backoff_ms` is that call's freshly-escalated `delay_ms()`.
+    fn record_publish_failure(&self, backoff_ms: u64, err: &CommunitySyncError, now_wall_ms: u64) {
+        self.publish_retry_owed.store(true, Ordering::Relaxed);
+        self.publish_retry_consecutive_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.publish_retry_backoff_ms
+            .store(backoff_ms, Ordering::Relaxed);
+        self.publish_retry_last_failure_ms
+            .store(now_wall_ms, Ordering::Relaxed);
+        self.publish_retry_last_error_code
+            .store(PublishErrorClass::of(err) as u8, Ordering::Relaxed);
+    }
+
+    /// ZEB-762: a publish succeeded — clear the ACTIVE-retry state. The
+    /// historical `last_failure_ms` / `last_error_code` are deliberately
+    /// retained so the panel can still show "last failed at X (transport_closed),
+    /// now recovered" rather than erasing the incident on the first success.
+    fn record_publish_success(&self) {
+        self.publish_retry_owed.store(false, Ordering::Relaxed);
+        self.publish_retry_consecutive_failures
+            .store(0, Ordering::Relaxed);
+        self.publish_retry_backoff_ms.store(0, Ordering::Relaxed);
+    }
+}
+
+/// ZEB-762: coarse class of a publish-path failure, for the retry-health stat.
+/// Encoded as a stable `u8` in an atomic (`0` = none, so the discriminants
+/// start at 1). Deliberately coarse: an operator needs "is publishing failing,
+/// and roughly why (transport vs storage vs crypto vs encode)", not the full
+/// `Display`. One enum owns the error→class and class→label maps so they cannot
+/// drift.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PublishErrorClass {
+    TransportClosed = 1,
+    ContentStore = 2,
+    Crypto = 3,
+    Encode = 4,
+    Other = 5,
+}
+
+impl PublishErrorClass {
+    fn of(err: &CommunitySyncError) -> Self {
+        match err {
+            CommunitySyncError::TransportClosed => Self::TransportClosed,
+            CommunitySyncError::ContentStore(_) => Self::ContentStore,
+            CommunitySyncError::Crypto(_) => Self::Crypto,
+            CommunitySyncError::CborEncode(_) => Self::Encode,
+            _ => Self::Other,
+        }
+    }
+
+    fn from_u8(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::TransportClosed),
+            2 => Some(Self::ContentStore),
+            3 => Some(Self::Crypto),
+            4 => Some(Self::Encode),
+            5 => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    /// Stable snake_case label surfaced on the wire (`lastError`). Stable
+    /// because operators / dashboards key off it.
+    fn label(self) -> &'static str {
+        match self {
+            Self::TransportClosed => "transport_closed",
+            Self::ContentStore => "content_store",
+            Self::Crypto => "crypto",
+            Self::Encode => "encode",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// ZEB-805 (r1): where an inbound frame came from. `last_inbound_ms` means "a
@@ -5765,6 +5883,21 @@ impl CommunitySyncRegistry {
                         fetch_retries_scheduled: s.fetch_retries_scheduled.load(Ordering::Relaxed),
                         fetch_retries_dropped: s.fetch_retries_dropped.load(Ordering::Relaxed),
                         fetch_retries_exhausted: s.fetch_retries_exhausted.load(Ordering::Relaxed),
+                        // ZEB-762: publish-side retry state.
+                        publish_retry_owed: s.publish_retry_owed.load(Ordering::Relaxed),
+                        publish_retry_consecutive_failures: s
+                            .publish_retry_consecutive_failures
+                            .load(Ordering::Relaxed),
+                        publish_retry_backoff_ms: s
+                            .publish_retry_backoff_ms
+                            .load(Ordering::Relaxed),
+                        publish_retry_last_failure_ms: s
+                            .publish_retry_last_failure_ms
+                            .load(Ordering::Relaxed),
+                        publish_retry_last_error: PublishErrorClass::from_u8(
+                            s.publish_retry_last_error_code.load(Ordering::Relaxed),
+                        )
+                        .map(PublishErrorClass::label),
                     },
                 )
             })
@@ -7941,6 +8074,194 @@ mod tests {
         assert!(
             loaded.contains_event(&eid),
             "ZEB-462 B: CRDT must persist even when the publish failed"
+        );
+
+        engine.shutdown().await.ok();
+    }
+
+    /// ZEB-762: the publish-retry stat recording, isolated from the engine — the
+    /// escalation surfaces, the error class maps, and a success clears the
+    /// ACTIVE state while retaining the historical last-failure evidence.
+    #[test]
+    fn publish_retry_stats_record_escalation_and_clear_on_success() {
+        let stats = CommunitySyncStats::default();
+        // Healthy start.
+        assert!(!stats.publish_retry_owed.load(Ordering::Relaxed));
+        assert_eq!(
+            stats
+                .publish_retry_consecutive_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // Two consecutive failures: the surfaced backoff/count escalate, and the
+        // error class + failure stamp are recorded.
+        stats.record_publish_failure(30_000, &CommunitySyncError::TransportClosed, 111);
+        stats.record_publish_failure(60_000, &CommunitySyncError::TransportClosed, 222);
+        assert!(stats.publish_retry_owed.load(Ordering::Relaxed));
+        assert_eq!(
+            stats
+                .publish_retry_consecutive_failures
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            stats.publish_retry_backoff_ms.load(Ordering::Relaxed),
+            60_000
+        );
+        assert_eq!(
+            stats.publish_retry_last_failure_ms.load(Ordering::Relaxed),
+            222
+        );
+        assert_eq!(
+            PublishErrorClass::from_u8(stats.publish_retry_last_error_code.load(Ordering::Relaxed))
+                .map(PublishErrorClass::label),
+            Some("transport_closed"),
+        );
+
+        // A success clears the active state but keeps the historical evidence.
+        stats.record_publish_success();
+        assert!(!stats.publish_retry_owed.load(Ordering::Relaxed));
+        assert_eq!(
+            stats
+                .publish_retry_consecutive_failures
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(stats.publish_retry_backoff_ms.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            stats.publish_retry_last_failure_ms.load(Ordering::Relaxed),
+            222,
+            "historical last-failure stamp retained across recovery"
+        );
+        assert_ne!(
+            stats.publish_retry_last_error_code.load(Ordering::Relaxed),
+            0,
+            "historical error class retained across recovery"
+        );
+    }
+
+    /// ZEB-762: the coarse publish-failure classifier maps variants to stable
+    /// labels, falls through unmapped variants to `other`, and round-trips its
+    /// `u8` encoding (`0` = none).
+    #[test]
+    fn publish_error_class_maps_variants_to_stable_labels() {
+        assert_eq!(
+            PublishErrorClass::of(&CommunitySyncError::TransportClosed).label(),
+            "transport_closed"
+        );
+        assert_eq!(
+            PublishErrorClass::of(&CommunitySyncError::CborEncode("x".into())).label(),
+            "encode"
+        );
+        // A variant with no dedicated class falls through to `other`.
+        assert_eq!(
+            PublishErrorClass::of(&CommunitySyncError::Persist("x".into())).label(),
+            "other"
+        );
+        for c in [
+            PublishErrorClass::TransportClosed,
+            PublishErrorClass::ContentStore,
+            PublishErrorClass::Crypto,
+            PublishErrorClass::Encode,
+            PublishErrorClass::Other,
+        ] {
+            assert_eq!(PublishErrorClass::from_u8(c as u8), Some(c));
+        }
+        assert_eq!(
+            PublishErrorClass::from_u8(0),
+            None,
+            "0 is the none sentinel"
+        );
+        assert_eq!(PublishErrorClass::from_u8(99), None);
+    }
+
+    /// ZEB-762: end-to-end — a wedged publisher's escalating backoff must be
+    /// visible through the real network-health assembly path (`settle_publish`
+    /// → stats → registry `community_sync_raw` → `community_sync_row` DTO), not
+    /// just readable off the handle. This is the "am I actually replicating
+    /// outward?" question answered in the snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_retry_backoff_surfaces_in_community_sync_row_zeb762() {
+        let mut fix = build_test_fixture().await;
+        let community_id = SpaceId([0xd3; 16]);
+
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
+        let engine = std::sync::Arc::clone(&fix.registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                fix.membership_key.clone(),
+                fix.admin_addr,
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                fix.community_adapter_tx.clone(),
+                CatchUpChannels::none(),
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
+            )
+            .await
+            .expect("spawn_engine_with_guard");
+        guard.commit();
+
+        // Kill the outbound path so every publish fails (same rig as ZEB-462).
+        let adapter_req = fix
+            .community_adapter_rx
+            .recv()
+            .await
+            .expect("adapter request");
+        drop(adapter_req);
+
+        let event = seed_membership_event(community_id, fix.admin_addr);
+        engine.state().lock().await.insert_verified_for_test(event);
+        // `insert_verified_for_test` seeds state without the dirty flag a real
+        // mutation sets; mark it so the failed flush settles `Restore` (arms the
+        // retry) rather than `Spent`. A publish that owes nothing is correctly
+        // NOT a replication stall and would record nothing.
+        engine.notify_dirty();
+
+        // Two failed flushes → escalating backoff with a climbing failure count.
+        // The first failure re-arms the dirty flag (ZEB-761), so the second
+        // flush also owes work and escalates.
+        assert!(engine.flush_now().await.is_err());
+        assert!(engine.flush_now().await.is_err());
+
+        // Read it back through the SAME path the snapshot uses.
+        let raw = std::sync::Arc::clone(&fix.registry)
+            .community_sync_raw()
+            .await;
+        let (_, my_raw) = raw
+            .into_iter()
+            .find(|(id, _)| *id == community_id)
+            .expect("a row for the live community engine");
+        let row = crate::network_health::community_sync_row(
+            community_id,
+            my_raw,
+            crate::network_health::now_ms(),
+        );
+
+        assert!(
+            row.publish_retry.owed,
+            "a wedged publisher must report a retry owed"
+        );
+        assert!(
+            row.publish_retry.consecutive_failures >= 2,
+            "consecutive failures surfaced (got {})",
+            row.publish_retry.consecutive_failures
+        );
+        assert!(
+            row.publish_retry.backoff_ms >= harmony_crdt_sync::RETRY_BASE_MS,
+            "the backoff interval is surfaced (got {})",
+            row.publish_retry.backoff_ms
+        );
+        assert!(
+            row.publish_retry.last_error.is_some(),
+            "a failure class is recorded"
         );
 
         engine.shutdown().await.ok();

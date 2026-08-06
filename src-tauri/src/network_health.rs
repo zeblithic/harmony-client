@@ -146,6 +146,42 @@ pub struct CommunitySyncHealth {
     pub fetch_retries_scheduled: u64,
     pub fetch_retries_dropped: u64,
     pub fetch_retries_exhausted: u64,
+    /// ZEB-762: publish-side `RetryBackoff` health — the OUTBOUND-replication
+    /// complement to `last_inbound_ms`/`last_advance_ms`. Those answer "am I
+    /// receiving?"; this answers "am I successfully publishing MY state out?".
+    /// Always present for a live engine (a healthy engine is `owed: false` with
+    /// zero counters — present-and-zeroed = live, per this snapshot's
+    /// convention); the frontend decides the visual-alert threshold.
+    /// `#[serde(default)]` keeps a pre-field cached snapshot forward-compatible.
+    #[serde(default)]
+    pub publish_retry: CommunityPublishRetryHealth,
+}
+
+/// ZEB-762: per-community publish-side retry state, derived from the engine's
+/// `RetryBackoff` (ZEB-761: 30 s base doubling to a 600 s cap). `owed: true`
+/// with `backoff_ms` at/near the cap is the sustained-stall incident this
+/// surface exists to reveal — a node durably holding local state it can no
+/// longer replicate outward, previously visible only as a per-attempt
+/// `tracing::warn!` in the log file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityPublishRetryHealth {
+    /// Whether an autonomous publish retry is currently owed — the engine has
+    /// unreplicated local state and its last publish failed. The direct
+    /// "am I actually replicating outward?" bit.
+    pub owed: bool,
+    /// Consecutive failed publish attempts since the last success. Unbounded;
+    /// climbs while the transport stays unhealthy, and unlike `backoff_ms` it
+    /// keeps distinguishing severity after the interval saturates at the cap.
+    pub consecutive_failures: u64,
+    /// Current backoff interval (ms) between retries. `0` when nothing is owed.
+    pub backoff_ms: u64,
+    /// Wall ms of the most recent failed publish. `None` if none ever. Retained
+    /// across a later success as historical evidence.
+    pub last_failure_ms: Option<u64>,
+    /// Coarse class of the most recent publish failure (`transport_closed` /
+    /// `content_store` / `crypto` / `encode` / `other`). `None` if none ever.
+    pub last_error: Option<String>,
 }
 
 /// ZEB-805 raw per-community counters, read from the engine registry. Kept
@@ -160,6 +196,15 @@ pub struct CommunitySyncRaw {
     pub fetch_retries_scheduled: u64,
     pub fetch_retries_dropped: u64,
     pub fetch_retries_exhausted: u64,
+    /// ZEB-762: publish-side `RetryBackoff` state (outbound replication). See
+    /// [`CommunityPublishRetryHealth`] for what each maps to.
+    pub publish_retry_owed: bool,
+    pub publish_retry_consecutive_failures: u64,
+    pub publish_retry_backoff_ms: u64,
+    /// `0` means never.
+    pub publish_retry_last_failure_ms: u64,
+    /// `None` means never. A stable snake_case class label owned by the engine.
+    pub publish_retry_last_error: Option<&'static str>,
 }
 
 /// ZEB-805: source of per-community sync counters. Implemented by the community
@@ -1869,6 +1914,16 @@ pub fn community_sync_row(
         fetch_retries_scheduled: raw.fetch_retries_scheduled,
         fetch_retries_dropped: raw.fetch_retries_dropped,
         fetch_retries_exhausted: raw.fetch_retries_exhausted,
+        publish_retry: CommunityPublishRetryHealth {
+            owed: raw.publish_retry_owed,
+            consecutive_failures: raw.publish_retry_consecutive_failures,
+            backoff_ms: raw.publish_retry_backoff_ms,
+            // `0` is the engine's "never" sentinel — same treatment as the
+            // inbound/advance stamps above.
+            last_failure_ms: (raw.publish_retry_last_failure_ms != 0)
+                .then_some(raw.publish_retry_last_failure_ms),
+            last_error: raw.publish_retry_last_error.map(str::to_string),
+        },
     }
 }
 
@@ -4988,6 +5043,7 @@ mod tests {
                 fetch_retries_scheduled: 4,
                 fetch_retries_dropped: 1,
                 fetch_retries_exhausted: 2,
+                ..Default::default()
             },
         )])));
 
@@ -6247,6 +6303,13 @@ mod tests {
                 fetch_retries_scheduled: 1,
                 fetch_retries_dropped: 2,
                 fetch_retries_exhausted: 3,
+                // ZEB-762: non-default publish-retry state so the round-trip
+                // and key checks actually exercise the new sub-object.
+                publish_retry_owed: true,
+                publish_retry_consecutive_failures: 4,
+                publish_retry_backoff_ms: 120_000,
+                publish_retry_last_failure_ms: 8,
+                publish_retry_last_error: Some("transport_closed"),
             },
             9,
         );
@@ -6259,6 +6322,13 @@ mod tests {
             "fetchRetriesScheduled",
             "fetchRetriesDropped",
             "fetchRetriesExhausted",
+            // ZEB-762 publish-retry sub-object + its camelCase keys.
+            "publishRetry",
+            "owed",
+            "consecutiveFailures",
+            "backoffMs",
+            "lastFailureMs",
+            "lastError",
         ] {
             assert!(json.contains(key), "missing {key} in {json}");
         }
@@ -6269,11 +6339,41 @@ mod tests {
             "fetch_retries_scheduled",
             "fetch_retries_dropped",
             "fetch_retries_exhausted",
+            // ZEB-762: the snake_case field names must not leak (the snake_case
+            // `lastError` *value* `transport_closed` is a deliberate label, not
+            // a key, and is checked positively below).
+            "publish_retry",
+            "consecutive_failures",
+            "backoff_ms",
+            "last_failure_ms",
+            "last_error",
         ] {
             assert!(!json.contains(leak), "snake_case leak {leak} in {json}");
         }
         let back: CommunitySyncHealth = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(back, row);
+        // ZEB-762: the mapper carries the publish-retry state through faithfully.
+        assert!(row.publish_retry.owed);
+        assert_eq!(row.publish_retry.consecutive_failures, 4);
+        assert_eq!(row.publish_retry.backoff_ms, 120_000);
+        assert_eq!(row.publish_retry.last_failure_ms, Some(8));
+        assert_eq!(
+            row.publish_retry.last_error.as_deref(),
+            Some("transport_closed")
+        );
+    }
+
+    /// ZEB-762: a pre-field cached snapshot row has no `publishRetry` key.
+    /// `#[serde(default)]` must fill it rather than fail the whole deserialize
+    /// (spec §6.1: the snapshot never throws).
+    #[test]
+    fn community_sync_health_tolerates_absent_publish_retry() {
+        let json = r#"{"communityShort":"abcd0123","lastInboundMs":null,"lastAdvanceMs":null,"staleness":null,"fetchRetriesScheduled":0,"fetchRetriesDropped":0,"fetchRetriesExhausted":0}"#;
+        let row: CommunitySyncHealth =
+            serde_json::from_str(json).expect("pre-ZEB-762 row still deserializes");
+        assert_eq!(row.publish_retry, CommunityPublishRetryHealth::default());
+        assert!(!row.publish_retry.owed);
+        assert_eq!(row.publish_retry.last_error, None);
     }
 
     /// Tier boundaries with an injected `now` (no wall clock): fresh below

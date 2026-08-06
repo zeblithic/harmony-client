@@ -263,6 +263,37 @@ export interface CommunitySyncHealth {
   fetchRetriesScheduled: number;
   fetchRetriesDropped: number;
   fetchRetriesExhausted: number;
+  /**
+   * ZEB-762: publish-side RetryBackoff health — the OUTBOUND-replication
+   * complement to `lastInboundMs`/`lastAdvanceMs` (which answer "am I
+   * receiving?"; this answers "am I successfully publishing MY state out?").
+   * Always present for a live engine; `owed: false` with zero counters is the
+   * healthy state. Optional here only for forward-compat with a pre-field
+   * cached snapshot (Rust `#[serde(default)]`).
+   */
+  publishRetry?: CommunityPublishRetryHealth;
+}
+
+/**
+ * ZEB-762: per-community publish-side retry state (camelCase mirror of Rust
+ * `CommunityPublishRetryHealth`, network_health.rs). `owed: true` with
+ * `backoffMs` at/near the 600 s cap (ZEB-761) is the sustained-stall incident:
+ * a node durably holding local state it can no longer replicate outward.
+ */
+export interface CommunityPublishRetryHealth {
+  /** Whether an autonomous publish retry is currently owed. */
+  owed: boolean;
+  /** Consecutive failed publish attempts since the last success (unbounded). */
+  consecutiveFailures: number;
+  /** Current backoff interval (ms); `0` when nothing is owed. */
+  backoffMs: number;
+  /** Wall ms of the most recent failed publish. `null` if none ever. */
+  lastFailureMs?: number | null;
+  /**
+   * Coarse class of the most recent publish failure (`transport_closed` /
+   * `content_store` / `crypto` / `encode` / `other`). `null` if none ever.
+   */
+  lastError?: string | null;
 }
 
 /** ZEB-702: process-lifetime butler-deposit decision counters (camelCase
