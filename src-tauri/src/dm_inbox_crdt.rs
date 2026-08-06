@@ -143,6 +143,18 @@ impl DmInboxDoc {
         self.first_observed_ms.retain(|k, _| live.contains(k));
         self.entries.len() != before
     }
+
+    /// ZEB-862: read the LOCAL first-observation clock for durable sidecar
+    /// persistence. Never leaves this replica and never enters the wire.
+    pub fn first_observed_ms(&self) -> &BTreeMap<String, u64> {
+        &self.first_observed_ms
+    }
+
+    /// ZEB-862: restore the LOCAL first-observation clock on boot from the
+    /// sidecar file, so TTL GC survives restart instead of re-stamping `now`.
+    pub fn restore_first_observed(&mut self, map: BTreeMap<String, u64>) {
+        self.first_observed_ms = map;
+    }
 }
 
 impl DmInboxDoc {
@@ -299,6 +311,47 @@ mod tests {
 
     fn key() -> String {
         DmInboxDoc::key(&[1u8; 16], &[2u8; 32])
+    }
+
+    // ----------------------------------------------------------------
+    // ZEB-862: restart-durable first-observation clock
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn restored_old_first_observed_expires_across_restart() {
+        let mut doc = DmInboxDoc::default();
+        let k = key();
+        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
+        let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
+        doc.restore_first_observed([(k.clone(), 1u64)].into_iter().collect());
+        assert!(
+            doc.gc_expired(now, &BTreeSet::new()),
+            "old restored stamp → entry ages out"
+        );
+        assert!(doc.entries.is_empty());
+    }
+
+    #[test]
+    fn empty_first_observed_survives_first_sweep_after_restart() {
+        let mut doc = DmInboxDoc::default();
+        let k = key();
+        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
+        let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
+        assert!(
+            !doc.gc_expired(now, &BTreeSet::new()),
+            "empty clock re-stamps at now → survives"
+        );
+        assert_eq!(doc.entries.len(), 1);
+    }
+
+    #[test]
+    fn restore_and_read_first_observed_round_trips() {
+        let mut doc = DmInboxDoc::default();
+        let k = key();
+        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
+        let m: BTreeMap<String, u64> = [(k.clone(), 12_345u64)].into_iter().collect();
+        doc.restore_first_observed(m.clone());
+        assert_eq!(doc.first_observed_ms(), &m);
     }
 
     #[test]

@@ -208,6 +208,18 @@ impl RelayHoldDoc {
         self.first_observed_ms.retain(|k, _| live.contains(k));
         self.entries.len() != before
     }
+
+    /// ZEB-862: read the LOCAL first-observation clock for durable sidecar
+    /// persistence. Never leaves this replica and never enters the wire.
+    pub fn first_observed_ms(&self) -> &BTreeMap<String, u64> {
+        &self.first_observed_ms
+    }
+
+    /// ZEB-862: restore the LOCAL first-observation clock on boot from the
+    /// sidecar file, so TTL GC survives restart instead of re-stamping `now`.
+    pub fn restore_first_observed(&mut self, map: BTreeMap<String, u64>) {
+        self.first_observed_ms = map;
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +261,48 @@ mod tests {
 
     fn key_rr(recipient: u8, content: u8) -> String {
         RelayHoldDoc::key(&[recipient; 16], &[content; 32])
+    }
+
+    // ----------------------------------------------------------------
+    // ZEB-862: restart-durable first-observation clock
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn restored_old_first_observed_expires_across_restart() {
+        // A durable OLD stamp (as if reloaded from the sidecar) ages the entry
+        // out on the next sweep — the whole point of the fix.
+        let mut doc = RelayHoldDoc::default();
+        let k = key_rr(1, 1);
+        doc.entries
+            .insert(k.clone(), entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]));
+        let now = crate::community_relay::RELAY_HOLD_TTL_MS + 10_000;
+        doc.restore_first_observed([(k.clone(), 1u64)].into_iter().collect());
+        assert!(doc.gc(now), "old restored stamp → entry ages out");
+        assert!(doc.entries.is_empty());
+    }
+
+    #[test]
+    fn empty_first_observed_survives_first_sweep_after_restart() {
+        // Negative: without the sidecar the empty clock re-stamps at `now`, so
+        // the entry survives — this is today's bug, pinned to show the contrast.
+        let mut doc = RelayHoldDoc::default();
+        let k = key_rr(1, 1);
+        doc.entries
+            .insert(k.clone(), entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]));
+        let now = crate::community_relay::RELAY_HOLD_TTL_MS + 10_000;
+        assert!(!doc.gc(now), "empty clock re-stamps at now → survives");
+        assert_eq!(doc.entries.len(), 1);
+    }
+
+    #[test]
+    fn restore_and_read_first_observed_round_trips() {
+        let mut doc = RelayHoldDoc::default();
+        let k = key_rr(1, 1);
+        doc.entries
+            .insert(k.clone(), entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]));
+        let m: BTreeMap<String, u64> = [(k.clone(), 12_345u64)].into_iter().collect();
+        doc.restore_first_observed(m.clone());
+        assert_eq!(doc.first_observed_ms(), &m);
     }
 
     // ----------------------------------------------------------------
