@@ -177,6 +177,21 @@ jobs:
       - name: cargo clippy --locked --all-targets
         run: cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings
 
+      # ZEB-798: every Rust gate above compiles `--features test-fixtures`, but
+      # that feature is NOT in the binary users install — it gates
+      # deterministic-nonce crypto helpers production must never reach (see the
+      # clippy comment above; ZEB-747 gates the last such seam). So `-D warnings`
+      # is enforced only against a configuration nobody ships, and a warning that
+      # exists solely WITHOUT the feature — e.g. an import used only by a
+      # `test-fixtures`-gated item — stays invisible until someone builds a
+      # release binary. This step lints the actual shipping configuration
+      # (`--lib`, no `test-fixtures`) with warnings denied, so that blind spot
+      # fails here instead of in a release build. `--no-deps` scopes `-D warnings`
+      # to our own crate; dependency lints stay non-fatal, exactly like the gate
+      # above. Cheap: it reuses this job's warm dependency cache.
+      - name: cargo clippy --locked --lib (shipping config — no test-fixtures)
+        run: cargo clippy --locked --lib --no-deps -- -D warnings
+
       - name: sccache stats (ZEB-499)
         if: always()
         run: |

@@ -235,6 +235,13 @@ fn verify_round_trip(store: &dyn KeyStore, expected: &[u8; BLOB_LEN]) -> Result<
 ///
 /// Caller supplies salt and nonce explicitly so the function is deterministic
 /// for testing. Production code generates fresh random values per save.
+// ZEB-747: caller-supplied-nonce v0x01 encrypt seam — a nonce-reuse footgun
+// on XChaCha20-Poly1305 if ever reached from production. It has no production
+// caller (all call sites are `#[cfg(test)]` unit tests + the `wire_format`
+// fixture via `test_only::encrypt_with_params_for_test`); production writes
+// v0x02 through `encrypt_vault`. Gate it out of shipping builds entirely, matching
+// the already-gated `encrypt_vault_with_params` (v0x02) and HRSS snapshot seams.
+#[cfg(any(test, feature = "test-fixtures"))]
 #[doc(hidden)]
 pub fn encrypt_with_params(
     passphrase: &[u8],
@@ -3549,6 +3556,9 @@ fn warn_permissions(path: &Path) {
 #[doc(hidden)]
 pub mod test_only {
     pub use super::decrypt as decrypt_for_test;
+    // ZEB-747: gated to match its target `encrypt_with_params`, so the seam and
+    // its re-export vanish together from shipping builds (nothing dangling).
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub use super::encrypt_with_params as encrypt_with_params_for_test;
 
     #[cfg(any(test, feature = "test-fixtures"))]
