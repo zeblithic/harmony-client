@@ -274,16 +274,14 @@ pub async fn fork_community(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state
-                .clone()
-                .ok_or("crdt_state missing — node not running?")?,
+            g.crdt_state.clone().ok_or("crdt_state missing")?,
             g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id.clone().ok_or("dm_device_id missing")?,
             g.dm_self_owner.ok_or("dm_self_owner missing")?,
             g.community_registry
                 .clone()
-                .ok_or("community_registry missing — node not running?")?,
+                .ok_or("community_registry missing")?,
             g.community_adapter_request_tx
                 .clone()
                 .ok_or("community_adapter_request_tx missing")?,
@@ -293,10 +291,8 @@ pub async fn fork_community(
             g.transport_epoch_rx.clone(),
             g.channel_log_registry
                 .clone()
-                .ok_or("channel_log_registry missing — node not running?")?,
-            g.dm_outbox
-                .clone()
-                .ok_or("dm_outbox missing — no owner identity?")?,
+                .ok_or("channel_log_registry missing")?,
+            g.dm_outbox.clone().ok_or("dm_outbox missing")?,
             // ZEB-709 (audit A1): the owner-state engine — the fork's Space
             // commit below must fence its flush or the forked community's
             // owner-state row evaporates on a crash (its twin

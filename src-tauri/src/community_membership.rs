@@ -6096,19 +6096,19 @@ pub async fn apply_auto_exec_set_power(
         (
             g.hlc_tracker
                 .clone()
-                .ok_or("hlc_tracker missing (node not running?)")?,
+                .ok_or("hlc_tracker missing (owner identity not loaded?)")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id
                 .clone()
-                .ok_or("dm_device_id missing (node not running?)")?,
+                .ok_or("dm_device_id missing (owner identity not loaded?)")?,
             g.dm_self_owner
-                .ok_or("dm_self_owner missing (node not running?)")?,
+                .ok_or("dm_self_owner missing (owner identity not loaded?)")?,
             g.community_registry
                 .clone()
-                .ok_or("community_registry missing (node not running?)")?,
+                .ok_or("community_registry missing (owner identity not loaded?)")?,
             g.dm_outbox
                 .clone()
-                .ok_or("dm_outbox missing (no owner identity?)")?,
+                .ok_or("dm_outbox missing (owner identity not loaded?)")?,
         )
     };
 
@@ -6299,19 +6299,19 @@ pub async fn apply_auto_exec_admin_proposal_set_power(
         (
             g.hlc_tracker
                 .clone()
-                .ok_or("hlc_tracker missing (node not running?)")?,
+                .ok_or("hlc_tracker missing (owner identity not loaded?)")?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id
                 .clone()
-                .ok_or("dm_device_id missing (node not running?)")?,
+                .ok_or("dm_device_id missing (owner identity not loaded?)")?,
             g.dm_self_owner
-                .ok_or("dm_self_owner missing (node not running?)")?,
+                .ok_or("dm_self_owner missing (owner identity not loaded?)")?,
             g.community_registry
                 .clone()
-                .ok_or("community_registry missing (node not running?)")?,
+                .ok_or("community_registry missing (owner identity not loaded?)")?,
             g.dm_outbox
                 .clone()
-                .ok_or("dm_outbox missing (no owner identity?)")?,
+                .ok_or("dm_outbox missing (owner identity not loaded?)")?,
         )
     };
 
