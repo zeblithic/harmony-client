@@ -2182,6 +2182,32 @@ pub fn filter_peers_by_shared_membership(
     out
 }
 
+/// ZEB-829: count reachable co-member peers per community, keyed by full
+/// lowercase hex `SpaceId` — the exact key `PeerHealth::shared_communities`
+/// carries (`communities_shared_with` emits it via `hex::encode`), so the
+/// snapshot's `hex::encode(community_id.0)` lookup matches byte-for-byte.
+/// "Reachable" = any live [`ConnectionMode`]; `NoConnection` does not count.
+///
+/// A pure fold over the `peers` vec `snapshot` has already built: it needs no
+/// membership handle and no identity translation, because the
+/// membership∩reachability join is already baked into `shared_communities`.
+/// This is also the per-community signal ZEB-803's acceptor watchdog should
+/// adopt in place of its current global `count_peer_states().connected`.
+pub(crate) fn reachable_peers_by_community(
+    peers: &[PeerHealth],
+) -> std::collections::BTreeMap<String, u32> {
+    let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for p in peers {
+        if p.connection_mode == ConnectionMode::NoConnection {
+            continue;
+        }
+        for community_hex in &p.shared_communities {
+            *counts.entry(community_hex.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
 /// Plain-data input to `filter_peers_by_shared_membership`. Constructed
 /// by `NetworkHealthService::snapshot` (Task 3) from the resolver +
 /// connection-info read. Decoupled so the filter is testable without
@@ -6407,6 +6433,46 @@ mod tests {
 
     fn sync_cid(b: u8) -> crate::owner_state_types::SpaceId {
         crate::owner_state_types::SpaceId([b; 16])
+    }
+
+    /// ZEB-829 fixture: `PeerHealth` has no `Default` derive, and the peer-count
+    /// helper reads only `connection_mode` + `shared_communities`, so fill the
+    /// rest with `None`.
+    fn peer_fixture(mode: ConnectionMode, communities: Vec<String>) -> PeerHealth {
+        PeerHealth {
+            owner_addr: String::new(),
+            display_name: None,
+            shared_communities: communities,
+            connection_mode: mode,
+            rtt_ms: None,
+            last_seen_ms: None,
+            reachability_record_age_ms: None,
+            protocol_incompat_reason: None,
+            last_traffic_ms: None,
+            last_relay_pull_served_ms: None,
+            connected_since_ms: None,
+            staleness: None,
+        }
+    }
+
+    #[test]
+    fn reachable_peers_by_community_counts_live_comembers_only() {
+        let a = hex::encode([0xAAu8; 16]);
+        let b = hex::encode([0xBBu8; 16]);
+        let peers = vec![
+            peer_fixture(ConnectionMode::Direct, vec![a.clone(), b.clone()]),
+            peer_fixture(ConnectionMode::Relay, vec![a.clone()]),
+            peer_fixture(ConnectionMode::Degraded, vec![b.clone()]),
+            // NoConnection co-member of both — excluded from every count.
+            peer_fixture(ConnectionMode::NoConnection, vec![a.clone(), b.clone()]),
+        ];
+        let counts = reachable_peers_by_community(&peers);
+        assert_eq!(counts.get(&a), Some(&2), "Direct + Relay; NoConnection excluded");
+        assert_eq!(counts.get(&b), Some(&2), "Direct + Degraded; NoConnection excluded");
+        // A community whose only co-member is unreachable never appears.
+        let only_dead =
+            reachable_peers_by_community(&[peer_fixture(ConnectionMode::NoConnection, vec![a.clone()])]);
+        assert_eq!(only_dead.get(&a), None);
     }
 
     /// THE ZEB-805 INCIDENT REPLAY, as a permanent regression pin.
