@@ -1363,6 +1363,13 @@ pub enum CommunityInviteVerifyError {
     /// ZEB-497.
     #[error("inviter enrollment owner mismatch")]
     InviterEnrollmentOwnerMismatch,
+    /// ZEB-875: this single-use invite token was already claimed by a
+    /// different actor's committed PendingJoin. Refused before the counter-sign
+    /// hook fires. Host-side telemetry only — the acceptor writes no response
+    /// on this Err, so the losing joiner sees the generic "inviter_unreachable"
+    /// outcome (no wire-protocol change).
+    #[error("invite already claimed by another actor")]
+    InviteAlreadyClaimed,
 }
 
 impl CommunityInviteVerifyError {
@@ -1390,6 +1397,7 @@ impl CommunityInviteVerifyError {
             Self::InviterEnrollmentOwnerMismatch => {
                 "community_invite_inviter_enrollment_owner_mismatch"
             }
+            Self::InviteAlreadyClaimed => "community_invite_already_claimed",
         }
     }
 }
@@ -2291,9 +2299,14 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         // insert path. The former F6 event↔envelope pub cross-check is
         // subsumed by the cert→actor binding inside verify_event. (Task 8 will
         // rework this redemption path onto the cert model end-to-end.)
-        let joiner_identity_pub = signed.joiner_identity_pub;
+        // ZEB-875: bind the single-use invite to the FIRST verified claimant.
+        // Routing through the engine's claim-checked insert (atomic under the
+        // state lock) refuses a *distinct* actor redeeming the same token while
+        // letting the same actor retry idempotently. `join_event` is moved into
+        // the call, so capture the verified claimant first.
+        let claimant = join_event.actor;
         match engine_arc
-            .insert_local_event_with_pubs(join_event, joiner_identity_pub, None)
+            .insert_local_claim_bound_pending_join(join_event, signed.invite_token.sig, claimant)
             .await
         {
             Ok(crate::community_state_crdt::InsertOutcome::Inserted) => {
@@ -2311,6 +2324,22 @@ pub async fn handle_unicast<H: AppHandleEmit>(
                 emit_degraded(app, &signed.community_id, e.reason_tag());
                 Err(e)
             }
+            Err(crate::community_state_sync::LocalInsertError::InviteAlreadyClaimed { winner }) => {
+                // ZEB-875: a *different* actor already claimed this single-use
+                // invite. Refuse before the counter-sign hook can fire. The
+                // acceptor writes no response on this Err, so the losing joiner
+                // sees the generic "inviter_unreachable" outcome (no wire
+                // change); the rejection is diagnosable host-side via this warn
+                // + the reason_tag.
+                tracing::warn!(
+                    ?winner,
+                    ?claimant,
+                    "ZEB-875 handle_unicast: invite token already claimed by a different actor; refusing redeem"
+                );
+                let e = CommunityInviteVerifyError::InviteAlreadyClaimed;
+                emit_degraded(app, &signed.community_id, e.reason_tag());
+                Err(e)
+            }
             Err(local_err) => {
                 tracing::warn!(error = %local_err, "ZEB-254 handle_unicast: insert PendingJoin failed");
                 let e = CommunityInviteVerifyError::EngineLocalError;
@@ -2319,6 +2348,15 @@ pub async fn handle_unicast<H: AppHandleEmit>(
             }
         }
     } else {
+        // ZEB-875: the claimant-bound single-use claim is enforced only on the
+        // PendingJoin shape — the only shape any live minter emits (the lib.rs
+        // redeem builds PendingJoin for invite-only). A bare legacy Join carries
+        // no invite_token, so it cannot be claim-bound; reaching here means a
+        // pre-ZEB-254 stale client. Logged (NOT asserted) because such a client
+        // is rare but legitimate — a debug_assert would panic a real old peer.
+        tracing::warn!(
+            "ZEB-875: invite redeem via legacy bare-Join path (no claim binding; pre-ZEB-254 client)"
+        );
         // 6. LEGACY path: Attach countersig with our enrolled device key (#2).
         //    ZEB-339: the counter-sig MUST be produced with device #2, since
         //    `verify_countersig` resolves the counter-signer's key from their
