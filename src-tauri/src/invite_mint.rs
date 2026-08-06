@@ -106,24 +106,30 @@ impl std::fmt::Display for InviteMintError {
 /// carries an enrollment cert) in a community's event set. This is what the
 /// redeemer pre-inserts so its empty CRDT can verify the admin's publish-back.
 ///
-/// ZEB-833: before returning, the selected event is run through the joiner's
+/// ZEB-833: returns the EARLIEST structural candidate that passes the joiner's
 /// EXACT verify chain (`enrolled_key_from_cert` + `verify_membership_signer` —
 /// the same checks `community_invite::verify_admin_bootstrap` step 5 runs).
 /// Structural selection alone (actor/community/kind/countersig/enrollment-
 /// present) trusts that a self-Join sitting in the host's engine was validly
 /// signed; nothing re-checked the signature at mint time, so a structurally-
-/// qualifying but cryptographically-bad self-Join was silently baked into a
-/// poisoned invite that the joiner deterministically rejects with
+/// qualifying but cryptographically-bad self-Join could be silently baked into
+/// a poisoned invite that the joiner deterministically rejects with
 /// `admin_bootstrap signature verify failed` (after the host has already
 /// committed a phantom member + burned the single-use invite — that acceptor-
 /// side fallout is ZEB-874). Verifying here turns that silent, host-invisible
 /// failure into a fail-fast host-side error at mint time.
+///
+/// Iterating in canonical order (rather than verifying only the earliest) means
+/// a single invalid historical duplicate — e.g. a legacy or superseded
+/// self-Join — cannot block minting when a usable bootstrap exists later in the
+/// log; minting fails only when NO structural candidate verifies.
 pub fn extract_admin_bootstrap(
     events: &[SignedMembershipEvent],
     community_id: SpaceId,
     admin_addr: OwnerAddr,
 ) -> Result<SignedMembershipEvent, InviteMintError> {
-    let selected = events
+    // Structural candidates: the admin's bootstrap self-Join carrying a cert.
+    let mut candidates: Vec<&SignedMembershipEvent> = events
         .iter()
         .filter(|e| {
             e.actor == admin_addr
@@ -132,32 +138,38 @@ pub fn extract_admin_bootstrap(
                 && e.countersig.is_none()
                 && e.enrollment.is_some()
         })
-        // Deterministic selection: pick the EARLIEST qualifying bootstrap Join by
-        // canonical HLC order (wall_ms, logical, device_id), with the event id as a
-        // final total-order tiebreaker. A plain `.find()` would surface whichever
-        // match happens to come first in iterator order — non-deterministic if the
-        // slice ever holds more than one admin bootstrap Join, which would let a
-        // non-canonical record get embedded in the minted invite.
-        .min_by(|a, b| {
-            (a.at.wall_ms, a.at.logical, &a.at.device_id, &a.id).cmp(&(
-                b.at.wall_ms,
-                b.at.logical,
-                &b.at.device_id,
-                &b.id,
-            ))
-        })
-        .cloned()
-        .ok_or(InviteMintError::NoAdminBootstrap)?;
+        .collect();
+    if candidates.is_empty() {
+        return Err(InviteMintError::NoAdminBootstrap);
+    }
+    // Deterministic order: EARLIEST qualifying bootstrap Join by canonical HLC
+    // (wall_ms, logical, device_id), with the event id as a final total-order
+    // tiebreaker — so selection is independent of the slice's iteration order
+    // even when the log holds more than one admin bootstrap Join.
+    candidates.sort_by(|a, b| {
+        (a.at.wall_ms, a.at.logical, &a.at.device_id, &a.id).cmp(&(
+            b.at.wall_ms,
+            b.at.logical,
+            &b.at.device_id,
+            &b.id,
+        ))
+    });
 
-    // ZEB-833: verify the selected bootstrap through the joiner's exact chain
-    // before returning it. Both calls are pure crypto (no I/O) — the same
-    // functions the redeemer runs in `verify_admin_bootstrap`.
-    let signer = crate::community_membership::enrolled_key_from_cert(&selected)
-        .map_err(InviteMintError::AdminBootstrapUnverifiable)?;
-    crate::community_membership::verify_membership_signer(&selected, &signer)
-        .map_err(InviteMintError::AdminBootstrapUnverifiable)?;
-
-    Ok(selected)
+    // Return the earliest candidate that verifies. Both calls are pure crypto
+    // (no I/O) — the same functions the redeemer runs in `verify_admin_bootstrap`.
+    let mut last_err = None;
+    for cand in candidates {
+        match crate::community_membership::enrolled_key_from_cert(cand)
+            .and_then(|signer| crate::community_membership::verify_membership_signer(cand, &signer))
+        {
+            Ok(()) => return Ok(cand.clone()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    // Non-empty candidates but none verified: surface the last verify failure.
+    Err(InviteMintError::AdminBootstrapUnverifiable(
+        last_err.expect("candidates is non-empty, so the loop recorded at least one verify error"),
+    ))
 }
 
 #[cfg(test)]
@@ -299,6 +311,31 @@ mod tests {
         assert!(
             matches!(r, Err(InviteMintError::AdminBootstrapUnverifiable(_))),
             "tampered-sig bootstrap must be rejected at mint, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn skips_invalid_earlier_bootstrap_for_valid_later() {
+        // ZEB-833: a single invalid historical duplicate that sorts earlier must
+        // not block minting when a valid bootstrap exists later in the log —
+        // extract returns the valid later one rather than failing on the first.
+        let owner = crate::community_membership::mint_test_owner(0x6E);
+        let cid = SpaceId([0x11u8; 16]);
+        // Earlier (smaller wall_ms) but tampered → does not verify.
+        let mut invalid_earlier = signed_admin_join(&owner, cid, [1u8; 16], 1_700_000_010_000);
+        invalid_earlier.sig[0] ^= 0x01;
+        // Later (larger wall_ms) and validly signed.
+        let valid_later = signed_admin_join(&owner, cid, [2u8; 16], 1_700_000_020_000);
+        // Present earliest-first so a "verify only the earliest" impl would fail.
+        let got = extract_admin_bootstrap(
+            &[invalid_earlier.clone(), valid_later.clone()],
+            cid,
+            owner.owner,
+        )
+        .expect("valid later bootstrap must be selected despite an invalid earlier one");
+        assert_eq!(
+            got.id, valid_later.id,
+            "must return the valid later bootstrap"
         );
     }
 }
