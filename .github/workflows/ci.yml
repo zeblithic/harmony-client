@@ -185,12 +185,17 @@ jobs:
       # exists solely WITHOUT the feature — e.g. an import used only by a
       # `test-fixtures`-gated item — stays invisible until someone builds a
       # release binary. This step lints the actual shipping configuration
-      # (`--lib`, no `test-fixtures`) with warnings denied, so that blind spot
-      # fails here instead of in a release build. `--no-deps` scopes `-D warnings`
-      # to our own crate; dependency lints stay non-fatal, exactly like the gate
-      # above. Cheap: it reuses this job's warm dependency cache.
-      - name: cargo clippy --locked --lib (shipping config — no test-fixtures)
-        run: cargo clippy --locked --lib --no-deps -- -D warnings
+      # (`--lib --bins`, no `test-fixtures`) with warnings denied, so that blind
+      # spot fails here instead of in a release build. `--bins` covers the
+      # installed binary entrypoints (src/main.rs et al.) that `--lib` alone
+      # skips. `--all-targets` is deliberately NOT used: it would pull in the
+      # tests/ integration targets, which REQUIRE `test-fixtures` to compile —
+      # the exact feature this gate must exclude — so `--all-targets` and "no
+      # test-fixtures" are mutually exclusive by construction. `--no-deps` scopes
+      # `-D warnings` to our own crate; dependency lints stay non-fatal, exactly
+      # like the gate above. Cheap: it reuses this job's warm dependency cache.
+      - name: cargo clippy --locked --lib --bins (shipping config — no test-fixtures)
+        run: cargo clippy --locked --lib --bins --no-deps -- -D warnings
 
       - name: sccache stats (ZEB-499)
         if: always()
