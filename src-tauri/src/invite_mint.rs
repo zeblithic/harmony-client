@@ -81,11 +81,23 @@ use crate::owner_state_types::SpaceId;
 #[derive(Debug)]
 pub enum InviteMintError {
     NoAdminBootstrap,
+    /// ZEB-833: the admin bootstrap self-Join selected from the community log
+    /// does not pass the joiner's own verify chain (`enrolled_key_from_cert` +
+    /// `verify_membership_signer`). Refusing to embed it means the host never
+    /// publishes an invite whose `admin_bootstrap` the joiner would
+    /// deterministically reject — turning a silent, host-invisible poisoned
+    /// invite into a fail-fast host-side error at mint time.
+    AdminBootstrapUnverifiable(crate::community_membership::VerifyError),
 }
 impl std::fmt::Display for InviteMintError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoAdminBootstrap => write!(f, "admin bootstrap Join not found in community log"),
+            Self::AdminBootstrapUnverifiable(e) => write!(
+                f,
+                "admin bootstrap self-Join failed the joiner's verify chain ({e}) — \
+                 refusing to publish an invite the joiner would reject"
+            ),
         }
     }
 }
@@ -93,12 +105,31 @@ impl std::fmt::Display for InviteMintError {
 /// Find the admin's bootstrap self-Join (kind=Join, actor=admin, no countersig,
 /// carries an enrollment cert) in a community's event set. This is what the
 /// redeemer pre-inserts so its empty CRDT can verify the admin's publish-back.
+///
+/// ZEB-833: returns the EARLIEST structural candidate that passes the joiner's
+/// EXACT verify chain (`enrolled_key_from_cert` + `verify_membership_signer` —
+/// the same checks `community_invite::verify_admin_bootstrap` step 5 runs).
+/// Structural selection alone (actor/community/kind/countersig/enrollment-
+/// present) trusts that a self-Join sitting in the host's engine was validly
+/// signed; nothing re-checked the signature at mint time, so a structurally-
+/// qualifying but cryptographically-bad self-Join could be silently baked into
+/// a poisoned invite that the joiner deterministically rejects with
+/// `admin_bootstrap signature verify failed` (after the host has already
+/// committed a phantom member + burned the single-use invite — that acceptor-
+/// side fallout is ZEB-874). Verifying here turns that silent, host-invisible
+/// failure into a fail-fast host-side error at mint time.
+///
+/// Iterating in canonical order (rather than verifying only the earliest) means
+/// a single invalid historical duplicate — e.g. a legacy or superseded
+/// self-Join — cannot block minting when a usable bootstrap exists later in the
+/// log; minting fails only when NO structural candidate verifies.
 pub fn extract_admin_bootstrap(
     events: &[SignedMembershipEvent],
     community_id: SpaceId,
     admin_addr: OwnerAddr,
 ) -> Result<SignedMembershipEvent, InviteMintError> {
-    events
+    // Structural candidates: the admin's bootstrap self-Join carrying a cert.
+    let mut candidates: Vec<&SignedMembershipEvent> = events
         .iter()
         .filter(|e| {
             e.actor == admin_addr
@@ -107,22 +138,38 @@ pub fn extract_admin_bootstrap(
                 && e.countersig.is_none()
                 && e.enrollment.is_some()
         })
-        // Deterministic selection: pick the EARLIEST qualifying bootstrap Join by
-        // canonical HLC order (wall_ms, logical, device_id), with the event id as a
-        // final total-order tiebreaker. A plain `.find()` would surface whichever
-        // match happens to come first in iterator order — non-deterministic if the
-        // slice ever holds more than one admin bootstrap Join, which would let a
-        // non-canonical record get embedded in the minted invite.
-        .min_by(|a, b| {
-            (a.at.wall_ms, a.at.logical, &a.at.device_id, &a.id).cmp(&(
-                b.at.wall_ms,
-                b.at.logical,
-                &b.at.device_id,
-                &b.id,
-            ))
-        })
-        .cloned()
-        .ok_or(InviteMintError::NoAdminBootstrap)
+        .collect();
+    if candidates.is_empty() {
+        return Err(InviteMintError::NoAdminBootstrap);
+    }
+    // Deterministic order: EARLIEST qualifying bootstrap Join by canonical HLC
+    // (wall_ms, logical, device_id), with the event id as a final total-order
+    // tiebreaker — so selection is independent of the slice's iteration order
+    // even when the log holds more than one admin bootstrap Join.
+    candidates.sort_by(|a, b| {
+        (a.at.wall_ms, a.at.logical, &a.at.device_id, &a.id).cmp(&(
+            b.at.wall_ms,
+            b.at.logical,
+            &b.at.device_id,
+            &b.id,
+        ))
+    });
+
+    // Return the earliest candidate that verifies. Both calls are pure crypto
+    // (no I/O) — the same functions the redeemer runs in `verify_admin_bootstrap`.
+    let mut last_err = None;
+    for cand in candidates {
+        match crate::community_membership::enrolled_key_from_cert(cand)
+            .and_then(|signer| crate::community_membership::verify_membership_signer(cand, &signer))
+        {
+            Ok(()) => return Ok(cand.clone()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    // Non-empty candidates but none verified: surface the last verify failure.
+    Err(InviteMintError::AdminBootstrapUnverifiable(
+        last_err.expect("candidates is non-empty, so the loop recorded at least one verify error"),
+    ))
 }
 
 #[cfg(test)]
@@ -137,6 +184,34 @@ mod tests {
             logical: 0,
             device_id: "dev2".to_string(),
         }
+    }
+
+    /// A validly-signed admin bootstrap self-Join for `owner`: signed by the
+    /// owner's enrolled device key and carrying the owner's Master cert, so it
+    /// passes the joiner's verify chain (enrolled_key_from_cert +
+    /// verify_membership_signer). `wall_ms` uses the cert-era timestamp so the
+    /// enrollment cert verifies at the event's own time.
+    fn signed_admin_join(
+        owner: &crate::community_membership::TestOwner,
+        community_id: SpaceId,
+        id: [u8; 16],
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let payload = crate::community_membership::EventPayload {
+            id,
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: owner.owner,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        let mut ev =
+            crate::community_membership::sign_event(&payload, &owner.device_key).expect("sign");
+        ev.enrollment = Some(owner.cert.clone());
+        ev
     }
 
     #[test]
@@ -180,24 +255,12 @@ mod tests {
 
     #[test]
     fn extracts_admin_join_with_enrollment() {
-        let admin = OwnerAddr([0x6Eu8; 16]);
-        let cid = SpaceId([0x11u8; 16]);
         let owner = crate::community_membership::mint_test_owner(0x6E);
-        let admin_join = SignedMembershipEvent {
-            signer_certs: Vec::new(),
-            id: [1u8; 16],
-            community_id: cid,
-            kind: MembershipEventKind::Join,
-            actor: admin,
-            at: Hlc {
-                wall_ms: 1,
-                logical: 0,
-                device_id: "d".into(),
-            },
-            sig: [0u8; 64],
-            countersig: None,
-            enrollment: Some(owner.cert),
-        };
+        let admin = owner.owner;
+        let cid = SpaceId([0x11u8; 16]);
+        let admin_join = signed_admin_join(&owner, cid, [1u8; 16], 1_700_000_000_000);
+        // A different actor carrying no enrollment must be filtered out before
+        // selection (never reaches the ZEB-833 verify guard).
         let other = SignedMembershipEvent {
             actor: OwnerAddr([2u8; 16]),
             enrollment: None,
@@ -219,36 +282,60 @@ mod tests {
         // Two qualifying admin bootstrap Joins differing only by HLC. Selection
         // must be deterministic (earliest by canonical HLC order), independent of
         // the order they appear in the slice.
-        let admin = OwnerAddr([0x6Eu8; 16]);
-        let cid = SpaceId([0x11u8; 16]);
         let owner = crate::community_membership::mint_test_owner(0x6E);
-        let earlier = SignedMembershipEvent {
-            signer_certs: Vec::new(),
-            id: [1u8; 16],
-            community_id: cid,
-            kind: MembershipEventKind::Join,
-            actor: admin,
-            at: Hlc {
-                wall_ms: 10,
-                logical: 0,
-                device_id: "d".into(),
-            },
-            sig: [0u8; 64],
-            countersig: None,
-            enrollment: Some(owner.cert.clone()),
-        };
-        let later = SignedMembershipEvent {
-            id: [2u8; 16],
-            at: Hlc {
-                wall_ms: 20,
-                logical: 0,
-                device_id: "d".into(),
-            },
-            ..earlier.clone()
-        };
+        let admin = owner.owner;
+        let cid = SpaceId([0x11u8; 16]);
+        // Each event is individually signed (the sig covers id + at), so both
+        // are valid bootstraps differing only by HLC. extract only verifies the
+        // selected (earliest) one, which must still pass the ZEB-833 guard.
+        let earlier = signed_admin_join(&owner, cid, [1u8; 16], 1_700_000_010_000);
+        let later = signed_admin_join(&owner, cid, [2u8; 16], 1_700_000_020_000);
         // Present in reverse (later first) so a naive `.find()` would pick `later`.
         let got = extract_admin_bootstrap(&[later.clone(), earlier.clone()], cid, admin).unwrap();
         assert_eq!(got.id, earlier.id, "must pick the earliest-HLC bootstrap");
-        assert_eq!(got.at.wall_ms, 10);
+        assert_eq!(got.at.wall_ms, 1_700_000_010_000);
+    }
+
+    #[test]
+    fn rejects_unverifiable_admin_bootstrap() {
+        // ZEB-833: a structurally-qualifying admin bootstrap (right
+        // actor/community/kind, no countersig, carries an enrollment cert) but
+        // with a TAMPERED signature must be rejected at mint time. The host
+        // must never embed a bootstrap the joiner's verify_admin_bootstrap
+        // would deterministically reject.
+        let owner = crate::community_membership::mint_test_owner(0x6E);
+        let cid = SpaceId([0x11u8; 16]);
+        let mut ev = signed_admin_join(&owner, cid, [1u8; 16], 1_700_000_000_000);
+        ev.sig[0] ^= 0x01; // flip one bit: valid structure, invalid signature
+        let r = extract_admin_bootstrap(&[ev], cid, owner.owner);
+        assert!(
+            matches!(r, Err(InviteMintError::AdminBootstrapUnverifiable(_))),
+            "tampered-sig bootstrap must be rejected at mint, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn skips_invalid_earlier_bootstrap_for_valid_later() {
+        // ZEB-833: a single invalid historical duplicate that sorts earlier must
+        // not block minting when a valid bootstrap exists later in the log —
+        // extract returns the valid later one rather than failing on the first.
+        let owner = crate::community_membership::mint_test_owner(0x6E);
+        let cid = SpaceId([0x11u8; 16]);
+        // Earlier (smaller wall_ms) but tampered → does not verify.
+        let mut invalid_earlier = signed_admin_join(&owner, cid, [1u8; 16], 1_700_000_010_000);
+        invalid_earlier.sig[0] ^= 0x01;
+        // Later (larger wall_ms) and validly signed.
+        let valid_later = signed_admin_join(&owner, cid, [2u8; 16], 1_700_000_020_000);
+        // Present earliest-first so a "verify only the earliest" impl would fail.
+        let got = extract_admin_bootstrap(
+            &[invalid_earlier.clone(), valid_later.clone()],
+            cid,
+            owner.owner,
+        )
+        .expect("valid later bootstrap must be selected despite an invalid earlier one");
+        assert_eq!(
+            got.id, valid_later.id,
+            "must return the valid later bootstrap"
+        );
     }
 }
