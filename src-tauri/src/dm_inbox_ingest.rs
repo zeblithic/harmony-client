@@ -459,24 +459,37 @@ pub fn ingest_nudge_on_applied(nudge_tx: mpsc::Sender<()>) -> Arc<dyn Fn() + Sen
 /// ));
 /// // Shutdown: drop nudge_tx (stop_inner) → recv() yields None → task exits.
 /// ```
+/// ZEB-862: local-only durable-persist trigger (an `engine.persist_now()`),
+/// passed as a boxed-future closure so the sweeper stays decoupled from the
+/// concrete engine type (mirroring the `notify_dirty` closure). Invoked when a
+/// sweep adds first-observation stamps but removes nothing, so the durable TTL
+/// clock reaches disk without a fleet republish.
+pub type PersistNowFn = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::fleet_sync::SyncError>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 pub async fn run_dm_inbox_ingest_sweeper(
     doc: Arc<Mutex<DmInboxDoc>>,
     ctx: Arc<dyn DmInboxIngestCtx>,
     mut nudge_rx: mpsc::Receiver<()>,
     notify_dirty: Arc<dyn Fn() + Send + Sync>,
+    persist_now: PersistNowFn,
     debounce: Duration,
 ) {
     // Startup sweep: ingest entries deposited while this device was
     // offline (they arrive via the engine's initial fan-in BEFORE
     // on_applied wiring can observe them, and via the persisted doc).
-    sweep_once(&doc, ctx.as_ref(), notify_dirty.as_ref()).await;
+    sweep_once(&doc, ctx.as_ref(), notify_dirty.as_ref(), &persist_now).await;
 
     while nudge_rx.recv().await.is_some() {
         // Debounce: let the rest of a merge burst land, then drain any
         // extra nudges so the burst coalesces into one sweep.
         tokio::time::sleep(debounce).await;
         while nudge_rx.try_recv().is_ok() {}
-        sweep_once(&doc, ctx.as_ref(), notify_dirty.as_ref()).await;
+        sweep_once(&doc, ctx.as_ref(), notify_dirty.as_ref(), &persist_now).await;
     }
     // recv() == None: every nudge sender dropped (engine shutdown).
 }
@@ -1470,13 +1483,29 @@ async fn sweep_once(
     doc: &Arc<Mutex<DmInboxDoc>>,
     ctx: &dyn DmInboxIngestCtx,
     notify_dirty: &(dyn Fn() + Send + Sync),
+    persist_now: &PersistNowFn,
 ) {
-    let changed = {
+    let (changed, fo_grew) = {
         let mut guard = doc.lock().await;
-        ingest_pending(&mut guard, ctx).await
+        let before = guard.first_observed_ms().len();
+        let changed = ingest_pending(&mut guard, ctx).await;
+        // When `changed` is false the side-map cannot shrink (no entry was
+        // removed, so its live-key prune removes nothing), so a length change
+        // means `gc_expired` lazily stamped a newly-seen entry.
+        (changed, guard.first_observed_ms().len() != before)
     };
     if changed {
+        // `notify_dirty` schedules a debounced publish + persist, which also
+        // captures any first-observation stamps added during this sweep.
         notify_dirty();
+    } else if fo_grew {
+        // ZEB-862: a stamp-only sweep added durable first-observation
+        // timestamps but removed nothing. Persist them LOCALLY (no fleet
+        // republish; the clock is serde-skip so the wire bytes are unchanged)
+        // so the TTL survives restart.
+        if let Err(e) = persist_now().await {
+            tracing::warn!(error = %e, "ZEB-862: dm-inbox first-observed persist_now failed");
+        }
     }
 }
 
@@ -2091,12 +2120,27 @@ mod tests {
             })
         };
         let (nudge_tx, nudge_rx) = mpsc::channel(1);
+        // ZEB-862: count stamp-only persist_now calls. Every sweep in this test
+        // mutates (ingests), so it takes the notify_dirty path — persist_now must
+        // stay at 0.
+        let persisted = Arc::new(AtomicUsize::new(0));
+        let persist_now: PersistNowFn = {
+            let persisted = Arc::clone(&persisted);
+            Arc::new(move || {
+                let persisted = Arc::clone(&persisted);
+                Box::pin(async move {
+                    persisted.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
 
         let handle = tokio::spawn(run_dm_inbox_ingest_sweeper(
             Arc::clone(&doc),
             Arc::clone(&ctx) as Arc<dyn DmInboxIngestCtx>,
             nudge_rx,
             notify_dirty,
+            persist_now,
             Duration::from_millis(INGEST_SWEEP_DEBOUNCE_MS),
         ));
 
@@ -2124,6 +2168,12 @@ mod tests {
             .await
             .expect("sweeper must exit when nudge senders drop")
             .expect("sweeper must not panic");
+
+        assert_eq!(
+            persisted.load(Ordering::SeqCst),
+            0,
+            "mutating sweeps notify_dirty; the stamp-only persist_now path is not taken here"
+        );
     }
 
     /// The on_applied adapter nudges the channel; a full buffer (sweep

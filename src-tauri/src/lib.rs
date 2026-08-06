@@ -6011,11 +6011,16 @@ pub async fn start_node_inner(
                     let dm_inbox_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
                         let mut doc = crate::dm_inbox_persist::load_doc_or_recover(&dm_inbox_path)
                             .map_err(|e| format!("load dm-inbox doc: {e}"))?;
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
                         doc.restore_first_observed(
                             crate::dm_inbox_persist::load_first_observed_or_recover(
                                 &dm_inbox_first_observed_path,
                             )
                             .map_err(|e| format!("load dm-inbox first-observed: {e}"))?,
+                            now_ms,
                         );
                         doc
                     }));
@@ -6134,11 +6139,21 @@ pub async fn start_node_inner(
                     // above) — stop_inner's engine shutdown is its shutdown.
                     {
                         let sweeper_engine = std::sync::Arc::clone(&dm_inbox_sync);
+                        // ZEB-862: local-only persist trigger for stamp-only
+                        // sweeps (durable first-observation clock without a
+                        // fleet republish).
+                        let persist_engine = std::sync::Arc::clone(&dm_inbox_sync);
+                        let dm_inbox_persist_now: crate::dm_inbox_ingest::PersistNowFn =
+                            std::sync::Arc::new(move || {
+                                let e = std::sync::Arc::clone(&persist_engine);
+                                Box::pin(async move { e.persist_now().await })
+                            });
                         tokio::spawn(crate::dm_inbox_ingest::run_dm_inbox_ingest_sweeper(
                             std::sync::Arc::clone(&dm_inbox_doc),
                             dm_inbox_ingest_ctx,
                             dm_inbox_nudge_rx,
                             std::sync::Arc::new(move || sweeper_engine.notify_dirty()),
+                            dm_inbox_persist_now,
                             std::time::Duration::from_millis(
                                 crate::dm_inbox_ingest::INGEST_SWEEP_DEBOUNCE_MS,
                             ),
@@ -6285,11 +6300,16 @@ pub async fn start_node_inner(
                         let mut doc =
                             crate::relay_hold_persist::load_doc_or_recover(&relay_hold_path)
                                 .map_err(|e| format!("load relay-hold doc: {e}"))?;
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
                         doc.restore_first_observed(
                             crate::relay_hold_persist::load_first_observed_or_recover(
                                 &relay_hold_first_observed_path,
                             )
                             .map_err(|e| format!("load relay-hold first-observed: {e}"))?,
+                            now_ms,
                         );
                         doc
                     }));
@@ -12104,9 +12124,11 @@ pub async fn start_node_inner(
                                         .unwrap_or_default()
                                         .as_millis()
                                         as u64;
-                                    let changed = {
+                                    let (changed, fo_grew) = {
                                         let mut d = gc_doc.lock().await;
-                                        d.gc(now_ms)
+                                        let before = d.first_observed_ms().len();
+                                        let changed = d.gc(now_ms);
+                                        (changed, d.first_observed_ms().len() != before)
                                     };
                                     if changed {
                                         gc_sync.notify_dirty();
@@ -12114,6 +12136,22 @@ pub async fn start_node_inner(
                                             tracing::warn!(
                                                 error = %e,
                                                 "ZEB-458: relay-hold GC flush_now failed"
+                                            );
+                                        }
+                                    } else if fo_grew {
+                                        // ZEB-862: a stamp-only sweep added durable
+                                        // first-observation timestamps but removed
+                                        // nothing (`gc` returned false), so the
+                                        // `changed` path above did not run. Persist
+                                        // them LOCALLY — `persist_now` writes disk
+                                        // WITHOUT a fleet republish (the clock is
+                                        // serde-skip, so the wire bytes are unchanged)
+                                        // and cannot be starved by a stalled publish —
+                                        // so the TTL survives restart.
+                                        if let Err(e) = gc_sync.persist_now().await {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "ZEB-862: relay-hold first-observed persist_now failed"
                                             );
                                         }
                                     }

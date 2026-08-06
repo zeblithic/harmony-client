@@ -507,8 +507,13 @@ mod tests {
         };
         use crate::fleet_sync::FleetPersist;
         let mut doc = sample_doc();
-        let fo: BTreeMap<String, u64> = [("x".to_string(), 9u64)].into_iter().collect();
-        doc.restore_first_observed(fo.clone());
+        // Key the stamp to the sample entry so `restore_first_observed`'s
+        // orphan-prune (ZEB-862 Q-2) keeps it; `u64::MAX` avoids the Q-1
+        // future-stamp clamp.
+        let fo: BTreeMap<String, u64> = [(RelayHoldDoc::key(&[9u8; 16], &[2u8; 32]), 9u64)]
+            .into_iter()
+            .collect();
+        doc.restore_first_observed(fo.clone(), u64::MAX);
         let mut t = std::collections::BTreeMap::new();
         t.insert(
             "A".to_string(),
@@ -584,8 +589,9 @@ mod tests {
         let mut e = sample_entry();
         e.pulled_by.clear(); // never covered → only TTL removes it
         doc.entries.insert(key.clone(), e);
-        doc.restore_first_observed(load_first_observed_or_recover(&fo_path).unwrap());
-        doc.gc(crate::community_relay::RELAY_HOLD_TTL_MS + 10_000);
+        let now = crate::community_relay::RELAY_HOLD_TTL_MS + 10_000;
+        doc.restore_first_observed(load_first_observed_or_recover(&fo_path).unwrap(), now);
+        doc.gc(now);
         assert!(
             !doc.entries.contains_key(&key),
             "reloaded old stamp aged the entry out"

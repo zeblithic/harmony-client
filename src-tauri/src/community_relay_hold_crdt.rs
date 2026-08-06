@@ -167,9 +167,13 @@ impl RelayHoldDoc {
     /// less-than, keyed off this replica's OWN local receipt time rather than
     /// the peer-supplied `held_at`, so a backdated stamp cannot pre-expire a
     /// live hold). `first_observed_ms` is lazily stamped on the first sweep
-    /// that observes each entry and is process-local (never persisted or
-    /// replicated) — a restart clears it, restarting the TTL from the first
-    /// post-restart sweep. Unlike coverage, this is a per-replica SOFT
+    /// that observes each entry. ZEB-862: it is LOCAL-only (never on the wire
+    /// or in `PartialEq`) but restart-DURABLE — persisted to and restored from
+    /// a local sidecar (`relay_hold_persist::save_first_observed`), so a
+    /// restart no longer resets the TTL. A stamp read back GREATER than the
+    /// boot `now_ms` (a backward local clock step across restart) is rebased to
+    /// `now_ms` in [`Self::restore_first_observed`], so a future stamp cannot
+    /// delay expiry. Unlike coverage, this is a per-replica SOFT
     /// deadline, not fleet-wide deterministic: a never-covered entry
     /// resurrected by a still-holding peer re-stamps `first_observed_ms` and
     /// gets a fresh TTL window here too, so it may persist beyond a single
@@ -217,7 +221,21 @@ impl RelayHoldDoc {
 
     /// ZEB-862: restore the LOCAL first-observation clock on boot from the
     /// sidecar file, so TTL GC survives restart instead of re-stamping `now`.
-    pub fn restore_first_observed(&mut self, map: BTreeMap<String, u64>) {
+    /// `now_ms` is the boot wall clock.
+    ///
+    /// - Q-2: orphan stamps for keys not in `entries` (e.g. a crash between the
+    ///   doc and sidecar writes) are dropped, so the restored clock is
+    ///   self-consistent and `persist` never re-writes dead keys.
+    /// - Q-1: a stamp GREATER than `now_ms` (a backward local clock step left a
+    ///   future stamp in the sidecar) is rebased down to `now_ms`, so it cannot
+    ///   delay TTL expiry beyond `now_ms + TTL`. Self-heals on each boot.
+    ///
+    /// Callers MUST load `entries` before calling this (the boot path does).
+    pub fn restore_first_observed(&mut self, mut map: BTreeMap<String, u64>, now_ms: u64) {
+        map.retain(|k, _| self.entries.contains_key(k));
+        for v in map.values_mut() {
+            *v = (*v).min(now_ms);
+        }
         self.first_observed_ms = map;
     }
 }
@@ -278,7 +296,7 @@ mod tests {
             entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]),
         );
         let now = crate::community_relay::RELAY_HOLD_TTL_MS + 10_000;
-        doc.restore_first_observed([(k.clone(), 1u64)].into_iter().collect());
+        doc.restore_first_observed([(k.clone(), 1u64)].into_iter().collect(), now);
         assert!(doc.gc(now), "old restored stamp → entry ages out");
         assert!(doc.entries.is_empty());
     }
@@ -307,8 +325,75 @@ mod tests {
             entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]),
         );
         let m: BTreeMap<String, u64> = [(k.clone(), 12_345u64)].into_iter().collect();
-        doc.restore_first_observed(m.clone());
+        doc.restore_first_observed(m.clone(), u64::MAX);
         assert_eq!(doc.first_observed_ms(), &m);
+    }
+
+    #[test]
+    fn gc_grows_first_observed_once_per_entry() {
+        // The stamp-only detection in both sweepers keys off the side-map length
+        // delta: gc grows it on the first sweep that sees a new entry, and not
+        // thereafter. (ZEB-862 finding A — persist a stamp-only sweep.)
+        let mut doc = RelayHoldDoc::default();
+        let k = key_rr(1, 1);
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        assert_eq!(doc.first_observed_ms().len(), 0);
+        assert!(!doc.gc(1_000), "fresh stamp at now → nothing removed");
+        assert_eq!(doc.first_observed_ms().len(), 1, "gc stamped the new entry");
+        assert!(!doc.gc(2_000));
+        assert_eq!(
+            doc.first_observed_ms().len(),
+            1,
+            "already-stamped entry does not grow the side-map"
+        );
+    }
+
+    #[test]
+    fn restore_clamps_future_stamp_to_now() {
+        // ZEB-862 Q-1: a stamp restored GREATER than the boot `now` (a backward
+        // clock step) is rebased to `now`, so it cannot delay expiry past now+TTL.
+        let mut doc = RelayHoldDoc::default();
+        let k = key_rr(1, 1);
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        let now = 1_000_000u64;
+        doc.restore_first_observed([(k.clone(), now + 5_000_000)].into_iter().collect(), now);
+        assert_eq!(
+            doc.first_observed_ms()[&k],
+            now,
+            "future stamp rebased to now"
+        );
+        assert!(
+            doc.gc(now + RELAY_HOLD_TTL_MS + 1),
+            "expires at now+TTL, not later"
+        );
+        assert!(doc.entries.is_empty());
+    }
+
+    #[test]
+    fn restore_prunes_orphan_stamps() {
+        // ZEB-862 Q-2: a sidecar stamp whose key is absent from `entries` (a
+        // crash between the doc and sidecar writes) is dropped on restore.
+        let mut doc = RelayHoldDoc::default();
+        let k = key_rr(1, 1);
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        let mut m: BTreeMap<String, u64> = BTreeMap::new();
+        m.insert(k.clone(), 5);
+        m.insert(key_rr(9, 9), 5); // orphan: not in entries
+        doc.restore_first_observed(m, u64::MAX);
+        assert!(doc.first_observed_ms().contains_key(&k));
+        assert!(
+            !doc.first_observed_ms().contains_key(&key_rr(9, 9)),
+            "orphan stamp pruned"
+        );
     }
 
     // ----------------------------------------------------------------
