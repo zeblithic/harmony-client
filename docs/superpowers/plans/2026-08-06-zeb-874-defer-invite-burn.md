@@ -219,6 +219,8 @@
 **Interfaces:**
 - Consumes: `setup_two_party_iroh_handshake_with_config(HandshakeAcceptorConfig) -> TwoPartySetup` (new); `setup_two_party_iroh_handshake()` becomes a thin wrapper over it with `default_acceptor_config()`.
 
+> **Amendment (review, PR #619):** the original `poll_deadline = 0` test relied on the async auto-countersign not landing before the acceptor's first poll scan — a genuine scheduler race that CI reproduced. Fixed deterministically by a **production change in Task 1's acceptor**: the poll loop now checks the deadline **before** scanning state, so a zero deadline times out on the first iteration without ever scanning (production's 10s deadline is unaffected — the ordering is a no-op there). The negative test additionally asserts Alice inserted Bob's `PendingJoin`, proving the failure is genuinely post-insert. The embedded comment/asserts below reflect the pre-amendment draft; the authoritative code is the merged test.
+
 - [ ] **Step 1: parameterize the harness on the acceptor config.** Replace the helper opener:
   ```rust
   /// Stand up the full two-party iroh-handshake harness (identities, endpoints,

@@ -482,6 +482,19 @@ where
             .ok_or(HandshakeAcceptError::CommunityNotFound { community_id })?;
         let deadline = Instant::now() + self.config.poll_deadline;
         let countersign = loop {
+            // ZEB-874: check the deadline BEFORE scanning so a zero/elapsed
+            // poll_deadline times out deterministically without a racy "free"
+            // scan (a zero budget means do-not-wait). Production uses a 10s
+            // deadline, so this ordering is a no-op there; it makes the
+            // `invite_not_burned_when_handshake_fails_after_insert` negative test
+            // a deterministic post-insert timeout rather than a scheduler race
+            // against the async auto-counter-sign task.
+            if Instant::now() >= deadline {
+                return Err(HandshakeAcceptError::CountersignTimeout {
+                    target_event_id: bootstrap_join_id,
+                    deadline_ms: self.config.poll_deadline.as_millis() as u64,
+                });
+            }
             let found: Option<SignedMembershipEvent> = {
                 let g = state_arc.lock().await;
                 let matched = g
@@ -500,12 +513,6 @@ where
             };
             if let Some(cs) = found {
                 break cs;
-            }
-            if Instant::now() >= deadline {
-                return Err(HandshakeAcceptError::CountersignTimeout {
-                    target_event_id: bootstrap_join_id,
-                    deadline_ms: self.config.poll_deadline.as_millis() as u64,
-                });
             }
             tokio::time::sleep(self.config.poll_interval).await;
         };

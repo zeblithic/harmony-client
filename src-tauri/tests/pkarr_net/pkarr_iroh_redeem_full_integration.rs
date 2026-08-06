@@ -1910,20 +1910,20 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
 
 // ────────────────────────────────────────────────────────────────────────────
 // ZEB-874 Tier 1: a redeem that fails AFTER the host's local insert must NOT
-// burn the single-use invite. Alice's acceptor runs with poll_deadline=0, so it
-// returns CountersignTimeout immediately after handle_unicast inserts Bob's
-// PendingJoin — the auto-counter-sign task spawns but cannot land in the
-// microseconds before the first poll check. This is exactly a post-insert,
-// pre-delivery failure: pre-ZEB-874 handle_unicast had already burned the invite
-// on the insert; post-ZEB-874 the burn lives after the countersign write, which
-// is never reached, so the invite stays live.
+// burn the single-use invite. Alice's acceptor runs with poll_deadline=0. The
+// acceptor's poll loop checks the deadline BEFORE scanning state (the ZEB-874
+// ordering in handle_invite_handshake_inbound), so a zero deadline times out on
+// the first iteration WITHOUT ever observing a countersign — the async
+// auto-counter-sign task cannot win a race that never runs. The acceptor thus
+// deterministically returns CountersignTimeout right after handle_unicast
+// inserts Bob's PendingJoin: a post-insert, pre-delivery failure. Pre-ZEB-874
+// handle_unicast had already burned the invite on that insert; post-ZEB-874 the
+// burn lives after the countersign write, which is never reached, so the invite
+// stays live.
 //
-// Determinism/no-flake contract: the ONLY way the race is lost is if the async
-// resolve+sign+insert completes within microseconds of tokio::spawn. If it ever
-// did, the acceptor would write, burn, and Bob would join — tripping BOTH asserts
-// LOUDLY. On broken (pre-fix) code the handle is burned on insert, also tripping
-// the assert loudly. There is no path where this test passes while the code is
-// wrong; the worst case is a loud, re-runnable flake, never a false green.
+// The test asserts both halves: (1) Alice DID insert Bob's PendingJoin, so the
+// failure is genuinely post-insert (pre-ZEB-874 would have burned here); and
+// (2) the invite handle is STILL in active_handles (post-ZEB-874 did not burn).
 // ────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2060,10 +2060,38 @@ async fn invite_not_burned_when_handshake_fails_after_insert() {
             outcome.status
         );
 
-        // THE load-bearing assertion: the single-use invite must remain live.
-        // Grace window for any spawned tasks to settle, then assert the handle
-        // is STILL registered — pre-ZEB-874 handle_unicast burned it on insert.
+        // Grace window for the spawned auto-counter-sign task and teardown to
+        // settle before the final observations.
         tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // (1) Prove the failure is genuinely POST-insert: Alice's handle_unicast
+        // DID insert Bob's PendingJoin, so pre-ZEB-874 the burn would have fired
+        // here. Without this, the invite-still-active assertion could vacuously
+        // pass on a failure that occurred before the insert.
+        let alice_state = s
+            .registry_alice
+            .state_for(&s.community_id)
+            .await
+            .expect("alice state must exist");
+        let alice_events: Vec<_> = {
+            let g = alice_state.lock().await;
+            g.events().cloned().collect()
+        };
+        let alice_has_pending = alice_events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                harmony_app::community_membership::MembershipEventKind::PendingJoin { .. }
+            ) && e.actor == s.bob_addr
+        });
+        assert!(
+            alice_has_pending,
+            "Alice's handle_unicast must have inserted Bob's PendingJoin — the \
+             invite-still-active assertion only proves the ZEB-874 invariant when the \
+             failure is genuinely POST-insert (pre-ZEB-874 would have burned here)"
+        );
+
+        // (2) THE load-bearing assertion: the single-use invite must remain live
+        // — pre-ZEB-874 handle_unicast burned it on the insert proven above.
         assert!(
             s.pkarr_publisher
                 .active_handles()
