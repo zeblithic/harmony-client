@@ -68,7 +68,14 @@
 
   async function refresh(): Promise<void> {
     try {
-      snap = await fetchSnapshot();
+      const s = await fetchSnapshot();
+      // ZEB-871: refresh() is driven by the 30s steady-refetch interval, the
+      // startup retry, and two event listeners, so an in-flight call can settle
+      // after onDestroy. Guard the $state write (the catch writes no $state, so
+      // it needs none). Post-teardown writes are silent in Svelte 5 — this is
+      // defensive consistency with the FriendsPanel (ZEB-793) idiom.
+      if (destroyed) return;
+      snap = s;
     } catch (e) {
       // Spec §6.3: never show top-level error banner — render empty.
       // The "diagnostics unavailable" banner shows only if snap stays null
