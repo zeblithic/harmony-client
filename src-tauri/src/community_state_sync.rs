@@ -7688,18 +7688,33 @@ mod tests {
             .identity_dir
             .join("communities")
             .join(hex::encode(community_id.0));
+        // `try_exists` (not `Path::exists`): the latter collapses an I/O
+        // error probing the path into `false`, which would let this loop —
+        // and the final assertion — mistake a probe failure for successful
+        // removal. Surface the error as a hard test failure instead (matches
+        // the codebase's checked-probe convention, e.g. the pre-spawn probe
+        // in spawn_engine_with_guard). Qodo PR #622.
+        let dir_present = || {
+            dir.try_exists().expect(
+                "probe persistence dir (an I/O error here is a real test failure, not \"absent\")",
+            )
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
-        while (fix.registry.has_engine(&community_id).await || dir.exists())
-            && std::time::Instant::now() < deadline
-        {
-            tokio::task::yield_now().await;
+        while std::time::Instant::now() < deadline {
+            if !fix.registry.has_engine(&community_id).await && !dir_present() {
+                break;
+            }
+            // Brief backoff rather than a `yield_now()` hot-spin: the cleanup
+            // task runs on another worker, so a short sleep lets it make
+            // progress without busy-repolling the map + filesystem. Qodo PR #622.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         assert!(
             !fix.registry.has_engine(&community_id).await,
             "engine must be torn down after guard drops without commit"
         );
         assert!(
-            !dir.exists(),
+            !dir_present(),
             "persistence dir must be removed after guard drops"
         );
     }
