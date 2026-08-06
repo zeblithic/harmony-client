@@ -61668,17 +61668,36 @@ where
         // verify, decode, or synthesize, fall through to the
         // unreachable outcome below.
         if attempt == 0 {
-            let rec2_opt = resolver.resolve_window_freshest(&verifying_keys).await;
-            // Sample wall-clock AFTER the re-resolve await, not before: the
-            // all-relays query can take seconds, so a pre-await sample would let
-            // the TTL check accept a record that expired *during* re-resolution.
+            // ZEB-825 (mirrors ZEB-817 `resolve_vine_relays`): verify each
+            // candidate INSIDE the resolver via `_with`, not the single
+            // freshest-by-seq winner after the fact. An attacker who already
+            // holds the invite material can publish a self-consistent record
+            // under a sibling epoch-window key (its inner sig verifies against
+            // its OWN embedded identity pub); post-hoc-verifying only the
+            // resolver's freshest-by-seq pick would let that squat shadow the
+            // genuine record AND pin the resolver's seq-highwater + positive
+            // cache with itself, hiding the real record for the process
+            // lifetime. `_with` ranks freshest-first and returns the first
+            // candidate passing this predicate; failing candidates touch
+            // neither surface.
+            //
+            // `retry_now_ms` is sampled BEFORE the resolve here (a one-shot
+            // dial samples after): the predicate runs per-candidate DURING
+            // resolution, so sample-after is not expressible with `_with`. The
+            // freshness window it feeds spans whole epochs, so the seconds-scale
+            // sampling shift is immaterial — the same tradeoff
+            // `resolve_vine_relays` makes.
             let retry_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+            let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+                rec.verify_inner_sig().is_ok()
+                    && rec.verify_identity_match(&admin_id_pub).is_ok()
+                    && rec.verify_freshness(retry_now_ms).is_ok()
+            };
+            let rec2_opt = resolver
+                .resolve_window_freshest_with(&verifying_keys, &verify)
+                .await;
             match rec2_opt {
-                Ok(Some(rec2))
-                    if rec2.verify_inner_sig().is_ok()
-                        && rec2.verify_identity_match(&admin_id_pub).is_ok()
-                        && rec2.verify_freshness(retry_now_ms).is_ok() =>
-                {
+                Ok(Some(rec2)) => {
                     match ciborium::from_reader::<
                         crate::reachability_record::ReachabilityAnnouncePayload,
                         _,
@@ -66890,17 +66909,36 @@ pub async fn connectivity_add_friend_by_key_inner(
         // the final attempt. If the freshest record fails to resolve,
         // verify, decode, or synthesize, fall through to `last_err` below.
         if attempt == 0 {
-            let rec2_opt = resolver.resolve_window_freshest(&verifying_keys).await;
-            // Sample wall-clock AFTER the re-resolve await, not before: the
-            // all-relays query can take seconds, so a pre-await sample would let
-            // the TTL check accept a record that expired *during* re-resolution.
+            // ZEB-825 (mirrors ZEB-817 `resolve_vine_relays`): verify each
+            // candidate INSIDE the resolver via `_with`, not the single
+            // freshest-by-seq winner after the fact. The slot key derives from
+            // the target's 64-byte identity pub, so anyone holding it can
+            // publish a self-consistent record under a sibling epoch-window key
+            // (its inner sig verifies against its OWN embedded identity pub);
+            // post-hoc-verifying only the resolver's freshest-by-seq pick would
+            // let that squat shadow the genuine record AND pin the resolver's
+            // seq-highwater + positive cache with itself, hiding the real record
+            // for the process lifetime. `_with` ranks freshest-first and returns
+            // the first candidate passing this predicate; failing candidates
+            // touch neither surface.
+            //
+            // `retry_now_ms` is sampled BEFORE the resolve here (a one-shot
+            // dial samples after): the predicate runs per-candidate DURING
+            // resolution, so sample-after is not expressible with `_with`. The
+            // freshness window it feeds spans whole epochs, so the seconds-scale
+            // sampling shift is immaterial — the same tradeoff
+            // `resolve_vine_relays` makes.
             let retry_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+            let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+                rec.verify_inner_sig().is_ok()
+                    && rec.verify_identity_match(&identity_pub).is_ok()
+                    && rec.verify_freshness(retry_now_ms).is_ok()
+            };
+            let rec2_opt = resolver
+                .resolve_window_freshest_with(&verifying_keys, &verify)
+                .await;
             match rec2_opt {
-                Ok(Some(rec2))
-                    if rec2.verify_inner_sig().is_ok()
-                        && rec2.verify_identity_match(&identity_pub).is_ok()
-                        && rec2.verify_freshness(retry_now_ms).is_ok() =>
-                {
+                Ok(Some(rec2)) => {
                     match ciborium::from_reader::<
                         crate::reachability_record::ReachabilityAnnouncePayload,
                         _,
