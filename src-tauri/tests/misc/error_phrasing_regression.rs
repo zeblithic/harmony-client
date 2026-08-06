@@ -9,7 +9,7 @@
 //! ZEB-872 broadened the first three scans from `src/lib.rs` only to **all**
 //! production Rust under `src/` (the original lib.rs-only scope was inherited
 //! from ZEB-338 and let the phrasing survive in `community_fork.rs` /
-//! `community_membership.rs`). The scan skips pure comment lines so a doc
+//! `community_membership.rs`). The scan skips `//`-style line comments so a doc
 //! comment may still *describe* the forbidden phrase (e.g. `owner_loaded.rs`)
 //! without tripping the guard.
 
@@ -38,10 +38,15 @@ fn production_rs_sources() -> Vec<(String, String)> {
     out
 }
 
-/// `(path, 1-based line)` for every occurrence of `needle` on a **non-comment**
-/// line across all production sources. Pure comment lines (trimmed start `//`,
-/// which covers `//`, `///`, `//!`) are skipped so documentation may reference
-/// the forbidden phrase; trailing comments on code lines are still scanned.
+/// `(path, 1-based line)` for every occurrence of `needle` on a line that is
+/// not a `//`-style line comment, across all production sources. Lines whose
+/// trimmed start is `//` (covers `//`, `///`, `//!`) are skipped so
+/// documentation may reference the forbidden phrase (e.g. `owner_loaded.rs`);
+/// trailing comments on code lines are still scanned. `/* … */` block comments
+/// are deliberately NOT stripped: these are error-message strings that never
+/// legitimately live in a block comment, and a stray one would surface as a
+/// loud, easily-fixed CI failure rather than a silent miss — not worth a
+/// hand-rolled block-comment parser here.
 fn code_offenders(needle: &str) -> Vec<String> {
     let mut offenders = Vec::new();
     for (path, src) in production_rs_sources() {

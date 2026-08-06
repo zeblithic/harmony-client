@@ -274,25 +274,37 @@ pub async fn fork_community(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         (
-            g.crdt_state.clone().ok_or("crdt_state missing")?,
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+            // ZEB-872: owner-derived handles are all None iff the owner isn't
+            // loaded; route through the single-sourced owner-not-loaded
+            // classifier (`g` is still held, so the snapshot stays atomic)
+            // instead of leaking bare handle names to the UI.
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
             g.community_registry
                 .clone()
-                .ok_or("community_registry missing")?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.community_adapter_request_tx
                 .clone()
-                .ok_or("community_adapter_request_tx missing")?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             // ZEB-434 D6: pass-through Option (no ok_or) — a missing
             // receiver degrades to a non-re-arming fetch driver rather
             // than failing the IPC.
             g.transport_epoch_rx.clone(),
             g.channel_log_registry
                 .clone()
-                .ok_or("channel_log_registry missing")?,
-            g.dm_outbox.clone().ok_or("dm_outbox missing")?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_outbox
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             // ZEB-709 (audit A1): the owner-state engine — the fork's Space
             // commit below must fence its flush or the forked community's
             // owner-state row evaporates on a crash (its twin
