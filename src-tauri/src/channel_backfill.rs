@@ -1373,9 +1373,13 @@ mod tests {
         // Let the driver issue request #1 and arm its 30s backoff
         // sleep. yield_now keeps the test task runnable so paused time
         // does NOT auto-advance here.
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -1419,9 +1423,13 @@ mod tests {
             move || start.elapsed().as_millis() as u64,
             None,
         ));
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -1520,18 +1528,26 @@ mod tests {
             move || start.elapsed().as_millis() as u64,
             None,
         ));
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
         assert!(!driver.is_finished(), "must park on Idle with epoch watch");
         epoch_tx.send(1).expect("bump");
         tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 2, "ZEB-808: bounded spin — the awaited count never reached 2 (regression fails legibly here instead of hanging CI under paused time)");
         // Re-arm must reset() with the CURRENT log watermark, not the
         // spawn-time one.
         assert_eq!(
@@ -1589,9 +1605,13 @@ mod tests {
         ));
         // First request satisfies the latch → the driver parks on Idle
         // (parked because the presence watch is wired, though no epoch/floor is).
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -1753,9 +1773,13 @@ mod tests {
             None,
         ));
         // Request #1 fires (NoReply) → the driver enters its backoff (WaitUntil).
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -1820,9 +1844,13 @@ mod tests {
             None,
         ));
         // Request #1 fires (NoReply) and the driver enters its backoff.
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -1837,7 +1865,10 @@ mod tests {
             "presence sender drop mid-backoff must not end the driver"
         );
         tokio::time::advance(Duration::from_millis(BACKFILL_RETRY_BASE_MS + 1)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(requests.load(Ordering::SeqCst), 2);
@@ -1875,9 +1906,13 @@ mod tests {
             None,
         ));
         // Request #1 fires (NoReply) and the driver enters its backoff.
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -1892,7 +1927,10 @@ mod tests {
             "sender drop mid-backoff must not end the driver"
         );
         tokio::time::advance(Duration::from_millis(BACKFILL_RETRY_BASE_MS + 1)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(requests.load(Ordering::SeqCst), 2);
@@ -2063,16 +2101,24 @@ mod tests {
         // deadlock under start_paused: the busy test task keeps the
         // runtime non-idle so paused time never auto-advances across
         // the driver's 30s backoff sleep. Advance the clock EXPLICITLY.
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
         tokio::time::advance(Duration::from_millis(30_001)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 2, "ZEB-808: bounded spin — the awaited count never reached 2 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -2085,7 +2131,10 @@ mod tests {
         // the re-query; advancing past it lets request #3 fire.
         epoch_tx.send(1).expect("epoch bump");
         tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
-        while requests.load(Ordering::SeqCst) < 3 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(requests.load(Ordering::SeqCst), 3);
@@ -2138,9 +2187,13 @@ mod tests {
         // Wait deterministically until the request has been answered,
         // then let the driver advance from the completed request into
         // the parked select!.
-        while !answered.load(Ordering::SeqCst) {
+        for _ in 0..128 {
+            if answered.load(Ordering::SeqCst) {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(answered.load(Ordering::SeqCst), "ZEB-808: bounded spin — the awaited signal never fired (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -2205,9 +2258,13 @@ mod tests {
             None,
         ));
         // Wait for request #1 to fire.
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -2215,7 +2272,10 @@ mod tests {
         epoch_tx.send(1).expect("epoch bump");
         // Advance past the cooldown (60s since request #1 at t=0).
         tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(requests.load(Ordering::SeqCst), 2);
@@ -2251,9 +2311,13 @@ mod tests {
             None,
         ));
         // Request #1 fires (NoReply) and the driver enters its 30s backoff.
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -2268,7 +2332,10 @@ mod tests {
             "sender drop mid-backoff must not end the driver"
         );
         tokio::time::advance(Duration::from_millis(BACKFILL_RETRY_BASE_MS + 1)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(requests.load(Ordering::SeqCst), 2);
@@ -2322,9 +2389,13 @@ mod tests {
         ));
         // Wait for request #1 (answered → satisfied). `last_request_at`
         // is stamped at this point, which is t ≈ 0 under paused time.
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -2351,7 +2422,10 @@ mod tests {
         // Cross it: fired (not dropped).
         // Advancing 2 ms brings us to 60_001, past the 60_000 boundary.
         tokio::time::advance(Duration::from_millis(2)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(requests.load(Ordering::SeqCst), 2);
@@ -2400,9 +2474,13 @@ mod tests {
         ));
         // Req #1 fires + satisfies → driver parks (resync keeps it alive
         // despite epoch_rx = None).
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -2422,9 +2500,13 @@ mod tests {
         );
         // Cross the floor: re-arm fires req #2 (NoReply → backoff).
         tokio::time::advance(Duration::from_millis(2)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 2, "ZEB-808: bounded spin — the awaited count never reached 2 (regression fails legibly here instead of hanging CI under paused time)");
         // No storm: req #2 got NoReply, so the latch is now backing off
         // (30 s), NOT immediately re-Idle. A third request must wait out
         // the backoff, not fire instantly.
@@ -2437,7 +2519,10 @@ mod tests {
             "a re-armed no-holder latch must back off, not storm"
         );
         tokio::time::advance(Duration::from_millis(BACKFILL_RETRY_BASE_MS + 1)).await;
-        while requests.load(Ordering::SeqCst) < 3 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(requests.load(Ordering::SeqCst), 3);
@@ -2492,9 +2577,13 @@ mod tests {
         ));
         // Req #1: the initial reconnect catch-up uses the incremental
         // watermark.
-        while sinces.lock().unwrap().is_empty() {
+        for _ in 0..128 {
+            if !sinces.lock().unwrap().is_empty() {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(!sinces.lock().unwrap().is_empty(), "ZEB-808: bounded spin — the awaited collection never became non-empty (regression fails legibly here instead of hanging CI under paused time)");
         assert_eq!(
             sinces.lock().unwrap()[0],
             Some(watermark.clone()),
@@ -2502,9 +2591,13 @@ mod tests {
         );
         // Cross the floor → the re-arm must request a FULL reconcile.
         tokio::time::advance(Duration::from_millis(RESYNC_MS + 1)).await;
-        while sinces.lock().unwrap().len() < 2 {
+        for _ in 0..128 {
+            if sinces.lock().unwrap().len() >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(sinces.lock().unwrap().len() >= 2, "ZEB-808: bounded spin — the awaited count never reached 2 (regression fails legibly here instead of hanging CI under paused time)");
         assert_eq!(
             sinces.lock().unwrap()[1],
             None,
@@ -2585,9 +2678,13 @@ mod tests {
             }),
         ));
         // Req #1 (initial full pull) satisfies → park on the persisted deadline.
-        while sinces.lock().unwrap().is_empty() {
+        for _ in 0..128 {
+            if !sinces.lock().unwrap().is_empty() {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(!sinces.lock().unwrap().is_empty(), "ZEB-808: bounded spin — the awaited collection never became non-empty (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -2609,9 +2706,13 @@ mod tests {
         );
         // Cross 40s → first floor fire: FULL reconcile (since=None) + persist.
         tokio::time::advance(Duration::from_millis(2)).await;
-        while sinces.lock().unwrap().len() < 2 {
+        for _ in 0..128 {
+            if sinces.lock().unwrap().len() >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(sinces.lock().unwrap().len() >= 2, "ZEB-808: bounded spin — the awaited count never reached 2 (regression fails legibly here instead of hanging CI under paused time)");
         assert_eq!(
             sinces.lock().unwrap()[1],
             None,
@@ -2637,9 +2738,13 @@ mod tests {
             "second fire waits the full steady-state interval"
         );
         tokio::time::advance(Duration::from_millis(2)).await;
-        while sinces.lock().unwrap().len() < 3 {
+        for _ in 0..128 {
+            if sinces.lock().unwrap().len() >= 3 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(sinces.lock().unwrap().len() >= 3, "ZEB-808: bounded spin — the awaited count never reached 3 (regression fails legibly here instead of hanging CI under paused time)");
         assert_eq!(
             fired.lock().unwrap().len(),
             2,
@@ -2675,9 +2780,13 @@ mod tests {
             move || start.elapsed().as_millis() as u64,
             None,
         ));
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -2695,7 +2804,10 @@ mod tests {
             "root re-arm must not fire before the interval elapses"
         );
         tokio::time::advance(Duration::from_millis(2)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(requests.load(Ordering::SeqCst), 2);
@@ -2732,9 +2844,13 @@ mod tests {
             None, // no persist
         ));
         // Request #1 fires at spawn → answered → parks on Idle.
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -2743,7 +2859,10 @@ mod tests {
         // defers the re-query; advancing past it lets request #2 fire.
         kick_tx.send_modify(|e| *e = e.wrapping_add(1));
         tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(
@@ -2788,9 +2907,13 @@ mod tests {
             }),
         ));
         // Req #1 (initial pull) satisfies → parks on the persisted deadline.
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -2811,9 +2934,13 @@ mod tests {
         );
         // Cross 5s → first floor fire: re-arm + persist.
         tokio::time::advance(Duration::from_millis(2)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 2, "ZEB-808: bounded spin — the awaited count never reached 2 (regression fails legibly here instead of hanging CI under paused time)");
         let stamps = fired.lock().unwrap();
         assert_eq!(stamps.len(), 1, "exactly one persist per floor fire");
         assert!(
@@ -2861,9 +2988,13 @@ mod tests {
             }),
         ));
         // Req #1 at spawn satisfies → parks on Idle.
-        while sinces.lock().unwrap().is_empty() {
+        for _ in 0..128 {
+            if !sinces.lock().unwrap().is_empty() {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(!sinces.lock().unwrap().is_empty(), "ZEB-808: bounded spin — the awaited collection never became non-empty (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -2941,18 +3072,26 @@ mod tests {
                 on_full_reconcile: Arc::new(move |ts| fired_cb.lock().unwrap().push(ts)),
             }),
         ));
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
         // Presence kick past the cooldown → req #2; no persist.
         tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
         kick_tx.send_modify(|e| *e = e.wrapping_add(1));
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 2, "ZEB-808: bounded spin — the awaited count never reached 2 (regression fails legibly here instead of hanging CI under paused time)");
         assert!(
             fired.lock().unwrap().is_empty(),
             "ZEB-625: a presence kick must NOT invoke on_full_reconcile"
@@ -3018,9 +3157,13 @@ mod tests {
             None,
         ));
         // Req #1 fires and goes unanswered → the driver parks in WaitUntil.
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -3032,7 +3175,10 @@ mod tests {
         // until we advance past it.
         kick_tx.send_modify(|e| *e = e.wrapping_add(1));
         tokio::time::advance(Duration::from_millis(EPOCH_REARM_COOLDOWN_MS + 1)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(
@@ -3071,9 +3217,13 @@ mod tests {
             None,
         ));
         // Req #1 fires → answered → parks on Idle.
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
@@ -3089,7 +3239,10 @@ mod tests {
         );
         // The floor still re-arms after the presence watch is gone.
         tokio::time::advance(Duration::from_millis(RESYNC_MS + 1)).await;
-        while requests.load(Ordering::SeqCst) < 2 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(
@@ -3128,9 +3281,13 @@ mod tests {
             move || start.elapsed().as_millis() as u64,
             None,
         ));
-        while requests.load(Ordering::SeqCst) < 1 {
+        for _ in 0..128 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
             tokio::task::yield_now().await;
         }
+        assert!(requests.load(Ordering::SeqCst) >= 1, "ZEB-808: bounded spin — the awaited count never reached 1 (regression fails legibly here instead of hanging CI under paused time)");
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
