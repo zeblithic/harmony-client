@@ -393,10 +393,11 @@ pub fn verify_and_admit_open_join(
     //     the persisted membership log, so an attacker who mints a fresh
     //     envelope around a far-future-walled Join must be rejected here,
     //     not just at the zenoh-merge path's `verify_event` (Task 3).
-    if crate::clock_trust::reject_future(
+    if crate::clock_trust::reject_future_logged(
         req.join_event.at.wall_ms,
         wall_now_ms,
         crate::clock_trust::MAX_FORWARD_SKEW_MS,
+        "open_join_admit.join_event.at",
     ) {
         return Err(OpenJoinReject::JoinEventFutureSkew);
     }

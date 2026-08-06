@@ -441,7 +441,11 @@ impl ActiveModeration {
         ttl_ms: u64,
         now_wall_ms: Option<u64>,
     ) -> bool {
-        if crate::clock_trust::wall_exceeds_forward_skew(d.issued_hlc.wall_ms, now_wall_ms) {
+        if crate::clock_trust::wall_exceeds_forward_skew_logged(
+            d.issued_hlc.wall_ms,
+            now_wall_ms,
+            "voice_moderation.directive.issued_hlc",
+        ) {
             return false;
         }
         self.apply(c, ch, d, now_ms, ttl_ms)

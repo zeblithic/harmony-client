@@ -1868,10 +1868,11 @@ where
     //     membership log, so an attacker who mints a fresh envelope around a
     //     far-future-walled Join must be rejected here too, not just at the
     //     zenoh-merge path's `verify_event` (Task 3).
-    if crate::clock_trust::reject_future(
+    if crate::clock_trust::reject_future_logged(
         signed.join_event.at.wall_ms,
         now,
         crate::clock_trust::MAX_FORWARD_SKEW_MS,
+        "community_invite.join_event.at",
     ) {
         return Err(CommunityInviteVerifyError::JoinEventFutureSkew);
     }

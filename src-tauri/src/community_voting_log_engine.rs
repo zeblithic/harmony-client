@@ -2921,10 +2921,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         if receiver_now_ms != 0
-            && crate::clock_trust::reject_future(
+            && crate::clock_trust::reject_future_logged(
                 event.hlc.wall_ms,
                 receiver_now_ms,
                 crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                "voting_log.inbound.event.hlc",
             )
         {
             return Err(format!(
@@ -3079,10 +3080,11 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         if receiver_now_ms != 0
-            && crate::clock_trust::reject_future(
+            && crate::clock_trust::reject_future_logged(
                 event.hlc.wall_ms,
                 receiver_now_ms,
                 crate::clock_trust::MAX_FORWARD_SKEW_MS,
+                "voting_log.backfill.event.hlc",
             )
         {
             return Err(format!(

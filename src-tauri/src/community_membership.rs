@@ -4069,10 +4069,11 @@ pub fn verify_event(
     //     authorization reads carry their own receiver ceiling separately)
     //     — only admission of the new event itself is gated here.
     if let Some(now) = ctx.now_ms {
-        if crate::clock_trust::reject_future(
+        if crate::clock_trust::reject_future_logged(
             event.at.wall_ms,
             now,
             crate::clock_trust::MAX_FORWARD_SKEW_MS,
+            "community_membership.event.at",
         ) {
             return Err(VerifyError::FutureSkew);
         }

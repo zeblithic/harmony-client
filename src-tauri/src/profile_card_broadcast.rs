@@ -222,10 +222,11 @@ pub fn verify_card(
     // ZEB-849 (C4): reject an implausibly future-dated shared_at before it can
     // out-HLC every honest card. Control tier — a card pins IDENTITY fields
     // (name/avatar/profile-page), so the tight 5-min bound is correct.
-    if crate::clock_trust::wall_exceeds_forward_skew_secs(
+    if crate::clock_trust::wall_exceeds_forward_skew_secs_logged(
         card.shared_at.wall_ms,
         now_secs,
         crate::clock_trust::MAX_FORWARD_SKEW_MS,
+        "profile_card.shared_at",
     ) {
         return Err(CardVerifyError::SharedAtTooFarInFuture);
     }

@@ -1410,10 +1410,11 @@ where
     // `community_membership`'s own Layer-1 guard, not this function).
     // `None` ⇒ apply-all (no trusted receiver clock to bound against).
     if let Some(now) = now_ms {
-        if crate::clock_trust::reject_future(
+        if crate::clock_trust::reject_future_logged(
             at.wall_ms,
             now,
             crate::clock_trust::MAX_FORWARD_SKEW_MS,
+            "channel_log.event.at",
         ) {
             return Err(ChannelEventError::FutureSkew {
                 wall_ms: at.wall_ms,
