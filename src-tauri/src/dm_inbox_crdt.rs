@@ -123,6 +123,13 @@ impl DmInboxDoc {
     /// here on the first sweep that sees each entry), never the butler-minted
     /// `deposited_at` — a backdated deposit must not drop a DM as pre-expired.
     ///
+    /// ZEB-862: `first_observed_ms` is LOCAL-only but restart-DURABLE (persisted
+    /// to and restored from a local sidecar, `dm_inbox_persist::save_first_observed`),
+    /// so a restart no longer resets the TTL. A stamp read back GREATER than the
+    /// boot `now_ms` (a backward local clock step across restart) is rebased to
+    /// `now_ms` in [`Self::restore_first_observed`], so a future stamp cannot
+    /// delay expiry.
+    ///
     /// Borrows `entries` and `first_observed_ms` as disjoint fields across the
     /// `retain` (no per-sweep clone of the side-map), mirroring `RelayHoldDoc::gc`
     /// in `community_relay_hold_crdt`.
@@ -142,6 +149,32 @@ impl DmInboxDoc {
         let live: BTreeSet<String> = self.entries.keys().cloned().collect();
         self.first_observed_ms.retain(|k, _| live.contains(k));
         self.entries.len() != before
+    }
+
+    /// ZEB-862: read the LOCAL first-observation clock for durable sidecar
+    /// persistence. Never leaves this replica and never enters the wire.
+    pub fn first_observed_ms(&self) -> &BTreeMap<String, u64> {
+        &self.first_observed_ms
+    }
+
+    /// ZEB-862: restore the LOCAL first-observation clock on boot from the
+    /// sidecar file, so TTL GC survives restart instead of re-stamping `now`.
+    /// `now_ms` is the boot wall clock.
+    ///
+    /// - Q-2: orphan stamps for keys not in `entries` (e.g. a crash between the
+    ///   doc and sidecar writes) are dropped, so the restored clock is
+    ///   self-consistent and `persist` never re-writes dead keys.
+    /// - Q-1: a stamp GREATER than `now_ms` (a backward local clock step left a
+    ///   future stamp in the sidecar) is rebased down to `now_ms`, so it cannot
+    ///   delay TTL expiry beyond `now_ms + TTL`. Self-heals on each boot.
+    ///
+    /// Callers MUST load `entries` before calling this (the boot path does).
+    pub fn restore_first_observed(&mut self, mut map: BTreeMap<String, u64>, now_ms: u64) {
+        map.retain(|k, _| self.entries.contains_key(k));
+        for v in map.values_mut() {
+            *v = (*v).min(now_ms);
+        }
+        self.first_observed_ms = map;
     }
 }
 
@@ -299,6 +332,107 @@ mod tests {
 
     fn key() -> String {
         DmInboxDoc::key(&[1u8; 16], &[2u8; 32])
+    }
+
+    // ----------------------------------------------------------------
+    // ZEB-862: restart-durable first-observation clock
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn restored_old_first_observed_expires_across_restart() {
+        let mut doc = DmInboxDoc::default();
+        let k = key();
+        doc.entries
+            .insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
+        let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
+        doc.restore_first_observed([(k.clone(), 1u64)].into_iter().collect(), now);
+        assert!(
+            doc.gc_expired(now, &BTreeSet::new()),
+            "old restored stamp → entry ages out"
+        );
+        assert!(doc.entries.is_empty());
+    }
+
+    #[test]
+    fn empty_first_observed_survives_first_sweep_after_restart() {
+        let mut doc = DmInboxDoc::default();
+        let k = key();
+        doc.entries
+            .insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
+        let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
+        assert!(
+            !doc.gc_expired(now, &BTreeSet::new()),
+            "empty clock re-stamps at now → survives"
+        );
+        assert_eq!(doc.entries.len(), 1);
+    }
+
+    #[test]
+    fn restore_and_read_first_observed_round_trips() {
+        let mut doc = DmInboxDoc::default();
+        let k = key();
+        doc.entries
+            .insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
+        let m: BTreeMap<String, u64> = [(k.clone(), 12_345u64)].into_iter().collect();
+        doc.restore_first_observed(m.clone(), u64::MAX);
+        assert_eq!(doc.first_observed_ms(), &m);
+    }
+
+    #[test]
+    fn gc_grows_first_observed_once_per_entry() {
+        // Stamp-only detection (ZEB-862 finding A) keys off the side-map length
+        // delta: gc_expired grows it once per newly-seen entry, not thereafter.
+        let mut doc = DmInboxDoc::default();
+        doc.entries.insert(key(), entry(hlc(1, "a"), "butler", &[]));
+        assert_eq!(doc.first_observed_ms().len(), 0);
+        assert!(!doc.gc_expired(1_000, &BTreeSet::new()));
+        assert_eq!(
+            doc.first_observed_ms().len(),
+            1,
+            "gc_expired stamped the entry"
+        );
+        assert!(!doc.gc_expired(2_000, &BTreeSet::new()));
+        assert_eq!(doc.first_observed_ms().len(), 1, "no further growth");
+    }
+
+    #[test]
+    fn restore_clamps_future_stamp_to_now() {
+        // ZEB-862 Q-1: a restored FUTURE stamp is rebased to `now`.
+        let mut doc = DmInboxDoc::default();
+        let k = key();
+        doc.entries
+            .insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
+        let now = 1_000_000u64;
+        doc.restore_first_observed([(k.clone(), now + 5_000_000)].into_iter().collect(), now);
+        assert_eq!(
+            doc.first_observed_ms()[&k],
+            now,
+            "future stamp rebased to now"
+        );
+        assert!(doc.gc_expired(
+            now + crate::butler_deposit::INBOX_TTL_MS + 1,
+            &BTreeSet::new()
+        ));
+        assert!(doc.entries.is_empty());
+    }
+
+    #[test]
+    fn restore_prunes_orphan_stamps() {
+        // ZEB-862 Q-2: a sidecar stamp with no matching entry is dropped.
+        let mut doc = DmInboxDoc::default();
+        let k = key();
+        doc.entries
+            .insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
+        let orphan = DmInboxDoc::key(&[9u8; 16], &[9u8; 32]);
+        let mut m: BTreeMap<String, u64> = BTreeMap::new();
+        m.insert(k.clone(), 5);
+        m.insert(orphan.clone(), 5);
+        doc.restore_first_observed(m, u64::MAX);
+        assert!(doc.first_observed_ms().contains_key(&k));
+        assert!(
+            !doc.first_observed_ms().contains_key(&orphan),
+            "orphan stamp pruned"
+        );
     }
 
     #[test]
