@@ -10,14 +10,27 @@
 //! test once. It will overwrite the fixture file. Then commit and run again
 //! without the env var to confirm the assertion passes.
 
+// ZEB-747: `encrypt_with_params_for_test` is now gated behind `test-fixtures`
+// (its v0x01 seam is a deterministic-nonce footgun kept out of shipping builds).
+// Integration tests link the lib as a dependency, where `cfg(test)` never
+// applies, so the re-export is feature-only here — gate the whole v0x01 pin
+// block on `test-fixtures`, mirroring the v0x02 block below. `PathBuf` is used
+// only by `fixture_path` (the v2 helper is fully-qualified), so it gates too.
+#[cfg(feature = "test-fixtures")]
 use harmony_app::identity::test_only::encrypt_with_params_for_test;
+#[cfg(feature = "test-fixtures")]
 use std::path::PathBuf;
 
+#[cfg(feature = "test-fixtures")]
 const TEST_PASSPHRASE: &[u8] = b"correct horse battery staple";
+#[cfg(feature = "test-fixtures")]
 const TEST_SALT: [u8; 16] = [0xAB; 16];
+#[cfg(feature = "test-fixtures")]
 const TEST_NONCE: [u8; 24] = [0xCD; 24];
+#[cfg(feature = "test-fixtures")]
 const TEST_BLOB: [u8; 32] = [0x42; 32];
 
+#[cfg(feature = "test-fixtures")]
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -25,6 +38,7 @@ fn fixture_path() -> PathBuf {
         .join("encrypted_v1.bin")
 }
 
+#[cfg(feature = "test-fixtures")]
 #[test]
 fn wire_format_v1_pinned() {
     let bytes = encrypt_with_params_for_test(TEST_PASSPHRASE, &TEST_SALT, &TEST_NONCE, &TEST_BLOB);
@@ -180,8 +194,9 @@ fn space_shared_in_profile_true_emits_sp_key() {
 // The v0x02 pin uses the `test-fixtures`-gated deterministic seam
 // (`encrypt_vault_with_params_for_test` / `decrypt_vault_bytes_for_test`), so
 // the whole v2 block is gated on that feature — mirroring `zeb213_fixtures.rs`.
-// (`wire_format_v1_pinned` above stays ungated: its `encrypt_with_params_for_test`
-// seam is not feature-gated.)
+// (The v0x01 block above is gated the same way: ZEB-747 gated its
+// `encrypt_with_params_for_test` seam behind `test-fixtures` too, so both pins
+// are feature-only for integration builds.)
 #[cfg(feature = "test-fixtures")]
 use harmony_app::identity::test_only::encrypt_vault_with_params_for_test;
 
