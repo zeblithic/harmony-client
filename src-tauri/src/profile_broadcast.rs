@@ -593,10 +593,11 @@ impl ProfileBroadcastCache {
         // only (no control gated), so the 30-min DISPLAY_SKEW_TOLERANCE_MS
         // tolerates honest moderate clock drift instead of the 5-min control
         // bound (which would drop a peer 5–30 min ahead).
-        if crate::clock_trust::wall_exceeds_forward_skew_secs(
+        if crate::clock_trust::wall_exceeds_forward_skew_secs_logged(
             broadcast.shared_at.wall_ms,
             now_secs,
             crate::clock_trust::DISPLAY_SKEW_TOLERANCE_MS,
+            "profile_broadcast.shared_at",
         ) {
             return Err(CacheOnSampleError::FutureSkew);
         }
