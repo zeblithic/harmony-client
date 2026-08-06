@@ -125,6 +125,10 @@
 
     // Phase 2b pkarr section: initial fetch + 5-second auto-refresh.
     await refreshPkarr();
+    // ZEB-871: if we unmounted during any of the awaits above, onDestroy has
+    // already run (and cleared nothing, since these resources don't exist yet).
+    // Bail before creating the interval + listener, or they leak forever.
+    if (destroyed) return;
     pkarrRefreshInterval = setInterval(() => {
       void refreshPkarr();
     }, 5000);

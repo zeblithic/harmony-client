@@ -115,6 +115,9 @@
   }
 
   function startStartupRetry(): void {
+    // ZEB-871: never arm the retry interval on a torn-down component — covers
+    // both the onMount continuation and the user-driven recheckTransport() path.
+    if (destroyed) return;
     if (startupRetryHandle) return;
     startupRetryHandle = setInterval(async () => {
       startupRetryElapsedMs += 2000;
@@ -150,6 +153,10 @@
       if (!destroyed) void refresh();
     }, 30_000);
     await refresh();
+    // ZEB-871: if we unmounted during the await, onDestroy has already run.
+    // Bail before registering any further intervals/listeners below, or they
+    // leak (onDestroy cleared only what existed when it ran).
+    if (destroyed) return;
     // ZEB-450: don't auto-retry when transport is disabled this session — it
     // won't recover without a restart, so the banner (not a spinner) is shown.
     if (!snap?.myNetwork && !snap?.transportDisabledReason) startStartupRetry();
