@@ -320,10 +320,15 @@ export interface FleetSyncHealth {
    * `relayOptIn`, `dmOuthold`, `fleetNet`, `ownerQuorum`, or `fleetKeys`.
    */
   doc: string;
-  /** ZEB-705 bounded fetch-retry counters. */
+  /**
+   * ZEB-705 bounded fetch-retry counters. `fetchRetriesExhausted` is the "am I
+   * losing publishes?" signal — retries that spent their whole attempt budget
+   * and dropped the publish (recovered only by a peer re-publish/re-offer).
+   */
   fetchRetriesScheduled: number;
   fetchRetriesRun: number;
   fetchRetriesDropped: number;
+  fetchRetriesExhausted: number;
   fetchRetryInflightPeak: number;
   /**
    * Publish-side RetryBackoff health. Always present for a live engine; `owed:

@@ -317,6 +317,10 @@ pub struct FleetSyncRaw {
     pub fetch_retries_scheduled: u64,
     pub fetch_retries_run: u64,
     pub fetch_retries_dropped: u64,
+    /// Retries that exhausted their attempt budget — the publish was permanently
+    /// lost (recovered only by a peer re-publish/re-offer). The "am I losing
+    /// publishes?" counter.
+    pub fetch_retries_exhausted: u64,
     pub fetch_retry_inflight_peak: u64,
     /// Publish-side `RetryBackoff` state (outbound replication). See
     /// [`PublishRetryHealth`] for what each maps to.
@@ -346,6 +350,8 @@ pub struct FleetSyncHealth {
     pub fetch_retries_scheduled: u64,
     pub fetch_retries_run: u64,
     pub fetch_retries_dropped: u64,
+    /// Retries that exhausted their attempt budget (publish permanently lost).
+    pub fetch_retries_exhausted: u64,
     pub fetch_retry_inflight_peak: u64,
     /// Publish-side `RetryBackoff` health. `owed: true` with `backoffMs` at/near
     /// the 600 s cap is the sustained-stall incident this surface reveals — a
@@ -2087,6 +2093,7 @@ pub fn fleet_sync_row(doc: FleetDoc, raw: FleetSyncRaw) -> FleetSyncHealth {
         fetch_retries_scheduled: raw.fetch_retries_scheduled,
         fetch_retries_run: raw.fetch_retries_run,
         fetch_retries_dropped: raw.fetch_retries_dropped,
+        fetch_retries_exhausted: raw.fetch_retries_exhausted,
         fetch_retry_inflight_peak: raw.fetch_retry_inflight_peak,
         publish_retry: PublishRetryHealth {
             owed: raw.publish_retry_owed,
@@ -6581,6 +6588,7 @@ mod tests {
                 fetch_retries_scheduled: 1,
                 fetch_retries_run: 2,
                 fetch_retries_dropped: 3,
+                fetch_retries_exhausted: 9,
                 fetch_retry_inflight_peak: 4,
                 publish_retry_owed: true,
                 publish_retry_consecutive_failures: 5,
@@ -6596,6 +6604,7 @@ mod tests {
             "fetchRetriesScheduled",
             "fetchRetriesRun",
             "fetchRetriesDropped",
+            "fetchRetriesExhausted",
             "fetchRetryInflightPeak",
             "publishRetry",
             "owed",
@@ -6610,6 +6619,7 @@ mod tests {
             "fetch_retries_scheduled",
             "fetch_retries_run",
             "fetch_retries_dropped",
+            "fetch_retries_exhausted",
             "fetch_retry_inflight_peak",
             "publish_retry",
             "consecutive_failures",
@@ -6634,7 +6644,7 @@ mod tests {
     /// `#[serde(default)]` fills it rather than failing (spec §6.1).
     #[test]
     fn fleet_sync_health_tolerates_absent_publish_retry() {
-        let json = r#"{"doc":"ownerState","fetchRetriesScheduled":0,"fetchRetriesRun":0,"fetchRetriesDropped":0,"fetchRetryInflightPeak":0}"#;
+        let json = r#"{"doc":"ownerState","fetchRetriesScheduled":0,"fetchRetriesRun":0,"fetchRetriesDropped":0,"fetchRetriesExhausted":0,"fetchRetryInflightPeak":0}"#;
         let row: FleetSyncHealth =
             serde_json::from_str(json).expect("pre-ZEB-877 fleet row still deserializes");
         assert_eq!(row.publish_retry, PublishRetryHealth::default());

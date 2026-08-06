@@ -136,12 +136,16 @@ pub enum SyncError {
 #[derive(Debug, Default)]
 pub(crate) struct FleetSyncStats {
     /// ZEB-705 observability: retries scheduled / retry frames processed /
-    /// retries dropped because the in-flight cap was saturated / peak concurrent
-    /// sleepers observed. Promoted from `cfg(test)` handle clones to real
-    /// telemetry (ZEB-877).
+    /// retries dropped because the in-flight cap was saturated / retries that
+    /// exhausted their attempt budget (the publish was permanently lost —
+    /// tracker un-advanced, recovered only by a peer re-publish/re-offer) / peak
+    /// concurrent sleepers observed. Promoted from `cfg(test)` handle clones to
+    /// real telemetry (ZEB-877). `exhausted` is the "am I losing publishes?"
+    /// signal and mirrors the community engine's `fetch_retries_exhausted`.
     pub(crate) fetch_retries_scheduled: AtomicU64,
     pub(crate) fetch_retries_run: AtomicU64,
     pub(crate) fetch_retries_dropped: AtomicU64,
+    pub(crate) fetch_retries_exhausted: AtomicU64,
     pub(crate) fetch_retry_inflight_peak: AtomicU64,
     // ZEB-877: publish-side `RetryBackoff` observability — mirrors the community
     // engine (ZEB-762). Recorded in `settle_publish` at the same `on_failure` /
@@ -219,7 +223,9 @@ fn classify_fleet_publish_error(err: &SyncError) -> crate::network_health::Publi
 /// The lock is a `std::sync::Mutex`, not tokio's: registration is boot-only and
 /// `fleet_sync_raw` does brief atomic loads and never holds the guard across an
 /// `.await`, so a sync mutex keeps `register` sync (no `.await` at the 11 boot
-/// sites) without risking `await_holding_lock`.
+/// sites) without risking `await_holding_lock`. Both paths poison-recover
+/// (`into_inner`) rather than panic — telemetry degrades, it never takes down
+/// the snapshot.
 #[derive(Default)]
 pub(crate) struct FleetSyncRegistry {
     engines: std::sync::Mutex<BTreeMap<crate::network_health::FleetDoc, Arc<FleetSyncStats>>>,
@@ -237,9 +243,14 @@ impl FleetSyncRegistry {
         doc: crate::network_health::FleetDoc,
         stats: Arc<FleetSyncStats>,
     ) {
+        // Recover from a poisoned lock rather than panicking: the map is always
+        // internally consistent (trivial insert/read critical sections), and
+        // telemetry must degrade, never take down the caller. `snapshot()` reads
+        // this on every capture, so a panic here would cascade into snapshot
+        // generation (Qodo #628; team precedent #564/#509/#552).
         self.engines
             .lock()
-            .expect("fleet-sync registry mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(doc, stats);
     }
 
@@ -252,9 +263,10 @@ impl FleetSyncRegistry {
         crate::network_health::FleetDoc,
         crate::network_health::FleetSyncRaw,
     )> {
+        // Poison-recover (see `register`): a snapshot read must never panic.
         self.engines
             .lock()
-            .expect("fleet-sync registry mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .map(|(doc, s)| {
                 (
@@ -263,6 +275,7 @@ impl FleetSyncRegistry {
                         fetch_retries_scheduled: s.fetch_retries_scheduled.load(Ordering::Relaxed),
                         fetch_retries_run: s.fetch_retries_run.load(Ordering::Relaxed),
                         fetch_retries_dropped: s.fetch_retries_dropped.load(Ordering::Relaxed),
+                        fetch_retries_exhausted: s.fetch_retries_exhausted.load(Ordering::Relaxed),
                         fetch_retry_inflight_peak: s
                             .fetch_retry_inflight_peak
                             .load(Ordering::Relaxed),
@@ -1397,6 +1410,13 @@ where
         }
         Inbound::FetchMiss(wire) => {
             if attempts_left == 0 {
+                // ZEB-877: the publish is permanently lost here (all retries
+                // spent). Count it so `fleet_sync` can distinguish "retries are
+                // working" from "publishes are being dropped" — the community
+                // engine's `fetch_retries_exhausted` (CodeRabbit #628).
+                ctx.sync_stats
+                    .fetch_retries_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     "ZEB-705: state-root blob fetch retries exhausted — publish dropped; \
                      tracker un-advanced, the peer's next publish or re-offer recovers"
