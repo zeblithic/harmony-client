@@ -60,19 +60,34 @@
 
   async function refreshPkarr(): Promise<void> {
     try {
-      pkarrStatus = await pkarrPublicationStatus();
+      const status = await pkarrPublicationStatus();
+      // ZEB-871: refreshPkarr() runs on a 5s setInterval; an in-flight tick can
+      // settle after onDestroy clears the interval. Guard the $state write.
+      // Svelte-5 post-teardown writes are silent, so this is defensive
+      // consistency with the FriendsPanel (ZEB-793) idiom, not a visible bug.
+      if (destroyed) return;
+      pkarrStatus = status;
     } catch {
       // Non-fatal — pkarr not yet initialized on this boot is expected.
+      if (destroyed) return;
       pkarrStatus = null;
     }
   }
 
   async function refresh(): Promise<void> {
     try {
-      myRecord = await getMyReachabilityRecord();
-      peerRecords = await listPeerReachability();
+      const my = await getMyReachabilityRecord();
+      const peers = await listPeerReachability();
+      // ZEB-871: refresh() is driven by the onReachabilityChanged listener, so
+      // an in-flight call can settle after onDestroy. Defer both $state writes
+      // past a single destroyed-guard (also avoids a partial write if we unmount
+      // between the two awaits).
+      if (destroyed) return;
+      myRecord = my;
+      peerRecords = peers;
       error = null;
     } catch (e) {
+      if (destroyed) return;
       error = e instanceof Error ? e.message : String(e);
     }
   }
@@ -110,6 +125,10 @@
 
     // Phase 2b pkarr section: initial fetch + 5-second auto-refresh.
     await refreshPkarr();
+    // ZEB-871: if we unmounted during any of the awaits above, onDestroy has
+    // already run (and cleared nothing, since these resources don't exist yet).
+    // Bail before creating the interval + listener, or they leak forever.
+    if (destroyed) return;
     pkarrRefreshInterval = setInterval(() => {
       void refreshPkarr();
     }, 5000);

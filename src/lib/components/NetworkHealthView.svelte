@@ -68,7 +68,14 @@
 
   async function refresh(): Promise<void> {
     try {
-      snap = await fetchSnapshot();
+      const s = await fetchSnapshot();
+      // ZEB-871: refresh() is driven by the 30s steady-refetch interval, the
+      // startup retry, and two event listeners, so an in-flight call can settle
+      // after onDestroy. Guard the $state write (the catch writes no $state, so
+      // it needs none). Post-teardown writes are silent in Svelte 5 — this is
+      // defensive consistency with the FriendsPanel (ZEB-793) idiom.
+      if (destroyed) return;
+      snap = s;
     } catch (e) {
       // Spec §6.3: never show top-level error banner — render empty.
       // The "diagnostics unavailable" banner shows only if snap stays null
@@ -108,6 +115,9 @@
   }
 
   function startStartupRetry(): void {
+    // ZEB-871: never arm the retry interval on a torn-down component — covers
+    // both the onMount continuation and the user-driven recheckTransport() path.
+    if (destroyed) return;
     if (startupRetryHandle) return;
     startupRetryHandle = setInterval(async () => {
       startupRetryElapsedMs += 2000;
@@ -143,6 +153,10 @@
       if (!destroyed) void refresh();
     }, 30_000);
     await refresh();
+    // ZEB-871: if we unmounted during the await, onDestroy has already run.
+    // Bail before registering any further intervals/listeners below, or they
+    // leak (onDestroy cleared only what existed when it ran).
+    if (destroyed) return;
     // ZEB-450: don't auto-retry when transport is disabled this session — it
     // won't recover without a restart, so the banner (not a spinner) is shown.
     if (!snap?.myNetwork && !snap?.transportDisabledReason) startStartupRetry();

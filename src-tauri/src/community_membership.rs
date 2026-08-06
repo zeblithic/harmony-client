@@ -6096,19 +6096,18 @@ pub async fn apply_auto_exec_set_power(
         (
             g.hlc_tracker
                 .clone()
-                .ok_or("hlc_tracker missing (node not running?)")?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id
                 .clone()
-                .ok_or("dm_device_id missing (node not running?)")?,
-            g.dm_self_owner
-                .ok_or("dm_self_owner missing (node not running?)")?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
             g.community_registry
                 .clone()
-                .ok_or("community_registry missing (node not running?)")?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.dm_outbox
                 .clone()
-                .ok_or("dm_outbox missing (no owner identity?)")?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
 
@@ -6299,19 +6298,18 @@ pub async fn apply_auto_exec_admin_proposal_set_power(
         (
             g.hlc_tracker
                 .clone()
-                .ok_or("hlc_tracker missing (node not running?)")?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.hlc_adopt_floor.clone(),
             g.dm_device_id
                 .clone()
-                .ok_or("dm_device_id missing (node not running?)")?,
-            g.dm_self_owner
-                .ok_or("dm_self_owner missing (node not running?)")?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.dm_self_owner.ok_or_else(|| g.owner_not_loaded_msg())?,
             g.community_registry
                 .clone()
-                .ok_or("community_registry missing (node not running?)")?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
             g.dm_outbox
                 .clone()
-                .ok_or("dm_outbox missing (no owner identity?)")?,
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
         )
     };
 
@@ -6842,8 +6840,11 @@ mod auto_exec_tests {
             .await
             .expect_err("missing NodeState handles must Err, not panic");
         assert!(
-            err.contains("missing") || err.contains("not running"),
-            "error must mention missing/not running; got: {err}"
+            // ZEB-872: owner-derived handle guards now route through the
+            // owner-not-loaded classifier (owner_not_loaded_msg) rather than
+            // bare handle names, per the ZEB-338 incremental-migration policy.
+            err.contains("Owner identity not loaded"),
+            "error must be the owner-not-loaded classification; got: {err}"
         );
     }
 
@@ -6977,8 +6978,11 @@ mod auto_exec_tests {
             .await
             .expect_err("bare NodeState must Err, not panic");
         assert!(
-            err.contains("missing") || err.contains("not running"),
-            "error must mention missing/not running; got: {err}"
+            // ZEB-872: owner-derived handle guards now route through the
+            // owner-not-loaded classifier (owner_not_loaded_msg) rather than
+            // bare handle names, per the ZEB-338 incremental-migration policy.
+            err.contains("Owner identity not loaded"),
+            "error must be the owner-not-loaded classification; got: {err}"
         );
 
         // ── Part 2: the routed-mint seam yields a verifiable AdminProposal.

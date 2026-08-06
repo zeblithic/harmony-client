@@ -360,6 +360,11 @@ jobs:
           # bundle `*-setup.nsis.zip`); checking it explicitly prevents the
           # release from shipping with no Windows installer.
           for glob in '*-setup.exe' '*-setup.nsis.zip' '*-setup.nsis.zip.sig' '*amd64.AppImage.tar.gz' '*amd64.AppImage.tar.gz.sig'; do
+            # $glob is intentionally unquoted: the shell must expand it against
+            # release-files/ so `ls` fails when no artifact matches. Quoting it
+            # would make `ls` seek a literal filename containing '*', defeating
+            # the presence check — so suppress SC2086 for this one line.
+            # shellcheck disable=SC2086
             if ! ls release-files/$glob >/dev/null 2>&1; then
               missing+=("$glob")
             fi
