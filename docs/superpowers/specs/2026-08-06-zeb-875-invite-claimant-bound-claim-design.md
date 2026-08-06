@@ -53,9 +53,13 @@ The **check-then-insert must be indivisible** against concurrent redeems (the ac
 
 **Durability is free:** the predicate reads persisted, synced `PendingJoin` events, so a host restart re-derives the identical verdict. No in-memory index to rebuild or lose. (Cost: an O(events) scan per redeem — redeem is rare and off the hot path, so this is irrelevant; no index needed. Single source of truth over a parallel structure that could drift.)
 
-### Error surface
+### Error surface (host-side telemetry; no distinct joiner message — and why)
 
-New `CommunityInviteVerifyError::InviteAlreadyClaimed` (carrying the losing actor / token sig for logs, not the winner's identity). The acceptor maps it through its existing error arm (`iroh_invite_acceptor.rs:464-466` → `HandshakeAcceptError::HandleUnicast`) so the losing joiner receives a **clear rejection**, surfaced to the UI as "this invite has already been used" — never a silent drop, never a leaked internal debug string. (Follows the honest-error-phrasing discipline from ZEB-872.)
+The rejection is enforced and *diagnosed* host-side, not delivered to the losing joiner as a distinct message — because delivering one would require the wire change we declined. On **any** `handle_unicast` error the acceptor writes **no response** and closes (the burn is gated on a *successful* write, `iroh_invite_acceptor.rs:529-539`, ZEB-874). So the losing racer hits a response-read failure/timeout and maps to the **existing generic** `RedemptionOutcome.status = "inviter_unreachable"` (`lib.rs:62010/62021`) — the same status any transport failure yields. A *distinct* "invite already used" message would mean writing a typed rejection payload before close, i.e. the joiner→host protocol change that is a **non-goal** here.
+
+That is acceptable: the security property (**exactly one actor joins**) holds regardless of the loser's message, and the legitimate claimant (same actor) always succeeds with `"joined"`. Diagnosability lives host-side:
+- New engine-level `LocalInsertError::InviteAlreadyClaimed { winner }` returned by the atomic precheck.
+- New `CommunityInviteVerifyError::InviteAlreadyClaimed` (with its paired `reason_tag()` arm `"community_invite_already_claimed"` — the enum has an exhaustive `reason_tag` match, so the arm is mandatory) that the PendingJoin branch maps the engine error to, plus a `tracing::warn!` at the reject so operators see the claim firing in the field. No leaked debug string reaches a user (the honest-phrasing discipline from ZEB-872 still applies to anything user-facing).
 
 ### The burn is unchanged
 
@@ -86,11 +90,14 @@ The post-write `unregister_invite` (`iroh_invite_acceptor.rs:538-539`, ZEB-874) 
 
 Rust, `cargo nextest`, deterministic. No wall-clock races.
 
-1. **Exactly-one-winner under concurrency** (ported from `try_consume_friend_token_exactly_one_winner_under_concurrency`, `pkarr_invite_publisher.rs:404-446`): two *distinct* actors redeem one invite token concurrently → exactly one materializes `Joined`, the other gets `InviteAlreadyClaimed`. Assert `won_a ^ won_b`.
-2. **Same-actor idempotent retry** → re-delivers the existing countersign, no new event, no error (regression-guards the recon-Q5 behavior).
-3. **End-to-end distinct-actor rejection** in the two-party harness (`tests/pkarr_net/pkarr_iroh_redeem_full_integration.rs`): second distinct actor's redeem returns the rejection over the real iroh stream.
-4. **Restart-safety** (unit over the predicate): a claim recorded, then the claim scan re-run against the persisted event set, yields the same claimant (proves durability without a real process restart).
-5. Legacy-branch coverage: either a claim test through the legacy `Join` path, or an assertion that the legacy path is unreachable from live minters (implementer's finding decides which).
+Enforcement is proven at the **engine seam** and the **`handle_unicast` production path** — the two layers where the claim actually lives — not at the transport layer (the claim is transport-independent).
+
+1. **Engine exactly-one-winner under concurrency** (structure ported from `try_consume_friend_token_exactly_one_winner_under_concurrency`, `pkarr_invite_publisher.rs:404-446`): two concurrent `insert_local_claim_bound_pending_join` calls with *distinct* actors on one token sig → exactly one `Inserted`, the other `Err(LocalInsertError::InviteAlreadyClaimed { winner })`. Assert `won_a ^ won_b`.
+2. **Engine sequential + same-actor idempotent + different-sig:** A claims → `Inserted`; B same sig → `InviteAlreadyClaimed{winner:A}`; A same sig again → `AlreadyKnown` (no new event); a *different* sig → `Inserted`.
+3. **Engine restart-safety:** build state with A's `PendingJoin`, drop the engine, rebuild from the persisted event set, then a claim-bound insert for B on the same sig is still rejected (proves the verdict is a function of persisted events, no in-memory index).
+4. **`handle_unicast` distinct-actor rejection** (production verify+claim path): drive two `handle_unicast` calls with distinct-actor signed invite packets for the same token → first `Ok(())`, second `Err(CommunityInviteVerifyError::InviteAlreadyClaimed)`; a same-actor second call → `Ok(())` (idempotent retry preserved). This is the authoritative distinct-actor proof — it exercises the real verify → claim → map path, transport aside.
+5. **E2E regression** (`tests/pkarr_net/pkarr_iroh_redeem_full_integration.rs`): a same-actor retry over the real iroh handshake still reaches `outcome.status == "joined"` (the claim doesn't break the happy path / retry over real transport). A full distinct-actor *network* e2e (a second joiner racing over iroh) is **deliberately not added**: the rejection is enforced in `handle_unicast`/the engine (both covered above) and is transport-independent, and the losing racer only ever sees the generic `"inviter_unreachable"` status (no wire change) — so a network race would add substantial harness setup for zero new *enforcement* coverage. Noted here so the omission is explicit, not silent.
+6. **Legacy branch:** the sig-scan precheck is structurally inapplicable to the bare-`Join` shape (only `PendingJoin` carries an `invite_token`), and no live minter emits bare `Join` into `handle_unicast` (verified: `lib.rs:39511` emits `PendingJoin` for invite-only). The legacy branch keeps its behavior with an added unreachability `warn`/`debug_assert` documenting that a claimant-bound single-use invite should never redeem through it.
 
 Full local gate before PR: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run --locked --workspace --all-targets --features test-fixtures`; `npx tsc --noEmit` + `npx vitest run`.
 
