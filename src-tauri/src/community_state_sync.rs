@@ -7630,7 +7630,7 @@ mod tests {
 
         {
             let mut guard = std::sync::Arc::clone(&fix.registry).begin_spawn_guard(community_id);
-            let _engine = std::sync::Arc::clone(&fix.registry)
+            let engine = std::sync::Arc::clone(&fix.registry)
                 .spawn_engine_with_guard(
                     &mut guard,
                     community_id,
@@ -7648,33 +7648,73 @@ mod tests {
                 )
                 .await
                 .expect("spawn_engine_with_guard");
-            // guard drops here without commit → Drop spawns cleanup task
+            // ZEB-821: force the persistence dir onto disk NOW, while the
+            // engine is alive and BEFORE the guard drops. This is what
+            // makes the teardown assertion below race-free — see its
+            // comment. `persist_now` is awaited, so the dir + crdt.cbor
+            // exist deterministically by the time the guard drops. The
+            // pre-spawn `preserve_persistence` probe already ran (and saw
+            // no dir) inside spawn_engine_with_guard, so this later write
+            // does NOT flip the rollback to preservation — the dir this
+            // spawn created is still deleted by the fresh-spawn rollback.
+            engine
+                .persist_now()
+                .await
+                .expect("persist_now to create the persistence dir before rollback");
+            // guard + engine drop here without commit → Drop spawns cleanup task
         }
 
-        // Poll up to 2s for the cleanup task to BOTH remove the engine
-        // from the registry map AND remove the per-community persistence
-        // dir from disk. shutdown_engine_and_cleanup_persistence runs
-        // these in sequence: stop_engine first (engine.shutdown().await
-        // + map remove) THEN tokio::fs::remove_dir_all. CI's slower disk
-        // I/O exposed a race where has_engine() became false (after
-        // stop_engine) but the dir was still present (remove_dir_all
-        // not yet completed). The fix: wait for BOTH conditions.
+        // Poll up to 2s for the Drop-spawned cleanup task to reach its
+        // terminal state: engine gone from the map AND the per-community
+        // persistence dir gone from disk.
+        //
+        // ZEB-821: the exit predicate `!has_engine && !dir.exists()` is
+        // only unambiguous because we persisted the dir above. Without
+        // that write the dir would not exist until the rollback's OWN
+        // shutdown flush (ZEB-462 B persists `crdt.cbor` unconditionally)
+        // creates it — and `stop_engine` removes the engine from the map
+        // BEFORE that flush runs. So a fresh engine's teardown passes
+        // through the predicate twice:
+        //   (engine, dir): (T,F) -> (F,F) transient, pre-flush
+        //                        -> (F,T) flush created the dir
+        //                        -> (F,F) terminal, after detach-rename.
+        // The poll could sample the transient (F,F), exit, then the
+        // assert would catch the (F,T) phase (observed as an intermittent
+        // "persistence dir must be removed" panic under full-parallel
+        // nextest — the flake this test now pins closed). Seeding the dir
+        // first means it exists continuously from here until the
+        // rollback's rename, so (F,F) can only be the terminal state.
         let dir = fix
             .identity_dir
             .join("communities")
             .join(hex::encode(community_id.0));
+        // `try_exists` (not `Path::exists`): the latter collapses an I/O
+        // error probing the path into `false`, which would let this loop —
+        // and the final assertion — mistake a probe failure for successful
+        // removal. Surface the error as a hard test failure instead (matches
+        // the codebase's checked-probe convention, e.g. the pre-spawn probe
+        // in spawn_engine_with_guard). Qodo PR #622.
+        let dir_present = || {
+            dir.try_exists().expect(
+                "probe persistence dir (an I/O error here is a real test failure, not \"absent\")",
+            )
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
-        while (fix.registry.has_engine(&community_id).await || dir.exists())
-            && std::time::Instant::now() < deadline
-        {
-            tokio::task::yield_now().await;
+        while std::time::Instant::now() < deadline {
+            if !fix.registry.has_engine(&community_id).await && !dir_present() {
+                break;
+            }
+            // Brief backoff rather than a `yield_now()` hot-spin: the cleanup
+            // task runs on another worker, so a short sleep lets it make
+            // progress without busy-repolling the map + filesystem. Qodo PR #622.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         assert!(
             !fix.registry.has_engine(&community_id).await,
             "engine must be torn down after guard drops without commit"
         );
         assert!(
-            !dir.exists(),
+            !dir_present(),
             "persistence dir must be removed after guard drops"
         );
     }
