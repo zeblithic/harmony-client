@@ -2117,16 +2117,12 @@ fn emit_degraded<H: AppHandleEmit>(
 /// only mutates the per-community CRDT (inside the engine), not the
 /// owner-state Space. The arg is kept for future expansion (e.g.,
 /// resolving the inviter's devices for ack-back routing in ZEB-251).
-#[allow(clippy::too_many_arguments)] // 5 args — clippy default is 7; kept here for symmetry with future expansion.
 pub async fn handle_unicast<H: AppHandleEmit>(
     community_registry: &std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
     dm_outbox: &std::sync::Arc<tokio::sync::Mutex<crate::dm_outbox::DmOutbox>>,
     _crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     packet_bytes: Vec<u8>,
     app: Option<&H>,
-    pkarr_invite_publisher: Option<
-        &std::sync::Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>,
-    >,
 ) -> Result<(), CommunityInviteVerifyError> {
     // 1. decode_packet — peels the 0x10 discriminant + 64-byte trailer,
     //    canonical-CBOR-checks the inner body, enforces the
@@ -2301,11 +2297,11 @@ pub async fn handle_unicast<H: AppHandleEmit>(
             .await
         {
             Ok(crate::community_state_crdt::InsertOutcome::Inserted) => {
-                // ZEB-367: invite consumed — stop the case-A pkarr publication
-                // (single-use; frees the DHT slot) now that the Join is inserted.
-                if let Some(pubr) = pkarr_invite_publisher {
-                    pubr.unregister_invite(&signed.invite_token.sig).await;
-                }
+                // ZEB-874: the single-use invite is NO LONGER burned here. The
+                // burn moved to the acceptor, gated behind a successful
+                // countersign-response write, so a post-insert delivery failure
+                // leaves the invite live for retry. See
+                // iroh_invite_acceptor::handle_invite_handshake_inbound.
                 Ok(())
             }
             Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => Ok(()),
@@ -2372,11 +2368,11 @@ pub async fn handle_unicast<H: AppHandleEmit>(
             .await
         {
             Ok(crate::community_state_crdt::InsertOutcome::Inserted) => {
-                // ZEB-367: invite consumed — stop the case-A pkarr publication
-                // (single-use; frees the DHT slot) now that the Join is inserted.
-                if let Some(pubr) = pkarr_invite_publisher {
-                    pubr.unregister_invite(&signed.invite_token.sig).await;
-                }
+                // ZEB-874: the single-use invite is NO LONGER burned here. The
+                // burn moved to the acceptor, gated behind a successful
+                // countersign-response write, so a post-insert delivery failure
+                // leaves the invite live for retry. See
+                // iroh_invite_acceptor::handle_invite_handshake_inbound.
                 Ok(())
             }
             Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {
