@@ -233,8 +233,10 @@ pub enum TombstoneOutcome {
 /// persisted forever, `save()` rewrites the file per insert). Generous
 /// relative to MAX_DESCRIPTORS because rows are tiny and every legit
 /// delete needs its guard; oldest-by-`deleted_at` trims first. Adversarial
-/// far-future timestamps can push out honest guards — that spam vector is
-/// inherent to the unsigned vine wire (ZEB-673), which can spoof far worse.
+/// far-future timestamps can push out honest guards — signing (ZEB-678)
+/// authenticates a tombstone's author but does not bound its self-asserted
+/// `deleted_at`, so a validly-signed tombstone can still carry an
+/// attacker-chosen far-future stamp.
 pub const MAX_TOMBSTONES: usize = 10_000;
 
 /// Aggregated reaction view for a vine from the local viewer's

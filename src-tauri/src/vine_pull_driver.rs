@@ -175,41 +175,114 @@ pub struct PullSessionResult {
     pub skipped_invalid: u32,
 }
 
-/// ZEB-819: caller-owned cursor-progress slot. The pull session commits
-/// after each fully processed page; the driver reads it even when the IO
-/// deadline drops the session future mid-flight, so completed pages are
-/// never re-downloaded. Tuple order (created_at, id) matches the cursor.
+/// ZEB-819: caller-owned pull-progress slot. The pull session commits after
+/// each fully processed page; the driver reads it even when the IO deadline
+/// drops the session future mid-flight, so completed pages are never
+/// re-downloaded. Tuple order (created_at, id) matches the cursor.
+///
+/// ZEB-826: the same slot also carries two drop-surviving counters —
+/// `ingested` (rows durably backfilled) and `refused_forward_skew` (rows the
+/// ZEB-818 clamp refused) — for the same reason the cursor lives here. A
+/// candidate that committed pages then died (dropped future / early `Err`)
+/// otherwise takes its counts to the grave, and those are exactly the rows a
+/// fleet operator most needs counted: `record_session_ok` sees only the
+/// winning candidate's return value.
 ///
 /// Why a side channel rather than the return value: a dropped future never
 /// returns anything at all. [`PullSessionResult`] can only report progress
 /// the session survived long enough to hand back, and the whole point of
 /// the failure this guards is that it does not get that far.
 #[derive(Clone, Default)]
-pub struct PullProgressSink(Arc<std::sync::Mutex<Option<(u64, String)>>>);
+pub struct PullProgressSink(Arc<std::sync::Mutex<PullProgress>>);
+
+/// Inner state of [`PullProgressSink`]. All three fields share one lock: they
+/// are written at the same page-boundary commit points and read together once
+/// per creator per pass.
+#[derive(Default)]
+struct PullProgress {
+    cursor: Option<(u64, String)>,
+    /// ZEB-826: rows durably ingested this pass. Summed, not max-merged —
+    /// each candidate re-pulls from the same starting cursor and sees earlier
+    /// candidates' rows as `AdvanceDuplicate` (cursor advances, ingest count
+    /// does not), so per-candidate contributions are disjoint and add to the
+    /// pass total rather than overlapping.
+    ingested: u32,
+    /// ZEB-826: rows the ZEB-818 skew clamp refused to advance the cursor
+    /// past, summed across the pass's candidates.
+    refused_forward_skew: u32,
+}
 
 impl PullProgressSink {
     /// Monotone: only advances (strictly greater tuple order), so a stale
     /// commit from a failed earlier candidate cannot regress progress.
     ///
-    /// Poison is RECOVERED, not propagated (both methods): the sink exists
-    /// to preserve progress across another task's failure, and the slot is
-    /// a plain `Option` that is valid at every instruction — a panic while
-    /// the lock was held cannot leave it torn. Panicking here would turn
-    /// one earlier panic into a permanently broken pull path (every later
-    /// commit/take repanics until restart), which is strictly worse than
-    /// the stale-progress cost it guards against (Qodo PR #564 round 1).
+    /// Poison is RECOVERED, not propagated (every method): the sink exists to
+    /// preserve progress across another task's failure, and the slot holds
+    /// only a cursor `Option` and two `u32` counters — valid at every
+    /// instruction, so a panic while the lock was held cannot leave it torn.
+    /// Panicking here would turn one earlier panic into a permanently broken
+    /// pull path (every later commit/take repanics until restart), which is
+    /// strictly worse than the stale-progress cost it guards against (Qodo
+    /// PR #564 round 1).
     pub fn commit(&self, cursor: (u64, String)) {
         let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        match slot.as_ref() {
+        match slot.cursor.as_ref() {
             Some(cur) if *cur >= cursor => {}
-            _ => *slot = Some(cursor),
+            _ => slot.cursor = Some(cursor),
         }
     }
 
-    /// Read and clear the slot. The driver calls this once per creator per
-    /// pass, after every candidate relay has had its turn.
+    /// ZEB-826: add rows ingested since the last commit to the drop-surviving
+    /// pass total. Called at the same page-boundary points as [`commit`], so
+    /// an ingest count survives a dropped session exactly as its committed
+    /// cursor does. Saturating: the count is telemetry, never a correctness
+    /// input, so an implausible wrap is capped rather than aliased low.
+    pub fn add_ingested(&self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        slot.ingested = slot.ingested.saturating_add(n);
+    }
+
+    /// ZEB-826: count `n` rows the ZEB-818 clamp refused. Written the instant
+    /// a row is refused (not deferred to a page boundary), so even a session
+    /// dropped mid-page still surfaces the refusals it saw.
+    pub fn add_refused_forward_skew(&self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        slot.refused_forward_skew = slot.refused_forward_skew.saturating_add(n);
+    }
+
+    /// Read and clear the committed cursor. The driver calls this once per
+    /// creator per pass, after every candidate relay has had its turn.
     pub fn take(&self) -> Option<(u64, String)> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cursor
+            .take()
+    }
+
+    /// ZEB-826: read and clear the pass's ingest total — the ingest-count
+    /// sibling of [`take`], recording rows a failed candidate committed
+    /// before dying (plus the winning candidate's own, which the driver
+    /// nets out so `record_session_ok` isn't double-counted).
+    pub fn take_ingested(&self) -> u32 {
+        std::mem::take(&mut self.0.lock().unwrap_or_else(|e| e.into_inner()).ingested)
+    }
+
+    /// ZEB-826: read and clear the pass's refused-advance total.
+    pub fn take_refused_forward_skew(&self) -> u32 {
+        std::mem::take(
+            &mut self
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .refused_forward_skew,
+        )
     }
 }
 
@@ -250,6 +323,9 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut ingested: u32 = 0;
+    // ZEB-826: how much of `ingested` has already been pushed to the sink at a
+    // prior page boundary, so each commit point pushes only its page's delta.
+    let mut ingested_committed: u32 = 0;
     let mut skipped_invalid: u32 = 0;
     loop {
         let query = VinePullRequest::Query(VinePullQuery {
@@ -310,6 +386,12 @@ where
                     // these advances nothing and ends the session via the
                     // zero-advance guard below.
                     if candidate.0 > now_ms / 1000 + VINE_PULL_INVALID_FORWARD_SKEW_SECS {
+                        // ZEB-826: broken out of the generic `skipped_invalid`
+                        // into its own drop-surviving counter so a
+                        // cursor-poisoning relay is visible in a default `info`
+                        // build (the debug! below is filtered out there) —
+                        // without a spammable `warn!`.
+                        progress.add_refused_forward_skew(1);
                         tracing::debug!(
                             creator,
                             created_at = candidate.0,
@@ -325,6 +407,9 @@ where
                     // so publish exactly what `cursor` holds — the halting
                     // row itself never moved it (see the variant's doc).
                     progress.commit(cursor.clone());
+                    // ZEB-826: those same durable rows must count toward the
+                    // drop-surviving ingest total (sibling of the commit).
+                    progress.add_ingested(ingested - ingested_committed);
                     return Ok(PullSessionResult {
                         cursor,
                         ingested,
@@ -349,6 +434,10 @@ where
         // here, and the driver's success-path assignment is monotone for
         // the same reason — the durable cursor never follows it backward.
         progress.commit(cursor.clone());
+        // ZEB-826: page committed — fold this page's new ingests into the
+        // drop-surviving total (the ingest-count sibling of the commit above).
+        progress.add_ingested(ingested - ingested_committed);
+        ingested_committed = ingested;
 
         if page_len < VINE_PULL_PAGE_LIMIT_MAX as usize {
             break;
@@ -756,6 +845,11 @@ impl VinePullDriver {
         // monotone — a candidate that got less far cannot rewind one that
         // got further.
         let progress = PullProgressSink::default();
+        // ZEB-826: the winning candidate's own ingests, recorded by
+        // `record_session_ok`; netted out of the sink's pass total below so a
+        // rescued failed candidate's rows are counted once and the winner is
+        // not counted twice.
+        let mut recorded_ingested: u32 = 0;
 
         // Try every candidate in order within this pass, stopping at the
         // first success — a dead head-of-list relay must not block the
@@ -785,6 +879,9 @@ impl VinePullDriver {
                     if res.cursor > st.cursor {
                         st.cursor = res.cursor;
                     }
+                    // ZEB-826: stash the winner's ingests to net out of the
+                    // sink pass total (which includes them) at the merge below.
+                    recorded_ingested = res.ingested;
                     if let Some(t) = self.telemetry.as_ref() {
                         t.record_session_ok(creator, &relay.iroh_endpoint_id, res.ingested);
                     }
@@ -820,7 +917,34 @@ impl VinePullDriver {
         // Pinned by `failover_keeps_the_higher_committed_cursor_over_a_lower_success`.
         if let Some(p) = progress.take() {
             if p > st.cursor {
+                // ZEB-826: the rescue actually bit — a candidate committed a
+                // page (or the winner returned a lower cursor than an earlier
+                // failed candidate reached) that the loop's own assignment did
+                // not carry. Module convention logs each unusual cursor move.
+                tracing::debug!(
+                    creator,
+                    rescued_created_at = p.0,
+                    "ZEB-819 pull: rescued a committed cursor the session loop did not return"
+                );
                 st.cursor = p;
+            }
+        }
+
+        // ZEB-826: record ingests the sink rescued from candidates that
+        // committed pages then failed — invisible to `record_session_ok`,
+        // which sees only the winner's return value. The winner's own ingests
+        // are already in the sink total, so net them out; any positive
+        // remainder is rows a FAILED candidate committed durably this pass.
+        // Refusals ride the same sink so a poisoning relay that also fails the
+        // session is still counted.
+        if let Some(t) = self.telemetry.as_ref() {
+            let rescued = progress.take_ingested().saturating_sub(recorded_ingested);
+            if rescued > 0 {
+                t.record_rescued_ingested(rescued);
+            }
+            let refused = progress.take_refused_forward_skew();
+            if refused > 0 {
+                t.record_refused_forward_skew(refused);
             }
         }
 
@@ -1190,7 +1314,7 @@ mod tests {
     async fn run_session_capturing_second_query(
         rows: Vec<Vec<u8>>,
         verdicts: Vec<IngestVerdict>,
-    ) -> (PullSessionResult, VinePullQuery) {
+    ) -> (PullSessionResult, VinePullQuery, PullProgressSink) {
         let (client, server) = tokio::io::duplex(1 << 20);
         let (mut client_read, mut client_write) = tokio::io::split(client);
         let (mut server_read, mut server_write) = tokio::io::split(server);
@@ -1209,6 +1333,9 @@ mod tests {
         });
 
         let ingest = ScriptedIngest::new(verdicts);
+        // ZEB-826: kept (Arc clone shares state) so callers can assert the
+        // drop-surviving refused/ingested counters the session wrote.
+        let sink = PullProgressSink::default();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             run_vine_pull_client_session(
@@ -1218,7 +1345,7 @@ mod tests {
                 (0, String::new()),
                 &ingest,
                 TEST_NOW_MS,
-                PullProgressSink::default(),
+                sink.clone(),
             ),
         )
         .await
@@ -1230,7 +1357,7 @@ mod tests {
             .expect("server task must finish promptly")
             .expect("server task must not panic");
 
-        (result, second)
+        (result, second, sink)
     }
 
     /// ZEB-818: an unverifiable row with an implausibly future `created_at`
@@ -1246,7 +1373,7 @@ mod tests {
             ),
         ]);
 
-        let (result, second_query) = run_session_capturing_second_query(rows, verdicts).await;
+        let (result, second_query, sink) = run_session_capturing_second_query(rows, verdicts).await;
 
         assert_eq!(
             query_cursor(&second_query),
@@ -1260,6 +1387,14 @@ mod tests {
             result.skipped_invalid, 1,
             "the refused row is still counted as skipped-invalid"
         );
+        // ZEB-826: the refused row is ALSO counted in the dedicated
+        // drop-surviving counter, so a poisoning relay is visible without the
+        // debug-level `skipped_invalid` conflation.
+        assert_eq!(
+            sink.take_refused_forward_skew(),
+            1,
+            "the refused row must increment refused_forward_skew"
+        );
     }
 
     /// Plausibly-timed invalid rows must STILL advance the cursor
@@ -1272,7 +1407,8 @@ mod tests {
             IngestVerdict::SkipInvalid,
         )]);
 
-        let (result, second_query) = run_session_capturing_second_query(rows, verdicts).await;
+        let (result, second_query, _sink) =
+            run_session_capturing_second_query(rows, verdicts).await;
 
         assert_eq!(
             query_cursor(&second_query),
@@ -1292,7 +1428,8 @@ mod tests {
             descriptor_json("edge", just_inside),
             IngestVerdict::SkipInvalid,
         )]);
-        let (result, second_query) = run_session_capturing_second_query(rows, verdicts).await;
+        let (result, second_query, _sink) =
+            run_session_capturing_second_query(rows, verdicts).await;
         assert_eq!(
             query_cursor(&second_query),
             (just_inside, "edge"),
@@ -1316,7 +1453,8 @@ mod tests {
                 IngestVerdict::SkipInvalid,
             ),
         ]);
-        let (result, second_query) = run_session_capturing_second_query(rows, verdicts).await;
+        let (result, second_query, _sink) =
+            run_session_capturing_second_query(rows, verdicts).await;
         assert_eq!(
             query_cursor(&second_query),
             (anchor_created_at, "anchor"),
@@ -1536,6 +1674,13 @@ mod tests {
         /// queue commits nothing, so tests that don't care omit it and drive
         /// the identical code path they did before ZEB-819.
         commits: std::sync::Mutex<VecDeque<ScriptedCommit>>,
+        /// ZEB-826: rows this mock adds to the caller's sink BEFORE returning
+        /// each scripted result — the mock's stand-in for a session that
+        /// backfilled N rows into the durable store (and the drop-surviving
+        /// sink) before its outcome, including an `Err` whose real session
+        /// would carry no count. Positionally aligned with `script`; an
+        /// exhausted queue adds nothing.
+        ingesting: std::sync::Mutex<VecDeque<u32>>,
     }
 
     impl MockTransport {
@@ -1544,6 +1689,7 @@ mod tests {
                 calls: std::sync::Mutex::new(Vec::new()),
                 script: std::sync::Mutex::new(results.into()),
                 commits: std::sync::Mutex::new(VecDeque::new()),
+                ingesting: std::sync::Mutex::new(VecDeque::new()),
             }
         }
 
@@ -1554,6 +1700,15 @@ mod tests {
         /// committed progress to one specific candidate relay.
         fn committing(mut self, commits: Vec<ScriptedCommit>) -> Self {
             self.commits = std::sync::Mutex::new(commits.into());
+            self
+        }
+
+        /// ZEB-826: script one `add_ingested(n)` PER CALL, aligned with
+        /// `with_results` — entry *i* lands in the caller's sink just before
+        /// outcome *i* returns. Lets a test attribute rescued ingests to a
+        /// specific candidate (notably one whose scripted outcome is `Err`).
+        fn ingesting(mut self, ingests: Vec<u32>) -> Self {
+            self.ingesting = std::sync::Mutex::new(ingests.into());
             self
         }
 
@@ -1578,6 +1733,9 @@ mod tests {
                 .push((relay.clone(), creator.to_string(), cursor.clone()));
             if let Some(Some(committed)) = self.commits.lock().unwrap().pop_front() {
                 progress.commit(committed);
+            }
+            if let Some(n) = self.ingesting.lock().unwrap().pop_front() {
+                progress.add_ingested(n);
             }
             self.script
                 .lock()
@@ -2240,6 +2398,148 @@ mod tests {
             (9, "x".to_string()),
             "the merge is a MAX: a succeeding candidate's LOWER cursor must not \
              rewind progress an earlier failed candidate already committed"
+        );
+    }
+
+    /// ZEB-826: a candidate that ingested pages then FAILED (its `Err` carries
+    /// no count, and a dropped future returns nothing at all) still has those
+    /// rows counted toward `descriptors_ingested`, because they rode the
+    /// drop-surviving sink out. `record_session_ok` sees only the winning
+    /// candidate's ingests; before this fix the failed candidate's were lost,
+    /// leaving fleet-health blind on exactly the ZEB-819 failover path.
+    #[tokio::test]
+    async fn rescued_ingests_from_a_failed_candidate_are_counted() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "ca".repeat(16);
+        let now = 1_700_000_000_000u64;
+        let died_after_ingesting = VineRelayEntry {
+            iroh_endpoint_id: [0x21; 32],
+            home_relay: "https://ingested-then-died".to_string(),
+        };
+        let winner = VineRelayEntry {
+            iroh_endpoint_id: [0x22; 32],
+            home_relay: "https://the-winner".to_string(),
+        };
+
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (0, String::new()), // first follow: always pulls
+                    last_pull_attempt_ms: 0,
+                    consecutive_skips: 0,
+                    relay_set: vec![died_after_ingesting.clone(), winner.clone()],
+                    relays_fetched_at_ms: now, // cooldown active: no resolve
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        // Candidate A backfilled 5 rows into the sink, then its session failed
+        // (the `Err` carries no count). Candidate B succeeded with 3 more.
+        let transport = Arc::new(
+            MockTransport::with_results(vec![
+                Err("vine pull IO timeout".to_string()),
+                Ok(PullSessionResult {
+                    cursor: (8, "h".to_string()),
+                    ingested: 3,
+                    skipped_invalid: 0,
+                }),
+            ])
+            .ingesting(vec![5, 3]),
+        );
+        let followed = creator.clone();
+        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
+        let last_received: LastReceivedMsFn = Arc::new(|_| None);
+        let telemetry = Arc::new(crate::network_health::VinePullTelemetry::new());
+
+        let driver = VinePullDriver::new(
+            [0xFF; 32],
+            inert_pkarr_resolver(),
+            transport.clone(),
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path.clone(),
+        )
+        .with_telemetry(Arc::clone(&telemetry));
+
+        driver.run_one_pass(now).await;
+
+        assert_eq!(transport.calls().len(), 2, "A must fail over to winner B");
+        let s = telemetry.summary();
+        assert_eq!(
+            s.descriptors_ingested, 8,
+            "the failed candidate's 5 committed ingests must be rescued and \
+             added to the winner's 3 — not silently dropped"
+        );
+        assert_eq!(s.sessions_ok, 1, "only B completed a session");
+        assert_eq!(s.sessions_failed, 1, "A's session failed");
+    }
+
+    /// ZEB-826 guard: a lone successful candidate's ingests are counted
+    /// exactly ONCE. Moving ingest accounting onto the sink must not
+    /// double-count the common no-failover path — the merge nets the winner's
+    /// own `record_session_ok` contribution out of the sink pass total.
+    #[tokio::test]
+    async fn single_successful_candidate_counts_ingests_once() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let sidecar_path = temp_sidecar_path(&dir);
+        let creator = "da".repeat(16);
+        let now = 1_700_000_000_000u64;
+        let relay = VineRelayEntry {
+            iroh_endpoint_id: [0x31; 32],
+            home_relay: "https://sole-relay".to_string(),
+        };
+
+        let seeded = VinePullSidecar {
+            per_creator: BTreeMap::from([(
+                creator.clone(),
+                CreatorPullState {
+                    cursor: (0, String::new()),
+                    last_pull_attempt_ms: 0,
+                    consecutive_skips: 0,
+                    relay_set: vec![relay.clone()],
+                    relays_fetched_at_ms: now,
+                },
+            )]),
+        };
+        save_vine_pull(&sidecar_path, &seeded).expect("seed sidecar");
+
+        // One candidate: backfills 4 rows into the sink AND returns them as
+        // its result — exactly how a real single-candidate pass behaves.
+        let transport = Arc::new(
+            MockTransport::with_results(vec![Ok(PullSessionResult {
+                cursor: (4, "d".to_string()),
+                ingested: 4,
+                skipped_invalid: 0,
+            })])
+            .ingesting(vec![4]),
+        );
+        let followed = creator.clone();
+        let followed_fn: FollowedCreatorsFn = Arc::new(move || vec![followed.clone()]);
+        let last_received: LastReceivedMsFn = Arc::new(|_| None);
+        let telemetry = Arc::new(crate::network_health::VinePullTelemetry::new());
+
+        let driver = VinePullDriver::new(
+            [0xFF; 32],
+            inert_pkarr_resolver(),
+            transport.clone(),
+            Arc::new(StubIngest),
+            followed_fn,
+            last_received,
+            sidecar_path.clone(),
+        )
+        .with_telemetry(Arc::clone(&telemetry));
+
+        driver.run_one_pass(now).await;
+
+        let s = telemetry.summary();
+        assert_eq!(
+            s.descriptors_ingested, 4,
+            "a lone winner's ingests must be counted once, not doubled by the \
+             sink pass-total"
         );
     }
 

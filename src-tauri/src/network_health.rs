@@ -1129,6 +1129,11 @@ pub struct VinePullTelemetry {
     descriptors_ingested: AtomicU64,
     last_ingest_ms: AtomicU64,
     passes_no_relay: AtomicU64,
+    /// ZEB-826: rows the ZEB-818 skew clamp refused to advance the cursor
+    /// past (attacker-chosen implausibly-future `created_at`), broken out of
+    /// the generic `skipped_invalid` so a cursor-poisoning relay is visible in
+    /// a default `info` build without a spammable `warn!`.
+    refused_forward_skew: AtomicU64,
     recent: Mutex<VecDeque<VinePullHit>>,
 }
 
@@ -1175,6 +1180,31 @@ impl VinePullTelemetry {
         self.push(creator, relay_endpoint_id, "failed", 0);
     }
 
+    /// ZEB-826: rows durably backfilled by a candidate that committed pages
+    /// then FAILED (the ZEB-819 sink-rescue path) — counted toward
+    /// `descriptors_ingested` so fleet-health isn't blind on failover. The
+    /// winning candidate's ingests already flow through `record_session_ok`;
+    /// the driver nets those out and calls this only with the failed-candidate
+    /// remainder. Counter-only (no `recent` ring row): a rescued remainder is
+    /// not a session outcome, exactly like `record_no_relay`.
+    pub fn record_rescued_ingested(&self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        self.descriptors_ingested
+            .fetch_add(u64::from(n), Ordering::Relaxed);
+        self.last_ingest_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// ZEB-826: `n` rows the ZEB-818 skew clamp refused this pass. Counter-only
+    /// (no ring row) — the refusal is a per-row event, not a session outcome —
+    /// and deliberately never a `warn!`: an attacker chooses how many
+    /// future-dated rows to serve, so a per-row log line is spammable.
+    pub fn record_refused_forward_skew(&self, n: u32) {
+        self.refused_forward_skew
+            .fetch_add(u64::from(n), Ordering::Relaxed);
+    }
+
     fn push(&self, creator: &str, relay_endpoint_id: &[u8; 32], outcome: &str, ingested: u32) {
         // `creator` is already a hex address string, so its first 8 hex
         // characters ARE the first 4 bytes, short-form per ZEB-329. Never
@@ -1215,6 +1245,7 @@ impl VinePullTelemetry {
             descriptors_ingested: self.descriptors_ingested.load(Ordering::Relaxed),
             last_ingest_ms: (last_ingest != 0).then_some(last_ingest),
             passes_no_relay: self.passes_no_relay.load(Ordering::Relaxed),
+            refused_forward_skew: self.refused_forward_skew.load(Ordering::Relaxed),
             recent: self
                 .recent
                 .lock()
@@ -1239,6 +1270,13 @@ pub struct VinePullingHealth {
     pub descriptors_ingested: u64,
     pub last_ingest_ms: Option<u64>,
     pub passes_no_relay: u64,
+    /// ZEB-826: rows the ZEB-818 skew clamp refused to advance the cursor
+    /// past this process's lifetime. Broken out of `skipped_invalid` so a
+    /// cursor-poisoning relay is visible without a debug-level log session.
+    /// Additive wire field — `#[serde(default)]` keeps a pre-field snapshot
+    /// forward-compatible.
+    #[serde(default)]
+    pub refused_forward_skew: u64,
     pub recent: Vec<VinePullHit>,
 }
 
