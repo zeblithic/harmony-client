@@ -8212,6 +8212,7 @@ mod tests {
             community_id,
             my_raw,
             crate::network_health::now_ms(),
+            1, // ZEB-829: publish-retry assertions are independent of peer count
         );
 
         assert!(
