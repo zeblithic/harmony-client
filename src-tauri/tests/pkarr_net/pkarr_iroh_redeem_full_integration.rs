@@ -281,11 +281,29 @@ struct TwoPartySetup {
     _dir_bob: tempfile::TempDir,
 }
 
-/// Stand up the full two-party iroh-handshake harness (identities, endpoints,
-/// Alice's engine + acceptor, Bob's redeem deps, mock pkarr relay). Identical
-/// for the targeted and untargeted roundtrip tests; the only thing that
-/// differs between them is the invite payload each constructs afterward.
+/// The acceptor config the four happy-path roundtrips use (short wall-clock
+/// budgets so a stall surfaces as a timeout in seconds, not at the outer 60s).
+fn default_acceptor_config() -> harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
+    harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
+        io_deadline: Duration::from_millis(10_000),
+        poll_deadline: Duration::from_millis(10_000),
+        poll_interval: Duration::from_millis(20),
+    }
+}
+
+/// Thin wrapper: the happy-path roundtrips use the default acceptor config.
 async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
+    setup_two_party_iroh_handshake_with_config(default_acceptor_config()).await
+}
+
+/// Stand up the full two-party iroh-handshake harness (identities, endpoints,
+/// Alice's engine + acceptor, Bob's redeem deps, mock pkarr relay). The
+/// `acceptor_config` lets the ZEB-874 negative test force a deterministic
+/// post-insert failure (`poll_deadline = 0` → CountersignTimeout before the
+/// countersign write); the happy-path tests pass `default_acceptor_config()`.
+async fn setup_two_party_iroh_handshake_with_config(
+    acceptor_config: harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig,
+) -> TwoPartySetup {
     // ── 1. Identities. ───────────────────────────────────────────────
     // ZEB-339 dual-identity model: each party has TWO identities.
     //   - Community identity  = mint_test_owner(seed) → owner (OwnerAddr),
@@ -544,11 +562,7 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
             Arc::clone(&alice_crdt_state),
             None,
             Some(Arc::clone(&invite_pub)),
-            harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
-                io_deadline: Duration::from_millis(10_000),
-                poll_deadline: Duration::from_millis(10_000),
-                poll_interval: Duration::from_millis(20),
-            },
+            acceptor_config,
         ));
     if alice_link_mgr
         .install_handshake_dispatcher(alice_acceptor)
@@ -1031,6 +1045,33 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         assert!(
             alice_has_countersign,
             "Alice's CRDT must contain her own auto-counter-sign for Bob's PendingJoin"
+        );
+
+        // ZEB-874 regression: the single-use invite must be burned once the
+        // handshake completes — now the burn fires in the acceptor AFTER the
+        // countersign response is written, not in handle_unicast on insert. The
+        // deterministic signal is the publisher dropping the case-A handle from
+        // its active set (re-resolving the mock relay is unreliable; the PUT
+        // record lingers until TTL — see the untargeted roundtrip's note).
+        let invite_handle = format!("invite:{}", hex::encode(token_sig));
+        let mut handle_gone = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !s
+                .pkarr_publisher
+                .active_handles()
+                .await
+                .contains(&invite_handle)
+            {
+                handle_gone = true;
+                break;
+            }
+        }
+        assert!(
+            handle_gone,
+            "ZEB-874: the case-A invite publication must be unregistered (handle \
+             {invite_handle:?} dropped from active_handles) within 5s of the \
+             successful handshake (acceptor burns after the countersign write)"
         );
 
         // Graceful teardown. Abort the long-lived pkarr publisher task FIRST so it
@@ -1586,11 +1627,12 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
             "Bob must materialize as Joined after the untargeted handshake completes"
         );
 
-        // ZEB-367 unregister-on-consume (e2e). Alice's acceptor was built with
-        // Some(invite_pub); once Bob's PendingJoin lands as `Inserted` on
-        // Alice's accept side, handle_unicast calls
-        // unregister_invite(&invite_token.sig), which removes the case-A
-        // publication from the publisher's active set so it stops republishing.
+        // ZEB-367 / ZEB-874 unregister-on-consume (e2e). Alice's acceptor was
+        // built with Some(invite_pub); once the handshake completes and the
+        // acceptor has written the countersign back, it calls
+        // unregister_invite(&invite_token.sig) (ZEB-874 moved this burn off
+        // handle_unicast's insert), removing the case-A publication from the
+        // publisher's active set so it stops republishing.
         //
         // NOTE: `PkarrPublisher::unregister` only stops FUTURE republishes — it
         // does not send a DELETE to the relay, so the already-PUT record lingers
@@ -1618,9 +1660,9 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
         }
         assert!(
             handle_gone,
-            "ZEB-367: Alice's case-A invite publication must be unregistered \
+            "ZEB-367 / ZEB-874: Alice's case-A invite publication must be unregistered \
              (handle {invite_handle:?} dropped from active_handles) within 5s after \
-             the invite is consumed (handle_unicast → unregister_invite on Inserted)"
+             the invite is consumed (acceptor unregisters after the countersign write)"
         );
 
         // Graceful teardown. Abort the long-lived pkarr publisher task FIRST so it
@@ -1864,4 +1906,178 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
     })
     .await
     .expect("zeb427_iroh_redeem_fences_owner_state_space_to_disk timed out at 60s");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// ZEB-874 Tier 1: a redeem that fails AFTER the host's local insert must NOT
+// burn the single-use invite. Alice's acceptor runs with poll_deadline=0, so it
+// returns CountersignTimeout immediately after handle_unicast inserts Bob's
+// PendingJoin — the auto-counter-sign task spawns but cannot land in the
+// microseconds before the first poll check. This is exactly a post-insert,
+// pre-delivery failure: pre-ZEB-874 handle_unicast had already burned the invite
+// on the insert; post-ZEB-874 the burn lives after the countersign write, which
+// is never reached, so the invite stays live.
+//
+// Determinism/no-flake contract: the ONLY way the race is lost is if the async
+// resolve+sign+insert completes within microseconds of tokio::spawn. If it ever
+// did, the acceptor would write, burn, and Bob would join — tripping BOTH asserts
+// LOUDLY. On broken (pre-fix) code the handle is burned on insert, also tripping
+// the assert loudly. There is no path where this test passes while the code is
+// wrong; the worst case is a loud, re-runnable flake, never a false green.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invite_not_burned_when_handshake_fails_after_insert() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        // poll_deadline = 0 → the acceptor CountersignTimeouts right after the
+        // insert, before writing any countersign back.
+        let s = setup_two_party_iroh_handshake_with_config(
+            harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
+                io_deadline: Duration::from_millis(10_000),
+                poll_deadline: Duration::ZERO,
+                poll_interval: Duration::from_millis(20),
+            },
+        )
+        .await;
+
+        // Targeted invite-only URL — same construction as
+        // `bob_joins_alice_via_iroh_handshake_option_a`.
+        let token_minted_at = Hlc {
+            wall_ms: 100_500,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let invite_token_unsigned = InviteToken {
+            inviter: s.alice_addr,
+            invitee_hint: Some(s.bob_addr),
+            minted_at: token_minted_at.clone(),
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let token_payload_bytes =
+            canonical_invite_token_bytes(&invite_token_unsigned).expect("canonical token bytes");
+        let token_sig: [u8; 64] = s.alice_comm_sk.sign(&token_payload_bytes).to_bytes();
+        let invite_token = InviteToken {
+            inviter: s.alice_addr,
+            invitee_hint: Some(s.bob_addr),
+            minted_at: token_minted_at,
+            expires_at: None,
+            sig: token_sig,
+        };
+        let bob_x25519_pub = {
+            let verifying_bytes = s.bob_comm_sk.verifying_key().to_bytes();
+            harmony_app::dm_signing::ed25519_pub_to_x25519(&verifying_bytes)
+                .expect("bob_comm ed25519→x25519")
+        };
+        let sealed_epoch_key = harmony_app::dm_signing::seal_to_owner(
+            &bob_x25519_pub,
+            s.alice_minted.membership_key.as_bytes(),
+        )
+        .expect("seal epoch key to bob");
+        let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
+            community_id: s.community_id,
+            epoch_snapshot: InviteEpochSnapshot {
+                epoch: 0,
+                sealed_epoch_key: Vec::new(),
+                sealed_epoch_keys: vec![sealed_epoch_key],
+                state_snapshot: MaterializedCommunityState::default(),
+            },
+            admin_addr: s.alice_addr,
+            community_name: "OptionAHandshakeCommunity".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(invite_token),
+            admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
+            admin_identity_pub: Some(s.alice_pub),
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: Some(s.alice_comm.cert.clone()),
+            untargeted_decrypt_key: None,
+        };
+        let invite_url =
+            community_invite::encode_invite_url(&invite_payload).expect("encode invite");
+
+        s.invite_pub.register_invite(&invite_payload).await;
+        let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        let invite_handle = format!("invite:{}", hex::encode(token_sig));
+        assert!(
+            s.pkarr_publisher
+                .active_handles()
+                .await
+                .contains(&invite_handle),
+            "precondition: the case-A invite handle must be registered before the redeem"
+        );
+
+        // Drive Bob's redeem. The acceptor inserts Bob's PendingJoin, then
+        // CountersignTimeouts (poll_deadline=0) before writing anything back.
+        let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
+            invite_url,
+            Some(Arc::clone(&s.pkarr_resolver)),
+            Some(s.bob_reachability.clone()),
+            Some(Arc::clone(&s.bob_ep)),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            s.bob_adopt_floor.clone(),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            None,
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            None,
+            None,
+            |_| {},
+            |_payload: harmony_app::NavUpdatedPayload| {},
+            harmony_app::HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(10_000),
+                open_bi_timeout: Duration::from_millis(10_000),
+                response_read_timeout: Duration::from_millis(10_000),
+                write_timeout: Duration::from_millis(10_000),
+            },
+            || Ok(()),
+        )
+        .await
+        .expect("connectivity_redeem_invite_iroh_inner must Ok (errors → non-joined status)");
+
+        assert_ne!(
+            outcome.status, "joined",
+            "the redeem must NOT report joined when the acceptor CountersignTimeouts \
+             before delivering the countersign; got status={:?}",
+            outcome.status
+        );
+
+        // THE load-bearing assertion: the single-use invite must remain live.
+        // Grace window for any spawned tasks to settle, then assert the handle
+        // is STILL registered — pre-ZEB-874 handle_unicast burned it on insert.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            s.pkarr_publisher
+                .active_handles()
+                .await
+                .contains(&invite_handle),
+            "ZEB-874: a redeem that fails after the host's insert (CountersignTimeout) \
+             must NOT burn the single-use invite — handle {invite_handle:?} must still \
+             be in active_handles so the legitimate joiner can retry"
+        );
+
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("invite_not_burned_when_handshake_fails_after_insert timed out at 60s");
 }

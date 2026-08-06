@@ -200,10 +200,12 @@ where
     /// path; `None` falls through to the warn-log-only branch (matches
     /// the test-stub convention).
     app: Option<Arc<H>>,
-    /// ZEB-367: case-A pkarr publisher handle. When `Some`, a successful
-    /// invite consumption (PendingJoin / counter-signed Join `Inserted`)
-    /// unregisters the invite's case-A publication via
-    /// `handle_unicast`, freeing the DHT slot. `None` in tests.
+    /// ZEB-367 / ZEB-874: case-A pkarr publisher handle. When `Some`, the
+    /// invite's case-A publication is unregistered (freeing the DHT slot) once
+    /// the countersign response has been successfully written back to the
+    /// joiner — see `handle_invite_handshake_inbound`. ZEB-874 moved this burn
+    /// off `handle_unicast`'s local insert so a failed delivery no longer
+    /// consumes the single-use invite. `None` in tests.
     pkarr_invite_publisher: Option<Arc<crate::pkarr_invite_publisher::PkarrInvitePublisher>>,
     /// Per-handler timeouts. Production wiring constructs this via
     /// [`HandshakeAcceptorConfig::from_env`] so operators can override
@@ -457,7 +459,6 @@ where
             &self.crdt_state,
             packet_bytes,
             self.app.as_deref(),
-            self.pkarr_invite_publisher.as_ref(),
         )
         .await;
         if let Err(e) = unicast_result {
@@ -517,6 +518,19 @@ where
         // insert_local_event_with_pubs against them).
         self.write_len_prefixed_cbor(&mut send, &countersign)
             .await?;
+
+        // ZEB-874: burn the single-use invite ONLY now that the countersign
+        // response has been handed to the transport. The `?` above means any
+        // delivery failure (CountersignTimeout returns earlier; a failed
+        // write / io-timeout / lost connection returns here) leaves the invite
+        // live for the joiner to retry. Fires on both Inserted and
+        // AlreadyKnown (a retransmit re-delivers the countersign); the
+        // unregister is idempotent, so a repeat burn is a safe no-op. Moved
+        // here from `community_invite::handle_unicast`, which used to burn on
+        // local insert before delivery was known.
+        if let Some(pubr) = self.pkarr_invite_publisher.as_ref() {
+            pubr.unregister_invite(&signed.invite_token.sig).await;
+        }
 
         Ok(bootstrap_join_id)
     }
