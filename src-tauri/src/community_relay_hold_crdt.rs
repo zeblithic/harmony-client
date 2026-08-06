@@ -273,8 +273,10 @@ mod tests {
         // out on the next sweep — the whole point of the fix.
         let mut doc = RelayHoldDoc::default();
         let k = key_rr(1, 1);
-        doc.entries
-            .insert(k.clone(), entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]));
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
         let now = crate::community_relay::RELAY_HOLD_TTL_MS + 10_000;
         doc.restore_first_observed([(k.clone(), 1u64)].into_iter().collect());
         assert!(doc.gc(now), "old restored stamp → entry ages out");
@@ -287,8 +289,10 @@ mod tests {
         // the entry survives — this is today's bug, pinned to show the contrast.
         let mut doc = RelayHoldDoc::default();
         let k = key_rr(1, 1);
-        doc.entries
-            .insert(k.clone(), entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]));
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
         let now = crate::community_relay::RELAY_HOLD_TTL_MS + 10_000;
         assert!(!doc.gc(now), "empty clock re-stamps at now → survives");
         assert_eq!(doc.entries.len(), 1);
@@ -298,8 +302,10 @@ mod tests {
     fn restore_and_read_first_observed_round_trips() {
         let mut doc = RelayHoldDoc::default();
         let k = key_rr(1, 1);
-        doc.entries
-            .insert(k.clone(), entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]));
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [2; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
         let m: BTreeMap<String, u64> = [(k.clone(), 12_345u64)].into_iter().collect();
         doc.restore_first_observed(m.clone());
         assert_eq!(doc.first_observed_ms(), &m);

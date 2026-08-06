@@ -321,7 +321,8 @@ mod tests {
     fn restored_old_first_observed_expires_across_restart() {
         let mut doc = DmInboxDoc::default();
         let k = key();
-        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
+        doc.entries
+            .insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
         let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
         doc.restore_first_observed([(k.clone(), 1u64)].into_iter().collect());
         assert!(
@@ -335,7 +336,8 @@ mod tests {
     fn empty_first_observed_survives_first_sweep_after_restart() {
         let mut doc = DmInboxDoc::default();
         let k = key();
-        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
+        doc.entries
+            .insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
         let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
         assert!(
             !doc.gc_expired(now, &BTreeSet::new()),
@@ -348,7 +350,8 @@ mod tests {
     fn restore_and_read_first_observed_round_trips() {
         let mut doc = DmInboxDoc::default();
         let k = key();
-        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
+        doc.entries
+            .insert(k.clone(), entry(hlc(1, "a"), "butler", &[]));
         let m: BTreeMap<String, u64> = [(k.clone(), 12_345u64)].into_iter().collect();
         doc.restore_first_observed(m.clone());
         assert_eq!(doc.first_observed_ms(), &m);

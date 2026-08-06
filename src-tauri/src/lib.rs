@@ -6003,10 +6003,22 @@ pub async fn start_node_inner(
                         identity_dir.join(crate::dm_inbox_persist::DM_INBOX_FILENAME);
                     let dm_inbox_replay_path =
                         identity_dir.join(crate::dm_inbox_persist::DM_INBOX_REPLAY_FILENAME);
-                    let dm_inbox_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::dm_inbox_persist::load_doc_or_recover(&dm_inbox_path)
-                            .map_err(|e| format!("load dm-inbox doc: {e}"))?,
-                    ));
+                    let dm_inbox_first_observed_path = identity_dir
+                        .join(crate::dm_inbox_persist::DM_INBOX_FIRST_OBSERVED_FILENAME);
+                    // ZEB-862: restore the LOCAL first-observation clock from its
+                    // sidecar so TTL GC survives restart (else the first sweep
+                    // re-stamps every entry at `now`).
+                    let dm_inbox_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
+                        let mut doc = crate::dm_inbox_persist::load_doc_or_recover(&dm_inbox_path)
+                            .map_err(|e| format!("load dm-inbox doc: {e}"))?;
+                        doc.restore_first_observed(
+                            crate::dm_inbox_persist::load_first_observed_or_recover(
+                                &dm_inbox_first_observed_path,
+                            )
+                            .map_err(|e| format!("load dm-inbox first-observed: {e}"))?,
+                        );
+                        doc
+                    }));
                     let dm_inbox_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                         harmony_crdt_sync::ReplayTracker::from_accepted(
                             device_id.clone(),
@@ -6047,6 +6059,7 @@ pub async fn start_node_inner(
                                     crate::dm_inbox_persist::DmInboxPersist {
                                         doc_path: dm_inbox_path,
                                         replay_path: dm_inbox_replay_path,
+                                        first_observed_path: dm_inbox_first_observed_path,
                                     },
                                 ),
                                 lookup_key_tag: b"dm-inbox-v1",
@@ -6263,10 +6276,23 @@ pub async fn start_node_inner(
                         identity_dir.join(crate::relay_hold_persist::RELAY_HOLD_FILENAME);
                     let relay_hold_replay_path =
                         identity_dir.join(crate::relay_hold_persist::RELAY_HOLD_REPLAY_FILENAME);
-                    let relay_hold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::relay_hold_persist::load_doc_or_recover(&relay_hold_path)
-                            .map_err(|e| format!("load relay-hold doc: {e}"))?,
-                    ));
+                    let relay_hold_first_observed_path = identity_dir
+                        .join(crate::relay_hold_persist::RELAY_HOLD_FIRST_OBSERVED_FILENAME);
+                    // ZEB-862: restore the LOCAL first-observation clock from its
+                    // sidecar so TTL GC survives restart (else the first sweep
+                    // re-stamps every entry at `now`).
+                    let relay_hold_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
+                        let mut doc =
+                            crate::relay_hold_persist::load_doc_or_recover(&relay_hold_path)
+                                .map_err(|e| format!("load relay-hold doc: {e}"))?;
+                        doc.restore_first_observed(
+                            crate::relay_hold_persist::load_first_observed_or_recover(
+                                &relay_hold_first_observed_path,
+                            )
+                            .map_err(|e| format!("load relay-hold first-observed: {e}"))?,
+                        );
+                        doc
+                    }));
                     let relay_hold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
                         harmony_crdt_sync::ReplayTracker::from_accepted(
                             device_id.clone(),
@@ -6299,6 +6325,7 @@ pub async fn start_node_inner(
                                     crate::relay_hold_persist::RelayHoldPersist {
                                         doc_path: relay_hold_path,
                                         replay_path: relay_hold_replay_path,
+                                        first_observed_path: relay_hold_first_observed_path,
                                     },
                                 ),
                                 lookup_key_tag: b"relay-hold-v1",

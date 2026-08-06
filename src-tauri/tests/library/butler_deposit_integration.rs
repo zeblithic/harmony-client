@@ -597,6 +597,7 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
             inner: DmInboxPersist {
                 doc_path: a_dir.path().join("dm_inbox.cbor"),
                 replay_path: a_dir.path().join("dm_inbox_replay.cbor"),
+                first_observed_path: a_dir.path().join("dm_inbox_first_observed.cbor"),
             },
             expected_key: key.clone(),
             chronology: Arc::clone(&chronology),
@@ -609,6 +610,7 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
         Arc::new(DmInboxPersist {
             doc_path: b_dir.path().join("dm_inbox.cbor"),
             replay_path: b_dir.path().join("dm_inbox_replay.cbor"),
+            first_observed_path: b_dir.path().join("dm_inbox_first_observed.cbor"),
         }),
     );
 
@@ -902,6 +904,7 @@ async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
             inner: DmInboxPersist {
                 doc_path: a_dir.path().join("dm_inbox.cbor"),
                 replay_path: a_dir.path().join("dm_inbox_replay.cbor"),
+                first_observed_path: a_dir.path().join("dm_inbox_first_observed.cbor"),
             },
             expected_key: key.clone(),
             chronology: Arc::clone(&chronology),
@@ -914,6 +917,7 @@ async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
         Arc::new(DmInboxPersist {
             doc_path: b_dir.path().join("dm_inbox.cbor"),
             replay_path: b_dir.path().join("dm_inbox_replay.cbor"),
+            first_observed_path: b_dir.path().join("dm_inbox_first_observed.cbor"),
         }),
     );
 
@@ -1087,6 +1091,7 @@ async fn non_member_non_friend_deposit_is_rejected_and_not_persisted() {
             inner: DmInboxPersist {
                 doc_path: a_dir.path().join("dm_inbox.cbor"),
                 replay_path: a_dir.path().join("dm_inbox_replay.cbor"),
+                first_observed_path: a_dir.path().join("dm_inbox_first_observed.cbor"),
             },
             expected_key: key.clone(),
             chronology: Arc::clone(&chronology),
@@ -1184,6 +1189,7 @@ async fn co_member_deposit_for_unrelated_space_is_rejected_and_not_persisted() {
             inner: DmInboxPersist {
                 doc_path: a_dir.path().join("dm_inbox.cbor"),
                 replay_path: a_dir.path().join("dm_inbox_replay.cbor"),
+                first_observed_path: a_dir.path().join("dm_inbox_first_observed.cbor"),
             },
             expected_key: key.clone(),
             chronology: Arc::clone(&chronology),

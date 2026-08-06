@@ -203,6 +203,85 @@ pub fn save_replay(path: &Path, tracker: &BTreeMap<String, Hlc>) -> Result<(), S
     atomic_write(path, &bytes)
 }
 
+// ── first-observed sidecar (ZEB-862) ───────────────────────────────────────────
+
+/// File name for the persisted LOCAL first-observation clock. Lives alongside
+/// `dm_inbox.cbor`. Local-only: never replicated, never on the wire — it makes
+/// the `#[serde(skip)]` `DmInboxDoc::first_observed_ms` TTL clock survive
+/// restart instead of re-stamping `now` on the first post-boot sweep.
+pub const DM_INBOX_FIRST_OBSERVED_FILENAME: &str = "dm_inbox_first_observed.cbor";
+
+const DM_INBOX_FIRST_OBSERVED_SCHEMA_V1: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct DmInboxFirstObservedFileV1(BTreeMap<String, u64>);
+
+/// Load the LOCAL first-observation clock from `path`. Returns
+/// `Ok(BTreeMap::new())` if the file does not exist yet (→ today's re-stamp
+/// behavior; no doc-file migration needed).
+pub fn load_first_observed(path: &Path) -> Result<BTreeMap<String, u64>, SyncError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(SyncError::Persist(format!("read {}: {e}", path.display()))),
+    };
+    if bytes.is_empty() {
+        return Err(SyncError::CborDecode(format!(
+            "dm-inbox first-observed file is empty: {}",
+            path.display()
+        )));
+    }
+    let version = bytes[0];
+    let payload = &bytes[1..];
+    match version {
+        DM_INBOX_FIRST_OBSERVED_SCHEMA_V1 => {
+            let mut cursor = Cursor::new(payload);
+            let file: DmInboxFirstObservedFileV1 = from_reader(&mut cursor).map_err(|e| {
+                SyncError::CborDecode(format!("load_first_observed {}: {e}", path.display()))
+            })?;
+            // Reject trailing bytes after the CBOR value (mirrors `load`).
+            let pos = cursor.position() as usize;
+            if pos != payload.len() {
+                return Err(SyncError::CborDecode(format!(
+                    "trailing bytes after dm-inbox first-observed value: consumed {} of {}",
+                    pos,
+                    payload.len()
+                )));
+            }
+            Ok(file.0)
+        }
+        v => Err(SyncError::CborDecode(format!(
+            "unknown dm-inbox first-observed schema version {v:#x} in {}",
+            path.display()
+        ))),
+    }
+}
+
+/// Same recovery contract as [`load_doc_or_recover`]: `CborDecode` corruption is
+/// quarantined (`.corrupt-<ms>`, bytes preserved) and an empty map returned; a
+/// transient `Persist` error is left untouched and propagated (ZEB-460). A
+/// missing/empty clock is safe — the next sweep re-stamps `now`, exactly today's
+/// behavior — so quarantine-to-empty never loses correctness, only punctuality.
+pub fn load_first_observed_or_recover(path: &Path) -> Result<BTreeMap<String, u64>, SyncError> {
+    match load_first_observed(path) {
+        Ok(m) => Ok(m),
+        Err(e @ SyncError::CborDecode(_)) => {
+            quarantine(path, &e);
+            Ok(BTreeMap::new())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Save the LOCAL first-observation clock to `path` atomically.
+pub fn save_first_observed(path: &Path, map: &BTreeMap<String, u64>) -> Result<(), SyncError> {
+    let mut bytes = vec![DM_INBOX_FIRST_OBSERVED_SCHEMA_V1];
+    into_writer(&DmInboxFirstObservedFileV1(map.clone()), &mut bytes).map_err(|e| {
+        SyncError::CborEncode(format!("encode first-observed {}: {e}", path.display()))
+    })?;
+    atomic_write(path, &bytes)
+}
+
 // ── FleetPersist impl ─────────────────────────────────────────────────────────
 
 /// Durability sink for the dm-inbox fleet-sync engine. Holds the absolute
@@ -212,6 +291,9 @@ pub fn save_replay(path: &Path, tracker: &BTreeMap<String, Hlc>) -> Result<(), S
 pub struct DmInboxPersist {
     pub doc_path: std::path::PathBuf,
     pub replay_path: std::path::PathBuf,
+    /// ZEB-862: local-only first-observation clock sidecar (see
+    /// `DM_INBOX_FIRST_OBSERVED_FILENAME`).
+    pub first_observed_path: std::path::PathBuf,
 }
 
 impl crate::fleet_sync::FleetPersist<DmInboxDoc> for DmInboxPersist {
@@ -222,6 +304,7 @@ impl crate::fleet_sync::FleetPersist<DmInboxDoc> for DmInboxPersist {
     ) -> Result<(), SyncError> {
         save(&self.doc_path, state)?;
         save_replay(&self.replay_path, tracker)?;
+        save_first_observed(&self.first_observed_path, state.first_observed_ms())?;
         Ok(())
     }
 }
@@ -425,14 +508,17 @@ mod tests {
     }
 
     #[test]
-    fn dm_inbox_persist_writes_both_files() {
+    fn dm_inbox_persist_writes_all_files() {
         let dir = tempfile::tempdir().unwrap();
         let p = DmInboxPersist {
             doc_path: dir.path().join("dm_inbox.cbor"),
             replay_path: dir.path().join("dm_inbox_replay.cbor"),
+            first_observed_path: dir.path().join("dm_inbox_first_observed.cbor"),
         };
         use crate::fleet_sync::FleetPersist;
-        let doc = sample_doc();
+        let mut doc = sample_doc();
+        let fo: BTreeMap<String, u64> = [("x".to_string(), 9u64)].into_iter().collect();
+        doc.restore_first_observed(fo.clone());
         let mut t = std::collections::BTreeMap::new();
         t.insert(
             "A".to_string(),
@@ -445,5 +531,76 @@ mod tests {
         p.persist(&doc, &t).unwrap();
         assert_eq!(load(&p.doc_path).unwrap(), doc);
         assert_eq!(load_replay(&p.replay_path).unwrap(), t);
+        assert_eq!(load_first_observed(&p.first_observed_path).unwrap(), fo);
+    }
+
+    // ── first-observed sidecar (ZEB-862) ──────────────────────────────────────
+
+    #[test]
+    fn first_observed_round_trips_and_missing_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dm_inbox_first_observed.cbor");
+        assert!(load_first_observed(&path).unwrap().is_empty());
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("k1".to_string(), 111u64);
+        m.insert("k2".to_string(), 222u64);
+        save_first_observed(&path, &m).unwrap();
+        assert_eq!(load_first_observed(&path).unwrap(), m);
+    }
+
+    #[test]
+    fn load_first_observed_rejects_trailing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dm_inbox_first_observed.cbor");
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("k".to_string(), 5u64);
+        save_first_observed(&path, &m).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0xFF);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            load_first_observed(&path).unwrap_err(),
+            SyncError::CborDecode(_)
+        ));
+        assert!(load_first_observed_or_recover(&path).unwrap().is_empty());
+        assert!(!path.exists(), "corrupt sidecar was quarantined");
+    }
+
+    #[test]
+    fn load_first_observed_or_recover_propagates_transient_io_without_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fo.cbor");
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            load_first_observed_or_recover(&path).unwrap_err(),
+            SyncError::Persist(_)
+        ));
+        assert!(path.is_dir(), "transient error leaves the path untouched");
+    }
+
+    #[test]
+    fn persist_then_reload_first_observed_drives_expiry() {
+        // Full sidecar round-trip: an OLD stamp persisted by a prior run, then
+        // reloaded via the boot shape and restored into a fresh doc, ages the
+        // never-covered entry out on gc_expired(now, {}).
+        let dir = tempfile::tempdir().unwrap();
+        let fo_path = dir.path().join("dm_inbox_first_observed.cbor");
+        let key = DmInboxDoc::key(&[1u8; 16], &[2u8; 32]);
+        let seed: BTreeMap<String, u64> = [(key.clone(), 1u64)].into_iter().collect();
+        save_first_observed(&fo_path, &seed).unwrap();
+
+        let mut doc = DmInboxDoc::default();
+        let mut e = sample_entry();
+        e.ingested_by.clear(); // never covered → only TTL removes it
+        doc.entries.insert(key.clone(), e);
+        doc.restore_first_observed(load_first_observed_or_recover(&fo_path).unwrap());
+        doc.gc_expired(
+            crate::butler_deposit::INBOX_TTL_MS + 10_000,
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(
+            !doc.entries.contains_key(&key),
+            "reloaded old stamp aged the entry out"
+        );
     }
 }
