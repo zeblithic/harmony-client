@@ -13547,6 +13547,62 @@ pub async fn start_node_inner(
                                         dyn crate::network_health::CommunitySyncSource,
                                     >);
                             }
+                            // ZEB-877: per-fleet-engine publish-retry + fetch
+                            // telemetry. Each live fleet engine exposes a
+                            // type-erased `Arc<FleetSyncStats>`; collect them into
+                            // a fresh registry keyed by a stable doc label and
+                            // wire it as the `fleetSync` source. Absent (None)
+                            // engines are skipped — one row per LIVE engine, like
+                            // the community rows above.
+                            let fleet_sync_registry =
+                                std::sync::Arc::new(crate::fleet_sync::FleetSyncRegistry::new());
+                            {
+                                use crate::network_health::FleetDoc;
+                                if let Some(e) = guard.sync_engine.as_ref() {
+                                    fleet_sync_registry
+                                        .register(FleetDoc::OwnerState, e.sync_stats());
+                                }
+                                if let Some(e) = guard.notes_sync.as_ref() {
+                                    fleet_sync_registry.register(FleetDoc::Notes, e.sync_stats());
+                                }
+                                if let Some(e) = guard.dm_inbox_sync.as_ref() {
+                                    fleet_sync_registry.register(FleetDoc::DmInbox, e.sync_stats());
+                                }
+                                if let Some(e) = guard.community_device_intro_sync.as_ref() {
+                                    fleet_sync_registry
+                                        .register(FleetDoc::CommunityDeviceIntro, e.sync_stats());
+                                }
+                                if let Some(e) = guard.relay_hold_sync.as_ref() {
+                                    fleet_sync_registry
+                                        .register(FleetDoc::RelayHold, e.sync_stats());
+                                }
+                                if let Some(e) = guard.relay_optin_sync.as_ref() {
+                                    fleet_sync_registry
+                                        .register(FleetDoc::RelayOptIn, e.sync_stats());
+                                }
+                                if let Some(e) = guard.dm_outhold_sync.as_ref() {
+                                    fleet_sync_registry
+                                        .register(FleetDoc::DmOuthold, e.sync_stats());
+                                }
+                                if let Some(e) = guard.fleet_net_sync.as_ref() {
+                                    fleet_sync_registry
+                                        .register(FleetDoc::FleetNet, e.sync_stats());
+                                }
+                                if let Some(e) = guard.owner_trust_sync.as_ref() {
+                                    fleet_sync_registry
+                                        .register(FleetDoc::OwnerTrust, e.sync_stats());
+                                }
+                                if let Some(e) = guard.owner_quorum_sync.as_ref() {
+                                    fleet_sync_registry
+                                        .register(FleetDoc::OwnerQuorum, e.sync_stats());
+                                }
+                                if let Some(e) = guard.fleet_key_epoch_sync.as_ref() {
+                                    fleet_sync_registry
+                                        .register(FleetDoc::FleetKeys, e.sync_stats());
+                                }
+                            }
+                            nh.set_fleet_sync_source(std::sync::Arc::clone(&fleet_sync_registry)
+                                as std::sync::Arc<dyn crate::network_health::FleetSyncSource>);
                             // Spawn the rate-limiter — emits
                             // `network-health-changed` to the frontend
                             // when `notify()` fires (event_loop.rs hooks

@@ -3765,8 +3765,10 @@ impl CommunitySyncStats {
             .store(backoff_ms, Ordering::Relaxed);
         self.publish_retry_last_failure_ms
             .store(now_wall_ms, Ordering::Relaxed);
-        self.publish_retry_last_error_code
-            .store(PublishErrorClass::of(err) as u8, Ordering::Relaxed);
+        self.publish_retry_last_error_code.store(
+            classify_community_publish_error(err) as u8,
+            Ordering::Relaxed,
+        );
     }
 
     /// ZEB-762: a publish succeeded — clear the ACTIVE-retry state. The
@@ -3781,53 +3783,20 @@ impl CommunitySyncStats {
     }
 }
 
-/// ZEB-762: coarse class of a publish-path failure, for the retry-health stat.
-/// Encoded as a stable `u8` in an atomic (`0` = none, so the discriminants
-/// start at 1). Deliberately coarse: an operator needs "is publishing failing,
-/// and roughly why (transport vs storage vs crypto vs encode)", not the full
-/// `Display`. One enum owns the error→class and class→label maps so they cannot
-/// drift.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PublishErrorClass {
-    TransportClosed = 1,
-    ContentStore = 2,
-    Crypto = 3,
-    Encode = 4,
-    Other = 5,
-}
-
-impl PublishErrorClass {
-    fn of(err: &CommunitySyncError) -> Self {
-        match err {
-            CommunitySyncError::TransportClosed => Self::TransportClosed,
-            CommunitySyncError::ContentStore(_) => Self::ContentStore,
-            CommunitySyncError::Crypto(_) => Self::Crypto,
-            CommunitySyncError::CborEncode(_) => Self::Encode,
-            _ => Self::Other,
-        }
-    }
-
-    fn from_u8(code: u8) -> Option<Self> {
-        match code {
-            1 => Some(Self::TransportClosed),
-            2 => Some(Self::ContentStore),
-            3 => Some(Self::Crypto),
-            4 => Some(Self::Encode),
-            5 => Some(Self::Other),
-            _ => None,
-        }
-    }
-
-    /// Stable snake_case label surfaced on the wire (`lastError`). Stable
-    /// because operators / dashboards key off it.
-    fn label(self) -> &'static str {
-        match self {
-            Self::TransportClosed => "transport_closed",
-            Self::ContentStore => "content_store",
-            Self::Crypto => "crypto",
-            Self::Encode => "encode",
-            Self::Other => "other",
-        }
+/// ZEB-762 / ZEB-877: classify a community publish-path failure into the shared
+/// [`crate::network_health::PublishErrorClass`]. The class→label + stable `u8`
+/// codec live in `network_health` (shared with the fleet engine); this owns only
+/// the community-error→class map.
+fn classify_community_publish_error(
+    err: &CommunitySyncError,
+) -> crate::network_health::PublishErrorClass {
+    use crate::network_health::PublishErrorClass as P;
+    match err {
+        CommunitySyncError::TransportClosed => P::TransportClosed,
+        CommunitySyncError::ContentStore(_) => P::ContentStore,
+        CommunitySyncError::Crypto(_) => P::Crypto,
+        CommunitySyncError::CborEncode(_) => P::Encode,
+        _ => P::Other,
     }
 }
 
@@ -5894,10 +5863,11 @@ impl CommunitySyncRegistry {
                         publish_retry_last_failure_ms: s
                             .publish_retry_last_failure_ms
                             .load(Ordering::Relaxed),
-                        publish_retry_last_error: PublishErrorClass::from_u8(
-                            s.publish_retry_last_error_code.load(Ordering::Relaxed),
-                        )
-                        .map(PublishErrorClass::label),
+                        publish_retry_last_error:
+                            crate::network_health::PublishErrorClass::from_u8(
+                                s.publish_retry_last_error_code.load(Ordering::Relaxed),
+                            )
+                            .map(crate::network_health::PublishErrorClass::label),
                     },
                 )
             })
@@ -8114,8 +8084,10 @@ mod tests {
             222
         );
         assert_eq!(
-            PublishErrorClass::from_u8(stats.publish_retry_last_error_code.load(Ordering::Relaxed))
-                .map(PublishErrorClass::label),
+            crate::network_health::PublishErrorClass::from_u8(
+                stats.publish_retry_last_error_code.load(Ordering::Relaxed)
+            )
+            .map(crate::network_health::PublishErrorClass::label),
             Some("transport_closed"),
         );
 
@@ -8146,34 +8118,31 @@ mod tests {
     /// `u8` encoding (`0` = none).
     #[test]
     fn publish_error_class_maps_variants_to_stable_labels() {
+        use crate::network_health::PublishErrorClass as P;
         assert_eq!(
-            PublishErrorClass::of(&CommunitySyncError::TransportClosed).label(),
+            classify_community_publish_error(&CommunitySyncError::TransportClosed).label(),
             "transport_closed"
         );
         assert_eq!(
-            PublishErrorClass::of(&CommunitySyncError::CborEncode("x".into())).label(),
+            classify_community_publish_error(&CommunitySyncError::CborEncode("x".into())).label(),
             "encode"
         );
         // A variant with no dedicated class falls through to `other`.
         assert_eq!(
-            PublishErrorClass::of(&CommunitySyncError::Persist("x".into())).label(),
+            classify_community_publish_error(&CommunitySyncError::Persist("x".into())).label(),
             "other"
         );
         for c in [
-            PublishErrorClass::TransportClosed,
-            PublishErrorClass::ContentStore,
-            PublishErrorClass::Crypto,
-            PublishErrorClass::Encode,
-            PublishErrorClass::Other,
+            P::TransportClosed,
+            P::ContentStore,
+            P::Crypto,
+            P::Encode,
+            P::Other,
         ] {
-            assert_eq!(PublishErrorClass::from_u8(c as u8), Some(c));
+            assert_eq!(P::from_u8(c as u8), Some(c));
         }
-        assert_eq!(
-            PublishErrorClass::from_u8(0),
-            None,
-            "0 is the none sentinel"
-        );
-        assert_eq!(PublishErrorClass::from_u8(99), None);
+        assert_eq!(P::from_u8(0), None, "0 is the none sentinel");
+        assert_eq!(P::from_u8(99), None);
     }
 
     /// ZEB-762: end-to-end — a wedged publisher's escalating backoff must be
