@@ -196,8 +196,11 @@ impl FleetNetDoc {
         // Control tier; `receiver_now == None` ⇒ apply-all (a bad LOCAL clock must
         // never drop an honest owner pin). `pinned_at` is owner-stamped (vs
         // `seen_at` self-stamped by the subject sibling) — same freeze hazard.
-        if !crate::clock_trust::wall_exceeds_forward_skew(remote.pinned_at.wall_ms, receiver_now)
-            && remote.pinned_at.is_strictly_newer_than(&self.pinned_at)
+        if !crate::clock_trust::wall_exceeds_forward_skew_logged(
+            remote.pinned_at.wall_ms,
+            receiver_now,
+            "fleet_net.pin.pinned_at",
+        ) && remote.pinned_at.is_strictly_newer_than(&self.pinned_at)
         {
             let pin_changed = self.pinned != remote.pinned;
             self.pinned = remote.pinned;

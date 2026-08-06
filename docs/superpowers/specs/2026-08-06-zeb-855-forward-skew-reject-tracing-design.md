@@ -113,7 +113,7 @@ if wall_exceeds_forward_skew_logged(g.granted_at, receiver_now, "owner_state.gra
 
 Sites that compute their own receiver-now inline (`community_voting_log_engine`, `open_join_admit`) keep their existing `now`/`!= 0` guard unchanged and only swap the inner predicate — no refactor of the now-computation (that would exceed the observability-only scope).
 
-## In-scope reject sites (~22 blocks / 24 predicate calls)
+## In-scope reject sites (~23 blocks / 25 predicate calls)
 
 ### `wall_exceeds_forward_skew_logged` — control tier, ms
 
@@ -132,6 +132,7 @@ Sites that compute their own receiver-now inline (`community_voting_log_engine`,
 | `notes_crdt.rs:99` | `notes.note.updated_at` |
 | `fleet_net.rs:163` | `fleet_net.device.seen_at` |
 | `fleet_net.rs:219` | `fleet_net.petname.set_at` |
+| `fleet_net.rs:199` (pin, negated guard) | `fleet_net.pin.pinned_at` |
 | `voice_moderation.rs:444` | `voice_moderation.directive.issued_hlc` |
 
 ### `reject_future_logged` — ms
@@ -161,7 +162,9 @@ Sites that compute their own receiver-now inline (`community_voting_log_engine`,
 | `owner_trust_sync.rs:126` | Already emits `tracing::warn!` + `device` attribution (ZEB-854). Already observable; deliberately richer. Left as the one intentional warn exception. |
 | `community_state_crdt.rs:634` | Predicate reused inside a `.filter().min()` to schedule a **recompute** — nothing is dropped at this call. Logging a "reject" here would be false. |
 | `persistent_card_store.rs:253`, `:274` | Read-time **view gates** (ZEB-849 "gate the view, not the store"). Fire on *every read* of a skewed card → logging would be per-read noise, and these are not ingest boundaries. |
-| `fleet_net.rs:198`, `vine_feed_cache.rs:813`, `community_membership.rs:2336` | Negated **accept**-guards (`!predicate`) — no reject branch to log. |
+| `vine_feed_cache.rs:813` (list view), `community_membership.rs:2336` (`materialize_with_bounds`) | Read-time **view** gates expressed as negated filters — re-evaluated per read/materialize over an unchanged store, never an ingest boundary (same rationale as `persistent_card_store`; "gate the view, not the store"). |
+
+(Note: `fleet_net.rs:199`, the negated pin guard, *is* an ingest reject boundary — a skewed `pinned_at` is silently dropped — so it is covered above via `!wall_exceeds_forward_skew_logged`, which still emits on skew despite the `!`. It was reclassified out of this exclusion list during PR #616 review.)
 | test / doc-comment references | Not reject sites. |
 
 ## Testing
@@ -182,6 +185,6 @@ The correctness contract is **behaviour parity**, not log capture. (The repo has
 ## Files touched
 
 - `src/clock_trust.rs` — 3 logged wrappers + 1 private emit + parity/normalization unit tests.
-- 12 call-site files (one-line swaps each): `owner_state_sync.rs`, `notes_crdt.rs`, `fleet_net.rs`, `voice_moderation.rs`, `community_membership.rs`, `community_channel_log.rs`, `community_invite.rs`, `open_join_admit.rs`, `community_voting_log_engine.rs`, `library_directory.rs`, `vine_feed_cache.rs`, `profile_broadcast.rs`, `profile_card_broadcast.rs`.
+- 13 call-site files (one-line swaps each): `owner_state_sync.rs`, `notes_crdt.rs`, `fleet_net.rs`, `voice_moderation.rs`, `community_membership.rs`, `community_channel_log.rs`, `community_invite.rs`, `open_join_admit.rs`, `community_voting_log_engine.rs`, `library_directory.rs`, `vine_feed_cache.rs`, `profile_broadcast.rs`, `profile_card_broadcast.rs`.
 
 No frontend change.

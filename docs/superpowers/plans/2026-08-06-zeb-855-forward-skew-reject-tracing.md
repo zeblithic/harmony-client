@@ -292,6 +292,7 @@ Each control site: `reject_future(STAMP, NOW, MAX_FORWARD_SKEW_MS)` → `reject_
 | `community_voting_log_engine.rs:3082` (backfill) | `event.hlc.wall_ms, receiver_now_ms,` | `"voting_log.backfill.event.hlc"` |
 
 The new 4th arg goes after the tolerance line, e.g.:
+
 ```rust
 if crate::clock_trust::reject_future_logged(
     event.at.wall_ms,
@@ -304,6 +305,7 @@ if crate::clock_trust::reject_future_logged(
 - [ ] **Step 2: library_directory.rs:481 (display, ms)**
 
 `reject_future(announce.listed_at.wall_ms, now, DISPLAY_SKEW_TOLERANCE_MS)` →
+
 ```rust
 if crate::clock_trust::reject_future_logged(
     announce.listed_at.wall_ms,
@@ -316,6 +318,7 @@ if crate::clock_trust::reject_future_logged(
 - [ ] **Step 3: vine_feed_cache.rs:729 (display, seconds → ms rescale)**
 
 Replace the seconds-domain call with the ms-rescaled logged call (exact behaviour-preserving `×1000` rescale):
+
 ```rust
 if crate::clock_trust::reject_future_logged(
     descriptor.created_at.saturating_mul(1000),
@@ -357,6 +360,7 @@ git commit -m "ZEB-855: route reject_future ingest sites through logged wrapper"
 | `profile_card_broadcast.rs:225` | `card.shared_at.wall_ms, now_secs, MAX_FORWARD_SKEW_MS` | `"profile_card.shared_at"` |
 
 e.g. `profile_card_broadcast.rs`:
+
 ```rust
 if crate::clock_trust::wall_exceeds_forward_skew_secs_logged(
     card.shared_at.wall_ms,

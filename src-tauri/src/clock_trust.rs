@@ -193,11 +193,17 @@ fn secs_reject_fields(wall_ms: u64, now_secs: u64) -> (u64, u64) {
 }
 
 /// ZEB-855: the single home for the forward-skew reject event format. `debug`,
-/// never `warn` (a skewed peer is expected); no raw peer identity (`field` is a
-/// static `<subsystem>.<register>.<stamp_field>` discriminator). `tier` is
-/// derived from the budget so events are greppable by tier without memorising
-/// the numeric constants.
-fn emit_forward_skew_reject(field: &str, skew_ms: u64, receiver_now_ms: u64, tolerance_ms: u64) {
+/// never `warn` (a skewed peer is expected); no raw peer identity — `field` is a
+/// static `<subsystem>.<register>.<stamp_field>` discriminator, and the
+/// `&'static str` type compile-time forbids passing a runtime peer/user string
+/// (privacy + log-cardinality guard). `tier` is derived from the budget so
+/// events are greppable by tier without memorising the numeric constants.
+fn emit_forward_skew_reject(
+    field: &'static str,
+    skew_ms: u64,
+    receiver_now_ms: u64,
+    tolerance_ms: u64,
+) {
     let tier = if tolerance_ms <= MAX_FORWARD_SKEW_MS {
         "control"
     } else {
@@ -221,7 +227,7 @@ fn emit_forward_skew_reject(field: &str, skew_ms: u64, receiver_now_ms: u64, tol
 pub fn wall_exceeds_forward_skew_logged(
     wall_ms: u64,
     receiver_now_ms: Option<u64>,
-    field: &str,
+    field: &'static str,
 ) -> bool {
     match receiver_now_ms {
         Some(now) if reject_future(wall_ms, now, MAX_FORWARD_SKEW_MS) => {
@@ -235,7 +241,12 @@ pub fn wall_exceeds_forward_skew_logged(
 /// ZEB-855: logged sibling of [`reject_future`] for **millisecond** callers.
 /// Identical reject decision; emits one `debug` event on reject.
 #[inline]
-pub fn reject_future_logged(stamp_ms: u64, now_ms: u64, tolerance_ms: u64, field: &str) -> bool {
+pub fn reject_future_logged(
+    stamp_ms: u64,
+    now_ms: u64,
+    tolerance_ms: u64,
+    field: &'static str,
+) -> bool {
     if reject_future(stamp_ms, now_ms, tolerance_ms) {
         emit_forward_skew_reject(field, stamp_ms.saturating_sub(now_ms), now_ms, tolerance_ms);
         true
@@ -252,7 +263,7 @@ pub fn wall_exceeds_forward_skew_secs_logged(
     wall_ms: u64,
     now_secs: u64,
     tolerance_ms: u64,
-    field: &str,
+    field: &'static str,
 ) -> bool {
     if wall_exceeds_forward_skew_secs(wall_ms, now_secs, tolerance_ms) {
         let (skew_ms, now_ms) = secs_reject_fields(wall_ms, now_secs);
