@@ -181,9 +181,164 @@ pub fn wall_exceeds_forward_skew_secs(wall_ms: u64, now_secs: u64, tolerance_ms:
         )
 }
 
+/// ZEB-855: the (skew_ms, compensated receiver_now_ms) pair a seconds-domain
+/// reject reports, given an ms stamp and a seconds receiver-now. Pure (no
+/// `tracing`), so the ms-normalization is unit-testable without a subscriber.
+/// Mirrors the `now_secs*1000 + 999` floored-seconds compensation in
+/// [`wall_exceeds_forward_skew_secs`].
+#[inline]
+fn secs_reject_fields(wall_ms: u64, now_secs: u64) -> (u64, u64) {
+    let now_ms = now_secs.saturating_mul(1000).saturating_add(999);
+    (wall_ms.saturating_sub(now_ms), now_ms)
+}
+
+/// ZEB-855: the single home for the forward-skew reject event format. `debug`,
+/// never `warn` (a skewed peer is expected); no raw peer identity (`field` is a
+/// static `<subsystem>.<register>.<stamp_field>` discriminator). `tier` is
+/// derived from the budget so events are greppable by tier without memorising
+/// the numeric constants.
+fn emit_forward_skew_reject(field: &str, skew_ms: u64, receiver_now_ms: u64, tolerance_ms: u64) {
+    let tier = if tolerance_ms <= MAX_FORWARD_SKEW_MS {
+        "control"
+    } else {
+        "display"
+    };
+    tracing::debug!(
+        target: "clock_trust::forward_skew",
+        field,
+        skew_ms,
+        receiver_now_ms,
+        tolerance_ms,
+        tier,
+        "forward-skew reject: peer stamp beyond receiver clock tolerance",
+    );
+}
+
+/// ZEB-855: logged sibling of [`wall_exceeds_forward_skew`] (control tier, ms
+/// stamp, `Option` receiver-now). Identical reject decision; emits one `debug`
+/// event on reject. `field` is a static discriminator, never a peer id.
+#[inline]
+pub fn wall_exceeds_forward_skew_logged(
+    wall_ms: u64,
+    receiver_now_ms: Option<u64>,
+    field: &str,
+) -> bool {
+    match receiver_now_ms {
+        Some(now) if reject_future(wall_ms, now, MAX_FORWARD_SKEW_MS) => {
+            emit_forward_skew_reject(field, wall_ms.saturating_sub(now), now, MAX_FORWARD_SKEW_MS);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// ZEB-855: logged sibling of [`reject_future`] for **millisecond** callers.
+/// Identical reject decision; emits one `debug` event on reject.
+#[inline]
+pub fn reject_future_logged(stamp_ms: u64, now_ms: u64, tolerance_ms: u64, field: &str) -> bool {
+    if reject_future(stamp_ms, now_ms, tolerance_ms) {
+        emit_forward_skew_reject(field, stamp_ms.saturating_sub(now_ms), now_ms, tolerance_ms);
+        true
+    } else {
+        false
+    }
+}
+
+/// ZEB-855: logged sibling of [`wall_exceeds_forward_skew_secs`] (ms stamp,
+/// epoch-**seconds** receiver-now, explicit tolerance). Identical reject
+/// decision; emits one `debug` event on reject, magnitudes normalized to ms.
+#[inline]
+pub fn wall_exceeds_forward_skew_secs_logged(
+    wall_ms: u64,
+    now_secs: u64,
+    tolerance_ms: u64,
+    field: &str,
+) -> bool {
+    if wall_exceeds_forward_skew_secs(wall_ms, now_secs, tolerance_ms) {
+        let (skew_ms, now_ms) = secs_reject_fields(wall_ms, now_secs);
+        emit_forward_skew_reject(field, skew_ms, now_ms, tolerance_ms);
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wall_exceeds_forward_skew_logged_matches_plain() {
+        let now = 1_700_000_000_000u64;
+        let cases: [(u64, Option<u64>); 6] = [
+            (now, Some(now)),                            // present -> false
+            (now - 1, Some(now)),                        // past -> false
+            (now + MAX_FORWARD_SKEW_MS, Some(now)),      // boundary inclusive -> false
+            (now + MAX_FORWARD_SKEW_MS + 1, Some(now)),  // just over -> true
+            (now + 10 * MAX_FORWARD_SKEW_MS, Some(now)), // far future -> true
+            (now + MAX_FORWARD_SKEW_MS + 1, None),       // no clock -> apply-all -> false
+        ];
+        for (wall, rn) in cases {
+            assert_eq!(
+                wall_exceeds_forward_skew_logged(wall, rn, "test.parity"),
+                wall_exceeds_forward_skew(wall, rn),
+                "logged must match plain: wall={wall} rn={rn:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn reject_future_logged_matches_plain() {
+        let now = 1_700_000_000_000u64;
+        for tol in [MAX_FORWARD_SKEW_MS, DISPLAY_SKEW_TOLERANCE_MS] {
+            for stamp in [now, now - 1, now + tol, now + tol + 1, now + 5 * tol] {
+                assert_eq!(
+                    reject_future_logged(stamp, now, tol, "test.parity"),
+                    reject_future(stamp, now, tol),
+                    "logged must match plain: stamp={stamp} now={now} tol={tol}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wall_exceeds_forward_skew_secs_logged_matches_plain() {
+        let now_secs = 1_700_000_000u64;
+        let now_ms = now_secs * 1000;
+        let cases: [(u64, u64, u64); 5] = [
+            (now_ms, now_secs, MAX_FORWARD_SKEW_MS), // present
+            (
+                now_ms + MAX_FORWARD_SKEW_MS + 2000,
+                now_secs,
+                MAX_FORWARD_SKEW_MS,
+            ), // over
+            (
+                now_ms + DISPLAY_SKEW_TOLERANCE_MS + 2000,
+                now_secs,
+                DISPLAY_SKEW_TOLERANCE_MS,
+            ), // over (display)
+            (now_ms, 0, MAX_FORWARD_SKEW_MS),        // 0-sentinel -> apply-all
+            (u64::MAX, 0, MAX_FORWARD_SKEW_MS),      // 0-sentinel, huge stamp
+        ];
+        for (wall_ms, ns, tol) in cases {
+            assert_eq!(
+                wall_exceeds_forward_skew_secs_logged(wall_ms, ns, tol, "test.parity"),
+                wall_exceeds_forward_skew_secs(wall_ms, ns, tol),
+                "logged must match plain: wall_ms={wall_ms} now_secs={ns} tol={tol}",
+            );
+        }
+    }
+
+    #[test]
+    fn secs_reject_fields_normalizes_to_ms() {
+        // now_secs=1000 -> compensated now_ms = 1_000_999
+        assert_eq!(
+            secs_reject_fields(2_000_000, 1000),
+            (2_000_000 - 1_000_999, 1_000_999)
+        );
+        // stamp below compensated now -> saturating skew 0 (never underflows)
+        assert_eq!(secs_reject_fields(500, 1000), (0, 1_000_999));
+    }
 
     #[test]
     fn reject_future_boundary_is_inclusive() {
