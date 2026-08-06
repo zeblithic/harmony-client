@@ -61555,9 +61555,26 @@ where
         })
         .collect();
 
-    // 5. Resolve via pkarr window query.
+    // 5. Resolve via pkarr window query — verify identity INSIDE the resolver.
+    //
+    // ZEB-825 (CodeAnt review): the unverified `resolve_window` pins the
+    // resolver's per-key seq-highwater + positive cache with any self-consistent
+    // record it finds — its inner sig verifies against the record's OWN embedded
+    // identity pub, so no caller identity check is applied before the pin. A
+    // squat under a sibling epoch-window key could thus poison the highwater
+    // with a high seq, and the genuine lower-seq record would then be rejected
+    // by anti-rollback (`Ok(None)`) both here AND on the B4 retry below — hiding
+    // it for the process lifetime. `_with` discards candidates that fail the
+    // predicate BEFORE the highwater/cache write, so only a verified record can
+    // pin either surface. `now_ms` (sampled above) matches the prior post-hoc
+    // freshness timing exactly.
+    let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+        rec.verify_inner_sig().is_ok()
+            && rec.verify_identity_match(&admin_id_pub).is_ok()
+            && rec.verify_freshness(now_ms).is_ok()
+    };
     let rec = resolver
-        .resolve_window(&verifying_keys)
+        .resolve_window_freshest_with(&verifying_keys, &verify)
         .await
         .map_err(|e| format!("pkarr resolve: {e}"))?;
     let Some(rec) = rec else {
@@ -61566,17 +61583,6 @@ where
             community_id: None,
         });
     };
-
-    // 6. Verify the record's inner sig, identity binding, and skew.
-    if rec.verify_inner_sig().is_err()
-        || rec.verify_identity_match(&admin_id_pub).is_err()
-        || rec.verify_freshness(now_ms).is_err()
-    {
-        return Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        });
-    }
 
     // 7. Decode the inner routing payload.
     let routing: crate::reachability_record::ReachabilityAnnouncePayload =
@@ -61668,17 +61674,45 @@ where
         // verify, decode, or synthesize, fall through to the
         // unreachable outcome below.
         if attempt == 0 {
-            let rec2_opt = resolver.resolve_window_freshest(&verifying_keys).await;
-            // Sample wall-clock AFTER the re-resolve await, not before: the
-            // all-relays query can take seconds, so a pre-await sample would let
-            // the TTL check accept a record that expired *during* re-resolution.
+            // ZEB-825 (mirrors ZEB-817 `resolve_vine_relays`): verify each
+            // candidate INSIDE the resolver via `_with`, not the single
+            // freshest-by-seq winner after the fact. An attacker who already
+            // holds the invite material can publish a self-consistent record
+            // under a sibling epoch-window key (its inner sig verifies against
+            // its OWN embedded identity pub); post-hoc-verifying only the
+            // resolver's freshest-by-seq pick would let that squat shadow the
+            // genuine record AND pin the resolver's seq-highwater + positive
+            // cache with itself, hiding the real record for the process
+            // lifetime. `_with` ranks freshest-first and returns the first
+            // candidate passing this predicate; failing candidates touch
+            // neither surface.
+            //
+            // `retry_now_ms` is sampled BEFORE the resolve here (a one-shot
+            // dial samples after): the predicate runs per-candidate DURING
+            // resolution, so sample-after is not expressible with `_with`. The
+            // freshness window it feeds spans whole epochs, so the seconds-scale
+            // sampling shift is immaterial — the same tradeoff
+            // `resolve_vine_relays` makes.
             let retry_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+            let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+                rec.verify_inner_sig().is_ok()
+                    && rec.verify_identity_match(&admin_id_pub).is_ok()
+                    && rec.verify_freshness(retry_now_ms).is_ok()
+            };
+            let rec2_opt = resolver
+                .resolve_window_freshest_with(&verifying_keys, &verify)
+                .await;
+            // Qodo review: the predicate above ran against the pre-resolve
+            // `retry_now_ms`. Re-sample the wall clock AFTER the await and
+            // re-check the winner's freshness before the retry dial, so a record
+            // that expired *during* the multi-second all-relays resolve is
+            // treated as no usable record (→ break). The predicate keeps the
+            // anti-shadowing guarantee (a squat fails `verify_identity_match` and
+            // never becomes the winner); this recheck restores the one-shot
+            // dial's freshness-at-use strictness on the genuine winner.
+            let retry_dial_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
             match rec2_opt {
-                Ok(Some(rec2))
-                    if rec2.verify_inner_sig().is_ok()
-                        && rec2.verify_identity_match(&admin_id_pub).is_ok()
-                        && rec2.verify_freshness(retry_now_ms).is_ok() =>
-                {
+                Ok(Some(rec2)) if rec2.verify_freshness(retry_dial_now_ms).is_ok() => {
                     match ciborium::from_reader::<
                         crate::reachability_record::ReachabilityAnnouncePayload,
                         _,
@@ -66810,9 +66844,26 @@ pub async fn connectivity_add_friend_by_key_inner(
         })
         .collect();
 
-    let rec = match resolver.resolve_window(&verifying_keys).await {
+    // ZEB-825 (CodeAnt review): verify identity INSIDE the resolver via `_with`.
+    // The unverified `resolve_window` pins the resolver's per-key seq-highwater +
+    // positive cache with any self-consistent record (its inner sig verifies
+    // against the record's OWN embedded identity pub — no caller identity check),
+    // so a squat under a sibling epoch-window key could poison the highwater with
+    // a high seq and make the genuine lower-seq record fail anti-rollback
+    // (`Ok(None)`) here AND on the B4 retry below, for the process lifetime.
+    // `_with` discards predicate-failing candidates before the highwater/cache
+    // write. `now_ms` (sampled above) matches the prior post-hoc freshness timing.
+    let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+        rec.verify_inner_sig().is_ok()
+            && rec.verify_identity_match(&identity_pub).is_ok()
+            && rec.verify_freshness(now_ms).is_ok()
+    };
+    let rec = match resolver
+        .resolve_window_freshest_with(&verifying_keys, &verify)
+        .await
+    {
         Ok(Some(rec)) => rec,
-        // No Case-B record published → the target isn't discoverable.
+        // No verified Case-B record → the target isn't discoverable.
         Ok(None) => return Ok(AddFriendOutcome::Unreachable),
         // Relay warm-up / cooldown is transient — map to `Unreachable` (retry
         // later) instead of leaking the raw error to the UI (ZEB-415 #3). Keep
@@ -66827,14 +66878,6 @@ pub async fn connectivity_add_friend_by_key_inner(
         }
         Err(e) => return Err(format!("pkarr resolve: {e}")),
     };
-    if rec.verify_inner_sig().is_err()
-        || rec.verify_identity_match(&identity_pub).is_err()
-        || rec.verify_freshness(now_ms).is_err()
-    {
-        // A record that doesn't authenticate is treated as not-reachable (same as
-        // `connectivity_discover_identity`'s `Ok(None)`).
-        return Ok(AddFriendOutcome::Unreachable);
-    }
 
     let routing: crate::reachability_record::ReachabilityAnnouncePayload =
         ciborium::from_reader(rec.routing_blob.as_slice())
@@ -66890,17 +66933,45 @@ pub async fn connectivity_add_friend_by_key_inner(
         // the final attempt. If the freshest record fails to resolve,
         // verify, decode, or synthesize, fall through to `last_err` below.
         if attempt == 0 {
-            let rec2_opt = resolver.resolve_window_freshest(&verifying_keys).await;
-            // Sample wall-clock AFTER the re-resolve await, not before: the
-            // all-relays query can take seconds, so a pre-await sample would let
-            // the TTL check accept a record that expired *during* re-resolution.
+            // ZEB-825 (mirrors ZEB-817 `resolve_vine_relays`): verify each
+            // candidate INSIDE the resolver via `_with`, not the single
+            // freshest-by-seq winner after the fact. The slot key derives from
+            // the target's 64-byte identity pub, so anyone holding it can
+            // publish a self-consistent record under a sibling epoch-window key
+            // (its inner sig verifies against its OWN embedded identity pub);
+            // post-hoc-verifying only the resolver's freshest-by-seq pick would
+            // let that squat shadow the genuine record AND pin the resolver's
+            // seq-highwater + positive cache with itself, hiding the real record
+            // for the process lifetime. `_with` ranks freshest-first and returns
+            // the first candidate passing this predicate; failing candidates
+            // touch neither surface.
+            //
+            // `retry_now_ms` is sampled BEFORE the resolve here (a one-shot
+            // dial samples after): the predicate runs per-candidate DURING
+            // resolution, so sample-after is not expressible with `_with`. The
+            // freshness window it feeds spans whole epochs, so the seconds-scale
+            // sampling shift is immaterial — the same tradeoff
+            // `resolve_vine_relays` makes.
             let retry_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+            let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+                rec.verify_inner_sig().is_ok()
+                    && rec.verify_identity_match(&identity_pub).is_ok()
+                    && rec.verify_freshness(retry_now_ms).is_ok()
+            };
+            let rec2_opt = resolver
+                .resolve_window_freshest_with(&verifying_keys, &verify)
+                .await;
+            // Qodo review: the predicate above ran against the pre-resolve
+            // `retry_now_ms`. Re-sample the wall clock AFTER the await and
+            // re-check the winner's freshness before the retry dial, so a record
+            // that expired *during* the multi-second all-relays resolve is
+            // treated as no usable record (→ break). The predicate keeps the
+            // anti-shadowing guarantee (a squat fails `verify_identity_match` and
+            // never becomes the winner); this recheck restores the one-shot
+            // dial's freshness-at-use strictness on the genuine winner.
+            let retry_dial_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
             match rec2_opt {
-                Ok(Some(rec2))
-                    if rec2.verify_inner_sig().is_ok()
-                        && rec2.verify_identity_match(&identity_pub).is_ok()
-                        && rec2.verify_freshness(retry_now_ms).is_ok() =>
-                {
+                Ok(Some(rec2)) if rec2.verify_freshness(retry_dial_now_ms).is_ok() => {
                     match ciborium::from_reader::<
                         crate::reachability_record::ReachabilityAnnouncePayload,
                         _,
