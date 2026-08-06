@@ -313,7 +313,11 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         // `shared_in_profile` (privacy-control bypass), discarding a later
         // opt-out. Reject it; `created_at` is not a vector (earliest-wins +
         // immutable-field guard at owner_state_crdt.rs:361-382).
-        if crate::clock_trust::wall_exceeds_forward_skew(space.updated_at.wall_ms, receiver_now) {
+        if crate::clock_trust::wall_exceeds_forward_skew_logged(
+            space.updated_at.wall_ms,
+            receiver_now,
+            "owner_state.space.updated_at",
+        ) {
             continue;
         }
         local.apply_space_with_canonicalization(space);
@@ -326,8 +330,11 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
     }
     for (_, marker) in markers {
         // ZEB-847: a future `last_read_at` would pin "all read" forever (RM).
-        if crate::clock_trust::wall_exceeds_forward_skew(marker.last_read_at.wall_ms, receiver_now)
-        {
+        if crate::clock_trust::wall_exceeds_forward_skew_logged(
+            marker.last_read_at.wall_ms,
+            receiver_now,
+            "owner_state.read_marker.last_read_at",
+        ) {
             continue;
         }
         local.apply_marker(marker);
@@ -354,7 +361,11 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         // ZEB-847: a future `learned_at` would LWW-replace and then block every
         // later legit device update (DEV → peer devices unlearnable, DMs
         // UnknownSigningKey).
-        if crate::clock_trust::wall_exceeds_forward_skew(entry.learned_at.wall_ms, receiver_now) {
+        if crate::clock_trust::wall_exceeds_forward_skew_logged(
+            entry.learned_at.wall_ms,
+            receiver_now,
+            "owner_state.owner_device.learned_at",
+        ) {
             continue;
         }
         local.apply_owner_device_update(
@@ -377,11 +388,16 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         // ZEB-847: a future `added_at` pins the library present; a future
         // `removed_at` pins it removed and blocks re-adds (LE). Reject if either
         // bound is implausibly future.
-        if crate::clock_trust::wall_exceeds_forward_skew(
+        if crate::clock_trust::wall_exceeds_forward_skew_logged(
             remote_entry.added_at.wall_ms,
             receiver_now,
+            "owner_state.library.added_at",
         ) || remote_entry.removed_at.as_ref().is_some_and(|rm| {
-            crate::clock_trust::wall_exceeds_forward_skew(rm.wall_ms, receiver_now)
+            crate::clock_trust::wall_exceeds_forward_skew_logged(
+                rm.wall_ms,
+                receiver_now,
+                "owner_state.library.removed_at",
+            )
         }) {
             continue;
         }
@@ -421,7 +437,11 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         // ZEB-847: a future-dated `learned_at` would out-LWW every later honest
         // revoke forever (FAIL-OPEN: blocked party keeps DM access). Reject it —
         // clamping is insufficient (a clamped now+5min still beats an honest now).
-        if crate::clock_trust::wall_exceeds_forward_skew(entry.learned_at.wall_ms, receiver_now) {
+        if crate::clock_trust::wall_exceeds_forward_skew_logged(
+            entry.learned_at.wall_ms,
+            receiver_now,
+            "owner_state.friend.learned_at",
+        ) {
             continue;
         }
         if let crate::owner_state_crdt::ApplyOutcome::Rejected(
@@ -517,9 +537,15 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
             // all-devices-agree values, nullifying the poison rather than
             // transforming it. Honest revokes stamp revoked_at = now.max(
             // granted_at) <= now+5min, so they pass the gate.
-            if crate::clock_trust::wall_exceeds_forward_skew(g.granted_at, receiver_now)
-                || crate::clock_trust::wall_exceeds_forward_skew(g.revoked_at, receiver_now)
-            {
+            if crate::clock_trust::wall_exceeds_forward_skew_logged(
+                g.granted_at,
+                receiver_now,
+                "owner_state.grant.granted_at",
+            ) || crate::clock_trust::wall_exceeds_forward_skew_logged(
+                g.revoked_at,
+                receiver_now,
+                "owner_state.grant.revoked_at",
+            ) {
                 continue;
             }
             match entry
@@ -575,7 +601,11 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         // receiver-dependent value and diverge across devices. A poisoned future
         // dismiss is nullified (never stored); an honest dismiss (<= now+5min)
         // passes and merges by max as before.
-        if crate::clock_trust::wall_exceeds_forward_skew(dismissed_at, receiver_now) {
+        if crate::clock_trust::wall_exceeds_forward_skew_logged(
+            dismissed_at,
+            receiver_now,
+            "owner_state.dismissed_grant.dismissed_at",
+        ) {
             continue;
         }
         let slot = local.dismissed_received_grants.entry(cid).or_insert(0);
@@ -607,7 +637,11 @@ fn merge_remote_into_local(local: &mut OwnerState, remote: OwnerState) {
         // max-merged compare). A clamp is insufficient (clamped now+5min still
         // beats an honest dismiss at now), so REJECT — mirrors GR (Task 5). A
         // legit re-share (received_at at real now, past receiver_now) is accepted.
-        if crate::clock_trust::wall_exceeds_forward_skew(grant.received_at, receiver_now) {
+        if crate::clock_trust::wall_exceeds_forward_skew_logged(
+            grant.received_at,
+            receiver_now,
+            "owner_state.received_grant.received_at",
+        ) {
             continue;
         }
         match local.received_file_grants.get(&cid) {

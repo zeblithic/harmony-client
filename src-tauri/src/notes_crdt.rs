@@ -96,7 +96,11 @@ impl NotesDoc {
         let receiver_now = crate::clock_trust::receiver_now_ms();
         let mut changed = false;
         for (id, r) in remote.notes {
-            if crate::clock_trust::wall_exceeds_forward_skew(r.updated_at.wall_ms, receiver_now) {
+            if crate::clock_trust::wall_exceeds_forward_skew_logged(
+                r.updated_at.wall_ms,
+                receiver_now,
+                "notes.note.updated_at",
+            ) {
                 continue;
             }
             let accept = match self.notes.get(&id) {

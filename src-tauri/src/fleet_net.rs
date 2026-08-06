@@ -160,9 +160,10 @@ impl FleetNetDoc {
             // implausibly far in the receiver's future (control tier). Gates
             // BOTH the absent-key insert and the LWW replace — either path would
             // otherwise store a poison stamp that freezes the register.
-            if crate::clock_trust::wall_exceeds_forward_skew(
+            if crate::clock_trust::wall_exceeds_forward_skew_logged(
                 remote_row.seen_at.wall_ms,
                 receiver_now,
+                "fleet_net.device.seen_at",
             ) {
                 continue;
             }
@@ -216,8 +217,11 @@ impl FleetNetDoc {
             // are owner-assigned about a device, not self-stamped by the subject —
             // still a stored LWW register a future stamp can freeze.)
             // Reject-not-clamp; `receiver_now == None` ⇒ apply-all.
-            if crate::clock_trust::wall_exceeds_forward_skew(remote_pn.set_at.wall_ms, receiver_now)
-            {
+            if crate::clock_trust::wall_exceeds_forward_skew_logged(
+                remote_pn.set_at.wall_ms,
+                receiver_now,
+                "fleet_net.petname.set_at",
+            ) {
                 continue;
             }
             match self.petnames.get(&device_id) {
