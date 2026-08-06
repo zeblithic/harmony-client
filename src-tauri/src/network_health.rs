@@ -19,6 +19,7 @@
 //! between the two IPCs.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -181,7 +182,12 @@ pub struct CommunityPublishRetryHealth {
     pub last_failure_ms: Option<u64>,
     /// Coarse class of the most recent publish failure (`transport_closed` /
     /// `content_store` / `crypto` / `encode` / `other`). `None` if none ever.
-    pub last_error: Option<String>,
+    ///
+    /// `Cow<'static, str>` so snapshot assembly carries the engine's borrowed
+    /// `&'static str` label without allocating (the common path), while a cached
+    /// snapshot still deserializes into an owned `String`. Serializes identically
+    /// to a plain string on the wire.
+    pub last_error: Option<Cow<'static, str>>,
 }
 
 /// ZEB-805 raw per-community counters, read from the engine registry. Kept
@@ -1922,7 +1928,7 @@ pub fn community_sync_row(
             // inbound/advance stamps above.
             last_failure_ms: (raw.publish_retry_last_failure_ms != 0)
                 .then_some(raw.publish_retry_last_failure_ms),
-            last_error: raw.publish_retry_last_error.map(str::to_string),
+            last_error: raw.publish_retry_last_error.map(Cow::Borrowed),
         },
     }
 }
