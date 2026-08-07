@@ -2,7 +2,9 @@
 //! owns the `dm-read-receipt` UI event shape and (in later tasks) the emit
 //! decision + packet build. Receipts never touch the outbox/deposit rung.
 
-use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+use crate::owner_state_types::{
+    DeviceIdentityHash, Hlc, OwnerAddr, ReadReceiptPref, Space, SpaceId, SpaceKind,
+};
 
 /// The `dm-read-receipt` UI event name — a peer told us they've read our DM up
 /// to a watermark. Emitted from the tunnel ingest path only (receipts are
@@ -26,4 +28,156 @@ pub(crate) fn dm_read_receipt_event_payload(
         "readUpTo": read_up_to.wall_ms,
         "at": at_ms,
     })
+}
+
+/// The single other member of a 1:1 `Dm` space, or `None` for any other shape
+/// (group DM, channel, or a degenerate member set). 1:1 only this cut.
+pub(crate) fn dm_peer_of(space: &Space, self_owner: OwnerAddr) -> Option<OwnerAddr> {
+    if space.kind != SpaceKind::Dm || space.members.len() != 2 {
+        return None;
+    }
+    space.members.iter().copied().find(|m| *m != self_owner)
+}
+
+/// Decide whether to emit a read receipt for `space_id` and, if so, build the
+/// signed wire packet. `Some((peer, wire))` iff the space is a 1:1 `Dm` with
+/// `read_receipt_pref == Broadcast`. Pure: reads state, mints no HLC, touches
+/// no outbox — the ephemerality invariant is structural (there is simply no
+/// outbox write anywhere in this path).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_read_receipt(
+    state: &crate::owner_state_crdt::OwnerState,
+    self_owner: OwnerAddr,
+    signing_device_hash: DeviceIdentityHash,
+    signing_key: &ed25519_dalek::SigningKey,
+    device_id: &str,
+    space_id: SpaceId,
+    up_to_ms: u64,
+    now_ms: u64,
+) -> Option<(OwnerAddr, Vec<u8>)> {
+    let space = state.spaces.get(&space_id)?;
+    if space.read_receipt_pref != Some(ReadReceiptPref::Broadcast) {
+        return None;
+    }
+    let peer = dm_peer_of(space, self_owner)?;
+    let signed = crate::dm_envelope::DmReadReceiptSigned {
+        space_id,
+        sender_owner_addr: self_owner,
+        signing_device_hash,
+        read_up_to: Hlc {
+            wall_ms: up_to_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        },
+        sent_at: Hlc {
+            wall_ms: now_ms,
+            logical: 0,
+            device_id: device_id.to_string(),
+        },
+    };
+    let packet = crate::dm_envelope::build_signed_read_receipt(signed, signing_key).ok()?;
+    let wire = crate::dm_envelope::encode_packet(&packet).ok()?;
+    Some((peer, wire))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::owner_state_crdt::OwnerState;
+    use crate::owner_state_types::DmContentKey;
+
+    fn hlc(w: u64) -> Hlc {
+        Hlc {
+            wall_ms: w,
+            logical: 0,
+            device_id: "d".into(),
+        }
+    }
+
+    fn state_with_space(
+        kind: SpaceKind,
+        pref: Option<ReadReceiptPref>,
+        me: OwnerAddr,
+        peer: OwnerAddr,
+    ) -> (OwnerState, SpaceId) {
+        let space_id = SpaceId([0x5A; 16]);
+        let mut st = OwnerState::default();
+        let mut members = vec![me, peer];
+        members.sort();
+        let content_key = if matches!(kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+            Some(DmContentKey::new([0x22; 32]))
+        } else {
+            None
+        };
+        st.spaces.insert(
+            space_id,
+            Space {
+                id: space_id,
+                kind,
+                parent: None,
+                community_id: None,
+                name: "s".into(),
+                transport: None,
+                members,
+                custom_name: None,
+                notification_pref: None,
+                read_receipt_pref: pref,
+                left_at: None,
+                created_at: hlc(1),
+                updated_at: hlc(1),
+                content_key,
+                prior_content_keys: vec![],
+                current_epoch: None,
+                current_epoch_key: None,
+                old_epoch_keys: std::collections::BTreeMap::new(),
+                admin_addr: None,
+                is_invite_only: None,
+                shared_in_profile: false,
+                pending_join_at: None,
+            },
+        );
+        (st, space_id)
+    }
+
+    #[test]
+    fn prepares_only_for_1to1_dm_broadcast() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let me = OwnerAddr([1; 16]);
+        let peer = OwnerAddr([2; 16]);
+        let (st, space_id) =
+            state_with_space(SpaceKind::Dm, Some(ReadReceiptPref::Broadcast), me, peer);
+        let (got_peer, wire) =
+            prepare_read_receipt(&st, me, DeviceIdentityHash([1; 16]), &sk, "dev", space_id, 1234, 5678)
+                .expect("Broadcast 1:1 DM prepares a receipt");
+        assert_eq!(got_peer, peer);
+        match crate::dm_envelope::decode_packet(&wire).unwrap() {
+            crate::dm_envelope::DmPacket::ReadReceipt { signed, .. } => {
+                assert_eq!(signed.read_up_to.wall_ms, 1234);
+                assert_eq!(signed.sent_at.wall_ms, 5678);
+                assert_eq!(signed.space_id, space_id);
+                assert_eq!(signed.sender_owner_addr, me);
+            }
+            other => panic!("expected ReadReceipt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_receipt_when_off_group_or_channel() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let me = OwnerAddr([1; 16]);
+        let peer = OwnerAddr([2; 16]);
+        for (pref, kind) in [
+            (Some(ReadReceiptPref::Off), SpaceKind::Dm),
+            (None, SpaceKind::Dm),
+            (Some(ReadReceiptPref::Broadcast), SpaceKind::GroupDm), // 1:1 only this cut
+            (Some(ReadReceiptPref::Broadcast), SpaceKind::Channel),
+        ] {
+            let (st, space_id) = state_with_space(kind, pref, me, peer);
+            assert!(
+                prepare_read_receipt(&st, me, DeviceIdentityHash([1; 16]), &sk, "dev", space_id, 1, 2)
+                    .is_none(),
+                "pref={pref:?} kind={kind:?} must not prepare a receipt"
+            );
+        }
+    }
 }
