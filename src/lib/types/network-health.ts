@@ -263,8 +263,9 @@ export interface CommunitySyncHealth {
   lastAdvanceMs?: number | null;
   /**
    * Tier derived server-side from `lastAdvanceMs` — NOT from `lastInboundMs`.
-   * Shares the peer-row vocabulary and thresholds. `null` when nothing has ever
-   * arrived (a solo community has no evidence to age).
+   * Shares the peer-row vocabulary and thresholds. ZEB-829: `null` when there is
+   * no reachable co-member to sync with (`reachablePeers === 0`) or nothing has
+   * ever arrived; otherwise bucketed from `lastAdvanceMs`.
    */
   staleness?: PeerStaleness | null;
   /** Bounded-retry counters. `exhausted` climbing means publishes are being lost. */
@@ -280,6 +281,14 @@ export interface CommunitySyncHealth {
    * cached snapshot (Rust `#[serde(default)]`).
    */
   publishRetry?: PublishRetryHealth;
+  /**
+   * ZEB-829: reachable co-member peers for this community at snapshot assembly
+   * (any live connection mode; NoConnection excluded). Makes the
+   * `staleness === null` decision legible — "zero peers to sync with" vs "no
+   * data yet". Optional for forward-compat with a pre-field cached snapshot
+   * (Rust `#[serde(default)]`).
+   */
+  reachablePeers?: number;
 }
 
 /**
