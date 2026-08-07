@@ -114,7 +114,8 @@ pub(crate) async fn maybe_send_read_receipt(
         return;
     };
     watermarks.lock().await.insert(space_id, up_to_ms);
-    crate::iroh_tunnel_dm_transport::send_packet_to_owner_tunnels(crdt_state, mgr, peer, &wire).await;
+    crate::iroh_tunnel_dm_transport::send_packet_to_owner_tunnels(crdt_state, mgr, peer, &wire)
+        .await;
 }
 
 /// The 1:1 DM spaces with `peer` that are opted in (Broadcast) AND have a
@@ -243,9 +244,17 @@ mod tests {
         let peer = OwnerAddr([2; 16]);
         let (st, space_id) =
             state_with_space(SpaceKind::Dm, Some(ReadReceiptPref::Broadcast), me, peer);
-        let (got_peer, wire) =
-            prepare_read_receipt(&st, me, DeviceIdentityHash([1; 16]), &sk, "dev", space_id, 1234, 5678)
-                .expect("Broadcast 1:1 DM prepares a receipt");
+        let (got_peer, wire) = prepare_read_receipt(
+            &st,
+            me,
+            DeviceIdentityHash([1; 16]),
+            &sk,
+            "dev",
+            space_id,
+            1234,
+            5678,
+        )
+        .expect("Broadcast 1:1 DM prepares a receipt");
         assert_eq!(got_peer, peer);
         match crate::dm_envelope::decode_packet(&wire).unwrap() {
             crate::dm_envelope::DmPacket::ReadReceipt { signed, .. } => {
@@ -271,8 +280,17 @@ mod tests {
         ] {
             let (st, space_id) = state_with_space(kind, pref, me, peer);
             assert!(
-                prepare_read_receipt(&st, me, DeviceIdentityHash([1; 16]), &sk, "dev", space_id, 1, 2)
-                    .is_none(),
+                prepare_read_receipt(
+                    &st,
+                    me,
+                    DeviceIdentityHash([1; 16]),
+                    &sk,
+                    "dev",
+                    space_id,
+                    1,
+                    2
+                )
+                .is_none(),
                 "pref={pref:?} kind={kind:?} must not prepare a receipt"
             );
         }
@@ -318,9 +336,19 @@ mod tests {
         let peer = OwnerAddr([2; 16]);
         let other = OwnerAddr([3; 16]);
         let mut st = OwnerState::default();
-        let a = dm_between(SpaceId([0xA0; 16]), me, peer, Some(ReadReceiptPref::Broadcast));
+        let a = dm_between(
+            SpaceId([0xA0; 16]),
+            me,
+            peer,
+            Some(ReadReceiptPref::Broadcast),
+        );
         let b = dm_between(SpaceId([0xB0; 16]), me, peer, Some(ReadReceiptPref::Off));
-        let c = dm_between(SpaceId([0xC0; 16]), me, other, Some(ReadReceiptPref::Broadcast));
+        let c = dm_between(
+            SpaceId([0xC0; 16]),
+            me,
+            other,
+            Some(ReadReceiptPref::Broadcast),
+        );
         let (a_id, b_id, c_id) = (a.id, b.id, c.id);
         for s in [a, b, c] {
             st.spaces.insert(s.id, s);
@@ -328,7 +356,7 @@ mod tests {
         let mut wm = std::collections::HashMap::new();
         wm.insert(a_id, 999u64); // a: opted-in + stored watermark → included
         wm.insert(b_id, 5u64); // b: Off → excluded regardless of a stored watermark
-        // c: opted-in but a different peer AND no stored watermark → excluded
+                               // c: opted-in but a different peer AND no stored watermark → excluded
         let plan = plan_reconnect_resends(&st, me, peer, &wm);
         assert_eq!(plan, vec![a_id]);
         let _ = (b_id, c_id);

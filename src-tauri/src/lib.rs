@@ -44550,9 +44550,11 @@ async fn set_space_read_receipt_pref(
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         if g.generation != snapshot_generation {
-            return Err("node generation changed during set_space_read_receipt_pref; \
+            return Err(
+                "node generation changed during set_space_read_receipt_pref; \
                  pref was written to a detached crdt_state — retry against the live node"
-                .to_string());
+                    .to_string(),
+            );
         }
     }
     if changed {

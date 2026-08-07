@@ -1971,7 +1971,10 @@ mod apply_space_tests {
         assert!(st
             .set_read_receipt_pref(dm_id, ReadReceiptPref::Broadcast, h1.clone())
             .unwrap());
-        assert_eq!(st.read_receipt_pref(dm_id), Some(ReadReceiptPref::Broadcast));
+        assert_eq!(
+            st.read_receipt_pref(dm_id),
+            Some(ReadReceiptPref::Broadcast)
+        );
         assert_eq!(st.spaces[&dm_id].updated_at, h1);
         // Idempotent: same value → no-op, no HLC change.
         assert!(!st

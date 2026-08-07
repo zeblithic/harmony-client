@@ -9904,14 +9904,7 @@ mod tests {
             pending_join_at: None,
         };
         state.spaces.insert(space_id, space);
-        (
-            state,
-            private_alice,
-            alice_device_hash,
-            alice,
-            me,
-            space_id,
-        )
+        (state, private_alice, alice_device_hash, alice, me, space_id)
     }
 
     fn signed_receipt(

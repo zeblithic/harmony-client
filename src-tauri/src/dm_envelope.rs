@@ -1884,7 +1884,10 @@ mod tests {
                 assert_eq!(got, signed, "signed body round-trips");
                 // The signature covers exactly the canonical body bytes.
                 sk.verifying_key()
-                    .verify_strict(&signed_bytes, &ed25519_dalek::Signature::from_bytes(&signature))
+                    .verify_strict(
+                        &signed_bytes,
+                        &ed25519_dalek::Signature::from_bytes(&signature),
+                    )
                     .expect("signature must verify over signed_bytes");
             }
             other => panic!("expected ReadReceipt, got {other:?}"),
