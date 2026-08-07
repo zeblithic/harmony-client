@@ -52,7 +52,7 @@ both, so the fail-safe direction is covered regardless.
 
 ### 1. Helper — `connectivity_settings.rs`
 
-```
+```rust
 /// Reset the identity-scoped privacy/trust posture to product first-run
 /// defaults for a freshly-minted identity, preserving the machine-level relay
 /// infrastructure (relays / iroh_relays are operational, not a user opt-out).
