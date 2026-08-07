@@ -266,14 +266,17 @@ Expected wall-clock times (measured from recent real releases, not aspirational 
   - `ubuntu-22.04`: ~14 min
   - `macos-14` (aarch64): ~13 min
 - release fan-in (draft assembly): <1 min
-- **Total: ~70 min for a clean run**, plus ~10-15 min per failed-leg rerun. The
-  two most recent real releases ran **1h19m** and **1h41m** end-to-end (each
-  included a leg rerun).
+- **Total: ~70 min for a clean run.** The two most recent real releases ran
+  **1h19m** and **1h41m** end-to-end (each needed a failed-leg rerun).
 
-A plain `gh run rerun --failed` recompiles the whole failed leg from scratch. The
-macOS legs now retry their DMG **bundling** in place (ZEB-764), so a transient
-`hdiutil` flake costs ~1-2 min (a warm-`target` re-bundle) instead of a fresh
-~40-min recompile.
+A `gh run rerun --failed` re-runs the whole failed leg from scratch, so its cost
+is that leg's **full build time — ~40 min if it is the `macos-15-intel` long
+pole**, ~13-28 min for the others — not a fixed increment. That recompile is
+exactly the waste this change removes for the common case: the macOS legs now
+retry their DMG **bundling** in place (ZEB-764), so a transient `hdiutil` flake
+costs ~1-2 min (a warm-`target` re-bundle) and needs no rerun at all. A
+`gh run rerun --failed` is now only for a genuine non-bundling failure (a real
+compile or signing error).
 
 Common early failures and fixes:
 - `version mismatch`: tauri.conf.json version doesn't match `-f version=` input — re-run with the correct value.
