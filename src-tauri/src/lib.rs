@@ -180,6 +180,7 @@ pub mod dm_outbox;
 pub mod dm_outhold;
 pub mod dm_outhold_apply;
 pub mod dm_outhold_persist;
+pub mod dm_read_receipt;
 pub mod dm_signing;
 pub mod dm_tunnel_contact;
 pub mod emoji_names;
