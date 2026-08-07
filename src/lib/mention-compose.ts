@@ -12,6 +12,32 @@ export interface MentionCandidate {
   ownerId: string;
   label: string;
 }
+
+/** A compose segment: free text, or an atomic mention (chip) carrying its ownerId.
+ *  The structural successor to the flat-text `TrackedMention` model (ZEB-594). */
+export type Segment =
+  | { type: 'text'; text: string }
+  | { type: 'mention'; ownerId: string };
+
+/** Serialize compose segments into the frozen wire payload: text verbatim, each
+ *  mention as a `<@ownerId>` token, plus the first-seen-deduped mentions array.
+ *  A chip carries its ownerId directly, so there is nothing to reconcile — this
+ *  replaces reconcileCompose. No escaping of text: the render side is frozen and a
+ *  literal `<@32hex>` rendering as a mention is the documented accepted-minor. */
+export function serializeSegments(segments: Segment[]): { body: string; mentions: string[] } {
+  let body = '';
+  const mentions: string[] = [];
+  for (const seg of segments) {
+    if (seg.type === 'mention') {
+      body += `<@${seg.ownerId}>`;
+      if (!mentions.includes(seg.ownerId)) mentions.push(seg.ownerId);
+    } else {
+      body += seg.text;
+    }
+  }
+  return { body, mentions };
+}
+
 export interface TrackedMention {
   ownerId: string;
   label: string;
