@@ -2331,7 +2331,10 @@
           if (action === 'added') void dm.onDmSpaceMaterialized(spaceId);
           else dm.onDmSpaceRemoved(spaceId);
         };
-        messageService.onDmReceived = (p) => dm.onDmReceived(p);
+        messageService.onDmReceived = (p) => {
+          dm.onDmReceived(p);
+          maybeMarkFocusedDmRead(p);
+        };
         // Owner may already be known (the $effect only re-fires on change).
         if (selfOwnerId) dm.connectOwner(selfOwnerId);
         fileManagerService.addUnlisten(() => {
@@ -3446,6 +3449,8 @@
   let activeHub = $state('harmony-dev');
   let activeChannelName = $state('general');
   let activeChannelType = $state<'channel' | 'dm' | 'group-chat'>('channel');
+  // ZEB-214: read-receipt broadcast state for the active 1:1 DM (fetched on open).
+  let dmReadReceiptOn = $state(false);
 
   // ── ZEB-360 T13: group-DM call presence watch/unwatch ──────────────
   // The currently-selected group-DM space (null when the active view isn't a
@@ -3624,6 +3629,51 @@
       messageService.loadDmThread(node.id).catch((e) => {
         console.error('loadDmThread failed:', e);
       });
+      // ZEB-214 (1:1 DMs): report our read position (best-effort receipt) and
+      // reflect the synced toggle state in the header.
+      if (node.type === 'dm') {
+        void tauriAdapter?.invoke('mark_dm_read', {
+          spaceId: node.id,
+          upToMs: newestDmTimestamp(node.id),
+        });
+        tauriAdapter
+          ?.invoke('get_space_read_receipt_pref', { spaceId: node.id })
+          .then((on) => {
+            dmReadReceiptOn = on as boolean;
+          })
+          .catch(() => {
+            dmReadReceiptOn = false;
+          });
+      }
+    }
+  }
+
+  // ZEB-214: the ms timestamp of the newest message in a DM space (0 if none) —
+  // the read watermark reported via mark_dm_read.
+  function newestDmTimestamp(spaceId: string): number {
+    return messageService.messages
+      .filter((m) => m.channel === spaceId)
+      .reduce((a, m) => Math.max(a, m.timestamp), 0);
+  }
+
+  // ZEB-214: flip read-receipt broadcast for the active DM.
+  function toggleReadReceipt(on: boolean): void {
+    const spaceId = activeChannel;
+    tauriAdapter
+      ?.invoke('set_space_read_receipt_pref', { spaceId, enabled: on })
+      .then(() => {
+        dmReadReceiptOn = on;
+      })
+      .catch((e) =>
+        console.warn('set read receipt pref:', e instanceof Error ? e.message : String(e)),
+      );
+  }
+
+  // ZEB-214: when the peer messages the DM we're actively viewing, re-send our
+  // read watermark (we're reading it now) so "Seen" advances during live chat.
+  function maybeMarkFocusedDmRead(p: { spaceId: string; sentAt: number }): void {
+    if (activeChannelType === 'dm' && p.spaceId === activeChannel) {
+      void tauriAdapter?.invoke('mark_dm_read', { spaceId: p.spaceId, upToMs: p.sentAt });
     }
   }
 
@@ -4161,6 +4211,8 @@
         channelName={activeChannelName}
         channelType={activeChannelType}
         channelId={activeChannel}
+        readReceiptOn={dmReadReceiptOn}
+        onToggleReadReceipt={toggleReadReceipt}
         onStartCall={(spaceId) => { if (callSession) swallow(leaveOtherVoiceThen(() => callSession!.placeCall(spaceId))); }}
         onStartGroupCall={(spaceId) => swallow(placeGroupCall(spaceId))}
         onJoinGroupCall={(spaceId) => swallow(joinGroupCall(spaceId))}
