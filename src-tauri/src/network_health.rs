@@ -2197,7 +2197,17 @@ pub fn filter_peers_by_shared_membership(
 /// lowercase hex `SpaceId` — the exact key `PeerHealth::shared_communities`
 /// carries (`communities_shared_with` emits it via `hex::encode`), so the
 /// snapshot's `hex::encode(community_id.0)` lookup matches byte-for-byte.
-/// "Reachable" = any live [`ConnectionMode`]; `NoConnection` does not count.
+/// "Reachable" = any live [`ConnectionMode`] (`Direct`/`Relay`/`Degraded`);
+/// `NoConnection` does not count. This is the SAME `connection_mode` the peer
+/// rows and `ReachabilityStatus` use — deliberately one reachability notion
+/// across the snapshot — so it includes the bounded-freshness self-test-Pass
+/// overlay (a peer that answered a ping within `SELF_TEST_OVERLAY_MAX_AGE_MS`,
+/// ZEB-804 §7). That is intentional: a peer that passed a recent ping is a real
+/// co-member to sync with, and if it has since gone silent, counting it errs
+/// toward `Dark` (over-report) rather than `null` — the safe direction
+/// (ZEB-804/ZEB-829: never healthy-while-wedged). A live-liveness-only signal
+/// would instead push toward `null` and could HIDE a wedge, so it is
+/// deliberately NOT used here.
 ///
 /// A pure fold over the `peers` vec `snapshot` has already built: it needs no
 /// membership handle and no identity translation, because the

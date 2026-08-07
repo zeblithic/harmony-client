@@ -15,7 +15,7 @@
 - New wire fields are additive and `#[serde(default)]`; DTOs are `#[serde(rename_all = "camelCase")]`.
 - `--all-targets` and `--locked` are load-bearing (CLAUDE.md).
 - Each task ends green (compiles + its tests pass) so task boundaries are reviewable. Commit at the end of each task; commit trailer: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` + `Claude-Session: https://claude.ai/code/session_01DUvg7gyEHqXrVU85Eg2D8D`.
-- Iterative gating may use `scripts/test-select --context task`; the final pre-PR sweep is the full CI-parity commands above.
+- Iterative gating may use `scripts/test-select --context task`; when used, paste its printed `round=… bucket=…` summary line into the task report so the selection is auditable (CLAUDE.md / ZEB-631). The final pre-PR sweep is the full CI-parity commands above. (This PR used direct `cargo nextest -E` scoping, not `test-select`.)
 
 ---
 
