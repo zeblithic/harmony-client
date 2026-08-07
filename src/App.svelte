@@ -81,6 +81,7 @@
   import type { ContributionSummaryDto, StorageBuddyDto } from './lib/storage-buddy-service';
   import StorageBuddySheet from './lib/components/StorageBuddySheet.svelte';
   import { MessageService } from './lib/message-service';
+  import { ReadReceiptService } from './lib/read-receipt-service';
   import { NotesService } from './lib/notes-service';
   import { migrateLocalNotes } from './lib/notes-migrate';
   import { MailService } from './lib/mail-service';
@@ -1954,6 +1955,9 @@
   fileManagerService.onChange = () => { fileManagerVersion++; };
   const messageService = new MessageService();
   $effect(() => () => messageService.destroy());
+  // ZEB-214: per-DM read-receipt watermarks (peer "Seen" state).
+  const readReceiptService = new ReadReceiptService();
+  $effect(() => () => readReceiptService.destroy());
 
   // ZEB-334: local-only self-notes store backing the private "Notes" space —
   // the always-present default shown when no community is joined.
@@ -2347,6 +2351,8 @@
       }
 
       await tryConnect('message', messageService.connectAdapter(adapter));
+      // ZEB-214: wire the read-receipt listener on the same adapter.
+      void readReceiptService.init(adapter);
       // Mail connect may fail if mail_mgr isn't ready yet (race with
       // start_node); non-blocking so other services proceed. The
       // zenoh-status handler below re-hydrates mail state on reconnect.
