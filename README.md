@@ -2,7 +2,7 @@
 
 Federated, polycentric social fabric. Desktop client built on Tauri 2 + Svelte 5 + Rust. See also Harmony Core: https://github.com/zeblithic/harmony
 
-## Status: v0.2.3 (public availability)
+## Status: v0.2.4 (public availability)
 
 Harmony is in public alpha; you can download the released client and create your own communities today! Install via the docs below and use a `harmony://invite/...` URL to join an existing server.
 
