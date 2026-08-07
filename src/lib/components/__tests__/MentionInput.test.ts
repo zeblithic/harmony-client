@@ -1,7 +1,17 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render } from '@testing-library/svelte';
+import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import MentionInput from '../MentionInput.svelte';
 import { createChip } from '../../mention-dom';
+
+/** Place a collapsed caret at (node, offset) so the component reads it via getSelection. */
+function setCaret(node: Node, offset: number) {
+  const range = document.createRange();
+  range.setStart(node, offset);
+  range.collapse(true);
+  const sel = window.getSelection()!;
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
 
 const ID_A = 'a'.repeat(32);
 
@@ -78,5 +88,37 @@ describe('MentionInput', () => {
     const { editable } = mount({ disabled: true });
     expect(editable.getAttribute('contenteditable')).toBe('false');
     expect(editable.getAttribute('aria-disabled')).toBe('true');
+  });
+
+  it('IME Enter with the autocomplete open neither picks a candidate nor sends', async () => {
+    const { editable, onSend, container } = mount();
+    editable.appendChild(document.createTextNode('@Ja'));
+    setCaret(editable.firstChild!, 3);
+    await fireEvent.input(editable);
+    await waitFor(() =>
+      expect(container.querySelector('[data-testid="mention-autocomplete"]')).toBeTruthy(),
+    );
+    // The IME guard runs before the autocomplete branch, so a composing Enter is
+    // ignored — no pick, no send, trigger text intact.
+    keydown(editable, { key: 'Enter', isComposing: true });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(editable.querySelector('.mention-chip')).toBeNull();
+    expect(editable.textContent).toBe('@Ja');
+  });
+
+  it('one Backspace with the caret after a [chip][separator] deletes both atomically', () => {
+    // The state pick() leaves behind: a chip followed by its generated separator
+    // space, caret after the space. (The full pick→chip flow is covered in the
+    // ChannelMessageFeed integration test; here we isolate the delete behavior
+    // from jsdom's deleteContents empty-text-node artifacts.)
+    const { editable } = mount();
+    const chip = createChip(document, 'a'.repeat(32), 'Jake');
+    const sep = document.createTextNode(' ');
+    editable.appendChild(chip);
+    editable.appendChild(sep);
+    setCaret(editable, 2); // after child 1 (the separator)
+    keydown(editable, { key: 'Backspace' });
+    expect(editable.querySelector('.mention-chip')).toBeNull();
+    expect(editable.contains(sep)).toBe(false);
   });
 });

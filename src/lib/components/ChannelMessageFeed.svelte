@@ -363,6 +363,11 @@
   async function handleSend(payload: { body: string; mentions: string[] }) {
     const trimmedBody = payload.body.trim();
     if ((!trimmedBody && pendingAttachments.length === 0) || posting || ingesting) return;
+    // Capture the channel we're posting to; if the user switches channels during
+    // the await, we must NOT clear the shared, preserved draft — that would wipe
+    // whatever they have since typed for the newly-viewed channel.
+    const sentCommunityId = communityId;
+    const sentChannelId = channelId;
     posting = true;
     composeError = null;
     try {
@@ -374,8 +379,10 @@
         payload.mentions,
         pendingAttachments.length > 0 ? pendingAttachments : undefined,
       );
-      mentionInput?.clear();
-      pendingAttachments = [];
+      if (communityId === sentCommunityId && channelId === sentChannelId) {
+        mentionInput?.clear();
+        pendingAttachments = [];
+      }
     } catch (e) {
       composeError = e instanceof Error ? e.message : String(e);
     } finally {

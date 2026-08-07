@@ -8,8 +8,22 @@ import type { Segment } from './mention-compose';
 
 const BLOCK_TAGS = new Set(['DIV', 'P']);
 
+/** A valid owner-id is 32 lowercase hex — the same shape the frozen render side
+ *  parses (`tokenizeBody`'s /<@([0-9a-f]{32})>/g). A chip whose data-owner-id
+ *  fails this is NOT serialized as a mention, so a malformed/empty attribute can
+ *  never emit a `<@>` token or a bad mentions[] entry. */
+const OWNER_ID_RE = /^[0-9a-f]{32}$/;
+
+/** The generated separator inserted after a picked chip (a normal space; the
+ *  editable is white-space: pre-wrap so it survives at end-of-line). */
+const SEPARATOR = ' ';
+
 function isChip(el: Element): boolean {
   return el.nodeType === Node.ELEMENT_NODE && el.hasAttribute('data-owner-id');
+}
+
+function isValidChip(el: Element): boolean {
+  return isChip(el) && OWNER_ID_RE.test(el.getAttribute('data-owner-id') ?? '');
 }
 
 /** Build a chip element: an atomic, non-editable inline span carrying the ownerId
@@ -42,8 +56,8 @@ export function domToSegments(root: Node): Segment[] {
         const el = child as Element;
         if (el.tagName === 'BR') {
           pushText('\n');
-        } else if (isChip(el)) {
-          segments.push({ type: 'mention', ownerId: el.getAttribute('data-owner-id') ?? '' });
+        } else if (isValidChip(el)) {
+          segments.push({ type: 'mention', ownerId: el.getAttribute('data-owner-id') as string });
         } else {
           // A block element the browser wraps a soft line in starts a new line
           // before its content (except the very first content in the root).
@@ -57,41 +71,74 @@ export function domToSegments(root: Node): Segment[] {
   return segments;
 }
 
+/** The sibling immediately on `direction`'s side, walking out of collapsed
+ *  ancestor edges (bounded by `root`) — so a chip that is a sibling of a
+ *  browser-generated block wrapper (`<div>line</div>`), not of the caret's text
+ *  node, is still reachable. */
+function siblingAcrossAncestors(
+  node: Node,
+  direction: 'backward' | 'forward',
+  root: Node,
+): Node | null {
+  let cur: Node | null = node;
+  while (cur && cur !== root) {
+    const sib = direction === 'backward' ? cur.previousSibling : cur.nextSibling;
+    if (sib) return sib;
+    cur = cur.parentNode;
+  }
+  return null;
+}
+
+/** The DOM node immediately on `direction`'s side of a collapsed caret at
+ *  (node, offset), descending into element children or ascending out of
+ *  collapsed edges as needed. Returns null when the caret sits in the middle of a
+ *  text node (an ordinary character deletion, not a chip boundary). */
+function nodeAtCaretEdge(
+  node: Node,
+  offset: number,
+  direction: 'backward' | 'forward',
+  root: Node,
+): Node | null {
+  if (node.nodeType === Node.ELEMENT_NODE) {
+    const idx = direction === 'backward' ? offset - 1 : offset;
+    const child = node.childNodes[idx];
+    return child ?? siblingAcrossAncestors(node, direction, root);
+  }
+  if (node.nodeType === Node.TEXT_NODE) {
+    const len = node.textContent?.length ?? 0;
+    if (direction === 'backward' && offset === 0) {
+      return node.previousSibling ?? siblingAcrossAncestors(node, 'backward', root);
+    }
+    if (direction === 'forward' && offset === len) {
+      return node.nextSibling ?? siblingAcrossAncestors(node, 'forward', root);
+    }
+    return null; // caret mid-text → ordinary character deletion
+  }
+  return null;
+}
+
 /** Given a collapsed caret at (node, offset), return the adjacent chip a
  *  Backspace ('backward') or Delete ('forward') should remove atomically, or null.
- *  Handles both a caret directly among the root's children and a caret at the very
- *  edge of a text node sitting next to a chip. */
+ *  Looks past a single generated separator space (so the first Backspace after a
+ *  pick removes the chip, not the space) and out of block wrappers (bounded by
+ *  `root` — the contenteditable element). */
 export function chipToDeleteAt(
   node: Node,
   offset: number,
   direction: 'backward' | 'forward',
+  root: Node,
 ): HTMLElement | null {
-  // Case 1: caret is positioned among an element's child nodes.
-  if (node.nodeType === Node.ELEMENT_NODE) {
-    const kids = node.childNodes;
-    const idx = direction === 'backward' ? offset - 1 : offset;
-    const cand = kids[idx];
-    if (cand && cand.nodeType === Node.ELEMENT_NODE && isChip(cand as Element)) {
-      return cand as HTMLElement;
-    }
-    return null;
+  const edge = nodeAtCaretEdge(node, offset, direction, root);
+  if (!edge) return null;
+  if (edge.nodeType === Node.ELEMENT_NODE && isChip(edge as Element)) {
+    return edge as HTMLElement;
   }
-  // Case 2: caret at the edge of a text node adjacent to a chip.
-  if (node.nodeType === Node.TEXT_NODE) {
-    const text = node as Text;
-    if (direction === 'backward' && offset === 0) {
-      const prev = text.previousSibling;
-      if (prev && prev.nodeType === Node.ELEMENT_NODE && isChip(prev as Element)) {
-        return prev as HTMLElement;
-      }
+  // Look past a lone generated separator to the chip beyond it.
+  if (edge.nodeType === Node.TEXT_NODE && (edge.textContent ?? '') === SEPARATOR) {
+    const beyond = direction === 'backward' ? edge.previousSibling : edge.nextSibling;
+    if (beyond && beyond.nodeType === Node.ELEMENT_NODE && isChip(beyond as Element)) {
+      return beyond as HTMLElement;
     }
-    if (direction === 'forward' && offset === (text.textContent?.length ?? 0)) {
-      const next = text.nextSibling;
-      if (next && next.nodeType === Node.ELEMENT_NODE && isChip(next as Element)) {
-        return next as HTMLElement;
-      }
-    }
-    return null;
   }
   return null;
 }

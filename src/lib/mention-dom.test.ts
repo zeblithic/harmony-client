@@ -67,6 +67,23 @@ describe('domToSegments', () => {
     div.appendChild(document.createTextNode('b'));
     expect(domToSegments(div)).toEqual([{ type: 'text', text: 'ab' }]);
   });
+  it('an empty data-owner-id is NOT a mention; it degrades to its label text', () => {
+    const div = root('');
+    const bad = document.createElement('span');
+    bad.setAttribute('data-owner-id', ''); // empty → invalid, never emits <@>
+    bad.setAttribute('contenteditable', 'false');
+    bad.textContent = '@Ghost';
+    div.appendChild(bad);
+    expect(domToSegments(div)).toEqual([{ type: 'text', text: '@Ghost' }]);
+  });
+  it('a non-32-hex data-owner-id is not serialized as a mention', () => {
+    const div = root('');
+    const bad = document.createElement('span');
+    bad.setAttribute('data-owner-id', 'nothex');
+    bad.textContent = '@x';
+    div.appendChild(bad);
+    expect(domToSegments(div)).toEqual([{ type: 'text', text: '@x' }]);
+  });
 });
 
 describe('chipToDeleteAt', () => {
@@ -75,13 +92,13 @@ describe('chipToDeleteAt', () => {
     const chip = createChip(document, ID_A, 'Jake');
     div.appendChild(chip);
     // caret at (div, 1) = immediately after child 0 (the chip)
-    expect(chipToDeleteAt(div, 1, 'backward')).toBe(chip);
+    expect(chipToDeleteAt(div, 1, 'backward', div)).toBe(chip);
   });
   it('Delete with the caret right before a chip returns that chip', () => {
     const div = root('');
     const chip = createChip(document, ID_A, 'Jake');
     div.appendChild(chip);
-    expect(chipToDeleteAt(div, 0, 'forward')).toBe(chip);
+    expect(chipToDeleteAt(div, 0, 'forward', div)).toBe(chip);
   });
   it('Backspace at offset 0 inside a text node preceded by a chip returns the chip', () => {
     const div = root('');
@@ -89,10 +106,38 @@ describe('chipToDeleteAt', () => {
     div.appendChild(chip);
     const text = document.createTextNode('x');
     div.appendChild(text);
-    expect(chipToDeleteAt(text, 0, 'backward')).toBe(chip);
+    expect(chipToDeleteAt(text, 0, 'backward', div)).toBe(chip);
   });
-  it('returns null when there is no adjacent chip', () => {
+  it('looks past the generated separator space to the chip (first-press atomic delete)', () => {
+    // Mirrors the just-picked DOM: [chip][" "] with the caret after the space.
+    const div = root('');
+    const chip = createChip(document, ID_A, 'Jake');
+    div.appendChild(chip);
+    div.appendChild(document.createTextNode(' '));
+    expect(chipToDeleteAt(div, 2, 'backward', div)).toBe(chip);
+  });
+  it('finds a chip across a block wrapper (caret at the start of a wrapped line)', () => {
+    // Browser Shift+Enter can wrap a line in <div>; the chip is then a sibling of
+    // the wrapper, not of the caret's text node.
+    const div = root('');
+    const chip = createChip(document, ID_A, 'Jake');
+    div.appendChild(chip);
+    const block = document.createElement('div');
+    const text = document.createTextNode('line2');
+    block.appendChild(text);
+    div.appendChild(block);
+    expect(chipToDeleteAt(text, 0, 'backward', div)).toBe(chip);
+  });
+  it('returns null at the root boundary when there is no chip to reach', () => {
+    const div = root('');
+    const block = document.createElement('div');
+    const text = document.createTextNode('only');
+    block.appendChild(text);
+    div.appendChild(block);
+    expect(chipToDeleteAt(text, 0, 'backward', div)).toBeNull();
+  });
+  it('returns null when the caret is mid-text', () => {
     const div = root('hello');
-    expect(chipToDeleteAt(div.firstChild!, 3, 'backward')).toBeNull();
+    expect(chipToDeleteAt(div.firstChild!, 3, 'backward', div)).toBeNull();
   });
 });

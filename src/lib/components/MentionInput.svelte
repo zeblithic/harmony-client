@@ -86,7 +86,12 @@
     range.setEnd(textNode, c.offset); // the caret
     range.deleteContents();
     const chip = createChip(document, candidate.ownerId, candidate.label);
-    const space = document.createTextNode(' '); // nbsp keeps the boundary visible
+    // Trailing separator so the caret sits after the chip and typing continues
+    // normally; atomic chip-delete treats [chip][separator] as one unit. A
+    // regular space (the editable is white-space: pre-wrap, so it survives at
+    // end-of-line) keeps the wire body's post-mention spacing identical to the
+    // retired textarea model.
+    const space = document.createTextNode(' ');
     range.insertNode(space);
     range.insertNode(chip);
     // Caret after the space.
@@ -102,7 +107,10 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    // 1) Autocomplete hijack — runs before send.
+    // 1) IME guard FIRST: while a composition is in flight every key belongs to
+    //    the IME — never navigate the autocomplete, pick a candidate, or send.
+    if (e.isComposing || e.keyCode === 229) return;
+    // 2) Autocomplete hijack — runs before send.
     if (acOpen) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -127,36 +135,42 @@
         return;
       }
     }
-    // 2) IME guard: never send while composing (also fixes the latent textarea bug).
-    if (e.isComposing || e.keyCode === 229) return;
     // 3) Enter sends; Shift+Enter falls through to the browser (newline).
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       onSend(serialize());
       return;
     }
-    // 4) Atomic chip delete at a boundary.
-    if (e.key === 'Backspace' || e.key === 'Delete') {
+    // 4) Atomic chip delete at a boundary — remove the chip and its generated
+    //    separator space together, so one Backspace after a pick deletes the chip.
+    if ((e.key === 'Backspace' || e.key === 'Delete') && editable) {
       const c = caret();
       if (!c) return;
       const dir = e.key === 'Backspace' ? 'backward' : 'forward';
-      const chip = chipToDeleteAt(c.node, c.offset, dir);
+      const chip = chipToDeleteAt(c.node, c.offset, dir, editable);
       if (chip) {
         e.preventDefault();
+        const sep = dir === 'backward' ? chip.nextSibling : chip.previousSibling;
+        if (sep && sep.nodeType === Node.TEXT_NODE && (sep.textContent ?? '') === ' ') {
+          sep.remove();
+        }
         chip.remove();
         refreshTrigger();
       }
     }
   }
 
-  /** Paste plain text only (strip rich HTML); insert as a text node at the caret. */
+  /** Paste plain text only (strip rich HTML); insert as a text node at the caret.
+   *  preventDefault is deferred until we know we can insert, so an unhandled paste
+   *  (no plain text, or no usable selection inside the editor) is never swallowed. */
   function handlePaste(e: ClipboardEvent) {
-    e.preventDefault();
     const text = e.clipboardData?.getData('text/plain') ?? '';
     if (!text) return;
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0) return;
     const range = sel.getRangeAt(0);
+    if (!editable || !editable.contains(range.startContainer)) return;
+    e.preventDefault();
     range.deleteContents();
     const node = document.createTextNode(text);
     range.insertNode(node);
