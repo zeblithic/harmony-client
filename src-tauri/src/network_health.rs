@@ -2001,48 +2001,49 @@ pub fn derive_staleness(
     })
 }
 
-/// ZEB-805: derive a community's sync-staleness tier.
+/// ZEB-805 + ZEB-829: derive a community's sync-staleness tier.
 ///
 /// Deliberately keyed on `last_advance_ms` — the last publish that actually
-/// MERGED — not on `last_inbound_ms`. That choice is the whole point of the
-/// ticket: during the incident a node kept receiving publishes and discarding
-/// every one, so a tier derived from arrivals would have rendered it perfectly
-/// fresh while it sat fully partitioned for 90 minutes.
+/// MERGED — not on `last_inbound_ms`. That choice is the whole point of ZEB-805:
+/// during the incident a node kept receiving publishes and discarding every one,
+/// so a tier derived from arrivals would have rendered it perfectly fresh while
+/// it sat fully partitioned for 90 minutes.
 ///
-/// Shape mirrors [`derive_staleness`] so the two read alike:
-/// - nothing has EVER arrived → `None`. There is no evidence to age, and a
-///   solo community (or one that just spawned) is not a fault. This is the
-///   counterpart of `NoConnection` → `None`.
-/// - publishes have arrived but NONE ever merged → `Dark`. A community that
-///   receives and never advances is the incident shape and must not read
-///   healthy, regardless of how recently the last one arrived.
+/// ZEB-829 replaced the original "nothing ever arrived → None" proxy with a real
+/// per-community reachable-peer signal (`reachable_peers`, folded from the peers
+/// vec at snapshot assembly by [`reachable_peers_by_community`]). The rule now:
+/// - **no reachable co-member (`reachable_peers == 0`) → `None`.** There is
+///   genuinely no one to sync with — the honest counterpart of `NoConnection`
+///   → `None` on the peer rows. This fixed ZEB-805's imprecision 1: a community
+///   that had traffic and then lost every peer now reads `None`, not a false
+///   `Dark` that fired for every community whenever the node went offline.
+/// - **nothing has ever arrived (`last_inbound_ms.is_none()`) → `None`.** The
+///   inbound guard: peers may be present, but with zero data there is no
+///   positive evidence of a wedge, so a freshly-joined-but-quiet community stays
+///   quiet rather than reading `Dark` (ZEB-805's imprecision 2, avoided).
+/// - publishes have arrived, a peer is reachable, but NONE ever merged
+///   (`last_advance_ms` is `None`) → `Dark`. Receiving and never advancing is
+///   the incident shape and must not read healthy.
 /// - otherwise bucket `age = now_ms - last_advance_ms` against the shared
 ///   [`STALENESS_QUIET_MS`] / [`STALENESS_DARK_MS`] thresholds.
 ///
-/// **The first rule is a PROXY, and reviewers have read it as more than it is.**
-/// "Nothing has ever arrived" stands in for "there is no peer to sync with";
-/// they are not the same predicate, and the engine has no per-community peer
-/// count to consult. Two known imprecisions follow, both deliberate:
-///
-/// - A community that had traffic and then lost every peer keeps a non-`None`
-///   `last_inbound_ms` and so renders `Dark` rather than `None`. A false alarm
-///   — but the row carries both timestamps, so an operator sees the cause.
-/// - A community with live peers that has never received anything renders
-///   `None`. True peer gating would call that `Dark`, which for a genuinely
-///   quiet freshly-joined community is a *worse* false alarm.
-///
-/// So the proxy errs toward over-reporting `Dark` and never toward reporting
+/// The rule still errs toward over-reporting `Dark` and never toward reporting
 /// healthy while wedged — the direction ZEB-804 established as the safe one.
-/// Do not "fix" the first rule by gating on a global connection state either:
-/// that would suppress the tier for every community at once on a signal none of
-/// them is actually keyed to. Real per-community peer-presence gating is
-/// ZEB-829.
+/// Do NOT regress this to gating on a GLOBAL connection state (the snapshot's
+/// `ReachabilityStatus`): that would suppress the tier for every community at
+/// once on a signal none of them is individually keyed to. The per-community
+/// `reachable_peers` count is the correct keyed signal.
 pub fn derive_sync_staleness(
     last_inbound_ms: Option<u64>,
     last_advance_ms: Option<u64>,
+    reachable_peers: u32,
     now_ms: u64,
 ) -> Option<PeerStaleness> {
-    last_inbound_ms?;
+    // ZEB-829: no reachable co-member to sync with, or nothing has ever
+    // arrived → no positive evidence of a wedge to report.
+    if reachable_peers == 0 || last_inbound_ms.is_none() {
+        return None;
+    }
     let Some(advance_ms) = last_advance_ms else {
         return Some(PeerStaleness::Dark);
     };
@@ -2075,7 +2076,7 @@ pub fn community_sync_row(
             .collect::<String>(),
         last_inbound_ms,
         last_advance_ms,
-        staleness: derive_sync_staleness(last_inbound_ms, last_advance_ms, now_ms),
+        staleness: derive_sync_staleness(last_inbound_ms, last_advance_ms, reachable_peers, now_ms),
         fetch_retries_scheduled: raw.fetch_retries_scheduled,
         fetch_retries_dropped: raw.fetch_retries_dropped,
         fetch_retries_exhausted: raw.fetch_retries_exhausted,
@@ -5344,6 +5345,36 @@ mod tests {
         assert!(snap2.community_sync.is_empty());
         let v2 = serde_json::to_value(&snap2).expect("serializes");
         assert_eq!(v2["communitySync"], serde_json::json!([]));
+
+        // ZEB-829 imprecision-1 fix, end-to-end: the SAME wedge stamps but ZERO
+        // reachable peers (empty resolver) → the tier is suppressed to null. A
+        // community with no one to sync with is not reported as stalled.
+        let mut svc3 = NetworkHealthService::new(
+            std::sync::Arc::new(FakeIroh { ready: true }),
+            std::sync::Arc::new(FakePkarr),
+            std::sync::Arc::new(FakeResolver { records: vec![] }),
+            empty_membership(),
+            std::sync::Arc::new(EmptyDialSnapshot),
+            std::sync::Arc::new(EmptyRelaySnapshot),
+        );
+        svc3.set_community_sync_source(std::sync::Arc::new(FakeCommunitySync(vec![(
+            crate::owner_state_types::SpaceId([0xAB; 16]),
+            CommunitySyncRaw {
+                last_inbound_ms: now,
+                last_advance_ms: 0,
+                ..Default::default()
+            },
+        )])));
+        let snap3 = svc3.snapshot().await;
+        assert_eq!(snap3.community_sync.len(), 1);
+        assert_eq!(
+            snap3.community_sync[0].reachable_peers, 0,
+            "no seeded resolver record → zero reachable co-members"
+        );
+        assert_eq!(
+            snap3.community_sync[0].staleness, None,
+            "zero reachable peers suppresses the tier to null even for a wedge shape"
+        );
     }
 
     // ── ZEB-710: drain-fence degraded-mode counters in the snapshot ────
@@ -6586,6 +6617,11 @@ mod tests {
         assert_eq!(row.staleness, None);
         assert_eq!(row.last_inbound_ms, None);
         assert_eq!(row.last_advance_ms, None);
+        // ZEB-829 inbound guard: even WITH reachable peers, a community that has
+        // never received anything stays None (a quiet fresh join is not a wedge).
+        let with_peers = community_sync_row(sync_cid(0x02), CommunitySyncRaw::default(), now, 5);
+        assert_eq!(with_peers.staleness, None);
+        assert_eq!(with_peers.reachable_peers, 5);
     }
 
     /// A healthy community: merges are current, so the tier tracks the merge
@@ -6593,13 +6629,55 @@ mod tests {
     #[test]
     fn sync_tier_boundaries_track_the_advance_stamp() {
         let now = 100_000_000u64;
-        let tier =
-            |advance_age: u64| derive_sync_staleness(Some(now - 1), Some(now - advance_age), now);
+        // A reachable co-member is present throughout (this test exercises the
+        // advance-age bucketing, not the peer/inbound gates).
+        let tier = |advance_age: u64| {
+            derive_sync_staleness(Some(now - 1), Some(now - advance_age), 1, now)
+        };
         assert_eq!(tier(0), Some(PeerStaleness::Fresh));
         assert_eq!(tier(STALENESS_QUIET_MS - 1), Some(PeerStaleness::Fresh));
         assert_eq!(tier(STALENESS_QUIET_MS), Some(PeerStaleness::Quiet));
         assert_eq!(tier(STALENESS_DARK_MS), Some(PeerStaleness::Quiet));
         assert_eq!(tier(STALENESS_DARK_MS + 1), Some(PeerStaleness::Dark));
+    }
+
+    /// ZEB-829 imprecision-1 fix: a community that HAD traffic but has since lost
+    /// every reachable peer must read `null`, not a false `dark`. With a peer
+    /// present the same wedge is real and reads `dark`.
+    #[test]
+    fn zeb829_lost_all_peers_after_traffic_renders_null_not_dark() {
+        let now = 1_000_000_000u64;
+        let old = now - (STALENESS_DARK_MS + 60_000); // would be dark, with peers
+        assert_eq!(
+            derive_sync_staleness(Some(now - 10_000), Some(old), 0, now),
+            None,
+            "no reachable co-member → nothing to sync with → null"
+        );
+        assert_eq!(
+            derive_sync_staleness(Some(now - 10_000), Some(old), 1, now),
+            Some(PeerStaleness::Dark),
+            "a reachable co-member exists → the stall is real → dark"
+        );
+    }
+
+    /// ZEB-829 the inbound guard (avoids imprecision-2): a freshly-joined
+    /// community that has reachable peers but has never received anything is not
+    /// evidence of a wedge — it stays `null`, not a false `dark`.
+    #[test]
+    fn zeb829_fresh_join_with_peers_but_no_inbound_stays_null() {
+        let now = 1_000_000_000u64;
+        assert_eq!(derive_sync_staleness(None, None, 3, now), None);
+    }
+
+    /// ZEB-829 the ZEB-805 incident shape is preserved: inbound present, never
+    /// merged, reachable co-member live → `dark`.
+    #[test]
+    fn zeb829_arrivals_without_merge_with_peers_still_dark() {
+        let now = 1_000_000_000u64;
+        assert_eq!(
+            derive_sync_staleness(Some(now - 1_000), None, 1, now),
+            Some(PeerStaleness::Dark)
+        );
     }
 
     /// The new fields must serialize camelCase, and no snake_case key may leak.
