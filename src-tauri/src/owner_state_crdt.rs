@@ -1293,6 +1293,10 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         members: newer.members.clone(),
         custom_name: newer.custom_name.clone(),
         notification_pref: newer.notification_pref,
+        // read_receipt_pref is LWW like the other owner-local per-Space prefs
+        // (notification_pref, custom_name): newer updated_at wins, preserving
+        // the cross-device opt-in (ZEB-214).
+        read_receipt_pref: newer.read_receipt_pref,
         // left_at is also LWW — newer overrides (re-invitation clears to None).
         left_at: newer.left_at.clone(),
         // created_at is monotonically the earliest.
@@ -1353,6 +1357,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -1384,6 +1389,7 @@ mod apply_space_tests {
             admin_addr: Some(admin_addr),
             is_invite_only: Some(invite_only),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -1411,6 +1417,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -1683,6 +1690,7 @@ mod apply_space_tests {
             admin_addr: Some(original_admin),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let attacker_replay = Space {
@@ -1706,6 +1714,7 @@ mod apply_space_tests {
             admin_addr: Some(OwnerAddr([99u8; 16])), // hostile admin takeover
             is_invite_only: Some(true),              // hostile flip to private
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
 
@@ -1777,6 +1786,7 @@ mod apply_space_tests {
             admin_addr: Some(OwnerAddr([1u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         // Newer (Device A): opted IN — user just flipped the toggle.
@@ -1801,6 +1811,7 @@ mod apply_space_tests {
             admin_addr: Some(OwnerAddr([1u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: true,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
 
@@ -1832,6 +1843,48 @@ mod apply_space_tests {
     }
 
     #[test]
+    fn lww_merge_space_carries_newer_read_receipt_pref() {
+        use crate::owner_state_types::{DmContentKey, ReadReceiptPref};
+        let older = Space {
+            id: SpaceId([7; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: None,
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            read_receipt_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+        // Newer side flips read receipts on; LWW (newer updated_at) must win,
+        // argument-order-independent — preserving the cross-device opt-in.
+        let mut newer = older.clone();
+        newer.read_receipt_pref = Some(ReadReceiptPref::Broadcast);
+        newer.updated_at = hlc(5);
+        assert_eq!(
+            lww_merge_space(&older, &newer).read_receipt_pref,
+            Some(ReadReceiptPref::Broadcast)
+        );
+        assert_eq!(
+            lww_merge_space(&newer, &older).read_receipt_pref,
+            Some(ReadReceiptPref::Broadcast)
+        );
+    }
+
+    #[test]
     fn lww_merge_same_space_id_prior_content_keys_union() {
         use crate::owner_state_types::DmContentKey;
 
@@ -1858,6 +1911,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let b = Space {
@@ -1881,6 +1935,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
 
@@ -2026,6 +2081,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert_eq!(s.apply_space(channel), ApplyOutcome::Inserted);
@@ -2053,6 +2109,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let outcome = s.apply_space(group_dm);
@@ -2764,6 +2821,7 @@ mod canonicalization_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -3063,6 +3121,7 @@ mod crypto_integration_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -3157,6 +3216,7 @@ mod crypto_integration_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         // Sanity: invariant check must pass for a well-formed DM.
@@ -4074,6 +4134,7 @@ mod merge_prior_content_keys_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -4233,6 +4294,7 @@ mod dm_crypto_integration_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }

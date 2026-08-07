@@ -2569,6 +2569,7 @@ pub(crate) fn run_invite_accept_tail(
         admin_addr: None,
         is_invite_only: None,
         shared_in_profile: false,
+        read_receipt_pref: None,
         pending_join_at: None,
     };
     let space_outcome = state.apply_space_with_canonicalization(space);
@@ -3955,6 +3956,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(
@@ -4163,6 +4165,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -9859,6 +9862,7 @@ mod outhold_write_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }

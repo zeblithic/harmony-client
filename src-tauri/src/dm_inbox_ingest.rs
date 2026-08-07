@@ -4600,6 +4600,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -5510,6 +5511,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let payload = crate::dm_envelope::MessagePayload {
@@ -5836,6 +5838,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let payload = crate::dm_envelope::MessagePayload {
@@ -5960,6 +5963,7 @@ mod tests {
                 admin_addr: None,
                 is_invite_only: None,
                 shared_in_profile: false,
+                read_receipt_pref: None,
                 pending_join_at: None,
             },
         );
@@ -6064,6 +6068,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let payload = crate::dm_envelope::MessagePayload {
@@ -6469,6 +6474,7 @@ pub(crate) mod test_fixture {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(matches!(

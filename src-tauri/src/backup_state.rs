@@ -213,6 +213,7 @@ mod tests {
                 admin_addr: None,
                 is_invite_only: None,
                 shared_in_profile: false,
+                read_receipt_pref: None,
                 pending_join_at: None,
             };
             s.spaces.insert(sp.id, sp);

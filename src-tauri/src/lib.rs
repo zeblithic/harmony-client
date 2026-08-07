@@ -16285,6 +16285,7 @@ pub fn add_space_dm_inner(
         admin_addr: None,
         is_invite_only: None,
         shared_in_profile: false,
+        read_receipt_pref: None,
         pending_join_at: None,
     };
 
@@ -29757,6 +29758,7 @@ mod zeb435_left_communities_for_nav_tests {
             admin_addr: None,
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -29856,6 +29858,7 @@ mod zeb393_communities_for_nav_tests {
             admin_addr: Some(OwnerAddr([9u8; 16])),
             is_invite_only: Some(invite_only),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: if pending { Some(hlc()) } else { None },
         }
     }
@@ -29940,6 +29943,7 @@ mod zeb666_dm_spaces_for_nav_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -30031,6 +30035,7 @@ mod zeb613_auto_subscribe_tests {
             admin_addr: Some(OwnerAddr([9u8; 16])),
             is_invite_only: Some(invite_only),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: if pending { Some(hlc()) } else { None },
         }
     }
@@ -35035,6 +35040,7 @@ pub fn mint_community_creation(
         admin_addr: Some(self_owner),
         is_invite_only: Some(is_invite_only),
         shared_in_profile: false,
+        read_receipt_pref: None,
         pending_join_at: None,
     };
 
@@ -38638,6 +38644,7 @@ mod zeb_315_membership_at_event_hlc_tests {
                 admin_addr: Some(admin),
                 is_invite_only: Some(true),
                 shared_in_profile: false,
+                read_receipt_pref: None,
                 pending_join_at: None,
             },
         );
@@ -38853,6 +38860,7 @@ mod list_bootstrap_hint_tests {
                 admin_addr: Some(admin),
                 is_invite_only: Some(true),
                 shared_in_profile: false,
+                read_receipt_pref: None,
                 pending_join_at: None,
             },
         );
@@ -39618,6 +39626,7 @@ pub fn mint_redemption(
         // silently reject the redemption Space if these disagreed).
         is_invite_only: Some(payload.is_invite_only),
         shared_in_profile: false,
+        read_receipt_pref: None,
         pending_join_at: None,
     };
 
@@ -45973,6 +45982,7 @@ mod zeb427_leave_left_at_tests {
             admin_addr: Some(OwnerAddr([9u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -46904,6 +46914,7 @@ mod clear_space_local_cache_tests {
             admin_addr: None,
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -47127,6 +47138,7 @@ mod remove_space_tests {
             admin_addr: None,
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -77391,6 +77403,7 @@ mod zeb703_outbox_runtime_durability_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
