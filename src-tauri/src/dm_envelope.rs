@@ -148,6 +148,26 @@ pub struct DmCidNotifySigned {
     pub signing_device_hash: DeviceIdentityHash,
 }
 
+/// ZEB-214: an opt-in read-receipt watermark. `read_up_to` is the HLC of the
+/// newest message the sender has read in `space_id`; the recipient marks its
+/// own sent messages at or before it as "seen". Signed with the sender's
+/// per-device Ed25519 key (same key as `DmCidNotifySigned`) and verified via
+/// the same admission chain. Ephemeral: pushed over the live tunnel only,
+/// never deposited; carries no message body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmReadReceiptSigned {
+    #[serde(rename = "si")]
+    pub space_id: SpaceId,
+    #[serde(rename = "so")]
+    pub sender_owner_addr: OwnerAddr,
+    #[serde(rename = "dh")]
+    pub signing_device_hash: DeviceIdentityHash,
+    #[serde(rename = "ru")]
+    pub read_up_to: Hlc,
+    #[serde(rename = "sa")]
+    pub sent_at: Hlc,
+}
+
 /// Reticulum-unicast packet acknowledging receipt of a DmCidNotify.
 /// `ack_from_owner_addr` is diagnostic only — receiver MUST resolve via
 /// link-origin binding + signature verification AND verify the resolved
@@ -247,6 +267,14 @@ pub enum DmPacket {
     RevocationPush {
         revocation: Box<harmony_owner::certs::RevocationCert>,
         enrollment: Box<harmony_owner::certs::EnrollmentCert>,
+    },
+    /// ZEB-214: an opt-in read-receipt watermark control frame. Uses the shared
+    /// `[disc 0x06][CBOR body][64-byte sig]` layout, device-Ed25519-signed like
+    /// `CidNotify`. Never a chat message — ingest emits `dm-read-receipt` only.
+    ReadReceipt {
+        signed: DmReadReceiptSigned,
+        signature: [u8; 64],
+        signed_bytes: Vec<u8>,
     },
 }
 
@@ -414,6 +442,22 @@ pub fn encode_packet(packet: &DmPacket) -> Result<Vec<u8>, EncodeError> {
             }
             (0x03, signed_bytes, signature)
         }
+        DmPacket::ReadReceipt {
+            signed,
+            signature,
+            signed_bytes,
+        } => {
+            let re_encoded = crate::owner_state_crypto::canonical_cbor_encode(signed)
+                .map_err(|e| EncodeError::ReSerialize(format!("re-encode signed body: {e}")))?;
+            if re_encoded != *signed_bytes {
+                return Err(EncodeError::SignedMutated(
+                    "DmPacket ReadReceipt variant: signed mutated post-build (re-encode \
+                     mismatches cached signed_bytes; signature would not cover wire body)"
+                        .to_string(),
+                ));
+            }
+            (0x06, signed_bytes, signature)
+        }
         DmPacket::CidNotifyWithBlob { .. } => {
             unreachable!("CidNotifyWithBlob is handled by the early return above")
         }
@@ -480,6 +524,22 @@ pub fn build_signed_cidnotify(
         .map_err(|e| EncodeError::Cbor(e.to_string()))?;
     let signature = crate::dm_signing::sign_dm_packet(&signed_bytes, signing_key);
     Ok(DmPacket::CidNotify {
+        signed,
+        signature,
+        signed_bytes,
+    })
+}
+
+/// ZEB-214: build + sign a complete read-receipt packet ready for
+/// `encode_packet`. Same shape as `build_signed_cidnotify`.
+pub fn build_signed_read_receipt(
+    signed: DmReadReceiptSigned,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<DmPacket, EncodeError> {
+    let signed_bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed)
+        .map_err(|e| EncodeError::Cbor(e.to_string()))?;
+    let signature = crate::dm_signing::sign_dm_packet(&signed_bytes, signing_key);
+    Ok(DmPacket::ReadReceipt {
         signed,
         signature,
         signed_bytes,
@@ -654,6 +714,18 @@ pub fn decode_packet(bytes: &[u8]) -> Result<DmPacket, DecodeError> {
                 ));
             }
             DmPacket::Ack {
+                signed,
+                signature,
+                signed_bytes,
+            }
+        }
+        0x06 => {
+            // ZEB-214: a read-receipt watermark. Shared `[disc][body][64-sig]`
+            // layout; no `sender_devices` field, so no membership guard here —
+            // the ingest admission check resolves + verifies the signer.
+            let signed: DmReadReceiptSigned = decode_body(body_bytes)?;
+            ensure_canonical_body(&signed, body_bytes)?;
+            DmPacket::ReadReceipt {
                 signed,
                 signature,
                 signed_bytes,
@@ -835,6 +907,8 @@ impl CanonicalPayloadSealed for DmCidNotifySigned {}
 impl CanonicalPayload for DmCidNotifySigned {}
 impl CanonicalPayloadSealed for DmAckSigned {}
 impl CanonicalPayload for DmAckSigned {}
+impl CanonicalPayloadSealed for DmReadReceiptSigned {}
+impl CanonicalPayload for DmReadReceiptSigned {}
 // ZEB-685 (S3): RevocationPushBody is encoded/decoded via
 // canonical_cbor_encode/canonical_cbor_decode (see encode_packet's 0x05 arm
 // and decode_packet's 0x05 early return), so it needs the same registration.
@@ -1785,6 +1859,38 @@ mod tests {
                 assert_eq!(d_blob, storage_blob, "storage_blob round-trips");
             }
             other => panic!("expected CidNotifyWithBlob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_receipt_packet_roundtrips_and_signs() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let signed = DmReadReceiptSigned {
+            space_id: SpaceId([1u8; 16]),
+            sender_owner_addr: OwnerAddr([2u8; 16]),
+            signing_device_hash: DeviceIdentityHash([3u8; 16]),
+            read_up_to: hlc(1_700_000_000_000),
+            sent_at: hlc(1_700_000_005_000),
+        };
+        let packet = build_signed_read_receipt(signed.clone(), &sk).expect("build");
+        let wire = encode_packet(&packet).expect("encode");
+        assert_eq!(wire[0], 0x06, "read-receipt discriminant");
+        match decode_packet(&wire).expect("decode") {
+            DmPacket::ReadReceipt {
+                signed: got,
+                signature,
+                signed_bytes,
+            } => {
+                assert_eq!(got, signed, "signed body round-trips");
+                // The signature covers exactly the canonical body bytes.
+                sk.verifying_key()
+                    .verify_strict(
+                        &signed_bytes,
+                        &ed25519_dalek::Signature::from_bytes(&signature),
+                    )
+                    .expect("signature must verify over signed_bytes");
+            }
+            other => panic!("expected ReadReceipt, got {other:?}"),
         }
     }
 

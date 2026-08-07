@@ -653,6 +653,7 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
         admin_addr: Some(admin_addr),
         is_invite_only: Some(true),
         shared_in_profile: false,
+        read_receipt_pref: None,
         pending_join_at: Some(pending_join_hlc.clone()),
     };
     owner_state_inner.apply_space_with_canonicalization(space);

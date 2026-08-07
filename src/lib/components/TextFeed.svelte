@@ -47,6 +47,10 @@
     ownAddress = '',
     resolveNickname,
     resolveCard,
+    readReceiptOn = false,
+    onToggleReadReceipt,
+    peerReadUpToMs,
+    peerSeenAtMs,
   }: {
     messages: Message[];
     collapsed?: boolean;
@@ -105,6 +109,15 @@
     /** ZEB-839: broadcast profile card for an owner_id — second rung of the
      *  author ladder. Same pure-consumer contract as `resolveNickname`. */
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-214: whether this 1:1 DM has read-receipt broadcast enabled (drives
+     *  the header toggle state). */
+    readReceiptOn?: boolean;
+    /** ZEB-214: toggle read-receipt broadcast for this DM. */
+    onToggleReadReceipt?: (on: boolean) => void;
+    /** ZEB-214: the peer's read-watermark (ms) — own messages at/below it show "Seen". */
+    peerReadUpToMs?: number;
+    /** ZEB-214: the peer's read time (ms) — the "Seen HH:MM" clock. */
+    peerSeenAtMs?: number;
   } = $props();
 
   // Fallback invoke for the group-call banner when the parent doesn't thread one
@@ -124,6 +137,21 @@
   }
 
   let feedItems = $derived(groupMessages(messages));
+
+  // ZEB-214: the newest own-sent message at or below the peer's read watermark
+  // (1:1 DM only) — the single message that shows a "Seen HH:MM" line.
+  let seenMessageId = $derived.by(() => {
+    if (channelType !== 'dm' || peerReadUpToMs === undefined) return null;
+    const isOwn = (m: Message) =>
+      m.sender.address === 'self' || (ownAddress !== '' && m.sender.address === ownAddress);
+    let best: Message | null = null;
+    for (const m of messages) {
+      if (isOwn(m) && m.timestamp <= peerReadUpToMs && (!best || m.timestamp > best.timestamp)) {
+        best = m;
+      }
+    }
+    return best?.id ?? null;
+  });
 
   // Drag handle state
   let splitPercent = $state(60);
@@ -200,6 +228,19 @@
            engine at a time, symmetric with the group Call/Join buttons below. -->
       <div class="dm-header">
         <span class="dm-name">{channelName}</span>
+        <!-- ZEB-214: opt-in read receipts for this DM (off by default). -->
+        <button
+          type="button"
+          class="btn-receipt"
+          data-testid="read-receipt-toggle"
+          aria-pressed={readReceiptOn}
+          title={readReceiptOn
+            ? 'Read receipts on — click to stop sending'
+            : 'Read receipts off — click to send'}
+          onclick={() => onToggleReadReceipt?.(!readReceiptOn)}
+        >
+          {readReceiptOn ? '👁 Receipts on' : '👁 Receipts off'}
+        </button>
         <button
           type="button"
           class="btn-call"
@@ -281,6 +322,9 @@
             onDelete={onMessageDelete}
             {resolveNickname}
             {resolveCard}
+            seenAt={item.message.id === seenMessageId
+              ? (peerSeenAtMs ?? peerReadUpToMs)
+              : undefined}
           />
           {/if}
           {#if threadMeta.has(item.message.id)}
@@ -374,6 +418,25 @@
   .btn-call:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+  /* ZEB-214: read-receipt toggle mirrors the call button; accent when on. */
+  .btn-receipt {
+    border: 1px solid var(--border);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .btn-receipt[aria-pressed='true'] {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .btn-receipt:hover {
+    background: var(--bg-tertiary);
   }
 
   .main-section {

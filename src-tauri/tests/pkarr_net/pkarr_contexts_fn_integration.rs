@@ -137,6 +137,7 @@ fn community_space(cid: SpaceId, admin: OwnerAddr, live_key: [u8; 32], epoch: u6
         admin_addr: Some(admin),
         is_invite_only: Some(false),
         shared_in_profile: false,
+        read_receipt_pref: None,
         pending_join_at: None,
     }
 }

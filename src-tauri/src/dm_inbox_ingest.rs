@@ -507,7 +507,7 @@ pub async fn run_dm_inbox_ingest_sweeper(
 /// The friend handshake (ZEB-473) is what populates each friend's
 /// owner → devices → `DeviceTunnelContact`, so a real friend's invite binds; a
 /// device we have never handshaked (no contact cached) is unbindable.
-fn resolve_owner_for_peer(
+pub(crate) fn resolve_owner_for_peer(
     state: &crate::owner_state_crdt::OwnerState,
     peer_node_id: [u8; 32],
 ) -> Option<crate::owner_state_types::OwnerAddr> {
@@ -791,6 +791,44 @@ pub async fn ingest_dm_packet(
             // CidNotify path verbatim.
             inline_blob = Some(storage_blob);
             (signed, signature, signed_bytes)
+        }
+        crate::dm_envelope::DmPacket::ReadReceipt {
+            signed,
+            signature,
+            signed_bytes,
+        } => {
+            // ZEB-214: an opt-in read-receipt watermark. Verify against the
+            // CURRENT cache (same admission chain as CidNotify), then emit
+            // `dm-read-receipt`. A control frame: never a chat message, so this
+            // returns Ok(false) without touching the inbox.
+            let resolved = {
+                let state = crdt_state.lock().await;
+                crate::dm_outbox::verify_read_receipt_admission(
+                    &state,
+                    &signed,
+                    &signature,
+                    &signed_bytes,
+                    revoked,
+                )
+            };
+            match resolved {
+                Ok(resolved_owner) => {
+                    crate::node_event_sink::emit_ser(
+                        sink.as_ref(),
+                        crate::dm_read_receipt::DM_READ_RECEIPT_EVENT,
+                        &crate::dm_read_receipt::dm_read_receipt_event_payload(
+                            signed.space_id,
+                            resolved_owner,
+                            &signed.read_up_to,
+                            signed.sent_at.wall_ms,
+                        ),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "ZEB-214: rejected read receipt; dropping");
+                }
+            }
+            return Ok(false);
         }
     };
 
@@ -3597,6 +3635,131 @@ mod tests {
         );
     }
 
+    /// ZEB-214: a valid read-receipt frame emits `dm-read-receipt` (with the
+    /// watermark + read time) and never writes the inbox (it is not a message).
+    #[tokio::test]
+    async fn ingest_read_receipt_emits_event_and_no_inbox_write() {
+        let me = OwnerAddr([0x01; 16]);
+        let alice = OwnerAddr([0xA1; 16]);
+        let space_id = crate::owner_state_types::SpaceId([0x5A; 16]);
+        let state = std::sync::Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
+        let content_store: Arc<dyn crate::content_store::ContentStore> =
+            std::sync::Arc::new(crate::content_store::InMemoryStub::default());
+        let sink_handle = crate::node_event_sink::RecordingSink::new();
+        let sink: Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(std::sync::Arc::clone(&sink_handle));
+
+        // Alice is a cached signer; a 1:1 DM space [alice, me] exists.
+        let priv_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let alice_pub = priv_alice.public_identity();
+        let alice_identity_pub = alice_pub.to_public_bytes();
+        let alice_dev = crate::owner_state_types::DeviceIdentityHash(alice_pub.address_hash);
+        {
+            let mut st = state.lock().await;
+            st.apply_owner_device_update(
+                alice,
+                vec![alice_dev],
+                vec![Some(alice_identity_pub)],
+                vec![],
+                Hlc {
+                    wall_ms: 50,
+                    logical: 0,
+                    device_id: "alice-dev".into(),
+                },
+            );
+            let mut members = vec![alice, me];
+            members.sort();
+            st.spaces.insert(
+                space_id,
+                crate::owner_state_types::Space {
+                    id: space_id,
+                    kind: crate::owner_state_types::SpaceKind::Dm,
+                    parent: None,
+                    community_id: None,
+                    name: "dm".into(),
+                    transport: None,
+                    members,
+                    custom_name: None,
+                    notification_pref: None,
+                    read_receipt_pref: None,
+                    left_at: None,
+                    created_at: Hlc {
+                        wall_ms: 1,
+                        logical: 0,
+                        device_id: "d".into(),
+                    },
+                    updated_at: Hlc {
+                        wall_ms: 1,
+                        logical: 0,
+                        device_id: "d".into(),
+                    },
+                    content_key: Some(crate::owner_state_types::DmContentKey::new([0x22; 32])),
+                    prior_content_keys: vec![],
+                    current_epoch: None,
+                    current_epoch_key: None,
+                    old_epoch_keys: std::collections::BTreeMap::new(),
+                    admin_addr: None,
+                    is_invite_only: None,
+                    shared_in_profile: false,
+                    pending_join_at: None,
+                },
+            );
+        }
+
+        let signed = crate::dm_envelope::DmReadReceiptSigned {
+            space_id,
+            sender_owner_addr: alice,
+            signing_device_hash: alice_dev,
+            read_up_to: Hlc {
+                wall_ms: 1234,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            sent_at: Hlc {
+                wall_ms: 1600,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let sig = priv_alice.sign(&bytes);
+        let wire = crate::dm_envelope::encode_packet(&crate::dm_envelope::DmPacket::ReadReceipt {
+            signed,
+            signature: sig,
+            signed_bytes: bytes,
+        })
+        .unwrap();
+
+        let emitted = ingest_dm_packet(
+            &state,
+            &content_store,
+            &sink,
+            None,
+            me,
+            "me-device",
+            [0u8; 32],
+            &wire,
+            &crate::revoked_device_projection::RevokedDeviceProjection::new(),
+            None,
+        )
+        .await
+        .expect("a valid read receipt is admitted (control frame, Ok(false))");
+
+        assert!(!emitted, "a receipt is not a chat message");
+        let frames = sink_handle.frames();
+        let (_, payload) = frames
+            .iter()
+            .find(|(n, _)| n == "dm-read-receipt")
+            .expect("dm-read-receipt emitted");
+        assert_eq!(payload["readUpTo"], 1234);
+        assert_eq!(payload["at"], 1600);
+        assert_eq!(payload["from"], hex::encode(alice.0));
+        assert!(
+            state.lock().await.inbox.is_empty(),
+            "a read receipt must not write the inbox"
+        );
+    }
+
     /// ZEB-685 (S3): a RevocationPush from a tunnel peer we cannot bind to a
     /// known owner is rejected before any store mutation — and the owner-state
     /// engine is NOT marked dirty (no spurious publish on a rejected frame).
@@ -4600,6 +4763,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -5510,6 +5674,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let payload = crate::dm_envelope::MessagePayload {
@@ -5836,6 +6001,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let payload = crate::dm_envelope::MessagePayload {
@@ -5960,6 +6126,7 @@ mod tests {
                 admin_addr: None,
                 is_invite_only: None,
                 shared_in_profile: false,
+                read_receipt_pref: None,
                 pending_join_at: None,
             },
         );
@@ -6064,6 +6231,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let payload = crate::dm_envelope::MessagePayload {
@@ -6469,6 +6637,7 @@ pub(crate) mod test_fixture {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(matches!(

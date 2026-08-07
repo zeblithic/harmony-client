@@ -713,6 +713,49 @@ impl OwnerState {
         }
     }
 
+    /// ZEB-214: set the owner-local per-DM read-receipt preference. Gated to
+    /// `Dm`/`GroupDm` (the field is meaningless elsewhere). `Ok(true)` on a
+    /// real change (caller has already reserved `new_hlc` and will notify the
+    /// sync engine so it persists + replicates), `Ok(false)` on a no-op
+    /// (unchanged — no HLC burned).
+    pub fn set_read_receipt_pref(
+        &mut self,
+        space_id: crate::owner_state_types::SpaceId,
+        pref: crate::owner_state_types::ReadReceiptPref,
+        new_hlc: crate::owner_state_types::Hlc,
+    ) -> Result<bool, String> {
+        let space = self
+            .spaces
+            .get_mut(&space_id)
+            .ok_or_else(|| format!("space not found: {space_id:?}"))?;
+        if !matches!(
+            space.kind,
+            crate::owner_state_types::SpaceKind::Dm | crate::owner_state_types::SpaceKind::GroupDm
+        ) {
+            return Err(format!(
+                "read_receipt_pref is DM-only (kind={:?})",
+                space.kind
+            ));
+        }
+        // `None ≡ Off`: store `Off` as `None` so the `rr` field is omitted from
+        // the wire when receipts are off (see `ReadReceiptPref::stored`).
+        let target = pref.stored();
+        if space.read_receipt_pref == target {
+            return Ok(false);
+        }
+        space.read_receipt_pref = target;
+        space.updated_at = new_hlc;
+        Ok(true)
+    }
+
+    /// ZEB-214: read the per-DM read-receipt preference (`None` ≡ Off).
+    pub fn read_receipt_pref(
+        &self,
+        space_id: crate::owner_state_types::SpaceId,
+    ) -> Option<crate::owner_state_types::ReadReceiptPref> {
+        self.spaces.get(&space_id).and_then(|s| s.read_receipt_pref)
+    }
+
     /// Apply a device-list update for an OwnerAddr. LWW on `learned_at` HLC;
     /// devices are deduped + sorted + capped at MAX_DEVICES_PER_OWNER before
     /// storage to bound cache memory and prevent cache-growth DoS via spoofed
@@ -1293,6 +1336,10 @@ fn lww_merge_space(a: &Space, b: &Space) -> Space {
         members: newer.members.clone(),
         custom_name: newer.custom_name.clone(),
         notification_pref: newer.notification_pref,
+        // read_receipt_pref is LWW like the other owner-local per-Space prefs
+        // (notification_pref, custom_name): newer updated_at wins, preserving
+        // the cross-device opt-in (ZEB-214).
+        read_receipt_pref: newer.read_receipt_pref,
         // left_at is also LWW — newer overrides (re-invitation clears to None).
         left_at: newer.left_at.clone(),
         // created_at is monotonically the earliest.
@@ -1353,6 +1400,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -1384,6 +1432,7 @@ mod apply_space_tests {
             admin_addr: Some(admin_addr),
             is_invite_only: Some(invite_only),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -1411,6 +1460,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -1683,6 +1733,7 @@ mod apply_space_tests {
             admin_addr: Some(original_admin),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let attacker_replay = Space {
@@ -1706,6 +1757,7 @@ mod apply_space_tests {
             admin_addr: Some(OwnerAddr([99u8; 16])), // hostile admin takeover
             is_invite_only: Some(true),              // hostile flip to private
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
 
@@ -1777,6 +1829,7 @@ mod apply_space_tests {
             admin_addr: Some(OwnerAddr([1u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         // Newer (Device A): opted IN — user just flipped the toggle.
@@ -1801,6 +1854,7 @@ mod apply_space_tests {
             admin_addr: Some(OwnerAddr([1u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: true,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
 
@@ -1832,6 +1886,129 @@ mod apply_space_tests {
     }
 
     #[test]
+    fn lww_merge_space_carries_newer_read_receipt_pref() {
+        use crate::owner_state_types::{DmContentKey, ReadReceiptPref};
+        let older = Space {
+            id: SpaceId([7; 16]),
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "x".into(),
+            transport: None,
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            read_receipt_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+            content_key: Some(DmContentKey::new([0xaa; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+        // Newer side flips read receipts on; LWW (newer updated_at) must win,
+        // argument-order-independent — preserving the cross-device opt-in.
+        let mut newer = older.clone();
+        newer.read_receipt_pref = Some(ReadReceiptPref::Broadcast);
+        newer.updated_at = hlc(5);
+        assert_eq!(
+            lww_merge_space(&older, &newer).read_receipt_pref,
+            Some(ReadReceiptPref::Broadcast)
+        );
+        assert_eq!(
+            lww_merge_space(&newer, &older).read_receipt_pref,
+            Some(ReadReceiptPref::Broadcast)
+        );
+    }
+
+    fn space_of_kind(id: SpaceId, kind: SpaceKind) -> Space {
+        use crate::owner_state_types::DmContentKey;
+        let content_key = if matches!(kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+            Some(DmContentKey::new([0x22; 32]))
+        } else {
+            None
+        };
+        Space {
+            id,
+            kind,
+            parent: None,
+            community_id: None,
+            name: "s".into(),
+            transport: None,
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            read_receipt_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+            content_key,
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    #[test]
+    fn set_read_receipt_pref_gates_kind_and_is_idempotent() {
+        use crate::owner_state_types::ReadReceiptPref;
+        let dm_id = SpaceId([0xD1; 16]);
+        let ch_id = SpaceId([0xC1; 16]);
+        let mut st = OwnerState::default();
+        st.spaces.insert(dm_id, space_of_kind(dm_id, SpaceKind::Dm));
+        st.spaces
+            .insert(ch_id, space_of_kind(ch_id, SpaceKind::Channel));
+
+        let h1 = hlc(10);
+        assert!(st
+            .set_read_receipt_pref(dm_id, ReadReceiptPref::Broadcast, h1.clone())
+            .unwrap());
+        assert_eq!(
+            st.read_receipt_pref(dm_id),
+            Some(ReadReceiptPref::Broadcast)
+        );
+        assert_eq!(st.spaces[&dm_id].updated_at, h1);
+        // Idempotent: same value → no-op, no HLC change.
+        assert!(!st
+            .set_read_receipt_pref(dm_id, ReadReceiptPref::Broadcast, hlc(20))
+            .unwrap());
+        assert_eq!(st.spaces[&dm_id].updated_at, h1);
+        // `None ≡ Off`: disabling stores `None` (not `Some(Off)`) so the `rr`
+        // field drops from the wire — and it IS a real change from Broadcast.
+        let h2 = hlc(25);
+        assert!(st
+            .set_read_receipt_pref(dm_id, ReadReceiptPref::Off, h2.clone())
+            .unwrap());
+        assert_eq!(st.read_receipt_pref(dm_id), None);
+        assert_eq!(st.spaces[&dm_id].read_receipt_pref, None);
+        assert_eq!(st.spaces[&dm_id].updated_at, h2);
+        // Off on an already-off DM is a no-op (None matches Off's stored form).
+        assert!(!st
+            .set_read_receipt_pref(dm_id, ReadReceiptPref::Off, hlc(28))
+            .unwrap());
+        assert_eq!(st.spaces[&dm_id].updated_at, h2);
+        // Non-DM kind → Err.
+        assert!(st
+            .set_read_receipt_pref(ch_id, ReadReceiptPref::Broadcast, hlc(30))
+            .is_err());
+        // Missing space → Err.
+        assert!(st
+            .set_read_receipt_pref(SpaceId([0xAB; 16]), ReadReceiptPref::Off, hlc(40))
+            .is_err());
+    }
+
+    #[test]
     fn lww_merge_same_space_id_prior_content_keys_union() {
         use crate::owner_state_types::DmContentKey;
 
@@ -1858,6 +2035,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let b = Space {
@@ -1881,6 +2059,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
 
@@ -2026,6 +2205,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert_eq!(s.apply_space(channel), ApplyOutcome::Inserted);
@@ -2053,6 +2233,7 @@ mod apply_space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let outcome = s.apply_space(group_dm);
@@ -2764,6 +2945,7 @@ mod canonicalization_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -3063,6 +3245,7 @@ mod crypto_integration_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -3157,6 +3340,7 @@ mod crypto_integration_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         // Sanity: invariant check must pass for a well-formed DM.
@@ -4074,6 +4258,7 @@ mod merge_prior_content_keys_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -4233,6 +4418,7 @@ mod dm_crypto_integration_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }

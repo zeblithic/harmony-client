@@ -881,6 +881,7 @@ mod debounce_tests {
                 admin_addr: Some(OwnerAddr([2u8; 16])),
                 is_invite_only: Some(false),
                 shared_in_profile: false,
+                read_receipt_pref: None,
                 pending_join_at: None,
             };
             state.lock().await.spaces.insert(space.id, space);
@@ -1093,6 +1094,7 @@ mod wire_identity_tests {
                     admin_addr: None,
                     is_invite_only: None,
                     shared_in_profile: false,
+                    read_receipt_pref: None,
                     pending_join_at: None,
                 },
             );
@@ -1568,6 +1570,7 @@ mod subscriber_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -2096,6 +2099,7 @@ mod integration_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -2936,6 +2940,7 @@ mod integration_tests {
             admin_addr: Some(OwnerAddr([0x22; 16])),
             is_invite_only: Some(false),
             shared_in_profile,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }

@@ -81,6 +81,7 @@
   import type { ContributionSummaryDto, StorageBuddyDto } from './lib/storage-buddy-service';
   import StorageBuddySheet from './lib/components/StorageBuddySheet.svelte';
   import { MessageService } from './lib/message-service';
+  import { ReadReceiptService } from './lib/read-receipt-service';
   import { NotesService } from './lib/notes-service';
   import { migrateLocalNotes } from './lib/notes-migrate';
   import { MailService } from './lib/mail-service';
@@ -1954,6 +1955,14 @@
   fileManagerService.onChange = () => { fileManagerVersion++; };
   const messageService = new MessageService();
   $effect(() => () => messageService.destroy());
+  // ZEB-214: per-DM read-receipt watermarks (peer "Seen" state). Bumping the
+  // version counter on each receipt forces the watermark derives to re-read.
+  const readReceiptService = new ReadReceiptService();
+  let readReceiptVersion = $state(0);
+  readReceiptService.onChange = () => {
+    readReceiptVersion++;
+  };
+  $effect(() => () => readReceiptService.destroy());
 
   // ZEB-334: local-only self-notes store backing the private "Notes" space —
   // the always-present default shown when no community is joined.
@@ -2327,7 +2336,10 @@
           if (action === 'added') void dm.onDmSpaceMaterialized(spaceId);
           else dm.onDmSpaceRemoved(spaceId);
         };
-        messageService.onDmReceived = (p) => dm.onDmReceived(p);
+        messageService.onDmReceived = (p) => {
+          dm.onDmReceived(p);
+          maybeMarkFocusedDmRead(p);
+        };
         // Owner may already be known (the $effect only re-fires on change).
         if (selfOwnerId) dm.connectOwner(selfOwnerId);
         fileManagerService.addUnlisten(() => {
@@ -2347,6 +2359,8 @@
       }
 
       await tryConnect('message', messageService.connectAdapter(adapter));
+      // ZEB-214: wire the read-receipt listener on the same adapter.
+      void readReceiptService.init(adapter);
       // Mail connect may fail if mail_mgr isn't ready yet (race with
       // start_node); non-blocking so other services proceed. The
       // zenoh-status handler below re-hydrates mail state on reconnect.
@@ -3440,6 +3454,20 @@
   let activeHub = $state('harmony-dev');
   let activeChannelName = $state('general');
   let activeChannelType = $state<'channel' | 'dm' | 'group-chat'>('channel');
+  // ZEB-214: read-receipt broadcast state for the active 1:1 DM (fetched on open).
+  let dmReadReceiptOn = $state(false);
+  // ZEB-214: the peer's read watermark + seen-time for the active DM (1:1 only),
+  // re-read when a receipt arrives (readReceiptVersion) or the channel switches.
+  let peerReadUpToMs = $derived.by(() => {
+    void readReceiptVersion;
+    return activeChannelType === 'dm'
+      ? readReceiptService.getWatermark(activeChannel)
+      : undefined;
+  });
+  let peerSeenAtMs = $derived.by(() => {
+    void readReceiptVersion;
+    return activeChannelType === 'dm' ? readReceiptService.getSeenAt(activeChannel) : undefined;
+  });
 
   // ── ZEB-360 T13: group-DM call presence watch/unwatch ──────────────
   // The currently-selected group-DM space (null when the active view isn't a
@@ -3618,6 +3646,51 @@
       messageService.loadDmThread(node.id).catch((e) => {
         console.error('loadDmThread failed:', e);
       });
+      // ZEB-214 (1:1 DMs): report our read position (best-effort receipt) and
+      // reflect the synced toggle state in the header.
+      if (node.type === 'dm') {
+        void tauriAdapter?.invoke('mark_dm_read', {
+          spaceId: node.id,
+          upToMs: newestDmTimestamp(node.id),
+        });
+        tauriAdapter
+          ?.invoke('get_space_read_receipt_pref', { spaceId: node.id })
+          .then((on) => {
+            dmReadReceiptOn = on as boolean;
+          })
+          .catch(() => {
+            dmReadReceiptOn = false;
+          });
+      }
+    }
+  }
+
+  // ZEB-214: the ms timestamp of the newest message in a DM space (0 if none) —
+  // the read watermark reported via mark_dm_read.
+  function newestDmTimestamp(spaceId: string): number {
+    return messageService.messages
+      .filter((m) => m.channel === spaceId)
+      .reduce((a, m) => Math.max(a, m.timestamp), 0);
+  }
+
+  // ZEB-214: flip read-receipt broadcast for the active DM.
+  function toggleReadReceipt(on: boolean): void {
+    const spaceId = activeChannel;
+    tauriAdapter
+      ?.invoke('set_space_read_receipt_pref', { spaceId, enabled: on })
+      .then(() => {
+        dmReadReceiptOn = on;
+      })
+      .catch((e) =>
+        console.warn('set read receipt pref:', e instanceof Error ? e.message : String(e)),
+      );
+  }
+
+  // ZEB-214: when the peer messages the DM we're actively viewing, re-send our
+  // read watermark (we're reading it now) so "Seen" advances during live chat.
+  function maybeMarkFocusedDmRead(p: { spaceId: string; sentAt: number }): void {
+    if (activeChannelType === 'dm' && p.spaceId === activeChannel) {
+      void tauriAdapter?.invoke('mark_dm_read', { spaceId: p.spaceId, upToMs: p.sentAt });
     }
   }
 
@@ -4155,6 +4228,10 @@
         channelName={activeChannelName}
         channelType={activeChannelType}
         channelId={activeChannel}
+        readReceiptOn={dmReadReceiptOn}
+        onToggleReadReceipt={toggleReadReceipt}
+        {peerReadUpToMs}
+        {peerSeenAtMs}
         onStartCall={(spaceId) => { if (callSession) swallow(leaveOtherVoiceThen(() => callSession!.placeCall(spaceId))); }}
         onStartGroupCall={(spaceId) => swallow(placeGroupCall(spaceId))}
         onJoinGroupCall={(spaceId) => swallow(joinGroupCall(spaceId))}

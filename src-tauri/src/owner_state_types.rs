@@ -1493,6 +1493,30 @@ pub enum NotificationPref {
     Muted,
 }
 
+/// Per-DM read-receipt preference (owner-local; NOT propagated to other
+/// members — like `NotificationPref`). `None` ≡ `Off`. ZEB-214.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadReceiptPref {
+    #[serde(rename = "o")]
+    Off,
+    #[serde(rename = "b")]
+    Broadcast,
+}
+
+impl ReadReceiptPref {
+    /// The stored/serialized representation, honoring the `None ≡ Off` contract:
+    /// `Off` maps to `None` so the additive `rr` field is omitted from the wire
+    /// when receipts are off, and toggling back off leaves no residual bytes.
+    /// The single source of truth for that normalization (used by both the CRDT
+    /// setter and the Tauri command's no-op peek).
+    pub const fn stored(self) -> Option<ReadReceiptPref> {
+        match self {
+            ReadReceiptPref::Off => None,
+            other => Some(other),
+        }
+    }
+}
+
 // ZEB-220 sealed trait impls — every wire type in this module must
 // implement `CanonicalPayload` so it can pass through
 // `canonical_cbor_encode` / `canonical_cbor_decode`. Adding a new
@@ -1522,6 +1546,7 @@ impl_canonical!(
     OwnerDeviceEntry,
     SpaceKind,
     NotificationPref,
+    ReadReceiptPref,
     TransportBinding,
     Space,
     DedupeKey,
@@ -1875,6 +1900,12 @@ pub struct Space {
     pub custom_name: Option<String>,
     #[serde(rename = "np")]
     pub notification_pref: Option<NotificationPref>,
+    /// ZEB-214: per-DM opt-in read-receipt broadcast preference. Owner-local
+    /// (NOT propagated to other members, like `notification_pref`); syncs
+    /// across the owner's own devices via owner-state Flow A. `None` ≡ `Off`.
+    /// Additive `Option` keeps pre-ZEB-214 owner-state wire bytes identical.
+    #[serde(rename = "rr", skip_serializing_if = "Option::is_none", default)]
+    pub read_receipt_pref: Option<ReadReceiptPref>,
     #[serde(rename = "la")]
     pub left_at: Option<Hlc>,
     #[serde(rename = "ca")]
@@ -2877,6 +2908,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -2942,6 +2974,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(mk_dm(0).validate_invariants().is_err());
@@ -2973,6 +3006,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(mk(2).validate_invariants().is_err());
@@ -3007,6 +3041,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
@@ -3043,6 +3078,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
@@ -3078,6 +3114,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(g.validate_invariants().is_err());
@@ -3119,6 +3156,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(g.validate_invariants().is_err());
@@ -3148,6 +3186,7 @@ mod space_tests {
                 admin_addr: None,
                 is_invite_only: None,
                 shared_in_profile: false,
+                read_receipt_pref: None,
                 pending_join_at: None,
             };
         // Missing community_id → reject.
@@ -3199,6 +3238,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let a = OwnerAddr([1u8; 16]);
@@ -3235,6 +3275,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert_eq!(
@@ -3286,6 +3327,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
@@ -3324,6 +3366,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
@@ -3362,6 +3405,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(f.validate_invariants().is_err());
@@ -3398,6 +3442,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(f.validate_invariants().is_err());
@@ -3435,6 +3480,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
@@ -3473,6 +3519,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(d.validate_invariants().is_err());
@@ -3514,8 +3561,29 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
+    }
+
+    #[test]
+    fn read_receipt_pref_roundtrips_and_omits_when_none() {
+        use crate::owner_state_crypto::{canonical_cbor_decode, canonical_cbor_encode};
+        let mut space = dm_with_priors(vec![]);
+        space.read_receipt_pref = Some(ReadReceiptPref::Broadcast);
+        let bytes = canonical_cbor_encode(&space).unwrap();
+        let back: Space = canonical_cbor_decode(&bytes).unwrap();
+        assert_eq!(back.read_receipt_pref, Some(ReadReceiptPref::Broadcast));
+        // None is omitted from the wire (additive back-compat): the "rr" key
+        // MUST NOT appear in the encoding, so pre-ZEB-214 bytes stay identical.
+        space.read_receipt_pref = None;
+        let bytes_none = canonical_cbor_encode(&space).unwrap();
+        assert!(
+            !bytes_none.windows(2).any(|w| w == b"rr"),
+            "read_receipt_pref=None must not serialize the 'rr' key"
+        );
+        let back_none: Space = canonical_cbor_decode(&bytes_none).unwrap();
+        assert_eq!(back_none.read_receipt_pref, None);
     }
 
     #[test]
@@ -3692,6 +3760,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let mut bytes = Vec::new();
@@ -3732,6 +3801,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let mut bytes = Vec::new();
@@ -3791,6 +3861,7 @@ mod space_tests {
             admin_addr: Some(admin),
             is_invite_only: Some(true),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
 
@@ -3850,6 +3921,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(s.validate_invariants().is_ok());
@@ -3886,6 +3958,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
@@ -3923,6 +3996,7 @@ mod space_tests {
             admin_addr: None, // ← invariant violation
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
@@ -3960,6 +4034,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: None, // ← invariant violation
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
@@ -3997,6 +4072,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
@@ -4034,6 +4110,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
@@ -4071,6 +4148,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
@@ -4119,6 +4197,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
@@ -4162,6 +4241,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
@@ -4199,6 +4279,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = s.validate_invariants().expect_err("must reject");
@@ -4243,6 +4324,7 @@ mod space_tests {
             admin_addr: Some(OwnerAddr([2u8; 16])),
             is_invite_only: Some(false),
             shared_in_profile: true,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert_eq!(s.validate_invariants(), Ok(()));
@@ -4283,6 +4365,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: true, // ← invariant violation
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = s
@@ -4328,6 +4411,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
 
@@ -4395,6 +4479,7 @@ mod space_tests {
             admin_addr: Some(admin),
             is_invite_only: Some(true),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: Some(Hlc {
                 wall_ms: 1_700_000_000_500,
                 logical: 0,
@@ -4440,6 +4525,7 @@ mod space_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let _ = admin; // suppress unused warning — admin is for test symmetry

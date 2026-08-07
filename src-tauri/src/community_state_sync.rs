@@ -551,6 +551,7 @@ pub fn test_community_space(id: SpaceId, epoch: u64, key: EpochKey) -> Space {
         admin_addr: Some(OwnerAddr([0xbb; 16])),
         is_invite_only: Some(false),
         shared_in_profile: false,
+        read_receipt_pref: None,
         pending_join_at: None,
     }
 }
@@ -11067,6 +11068,7 @@ mod envelope_tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = encrypt_for_topic(&space, b"test payload")
@@ -11106,6 +11108,7 @@ mod envelope_tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         let err = encrypt_for_topic(&space, b"test payload")

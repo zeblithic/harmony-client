@@ -2569,6 +2569,7 @@ pub(crate) fn run_invite_accept_tail(
         admin_addr: None,
         is_invite_only: None,
         shared_in_profile: false,
+        read_receipt_pref: None,
         pending_join_at: None,
     };
     let space_outcome = state.apply_space_with_canonicalization(space);
@@ -3500,6 +3501,48 @@ pub(crate) fn verify_cidnotify_space(
     Ok(space)
 }
 
+/// ZEB-214: verify an inbound read-receipt frame against the CURRENT
+/// OwnerDeviceCache — mirrors `verify_cidnotify_admission` (sender-binding +
+/// space-binding) for `DmReadReceiptSigned`. Returns the resolved sender owner.
+/// No CAS/blob steps: a receipt carries no message body.
+pub(crate) fn verify_read_receipt_admission(
+    state: &OwnerState,
+    signed: &crate::dm_envelope::DmReadReceiptSigned,
+    signature: &[u8; 64],
+    signed_bytes: &[u8],
+    revoked: &crate::revoked_device_projection::RevokedDeviceProjection,
+) -> Result<OwnerAddr, DmReceiveError> {
+    let identity_pub =
+        lookup_pubkey_for_device(&state.owner_device_cache, signed.signing_device_hash)
+            .ok_or(DmReceiveError::UnknownSigningKey)?;
+    crate::dm_signing::verify_dm_packet_signature(
+        signed_bytes,
+        signature,
+        &identity_pub,
+        signed.signing_device_hash,
+    )?;
+    let resolved_owner =
+        resolve_signed_origin_owner(&state.owner_device_cache, signed.signing_device_hash)?;
+    if signed.sender_owner_addr != resolved_owner {
+        return Err(DmReceiveError::OwnerFieldMismatch);
+    }
+    let ed25519: [u8; 32] = identity_pub[32..64].try_into().expect("64 - 32 == 32");
+    if revoked.is_revoked(&resolved_owner, &ed25519) {
+        return Err(DmReceiveError::SignerDeviceRevoked);
+    }
+    let space = state
+        .spaces
+        .get(&signed.space_id)
+        .ok_or(DmReceiveError::SpaceNotFound)?;
+    if !matches!(space.kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+        return Err(DmReceiveError::SpaceKindMismatch);
+    }
+    if !space.members.contains(&resolved_owner) {
+        return Err(DmReceiveError::SenderNotInSpaceMembers);
+    }
+    Ok(resolved_owner)
+}
+
 /// Phase C decrypt + sender binding for an inbound DM storage blob
 /// (ZEB-418 P1 Task 6; originally extracted from the since-deleted direct
 /// receive handler, ZEB-710). Shared by every live receive path via
@@ -3955,6 +3998,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         assert!(
@@ -4163,6 +4207,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }
@@ -9793,6 +9838,151 @@ mod tests {
             "legacy #3 signer is not subject to the cutoff (no downgrade hole)"
         );
     }
+
+    /// ZEB-214: a cached signer (alice) + a 1:1 DM space [alice, me]. Returns
+    /// the signer's private identity so the test can sign a read-receipt body
+    /// with the SAME key the cache holds.
+    fn read_receipt_verify_fixture() -> (
+        OwnerState,
+        harmony_identity::PrivateIdentity,
+        DeviceIdentityHash,
+        OwnerAddr, // alice (signer)
+        OwnerAddr, // me (the other member)
+        SpaceId,
+    ) {
+        let alice = OwnerAddr([0xA1; 16]);
+        let me = OwnerAddr([0x1E; 16]);
+        let space_id = SpaceId([0x5A; 16]);
+        let mut state = OwnerState::default();
+        let private_alice = harmony_identity::PrivateIdentity::from_seed(&[0xA1; 32]);
+        let alice_pub = private_alice.public_identity();
+        let alice_identity_pub = alice_pub.to_public_bytes();
+        let alice_device_hash = DeviceIdentityHash(alice_pub.address_hash);
+        state.apply_owner_device_update(
+            alice,
+            vec![alice_device_hash],
+            vec![Some(alice_identity_pub)],
+            vec![],
+            Hlc {
+                wall_ms: 50,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        );
+        let mut members = vec![alice, me];
+        members.sort();
+        let space = Space {
+            id: space_id,
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "dm".into(),
+            transport: None,
+            members,
+            custom_name: None,
+            notification_pref: None,
+            read_receipt_pref: None,
+            left_at: None,
+            created_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            updated_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            content_key: Some(DmContentKey::new([0x22; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        };
+        state.spaces.insert(space_id, space);
+        (state, private_alice, alice_device_hash, alice, me, space_id)
+    }
+
+    fn signed_receipt(
+        priv_id: &harmony_identity::PrivateIdentity,
+        device_hash: DeviceIdentityHash,
+        sender: OwnerAddr,
+        space_id: SpaceId,
+    ) -> (crate::dm_envelope::DmReadReceiptSigned, [u8; 64], Vec<u8>) {
+        let signed = crate::dm_envelope::DmReadReceiptSigned {
+            space_id,
+            sender_owner_addr: sender,
+            signing_device_hash: device_hash,
+            read_up_to: Hlc {
+                wall_ms: 1000,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            sent_at: Hlc {
+                wall_ms: 1500,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        };
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&signed).unwrap();
+        let sig = priv_id.sign(&bytes);
+        (signed, sig, bytes)
+    }
+
+    #[test]
+    fn read_receipt_admission_accepts_valid_and_rejects_failures() {
+        let (state, priv_alice, dev, alice, _me, space_id) = read_receipt_verify_fixture();
+        let clean = crate::revoked_device_projection::RevokedDeviceProjection::new();
+
+        // Valid → resolved sender owner.
+        let (signed, sig, bytes) = signed_receipt(&priv_alice, dev, alice, space_id);
+        assert_eq!(
+            verify_read_receipt_admission(&state, &signed, &sig, &bytes, &clean).unwrap(),
+            alice
+        );
+
+        // Tampered signed_bytes → signature fails.
+        let mut bad = bytes.clone();
+        bad[0] ^= 0xFF;
+        assert!(matches!(
+            verify_read_receipt_admission(&state, &signed, &sig, &bad, &clean),
+            Err(DmReceiveError::SignatureVerificationFailed)
+        ));
+
+        // Owner-field mismatch: re-sign with a bogus sender_owner_addr.
+        let mut wrong = signed.clone();
+        wrong.sender_owner_addr = OwnerAddr([0x99; 16]);
+        let wb = crate::owner_state_crypto::canonical_cbor_encode(&wrong).unwrap();
+        let ws = priv_alice.sign(&wb);
+        assert!(matches!(
+            verify_read_receipt_admission(&state, &wrong, &ws, &wb, &clean),
+            Err(DmReceiveError::OwnerFieldMismatch)
+        ));
+
+        // A receipt for a space we don't hold → SpaceNotFound.
+        let (s2, sig2, b2) = signed_receipt(&priv_alice, dev, alice, SpaceId([0xEE; 16]));
+        assert!(matches!(
+            verify_read_receipt_admission(&state, &s2, &sig2, &b2, &clean),
+            Err(DmReceiveError::SpaceNotFound)
+        ));
+
+        // Revoked signer device → SignerDeviceRevoked.
+        let alice_combined = priv_alice.public_identity().to_public_bytes();
+        let ed: [u8; 32] = alice_combined[32..64].try_into().unwrap();
+        let revoked = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        revoked.union_from_members(std::iter::once((
+            alice,
+            &std::collections::BTreeSet::from([ed]),
+        )));
+        assert!(matches!(
+            verify_read_receipt_admission(&state, &signed, &sig, &bytes, &revoked),
+            Err(DmReceiveError::SignerDeviceRevoked)
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -9859,6 +10049,7 @@ mod outhold_write_tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         }
     }

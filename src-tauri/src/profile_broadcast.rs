@@ -846,6 +846,7 @@ mod tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: true,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         // Community B — opted OUT. Must NOT appear.
@@ -870,6 +871,7 @@ mod tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         // DM — shared_in_profile=true defensively, kind != Community
@@ -895,6 +897,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: true,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         // Channel — kind != Community, with community_id back-pointer
@@ -922,6 +925,7 @@ mod tests {
             admin_addr: None,
             is_invite_only: None,
             shared_in_profile: false,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
 
@@ -1001,6 +1005,7 @@ mod tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: true,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
         // Community B — was opted-in but the user has since left. The
@@ -1028,6 +1033,7 @@ mod tests {
             admin_addr: Some(OwnerAddr([0xbb; 16])),
             is_invite_only: Some(false),
             shared_in_profile: true,
+            read_receipt_pref: None,
             pending_join_at: None,
         };
 

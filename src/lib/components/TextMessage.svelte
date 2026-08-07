@@ -6,7 +6,7 @@
   import { sanitizeHref } from '../url-sanitize';
   import Avatar from './Avatar.svelte';
 
-  let { message, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0, allMessages = [], onScrollToMessage, isSelf = false, onDelete, resolveNickname, resolveCard }: {
+  let { message, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0, allMessages = [], onScrollToMessage, isSelf = false, onDelete, resolveNickname, resolveCard, seenAt }: {
     message: Message;
     collapsed?: boolean;
     onMediaClick?: (mediaId: string) => void;
@@ -30,6 +30,9 @@
     /** ZEB-839: broadcast profile card for an owner_id — second rung of the
      *  author ladder. Same pure-consumer contract as `resolveNickname`. */
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    /** ZEB-214: when set (ms), render a "Seen HH:MM" line under this message —
+     *  the parent sets it only on the newest own-message the DM peer has read. */
+    seenAt?: number;
   } = $props();
 
   // ZEB-228 Phase 4: re-evaluate `canDelete` every 5s so the button
@@ -66,6 +69,13 @@
       hour: '2-digit',
       minute: '2-digit',
     })
+  );
+
+  // ZEB-214: "Seen HH:MM" clock (only rendered when seenAt is set).
+  let seenStr = $derived(
+    seenAt === undefined
+      ? ''
+      : new Date(seenAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   );
 
   let parentMessage = $derived(
@@ -132,6 +142,10 @@
       </button>
     {/if}
     <div class="message-text">{message.text}</div>
+    {#if seenAt !== undefined}
+      <!-- ZEB-214: peer read up to (at least) this message. -->
+      <div class="seen-indicator" data-testid="seen-indicator">Seen {seenStr}</div>
+    {/if}
     {#if message.media.length > 0}
       <div class="media-indicators">
         {#each message.media as attachment (attachment.id)}
@@ -246,6 +260,15 @@
     color: var(--text-secondary);
     font-size: 14px;
     word-wrap: break-word;
+  }
+
+  /* ZEB-214: subtle right-aligned "Seen HH:MM" under the last read own-message. */
+  .seen-indicator {
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--text-muted, var(--text-secondary));
+    text-align: right;
+    opacity: 0.8;
   }
 
   .media-indicators {
