@@ -250,7 +250,50 @@ jobs:
       - name: npm ci
         run: npm ci
 
+      # ZEB-764: macOS DMG bundling occasionally wedges hdiutil /
+      # diskimages-helper at the very end of an otherwise-clean build — a
+      # ~30s transient that `tauri build` surfaces as a hard bundle failure
+      # ("error running bundle_dmg.sh"). A plain `gh run rerun --failed`
+      # then recompiles the leg from scratch, so a coin-flip flake costs the
+      # full ~25-40 min Intel compile. Wrapping ONLY the macOS legs in a
+      # retry lets attempt 2 reuse the already-compiled target/ dir (cargo
+      # skips the recompile and only re-bundles, ~1-2 min).
+      #
+      # This step receives TAURI_SIGNING_PRIVATE_KEY, so the third-party
+      # action is pinned to a full commit SHA (immutable) rather than the
+      # mutable @v3 tag — a moved or compromised tag must not be able to swap
+      # the code that sees the signing key. To bump: take the new release's
+      # commit SHA from https://github.com/nick-fields/retry/releases, review
+      # the diff, and update both the SHA and the trailing `# vX.Y.Z`.
+      #
+      # retry_on: error retries a non-zero exit (the bundle failure) but NOT
+      # a genuine timeout (a hung build must not re-run for another 90 min).
+      # It will also retry a genuine compile/signing failure once — an
+      # accepted, bounded cost: release builds are already CI-gated so a real
+      # macOS compile failure here is rare, max_attempts is 2, and it still
+      # ends red. The precise alternative (grep Tauri's stderr for the DMG
+      # string -> dedicated exit code -> retry_on_exit_code) would couple us
+      # to Tauri's error text and buffer away live log streaming — a worse
+      # trade. retry_wait_seconds gives the orphaned diskimages-helper a
+      # moment to be reaped before the second attempt.
+      - name: tauri build (macOS — retry transient DMG bundling flake)
+        if: startsWith(matrix.os, 'macos')
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3.0.2
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          timeout_minutes: 90
+          max_attempts: 2
+          retry_on: error
+          retry_wait_seconds: 30
+          command: npm run tauri build -- --target ${{ matrix.target }}
+
+      # Windows (NSIS) and Linux (AppImage + deb) use different bundlers, not
+      # the macOS hdiutil path, so they keep the plain single-attempt step — a
+      # retry there would re-run a genuine compile failure for a second ~25 min.
       - name: tauri build
+        if: ${{ !startsWith(matrix.os, 'macos') }}
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}

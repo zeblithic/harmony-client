@@ -255,11 +255,28 @@ gh run list --workflow=release.yml --repo zeblithic/harmony-client --limit 5
 gh run watch   # streams live; Ctrl-C is safe, run continues
 ```
 
-Expected wall-clock times:
-- precheck job: ~7 min (fmt + clippy + version cross-check)
-- matrix jobs (4 platforms in parallel): ~10-12 min each
-- release fan-in: ~2 min
-- Total: ~25 min
+Expected wall-clock times (measured from recent real releases, not aspirational — ZEB-764):
+- precheck job (gates the matrix — `build` needs it): several minutes; it runs
+  without CI's warm sccache/R2 cache, so it is slower here than the ~4 min CI equivalent.
+- matrix build jobs run in parallel once precheck passes, so the matrix is only
+  as fast as its long pole:
+  - `macos-15-intel` (x86_64): **~40 min — the long pole**, ~3× the ARM leg. A
+    40-minute Intel build is healthy, **NOT** hung — do not cancel it.
+  - `windows-latest`: ~28 min
+  - `ubuntu-22.04`: ~14 min
+  - `macos-14` (aarch64): ~13 min
+- release fan-in (draft assembly): <1 min
+- **Total: ~70 min for a clean run.** The two most recent real releases ran
+  **1h19m** and **1h41m** end-to-end (each needed a failed-leg rerun).
+
+A `gh run rerun --failed` re-runs the whole failed leg from scratch, so its cost
+is that leg's **full build time — ~40 min if it is the `macos-15-intel` long
+pole**, ~13-28 min for the others — not a fixed increment. That recompile is
+exactly the waste this change removes for the common case: the macOS legs now
+retry their DMG **bundling** in place (ZEB-764), so a transient `hdiutil` flake
+costs ~1-2 min (a warm-`target` re-bundle) and needs no rerun at all. A
+`gh run rerun --failed` is now only for a genuine non-bundling failure (a real
+compile or signing error).
 
 Common early failures and fixes:
 - `version mismatch`: tauri.conf.json version doesn't match `-f version=` input — re-run with the correct value.
