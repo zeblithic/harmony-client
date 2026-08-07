@@ -49,6 +49,8 @@
     resolveCard,
     readReceiptOn = false,
     onToggleReadReceipt,
+    peerReadUpToMs,
+    peerSeenAtMs,
   }: {
     messages: Message[];
     collapsed?: boolean;
@@ -112,6 +114,10 @@
     readReceiptOn?: boolean;
     /** ZEB-214: toggle read-receipt broadcast for this DM. */
     onToggleReadReceipt?: (on: boolean) => void;
+    /** ZEB-214: the peer's read-watermark (ms) — own messages at/below it show "Seen". */
+    peerReadUpToMs?: number;
+    /** ZEB-214: the peer's read time (ms) — the "Seen HH:MM" clock. */
+    peerSeenAtMs?: number;
   } = $props();
 
   // Fallback invoke for the group-call banner when the parent doesn't thread one
@@ -131,6 +137,21 @@
   }
 
   let feedItems = $derived(groupMessages(messages));
+
+  // ZEB-214: the newest own-sent message at or below the peer's read watermark
+  // (1:1 DM only) — the single message that shows a "Seen HH:MM" line.
+  let seenMessageId = $derived.by(() => {
+    if (channelType !== 'dm' || peerReadUpToMs === undefined) return null;
+    const isOwn = (m: Message) =>
+      m.sender.address === 'self' || (ownAddress !== '' && m.sender.address === ownAddress);
+    let best: Message | null = null;
+    for (const m of messages) {
+      if (isOwn(m) && m.timestamp <= peerReadUpToMs && (!best || m.timestamp > best.timestamp)) {
+        best = m;
+      }
+    }
+    return best?.id ?? null;
+  });
 
   // Drag handle state
   let splitPercent = $state(60);
@@ -301,6 +322,9 @@
             onDelete={onMessageDelete}
             {resolveNickname}
             {resolveCard}
+            seenAt={item.message.id === seenMessageId
+              ? (peerSeenAtMs ?? peerReadUpToMs)
+              : undefined}
           />
           {/if}
           {#if threadMeta.has(item.message.id)}

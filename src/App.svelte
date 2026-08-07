@@ -1955,8 +1955,13 @@
   fileManagerService.onChange = () => { fileManagerVersion++; };
   const messageService = new MessageService();
   $effect(() => () => messageService.destroy());
-  // ZEB-214: per-DM read-receipt watermarks (peer "Seen" state).
+  // ZEB-214: per-DM read-receipt watermarks (peer "Seen" state). Bumping the
+  // version counter on each receipt forces the watermark derives to re-read.
   const readReceiptService = new ReadReceiptService();
+  let readReceiptVersion = $state(0);
+  readReceiptService.onChange = () => {
+    readReceiptVersion++;
+  };
   $effect(() => () => readReceiptService.destroy());
 
   // ZEB-334: local-only self-notes store backing the private "Notes" space —
@@ -3451,6 +3456,18 @@
   let activeChannelType = $state<'channel' | 'dm' | 'group-chat'>('channel');
   // ZEB-214: read-receipt broadcast state for the active 1:1 DM (fetched on open).
   let dmReadReceiptOn = $state(false);
+  // ZEB-214: the peer's read watermark + seen-time for the active DM (1:1 only),
+  // re-read when a receipt arrives (readReceiptVersion) or the channel switches.
+  let peerReadUpToMs = $derived.by(() => {
+    void readReceiptVersion;
+    return activeChannelType === 'dm'
+      ? readReceiptService.getWatermark(activeChannel)
+      : undefined;
+  });
+  let peerSeenAtMs = $derived.by(() => {
+    void readReceiptVersion;
+    return activeChannelType === 'dm' ? readReceiptService.getSeenAt(activeChannel) : undefined;
+  });
 
   // ── ZEB-360 T13: group-DM call presence watch/unwatch ──────────────
   // The currently-selected group-DM space (null when the active view isn't a
@@ -4213,6 +4230,8 @@
         channelId={activeChannel}
         readReceiptOn={dmReadReceiptOn}
         onToggleReadReceipt={toggleReadReceipt}
+        {peerReadUpToMs}
+        {peerSeenAtMs}
         onStartCall={(spaceId) => { if (callSession) swallow(leaveOtherVoiceThen(() => callSession!.placeCall(spaceId))); }}
         onStartGroupCall={(spaceId) => swallow(placeGroupCall(spaceId))}
         onJoinGroupCall={(spaceId) => swallow(joinGroupCall(spaceId))}

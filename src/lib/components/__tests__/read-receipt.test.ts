@@ -52,4 +52,28 @@ describe('TextFeed read-receipt toggle', () => {
     await fireEvent.click(toggle);
     expect(calls).toEqual([true]); // off → on
   });
+
+  it('shows one "Seen HH:MM" under the newest own message within the watermark', () => {
+    const mk = (id: string, ts: number, self: boolean) => ({
+      id,
+      text: id,
+      timestamp: ts,
+      media: [],
+      priority: 'standard' as const,
+      sender: { address: self ? 'self' : 'peer', displayName: self ? 'Me' : 'Them' },
+    });
+    const { queryAllByText } = render(TextFeed, {
+      props: {
+        channelType: 'dm',
+        channelId: 'aa'.repeat(16),
+        ownAddress: 'me',
+        // own@100 (seen), peer@150, own@200 (after watermark → NOT seen)
+        messages: [mk('a', 100, true), mk('b', 150, false), mk('c', 200, true)],
+        peerReadUpToMs: 150,
+        peerSeenAtMs: 160,
+      },
+    });
+    // Exactly one "Seen …" line, attached to the own message at ts=100.
+    expect(queryAllByText(/^Seen /).length).toBe(1);
+  });
 });
