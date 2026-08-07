@@ -17,16 +17,8 @@
   import type { ResolvedCard } from '../member-card-service';
   import { nonEmpty } from '../display-label';
   import { tokenizeBody, resolveMentionLabel } from '../mention-render';
-  import {
-    detectMentionTrigger,
-    applyMentionPick,
-    filterCandidates,
-    reconcileCompose,
-    shiftTrackedSpans,
-    type MentionCandidate,
-    type TrackedMention,
-  } from '../mention-compose';
-  import MentionAutocomplete from './MentionAutocomplete.svelte';
+  import type { MentionCandidate } from '../mention-compose';
+  import MentionInput from './MentionInput.svelte';
 
   let {
     communityId,
@@ -121,11 +113,15 @@
   let scrollAtTop = $state(false);
   let backfillInFlight = $state(false);
   let backfillProgress = $state<{ fetched: number; totalEstimate?: number } | null>(null);
-  let composeText = $state('');
-  // ZEB-590: last compose text the span-shifter has seen. Kept in lockstep with
-  // composeText so shiftTrackedSpans can diff each edit. A plain (non-$state)
-  // shadow: it's never read in the template, only by the input handler.
-  let prevComposeText = '';
+  // ZEB-594: the compose draft now lives in the MentionInput contenteditable DOM
+  // (each chip carries its ownerId directly), not in a bound string + span shadow.
+  // Ref exposes serialize()/clear()/focus() — the parent only calls clear() on a
+  // successful send, so the draft survives channel switches and failed posts.
+  let mentionInput = $state<{
+    serialize: () => { body: string; mentions: string[] };
+    clear: () => void;
+    focus: () => void;
+  }>();
   let composeError = $state<string | null>(null);
   let loadError = $state<string | null>(null);
   let posting = $state(false);
@@ -140,57 +136,7 @@
   let pickerOpenFor = $state<string | null>(null);
 
   let scrollEl: HTMLDivElement | undefined = $state();
-  let composeEl: HTMLTextAreaElement | undefined = $state();
 
-  // ── ZEB-588: @-mention compose state ──────────────────────────────────────
-  // `tracked` records each picked mention so reconcileCompose can rewrite the
-  // still-intact `@Label`s into `<@ownerId>` wire tokens on send. `trigger` is
-  // the active `@query` at the caret (null when not mentioning).
-  let tracked = $state<TrackedMention[]>([]);
-  let trigger = $state<{ query: string; atIndex: number } | null>(null);
-  let acIndex = $state(0);
-  const acCandidates = $derived(trigger ? filterCandidates(mentionCandidates, trigger.query) : []);
-  const acOpen = $derived(acCandidates.length > 0);
-
-  // Re-detect the trigger from the LIVE DOM value/caret (not the bound state,
-  // which can lag the input event). Reset the active row on every change.
-  function refreshTrigger() {
-    const el = composeEl;
-    if (!el) {
-      trigger = null;
-      return;
-    }
-    // ZEB-590: realign / invalidate tracked spans against the just-applied edit
-    // BEFORE re-detecting the trigger, so a deleted-then-retyped label can't be
-    // reclaimed by a stale pick.
-    tracked = shiftTrackedSpans(prevComposeText, el.value, tracked);
-    prevComposeText = el.value;
-    trigger = detectMentionTrigger(el.value, el.selectionStart ?? el.value.length);
-    acIndex = 0;
-  }
-
-  function pickMention(c: MentionCandidate) {
-    const el = composeEl;
-    if (!el || !trigger) return;
-    const caret = el.selectionStart ?? el.value.length;
-    const r = applyMentionPick(el.value, trigger.atIndex, caret, c);
-    composeText = r.text;
-    // ZEB-590: applyMentionPick is a programmatic edit (it replaces the active
-    // "@query" with "@Label "), so rebase existing tracked spans across that edit
-    // BEFORE appending the new pick — otherwise a mention sitting after the
-    // insertion point keeps a stale `start` and fails position-anchored
-    // reconcile. refreshTrigger only shifts on user `input`, which this path
-    // bypasses. (Qodo PR #369.)
-    tracked = [...shiftTrackedSpans(el.value, r.text, tracked), r.tracked];
-    // The next user edit must diff against the post-insert text.
-    prevComposeText = r.text;
-    trigger = null;
-    // Restore focus + caret after Svelte flushes the new bound value.
-    queueMicrotask(() => {
-      el.focus();
-      el.setSelectionRange(r.caret, r.caret);
-    });
-  }
   let unsubChannel: (() => void) | null = null;
   let prevOnBackfillProgress: typeof channelMessageService.onBackfillProgress | undefined;
   let scrollAtTopTimer: ReturnType<typeof setTimeout> | null = null;
@@ -214,15 +160,9 @@
     channelMessageService.selfOwnerId = ownAddress;
     // Fresh local mirror per channel switch.
     messages = [];
-    // ZEB-588 (CodeRabbit): drop any in-progress @-mention picks on a channel/
-    // community switch so a label picked in the previous channel can't be
-    // rewritten into a stale owner id when sending here.
-    // ZEB-590: prevComposeText is intentionally NOT reset here — composeText is a
-    // preserved draft across switches, so the shadow stays paired with it; tracked
-    // is empty here regardless, so no span can be mis-shifted.
-    tracked = [];
-    trigger = null;
-    acIndex = 0;
+    // ZEB-594: the compose draft (chips + text) lives in MentionInput and is a
+    // preserved cross-channel draft, so it is intentionally NOT cleared here.
+    // MentionInput resets its own @-autocomplete dropdown when the roster changes.
     // ZEB-536: close any open reaction picker so it doesn't linger across a
     // channel switch (and its Escape/outside-click window listeners unwind).
     pickerOpenFor = null;
@@ -416,40 +356,12 @@
     });
   }
 
-  async function handleCompose(e: KeyboardEvent) {
-    // ZEB-588: while the @-autocomplete is open, the navigation keys drive it
-    // instead of the composer (Enter picks the active row rather than sending).
-    if (acOpen) {
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        acIndex = (acIndex + 1) % acCandidates.length;
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        acIndex = (acIndex - 1 + acCandidates.length) % acCandidates.length;
-        return;
-      }
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        // Guard a stale index (the roster can change while the menu is open).
-        const candidate = acCandidates[acIndex];
-        if (candidate) pickMention(candidate);
-        else acIndex = 0;
-        return;
-      }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        trigger = null;
-        return;
-      }
-    }
-    if (e.key !== 'Enter') return;
-    if (e.shiftKey) return; // newline; let browser handle
-    e.preventDefault();
-    // ZEB-588: rewrite picked @Labels into <@id> tokens + the mentions array.
-    const { body, mentions } = reconcileCompose(composeText, tracked);
-    const trimmedBody = body.trim();
+  // ZEB-594: MentionInput owns the keyboard (autocomplete nav, Enter/Shift+Enter,
+  // IME guard) and emits the serialized payload on Enter. This handler owns only
+  // the post: trim, the empty/posting/ingesting guards, attachments, and clearing
+  // the input on a successful send (the draft survives a failed post).
+  async function handleSend(payload: { body: string; mentions: string[] }) {
+    const trimmedBody = payload.body.trim();
     if ((!trimmedBody && pendingAttachments.length === 0) || posting || ingesting) return;
     posting = true;
     composeError = null;
@@ -459,14 +371,10 @@
         channelId,
         trimmedBody,
         undefined,
-        mentions,
+        payload.mentions,
         pendingAttachments.length > 0 ? pendingAttachments : undefined,
       );
-      composeText = '';
-      prevComposeText = '';
-      tracked = [];
-      trigger = null;
-      acIndex = 0;
+      mentionInput?.clear();
       pendingAttachments = [];
     } catch (e) {
       composeError = e instanceof Error ? e.message : String(e);
@@ -1191,22 +1099,15 @@
         aria-label="Attach file"
         title="Attach file"
       >{ingesting ? '…' : '📎'}</button>
-      <textarea
-        bind:this={composeEl}
-        bind:value={composeText}
-        onkeydown={handleCompose}
-        oninput={refreshTrigger}
-        onkeyup={refreshTrigger}
-        onclick={refreshTrigger}
-        class="compose-input"
+      <MentionInput
+        bind:this={mentionInput}
+        candidates={mentionCandidates}
         placeholder={ingesting ? 'Finishing upload…' : (composerPlaceholder ?? `Message #${channelName}`)}
-        rows="2"
-        aria-label="Channel message"
+        ariaLabel="Channel message"
         disabled={posting}
-      ></textarea>
-      {#if acOpen}
-        <MentionAutocomplete candidates={acCandidates} activeIndex={acIndex} onPick={pickMention} />
-      {/if}
+        onSend={handleSend}
+        onInput={() => (composeError = null)}
+      />
     </div>
   </div>
 </div>
@@ -1484,20 +1385,6 @@
     font-size: 0.75rem;
     margin-bottom: 8px;
   }
-  .compose-input {
-    width: 100%;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    color: var(--text-primary);
-    padding: 8px 10px;
-    font-size: 0.9rem;
-    font-family: inherit;
-    resize: vertical;
-    box-sizing: border-box;
-  }
-  .compose-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-  .compose-input:disabled { opacity: 0.6; }
   .load-error {
     background: var(--bg-tertiary);
     border: 1px solid var(--danger-muted);

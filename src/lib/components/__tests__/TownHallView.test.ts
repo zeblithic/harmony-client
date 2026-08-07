@@ -266,7 +266,7 @@ describe('TownHallView (ZEB-612 S5): rail — motion card + backchannel', () => 
     await setup({ phase: 'connected', roster: [member(1)] });
     expect(screen.getByText('⚖ Call this to a motion')).toBeInTheDocument();
     await waitFor(() => {
-      expect(document.querySelector('[placeholder="Message the room…"]')).toBeTruthy();
+      expect(document.querySelector('[data-placeholder="Message the room…"]')).toBeTruthy();
     });
   });
 });

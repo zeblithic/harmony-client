@@ -155,9 +155,9 @@ describe('ChannelMessageFeed', () => {
 
   it('compose Enter posts via channelMessageService.postMessage', async () => {
     const { adapter, container } = await setup();
-    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: 'first message' } });
-    await fireEvent.keyDown(textarea, { key: 'Enter' });
+    const el = container.querySelector('[role="textbox"]') as HTMLElement;
+    el.textContent = 'first message';
+    await fireEvent.keyDown(el, { key: 'Enter' });
     await waitFor(() => {
       expect(adapter.invoke).toHaveBeenCalledWith('post_channel_message', expect.objectContaining({
         communityId: 'aa'.repeat(16),
@@ -167,28 +167,28 @@ describe('ChannelMessageFeed', () => {
       }));
     });
     // Compose box clears on successful send.
-    expect(textarea.value).toBe('');
+    await waitFor(() => expect(el.textContent).toBe(''));
   });
 
   it('Shift+Enter inserts a newline (does NOT send)', async () => {
     const { adapter, container } = await setup();
-    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: 'line one' } });
-    await fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: true });
+    const el = container.querySelector('[role="textbox"]') as HTMLElement;
+    el.textContent = 'line one';
+    await fireEvent.keyDown(el, { key: 'Enter', shiftKey: true });
     expect(adapter.invoke).not.toHaveBeenCalledWith(
       'post_channel_message',
       expect.anything(),
     );
-    // Textarea retains the value (browser would handle the newline insertion;
-    // we just verify we didn't send).
-    expect(textarea.value).toBe('line one');
+    // Content retained (the browser would insert the newline; we just verify we
+    // didn't send).
+    expect(el.textContent).toBe('line one');
   });
 
   it('does not post empty/whitespace-only messages', async () => {
     const { adapter, container } = await setup();
-    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: '   ' } });
-    await fireEvent.keyDown(textarea, { key: 'Enter' });
+    const el = container.querySelector('[role="textbox"]') as HTMLElement;
+    el.textContent = '   ';
+    await fireEvent.keyDown(el, { key: 'Enter' });
     expect(adapter.invoke).not.toHaveBeenCalledWith(
       'post_channel_message',
       expect.anything(),
@@ -471,23 +471,30 @@ describe('ChannelMessageFeed', () => {
   });
 
   it('compose: @-autocomplete pick → Enter sends a body token + mentions array', async () => {
+    // ZEB-594: drive the real trigger→autocomplete→pick flow via a jsdom
+    // Selection, then Enter to send. The pick splices an atomic chip node whose
+    // ownerId serializes to a <@id> token.
     const ID = 'a'.repeat(32);
     const { adapter, container } = await setup({ mentionCandidates: [{ ownerId: ID, label: 'Jake' }] });
-    const ta = container.querySelector('.compose-input') as HTMLTextAreaElement;
+    const el = container.querySelector('[role="textbox"]') as HTMLElement;
     // type "@Ja" with the caret at the end
-    ta.value = '@Ja';
-    ta.selectionStart = 3;
-    ta.selectionEnd = 3;
-    await fireEvent.input(ta);
+    el.textContent = '@Ja';
+    const range = document.createRange();
+    range.setStart(el.firstChild!, 3);
+    range.collapse(true);
+    const sel = window.getSelection()!;
+    sel.removeAllRanges();
+    sel.addRange(range);
+    await fireEvent.input(el);
     // the autocomplete opens
     await waitFor(() =>
       expect(container.querySelector('[data-testid="mention-autocomplete"]')).toBeTruthy(),
     );
-    // pick "Jake" (mousedown, so the textarea keeps focus/selection)
+    // pick "Jake" (mousedown, so the input keeps focus/selection)
     await fireEvent.mouseDown(container.querySelector('[data-testid="mention-option"] button')!);
-    await waitFor(() => expect(ta.value).toContain('@Jake '));
+    await waitFor(() => expect(el.querySelector('.mention-chip')).toBeTruthy());
     // send with Enter (dropdown is closed now → Enter sends, not picks)
-    await fireEvent.keyDown(ta, { key: 'Enter' });
+    await fireEvent.keyDown(el, { key: 'Enter' });
     await waitFor(() => {
       const call = (adapter.invoke as ReturnType<typeof vi.fn>).mock.calls.find(
         (c: unknown[]) => c[0] === 'post_channel_message',
@@ -503,11 +510,9 @@ describe('ChannelMessageFeed', () => {
     const { adapter, container } = await setup({
       mentionCandidates: [{ ownerId: 'a'.repeat(32), label: 'Jake' }],
     });
-    const ta = container.querySelector('.compose-input') as HTMLTextAreaElement;
-    ta.value = 'hello world';
-    ta.selectionStart = 11;
-    await fireEvent.input(ta);
-    await fireEvent.keyDown(ta, { key: 'Enter' });
+    const el = container.querySelector('[role="textbox"]') as HTMLElement;
+    el.textContent = 'hello world';
+    await fireEvent.keyDown(el, { key: 'Enter' });
     await waitFor(() => {
       const call = (adapter.invoke as ReturnType<typeof vi.fn>).mock.calls.find(
         (c: unknown[]) => c[0] === 'post_channel_message',
@@ -517,55 +522,6 @@ describe('ChannelMessageFeed', () => {
         'hello world',
       );
       expect((call![1] as { mentions?: string[] }).mentions).toBeUndefined();
-    });
-  });
-
-  it('compose: picking a second mention BEFORE an existing one keeps both (span rebase on pick)', async () => {
-    // ZEB-590 regression (Qodo PR #369): pickMention is a programmatic edit, so
-    // it must rebase existing tracked spans across the insertion. Otherwise an
-    // earlier-tracked mention that now sits AFTER the new pick keeps a stale
-    // `start` and silently degrades to plain text under position-anchored
-    // reconcile.
-    const ALICE = 'a'.repeat(32);
-    const BOB = 'b'.repeat(32);
-    const { adapter, container } = await setup({
-      mentionCandidates: [
-        { ownerId: ALICE, label: 'Alice' },
-        { ownerId: BOB, label: 'Bob' },
-      ],
-    });
-    const ta = container.querySelector('.compose-input') as HTMLTextAreaElement;
-    // 1) type "hi @Al" and pick Alice → "hi @Alice " (Alice tracked at offset 3)
-    ta.value = 'hi @Al';
-    ta.selectionStart = 6;
-    ta.selectionEnd = 6;
-    await fireEvent.input(ta);
-    await waitFor(() =>
-      expect(container.querySelector('[data-testid="mention-autocomplete"]')).toBeTruthy(),
-    );
-    await fireEvent.mouseDown(container.querySelector('[data-testid="mention-option"] button')!);
-    await waitFor(() => expect(ta.value).toBe('hi @Alice '));
-    // 2) jump to the start and type "@B" (caret right after "@B") to mention Bob
-    //    FIRST — this shifts Alice's span; pickMention must rebase it.
-    ta.value = '@Bhi @Alice ';
-    ta.selectionStart = 2;
-    ta.selectionEnd = 2;
-    await fireEvent.input(ta);
-    await waitFor(() =>
-      expect(container.querySelector('[data-testid="mention-autocomplete"]')).toBeTruthy(),
-    );
-    await fireEvent.mouseDown(container.querySelector('[data-testid="mention-option"] button')!);
-    await waitFor(() => expect(ta.value).toBe('@Bob hi @Alice '));
-    // 3) send — BOTH mentions must tokenize, in document order
-    await fireEvent.keyDown(ta, { key: 'Enter' });
-    await waitFor(() => {
-      const call = (adapter.invoke as ReturnType<typeof vi.fn>).mock.calls.find(
-        (c: unknown[]) => c[0] === 'post_channel_message',
-      );
-      expect(call).toBeTruthy();
-      const body = new TextDecoder().decode(new Uint8Array((call![1] as { body: number[] }).body));
-      expect(body).toBe(`<@${BOB}> hi <@${ALICE}>`);
-      expect((call![1] as { mentions?: string[] }).mentions).toEqual([BOB, ALICE]);
     });
   });
 
@@ -613,14 +569,14 @@ describe('ChannelMessageFeed', () => {
       if (cmd === 'post_channel_message') return Promise.reject(new Error('no engine for ...'));
       return Promise.resolve(undefined);
     });
-    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: 'will fail' } });
-    await fireEvent.keyDown(textarea, { key: 'Enter' });
+    const el = container.querySelector('[role="textbox"]') as HTMLElement;
+    el.textContent = 'will fail';
+    await fireEvent.keyDown(el, { key: 'Enter' });
     await waitFor(() => {
       expect(container.querySelector('.compose-error')?.textContent).toMatch(/no engine/);
     });
     // Compose retains text on failure so user can retry.
-    expect(textarea.value).toBe('will fail');
+    expect(el.textContent).toBe('will fail');
   });
 
   it('renders the Commons fork-divider band with the real carried count', async () => {
@@ -832,9 +788,9 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
     withIngest(adapter);
     await fireEvent.click(container.querySelector('.attach-btn')!);
     await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
-    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: 'here it is' } });
-    await fireEvent.keyDown(textarea, { key: 'Enter' });
+    const el = container.querySelector('[role="textbox"]') as HTMLElement;
+    el.textContent = 'here it is';
+    await fireEvent.keyDown(el, { key: 'Enter' });
     await waitFor(() => {
       expect(adapter.invoke).toHaveBeenCalledWith('post_channel_message', expect.objectContaining({
         body: Array.from(new TextEncoder().encode('here it is')),
@@ -850,8 +806,8 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
     withIngest(adapter);
     await fireEvent.click(container.querySelector('.attach-btn')!);
     await waitFor(() => expect(container.querySelectorAll('.pending-chip').length).toBe(1));
-    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
-    await fireEvent.keyDown(textarea, { key: 'Enter' });
+    const el = container.querySelector('[role="textbox"]') as HTMLElement;
+    await fireEvent.keyDown(el, { key: 'Enter' });
     await waitFor(() => {
       expect(adapter.invoke).toHaveBeenCalledWith('post_channel_message', expect.objectContaining({
         body: [],
@@ -894,9 +850,9 @@ describe('ChannelMessageFeed author display-name resolution (ZEB-432)', () => {
       expect(container.querySelector('[data-testid="compose-ingest-hint"]')).toBeTruthy();
     });
     // Enter during ingest must not post.
-    const textarea = container.querySelector('textarea.compose-input') as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: 'too soon' } });
-    await fireEvent.keyDown(textarea, { key: 'Enter' });
+    const el = container.querySelector('[role="textbox"]') as HTMLElement;
+    el.textContent = 'too soon';
+    await fireEvent.keyDown(el, { key: 'Enter' });
     expect(adapter.invoke).not.toHaveBeenCalledWith('post_channel_message', expect.anything());
     // Let the ingest finish; the hint clears.
     resolveIngest({ cid: 'cid0', mime: 'text/plain', name: 'f.txt', size: 5, encrypted: true });
@@ -1674,15 +1630,15 @@ describe('ChannelMessageFeed: composerPlaceholder (ZEB-612 S5)', () => {
   it('composerPlaceholder overrides the default composer placeholder', async () => {
     const { container } = await setup({ composerPlaceholder: 'Message the room…' });
     await waitFor(() => {
-      expect(container.querySelector('[placeholder="Message the room…"]')).toBeTruthy();
+      expect(container.querySelector('[data-placeholder="Message the room…"]')).toBeTruthy();
     });
-    expect(container.querySelector('[placeholder="Message #general"]')).toBeNull();
+    expect(container.querySelector('[data-placeholder="Message #general"]')).toBeNull();
   });
 
   it('absent composerPlaceholder keeps the long-standing Message #name default', async () => {
     const { container } = await setup();
     await waitFor(() => {
-      expect(container.querySelector('[placeholder="Message #general"]')).toBeTruthy();
+      expect(container.querySelector('[data-placeholder="Message #general"]')).toBeTruthy();
     });
   });
 });
