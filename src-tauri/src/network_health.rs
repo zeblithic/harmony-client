@@ -6538,11 +6538,21 @@ mod tests {
             peer_fixture(ConnectionMode::NoConnection, vec![a.clone(), b.clone()]),
         ];
         let counts = reachable_peers_by_community(&peers);
-        assert_eq!(counts.get(&a), Some(&2), "Direct + Relay; NoConnection excluded");
-        assert_eq!(counts.get(&b), Some(&2), "Direct + Degraded; NoConnection excluded");
+        assert_eq!(
+            counts.get(&a),
+            Some(&2),
+            "Direct + Relay; NoConnection excluded"
+        );
+        assert_eq!(
+            counts.get(&b),
+            Some(&2),
+            "Direct + Degraded; NoConnection excluded"
+        );
         // A community whose only co-member is unreachable never appears.
-        let only_dead =
-            reachable_peers_by_community(&[peer_fixture(ConnectionMode::NoConnection, vec![a.clone()])]);
+        let only_dead = reachable_peers_by_community(&[peer_fixture(
+            ConnectionMode::NoConnection,
+            vec![a.clone()],
+        )]);
         assert_eq!(only_dead.get(&a), None);
     }
 
