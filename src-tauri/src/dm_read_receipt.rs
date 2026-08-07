@@ -117,6 +117,66 @@ pub(crate) async fn maybe_send_read_receipt(
     crate::iroh_tunnel_dm_transport::send_packet_to_owner_tunnels(crdt_state, mgr, peer, &wire).await;
 }
 
+/// The 1:1 DM spaces with `peer` that are opted in (Broadcast) AND have a
+/// stored watermark to re-send. Used when `peer` proves reachable (an inbound
+/// DM just arrived over a live tunnel).
+pub(crate) fn plan_reconnect_resends(
+    state: &crate::owner_state_crdt::OwnerState,
+    self_owner: OwnerAddr,
+    peer: OwnerAddr,
+    watermarks: &std::collections::HashMap<SpaceId, u64>,
+) -> Vec<SpaceId> {
+    state
+        .spaces
+        .values()
+        .filter(|s| s.read_receipt_pref == Some(ReadReceiptPref::Broadcast))
+        .filter(|s| dm_peer_of(s, self_owner) == Some(peer))
+        .filter(|s| watermarks.contains_key(&s.id))
+        .map(|s| s.id)
+        .collect()
+}
+
+/// Re-send our stored watermark to `peer` for each opted-in 1:1 DM. Best-effort
+/// (a live tunnel to `peer` was just proven by the inbound DM that triggered
+/// this). Never writes the outbox (ephemeral).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resend_watermarks_to_peer(
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    mgr: &std::sync::Arc<crate::tunnel_manager::TunnelManager>,
+    signing_key: &std::sync::Arc<ed25519_dalek::SigningKey>,
+    signing_device_hash: DeviceIdentityHash,
+    self_owner: OwnerAddr,
+    device_id: &str,
+    watermarks: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<SpaceId, u64>>>,
+    peer: OwnerAddr,
+    now_ms: u64,
+) {
+    let plan = {
+        let state = crdt_state.lock().await;
+        let wm = watermarks.lock().await;
+        plan_reconnect_resends(&state, self_owner, peer, &wm)
+    };
+    for space_id in plan {
+        let up_to_ms = match watermarks.lock().await.get(&space_id) {
+            Some(v) => *v,
+            None => continue,
+        };
+        maybe_send_read_receipt(
+            crdt_state,
+            mgr,
+            signing_key,
+            signing_device_hash,
+            self_owner,
+            device_id,
+            watermarks,
+            space_id,
+            up_to_ms,
+            now_ms,
+        )
+        .await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +276,61 @@ mod tests {
                 "pref={pref:?} kind={kind:?} must not prepare a receipt"
             );
         }
+    }
+
+    fn dm_between(
+        id: SpaceId,
+        me: OwnerAddr,
+        peer: OwnerAddr,
+        pref: Option<ReadReceiptPref>,
+    ) -> Space {
+        let mut members = vec![me, peer];
+        members.sort();
+        Space {
+            id,
+            kind: SpaceKind::Dm,
+            parent: None,
+            community_id: None,
+            name: "dm".into(),
+            transport: None,
+            members,
+            custom_name: None,
+            notification_pref: None,
+            read_receipt_pref: pref,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+            content_key: Some(DmContentKey::new([0x22; 32])),
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    #[test]
+    fn plan_reconnect_resends_only_opted_in_dms_with_stored_watermark() {
+        let me = OwnerAddr([1; 16]);
+        let peer = OwnerAddr([2; 16]);
+        let other = OwnerAddr([3; 16]);
+        let mut st = OwnerState::default();
+        let a = dm_between(SpaceId([0xA0; 16]), me, peer, Some(ReadReceiptPref::Broadcast));
+        let b = dm_between(SpaceId([0xB0; 16]), me, peer, Some(ReadReceiptPref::Off));
+        let c = dm_between(SpaceId([0xC0; 16]), me, other, Some(ReadReceiptPref::Broadcast));
+        let (a_id, b_id, c_id) = (a.id, b.id, c.id);
+        for s in [a, b, c] {
+            st.spaces.insert(s.id, s);
+        }
+        let mut wm = std::collections::HashMap::new();
+        wm.insert(a_id, 999u64); // a: opted-in + stored watermark → included
+        wm.insert(b_id, 5u64); // b: Off → excluded regardless of a stored watermark
+        // c: opted-in but a different peer AND no stored watermark → excluded
+        let plan = plan_reconnect_resends(&st, me, peer, &wm);
+        assert_eq!(plan, vec![a_id]);
+        let _ = (b_id, c_id);
     }
 }

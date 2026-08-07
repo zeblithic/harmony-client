@@ -5277,6 +5277,12 @@ pub async fn start_node_inner(
             std::sync::Arc<ed25519_dalek::SigningKey>,
             crate::owner_state_types::DeviceIdentityHash,
         )> = None;
+        // ZEB-214: the SHARED per-DM read-watermark map. Created here (outer
+        // scope) so both `mark_dm_read` (via NodeState, writes) and the tunnel
+        // drain (reads to re-send on peer reachability) reference the SAME Arc.
+        let rr_watermarks_for_state: std::sync::Arc<
+            tokio::sync::Mutex<std::collections::HashMap<crate::owner_state_types::SpaceId, u64>>,
+        > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         // ZEB-623: the per-peer protocol-compatibility registry, built alongside
         // the `TunnelManager` below (sharing the SAME `Arc`) and published onto
         // NodeState only when the tunnel acceptor actually installs — so the
@@ -11162,6 +11168,20 @@ pub async fn start_node_inner(
                             // is flushed (persist + replicate to sibling devices).
                             let drain_owner_engine =
                                 std::sync::Arc::clone(&owner_state_engine_for_dirty);
+                            // ZEB-214: the reconnect re-send needs the tunnel
+                            // manager (built just below, so bridged via a
+                            // OnceCell slot filled right after), the SHARED
+                            // watermark map, and the DM signer material.
+                            let rr_mgr_slot: std::sync::Arc<
+                                tokio::sync::OnceCell<
+                                    std::sync::Arc<crate::tunnel_manager::TunnelManager>,
+                                >,
+                            > = std::sync::Arc::new(tokio::sync::OnceCell::new());
+                            let drain_rr_mgr_slot = std::sync::Arc::clone(&rr_mgr_slot);
+                            let drain_rr_watermarks =
+                                std::sync::Arc::clone(&rr_watermarks_for_state);
+                            let drain_rr_sign_key = dm_tunnel_sign_key_arc.clone();
+                            let drain_rr_sign_hash = dm_tunnel_sign_hash;
                             tokio::spawn(async move {
                                 let mark_owner_state_dirty =
                                     move || drain_owner_engine.notify_dirty();
@@ -11195,6 +11215,39 @@ pub async fn start_node_inner(
                                             "ZEB-473: tunnel DM rejected; dropping \
                                              (deposit rung covers durability)"
                                         ),
+                                    }
+                                    // ZEB-214: the peer just proved reachable (a DM
+                                    // arrived over a live tunnel). Re-send our stored
+                                    // read watermark for any opted-in 1:1 DM with
+                                    // them. Best-effort; no-op until the manager slot
+                                    // is filled (just after this drain is spawned).
+                                    if let Some(mgr) = drain_rr_mgr_slot.get() {
+                                        let peer = {
+                                            let st = drain_crdt_state.lock().await;
+                                            crate::dm_inbox_ingest::resolve_owner_for_peer(
+                                                &st,
+                                                dm.peer_node_id,
+                                            )
+                                        };
+                                        if let Some(peer) = peer {
+                                            let now_ms = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis()
+                                                as u64;
+                                            crate::dm_read_receipt::resend_watermarks_to_peer(
+                                                &drain_crdt_state,
+                                                mgr,
+                                                &drain_rr_sign_key,
+                                                drain_rr_sign_hash,
+                                                drain_self_owner,
+                                                &drain_device_id,
+                                                &drain_rr_watermarks,
+                                                peer,
+                                                now_ms,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                             });
@@ -11234,6 +11287,10 @@ pub async fn start_node_inner(
                             // transport.
                             match link_mgr.install_tunnel_acceptor(tunnel_acceptor) {
                                 Ok(()) => {
+                                    // ZEB-214: publish the manager into the
+                                    // drain's reconnect-resend slot before it is
+                                    // moved onto NodeState.
+                                    let _ = rr_mgr_slot.set(std::sync::Arc::clone(&tunnel_manager));
                                     // Share the manager onto NodeState so the
                                     // Task 8 DmTransport can route outbound DMs
                                     // through it (wired to the installed acceptor).
@@ -13034,6 +13091,9 @@ pub async fn start_node_inner(
                             guard.dm_tunnel_sign_key = Some(key);
                             guard.dm_tunnel_sign_hash = Some(hash);
                         }
+                        // ZEB-214: publish the SHARED watermark map so mark_dm_read
+                        // and the tunnel drain reference the same Arc.
+                        guard.read_receipt_watermarks = rr_watermarks_for_state;
                         // ZEB-623: publish the compat registry shared with the
                         // installed TunnelManager (kept as an empty default on a
                         // deposit-only node where no manager installed).
