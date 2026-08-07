@@ -80,6 +80,43 @@ pub(crate) fn prepare_read_receipt(
     Some((peer, wire))
 }
 
+/// Orchestrate a single read-receipt push: prepare (pref gate + packet build),
+/// record the watermark for later reconnect re-sends, and push over the live
+/// tunnel. No-op when `prepare_read_receipt` returns `None`. Never writes the
+/// outbox (ephemeral).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn maybe_send_read_receipt(
+    crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    mgr: &std::sync::Arc<crate::tunnel_manager::TunnelManager>,
+    signing_key: &std::sync::Arc<ed25519_dalek::SigningKey>,
+    signing_device_hash: DeviceIdentityHash,
+    self_owner: OwnerAddr,
+    device_id: &str,
+    watermarks: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<SpaceId, u64>>>,
+    space_id: SpaceId,
+    up_to_ms: u64,
+    now_ms: u64,
+) {
+    let prepared = {
+        let state = crdt_state.lock().await;
+        prepare_read_receipt(
+            &state,
+            self_owner,
+            signing_device_hash,
+            signing_key,
+            device_id,
+            space_id,
+            up_to_ms,
+            now_ms,
+        )
+    };
+    let Some((peer, wire)) = prepared else {
+        return;
+    };
+    watermarks.lock().await.insert(space_id, up_to_ms);
+    crate::iroh_tunnel_dm_transport::send_packet_to_owner_tunnels(crdt_state, mgr, peer, &wire).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1019,6 +1019,19 @@ pub struct NodeState {
     /// failed (no tunnel transport — DMs stay deposit-only). Cleared on stop_node
     /// so a stale identity's live tunnels never outlive an identity switch.
     tunnel_manager: Option<std::sync::Arc<crate::tunnel_manager::TunnelManager>>,
+    /// ZEB-214: the per-device Ed25519 key used to sign read-receipt frames
+    /// (the SAME #2/#3 material the tunnel transport signs CidNotify with).
+    /// `None` when iroh did not bind / no tunnel. Set at transport construction.
+    dm_tunnel_sign_key: Option<std::sync::Arc<ed25519_dalek::SigningKey>>,
+    /// ZEB-214: the DeviceIdentityHash paired with `dm_tunnel_sign_key`.
+    dm_tunnel_sign_hash: Option<crate::owner_state_types::DeviceIdentityHash>,
+    /// ZEB-214: the last read-watermark (ms) we emitted per DM space. Ephemeral
+    /// (in-memory, not persisted): populated by `mark_dm_read` and re-sent when
+    /// the peer next proves reachable (inbound DM). Empty after restart — a real
+    /// read re-populates it.
+    read_receipt_watermarks: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<crate::owner_state_types::SpaceId, u64>>,
+    >,
     /// ZEB-623: per-peer protocol-compatibility registry. Built once per node
     /// start (alongside the `TunnelManager`, sharing the SAME `Arc`) and stored
     /// here so Network Health (Task 3) can surface peers we couldn't speak a
@@ -2073,6 +2086,11 @@ impl Default for NodeState {
             dm_local_kem_pubkey: None,
             dm_pq_identity: None,
             tunnel_manager: None,
+            dm_tunnel_sign_key: None,
+            dm_tunnel_sign_hash: None,
+            read_receipt_watermarks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             protocol_compat: std::sync::Arc::new(
                 crate::protocol_versioning::ProtocolCompatRegistry::default(),
             ),
@@ -5252,6 +5270,13 @@ pub async fn start_node_inner(
         let mut tunnel_manager_for_state: Option<
             std::sync::Arc<crate::tunnel_manager::TunnelManager>,
         > = None;
+        // ZEB-214: the read-receipt signer material, lifted out of the tunnel
+        // block below so the guard assignment (far below) can stash it on
+        // NodeState for mark_dm_read / the reconnect re-send.
+        let mut dm_tunnel_sign_material_for_state: Option<(
+            std::sync::Arc<ed25519_dalek::SigningKey>,
+            crate::owner_state_types::DeviceIdentityHash,
+        )> = None;
         // ZEB-623: the per-peer protocol-compatibility registry, built alongside
         // the `TunnelManager` below (sharing the SAME `Arc`) and published onto
         // NodeState only when the tunnel acceptor actually installs — so the
@@ -12212,6 +12237,11 @@ pub async fn start_node_inner(
                     // assignment below.
                     device_id_for_state = Some(device_id);
                     self_owner_for_state = Some(self_owner);
+                    // ZEB-214: lift the read-receipt signer material too (used
+                    // only when a tunnel is up; mark_dm_read gates on the
+                    // manager being present).
+                    dm_tunnel_sign_material_for_state =
+                        Some((dm_tunnel_sign_key_arc.clone(), dm_tunnel_sign_hash));
                     keytree_for_state = Some(std::sync::Arc::clone(&kt));
                     crdt_state_for_state = Some(crdt_state);
                     tracker_for_state = Some(tracker);
@@ -12996,6 +13026,14 @@ pub async fn start_node_inner(
                         // `None` if iroh bind failed) so the Task 8 DmTransport
                         // can route outbound DMs through it.
                         guard.tunnel_manager = tunnel_manager_for_state;
+                        // ZEB-214: the read-receipt signer material — the SAME
+                        // #2/#3 key the tunnel transport signs CidNotify with —
+                        // so mark_dm_read / the reconnect re-send can build +
+                        // sign receipts consistently with the deposit rung.
+                        if let Some((key, hash)) = dm_tunnel_sign_material_for_state {
+                            guard.dm_tunnel_sign_key = Some(key);
+                            guard.dm_tunnel_sign_hash = Some(hash);
+                        }
                         // ZEB-623: publish the compat registry shared with the
                         // installed TunnelManager (kept as an empty default on a
                         // deposit-only node where no manager installed).
@@ -44390,6 +44428,166 @@ async fn list_shared_in_profile_communities(
     Ok(ids)
 }
 
+/// ZEB-214: toggle the per-DM read-receipt preference (owner-local, synced
+/// across the owner's own devices). Gated to Dm/GroupDm by the helper; a no-op
+/// toggle does not burn an HLC. Notifies the owner-state sync engine so the
+/// change persists + replicates.
+#[tauri::command]
+async fn set_space_read_receipt_pref(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    space_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let id_bytes: [u8; 16] = hex::decode(&space_id)
+        .map_err(|e| format!("invalid space_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "space_id must be 16 bytes (32 hex chars)".to_string())?;
+    let sid = crate::owner_state_types::SpaceId(id_bytes);
+    let pref = if enabled {
+        crate::owner_state_types::ReadReceiptPref::Broadcast
+    } else {
+        crate::owner_state_types::ReadReceiptPref::Off
+    };
+    let (crdt_state, hlc_tracker, adopt_floor, device_id, sync_engine, snapshot_generation) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.hlc_adopt_floor.clone(),
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| g.owner_not_loaded_msg())?,
+            g.sync_engine.clone(),
+            g.generation,
+        )
+    };
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let new_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+        &hlc_tracker,
+        &adopt_floor,
+        &device_id,
+        wall_now_ms,
+    )
+    .await;
+    let changed = {
+        let mut g = crdt_state.lock().await;
+        g.set_read_receipt_pref(sid, pref, new_hlc)?
+    };
+    // Detached-node post-check (mirrors set_space_shared_in_profile): a restart
+    // between the snapshot and now would orphan `crdt_state`.
+    {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        if g.generation != snapshot_generation {
+            return Err("node generation changed during set_space_read_receipt_pref; \
+                 pref was written to a detached crdt_state — retry against the live node"
+                .to_string());
+        }
+    }
+    if changed {
+        if let Some(engine) = sync_engine.as_ref() {
+            engine.notify_dirty();
+        }
+    }
+    Ok(())
+}
+
+/// ZEB-214: read the current per-DM read-receipt preference (true = Broadcast).
+/// Frontend calls this to reflect the synced toggle state on DM open.
+#[tauri::command]
+async fn get_space_read_receipt_pref(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    space_id: String,
+) -> Result<bool, String> {
+    let id_bytes: [u8; 16] = hex::decode(&space_id)
+        .map_err(|e| format!("invalid space_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "space_id must be 16 bytes (32 hex chars)".to_string())?;
+    let sid = crate::owner_state_types::SpaceId(id_bytes);
+    let crdt_state = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        g.crdt_state
+            .clone()
+            .ok_or_else(|| g.owner_not_loaded_msg())?
+    };
+    let g = crdt_state.lock().await;
+    Ok(matches!(
+        g.read_receipt_pref(sid),
+        Some(crate::owner_state_types::ReadReceiptPref::Broadcast)
+    ))
+}
+
+/// ZEB-214: the user read a DM up to `up_to_ms` (the newest rendered message's
+/// ms timestamp). If opted in (1:1 Dm, Broadcast) and the peer is reachable,
+/// push a signed watermark receipt over the live tunnel. Ephemeral — never
+/// deposited. A no-op when the tunnel/signing material isn't up (node still
+/// booting or deposit-only).
+#[tauri::command]
+async fn mark_dm_read(
+    state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    space_id: String,
+    up_to_ms: u64,
+) -> Result<(), String> {
+    let id_bytes: [u8; 16] = hex::decode(&space_id)
+        .map_err(|e| format!("invalid space_id hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "space_id must be 16 bytes (32 hex chars)".to_string())?;
+    let sid = crate::owner_state_types::SpaceId(id_bytes);
+    let (crdt_state, mgr, key, hash, self_owner, device_id, watermarks) = {
+        let g = state_lock
+            .lock()
+            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        (
+            g.crdt_state.clone(),
+            g.tunnel_manager.clone(),
+            g.dm_tunnel_sign_key.clone(),
+            g.dm_tunnel_sign_hash,
+            g.dm_self_owner,
+            g.dm_device_id.clone(),
+            g.read_receipt_watermarks.clone(),
+        )
+    };
+    // Any missing handle ⇒ node not fully up / no iroh ⇒ best-effort no-op.
+    let (Some(crdt_state), Some(mgr), Some(key), Some(hash), Some(self_owner), Some(device_id)) =
+        (crdt_state, mgr, key, hash, self_owner, device_id)
+    else {
+        return Ok(());
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    crate::dm_read_receipt::maybe_send_read_receipt(
+        &crdt_state,
+        &mgr,
+        &key,
+        hash,
+        self_owner,
+        &device_id,
+        &watermarks,
+        sid,
+        up_to_ms,
+        now_ms,
+    )
+    .await;
+    Ok(())
+}
+
 /// IPC: Sub-D Phase 4 (ZEB-281). Subscribe to a peer's profile-broadcast
 /// topic. Returns a u64 SubscriptionId the frontend uses to address
 /// subsequent unsubscribe/get_cached calls + to filter incoming
@@ -71666,6 +71864,9 @@ pub fn run() {
             browse_library,
             set_space_shared_in_profile,
             list_shared_in_profile_communities,
+            set_space_read_receipt_pref,
+            get_space_read_receipt_pref,
+            mark_dm_read,
             subscribe_peer_profile,
             unsubscribe_peer_profile,
             get_cached_peer_profile,
@@ -78916,6 +79117,11 @@ mod start_node_race_tests {
             dm_local_kem_pubkey: None,
             dm_pq_identity: None,
             tunnel_manager: None,
+            dm_tunnel_sign_key: None,
+            dm_tunnel_sign_hash: None,
+            read_receipt_watermarks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             protocol_compat: std::sync::Arc::new(
                 crate::protocol_versioning::ProtocolCompatRegistry::default(),
             ),

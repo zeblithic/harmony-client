@@ -713,6 +713,46 @@ impl OwnerState {
         }
     }
 
+    /// ZEB-214: set the owner-local per-DM read-receipt preference. Gated to
+    /// `Dm`/`GroupDm` (the field is meaningless elsewhere). `Ok(true)` on a
+    /// real change (caller has already reserved `new_hlc` and will notify the
+    /// sync engine so it persists + replicates), `Ok(false)` on a no-op
+    /// (unchanged — no HLC burned).
+    pub fn set_read_receipt_pref(
+        &mut self,
+        space_id: crate::owner_state_types::SpaceId,
+        pref: crate::owner_state_types::ReadReceiptPref,
+        new_hlc: crate::owner_state_types::Hlc,
+    ) -> Result<bool, String> {
+        let space = self
+            .spaces
+            .get_mut(&space_id)
+            .ok_or_else(|| format!("space not found: {space_id:?}"))?;
+        if !matches!(
+            space.kind,
+            crate::owner_state_types::SpaceKind::Dm | crate::owner_state_types::SpaceKind::GroupDm
+        ) {
+            return Err(format!(
+                "read_receipt_pref is DM-only (kind={:?})",
+                space.kind
+            ));
+        }
+        if space.read_receipt_pref == Some(pref) {
+            return Ok(false);
+        }
+        space.read_receipt_pref = Some(pref);
+        space.updated_at = new_hlc;
+        Ok(true)
+    }
+
+    /// ZEB-214: read the per-DM read-receipt preference (`None` ≡ Off).
+    pub fn read_receipt_pref(
+        &self,
+        space_id: crate::owner_state_types::SpaceId,
+    ) -> Option<crate::owner_state_types::ReadReceiptPref> {
+        self.spaces.get(&space_id).and_then(|s| s.read_receipt_pref)
+    }
+
     /// Apply a device-list update for an OwnerAddr. LWW on `learned_at` HLC;
     /// devices are deduped + sorted + capped at MAX_DEVICES_PER_OWNER before
     /// storage to bound cache memory and prevent cache-growth DoS via spoofed
@@ -1882,6 +1922,74 @@ mod apply_space_tests {
             lww_merge_space(&newer, &older).read_receipt_pref,
             Some(ReadReceiptPref::Broadcast)
         );
+    }
+
+    fn space_of_kind(id: SpaceId, kind: SpaceKind) -> Space {
+        use crate::owner_state_types::DmContentKey;
+        let content_key = if matches!(kind, SpaceKind::Dm | SpaceKind::GroupDm) {
+            Some(DmContentKey::new([0x22; 32]))
+        } else {
+            None
+        };
+        Space {
+            id,
+            kind,
+            parent: None,
+            community_id: None,
+            name: "s".into(),
+            transport: None,
+            members: vec![OwnerAddr([1; 16]), OwnerAddr([2; 16])],
+            custom_name: None,
+            notification_pref: None,
+            read_receipt_pref: None,
+            left_at: None,
+            created_at: hlc(1),
+            updated_at: hlc(1),
+            content_key,
+            prior_content_keys: vec![],
+            current_epoch: None,
+            current_epoch_key: None,
+            old_epoch_keys: std::collections::BTreeMap::new(),
+            admin_addr: None,
+            is_invite_only: None,
+            shared_in_profile: false,
+            pending_join_at: None,
+        }
+    }
+
+    #[test]
+    fn set_read_receipt_pref_gates_kind_and_is_idempotent() {
+        use crate::owner_state_types::ReadReceiptPref;
+        let dm_id = SpaceId([0xD1; 16]);
+        let ch_id = SpaceId([0xC1; 16]);
+        let mut st = OwnerState::default();
+        st.spaces.insert(dm_id, space_of_kind(dm_id, SpaceKind::Dm));
+        st.spaces
+            .insert(ch_id, space_of_kind(ch_id, SpaceKind::Channel));
+
+        let h1 = hlc(10);
+        assert_eq!(
+            st.set_read_receipt_pref(dm_id, ReadReceiptPref::Broadcast, h1.clone())
+                .unwrap(),
+            true
+        );
+        assert_eq!(st.read_receipt_pref(dm_id), Some(ReadReceiptPref::Broadcast));
+        assert_eq!(st.spaces[&dm_id].updated_at, h1);
+        // Idempotent: same value → no-op, no HLC change.
+        assert_eq!(
+            st.set_read_receipt_pref(dm_id, ReadReceiptPref::Broadcast, hlc(20))
+                .unwrap(),
+            false
+        );
+        assert_eq!(st.spaces[&dm_id].updated_at, h1);
+        // Non-DM kind → Err.
+        assert!(st
+            .set_read_receipt_pref(ch_id, ReadReceiptPref::Broadcast, hlc(30))
+            .is_err());
+        // Missing space → Err.
+        assert!(st
+            .set_read_receipt_pref(SpaceId([0xAB; 16]), ReadReceiptPref::Off, hlc(40))
+            .is_err());
     }
 
     #[test]
