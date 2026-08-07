@@ -792,6 +792,12 @@ pub async fn ingest_dm_packet(
             inline_blob = Some(storage_blob);
             (signed, signature, signed_bytes)
         }
+        crate::dm_envelope::DmPacket::ReadReceipt { .. } => {
+            // ZEB-214: a read-receipt watermark. Verify + emit is added in a
+            // later task; this placeholder keeps the dispatch total and drops
+            // the frame (never a chat message).
+            return Ok(false);
+        }
     };
 
     // 2. Admission under the owner-state lock — the SAME verification a
