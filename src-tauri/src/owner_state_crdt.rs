@@ -1968,19 +1968,15 @@ mod apply_space_tests {
             .insert(ch_id, space_of_kind(ch_id, SpaceKind::Channel));
 
         let h1 = hlc(10);
-        assert_eq!(
-            st.set_read_receipt_pref(dm_id, ReadReceiptPref::Broadcast, h1.clone())
-                .unwrap(),
-            true
-        );
+        assert!(st
+            .set_read_receipt_pref(dm_id, ReadReceiptPref::Broadcast, h1.clone())
+            .unwrap());
         assert_eq!(st.read_receipt_pref(dm_id), Some(ReadReceiptPref::Broadcast));
         assert_eq!(st.spaces[&dm_id].updated_at, h1);
         // Idempotent: same value → no-op, no HLC change.
-        assert_eq!(
-            st.set_read_receipt_pref(dm_id, ReadReceiptPref::Broadcast, hlc(20))
-                .unwrap(),
-            false
-        );
+        assert!(!st
+            .set_read_receipt_pref(dm_id, ReadReceiptPref::Broadcast, hlc(20))
+            .unwrap());
         assert_eq!(st.spaces[&dm_id].updated_at, h1);
         // Non-DM kind → Err.
         assert!(st
