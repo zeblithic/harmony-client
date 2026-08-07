@@ -737,10 +737,13 @@ impl OwnerState {
                 space.kind
             ));
         }
-        if space.read_receipt_pref == Some(pref) {
+        // `None ≡ Off`: store `Off` as `None` so the `rr` field is omitted from
+        // the wire when receipts are off (see `ReadReceiptPref::stored`).
+        let target = pref.stored();
+        if space.read_receipt_pref == target {
             return Ok(false);
         }
-        space.read_receipt_pref = Some(pref);
+        space.read_receipt_pref = target;
         space.updated_at = new_hlc;
         Ok(true)
     }
@@ -1981,6 +1984,20 @@ mod apply_space_tests {
             .set_read_receipt_pref(dm_id, ReadReceiptPref::Broadcast, hlc(20))
             .unwrap());
         assert_eq!(st.spaces[&dm_id].updated_at, h1);
+        // `None ≡ Off`: disabling stores `None` (not `Some(Off)`) so the `rr`
+        // field drops from the wire — and it IS a real change from Broadcast.
+        let h2 = hlc(25);
+        assert!(st
+            .set_read_receipt_pref(dm_id, ReadReceiptPref::Off, h2.clone())
+            .unwrap());
+        assert_eq!(st.read_receipt_pref(dm_id), None);
+        assert_eq!(st.spaces[&dm_id].read_receipt_pref, None);
+        assert_eq!(st.spaces[&dm_id].updated_at, h2);
+        // Off on an already-off DM is a no-op (None matches Off's stored form).
+        assert!(!st
+            .set_read_receipt_pref(dm_id, ReadReceiptPref::Off, hlc(28))
+            .unwrap());
+        assert_eq!(st.spaces[&dm_id].updated_at, h2);
         // Non-DM kind → Err.
         assert!(st
             .set_read_receipt_pref(ch_id, ReadReceiptPref::Broadcast, hlc(30))

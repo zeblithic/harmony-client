@@ -80,6 +80,19 @@ pub(crate) fn prepare_read_receipt(
     Some((peer, wire))
 }
 
+/// Record a per-space read watermark as a **grow-only max**: reconnect re-sends
+/// replay the stored watermark when a peer proves reachable, so it must never
+/// regress below the furthest point we've told the peer we've read — a later
+/// lower `up_to_ms` (reorder, an out-of-order mark) must not discard it (ZEB-214).
+pub(crate) fn record_watermark_max(
+    map: &mut std::collections::HashMap<SpaceId, u64>,
+    space_id: SpaceId,
+    up_to_ms: u64,
+) {
+    let entry = map.entry(space_id).or_insert(up_to_ms);
+    *entry = (*entry).max(up_to_ms);
+}
+
 /// Orchestrate a single read-receipt push: prepare (pref gate + packet build),
 /// record the watermark for later reconnect re-sends, and push over the live
 /// tunnel. No-op when `prepare_read_receipt` returns `None`. Never writes the
@@ -113,7 +126,7 @@ pub(crate) async fn maybe_send_read_receipt(
     let Some((peer, wire)) = prepared else {
         return;
     };
-    watermarks.lock().await.insert(space_id, up_to_ms);
+    record_watermark_max(&mut *watermarks.lock().await, space_id, up_to_ms);
     crate::iroh_tunnel_dm_transport::send_packet_to_owner_tunnels(crdt_state, mgr, peer, &wire)
         .await;
 }
@@ -360,5 +373,21 @@ mod tests {
         let plan = plan_reconnect_resends(&st, me, peer, &wm);
         assert_eq!(plan, vec![a_id]);
         let _ = (b_id, c_id);
+    }
+
+    #[test]
+    fn record_watermark_is_grow_only() {
+        let sid = SpaceId([0x7C; 16]);
+        let mut wm = std::collections::HashMap::new();
+        record_watermark_max(&mut wm, sid, 100);
+        assert_eq!(wm.get(&sid), Some(&100)); // first write seeds the value
+        record_watermark_max(&mut wm, sid, 250);
+        assert_eq!(wm.get(&sid), Some(&250)); // higher advances
+                                              // A later LOWER watermark must NOT discard the max (reconnect re-send
+                                              // depends on replaying the furthest read progress).
+        record_watermark_max(&mut wm, sid, 40);
+        assert_eq!(wm.get(&sid), Some(&250));
+        record_watermark_max(&mut wm, sid, 250);
+        assert_eq!(wm.get(&sid), Some(&250)); // equal is idempotent
     }
 }

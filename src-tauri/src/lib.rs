@@ -44528,6 +44528,15 @@ async fn set_space_read_receipt_pref(
             g.generation,
         )
     };
+    // Peek before reserving: a no-op toggle must not burn an HLC (honor
+    // `set_read_receipt_pref`'s contract). `None ≡ Off`, so disabling an
+    // already-off DM — or re-enabling an already-on one — is a no-op.
+    {
+        let g = crdt_state.lock().await;
+        if g.read_receipt_pref(sid) == pref.stored() {
+            return Ok(());
+        }
+    }
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

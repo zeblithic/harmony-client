@@ -29,7 +29,13 @@ export class ReadReceiptService {
       const prev = this.watermarks.get(p.spaceId) ?? -1;
       if (p.readUpTo <= prev) return; // monotonic: ignore stale/duplicate
       this.watermarks.set(p.spaceId, p.readUpTo);
-      if (typeof p.at === 'number') this.seenAt.set(p.spaceId, p.at);
+      // `at` advances monotonically too: a higher-watermark receipt sent with an
+      // older timestamp (clock skew, reorder, reconnect re-send) must not regress
+      // the displayed "Seen HH:MM" (see this module's header contract).
+      if (typeof p.at === 'number') {
+        const prevSeen = this.seenAt.get(p.spaceId) ?? -1;
+        if (p.at > prevSeen) this.seenAt.set(p.spaceId, p.at);
+      }
       this.onChange?.();
     });
   }

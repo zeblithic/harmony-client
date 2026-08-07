@@ -130,6 +130,7 @@ fn space_with_pending_join_at_canonical_cbor_pinned() {
         admin_addr: Some(FIXTURE_ADMIN_ADDR),
         is_invite_only: Some(true),
         shared_in_profile: false,
+        read_receipt_pref: None,
         pending_join_at: Some(Hlc {
             wall_ms: FIXTURE_MINTED_AT_MS + 500,
             logical: 0,

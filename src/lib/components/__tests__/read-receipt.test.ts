@@ -29,6 +29,11 @@ describe('ReadReceiptService', () => {
     a.emit({ spaceId: 'aa', from: 'bb', readUpTo: 50, at: 999 });
     expect(svc.getWatermark('aa')).toBe(200);
     expect(svc.getSeenAt('aa')).toBe(250);
+    // A higher watermark carrying an OLDER send-time advances the watermark but
+    // must NOT regress the displayed "Seen HH:MM" clock (skew/reorder/re-send).
+    a.emit({ spaceId: 'aa', from: 'bb', readUpTo: 300, at: 100 });
+    expect(svc.getWatermark('aa')).toBe(300);
+    expect(svc.getSeenAt('aa')).toBe(250);
     // Unknown space → undefined.
     expect(svc.getWatermark('zz')).toBeUndefined();
   });

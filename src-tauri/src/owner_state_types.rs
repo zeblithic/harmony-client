@@ -1503,6 +1503,20 @@ pub enum ReadReceiptPref {
     Broadcast,
 }
 
+impl ReadReceiptPref {
+    /// The stored/serialized representation, honoring the `None ≡ Off` contract:
+    /// `Off` maps to `None` so the additive `rr` field is omitted from the wire
+    /// when receipts are off, and toggling back off leaves no residual bytes.
+    /// The single source of truth for that normalization (used by both the CRDT
+    /// setter and the Tauri command's no-op peek).
+    pub const fn stored(self) -> Option<ReadReceiptPref> {
+        match self {
+            ReadReceiptPref::Off => None,
+            other => Some(other),
+        }
+    }
+}
+
 // ZEB-220 sealed trait impls — every wire type in this module must
 // implement `CanonicalPayload` so it can pass through
 // `canonical_cbor_encode` / `canonical_cbor_decode`. Adding a new
