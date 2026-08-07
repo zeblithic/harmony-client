@@ -1500,6 +1500,22 @@ where
     // it back — rolling back would lose the user's freshly minted identity
     // (spec §7.1). The cost of a failed restart is a manual relaunch, which
     // is strictly better than identity loss.
+    // ZEB-796: a freshly-minted identity must not inherit the previous
+    // identity's privacy posture (discoverability etc.) — `connectivity-settings.json`
+    // is keyed to the app-data dir, not the identity, so it outlives any single
+    // identity. Resolve its path up front so the mint's blocking closure can
+    // reset it right after the new identity is persisted. Resolution failure is
+    // non-fatal: the reset is best-effort and must never block a mint.
+    let connectivity_settings_path = match crate::resolve_app_data_dir() {
+        Ok(dir) => Some(dir.join("connectivity-settings.json")),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "mint: could not resolve app data dir for the ZEB-796 privacy-posture reset; skipping (a new identity may inherit the prior posture until the next settings change)"
+            );
+            None
+        }
+    };
     let mint_dir = identity_dir.clone();
     let mint_result = run_blocking(move || {
         // Hold the process-wide owner-state write mutex for the entire
@@ -1533,6 +1549,26 @@ where
             Some(&*master_seed),
             keychain,
         )?;
+        // ZEB-796: now that the new identity is persisted, reset the
+        // identity-scoped privacy/trust posture to product defaults (preserving
+        // the machine's relay infra). Best-effort: the identity is already
+        // written (no rollback — spec §7.1), so a reset failure must NOT fail the
+        // mint. On failure, fail SAFE — remove the inherited file so the next
+        // `load_or_default` returns Default (discoverable OFF) rather than leaving
+        // a stale opt-in in place. The node is stopped here (Phase 1), so no
+        // concurrent writer races this settings write.
+        if let Some(ref cs_path) = connectivity_settings_path {
+            if let Err(e) =
+                crate::connectivity_settings::ConnectivitySettings::reset_privacy_posture_for_new_identity(cs_path)
+            {
+                tracing::error!(
+                    path = %cs_path.display(),
+                    error = %e,
+                    "mint: failed to reset privacy posture for the new identity; removing the inherited settings file so it fails safe to defaults"
+                );
+                let _ = std::fs::remove_file(cs_path);
+            }
+        }
         let token = insert_token(master_seed.clone());
         let loaded = LoadedOwnerState {
             state: owner_state,

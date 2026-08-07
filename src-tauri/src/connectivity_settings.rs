@@ -408,6 +408,43 @@ impl ConnectivitySettings {
         std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
+
+    /// ZEB-796: reset the identity-scoped privacy/trust posture to product
+    /// first-run defaults for a freshly-minted identity, PRESERVING the
+    /// machine-level relay infrastructure. `relays` / `iroh_relays` are
+    /// operational infra, not a user opt-out (see [`Self::fail_closed_defaults`]),
+    /// so they carry across an identity rotation; the four privacy/trust toggles
+    /// do not.
+    ///
+    /// `connectivity-settings.json` is keyed to the app-data dir, not the
+    /// identity, so without this a new identity silently inherits the previous
+    /// one's discoverability (it produced a false conclusion during ZEB-770).
+    /// Every new identity funnels through mint, so this single call normalizes
+    /// the three start-fresh paths that today disagree on whether the file
+    /// survives: the boot-failure reset (`reset_local_identity`) and profile
+    /// reuse preserve it, while the ZEB-842 clean-slate wipe deletes it.
+    ///
+    /// Effect: `identity_discoverable` → OFF, `friend_auto_accept_known` → ON,
+    /// `presence_invisible` → visible, `peer_intro_policy` → FriendsOfFriends;
+    /// `relays` / `iroh_relays` carried over from any existing file, else the
+    /// default pool. Uses product [`Default`], not [`Self::fail_closed_defaults`]:
+    /// a deliberate mint is a fresh *install*, not untrusted state — and the one
+    /// safety-critical toggle (`identity_discoverable`) is OFF in both, so the
+    /// fail-safe direction is covered regardless.
+    pub fn reset_privacy_posture_for_new_identity(path: &PathBuf) -> std::io::Result<()> {
+        // Carry the machine's relay infra across the reset. `load_or_default`
+        // already fails closed on a corrupt/unreadable file (relays fall back to
+        // the vetted default pool), which is the right behavior here too — a new
+        // identity never inherits a *privacy* toggle, but it should keep whatever
+        // relay pool this machine can actually reach.
+        let existing = Self::load_or_default(path);
+        let reset = Self {
+            relays: existing.relays,
+            iroh_relays: existing.iroh_relays,
+            ..Self::default()
+        };
+        reset.save(path)
+    }
 }
 
 #[cfg(test)]
@@ -872,5 +909,76 @@ mod tests {
             ConnectivitySettings::load_or_default(&path).peer_intro_policy,
             crate::friend_graph::PeerIntroPolicy::Closed,
         );
+    }
+
+    // ---- ZEB-796: reset privacy posture on mint ----
+
+    #[test]
+    fn reset_privacy_posture_resets_toggles_preserves_relays() {
+        // A freshly-minted identity must not inherit the previous identity's
+        // privacy posture, but MUST keep the machine's relay infrastructure.
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        // Seed an "inherited" file: every privacy/trust toggle flipped AWAY from
+        // its product default, plus a custom relay pool the machine configured.
+        let inherited = ConnectivitySettings {
+            identity_discoverable: true,
+            friend_auto_accept_known: false,
+            presence_invisible: true,
+            peer_intro_policy: crate::friend_graph::PeerIntroPolicy::Closed,
+            relays: vec!["https://relay.pkarr.org".to_string()],
+            iroh_relays: vec!["https://use1-1.relay.n0.iroh.link".to_string()],
+        };
+        inherited.save(&path).expect("seed inherited settings");
+
+        ConnectivitySettings::reset_privacy_posture_for_new_identity(&path).expect("reset");
+
+        let after = ConnectivitySettings::load_or_default(&path);
+        // All four privacy/trust toggles back to product Default.
+        assert!(!after.identity_discoverable, "discoverable must reset OFF");
+        assert!(
+            after.friend_auto_accept_known,
+            "auto-accept-known back to product default ON"
+        );
+        assert!(!after.presence_invisible, "presence back to visible");
+        assert_eq!(
+            after.peer_intro_policy,
+            crate::friend_graph::PeerIntroPolicy::FriendsOfFriends,
+        );
+        // Machine relay infra preserved verbatim (not reset to the default pool).
+        assert_eq!(after.relays, vec!["https://relay.pkarr.org".to_string()]);
+        assert_eq!(
+            after.iroh_relays,
+            vec!["https://use1-1.relay.n0.iroh.link".to_string()]
+        );
+    }
+
+    #[test]
+    fn reset_privacy_posture_on_missing_file_writes_clean_default() {
+        // No prior file (a genuine first-run mint): the reset writes product
+        // Default — discoverable OFF, the vetted default relay pool.
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        assert!(!path.exists(), "precondition: no settings file");
+        ConnectivitySettings::reset_privacy_posture_for_new_identity(&path).expect("reset");
+        assert_eq!(
+            ConnectivitySettings::load_or_default(&path),
+            ConnectivitySettings::default()
+        );
+    }
+
+    #[test]
+    fn reset_privacy_posture_on_corrupt_file_writes_clean_default() {
+        // A corrupt inherited file must not block the reset and must not carry a
+        // stale toggle across: load_or_default fails closed (discoverable OFF,
+        // default relay pool), then the reset writes product Default over it.
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        std::fs::write(&path, b"{ not valid json").expect("write corrupt");
+        ConnectivitySettings::reset_privacy_posture_for_new_identity(&path).expect("reset");
+        let after = ConnectivitySettings::load_or_default(&path);
+        assert!(!after.identity_discoverable);
+        assert_eq!(after.relays, default_pkarr_relays());
+        assert_eq!(after, ConnectivitySettings::default());
     }
 }

@@ -535,6 +535,24 @@ Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
 > has never enabled discoverability. If you only need the two nodes to become
 > friends, that path has fewer preconditions.
 
+> **A freshly-minted identity is a clean slate for privacy posture (ZEB-796).**
+> `mint_owner_identity` now resets the four connectivity privacy/trust toggles
+> — `identity_discoverable` (→ OFF), `friend_auto_accept_known`,
+> `presence_invisible`, `peer_intro_policy` — to their product first-run
+> defaults, so a re-minted identity does **not** inherit the previous
+> identity's discoverability. The machine's relay pool (`relays` /
+> `iroh_relays`) is operational infra and **persists** across a mint.
+>
+> This matters when you use "mint a fresh profile" as a test control:
+> `connectivity-settings.json` is keyed to the app-data dir, not the identity,
+> so *before* ZEB-796 it outlived the identity — a 2-minute-old identity could
+> read `identity_discoverable: true` inherited from a prior one (this produced
+> a false conclusion during the ZEB-770 exercise: `enrolledAt` dates the
+> *identity*, but the flag lived in a longer-lived file). Post-ZEB-796 a fresh
+> mint reads `false` unless you explicitly re-enable it, so it is again a valid
+> clean-slate control **for discoverability** — but remember relays are
+> deliberately carried over.
+
 > **Sharing files: `grant_read` requires an Active friend.** Grants deliver
 > over the friend transport, so sharing with someone you merely share a
 > community with is rejected as `ineligible: non_friend`. Friend them first

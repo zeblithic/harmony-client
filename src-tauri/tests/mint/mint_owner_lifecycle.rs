@@ -29,8 +29,9 @@
 //! deliberately-failing closure (locks the no-rollback invariant from
 //! `feedback_metadata_before_irreversible_write` + spec §7.1).
 //!
-//! All four tests mutate `$HOME`/`$USERPROFILE` (process-global), so they
-//! run `#[serial]` (the workspace already depends on `serial_test`).
+//! All five tests mutate `$HOME`/`$USERPROFILE` (and the ZEB-796 test also
+//! `HARMONY_DATA_DIR`) — all process-global — so they run `#[serial]` (the
+//! workspace already depends on `serial_test`).
 //!
 //! ZEB-442: uses `mint_owner_identity_inner_for_test` (gated behind
 //! `feature = "test-fixtures"`), so the module self-gates — matching the
@@ -39,6 +40,8 @@
 //! binary) instead of failing on the unresolved fixtures-only import.
 #![cfg(feature = "test-fixtures")]
 
+use harmony_app::connectivity_settings::ConnectivitySettings;
+use harmony_app::friend_graph::PeerIntroPolicy;
 use harmony_app::owner_commands::mint_owner_identity_inner_for_test;
 use harmony_app::NodeState;
 use serial_test::serial;
@@ -101,6 +104,73 @@ fn cbor_path(home: &TempDir) -> std::path::PathBuf {
 /// successful `start_node_inner`.
 fn ok_restart() -> impl FnOnce() -> std::future::Ready<Result<(), String>> {
     || std::future::ready(Ok(()))
+}
+
+/// ZEB-796: `connectivity-settings.json` resolves via `resolve_app_data_dir()`
+/// (HARMONY_DATA_DIR base → `<base>/net.zeblith.harmony`, profile None — no test
+/// here sets HARMONY_PROFILE). Pinning HARMONY_DATA_DIR to a fresh tempdir makes
+/// the mint's privacy-posture reset land at a deterministic, cross-platform path
+/// we can seed and assert. Returns the tempdir (keep alive), its guard, and the
+/// resolved settings-file path. Independent of `home_override` (identity dir uses
+/// HOME; settings dir uses HARMONY_DATA_DIR).
+fn data_dir_override() -> (TempDir, EnvVarGuard, std::path::PathBuf) {
+    let data = TempDir::new().unwrap();
+    let guard = EnvVarGuard::set("HARMONY_DATA_DIR", data.path());
+    let settings_path = data
+        .path()
+        .join("net.zeblith.harmony")
+        .join("connectivity-settings.json");
+    (data, guard, settings_path)
+}
+
+#[test]
+#[serial]
+fn mint_resets_inherited_privacy_posture_preserving_relays() {
+    // ZEB-796: minting a fresh identity into an app-data dir that already holds a
+    // prior identity's connectivity-settings.json must NOT inherit that posture
+    // (the boot-failure-reset / profile-reuse footgun), but MUST keep the
+    // machine's relay infrastructure.
+    let (_home, _g1, _g2, _g3) = home_override();
+    let (_data, _gd, settings_path) = data_dir_override();
+
+    // Seed an "inherited" settings file: every privacy/trust toggle flipped away
+    // from its product default, plus a custom relay pool the machine configured.
+    std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    let inherited = ConnectivitySettings {
+        identity_discoverable: true,
+        friend_auto_accept_known: false,
+        presence_invisible: true,
+        peer_intro_policy: PeerIntroPolicy::Closed,
+        relays: vec!["https://relay.pkarr.org".to_string()],
+        iroh_relays: vec!["https://use1-1.relay.n0.iroh.link".to_string()],
+    };
+    inherited
+        .save(&settings_path)
+        .expect("seed inherited settings");
+
+    let state = Mutex::new(NodeState::default());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(mint_owner_identity_inner_for_test(&state, ok_restart()));
+    assert!(result.is_ok(), "mint must succeed; got: {result:?}");
+
+    // The mint reset the identity-scoped posture to product defaults...
+    let after = ConnectivitySettings::load_or_default(&settings_path);
+    assert!(
+        !after.identity_discoverable,
+        "mint must reset discoverable OFF (not inherit the prior identity's opt-in)"
+    );
+    assert!(
+        after.friend_auto_accept_known,
+        "auto-accept-known back to product default ON"
+    );
+    assert!(!after.presence_invisible, "presence back to visible");
+    assert_eq!(after.peer_intro_policy, PeerIntroPolicy::FriendsOfFriends);
+    // ...while preserving the machine's relay infrastructure verbatim.
+    assert_eq!(after.relays, vec!["https://relay.pkarr.org".to_string()]);
+    assert_eq!(
+        after.iroh_relays,
+        vec!["https://use1-1.relay.n0.iroh.link".to_string()]
+    );
 }
 
 #[test]
