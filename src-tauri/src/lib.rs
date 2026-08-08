@@ -40319,6 +40319,8 @@ fn orphan_dir_adoption_eligible(
     true
 }
 
+use crate::community_invite::{RedeemInviteError, RedeemInviteErrorCode};
+
 /// **Overrides.** Thin wrapper around `redeem_invite_inner_with_overrides`
 /// that passes the default (no overrides). Existing callers stay
 /// unchanged; the iroh-handshake redemption path (ZEB-325 Phase 2c
@@ -40347,7 +40349,7 @@ pub async fn redeem_invite_inner<F>(
     channel_log_registry: std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     fence_check: F,
     identity_dir: Option<std::path::PathBuf>,
-) -> Result<RedeemInviteResultDto, String>
+) -> Result<RedeemInviteResultDto, RedeemInviteError>
 where
     F: Fn() -> Result<(), String>,
 {
@@ -40420,13 +40422,19 @@ pub async fn redeem_invite_inner_with_overrides<F>(
     // ZEB-325 Phase 2c option A: pre-minted artifacts + pre-delivered
     // counter-sign event. See `RedeemInviteOverrides` docs.
     overrides: RedeemInviteOverrides,
-) -> Result<RedeemInviteResultDto, String>
+) -> Result<RedeemInviteResultDto, RedeemInviteError>
 where
     F: Fn() -> Result<(), String>,
 {
     // 1. Decode URL.
-    let payload = crate::community_invite::decode_invite_url(&url)
-        .map_err(|e| format!("decode invite URL: {e}"))?;
+    let payload = crate::community_invite::decode_invite_url(&url).map_err(|e| {
+        // ZEB-885: InviteUrlError → invite_url_malformed; keep the existing
+        // "decode invite URL:" prefix as the diagnostic message.
+        RedeemInviteError::new(
+            RedeemInviteErrorCode::InviteUrlMalformed,
+            format!("decode invite URL: {e}"),
+        )
+    })?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -40435,8 +40443,15 @@ where
 
     // ZEB-497: fail fast — verify the inviter's enrollment cert + token sig
     // before reserving an HLC, minting the local bootstrap Join, or any network.
-    crate::community_invite::verify_inviter_enrollment(&payload, wall_now_ms / 1000)
-        .map_err(|e| format!("verify inviter enrollment: {e}"))?;
+    crate::community_invite::verify_inviter_enrollment(&payload, wall_now_ms / 1000).map_err(
+        |e| {
+            // ZEB-885: CommunityInviteVerifyError → inviter_enrollment_invalid.
+            RedeemInviteError::new(
+                RedeemInviteErrorCode::InviterEnrollmentInvalid,
+                format!("verify inviter enrollment: {e}"),
+            )
+        },
+    )?;
 
     // 4. ZEB-267: atomic HLC reservation. Replaces the
     //    snapshot-then-release pattern + post-commit advance.
@@ -40691,7 +40706,10 @@ where
             crate::community_state_crdt::InsertOutcome::Inserted
         ) {
             // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-            return Err(format!("self Join not inserted (got {outcome:?})"));
+            return Err(RedeemInviteError::new(
+                RedeemInviteErrorCode::EngineInsertFailed,
+                format!("self Join not inserted (got {outcome:?})"),
+            ));
         }
 
         // Open cross-WAN first-contact dial (open-community-cross-wan): the
@@ -40773,7 +40791,10 @@ where
             Some(t) => t.clone(),
             None => {
                 // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                return Err("invite-only payload missing invite_token".to_string());
+                return Err(RedeemInviteError::new(
+                    RedeemInviteErrorCode::InviteTokenMissing,
+                    "invite-only payload missing invite_token",
+                ));
             }
         };
 
@@ -40788,7 +40809,9 @@ where
         let (admin_bootstrap, admin_identity_pub) =
             crate::community_invite::verify_admin_bootstrap(&payload)
                 // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                .map_err(|verify_err| verify_err.to_string())?;
+                // ZEB-885: RedeemBootstrapVerifyError → its matching bootstrap_*
+                // code (From reuses reason_tag); message stays the Display prose.
+                .map_err(RedeemInviteError::from)?;
         // Idempotent on retry: insert_local_event_with_pubs dedups on
         // event-id. The clone is cheap (SignedMembershipEvent is a few
         // hundred bytes) and required because the engine consumes by
@@ -40817,12 +40840,16 @@ where
             | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {}
             Ok(crate::community_state_crdt::InsertOutcome::Rejected(verify_err)) => {
                 // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                return Err(format!("engine rejected admin bootstrap: {verify_err}"));
+                return Err(RedeemInviteError::new(
+                    RedeemInviteErrorCode::EngineInsertFailed,
+                    format!("engine rejected admin bootstrap: {verify_err}"),
+                ));
             }
             Err(insert_err) => {
                 // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                return Err(format!(
-                    "engine.insert_local_event_with_pubs (admin bootstrap): {insert_err}"
+                return Err(RedeemInviteError::new(
+                    RedeemInviteErrorCode::EngineInsertFailed,
+                    format!("engine.insert_local_event_with_pubs (admin bootstrap): {insert_err}"),
                 ));
             }
         }
@@ -40877,7 +40904,10 @@ where
                     .take_pending_redemption(&minted.bootstrap_join.id)
                     .await;
                 // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                return Err(format!("build_signed_invite_packet: {e}"));
+                return Err(RedeemInviteError::new(
+                    RedeemInviteErrorCode::Internal,
+                    format!("build_signed_invite_packet: {e}"),
+                ));
             }
         };
         // ZEB-473 (Move 1a): the encoded `_wire` packet was previously consumed
@@ -40892,7 +40922,10 @@ where
                     .take_pending_redemption(&minted.bootstrap_join.id)
                     .await;
                 // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                return Err(format!("encode_packet: {e}"));
+                return Err(RedeemInviteError::new(
+                    RedeemInviteErrorCode::Internal,
+                    format!("encode_packet: {e}"),
+                ));
             }
         };
 
@@ -40907,14 +40940,16 @@ where
             | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {}
             Ok(crate::community_state_crdt::InsertOutcome::Rejected(verify_err)) => {
                 // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                return Err(format!(
-                    "engine rejected local PendingJoin insert: {verify_err}"
+                return Err(RedeemInviteError::new(
+                    RedeemInviteErrorCode::EngineInsertFailed,
+                    format!("engine rejected local PendingJoin insert: {verify_err}"),
                 ));
             }
             Err(insert_err) => {
                 // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
-                return Err(format!(
-                    "engine.insert_local_event (PendingJoin): {insert_err}"
+                return Err(RedeemInviteError::new(
+                    RedeemInviteErrorCode::EngineInsertFailed,
+                    format!("engine.insert_local_event (PendingJoin): {insert_err}"),
                 ));
             }
         }
@@ -40958,9 +40993,12 @@ where
                 let _ = community_registry
                     .take_pending_redemption(&minted.bootstrap_join.id)
                     .await;
-                return Err(format!(
-                    "pre_delivered_countersign target_event_id does not match bootstrap_join.id={}",
-                    hex::encode(minted.bootstrap_join.id)
+                return Err(RedeemInviteError::new(
+                    RedeemInviteErrorCode::Internal,
+                    format!(
+                        "pre_delivered_countersign target_event_id does not match bootstrap_join.id={}",
+                        hex::encode(minted.bootstrap_join.id)
+                    ),
                 ));
             }
             match engine_arc
@@ -41004,16 +41042,20 @@ where
                     let _ = community_registry
                         .take_pending_redemption(&minted.bootstrap_join.id)
                         .await;
-                    return Err(format!(
-                        "engine rejected pre_delivered_countersign: {verify_err}"
+                    return Err(RedeemInviteError::new(
+                        RedeemInviteErrorCode::EngineInsertFailed,
+                        format!("engine rejected pre_delivered_countersign: {verify_err}"),
                     ));
                 }
                 Err(insert_err) => {
                     let _ = community_registry
                         .take_pending_redemption(&minted.bootstrap_join.id)
                         .await;
-                    return Err(format!(
-                        "engine.insert_local_event_with_pubs (pre_delivered_countersign): {insert_err}"
+                    return Err(RedeemInviteError::new(
+                        RedeemInviteErrorCode::EngineInsertFailed,
+                        format!(
+                            "engine.insert_local_event_with_pubs (pre_delivered_countersign): {insert_err}"
+                        ),
                     ));
                 }
             }
@@ -41179,7 +41221,10 @@ where
     //    raced our await chain), this returns Err with crdt_state
     //    still untouched.
     // ZEB-274: rollback on Err collapses into community_sync_guard Drop.
-    fence_check()?;
+    // ZEB-885: the fence closure returns a String; a tripped generation guard
+    // (node stopped / stop+restart raced) is a generation_changed condition.
+    fence_check()
+        .map_err(|e| RedeemInviteError::new(RedeemInviteErrorCode::GenerationChanged, e))?;
 
     // ZEB-254 R5-2: FINAL TOCTOU recheck before commit. The R3 (C2)
     // recheck above narrows but does not close the window between the
@@ -41247,8 +41292,9 @@ where
             // state_g drops at this block's scope end (before the function-
             // exit guard Drop, which spawns its async cleanup via
             // Handle::try_current — no lock held across the spawn).
-            return Err(format!(
-                "apply_space rejected redemption Space: {outcome:?}"
+            return Err(RedeemInviteError::new(
+                RedeemInviteErrorCode::Internal,
+                format!("apply_space rejected redemption Space: {outcome:?}"),
             ));
         }
         // ZEB-267: tracker advance no longer needed here — the
@@ -41519,7 +41565,7 @@ async fn redeem_invite(
     app: tauri::AppHandle,
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     url: String,
-) -> Result<RedeemInviteResultDto, String> {
+) -> Result<RedeemInviteResultDto, RedeemInviteError> {
     let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> = std::sync::Arc::new(app);
     redeem_invite_impl(state_lock.inner(), sink, url).await
 }
@@ -41529,10 +41575,14 @@ pub(crate) async fn redeem_invite_impl(
     state: &std::sync::Mutex<NodeState>,
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     url: String,
-) -> Result<RedeemInviteResultDto, String> {
+) -> Result<RedeemInviteResultDto, RedeemInviteError> {
     // Snapshot NodeState handles in a single guard scope, then drop
     // the std lock BEFORE any `.await`. Mirrors `create_community`'s
     // pattern.
+    //
+    // ZEB-885: a not-fully-loaded node (owner state / handles absent) is a
+    // node_not_ready condition ("your identity is still loading — retry"),
+    // distinct from an internal poisoned-lock failure.
     let (
         crdt_state,
         hlc_tracker,
@@ -41547,33 +41597,42 @@ pub(crate) async fn redeem_invite_impl(
         snapshot_generation,
         sync_engine,
     ) = {
-        let g = state
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        let g = state.lock().map_err(|e| {
+            RedeemInviteError::new(
+                RedeemInviteErrorCode::Internal,
+                format!("NodeState poisoned: {e}"),
+            )
+        })?;
+        let not_ready = |m: String| RedeemInviteError::new(RedeemInviteErrorCode::NodeNotReady, m);
         (
             g.crdt_state
                 .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
-            g.hlc_tracker.clone().ok_or("hlc_tracker missing")?,
+                .ok_or_else(|| not_ready(g.owner_not_loaded_msg().to_string()))?,
+            g.hlc_tracker
+                .clone()
+                .ok_or_else(|| not_ready("hlc_tracker missing".to_string()))?,
             g.hlc_adopt_floor.clone(),
-            g.dm_device_id.clone().ok_or("dm_device_id missing")?,
-            g.dm_self_owner.ok_or("dm_self_owner missing")?,
+            g.dm_device_id
+                .clone()
+                .ok_or_else(|| not_ready("dm_device_id missing".to_string()))?,
+            g.dm_self_owner
+                .ok_or_else(|| not_ready("dm_self_owner missing".to_string()))?,
             g.community_registry
                 .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
+                .ok_or_else(|| not_ready(g.owner_not_loaded_msg().to_string()))?,
             g.community_adapter_request_tx
                 .clone()
-                .ok_or("community_adapter_request_tx missing")?,
+                .ok_or_else(|| not_ready("community_adapter_request_tx missing".to_string()))?,
             // ZEB-434 D6: pass-through Option (no ok_or) — a missing
             // receiver degrades to a non-re-arming fetch driver rather
             // than failing the IPC.
             g.transport_epoch_rx.clone(),
             g.channel_log_registry
                 .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
+                .ok_or_else(|| not_ready(g.owner_not_loaded_msg().to_string()))?,
             g.dm_outbox
                 .clone()
-                .ok_or_else(|| g.owner_not_loaded_msg())?,
+                .ok_or_else(|| not_ready(g.owner_not_loaded_msg().to_string()))?,
             g.generation,
             g.sync_engine.clone(),
         )
@@ -41796,6 +41855,10 @@ where
         crate::owner_commands::resolve_identity_dir().ok(),
     )
     .await
+    // ZEB-885: join_open_community is a separate command (directory-join UI,
+    // not the redeem dialog) — keep its String error contract by flattening
+    // the structured redeem error to its message here.
+    .map_err(|e| e.to_string())
 }
 
 /// Tauri IPC: join an open community directly from the library-directory
@@ -43229,7 +43292,7 @@ mod zeb436_orphan_adoption_tests {
         url: String,
         crdt_state: &std::sync::Arc<tokio::sync::Mutex<OwnerState>>,
         fence_ok: bool,
-    ) -> Result<super::RedeemInviteResultDto, String> {
+    ) -> Result<super::RedeemInviteResultDto, super::RedeemInviteError> {
         super::redeem_invite_inner(
             url,
             std::sync::Arc::clone(crdt_state),
@@ -43423,7 +43486,14 @@ mod zeb436_orphan_adoption_tests {
             false, // generation fence rejects → post-spawn early return
         )
         .await;
-        assert!(failed.is_err(), "fence rejection must surface as Err");
+        // ZEB-885: a tripped generation fence surfaces as a structured
+        // generation_changed error (not a bare string).
+        let failed_err = failed.expect_err("fence rejection must surface as Err");
+        assert_eq!(
+            failed_err.code,
+            super::RedeemInviteErrorCode::GenerationChanged,
+            "tripped generation fence must map to generation_changed (was: {failed_err:?})"
+        );
 
         // The rollback runs as a task spawned by the guard's Drop. Wait
         // for it to remove the engine, then hold the line: the (pre-fix)
@@ -61238,7 +61308,7 @@ async fn connectivity_redeem_invite_iroh(
     app: tauri::AppHandle,
     state: tauri::State<'_, Mutex<NodeState>>,
     invite_url: String,
-) -> Result<RedemptionOutcome, String> {
+) -> Result<RedemptionOutcome, RedeemInviteError> {
     // ZEB-447: thin wrapper over the shared IPC/RPC seam. Build the
     // NodeEventSink from the AppHandle (mirrors the `redeem_invite` IPC)
     // and delegate. The GUI path is unchanged — the same
@@ -61258,7 +61328,7 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
     state: &Mutex<NodeState>,
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     invite_url: String,
-) -> Result<RedemptionOutcome, String> {
+) -> Result<RedemptionOutcome, RedeemInviteError> {
     // Snapshot NodeState handles in a single guard scope, then drop the
     // std lock BEFORE any `.await`. Mirrors the `redeem_invite` IPC.
     let (
@@ -61655,7 +61725,11 @@ pub(crate) async fn connectivity_open_join_iroh_impl(
             ..Default::default()
         },
     )
-    .await?;
+    // ZEB-885: connectivity_open_join_iroh is a separate open/tokenless
+    // directory-join verb, not the redeem dialog's path — flatten the
+    // structured redeem error to its message to keep its String contract.
+    .await
+    .map_err(|e| e.to_string())?;
 
     // ZEB-393 Bug A: durable-on-commit fence (mirrors `redeem_invite`). Persist
     // the joined community's owner-state Space to disk before returning so a
@@ -62087,7 +62161,7 @@ pub async fn connectivity_redeem_invite_iroh_inner<F>(
     // lib.rs:15751-15774). Tests that don't drive the fence pass
     // `|| Ok(())`.
     fence_check: F,
-) -> Result<RedemptionOutcome, String>
+) -> Result<RedemptionOutcome, RedeemInviteError>
 where
     F: Fn() -> Result<(), String>,
 {
@@ -62536,7 +62610,10 @@ where
     ) {
         Ok(m) => m,
         Err(e) => {
-            return Err(format!("mint_redemption: {e}"));
+            return Err(RedeemInviteError::new(
+                RedeemInviteErrorCode::Internal,
+                format!("mint_redemption: {e}"),
+            ));
         }
     };
 

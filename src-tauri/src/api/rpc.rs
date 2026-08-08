@@ -833,7 +833,12 @@ pub fn build_registry() -> RpcRegistry {
         }
     );
     rpc!(m, "redeem_invite", UrlArgs, |state, sink, a| async move {
-        crate::redeem_invite_impl(state, sink, a.url).await
+        // ZEB-885: flatten the structured RedeemInviteError to its message —
+        // the serve/api WS wire stays a string error (the fleet CLI doesn't
+        // switch on codes). The structured form is GUI-only.
+        crate::redeem_invite_impl(state, sink, a.url)
+            .await
+            .map_err(|e| e.to_string())
     });
     // ZEB-447: the REAL first-contact community-join verb (pkarr-resolve +
     // iroh handshake + allow_no_reticulum_destinations=true). The
@@ -844,7 +849,11 @@ pub fn build_registry() -> RpcRegistry {
         "connectivity_redeem_invite_iroh",
         UrlArgs,
         |state, sink, a| async move {
-            crate::connectivity_redeem_invite_iroh_impl(state, sink, a.url).await
+            // ZEB-885: flatten the structured error to its message — WS wire
+            // stays a string (GUI-only structured form).
+            crate::connectivity_redeem_invite_iroh_impl(state, sink, a.url)
+                .await
+                .map_err(|e| e.to_string())
         }
     );
     // open-community-cross-wan: open/tokenless first-contact join verb. The

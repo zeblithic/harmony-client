@@ -1732,6 +1732,26 @@ mod redeem_invite_error_code_tests {
         assert_eq!(ad_hoc.code, RedeemInviteErrorCode::Internal);
         assert_eq!(ad_hoc.message, "some internal failure");
     }
+
+    #[test]
+    fn iroh_redemption_failure_statuses_are_valid_codes() {
+        // ZEB-885: the iroh `RedemptionOutcome.status` vocabulary (failure
+        // cases) overlaps the error-code space so the frontend can route both
+        // an iroh status and a redeem error code through one copy table. These
+        // status literals must remain valid codes. (Retyping the `status`
+        // String field into the enum is a deliberate non-goal — see the design
+        // doc — so this guards the overlap from the enum side.)
+        for status in [
+            "inviter_unreachable",
+            "join_failed",
+            "missing_admin_identity_pub",
+        ] {
+            assert!(
+                ALL_CODES.iter().any(|c| c.as_str() == status),
+                "iroh RedemptionOutcome.status {status:?} must be a RedeemInviteErrorCode"
+            );
+        }
+    }
 }
 
 /// Run the binding chain that admits the admin's signed bootstrap event
