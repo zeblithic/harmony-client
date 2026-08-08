@@ -91,13 +91,28 @@ the outcome (the toggle was previously fire-and-forget + silent):
   `add_friend_by_key` once the driver publishes.
 - `EnabledInactive` → `warn!` — enabled but NOT registered afterwards; node may stay
   unreachable (wiring regression guard).
-- `Disabled` → `info!` — case-B unregistered; `add_friend_by_key` now returns
-  `unreachable`.
+- `Disabled` → `info!` — case-B unregistered **locally**; the node stops
+  re-publishing, but any record already published stays resolvable by
+  `add_friend_by_key` until it expires (record TTL) — there is no immediate DHT
+  retraction. (Corrected from an earlier draft that claimed immediate
+  unreachability — CodeAnt.)
 
 The verify is inline in the existing cancellation-surviving detached task; it adds a
 sub-millisecond `active_handles()` read, not network latency. The toggle's return
 value to the IPC caller is unchanged (a `warn` does not fail the toggle — the setting
 persisted).
+
+**Serialization (`IDENTITY_DISCOVERABLE_TOGGLE_LOCK`).** The pre-existing detached
+toggle serialized only the disk RMW (`CONNECTIVITY_SETTINGS_WRITE_LOCK`), not the
+live publisher mutation. Adding an `is_active` verify made that gap observable: two
+concurrent toggles (a rapid on→off flip) could persist one value while applying the
+opposite live state, and a concurrent `disable` landing between `enable()` and the
+verify could spuriously report `EnabledInactive`. A process-global
+`IDENTITY_DISCOVERABLE_TOGGLE_LOCK` (mirroring `CONNECTIVITY_SETTINGS_WRITE_LOCK`) now
+wraps the entire persist + toggle + verify inside the detached task, so the last
+toggle wins atomically and the verify is authoritative. LOCK ORDER: acquired with no
+`NodeState` mutex held and outside the settings write lock (which the persist takes
+briefly within). (CodeAnt/Qodo convergence finding.)
 
 ### What this does and does not prove
 
@@ -121,6 +136,12 @@ Unit tests in `pkarr_identity_publisher.rs` (existing `MockPkarrRelay` + spawned
 The existing `identity_discoverable_toggle_pair_survives_future_cancellation`
 (`lib.rs`) already pins that the detached toggle registers the handle end-to-end;
 it continues to pass unchanged.
+
+`lib.rs::settings_rmw_cancellation_tests::concurrent_toggles_keep_persisted_and_live_consistent`
+races an enable against a disable through `set_identity_discoverable_detached` and
+asserts the serialization invariant — persisted `identity_discoverable` == live
+`is_active()` — holds on every round (deterministically green with the toggle lock;
+the guard against a future removal of that lock).
 
 ## Out of scope / follow-ups
 
