@@ -63705,10 +63705,30 @@ async fn set_identity_discoverable_detached(
 ) -> Result<(), String> {
     tokio::spawn(async move {
         persist_identity_discoverable_locked(path, enabled).await?;
-        if enabled {
-            id_pub.enable().await;
-        } else {
-            id_pub.disable().await;
+        // ZEB-879: the runtime toggle used to call enable()/disable()
+        // fire-and-forget with NO log on either path, so a stalled enable was
+        // indistinguishable from a working one — the "silently unreachable with
+        // no error at all" symptom. Verify + log the outcome. The verify reads
+        // the driver's active handle set (sub-ms, no network IO) and never fails
+        // the toggle: the setting has already persisted, so a `warn` is a
+        // diagnostic, not a rollback.
+        match id_pub.toggle_and_verify(enabled).await {
+            pkarr_identity_publisher::ToggleOutcome::EnabledActive => tracing::info!(
+                "ZEB-879: identity discoverability enabled at runtime — case-B \
+                 publication registered; this node becomes resolvable by \
+                 add_friend_by_key once the pkarr driver publishes"
+            ),
+            pkarr_identity_publisher::ToggleOutcome::EnabledInactive => tracing::warn!(
+                "ZEB-879: identity discoverability enabled at runtime but the \
+                 case-B publication is NOT registered afterwards — this node may \
+                 stay unreachable despite the setting being on; the pkarr \
+                 identity publisher may be mis-wired"
+            ),
+            pkarr_identity_publisher::ToggleOutcome::Disabled => tracing::info!(
+                "ZEB-879: identity discoverability disabled at runtime — case-B \
+                 publication unregistered; add_friend_by_key against this node \
+                 now returns `unreachable`"
+            ),
         }
         Ok(())
     })
