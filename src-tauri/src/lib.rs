@@ -15639,6 +15639,15 @@ pub(crate) async fn send_dm_impl(
         )
     };
 
+    // ZEB-887: decode + length-check the space_id BEFORE taking the shutdown
+    // fence permit below. The decode is an O(1) length precheck (ZEB-886), so a
+    // flood of malformed ids is rejected here without occupying a send-fence
+    // permit — permits that stop_inner's `acquire_many` drain would otherwise
+    // block on during shutdown, purely to reject bad input. Kept BELOW the
+    // handle snapshot so a not-loaded node still reports owner_not_loaded first
+    // (no error-precedence change; the snapshot is cheap and takes no permit).
+    let space_id_typed = decode_space_id_16(&space_id_hex)?;
+
     // ZEB-234: shutdown fence. Pre-check the stopping flag — if set,
     // short-circuit before any work. Then acquire a permit for the
     // duration of mutation; stop_inner's acquire_many drain blocks on
@@ -15654,8 +15663,6 @@ pub(crate) async fn send_dm_impl(
     // a second OutboxEntry → duplicate DM). Those post-checks were
     // removed by ZEB-234 (this PR).
     let _fence_permit = check_dm_send_fence(&dm_send_stopping, dm_send_inflight).await?;
-
-    let space_id_typed = decode_space_id_16(&space_id_hex)?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -16437,6 +16444,14 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
 
 // ── ZEB-228 Phase 4: add_space (DM/GroupDm creation) ─────────────────────
 
+/// Hard cap on the number of members (self + recipients) a DM or GroupDm Space
+/// may hold. The per-kind recipient rules — Dm = exactly 1 recipient, GroupDm =
+/// 2–15 — live in [`add_space_dm_inner`], which stays the single authority for
+/// cardinality; this constant is the shared upper bound that authority and the
+/// `add_space_impl` fail-fast precheck (ZEB-887) both derive from, so the two
+/// can never drift apart.
+pub(crate) const MAX_DM_SPACE_MEMBERS: usize = 16;
+
 /// Pure inner implementation of `add_space`'s DM/GroupDm dispatch. The
 /// `#[tauri::command]` shim snapshots NodeState handles, drops the sync
 /// mutex, calls this, then forwards each `UnicastSendRequest` into the
@@ -16534,9 +16549,9 @@ pub fn add_space_dm_inner(
     }
     // Defense in depth — frontend already blocks but enforce here too.
     let total_members = 1 + recipients.len();
-    if total_members > 16 {
+    if total_members > MAX_DM_SPACE_MEMBERS {
         return Err(format!(
-            "DM/GroupDm cap is 16 members; got {total_members} (use a community for larger groups)"
+            "DM/GroupDm cap is {MAX_DM_SPACE_MEMBERS} members; got {total_members} (use a community for larger groups)"
         ));
     }
     match kind {
@@ -16821,12 +16836,26 @@ pub(crate) async fn add_space_impl(
         }
     };
 
+    // ZEB-887 fail-fast: reject an oversized recipient list BEFORE decoding it.
+    // The most any kind accepts is `MAX_DM_SPACE_MEMBERS - 1` recipients
+    // (GroupDm's 2–15), so a longer `members` vector is guaranteed to be
+    // rejected on cardinality by `add_space_dm_inner` — bail here rather than
+    // iterate + decode an attacker-controlled list first. The exact per-kind
+    // bound (Dm = 1, GroupDm = 2–15) stays authoritative in `add_space_dm_inner`
+    // (single source of truth); this is only its shared upper bound.
+    let members = members.unwrap_or_default();
+    if members.len() > MAX_DM_SPACE_MEMBERS - 1 {
+        return Err(format!(
+            "DM/GroupDm cap is {MAX_DM_SPACE_MEMBERS} members; got {} recipients (use a community for larger groups)",
+            members.len()
+        ));
+    }
+
     // Decode each recipient OwnerAddr from hex. Keep the hardened
     // length-prechecked decode, but wrap its error with the offending element
     // so a malformed entry in a multi-recipient request is still identifiable
     // (Qodo review, ZEB-886).
     let recipients: Vec<OwnerAddr> = members
-        .unwrap_or_default()
         .iter()
         .map(|hex_addr| {
             decode_id_16(hex_addr, "recipient")
@@ -78922,6 +78951,99 @@ mod zeb703_outbox_runtime_durability_tests {
             .expect("server task must join after /v1/shutdown")
             .expect("server task must not panic")
             .expect("graceful shutdown must end the server cleanly");
+    }
+
+    /// ZEB-887: `send_dm_impl` must length-check + decode the `space_id` BEFORE
+    /// acquiring the ZEB-234 shutdown-fence permit, so a flood of malformed ids
+    /// can't occupy send-fence permits (which shutdown draining blocks on) purely
+    /// to be rejected. Discriminator: with the stopping flag SET, a malformed id
+    /// must still reject on the DECODE, not the fence — proving the decode runs
+    /// first. Flips to "node stopping" if the decode is ever moved back below the
+    /// fence.
+    #[tokio::test]
+    async fn send_dm_decodes_space_id_before_shutdown_fence_zeb887() {
+        let alice = crate::owner_state_types::OwnerAddr([0x01; 16]);
+        // Fence set to STOPPING: were the decode still below the fence, this send
+        // would short-circuit with "node stopping" before ever inspecting the id.
+        let stopping_flag = Arc::new(AtomicBool::new(true));
+        let inflight_sem = Arc::new(tokio::sync::Semaphore::new(DM_SEND_FENCE_CAPACITY));
+        let node = std::sync::Mutex::new(NodeState {
+            dm_outbox: Some(Arc::new(tokio::sync::Mutex::new(make_outbox_synthetic(
+                "zeb887-dev",
+                alice,
+            )))),
+            dm_transport: Some(Arc::new(crate::dm_outbox::StubTransport::new())),
+            crdt_state: Some(Arc::new(tokio::sync::Mutex::new(
+                crate::owner_state_crdt::OwnerState::default(),
+            ))),
+            hlc_tracker: Some(Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("zeb887-dev".into()),
+            ))),
+            dm_device_id: Some("zeb887-dev".into()),
+            dm_self_owner: Some(alice),
+            content_store: Some(Arc::new(crate::content_store::InMemoryStub::default())),
+            dm_send_inflight: Some(Arc::clone(&inflight_sem)),
+            dm_send_stopping: Some(Arc::clone(&stopping_flag)),
+            ..NodeState::default()
+        });
+
+        // An oversized, attacker-shaped hex id (18 000 chars). The length
+        // precheck rejects it in O(1) — no allocation, and no fence permit taken.
+        let malformed = "ab".repeat(9_000);
+        let err = send_dm_impl(&node, malformed, b"x".to_vec(), "text/plain".into())
+            .await
+            .expect_err("malformed space_id must be rejected");
+        assert!(
+            err.contains("space_id must be 16 bytes"),
+            "decode must run before the fence — a malformed id must reject on the \
+             length precheck even with the stopping flag set, got: {err}"
+        );
+        assert!(
+            !err.contains("node stopping"),
+            "fence must not pre-empt the decode for a malformed id (ZEB-887), got: {err}"
+        );
+    }
+
+    /// ZEB-887: `add_space_impl` must reject an oversized recipient list on the
+    /// cheap cardinality precheck BEFORE decoding it (and before the handle
+    /// snapshot) — a huge attacker-controlled `members` vector must not be fully
+    /// iterated + decoded just to be rejected on count. The precheck fires
+    /// without a loaded node; the exact per-kind bound stays authoritative in
+    /// `add_space_dm_inner`. Boundary: `MAX_DM_SPACE_MEMBERS - 1` recipients is
+    /// accepted by the precheck (only then hitting the unloaded-node error),
+    /// pinning the bound at 15 — no off-by-one that would reject a valid GroupDm.
+    #[tokio::test]
+    async fn add_space_rejects_oversized_recipient_list_before_decode_zeb887() {
+        let node = std::sync::Mutex::new(NodeState::default());
+
+        // One past the cap: MAX_DM_SPACE_MEMBERS recipients (→ +1 member over the
+        // limit). Distinct, well-formed hex ids so the ONLY reason to reject is
+        // cardinality — a decode failure would surface a different message.
+        let too_many: Vec<String> = (0..MAX_DM_SPACE_MEMBERS)
+            .map(|i| hex::encode([i as u8; 16]))
+            .collect();
+        let err = add_space_impl(&node, "group-dm".into(), "Big".into(), Some(too_many))
+            .await
+            .expect_err("oversized recipient list must be rejected");
+        assert!(
+            err.contains("DM/GroupDm cap is 16 members"),
+            "oversized list must reject on the cardinality precheck, got: {err}"
+        );
+
+        // Boundary: exactly MAX_DM_SPACE_MEMBERS - 1 recipients passes the
+        // precheck + decode, then hits the unloaded-node snapshot — so the error
+        // is owner-not-loaded, NOT the cap message. Proves the precheck admits a
+        // full-size GroupDm (no off-by-one).
+        let at_cap: Vec<String> = (0..MAX_DM_SPACE_MEMBERS - 1)
+            .map(|i| hex::encode([i as u8; 16]))
+            .collect();
+        let err2 = add_space_impl(&node, "group-dm".into(), "Ok".into(), Some(at_cap))
+            .await
+            .expect_err("unloaded node still errors, just not on the cap");
+        assert!(
+            !err2.contains("DM/GroupDm cap"),
+            "MAX_DM_SPACE_MEMBERS - 1 recipients must pass the precheck (got cap error): {err2}"
+        );
     }
 
     /// ZEB-703 (PR #485 Greptile P1): the pre-ack barrier must WAIT for
