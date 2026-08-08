@@ -630,9 +630,18 @@ mod tests {
             !loaded.identity_discoverable,
             "fail-closed recovery must leave the new identity NOT discoverable"
         );
-        assert!(loaded.presence_invisible, "fail-closed recovery must be invisible");
-        assert!(!loaded.friend_auto_accept_known, "fail-closed recovery must not auto-accept");
-        assert!(!loaded.relays.is_empty(), "fail-closed must keep the relay pool, not brick connectivity");
+        assert!(
+            loaded.presence_invisible,
+            "fail-closed recovery must be invisible"
+        );
+        assert!(
+            !loaded.friend_auto_accept_known,
+            "fail-closed recovery must not auto-accept"
+        );
+        assert!(
+            !loaded.relays.is_empty(),
+            "fail-closed must keep the relay pool, not brick connectivity"
+        );
     }
 
     #[test]
