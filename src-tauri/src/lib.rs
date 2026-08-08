@@ -773,6 +773,22 @@ pub(crate) async fn build_bundle_tree_with_options(
 /// `SyncEngine::shutdown` runs.
 pub const DM_SEND_FENCE_CAPACITY: usize = 1024;
 
+/// ZEB-882: a frontend-requested owner card that arrived before the owner
+/// runtime was wired (a boot-publish racing the Zenoh-session connect).
+/// `republish_owner_card_impl` stashes it here instead of dropping it on the
+/// `"owner card runtime not ready"` error; `start_node_inner` drains it once all
+/// gating components are committed, so a boot race can no longer leave the node
+/// permanently nameless (with `ProfileCardPublisher.latest == None`, every 600s
+/// refresh is a silent no-op). In-memory only — the display name is deliberately
+/// never persisted backend-side.
+#[derive(Clone)]
+struct PendingCard {
+    display_name: String,
+    status_text: String,
+    avatar_cid: Option<[u8; 32]>,
+    profile_page_root: Option<[u8; 32]>,
+}
+
 pub struct NodeState {
     /// Background thread running the event loop (NodeRuntime is !Send).
     thread: Option<thread::JoinHandle<()>>,
@@ -1132,6 +1148,10 @@ pub struct NodeState {
     /// receive it. Wired by start_node; shut down on stop/restart.
     profile_card_publisher:
         Option<std::sync::Arc<crate::profile_card_broadcast::ProfileCardPublisher>>,
+    /// ZEB-882: a boot-race owner-card publish stashed by
+    /// `republish_owner_card_impl` when the runtime wasn't ready, drained by
+    /// `start_node_inner` once it is. See `PendingCard`.
+    pending_card: Option<PendingCard>,
     /// ZEB-281 Sub-D Phase 4: peer-broadcast cache. Shared with the
     /// event-loop's subscriber task pool. Always Some while node is
     /// running.
@@ -2122,6 +2142,7 @@ impl Default for NodeState {
             // allocator starts at 1 (0 reserved as "uninitialized").
             profile_broadcast_publisher: None,
             profile_card_publisher: None,
+            pending_card: None,
             profile_broadcast_cache: None,
             profile_broadcast_request_tx: None,
             profile_broadcast_next_subscription_id: std::sync::Arc::new(
@@ -14767,6 +14788,16 @@ pub async fn start_node_inner(
         Err(_) => Err("runtime thread exited before reporting startup status".to_string()),
     };
 
+    // ZEB-882: on a successful start, complete any owner-card publish the frontend
+    // requested before the runtime was wired (a boot-publish that raced the
+    // Zenoh-session connect and was stashed in `pending_card`). This runs strictly
+    // after the atomic commit block above set every gating component, so the
+    // stash→drain ordering is race-free. Only on success — a failed start tears
+    // the runtime back down below and leaves the latch for the next start.
+    if result.is_ok() {
+        drain_pending_owner_card(state).await;
+    }
+
     // On startup failure, clean up stale handles — but only if the
     // generation still matches. A newer start_node may have already
     // replaced our handles; passing our generation avoids tearing
@@ -15126,17 +15157,55 @@ pub(crate) async fn republish_owner_card_impl(
             Some(root_arr)
         }
     };
-    let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, adopt_floor, profile_card_publisher) = {
-        let guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+    // ZEB-882: decide publish-vs-stash under ONE lock so a not-ready stash can't
+    // race the `start_node_inner` drain (which also takes this lock). If the five
+    // gating components are all wired, publish now (unchanged happy path). If not,
+    // stash the requested card into `pending_card` — `drain_pending_owner_card`
+    // completes it once the runtime is ready — and still return the same not-ready
+    // `Err` the frontend already handles. Fixes the boot race where a dropped
+    // not-ready publish left the node permanently nameless.
+    let (
+        ready,
+        dm_outbox,
+        dm_self_owner,
+        dm_device_id,
+        hlc_tracker,
+        adopt_floor,
+        profile_card_publisher,
+    ) = {
+        let mut guard = state.lock().map_err(|e| format!("lock: {e}"))?;
+        let dm_outbox = guard.dm_outbox.clone();
+        let dm_self_owner = guard.dm_self_owner;
+        let dm_device_id = guard.dm_device_id.clone();
+        let hlc_tracker = guard.hlc_tracker.clone();
+        let adopt_floor = guard.hlc_adopt_floor.clone();
+        let profile_card_publisher = guard.profile_card_publisher.clone();
+        let ready = dm_outbox.is_some()
+            && dm_self_owner.is_some()
+            && dm_device_id.is_some()
+            && hlc_tracker.is_some()
+            && profile_card_publisher.is_some();
+        if !ready {
+            guard.pending_card = Some(PendingCard {
+                display_name: display_name.clone(),
+                status_text: status_text.clone(),
+                avatar_cid: avatar_cid_bytes,
+                profile_page_root: profile_page_root_bytes,
+            });
+        }
         (
-            guard.dm_outbox.clone(),
-            guard.dm_self_owner,
-            guard.dm_device_id.clone(),
-            guard.hlc_tracker.clone(),
-            guard.hlc_adopt_floor.clone(),
-            guard.profile_card_publisher.clone(),
+            ready,
+            dm_outbox,
+            dm_self_owner,
+            dm_device_id,
+            hlc_tracker,
+            adopt_floor,
+            profile_card_publisher,
         )
     };
+    if !ready {
+        return Err("owner card runtime not ready".to_string());
+    }
     publish_owner_card(
         dm_outbox,
         dm_self_owner,
@@ -15150,6 +15219,113 @@ pub(crate) async fn republish_owner_card_impl(
         profile_page_root_bytes,
     )
     .await
+}
+
+/// ZEB-882: complete a boot-race owner-card publish. `republish_owner_card_impl`
+/// stashes the frontend's requested card into `NodeState.pending_card` when the
+/// owner runtime isn't wired yet (rather than dropping it and relying on a
+/// frontend retry). Once `start_node_inner` has committed all gating components,
+/// this drains the latch and publishes, so `ProfileCardPublisher.latest` is
+/// reliably set. No-op when nothing is pending. Gated on a successful start by
+/// the caller — a failed start leaves the latch for the next start.
+async fn drain_pending_owner_card(state: &std::sync::Mutex<NodeState>) {
+    let pending = match state.lock() {
+        Ok(mut guard) => guard.pending_card.take(),
+        Err(_) => return,
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+    let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, adopt_floor, profile_card_publisher) = {
+        match state.lock() {
+            Ok(guard) => (
+                guard.dm_outbox.clone(),
+                guard.dm_self_owner,
+                guard.dm_device_id.clone(),
+                guard.hlc_tracker.clone(),
+                guard.hlc_adopt_floor.clone(),
+                guard.profile_card_publisher.clone(),
+            ),
+            Err(_) => return,
+        }
+    };
+    if let Err(e) = publish_owner_card(
+        dm_outbox,
+        dm_self_owner,
+        dm_device_id,
+        hlc_tracker,
+        adopt_floor,
+        profile_card_publisher,
+        pending.display_name,
+        pending.status_text,
+        pending.avatar_cid,
+        pending.profile_page_root,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "ZEB-882: draining pending owner card after runtime-ready failed");
+    }
+}
+
+#[cfg(test)]
+mod pending_owner_card_tests {
+    use super::*;
+
+    /// ZEB-882: a boot-publish that races the runtime (all gating components
+    /// still `None`) is STASHED into `pending_card` — not dropped — while still
+    /// returning the same not-ready `Err` the frontend already handles.
+    #[tokio::test]
+    async fn republish_owner_card_stashes_pending_when_runtime_not_ready() {
+        let state = std::sync::Mutex::new(NodeState::default());
+        let err = republish_owner_card_impl(
+            &state,
+            "Ada".to_string(),
+            "coding".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a fresh NodeState has no owner runtime wired");
+        assert!(
+            err.contains("owner card runtime not ready"),
+            "unexpected error: {err}"
+        );
+        let guard = state.lock().unwrap();
+        let pending = guard
+            .pending_card
+            .as_ref()
+            .expect("the requested card must be stashed, not dropped");
+        assert_eq!(pending.display_name, "Ada");
+        assert_eq!(pending.status_text, "coding");
+        assert!(pending.avatar_cid.is_none());
+        assert!(pending.profile_page_root.is_none());
+    }
+
+    /// Draining with nothing pending is a no-op (no panic, latch stays empty).
+    #[tokio::test]
+    async fn drain_pending_owner_card_is_noop_when_nothing_pending() {
+        let state = std::sync::Mutex::new(NodeState::default());
+        drain_pending_owner_card(&state).await;
+        assert!(state.lock().unwrap().pending_card.is_none());
+    }
+
+    /// The drain TAKES the latch even when the publish itself can't complete, so
+    /// a stashed card can never strand `pending_card` as permanently `Some`.
+    #[tokio::test]
+    async fn drain_pending_owner_card_clears_latch() {
+        let state = std::sync::Mutex::new(NodeState::default());
+        state.lock().unwrap().pending_card = Some(PendingCard {
+            display_name: "Ada".to_string(),
+            status_text: String::new(),
+            avatar_cid: None,
+            profile_page_root: None,
+        });
+        drain_pending_owner_card(&state).await;
+        assert!(
+            state.lock().unwrap().pending_card.is_none(),
+            "drain must clear the latch"
+        );
+    }
 }
 
 /// Send a channel message to the mesh network via Zenoh pub/sub.
@@ -79215,6 +79391,7 @@ mod start_node_race_tests {
             library_directory: None,
             profile_broadcast_publisher: None,
             profile_card_publisher: None,
+            pending_card: None,
             profile_broadcast_cache: None,
             profile_broadcast_request_tx: None,
             profile_broadcast_next_subscription_id: std::sync::Arc::new(
