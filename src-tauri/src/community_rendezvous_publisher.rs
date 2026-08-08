@@ -245,7 +245,28 @@ impl CommunityRendezvousPublisher {
                     _,
                 >(base.as_slice())
                 {
-                    Ok(reach) => {
+                    Ok(mut reach) => {
+                        // ZEB-880: a rendezvous beacon is a first-contact DIAL
+                        // target — a joiner uses iroh_node_id + relay + direct
+                        // addresses and never reads butler_set (offline-DM
+                        // seal-targets). Carrying it is dead weight AND its
+                        // ~290 B for two entries is what pushed this record over
+                        // pkarr's size cap. Strip it, then bound the addresses
+                        // (reserving the record envelope + the "mv" vouch this
+                        // blob adds) so the signed record fits the cap.
+                        crate::reachability_bound::strip_offline_delivery_fields(&mut reach);
+                        let dropped = crate::reachability_bound::bound_direct_addresses(
+                            &mut reach,
+                            crate::reachability_bound::RECORD_ENVELOPE_BYTES
+                                + crate::reachability_bound::RENDEZVOUS_VOUCH_BYTES,
+                        );
+                        if dropped > 0 {
+                            tracing::debug!(
+                                dropped,
+                                kept = reach.direct_addresses.len(),
+                                "ZEB-880: trimmed rendezvous direct addresses to fit the pkarr record size cap"
+                            );
+                        }
                         let vouch = crate::membership_vouch::mint_membership_vouch(
                             &device_sk,
                             vouch_community,
@@ -479,6 +500,103 @@ mod tests {
         let mut b = Vec::new();
         ciborium::into_writer(&p, &mut b).unwrap();
         b
+    }
+
+    /// AVALON's overflowing shape: 2 IPv4 + 3 global IPv6 direct addresses and
+    /// a full 2-entry butler set (ZEB-880 repro).
+    fn avalon_reachability_blob() -> Vec<u8> {
+        let butler = |s: u8| crate::reachability_record::ButlerSetEntry {
+            device_id: [s; 16],
+            iroh_endpoint_id: [s.wrapping_add(1); 32],
+            device_ed25519_verify: [s.wrapping_add(2); 32],
+            home_relay: "https://usw1-1.relay.n0.iroh.link/".to_string(),
+            pinned: false,
+        };
+        let p = crate::reachability_record::ReachabilityAnnouncePayload {
+            iroh_node_id: [3u8; 32],
+            home_relay_url: "https://usw1-1.relay.n0.iroh.link/".to_string(),
+            direct_addresses: vec![
+                "165.162.82.51:35102".parse().unwrap(),
+                "192.168.1.59:63933".parse().unwrap(),
+                "[2603:8002:ddf0:3380::1787]:63934".parse().unwrap(),
+                "[2603:8002:ddf0:3380:6b34:be5b:30f8:5f6e]:63934"
+                    .parse()
+                    .unwrap(),
+                "[2603:8002:ddf0:3380:bc5e:7e59:7bfb:19a6]:63934"
+                    .parse()
+                    .unwrap(),
+            ],
+            announced_at_ms: 1_000,
+            identity_signature: [0u8; 64],
+            butler_set: vec![butler(0x10), butler(0x20)],
+            bs_at: 1_000,
+        };
+        let mut b = Vec::new();
+        ciborium::into_writer(&p, &mut b).unwrap();
+        b
+    }
+
+    /// ZEB-880 regression: an AVALON-shaped reachability blob (butler + 5 addrs)
+    /// overflowed pkarr's size cap as a rendezvous record. The publisher must
+    /// strip the (dial-irrelevant) butler set and bound addresses so the built
+    /// record fits — and, butler being the driver, keep all 5 addresses.
+    #[tokio::test]
+    async fn refresh_slot_bounds_oversized_record_to_fit() {
+        use crate::community_rendezvous::decode_rendezvous_blob;
+        use crate::reachability_bound::{MAX_RECORD_CBOR_BYTES, RECORD_ENVELOPE_BYTES};
+
+        // Guard the premise: the un-fixed record (butler + 5 addrs + vouch +
+        // envelope) genuinely overflows.
+        let unfixed = avalon_reachability_blob();
+        assert!(
+            unfixed.len()
+                + crate::reachability_bound::RENDEZVOUS_VOUCH_BYTES
+                + RECORD_ENVELOPE_BYTES
+                > MAX_RECORD_CBOR_BYTES,
+            "premise: the un-fixed AVALON rendezvous record must overflow"
+        );
+
+        let spy = Arc::new(MockPublisher::default());
+        let device_sk = SigningKey::from_bytes(&[42u8; 32]);
+        let id_sk = SigningKey::from_bytes(&[11u8; 32]);
+        let id_pub = build_id_pub(&id_sk);
+        let publisher = CommunityRendezvousPublisher::new_with_sink(
+            spy.clone(),
+            id_sk,
+            id_pub,
+            Arc::new(device_sk),
+            Arc::new(avalon_reachability_blob),
+        );
+
+        let cid = SpaceId([7u8; 16]);
+        let me = OwnerAddr([5u8; 16]);
+        publisher
+            .refresh_slot(cid, EpochKey::new([2u8; 32]), vec![me], me)
+            .await;
+
+        let reg = spy
+            .last_registration()
+            .await
+            .expect("a record was registered");
+        // The full record CBOR = routing_blob + envelope. It must fit the cap.
+        assert!(
+            reg.routing_blob.len() + RECORD_ENVELOPE_BYTES <= MAX_RECORD_CBOR_BYTES,
+            "rendezvous record still over budget: blob {} + envelope {} > {}",
+            reg.routing_blob.len(),
+            RECORD_ENVELOPE_BYTES,
+            MAX_RECORD_CBOR_BYTES
+        );
+        let (payload, vouch) = decode_rendezvous_blob(&reg.routing_blob).expect("blob decodes");
+        assert!(vouch.is_some(), "vouch still present");
+        assert!(
+            payload.butler_set.is_empty(),
+            "butler_set must be stripped from the rendezvous dial beacon"
+        );
+        assert_eq!(
+            payload.direct_addresses.len(),
+            5,
+            "stripping butler frees enough budget to keep all 5 addresses"
+        );
     }
 
     #[tokio::test]
