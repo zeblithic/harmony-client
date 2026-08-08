@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Cargo commands run from `src-tauri/`. Gates: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run --locked --workspace --all-targets --features test-fixtures`. Frontend from root: `npx tsc --noEmit`; `npx vitest run`.
+- **All** cargo commands (every intermediate task step, not just the final gate) run from `src-tauri/` with `--locked`; clippy uses `--all-targets`; any command that must see integration tests uses `--features test-fixtures`. Per-step shorthand like "cargo nextest on the touched tests" means `cd src-tauri && cargo nextest run --locked --features test-fixtures -E '<filter>'` (add `--all-targets` when a bin/integration target is in scope). Gates: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run --locked --workspace --all-targets --features test-fixtures`. Frontend from root: `npx tsc --noEmit`; `npx vitest run`.
 - **Reply-drain wedge (ZEB-803/812):** in the D2 subscriber `session.get`, ZERO `.await` forwarding a Zenoh `Reply` into a bounded channel. Local-drain into an owned `Option<Vec<u8>>` only. Mirror `fetch_via_zenoh` (event_loop.rs:7650) / `query_mail_root` (event_loop.rs:7706).
 - Display name is NEVER persisted backend-side. The latch is in-memory only.
 - No placeholder/empty-name card is ever published; a node with no real name publishes nothing.

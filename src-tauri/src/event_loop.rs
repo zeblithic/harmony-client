@@ -3009,25 +3009,66 @@ pub async fn run(
                                 // ZEB-884: query-on-subscribe fast path. A plain
                                 // declare_subscriber only receives FUTURE PUTs, so a
                                 // late joiner would wait up to the 600s publisher
-                                // refresh for a name. Immediately GET the peer's
-                                // current card from their publisher-side queryable and
-                                // ingest it, so the name resolves in <1s. Local-drain
-                                // into an owned Vec ONLY — never forward a Reply into a
-                                // bounded channel (ZEB-803/812 reply-drain wedge). A
-                                // peer with no queryable / no card yields nothing
-                                // within the budget; we fall through to live PUTs.
-                                match session.get(&key_expr).await {
-                                    Ok(replies) => {
+                                // refresh for a name. Fire a one-shot GET against the
+                                // peer's publisher-side queryable to fetch the current
+                                // card. Run it in a DETACHED task so it NEVER blocks the
+                                // live recv loop below (or a shutdown) for up to the GET
+                                // budget — the recv loop starts immediately and both
+                                // paths feed the same cache (newer-HLC-wins). Local-
+                                // drain into an owned Vec ONLY — never forward a Reply
+                                // into a bounded channel (ZEB-803/812 reply-drain
+                                // wedge). A peer with no queryable / no card yields
+                                // nothing; we fall through to live PUTs.
+                                {
+                                    let session_q = Arc::clone(&session);
+                                    let key_q = key_expr.clone();
+                                    let cache_q = Arc::clone(&cache_for_task);
+                                    let app_q = app_for_task.clone();
+                                    let closing_q = Arc::clone(&closing_task);
+                                    tokio::spawn(async move {
+                                        if closing_q.load(Ordering::SeqCst) {
+                                            return;
+                                        }
+                                        let replies = match session_q.get(&key_q).await {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    error = %e,
+                                                    subscription_id,
+                                                    "profile card query-on-subscribe get failed; relying on PUTs"
+                                                );
+                                                return;
+                                            }
+                                        };
                                         let fetched = tokio::time::timeout(
                                             std::time::Duration::from_secs(8),
                                             async {
                                                 while let Ok(reply) = replies.recv_async().await {
-                                                    if let Ok(sample) = reply.result() {
-                                                        let view = sample.payload().to_bytes();
-                                                        if view.len()
-                                                            <= crate::profile_card_broadcast::MAX_CARD_WIRE_BYTES
-                                                        {
-                                                            return Some(view.to_vec());
+                                                    match reply.result() {
+                                                        Ok(sample) => {
+                                                            let view = sample.payload().to_bytes();
+                                                            if view.len()
+                                                                <= crate::profile_card_broadcast::MAX_CARD_WIRE_BYTES
+                                                            {
+                                                                return Some(view.to_vec());
+                                                            }
+                                                            tracing::warn!(
+                                                                size = view.len(),
+                                                                max = crate::profile_card_broadcast::MAX_CARD_WIRE_BYTES,
+                                                                subscription_id,
+                                                                "oversized profile card query reply dropped"
+                                                            );
+                                                        }
+                                                        Err(err) => {
+                                                            let msg = String::from_utf8_lossy(
+                                                                &err.payload().to_bytes(),
+                                                            )
+                                                            .into_owned();
+                                                            tracing::debug!(
+                                                                subscription_id,
+                                                                err = %msg,
+                                                                "profile card query reply error"
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -3042,19 +3083,12 @@ pub async fn run(
                                                 &bytes,
                                                 subscription_id,
                                                 owner_id,
-                                                cache_for_task.as_ref(),
-                                                app_for_task.as_ref(),
+                                                cache_q.as_ref(),
+                                                app_q.as_ref(),
                                             )
                                             .await;
                                         }
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            error = %e,
-                                            subscription_id,
-                                            "profile card query-on-subscribe get failed; relying on PUTs"
-                                        );
-                                    }
+                                    });
                                 }
                                 loop {
                                     match sub.recv_async().await {

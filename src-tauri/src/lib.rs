@@ -15200,6 +15200,12 @@ pub(crate) async fn republish_owner_card_impl(
                 avatar_cid: avatar_cid_bytes,
                 profile_page_root: profile_page_root_bytes,
             });
+        } else {
+            // ZEB-884: a ready-path publish supersedes any older latched card, so
+            // clear the latch. Otherwise `drain_pending_owner_card` could later
+            // republish that stale card with a fresh (newer) HLC and regress the
+            // display name/avatar over the value we are publishing right now.
+            guard.pending_card = None;
         }
         (
             ready,
@@ -15237,25 +15243,53 @@ pub(crate) async fn republish_owner_card_impl(
 /// reliably set. No-op when nothing is pending. Gated on a successful start by
 /// the caller — a failed start leaves the latch for the next start.
 async fn drain_pending_owner_card(state: &std::sync::Mutex<NodeState>) {
-    let pending = match state.lock() {
-        Ok(mut guard) => guard.pending_card.take(),
+    // Single lock: snapshot the gating components AND take the latched card
+    // atomically, and take it ONLY when the runtime is ready. A two-lock version
+    // could take the card and then find the components cleared by a concurrent
+    // `stop_node`, losing the requested display name on a failed publish; taking
+    // only when ready instead leaves the latch intact for the next start.
+    let taken = match state.lock() {
+        Ok(mut guard) => {
+            let dm_outbox = guard.dm_outbox.clone();
+            let dm_self_owner = guard.dm_self_owner;
+            let dm_device_id = guard.dm_device_id.clone();
+            let hlc_tracker = guard.hlc_tracker.clone();
+            let adopt_floor = guard.hlc_adopt_floor.clone();
+            let profile_card_publisher = guard.profile_card_publisher.clone();
+            let ready = dm_outbox.is_some()
+                && dm_self_owner.is_some()
+                && dm_device_id.is_some()
+                && hlc_tracker.is_some()
+                && profile_card_publisher.is_some();
+            if !ready {
+                None
+            } else {
+                guard.pending_card.take().map(|pending| {
+                    (
+                        pending,
+                        dm_outbox,
+                        dm_self_owner,
+                        dm_device_id,
+                        hlc_tracker,
+                        adopt_floor,
+                        profile_card_publisher,
+                    )
+                })
+            }
+        }
         Err(_) => return,
     };
-    let Some(pending) = pending else {
+    let Some((
+        pending,
+        dm_outbox,
+        dm_self_owner,
+        dm_device_id,
+        hlc_tracker,
+        adopt_floor,
+        profile_card_publisher,
+    )) = taken
+    else {
         return;
-    };
-    let (dm_outbox, dm_self_owner, dm_device_id, hlc_tracker, adopt_floor, profile_card_publisher) = {
-        match state.lock() {
-            Ok(guard) => (
-                guard.dm_outbox.clone(),
-                guard.dm_self_owner,
-                guard.dm_device_id.clone(),
-                guard.hlc_tracker.clone(),
-                guard.hlc_adopt_floor.clone(),
-                guard.profile_card_publisher.clone(),
-            ),
-            Err(_) => return,
-        }
     };
     if let Err(e) = publish_owner_card(
         dm_outbox,
@@ -15312,10 +15346,12 @@ mod pending_owner_card_tests {
         assert!(state.lock().unwrap().pending_card.is_none());
     }
 
-    /// The drain TAKES the latch even when the publish itself can't complete, so
-    /// a stashed card can never strand `pending_card` as permanently `Some`.
+    /// ZEB-882 (CR#7 single-lock drain): when the runtime is NOT ready, the drain
+    /// must LEAVE the latch intact (take only when it can actually publish), so a
+    /// concurrent teardown can't drop the requested card on a doomed publish — the
+    /// latch survives for the next start.
     #[tokio::test]
-    async fn drain_pending_owner_card_clears_latch() {
+    async fn drain_pending_owner_card_leaves_latch_when_runtime_not_ready() {
         let state = std::sync::Mutex::new(NodeState::default());
         state.lock().unwrap().pending_card = Some(PendingCard {
             display_name: "Ada".to_string(),
@@ -15323,11 +15359,14 @@ mod pending_owner_card_tests {
             avatar_cid: None,
             profile_page_root: None,
         });
+        // NodeState::default() has no gating components -> not ready.
         drain_pending_owner_card(&state).await;
-        assert!(
-            state.lock().unwrap().pending_card.is_none(),
-            "drain must clear the latch"
-        );
+        let guard = state.lock().unwrap();
+        let pending = guard
+            .pending_card
+            .as_ref()
+            .expect("not-ready drain must leave the latch for the next start");
+        assert_eq!(pending.display_name, "Ada");
     }
 }
 
@@ -29461,18 +29500,21 @@ mod run_on_large_stack_tests {
 /// card. Explicit `--display-name` wins; otherwise fall back to the active
 /// profile name; a bare anonymous serve (no flag, default profile) publishes no
 /// card — it stays nameless rather than announcing a placeholder. Blank/
-/// whitespace-only values are treated as absent. Pure so the policy is
-/// unit-testable without spawning serve.
+/// whitespace-only values are treated as absent, and a surrounding-whitespace
+/// value is TRIMMED so the published name matches the blank-detection rule (a
+/// `"  Ada  "` flag publishes `"Ada"`, not the padded string). Pure so the
+/// policy is unit-testable without spawning serve.
 fn resolve_serve_card_name(flag: Option<String>, profile: Option<String>) -> Option<String> {
-    let non_blank = |s: String| {
-        if s.trim().is_empty() {
+    let trimmed_non_blank = |s: String| {
+        let t = s.trim();
+        if t.is_empty() {
             None
         } else {
-            Some(s)
+            Some(t.to_string())
         }
     };
-    flag.and_then(non_blank)
-        .or_else(|| profile.and_then(non_blank))
+    flag.and_then(trimmed_non_blank)
+        .or_else(|| profile.and_then(trimmed_non_blank))
 }
 
 #[cfg(test)]
@@ -29513,6 +29555,20 @@ mod serve_card_name_tests {
         assert_eq!(
             resolve_serve_card_name(Some(String::new()), Some("  ".into())),
             None
+        );
+    }
+
+    /// CR#8: the returned name is TRIMMED, so a surrounding-whitespace flag/profile
+    /// publishes the clean name rather than the padded one.
+    #[test]
+    fn surrounding_whitespace_is_trimmed() {
+        assert_eq!(
+            resolve_serve_card_name(Some("  Ada  ".into()), None),
+            Some("Ada".into())
+        );
+        assert_eq!(
+            resolve_serve_card_name(None, Some("\tKoya\n".into())),
+            Some("Koya".into())
         );
     }
 }

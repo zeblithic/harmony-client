@@ -79,9 +79,14 @@ on the frontend retry.
     `start_node_inner` end. ✅ (the previously-broken case)
   - Frontend call arrives *after* the runtime is ready → publishes immediately (today's happy path);
     the latch is empty, drain is a no-op. ✅
-- Idempotency: a redundant publish (latch drain + a later frontend success) re-emits an equal-or-newer
-  HLC card; peers apply newer-wins, so a duplicate is a harmless no-op. The latch is cleared on drain
-  so it fires at most once per start.
+- **Latch/ready-publish synchronization (no stale regression).** A ready-path publish and a stale
+  latch must never let older content win with a newer HLC. Two rules enforce this:
+  - The ready branch of `republish_owner_card_impl` **clears** `pending_card` under the same lock —
+    a fresh publish supersedes any older latched card, so the drain can't later republish stale
+    name/avatar with a newer HLC and regress the display over what we just published.
+  - `drain_pending_owner_card` snapshots the gating components **and** takes the latch under a
+    **single** lock, and takes **only when the runtime is ready**. A concurrent `stop_node` therefore
+    leaves the latch intact for the next start instead of dropping the card on a doomed publish.
 
 This does **not** publish anything when there is no real display name (no frontend call, no
 `--display-name`): `pending_card` stays `None` and the drain is a no-op. (Decision C.)
@@ -98,6 +103,10 @@ This does **not** publish anything when there is no real display name (no fronte
   named profile either, publish **nothing** (stay nameless — consistent with Decision C, no
   placeholder). Log which name source was used at info level so an operator can see it in the serve
   log.
+- **Blank normalization (single policy for both sources).** `resolve_serve_card_name` treats a
+  blank/whitespace-only flag *or* profile value as absent (falls through), and **trims** the value
+  it returns — so a `"  Ada  "` flag publishes `"Ada"`, never the padded string, and an empty
+  `--display-name ""` does not defeat the no-placeholder rule.
 - This reuses the same publish path as GUI, so the D2 queryable (below) automatically serves a serve
   node's card to late subscribers too.
 
@@ -117,12 +126,16 @@ Give a fresh subscriber the *current* card immediately instead of waiting for a 
     region, `event_loop.rs:2947`, or the publisher spawn site, `lib.rs:10738` — implementation
     choice, resolved in the plan).
 - **Subscriber side — query-on-subscribe.** In the per-subscription task, immediately after the
-  `declare_subscriber` (`event_loop.rs:2987`), issue one `session.get(card_topic)` and drain the
-  reply **locally** (mirror `fetch_via_zenoh`/`query_mail_root`, `event_loop.rs:7650`/`:7706`: a
-  bounded `tokio::time::timeout` around `while replies.recv_async().await`, storing the first valid
-  reply into a local `Option<Vec<u8>>`, then returning). Feed the fetched bytes through the **same**
-  decode → `verify_card` → attribution → `cache.insert_verified` pipeline the subscriber sample
-  handler uses. Then continue receiving live PUTs as today.
+  `declare_subscriber` (`event_loop.rs:2987`), fire one `session.get(card_topic)` in a **detached
+  task** (not inline) so it never blocks the live recv loop or a shutdown for up to the GET budget —
+  the recv loop starts immediately and both paths feed the same cache (newer-HLC-wins). The detached
+  get drains the reply **locally** (mirror `fetch_via_zenoh`/`query_mail_root`,
+  `event_loop.rs:7650`/`:7706`: a bounded `tokio::time::timeout` around `while replies.recv_async()
+  .await`, storing the first valid reply into a local `Option<Vec<u8>>`). It **logs** per-reply
+  errors and oversize skips (parity with `fetch_via_zenoh` and the live-PUT path), checks the
+  `closing` flag before starting, and feeds the fetched bytes through the **same** decode →
+  `verify_card` → attribution → `cache.insert_verified` pipeline (`ingest_card_bytes`) the subscriber
+  sample handler uses. The live recv loop continues receiving PUTs concurrently.
   - **Reply-drain safety (HARD):** the fetched bytes land in `ProfileCardCache` (a `Mutex`), **not**
     a bounded engine channel, so the local-drain pattern is sufficient and safe. There must be **zero
     `.await` forwarding a `Reply` into a bounded channel** in the get arm (the ZEB-803/812 wedge).
@@ -142,26 +155,32 @@ Give a fresh subscriber the *current* card immediately instead of waiting for a 
 Follow the established harness shapes (no real two-node Zenoh session — the existing suite proves that
 is flaky in CI; item 8 of the code map). Test each seam at the level it lives.
 
-- **A. Pending-card latch (unit, `lib.rs` or a focused module):**
-  - `publish_owner_card` on a not-ready runtime **stashes** `pending_card` (assert the field is
-    `Some` with the passed params) and still returns the `"owner card runtime not ready"` `Err`.
-  - The `start_node_inner`-end drain, given a `Some(pending_card)`, calls the publish path and clears
-    the latch to `None`. (Drive via a seam that exercises the drain without a full node boot; if a
-    direct unit seam isn't clean, cover via the `mint_owner_lifecycle` integration path asserting a
-    card is published after a simulated not-ready-then-ready sequence.)
-  - Drain with `pending_card == None` is a no-op.
-- **B. Serve name resolution (unit):** a small pure helper `resolve_serve_card_name(flag:
-  Option<String>, profile: Option<String>) -> Option<String>` returns flag > profile > `None`; unit
-  test all three branches. (Keeps the CLI wiring thin and the policy testable without spawning serve.)
+- **A. Pending-card latch (unit, `lib.rs` `pending_owner_card_tests`):**
+  - `republish_owner_card_impl` on a not-ready runtime **stashes** `pending_card` (assert `Some` with
+    the passed params) and still returns the `"owner card runtime not ready"` `Err`.
+  - `drain_pending_owner_card` with `pending_card == None` is a no-op.
+  - `drain_pending_owner_card` with the runtime **not ready** LEAVES the latch intact (single-lock,
+    take-only-when-ready — a torn-down runtime can't drop the card). The ready-path drain/publish is
+    exercised end-to-end by the integration suite (a full node boot publishes the card).
+- **B. Serve name resolution (unit, `serve_card_name_tests`):** `resolve_serve_card_name(flag,
+  profile)` returns flag > profile > `None`; blank/whitespace inputs fall through; a returned value
+  is **trimmed** (`"  Ada  "` → `"Ada"`). All branches unit-tested without spawning serve.
 - **C. Query-on-subscribe / queryable:**
   - Publisher `latest_handle()` returns a handle observing the same `Option<CardWire>` that
-    `publish_now` sets (extend the `CapturingSink` unit tests in `profile_card_broadcast.rs`).
-  - `ingest_card_bytes` helper: valid card → cached + `member-card-received` emitted; oversize
-    (>4096) → dropped pre-decode; wrong-owner attribution → rejected; stale HLC → newer-wins no-op.
-    (Reuses/renames the existing `profile_card_cross_peer_integration.rs` `pool_ingest` assertions —
-    they already drive this pipeline directly.)
-  - The `session.get` drain arm contains no `.await` into a bounded channel (enforced by construction
-    + a code comment citing ZEB-803; not a runtime test).
+    `publish_now` sets (`profile_card_broadcast.rs` unit test).
+  - `ingest_card_bytes` helper (`ingest_card_bytes_tests`): valid card → cached + `member-card-received`
+    emitted; oversize (>4096) → dropped pre-decode; wrong-owner attribution → rejected. This is the
+    shared pipeline BOTH the live-PUT arm and the query-on-subscribe path feed, so covering it proves
+    the ingest half of the D2 fast path deterministically. The existing
+    `profile_card_cross_peer_integration.rs` assertions continue to cover the verify/attribution
+    pipeline through the refactor.
+  - D2 wire-contract coverage: a real two-session Zenoh test is deliberately avoided (flaky in CI —
+    item 8 of the code map). The queryable→get contract is instead guaranteed by construction:
+    publisher and subscriber both key on `card_topic_for(owner_id)` (one function, symmetric), the
+    queryable replies the exact `latest_handle` bytes, and those bytes flow through the same
+    `ingest_card_bytes` the unit tests cover. The `session.get` drain runs in a detached task and
+    contains no `.await` into a bounded channel (ZEB-803/812), enforced by construction + a code
+    comment; not a runtime test.
 - **Full CI-parity gate before PR** (from `src-tauri/`): `cargo fmt --all -- --check`; `cargo clippy
   --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run
   --locked --workspace --all-targets --features test-fixtures`. From repo root: `npx tsc --noEmit`;
