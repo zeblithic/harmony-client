@@ -1,7 +1,12 @@
 <script lang="ts">
   import { untrack, onMount, onDestroy } from 'svelte';
   import Modal from './Modal.svelte';
-  import { mapRedeemInviteError } from '../redeem-invite-errors';
+  import {
+    mapRedeemInviteError,
+    redeemInviteCopy,
+    toRedeemInviteError,
+    type RedeemInviteError,
+  } from '../redeem-invite-errors';
   import {
     redeemInviteIroh,
     onResolutionProgress,
@@ -19,7 +24,7 @@
   }: {
     onSubmit: (url: string) => void;
     onCancel: () => void;
-    error?: string | null;
+    error?: RedeemInviteError | null;
     pending?: boolean;
     initialUrl?: string;
     /**
@@ -203,7 +208,10 @@
       }
     } catch (e) {
       irohStage = null;
-      irohError = e instanceof Error ? e.message : String(e);
+      // ZEB-885: the iroh command rejects with a structured { code, message };
+      // route its copy through the shared code table instead of dumping the
+      // raw backend message.
+      irohError = redeemInviteCopy(toRedeemInviteError(e).code).summary;
       showFallbackButton = true;
     } finally {
       // The `joined` branch defers `irohPending = false` to the dismiss
@@ -236,7 +244,7 @@
       <details>
         <summary>Show details</summary>
         <div class="diagnostic">
-          <div>Telemetry tag: <code>{mapped.tag}</code></div>
+          <div>Code: <code>{mapped.code}</code></div>
           <div>Raw error: <code>{mapped.raw}</code></div>
         </div>
       </details>

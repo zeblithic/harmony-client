@@ -120,6 +120,13 @@ export async function redeemInviteIroh(inviteUrl: string): Promise<RedemptionOut
   try {
     return await invoke<RedemptionOutcome>('connectivity_redeem_invite_iroh', { inviteUrl });
   } catch (e) {
+    // ZEB-885: the command rejects with a structured { code, message }. Preserve
+    // it unchanged so the dialog can route its copy off the code; wrapping it in
+    // a new Error here would stringify the object to "[object Object]" and drop
+    // the code. Only a non-structured rejection gets the context-prefixed Error.
+    if (e && typeof e === 'object' && 'code' in e) {
+      throw e;
+    }
     const msg = e instanceof Error ? e.message : String(e);
     throw new Error(`connectivity_redeem_invite_iroh: ${msg}`);
   }

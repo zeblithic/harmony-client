@@ -69,26 +69,46 @@ describe('RedeemInviteDialog', () => {
     expect(getByRole('status')).toBeTruthy();
   });
 
-  it('renders friendly summary when error provided', () => {
+  it('renders friendly summary keyed on the structured error code', () => {
     const { getByText } = render(RedeemInviteDialog, {
       props: {
         onSubmit: vi.fn(),
         onCancel: vi.fn(),
-        error: 'BootstrapSignatureInvalid: ed25519 verify failed',
+        // ZEB-885: the backend now returns a structured { code, message }; the
+        // dialog switches on the code, not the raw prose.
+        error: {
+          code: 'bootstrap_signature_invalid',
+          message: 'redeem_invite: admin_bootstrap signature verify failed',
+        },
       },
     });
     expect(getByText(/signature is invalid/i)).toBeTruthy();
   });
 
-  it('disclosure exposes variant + tag in DOM', () => {
+  it('disclosure exposes the code + raw message in DOM', () => {
     const { container } = render(RedeemInviteDialog, {
       props: {
         onSubmit: vi.fn(),
         onCancel: vi.fn(),
-        error: 'BootstrapSignatureInvalid: ed25519 verify failed',
+        error: {
+          code: 'bootstrap_signature_invalid',
+          message: 'redeem_invite: admin_bootstrap signature verify failed',
+        },
       },
     });
     expect(container.textContent).toContain('bootstrap_signature_invalid');
+    expect(container.textContent).toContain('signature verify failed');
+  });
+
+  it('falls back to generic copy for an unknown code (forward-compat)', () => {
+    const { getByText } = render(RedeemInviteDialog, {
+      props: {
+        onSubmit: vi.fn(),
+        onCancel: vi.fn(),
+        error: { code: 'some_future_backend_code', message: 'brand new failure' } as never,
+      },
+    });
+    expect(getByText(/Couldn't complete the invite redemption/i)).toBeTruthy();
   });
 
   it('preserves URL on error for retry', () => {
@@ -96,7 +116,7 @@ describe('RedeemInviteDialog', () => {
       props: {
         onSubmit: vi.fn(),
         onCancel: vi.fn(),
-        error: 'timed out after 15s',
+        error: { code: 'inviter_unreachable', message: 'timed out after 15s' },
         initialUrl: 'harmony://invite/v1?ci=foo',
       },
     });
@@ -268,10 +288,13 @@ describe('RedeemInviteDialog', () => {
     expect(queryByTestId('fallback-lan-btn')).toBeNull();
   });
 
-  it('shows fallback button and error on IPC rejection', async () => {
+  it('shows fallback button and code-sourced copy on a structured IPC rejection', async () => {
+    // ZEB-885: the iroh command rejects with a structured { code, message };
+    // the hard-error catch routes its copy through the shared code table
+    // instead of dumping the raw backend message.
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'connectivity_redeem_invite_iroh') {
-        return Promise.reject(new Error('network error'));
+        return Promise.reject({ code: 'internal', message: 'network error' });
       }
       return Promise.resolve(null);
     });
@@ -286,7 +309,9 @@ describe('RedeemInviteDialog', () => {
 
     await waitFor(() => {
       expect(getByTestId('fallback-lan-btn')).toBeTruthy();
-      expect(getByTestId('iroh-error-banner').textContent).toContain('network error');
+      expect(getByTestId('iroh-error-banner').textContent).toContain(
+        'Something went wrong redeeming the invite',
+      );
     });
   });
 

@@ -37,6 +37,7 @@
   import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import CreateCommunityDialog from './lib/components/CreateCommunityDialog.svelte';
   import RedeemInviteDialog from './lib/components/RedeemInviteDialog.svelte';
+  import { toRedeemInviteError, type RedeemInviteError } from './lib/redeem-invite-errors';
   import CreateChannelDialog from './lib/components/CreateChannelDialog.svelte';
   import ModifyChannelDialog from './lib/components/ModifyChannelDialog.svelte';
   import TypedConfirmationModal from './lib/components/TypedConfirmationModal.svelte';
@@ -1171,7 +1172,7 @@
   let createPending = $state(false);
   let createError = $state<string | null>(null);
   let redeemPending = $state(false);
-  let redeemError = $state<string | null>(null);
+  let redeemError = $state<RedeemInviteError | null>(null);
   let redeemUrl = $state('');
   /** ZEB-254: transient status message shown after a successful redeem.
    *  Empty string = no message displayed. Auto-cleared after 6 s. */
@@ -4741,7 +4742,9 @@
         changeSelectedCommunity(dto.communityId);
         await refreshCommunityMembers(dto.communityId);
       } catch (e) {
-        redeemError = e instanceof Error ? e.message : String(e);
+        // ZEB-885: redeem_invite rejects with a structured { code, message };
+        // normalize (an Error/string degrades to the `unknown` code).
+        redeemError = toRedeemInviteError(e);
       } finally {
         redeemPending = false;
       }
