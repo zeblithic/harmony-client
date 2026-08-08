@@ -15655,12 +15655,7 @@ pub(crate) async fn send_dm_impl(
     // removed by ZEB-234 (this PR).
     let _fence_permit = check_dm_send_fence(&dm_send_stopping, dm_send_inflight).await?;
 
-    let space_bytes = hex::decode(&space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
-    let space_arr: [u8; 16] = space_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("space_id must be 16 bytes, got {}", space_bytes.len()))?;
-    let space_id_typed = crate::owner_state_types::SpaceId(space_arr);
+    let space_id_typed = decode_space_id_16(&space_id_hex)?;
 
     let wall_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -16110,12 +16105,7 @@ pub(crate) async fn read_dm_thread_impl(
         )
     };
 
-    let space_bytes = hex::decode(&space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
-    let space_arr: [u8; 16] = space_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("space_id must be 16 bytes, got {}", space_bytes.len()))?;
-    let space_id = crate::owner_state_types::SpaceId(space_arr);
+    let space_id = decode_space_id_16(&space_id_hex)?;
 
     // Two-phase: gather everything we need under the OwnerState lock
     // (no .await), drop the lock, then run the cas.get + decrypt loop
@@ -16354,12 +16344,8 @@ async fn delete_outbox_entry<R: tauri::Runtime>(
     let _fence_permit = check_dm_send_fence(&dm_send_stopping, dm_send_inflight).await?;
 
     // Decode message_id from hex → OutboxEntryId.
-    let id_bytes = hex::decode(&message_id).map_err(|e| format!("message_id hex: {e}"))?;
-    let id_arr: [u8; 16] = id_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("message_id must be 16 bytes, got {}", id_bytes.len()))?;
-    let outbox_entry_id = crate::owner_state_types::OutboxEntryId(id_arr);
+    let outbox_entry_id =
+        crate::owner_state_types::OutboxEntryId(decode_id_16(&message_id, "message_id")?);
 
     // Capture wall time before entering the lock so the tombstone HLC is
     // sourced from a single consistent wall reading (matches send_dm's
@@ -16839,17 +16825,7 @@ pub(crate) async fn add_space_impl(
     let recipients: Vec<OwnerAddr> = members
         .unwrap_or_default()
         .iter()
-        .map(|hex_addr| {
-            let bytes = hex::decode(hex_addr)
-                .map_err(|e| format!("recipient '{hex_addr}' hex decode: {e}"))?;
-            let arr: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
-                format!(
-                    "recipient '{hex_addr}' must be 16 bytes, got {}",
-                    bytes.len()
-                )
-            })?;
-            Ok(OwnerAddr(arr))
-        })
+        .map(|hex_addr| Ok(OwnerAddr(decode_id_16(hex_addr, "recipient")?)))
         .collect::<Result<Vec<_>, String>>()?;
 
     // Snapshot all handles under the sync mutex; release before any
@@ -27756,8 +27732,11 @@ mod fetch_profile_doc_tests {
 /// `validate_voice_channel_id` blacklisted (`/ * ? # $`), so the V2 ids
 /// are namespace-safe by construction.
 fn parse_voice_id_16(label: &str, s: &str) -> Result<[u8; 16], String> {
-    let bytes = hex::decode(s).map_err(|_| format!("{label} not hex"))?;
-    <[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| format!("{label} must be 16 bytes"))
+    // ZEB-886: route through the shared hardened decoder so the voice command
+    // surface (community/channel/call/space IDs) gets the same length-precheck
+    // as every other externally-invokable ID decode — no allocation on an
+    // oversized, attacker-controlled hex string.
+    decode_id_16(s, label)
 }
 
 #[tauri::command]
@@ -28120,12 +28099,7 @@ async fn resolve_dm_call_peer(
     String,
 > {
     // Parse space_id.
-    let space_bytes = hex::decode(space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
-    let space_arr: [u8; 16] = space_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("space_id must be 16 bytes, got {}", space_bytes.len()))?;
-    let space_id = crate::owner_state_types::SpaceId(space_arr);
+    let space_id = decode_space_id_16(space_id_hex)?;
 
     // Snapshot handles under the std mutex — no await while locked.
     let (crdt_state, dm_outbox, self_owner) = {
@@ -28280,12 +28254,7 @@ async fn resolve_group_call_members(
     ),
     String,
 > {
-    let space_bytes = hex::decode(space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
-    let space_arr: [u8; 16] = space_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("space_id must be 16 bytes, got {}", space_bytes.len()))?;
-    let space_id = crate::owner_state_types::SpaceId(space_arr);
+    let space_id = decode_space_id_16(space_id_hex)?;
 
     // Snapshot handles under the std mutex — no await while locked.
     let (crdt_state, dm_outbox, self_owner) = {
@@ -28398,11 +28367,7 @@ async fn send_group_voice_signal(
     signing_key: &std::sync::Arc<ed25519_dalek::SigningKey>,
     self_owner: crate::owner_state_types::OwnerAddr,
 ) -> Result<(), String> {
-    let space_bytes = hex::decode(space_id_hex).map_err(|e| format!("space_id hex: {e}"))?;
-    let space_arr: [u8; 16] = space_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "space_id must be 16 bytes".to_string())?;
+    let space_arr = decode_id_16(space_id_hex, "space_id")?;
     let signal = crate::voice_signal::VoiceSignal {
         kind,
         call_id,
@@ -28651,12 +28616,7 @@ async fn get_group_dm_members(
     space_id: String,
     state: tauri::State<'_, Mutex<NodeState>>,
 ) -> Result<Vec<String>, String> {
-    let space_bytes = hex::decode(&space_id).map_err(|e| format!("space_id hex: {e}"))?;
-    let space_arr: [u8; 16] = space_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "space_id must be 16 bytes".to_string())?;
-    let space_id = crate::owner_state_types::SpaceId(space_arr);
+    let space_id = decode_space_id_16(&space_id)?;
     let (crdt_state, self_owner) = {
         let g = state
             .lock()
@@ -47248,12 +47208,7 @@ pub(crate) async fn remove_space_impl(
     state: &std::sync::Mutex<NodeState>,
     space_id: String,
 ) -> Result<(), String> {
-    let id_bytes: [u8; 16] = hex::decode(&space_id)
-        .map_err(|e| format!("invalid space_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "space_id must be 16 bytes (32 hex chars)".to_string())?;
-    let space_id = crate::owner_state_types::SpaceId(id_bytes);
+    let space_id = decode_space_id_16(&space_id)?;
     let id_hex = hex::encode(space_id.0);
 
     let (self_owner, community_registry, crdt_state, sync_engine, snapshot_generation) = {
@@ -66406,13 +66361,28 @@ pub fn list_pending_friend_requests_inner(
         .collect()
 }
 
+/// Decode a 32-hex-char ID into a fixed 16-byte array. The length is checked
+/// BEFORE decoding, so an oversized, attacker-controlled hex string can't force
+/// an input-proportional allocation on an externally-invokable (serve/api RPC
+/// or Tauri IPC) surface — the decode goes straight into the fixed buffer with
+/// no intermediate `Vec` (repo convention — PR #463/#313; swept across the
+/// DM/voice/space ID surface in ZEB-886). `field` names the ID in error
+/// messages (e.g. `"space_id"`, `"owner_id"`, `"message_id"`).
+pub(crate) fn decode_id_16(hex_str: &str, field: &str) -> Result<[u8; 16], String> {
+    if hex_str.len() != 32 {
+        return Err(format!("{field} must be 16 bytes (32 hex chars)"));
+    }
+    let mut bytes = [0u8; 16];
+    hex::decode_to_slice(hex_str, &mut bytes).map_err(|e| format!("invalid {field} hex: {e}"))?;
+    Ok(bytes)
+}
+
 /// Decode a 16-byte owner_id from hex, shared by the accept/decline IPCs.
 fn decode_owner_id_16(owner_id_hex: &str) -> Result<crate::owner_state_types::OwnerAddr, String> {
-    let bytes: [u8; 16] = hex::decode(owner_id_hex)
-        .map_err(|e| format!("invalid owner_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "owner_id must be 16 bytes (32 hex chars)".to_string())?;
-    Ok(crate::owner_state_types::OwnerAddr(bytes))
+    Ok(crate::owner_state_types::OwnerAddr(decode_id_16(
+        owner_id_hex,
+        "owner_id",
+    )?))
 }
 
 /// List the process-local pending inbound friend requests (Path A) for the
@@ -66922,11 +66892,10 @@ pub fn list_pending_dm_invites_inner(
 /// Decode a 16-byte `SpaceId` from hex, shared by the accept/decline IPCs
 /// (mirrors `decode_owner_id_16`).
 fn decode_space_id_16(space_id_hex: &str) -> Result<crate::owner_state_types::SpaceId, String> {
-    let bytes: [u8; 16] = hex::decode(space_id_hex)
-        .map_err(|e| format!("invalid space_id hex: {e}"))?
-        .try_into()
-        .map_err(|_| "space_id must be 16 bytes (32 hex chars)".to_string())?;
-    Ok(crate::owner_state_types::SpaceId(bytes))
+    Ok(crate::owner_state_types::SpaceId(decode_id_16(
+        space_id_hex,
+        "space_id",
+    )?))
 }
 
 /// List the process-local staged inbound DM invites (ZEB-236) for the frontend
@@ -69842,6 +69811,40 @@ mod friend_ipc_tests {
         assert!(super::decode_owner_id_16(&short).is_err());
         // not hex.
         assert!(super::decode_owner_id_16("zz").is_err());
+    }
+
+    #[test]
+    fn decode_id_16_prechecks_length_before_decoding() {
+        // Canonical happy path: 32 hex chars → the 16 decoded bytes.
+        let ok = "ab".repeat(16);
+        assert_eq!(
+            super::decode_id_16(&ok, "space_id").expect("decode"),
+            [0xAB; 16]
+        );
+        // Oversized, attacker-controlled input is rejected by the cheap length
+        // precheck — the message is the LENGTH error, not a hex-parse error,
+        // which proves control never reached `hex::decode_to_slice` (so no
+        // input-proportional allocation happened). ZEB-886.
+        let huge = "ab".repeat(8192);
+        let err = super::decode_id_16(&huge, "space_id").unwrap_err();
+        assert!(
+            err.contains("space_id must be 16 bytes"),
+            "oversized input must fail the precheck, got: {err}"
+        );
+        // Odd-length (31 chars) is a length failure, not an odd-digit hex failure.
+        let odd = "a".repeat(31);
+        assert!(super::decode_id_16(&odd, "space_id")
+            .unwrap_err()
+            .contains("must be 16 bytes"));
+        // Correct length but non-hex → decode error (precheck passed, decode ran).
+        let nonhex = "zz".repeat(16);
+        assert!(super::decode_id_16(&nonhex, "space_id")
+            .unwrap_err()
+            .contains("invalid space_id hex"));
+        // The `field` label is threaded into the error messages.
+        assert!(super::decode_id_16("", "owner_id")
+            .unwrap_err()
+            .contains("owner_id must be 16 bytes"));
     }
 
     #[test]
