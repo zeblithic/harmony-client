@@ -279,6 +279,7 @@ pub mod direct_addr_filter;
 // ZEB-621: delta-gated fan-out — on a real self-address change, republish pkarr
 // slots + kick the reconnect supervisor (wired into the publish callback).
 pub mod addr_change_fanout;
+pub mod reachability_bound;
 pub mod reachability_publisher;
 pub mod reachability_record;
 pub mod reachability_resolver;
@@ -9965,19 +9966,45 @@ pub async fn start_node_inner(
                                     ),
                                 )
                             };
-                            let payload = crate::reachability_record::ReachabilityAnnouncePayload {
-                                iroh_node_id,
-                                home_relay_url,
-                                direct_addresses,
-                                announced_at_ms,
-                                // identity_signature is zero-filled; see comment above.
-                                identity_signature: [0u8; 64],
-                                butler_set,
-                                // The whole-set freshness stamp (spec §3) —
-                                // written at blob-build time, read via
-                                // `fresh_butler_set`.
-                                bs_at: announced_at_ms,
-                            };
+                            let mut payload =
+                                crate::reachability_record::ReachabilityAnnouncePayload {
+                                    iroh_node_id,
+                                    home_relay_url,
+                                    direct_addresses,
+                                    announced_at_ms,
+                                    // identity_signature is zero-filled; see comment above.
+                                    identity_signature: [0u8; 64],
+                                    butler_set,
+                                    // The whole-set freshness stamp (spec §3) —
+                                    // written at blob-build time, read via
+                                    // `fresh_butler_set`.
+                                    bs_at: announced_at_ms,
+                                };
+                            // ZEB-880: bound direct_addresses so the published
+                            // record fits pkarr's SignedPacket cap. This shared
+                            // blob feeds the bare-blob record types
+                            // (identity/community/invite) and the sealed
+                            // friend/case-D record; reserve the record envelope
+                            // + the case-D seal so the largest of those fits.
+                            // On a multi-address host with a full butler_set the
+                            // un-bounded record overflows and NEVER publishes
+                            // (silently undiscoverable). Trimming drops the
+                            // least-useful (local-scoped, largest) legs first;
+                            // the relay + surviving addresses keep the node
+                            // dialable. The rendezvous publisher re-bounds its
+                            // own (butler-stripped) variant separately.
+                            let dropped = crate::reachability_bound::bound_direct_addresses(
+                                &mut payload,
+                                crate::reachability_bound::RECORD_ENVELOPE_BYTES
+                                    + crate::reachability_bound::CASE_D_SEAL_BYTES,
+                            );
+                            if dropped > 0 {
+                                tracing::debug!(
+                                    dropped,
+                                    kept = payload.direct_addresses.len(),
+                                    "ZEB-880: trimmed direct addresses to fit the pkarr record size cap"
+                                );
+                            }
                             let mut out = Vec::new();
                             if ciborium::into_writer(&payload, &mut out).is_err() {
                                 return Vec::new();
