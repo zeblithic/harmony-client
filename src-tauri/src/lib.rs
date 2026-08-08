@@ -29454,7 +29454,66 @@ mod run_on_large_stack_tests {
 /// ZEB-430 stdout purity) → tokio runtime → data dir → profile lock → node
 /// auto-start → API server → wait for ctrl-c/SIGTERM or `/v1/shutdown` →
 /// stop node → best-effort removal of the discovery files.
-pub fn serve_cli(api_port: Option<u16>) -> i32 {
+/// ZEB-882: pick the display name a headless `serve` node publishes on its owner
+/// card. Explicit `--display-name` wins; otherwise fall back to the active
+/// profile name; a bare anonymous serve (no flag, default profile) publishes no
+/// card — it stays nameless rather than announcing a placeholder. Blank/
+/// whitespace-only values are treated as absent. Pure so the policy is
+/// unit-testable without spawning serve.
+fn resolve_serve_card_name(flag: Option<String>, profile: Option<String>) -> Option<String> {
+    let non_blank = |s: String| {
+        if s.trim().is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    };
+    flag.and_then(non_blank).or_else(|| profile.and_then(non_blank))
+}
+
+#[cfg(test)]
+mod serve_card_name_tests {
+    use super::resolve_serve_card_name;
+
+    #[test]
+    fn flag_wins_over_profile() {
+        assert_eq!(
+            resolve_serve_card_name(Some("Koya".into()), Some("prof".into())),
+            Some("Koya".into())
+        );
+    }
+
+    #[test]
+    fn falls_back_to_profile_when_no_flag() {
+        assert_eq!(
+            resolve_serve_card_name(None, Some("prof".into())),
+            Some("prof".into())
+        );
+    }
+
+    #[test]
+    fn none_when_neither() {
+        assert_eq!(resolve_serve_card_name(None, None), None);
+    }
+
+    #[test]
+    fn blank_flag_falls_through_to_profile() {
+        assert_eq!(
+            resolve_serve_card_name(Some("   ".into()), Some("prof".into())),
+            Some("prof".into())
+        );
+    }
+
+    #[test]
+    fn blank_both_is_none() {
+        assert_eq!(
+            resolve_serve_card_name(Some(String::new()), Some("  ".into())),
+            None
+        );
+    }
+}
+
+pub fn serve_cli(api_port: Option<u16>, display_name: Option<String>) -> i32 {
     crate::app_tracing::init_serve_tracing();
 
     // ZEB-446: fail fast on a named profile with no vault passphrase —
@@ -29534,6 +29593,26 @@ pub fn serve_cli(api_port: Option<u16>) -> i32 {
         // every joined community so presence-kick recovery works on serve
         // nodes without a manual `api subscribe_community_presence`.
         let _ = auto_subscribe_presence_all_communities(state.as_ref()).await;
+
+        // ZEB-882: headless card parity — a serve node otherwise never publishes
+        // an owner card (no frontend to call republish_owner_card), so peers only
+        // ever see its hex address. Publish one now using --display-name, falling
+        // back to the active profile name. A bare anonymous serve stays nameless.
+        if let Some(name) = resolve_serve_card_name(
+            display_name,
+            crate::profile::active_profile().map(str::to_string),
+        ) {
+            match republish_owner_card_impl(state.as_ref(), name.clone(), String::new(), None, None)
+                .await
+            {
+                Ok(()) => tracing::info!(display_name = %name, "serve: published owner card"),
+                Err(e) => tracing::warn!(display_name = %name, error = %e, "serve: owner card publish failed (peers will see a hex address)"),
+            }
+        } else {
+            tracing::info!(
+                "serve: no --display-name and no named profile; not publishing an owner card (nameless to peers)"
+            );
+        }
 
         let port = api_port
             .or_else(|| {

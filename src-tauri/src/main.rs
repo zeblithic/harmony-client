@@ -61,6 +61,11 @@ enum Command {
         /// Port for the API server (default 7420; 0 = OS-assigned).
         #[arg(long, value_name = "PORT")]
         api_port: Option<u16>,
+        /// Display name this node publishes on its owner card so peers resolve
+        /// it by name instead of a hex address (ZEB-882). Omitted: fall back to
+        /// the active profile name; a bare anonymous serve publishes no card.
+        #[arg(long, value_name = "NAME")]
+        display_name: Option<String>,
     },
 
     /// Drive a running node's localhost API (ZEB-445): POST one RPC
@@ -332,14 +337,17 @@ fn main() {
                         }
                     }
                 }
-                Some(Command::Serve { api_port }) => {
+                Some(Command::Serve {
+                    api_port,
+                    display_name,
+                }) => {
                     // No init_tracing() here: serve_cli installs its own
                     // subscriber (stderr console + rolling file, ZEB-445).
                     // ZEB-519: drive the heavy node-bringup block_on on an
                     // explicit 8 MiB-stack thread so a repo-root build that
                     // missed the `/STACK` linker arg can't overflow on boot.
                     std::process::exit(harmony_app::run_on_large_stack("serve-main", move || {
-                        harmony_app::serve_cli(api_port)
+                        harmony_app::serve_cli(api_port, display_name)
                     }));
                 }
                 Some(Command::Api {
