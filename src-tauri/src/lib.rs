@@ -15640,12 +15640,15 @@ pub(crate) async fn send_dm_impl(
     };
 
     // ZEB-887: decode + length-check the space_id BEFORE taking the shutdown
-    // fence permit below. The decode is an O(1) length precheck (ZEB-886), so a
-    // flood of malformed ids is rejected here without occupying a send-fence
-    // permit — permits that stop_inner's `acquire_many` drain would otherwise
-    // block on during shutdown, purely to reject bad input. Kept BELOW the
-    // handle snapshot so a not-loaded node still reports owner_not_loaded first
-    // (no error-precedence change; the snapshot is cheap and takes no permit).
+    // fence permit below. The decode is an O(1) length precheck (ZEB-886).
+    // `check_dm_send_fence` already rejects WITHOUT a permit once the stopping
+    // flag is set, so this doesn't alter the shutdown path itself; what it buys
+    // is that a malformed id never transiently HOLDS a send-fence permit — the
+    // old order acquired one (then released it on decode failure) while not
+    // stopping, and an in-flight holder in that window is exactly what
+    // stop_inner's `acquire_many` drain has to wait out. Kept BELOW the handle
+    // snapshot so a not-loaded node still reports owner_not_loaded first (no
+    // error-precedence change; the snapshot is cheap and takes no permit).
     let space_id_typed = decode_space_id_16(&space_id_hex)?;
 
     // ZEB-234: shutdown fence. Pre-check the stopping flag — if set,
@@ -79016,24 +79019,25 @@ mod zeb703_outbox_runtime_durability_tests {
     async fn add_space_rejects_oversized_recipient_list_before_decode_zeb887() {
         let node = std::sync::Mutex::new(NodeState::default());
 
-        // One past the cap: MAX_DM_SPACE_MEMBERS recipients (→ +1 member over the
-        // limit). Distinct, well-formed hex ids so the ONLY reason to reject is
-        // cardinality — a decode failure would surface a different message.
-        let too_many: Vec<String> = (0..MAX_DM_SPACE_MEMBERS)
-            .map(|i| hex::encode([i as u8; 16]))
-            .collect();
+        // Oversized list of MALFORMED ids. On the fixed ordering the cardinality
+        // precheck rejects (len > cap) BEFORE the decode loop runs, so the error
+        // is the cap message. A decode-first regression would instead hit the
+        // malformed entries and return a "recipient ..." decode error — so
+        // asserting the cap message here proves cardinality runs before decode
+        // (well-formed ids would pass either ordering and prove nothing).
+        let too_many = vec!["not-a-valid-owner-id".to_owned(); MAX_DM_SPACE_MEMBERS];
         let err = add_space_impl(&node, "group-dm".into(), "Big".into(), Some(too_many))
             .await
             .expect_err("oversized recipient list must be rejected");
         assert!(
             err.contains("DM/GroupDm cap is 16 members"),
-            "oversized list must reject on the cardinality precheck, got: {err}"
+            "oversized list must reject on the cardinality precheck, not the decode, got: {err}"
         );
 
-        // Boundary: exactly MAX_DM_SPACE_MEMBERS - 1 recipients passes the
-        // precheck + decode, then hits the unloaded-node snapshot — so the error
-        // is owner-not-loaded, NOT the cap message. Proves the precheck admits a
-        // full-size GroupDm (no off-by-one).
+        // Boundary: exactly MAX_DM_SPACE_MEMBERS - 1 well-formed recipients passes
+        // the precheck + decode, then hits the unloaded-node snapshot — so the
+        // error is owner-not-loaded, NOT the cap message. Pins the bound at 15
+        // recipients (no off-by-one that would reject a full-size GroupDm).
         let at_cap: Vec<String> = (0..MAX_DM_SPACE_MEMBERS - 1)
             .map(|i| hex::encode([i as u8; 16]))
             .collect();
@@ -79043,6 +79047,25 @@ mod zeb703_outbox_runtime_durability_tests {
         assert!(
             !err2.contains("DM/GroupDm cap"),
             "MAX_DM_SPACE_MEMBERS - 1 recipients must pass the precheck (got cap error): {err2}"
+        );
+
+        // At-cap list of MALFORMED ids: passes the cardinality precheck (len ==
+        // cap is allowed) and therefore reaches the decode loop, which rejects
+        // the malformed entries BEFORE the handle snapshot. A snapshot-first
+        // regression would instead return owner_not_loaded — so asserting the
+        // per-recipient decode error proves decoding runs before the snapshot.
+        let at_cap_malformed = vec!["not-a-valid-owner-id".to_owned(); MAX_DM_SPACE_MEMBERS - 1];
+        let err3 = add_space_impl(
+            &node,
+            "group-dm".into(),
+            "Malformed".into(),
+            Some(at_cap_malformed),
+        )
+        .await
+        .expect_err("at-cap malformed recipients must reach decoding");
+        assert!(
+            err3.contains("recipient 'not-a-valid-owner-id'"),
+            "at-cap malformed ids must reject on the decode (before the snapshot), got: {err3}"
         );
     }
 
