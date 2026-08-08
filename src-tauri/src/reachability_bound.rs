@@ -12,17 +12,18 @@
 //! record NEVER publishes (community/identity silently undiscoverable).
 //!
 //! Two levers, applied by callers:
-//!   * `direct_addresses` is the only unbounded payload field. [`bound_direct_addresses`]
-//!     trims it (least-useful first) so the encoded record fits — keeping the
-//!     relay + as many addresses as budget allows. Dialing is relay-assisted
-//!     (`endpoint_addr_from_routing`), so trimming degrades gracefully.
-//!   * the rendezvous *dial beacon* never reads `butler_set` (a resolver uses
-//!     `iroh_node_id` + relay + addrs to dial), so it is pure dead weight there
-//!     and is the single largest reclaimable chunk (~290 B for 2 entries).
-//!     [`strip_offline_delivery_fields`] drops it from the rendezvous blob.
+//!   * `direct_addresses` is the only unbounded payload field.
+//!     [`bound_direct_addresses`] trims it (largest-encoding first) so the
+//!     encoded record fits — keeping the relay + as many addresses as budget
+//!     allows. Dialing is relay-assisted (`endpoint_addr_from_routing`), so
+//!     trimming degrades gracefully.
+//!   * the rendezvous blob uniquely adds a `MembershipVouch`, so a full 2-entry
+//!     `butler_set` (~290 B) cannot fit at any address count. [`cap_butler_set`]
+//!     caps it (rather than stripping) so a rendezvous-seeded peer keeps a
+//!     seal target for the offline-DM deposit path, while the record still fits.
 
 use crate::reachability_record::ReachabilityAnnouncePayload;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 /// The frozen core's `pkarr::SignedPacket::MAX_BYTES` (see `harmony-pkarr`
 /// `error.rs`: "MAX_BYTES = 1104"). The relay PUT payload must not exceed it.
@@ -37,13 +38,21 @@ const PKARR_SIGNED_PACKET_MAX_BYTES: usize = 1104;
 const PKARR_FRAMING_RESERVE_BYTES: usize = 130;
 
 /// Max canonical-CBOR length of a `PkarrRoutingRecord` that still fits the pkarr
-/// cap after base64url expansion + framing. Derived, not guessed:
-/// `base64url_len(n) = 4·⌈n/3⌉`, so `4·⌈n/3⌉ + FRAMING ≤ MAX_BYTES` ⇒
-/// `n ≤ (MAX_BYTES − FRAMING)·3/4`. With the constants above: **730 B**
-/// (→ base64 ~974 B → relay ~1084 B < 1104). Field-anchored: AVALON's actual
-/// overflowing rendezvous record measured 902 B CBOR / 1204 B base64.
+/// cap after base64url expansion + framing. The wire codec is `URL_SAFE_NO_PAD`
+/// (unpadded, `len = ⌈4n/3⌉`), but we derive the budget under the *padded*
+/// formula `4·⌈n/3⌉` — a strict upper bound on the unpadded length — so the
+/// budget is safe regardless of padding. The largest `n` with
+/// `4·⌈n/3⌉ ≤ (MAX_BYTES − FRAMING)` is `((MAX_BYTES − FRAMING) / 4) · 3`
+/// (integer floor of the base64-block count, times 3). With the constants
+/// above: **729 B** (→ base64 ≤ 972 B → relay ≤ ~1082 B < 1104). Field-anchored:
+/// AVALON's actual overflowing rendezvous record measured 902 B CBOR / 1204 B
+/// base64.
+///
+/// Computing `((M−F)/4)·3` rather than `(M−F)·3/4` matters: the latter's
+/// multiply-then-floor can round *up* past the true inverse and let a record one
+/// byte over the cap slip through (Qodo/CodeRabbit convergence finding).
 pub const MAX_RECORD_CBOR_BYTES: usize =
-    (PKARR_SIGNED_PACKET_MAX_BYTES - PKARR_FRAMING_RESERVE_BYTES) * 3 / 4;
+    ((PKARR_SIGNED_PACKET_MAX_BYTES - PKARR_FRAMING_RESERVE_BYTES) / 4) * 3;
 
 /// CBOR the `PkarrRoutingRecord` envelope adds around the routing blob:
 /// `harmony_identity_pub` (64) + two `u64` stamps + `inner_sig` (64) + CBOR map
@@ -77,44 +86,29 @@ fn addr_cbor_len(addr: &SocketAddr) -> usize {
     buf.len()
 }
 
-/// True for addresses that are useless for cross-WAN first contact — loopback,
-/// unspecified, RFC1918/link-local IPv4, or link-local/ULA IPv6. These are
-/// dropped before any globally-scoped address, so a trim keeps the reachable
-/// legs. (The routability filter already removes loopback/link-local, but this
-/// stays defensive and also demotes RFC1918/ULA that the filter keeps for
-/// same-LAN peers.)
-fn is_locally_scoped(addr: &SocketAddr) -> bool {
-    match addr.ip() {
-        IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-        }
-        IpAddr::V6(v6) => {
-            let seg0 = v6.segments()[0];
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
-                || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique-local
-        }
-    }
-}
-
 /// Trim `payload.direct_addresses` until the encoded record — the payload plus
 /// `reserved` bytes for its envelope (and any vouch/seal the caller adds) —
-/// fits [`MAX_RECORD_CBOR_BYTES`]. Drops the least-useful address each round
-/// (locally-scoped first, then largest-encoding to reclaim the most), so global
-/// legs and the relay survive. Order of surviving addresses is preserved. A
-/// no-op (bytes unchanged) when already within budget. Returns the number of
-/// addresses dropped.
+/// fits [`MAX_RECORD_CBOR_BYTES`]. Drops the **largest-encoding** address each
+/// round (reclaims the most bytes per drop, and keeps the greatest *number* of
+/// candidates). This deliberately does NOT rank by scope: IPv6 legs (16-byte
+/// octets) are the largest, so a trim tends to keep the compact IPv4 legs —
+/// which naturally retains both a public and a same-LAN (RFC1918) IPv4 route
+/// when present, rather than unconditionally demoting local addresses that may
+/// be a peer's only usable path (CodeAnt convergence finding). The relay
+/// (`home_relay_url`, always kept) plus the surviving legs keep the node
+/// dialable; dialing is relay-assisted, so trimming degrades gracefully. Order
+/// of surviving addresses is preserved; a no-op (bytes unchanged) when already
+/// within budget. Returns the number of addresses dropped.
 pub fn bound_direct_addresses(payload: &mut ReachabilityAnnouncePayload, reserved: usize) -> usize {
     let mut dropped = 0usize;
     while encoded_len(payload) + reserved > MAX_RECORD_CBOR_BYTES {
-        // Pick the lowest-priority survivor to drop: maximize (locally_scoped,
-        // cbor_len). `position_max`-style scan without an extra crate.
+        // Drop the largest-encoding survivor. `position_max`-style scan (first
+        // index wins ties, so drops are deterministic).
         let Some((victim, _)) = payload
             .direct_addresses
             .iter()
             .enumerate()
-            .map(|(i, a)| (i, (is_locally_scoped(a), addr_cbor_len(a))))
+            .map(|(i, a)| (i, addr_cbor_len(a)))
             .max_by(|(_, ka), (_, kb)| ka.cmp(kb))
         else {
             break; // no addresses left to trim — payload's fixed fields alone exceed budget
@@ -125,15 +119,25 @@ pub fn bound_direct_addresses(payload: &mut ReachabilityAnnouncePayload, reserve
     dropped
 }
 
-/// Strip the offline-delivery fields (`butler_set` + its `bs_at` stamp) from a
-/// payload destined for a rendezvous *dial beacon*. A joiner resolving a
-/// rendezvous slot dials via `iroh_node_id` + relay + `direct_addresses` and
-/// never reads `butler_set` (offline-DM seal-targets are a member-record
-/// concept), so carrying it there is dead weight — and its ~290 B for two
-/// entries is what pushes the rendezvous record over the cap (ZEB-880).
-pub fn strip_offline_delivery_fields(payload: &mut ReachabilityAnnouncePayload) {
-    payload.butler_set = Vec::new();
-    payload.bs_at = 0;
+/// Cap `payload.butler_set` to at most `max_entries` for a rendezvous *dial
+/// beacon*. The rendezvous blob uniquely also carries a `MembershipVouch`, so a
+/// full 2-entry butler set (~290 B) cannot fit the record under the cap at any
+/// address count. Rather than strip the set entirely — which would strand the
+/// offline-DM seal targets the gateway dial driver seeds into the
+/// `ReachabilityResolver` (`seed_from_pkarr` → `PkarrLive`, read by
+/// `butler_deposit::freshest_butler_set_by_source`; CodeAnt convergence finding)
+/// — keep the first `max_entries` (highest-priority: pinned/self first, per
+/// `fleet_net::build_butler_set`) so a rendezvous-discovered peer still has a
+/// seal target until durable/member reachability arrives. `bs_at` is cleared
+/// only when the set is emptied, so a retained entry stays fresh-gated. No-op
+/// if already at/under `max_entries`.
+pub fn cap_butler_set(payload: &mut ReachabilityAnnouncePayload, max_entries: usize) {
+    if payload.butler_set.len() > max_entries {
+        payload.butler_set.truncate(max_entries);
+    }
+    if payload.butler_set.is_empty() {
+        payload.bs_at = 0;
+    }
 }
 
 #[cfg(test)]
@@ -227,20 +231,31 @@ mod tests {
     }
 
     /// The reported bug: AVALON's rendezvous record (butler + vouch + 5 addrs)
-    /// overflowed. After stripping butler + bounding, the signed record's CBOR
-    /// must be within budget — with all global addresses retained (butler, not
-    /// addresses, was the driver, so no address trim is needed once it's gone).
+    /// overflowed. Capping butler to 1 (keeping a seal target for the seed path)
+    /// then bounding addresses must bring the signed record within budget, and
+    /// keep at least one butler entry (offline-DM seed) and at least one direct
+    /// address (dial candidate).
     #[test]
-    fn rendezvous_record_fits_after_strip_and_bound() {
+    fn rendezvous_record_fits_after_cap_and_bound() {
         let mut p = avalon_payload();
-        // Pre-condition: the un-fixed rendezvous record overflows.
+        // Pre-condition: the un-fixed rendezvous record overflows, and does so
+        // even with zero addresses — proving butler(2)+vouch cannot fit, so the
+        // cap (not just an address trim) is required.
         let before = sign_record(encode_rendezvous_blob(&p, Some(&vouch())));
         assert!(
             before > MAX_RECORD_CBOR_BYTES,
             "expected the un-fixed AVALON rendezvous record to overflow, got {before} B"
         );
+        let mut no_addrs = p.clone();
+        no_addrs.direct_addresses.clear();
+        let butler2_floor = sign_record(encode_rendezvous_blob(&no_addrs, Some(&vouch())));
+        assert!(
+            butler2_floor > MAX_RECORD_CBOR_BYTES,
+            "butler(2)+vouch must overflow even with 0 addresses ({butler2_floor} B) — \
+             address-bounding alone cannot fit it, so the butler cap is required"
+        );
 
-        strip_offline_delivery_fields(&mut p);
+        cap_butler_set(&mut p, 1);
         let dropped =
             bound_direct_addresses(&mut p, RECORD_ENVELOPE_BYTES + RENDEZVOUS_VOUCH_BYTES);
         let after = sign_record(encode_rendezvous_blob(&p, Some(&vouch())));
@@ -249,10 +264,14 @@ mod tests {
             "rendezvous record still over budget after fix: {after} B > {MAX_RECORD_CBOR_BYTES} B"
         );
         assert_eq!(
-            dropped, 0,
-            "stripping butler alone should fit all 5 addresses; dropped {dropped}"
+            p.butler_set.len(),
+            1,
+            "one seal target retained for the seed path"
         );
-        assert_eq!(p.direct_addresses.len(), 5, "all addresses retained");
+        assert!(
+            !p.direct_addresses.is_empty(),
+            "at least one dial address retained (dropped {dropped} of 5)"
+        );
     }
 
     /// The case-B identity record (keeps butler_set for offline DM) also
@@ -285,27 +304,34 @@ mod tests {
         );
     }
 
-    /// Drop-priority keeps globally-scoped addresses: the RFC1918 `192.168.*`
-    /// leg is dropped before any public/global one.
+    /// Largest-first drop keeps the compact IPv4 legs (both public and the
+    /// same-LAN RFC1918 one) and sheds the larger IPv6 octets first — so a trim
+    /// never strands a peer's only local route (CodeAnt convergence finding).
     #[test]
-    fn trim_drops_locally_scoped_before_global() {
+    fn trim_drops_largest_ipv6_before_compact_ipv4() {
         let mut p = avalon_payload();
         // Force exactly one drop by reserving almost the whole budget.
         let target = encoded_len(&p) - 1;
         let reserved = MAX_RECORD_CBOR_BYTES.saturating_sub(target);
         let dropped = bound_direct_addresses(&mut p, reserved);
         assert_eq!(dropped, 1, "reserve chosen to force exactly one drop");
+        // Both IPv4 legs (public + RFC1918) survive; an IPv6 leg is the one dropped.
         assert!(
-            !p.direct_addresses
+            p.direct_addresses
                 .iter()
                 .any(|a| a.ip().to_string() == "192.168.1.59"),
-            "the RFC1918 address should be the first dropped"
+            "the same-LAN RFC1918 route must survive (not dropped first)"
         );
         assert!(
             p.direct_addresses
                 .iter()
                 .any(|a| a.ip().to_string() == "165.162.82.51"),
             "the public IPv4 must survive"
+        );
+        assert_eq!(
+            p.direct_addresses.iter().filter(|a| a.is_ipv6()).count(),
+            2,
+            "exactly one of the three IPv6 legs is dropped"
         );
     }
 

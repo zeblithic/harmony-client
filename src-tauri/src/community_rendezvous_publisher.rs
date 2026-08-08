@@ -246,15 +246,17 @@ impl CommunityRendezvousPublisher {
                 >(base.as_slice())
                 {
                     Ok(mut reach) => {
-                        // ZEB-880: a rendezvous beacon is a first-contact DIAL
-                        // target — a joiner uses iroh_node_id + relay + direct
-                        // addresses and never reads butler_set (offline-DM
-                        // seal-targets). Carrying it is dead weight AND its
-                        // ~290 B for two entries is what pushed this record over
-                        // pkarr's size cap. Strip it, then bound the addresses
-                        // (reserving the record envelope + the "mv" vouch this
-                        // blob adds) so the signed record fits the cap.
-                        crate::reachability_bound::strip_offline_delivery_fields(&mut reach);
+                        // ZEB-880: the rendezvous blob uniquely also carries a
+                        // MembershipVouch, so a full 2-entry butler_set (~290 B)
+                        // cannot fit under pkarr's size cap at any address count.
+                        // Cap it to ONE seal target rather than strip it — the
+                        // gateway dial driver seeds this payload into the
+                        // ReachabilityResolver (PkarrLive), and butler_deposit
+                        // reads that butler_set for offline-DM, so a full strip
+                        // would strand seal targets for rendezvous-discovered
+                        // peers. Then bound the addresses (reserving envelope +
+                        // the "mv" vouch) so the signed record fits.
+                        crate::reachability_bound::cap_butler_set(&mut reach, 1);
                         let dropped = crate::reachability_bound::bound_direct_addresses(
                             &mut reach,
                             crate::reachability_bound::RECORD_ENVELOPE_BYTES
@@ -538,8 +540,9 @@ mod tests {
 
     /// ZEB-880 regression: an AVALON-shaped reachability blob (butler + 5 addrs)
     /// overflowed pkarr's size cap as a rendezvous record. The publisher must
-    /// strip the (dial-irrelevant) butler set and bound addresses so the built
-    /// record fits — and, butler being the driver, keep all 5 addresses.
+    /// cap the butler set (keeping a seal target for the offline-DM seed path)
+    /// and bound addresses so the built record fits — retaining the vouch, one
+    /// butler entry, and at least one dial address.
     #[tokio::test]
     async fn refresh_slot_bounds_oversized_record_to_fit() {
         use crate::community_rendezvous::decode_rendezvous_blob;
@@ -588,14 +591,14 @@ mod tests {
         );
         let (payload, vouch) = decode_rendezvous_blob(&reg.routing_blob).expect("blob decodes");
         assert!(vouch.is_some(), "vouch still present");
-        assert!(
-            payload.butler_set.is_empty(),
-            "butler_set must be stripped from the rendezvous dial beacon"
-        );
         assert_eq!(
-            payload.direct_addresses.len(),
-            5,
-            "stripping butler frees enough budget to keep all 5 addresses"
+            payload.butler_set.len(),
+            1,
+            "butler_set capped to one seal target for the offline-DM seed path"
+        );
+        assert!(
+            !payload.direct_addresses.is_empty(),
+            "at least one dial address retained"
         );
     }
 

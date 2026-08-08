@@ -7,7 +7,7 @@
 
 On AVALON, from community creation onward, the pkarr publisher failed every 60s:
 
-```
+```text
 WARN harmony_pkarr::publisher: pkarr publish failed — retrying in 60s
      handle=rendezvous:<cid>:0 error=RecordTooLarge
 ```
@@ -47,15 +47,21 @@ Two findings that shaped the fix:
 
 1. **`butler_set` (~290 B for 2 entries), not `direct_addresses` (~86 B), is the
    dominant driver.** Trimming *all 5 addresses* only drops rendezvous to base64
-   ~1089 — still over. So **address-bounding alone cannot fix the rendezvous
-   record.** But a rendezvous beacon is a first-contact *dial* target: a joiner
-   resolves the slot and dials via `iroh_node_id` + relay + `direct_addresses`
-   (`open_join_dial.rs:151` → `endpoint_addr_from_routing`); it **never reads
-   `butler_set`** (offline-DM seal-targets, a member-record concept, ZEB-418). So
-   `butler_set` is dead weight in the rendezvous blob and is the single largest
-   reclaimable chunk. This also explains the ticket's A/B test (toggling relay
-   opt-in OFF didn't clear it → `butler_set` content wasn't the whole story; the
-   record was simply oversized).
+   ~1089 — still over; the rendezvous blob overflows even with **zero** addresses,
+   so **address-bounding alone cannot fix it.** The single largest reclaimable
+   chunk is `butler_set`. This also explains the ticket's A/B test (toggling relay
+   opt-in OFF didn't clear it → the record was simply oversized).
+
+   **But `butler_set` is NOT dead weight in the rendezvous record** (a
+   convergence finding): the gateway dial driver seeds a resolved beacon's payload
+   into the `ReachabilityResolver` via `seed_from_pkarr` (stored as `PkarrLive`,
+   `community_gateway_dial_driver.rs:521`), and the offline-DM path reads *that*
+   `butler_set` for seal targets (`butler_deposit::freshest_butler_set_by_source`,
+   the `PkarrLive` arm). Stripping it entirely would strand offline-DM seal
+   targets for rendezvous-discovered peers until durable/member reachability
+   arrives. So the rendezvous blob **caps** `butler_set` to one entry (a full
+   2-entry set cannot fit under the cap at any address count) rather than
+   stripping it — keeping a seal target while still fitting.
 
 2. **The case-B identity record also overflows on the same host** (base64 1020 →
    relay payload > 1104). It legitimately needs `butler_set` (offline DM
@@ -68,21 +74,30 @@ Two findings that shaped the fix:
 Client-side only; no change to the frozen `harmony-pkarr` core. New module
 `reachability_bound.rs`:
 
-- **Budget, derived not guessed.** `MAX_RECORD_CBOR_BYTES = (MAX_BYTES −
-  FRAMING_RESERVE)·3/4 = 730 B` (base64url = `4·⌈n/3⌉`; `FRAMING_RESERVE = 130`
-  covers DNS TXT framing + BEP44 sig/seq). Field-anchored against AVALON's actual
-  902 B / 1204 B overflow. Satisfiability: even the worst butler-carrying record
-  with **zero** addresses (friend: envelope + case-D seal + butler payload ≈ 703 B)
-  fits, so the trim always converges (pinned by a test).
+- **Budget, derived not guessed.** The wire codec is base64url `URL_SAFE_NO_PAD`
+  (unpadded, `⌈4n/3⌉`), but the budget is derived under the *padded* bound
+  `4·⌈n/3⌉` — a strict upper bound — so it is safe regardless of padding:
+  `MAX_RECORD_CBOR_BYTES = ((MAX_BYTES − FRAMING_RESERVE) / 4)·3 = 729 B`
+  (`FRAMING_RESERVE = 130` covers DNS TXT framing + BEP44 sig/seq). Computing
+  `((M−F)/4)·3` — the integer base64-block-count floor times 3 — rather than
+  `(M−F)·3/4` matters: the latter's multiply-then-floor can round *up* past the
+  true inverse and admit a one-byte-over record (Qodo/CodeRabbit finding).
+  Field-anchored against AVALON's actual 902 B / 1204 B overflow. Satisfiability:
+  even the worst butler-carrying record with **zero** addresses (friend: envelope
+  + case-D seal + butler payload ≈ 714 B) fits, so the trim always converges
+  (pinned by a test).
 - **`bound_direct_addresses(payload, reserved) -> dropped`** trims
   `direct_addresses` until `encoded_len(payload) + reserved ≤ MAX_RECORD_CBOR_BYTES`,
-  dropping the least-useful leg each round (**locally-scoped** RFC1918/link-local/
-  ULA first, then largest-encoding to reclaim the most), so global legs + the
-  relay survive. No-op (bytes unchanged) when already within budget — the common
-  solo-node case pays nothing. `reserved` is passed by the caller for its record
-  shape (envelope, + vouch or seal).
-- **`strip_offline_delivery_fields(payload)`** clears `butler_set` + `bs_at` for
-  the rendezvous dial beacon.
+  dropping the **largest-encoding** leg each round. This deliberately does *not*
+  rank by scope (a CodeAnt finding: unconditionally demoting RFC1918/ULA can
+  strand a peer's only same-LAN route). Since IPv6 octets are the largest, the
+  trim keeps the compact IPv4 legs — naturally retaining both a public and a
+  same-LAN IPv4 route when present. No-op (bytes unchanged) when already within
+  budget — the common solo-node case pays nothing. `reserved` is passed by the
+  caller for its record shape (envelope, + vouch or seal).
+- **`cap_butler_set(payload, max_entries)`** truncates `butler_set` for the
+  rendezvous blob (clearing `bs_at` only when emptied), preserving the
+  highest-priority seal target(s) for the offline-DM seed path.
 
 **Wiring:**
 
@@ -90,10 +105,10 @@ Client-side only; no change to the frozen `harmony-pkarr` core. New module
   `RECORD_ENVELOPE_BYTES + CASE_D_SEAL_BYTES` (covers the bare-blob record types
   identity/community/invite *and* the sealed friend record — the largest bare
   consumer). A `debug!` notes any trim (expected behavior now, not an error).
-- **Rendezvous `RecordBuilder` (`community_rendezvous_publisher.rs`)** — strips
-  `butler_set` (dial-irrelevant + the dominant size driver), then bounds addresses
-  reserving `RECORD_ENVELOPE_BYTES + RENDEZVOUS_VOUCH_BYTES`. After the strip the
-  record fits with all of AVALON's 5 addresses retained.
+- **Rendezvous `RecordBuilder` (`community_rendezvous_publisher.rs`)** — caps
+  `butler_set` to 1 (a full 2-entry set + the `"mv"` vouch cannot fit at any
+  address count; capping keeps a seal target for the seed path), then bounds
+  addresses reserving `RECORD_ENVELOPE_BYTES + RENDEZVOUS_VOUCH_BYTES`.
 
 ### Degradation
 
@@ -105,7 +120,8 @@ publishes" is strictly better than an oversized record that never publishes.
 On a heavy host (full 2-entry butler set + several IPv6 legs), the butler-carrying
 identity/community records keep `butler_set` (offline delivery) and shed direct
 addresses — the correct priority, since the relay is the reliable fallback and
-`butler_set` enables offline DM.
+`butler_set` enables offline DM. The rendezvous record instead keeps one butler
+entry (seal-target seed) and as many addresses as then fit.
 
 ## What this does / does not do
 
@@ -123,19 +139,20 @@ addresses — the correct priority, since the relay is the reliable fallback and
 `reachability_bound.rs` unit tests:
 1. `budget_is_satisfiable_for_worst_butler_record` — the friend/zero-address case
    fits, so the trim converges.
-2. `rendezvous_record_fits_after_strip_and_bound` — the AVALON record overflows
-   pre-fix, fits post-fix, and keeps all 5 addresses (butler was the driver).
+2. `rendezvous_record_fits_after_cap_and_bound` — the AVALON record overflows
+   pre-fix (even with zero addresses, proving the butler cap is required), fits
+   post-fix, and keeps one butler seal target + ≥1 dial address.
 3. `identity_record_fits_after_bounding_addresses` — case-B overflows pre-fix,
    fits after address-bounding, with `butler_set` preserved.
-4. `trim_drops_locally_scoped_before_global` — the RFC1918 leg is dropped before
-   the public one.
+4. `trim_drops_largest_ipv6_before_compact_ipv4` — both IPv4 legs (public +
+   RFC1918) survive one forced drop; an IPv6 leg is the one shed.
 5. `small_payload_is_untouched` — under-budget payloads are byte-identical (no
    wire change; the pinned wire-format fixtures stay green).
 
 `community_rendezvous_publisher.rs`:
 6. `refresh_slot_bounds_oversized_record_to_fit` — end-to-end through the real
    publisher `RecordBuilder`: the registered record fits the budget, the vouch is
-   still present, `butler_set` is stripped, all 5 addresses retained.
+   still present, `butler_set` is capped to one entry, and ≥1 dial address is kept.
 
 ## Out of scope / follow-ups
 
