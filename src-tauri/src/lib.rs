@@ -16821,11 +16821,18 @@ pub(crate) async fn add_space_impl(
         }
     };
 
-    // Decode each recipient OwnerAddr from hex.
+    // Decode each recipient OwnerAddr from hex. Keep the hardened
+    // length-prechecked decode, but wrap its error with the offending element
+    // so a malformed entry in a multi-recipient request is still identifiable
+    // (Qodo review, ZEB-886).
     let recipients: Vec<OwnerAddr> = members
         .unwrap_or_default()
         .iter()
-        .map(|hex_addr| Ok(OwnerAddr(decode_id_16(hex_addr, "recipient")?)))
+        .map(|hex_addr| {
+            decode_id_16(hex_addr, "recipient")
+                .map(OwnerAddr)
+                .map_err(|e| format!("recipient '{hex_addr}': {e}"))
+        })
         .collect::<Result<Vec<_>, String>>()?;
 
     // Snapshot all handles under the sync mutex; release before any
