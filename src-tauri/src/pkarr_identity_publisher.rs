@@ -20,6 +20,25 @@ pub struct PkarrIdentityPublisher {
 /// duplicated string literal.
 pub(crate) const HANDLE: &str = "identity";
 
+/// ZEB-879: observed result of a runtime "Make me discoverable" toggle.
+///
+/// The runtime toggle used to call [`PkarrIdentityPublisher::enable`] /
+/// [`disable`][PkarrIdentityPublisher::disable] fire-and-forget with no log on
+/// either path, so a stalled enable was indistinguishable from a working one —
+/// the "silently unreachable with no error at all" symptom (ZEB-879). The
+/// caller now drives an explicit info/warn log off this outcome, and tests pin
+/// the behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToggleOutcome {
+    /// Enabled AND the case-B publication is registered with the driver.
+    EnabledActive,
+    /// Enabled but the publication is NOT registered afterwards — a wiring
+    /// regression; the node may stay unreachable despite the setting being on.
+    EnabledInactive,
+    /// Disabled and the publication is unregistered.
+    Disabled,
+}
+
 impl PkarrIdentityPublisher {
     pub fn new(
         publisher: Arc<PkarrPublisher>,
@@ -72,6 +91,42 @@ impl PkarrIdentityPublisher {
     /// Unregister the identity publication. Called when the user disables the toggle.
     pub async fn disable(&self) {
         self.publisher.unregister(HANDLE).await;
+    }
+
+    /// Whether this device's identity (case-B) publication is currently
+    /// registered with the pkarr driver.
+    ///
+    /// Reads the driver's active handle set — the SAME "is it publishing?"
+    /// source of truth the ZEB-385 Network Health self-test uses — rather than a
+    /// duplicated flag that could drift from the driver's real state.
+    pub async fn is_active(&self) -> bool {
+        self.publisher
+            .active_handles()
+            .await
+            .iter()
+            .any(|h| h == HANDLE)
+    }
+
+    /// Apply a runtime discoverability toggle and report the observed outcome so
+    /// the caller can log it (ZEB-879 — the toggle was previously silent).
+    ///
+    /// On enable, verifies the publication registered. Registration completes
+    /// synchronously inside [`enable`][Self::enable] (`register` inserts under
+    /// the driver's state lock before returning), so a single post-enable
+    /// [`is_active`][Self::is_active] check is authoritative — no polling window
+    /// is needed. An `EnabledInactive` result therefore signals a genuine wiring
+    /// regression, not a not-yet-settled race.
+    pub async fn toggle_and_verify(&self, enabled: bool) -> ToggleOutcome {
+        if !enabled {
+            self.disable().await;
+            return ToggleOutcome::Disabled;
+        }
+        self.enable().await;
+        if self.is_active().await {
+            ToggleOutcome::EnabledActive
+        } else {
+            ToggleOutcome::EnabledInactive
+        }
     }
 }
 
@@ -137,5 +192,82 @@ mod tests {
         // Should not panic if disabled before enabled.
         id_pub_publisher.disable().await;
         assert!(publisher.active_handles().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn is_active_reflects_registration() {
+        // ZEB-879: `is_active` is the ZEB-385 "is case-B publishing?" source of
+        // truth (the driver's active handle set) — false before enable, true
+        // after enable, false again after disable.
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let id_pub = build_id_pub(&sk);
+        let p = PkarrIdentityPublisher::new(
+            Arc::clone(&publisher),
+            sk,
+            id_pub,
+            Arc::new(|| b"fake-routing".to_vec()),
+        );
+
+        assert!(!p.is_active().await, "inactive before enable");
+        p.enable().await;
+        assert!(p.is_active().await, "active after enable");
+        p.disable().await;
+        assert!(!p.is_active().await, "inactive after disable");
+    }
+
+    #[tokio::test]
+    async fn toggle_and_verify_enable_reports_active() {
+        // ZEB-879: the runtime toggle was previously fire-and-forget + silent;
+        // `toggle_and_verify(true)` confirms the publication registered so the
+        // caller can log the outcome instead of leaving the node silently
+        // (un)reachable.
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let id_pub = build_id_pub(&sk);
+        let p = PkarrIdentityPublisher::new(
+            Arc::clone(&publisher),
+            sk,
+            id_pub,
+            Arc::new(|| b"fake-routing".to_vec()),
+        );
+
+        assert_eq!(
+            p.toggle_and_verify(true).await,
+            ToggleOutcome::EnabledActive
+        );
+        assert!(p.is_active().await);
+    }
+
+    #[tokio::test]
+    async fn toggle_and_verify_disable_reports_disabled() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let id_pub = build_id_pub(&sk);
+        let p = PkarrIdentityPublisher::new(
+            Arc::clone(&publisher),
+            sk,
+            id_pub,
+            Arc::new(|| b"fake-routing".to_vec()),
+        );
+
+        p.enable().await;
+        assert_eq!(p.toggle_and_verify(false).await, ToggleOutcome::Disabled);
+        assert!(!p.is_active().await);
     }
 }

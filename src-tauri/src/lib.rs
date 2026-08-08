@@ -63704,11 +63704,40 @@ async fn set_identity_discoverable_detached(
     enabled: bool,
 ) -> Result<(), String> {
     tokio::spawn(async move {
+        // ZEB-879: serialize the ENTIRE persist + live-toggle + verify so
+        // concurrent toggles (a rapid on→off flip) can't interleave — otherwise
+        // the disk value and the live publication could diverge, and a
+        // concurrent `disable` landing between `enable()` and the verify could
+        // spuriously report `EnabledInactive`. Held across the whole critical
+        // section; acquired INSIDE this detached task (not the cancellable
+        // caller frame) so the pair still survives caller cancellation (ZEB-697).
+        let _toggle_guard = identity_discoverable_toggle_lock().lock().await;
         persist_identity_discoverable_locked(path, enabled).await?;
-        if enabled {
-            id_pub.enable().await;
-        } else {
-            id_pub.disable().await;
+        // The runtime toggle used to call enable()/disable() fire-and-forget with
+        // NO log on either path, so a stalled enable was indistinguishable from a
+        // working one — the "silently unreachable with no error at all" symptom.
+        // Verify + log the outcome. The verify reads the driver's active handle
+        // set (sub-ms, no network IO) and never fails the toggle: the setting has
+        // already persisted, so a `warn` is a diagnostic, not a rollback.
+        match id_pub.toggle_and_verify(enabled).await {
+            pkarr_identity_publisher::ToggleOutcome::EnabledActive => tracing::info!(
+                "ZEB-879: identity discoverability enabled at runtime — case-B \
+                 publication registered; this node becomes resolvable by \
+                 add_friend_by_key once the pkarr driver publishes"
+            ),
+            pkarr_identity_publisher::ToggleOutcome::EnabledInactive => tracing::warn!(
+                "ZEB-879: identity discoverability enabled at runtime but the \
+                 case-B publication is NOT registered afterwards — this node may \
+                 stay unreachable despite the setting being on; the pkarr \
+                 identity publisher may be mis-wired"
+            ),
+            pkarr_identity_publisher::ToggleOutcome::Disabled => tracing::info!(
+                "ZEB-879: identity discoverability disabled at runtime — case-B \
+                 publication unregistered locally; this node stops re-publishing \
+                 its identity record, but any record already published stays \
+                 resolvable by add_friend_by_key until it expires (record TTL) — \
+                 there is no immediate DHT retraction"
+            ),
         }
         Ok(())
     })
@@ -64090,6 +64119,25 @@ static CONNECTIVITY_SETTINGS_WRITE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<
 
 fn connectivity_settings_write_lock() -> &'static tokio::sync::Mutex<()> {
     CONNECTIVITY_SETTINGS_WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// ZEB-879: serializes the FULL runtime discoverability toggle — persist + live
+/// publisher enable/disable + the post-enable verify — as one critical section.
+/// `CONNECTIVITY_SETTINGS_WRITE_LOCK` above only serializes the disk RMW; the
+/// live publisher mutation and the `is_active` verify were unserialized, so two
+/// concurrent toggles (a rapid on→off flip) could persist one value while
+/// applying the opposite live state, and a concurrent `disable` landing between
+/// `enable()` and the verify could spuriously report `EnabledInactive`. Holding
+/// this across the whole detached toggle makes the last toggle win atomically
+/// and the post-enable verify authoritative. LOCK ORDER: acquired inside the
+/// detached task with NO NodeState mutex held, and OUTSIDE
+/// `CONNECTIVITY_SETTINGS_WRITE_LOCK` (which `persist_identity_discoverable_locked`
+/// takes briefly within) — no other path takes the settings lock then this one.
+static IDENTITY_DISCOVERABLE_TOGGLE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn identity_discoverable_toggle_lock() -> &'static tokio::sync::Mutex<()> {
+    IDENTITY_DISCOVERABLE_TOGGLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// ZEB-380: replace the user-configurable pkarr relay list. Validates, persists
@@ -75444,6 +75492,68 @@ mod settings_rmw_cancellation_tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_toggles_keep_persisted_and_live_consistent() {
+        // ZEB-879 (CodeAnt/Qodo): identity_discoverable_toggle_lock serializes
+        // the persist + live enable/disable + verify, so a rapid on→off flip
+        // can't leave the disk value disagreeing with the live publication (nor
+        // spuriously report EnabledInactive). Whichever toggle wins the lock last
+        // sets BOTH, so persisted == is_active afterwards — on every round.
+        use harmony_pkarr::{testing::MockPkarrRelay, PkarrPublisher, RelayClient, RelayPool};
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = std::sync::Arc::new(RelayClient::new(pool));
+        let publisher = std::sync::Arc::new(PkarrPublisher::new(client));
+        let _ph = std::sync::Arc::clone(&publisher).spawn();
+
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut id_pub_bytes = [0u8; 64];
+        id_pub_bytes[32..].copy_from_slice(&sk.verifying_key().to_bytes());
+        let id_pub = std::sync::Arc::new(pkarr_identity_publisher::PkarrIdentityPublisher::new(
+            std::sync::Arc::clone(&publisher),
+            sk,
+            id_pub_bytes,
+            std::sync::Arc::new(|| b"fake-routing".to_vec()),
+        ));
+
+        // Race an enable against a disable repeatedly; the serialization
+        // invariant must hold on every round regardless of which wins.
+        for _ in 0..8 {
+            let (a, b) = tokio::join!(
+                super::set_identity_discoverable_detached(
+                    path.clone(),
+                    std::sync::Arc::clone(&id_pub),
+                    true,
+                ),
+                super::set_identity_discoverable_detached(
+                    path.clone(),
+                    std::sync::Arc::clone(&id_pub),
+                    false,
+                ),
+            );
+            a.expect("enable toggle task");
+            b.expect("disable toggle task");
+
+            let probe = path.clone();
+            let persisted = tokio::task::spawn_blocking(move || {
+                connectivity_settings::ConnectivitySettings::load_or_default(&probe)
+                    .identity_discoverable
+            })
+            .await
+            .expect("disk probe");
+            let live = id_pub.is_active().await;
+            assert_eq!(
+                persisted, live,
+                "persisted discoverable ({persisted}) must match live publication \
+                 ({live}) after a concurrent toggle"
+            );
+        }
     }
 
     #[tokio::test]
