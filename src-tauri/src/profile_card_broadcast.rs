@@ -620,6 +620,15 @@ impl ProfileCardPublisher {
         }
     }
 
+    /// ZEB-884: a cloned handle to the cached `latest` self-card, so a Zenoh
+    /// **queryable** declared elsewhere (where the shared session lives) can
+    /// answer a late subscriber's query-on-subscribe `get` with the exact cached
+    /// signed bytes — no re-sign, no separate cache. `None` until a card has been
+    /// published (a node that never published has no card to serve).
+    pub fn latest_handle(&self) -> std::sync::Arc<Mutex<Option<CardWire>>> {
+        std::sync::Arc::clone(&self.latest)
+    }
+
     /// Abort the refresh task. Idempotent. (Mirrors ProfileBroadcastPublisher::shutdown.)
     pub async fn shutdown(&self) {
         if let Some(h) = self.task.lock().await.take() {
@@ -762,6 +771,53 @@ mod tests {
         assert!(
             n >= 3,
             "initial burst re-published the cached card multiple times soon after spawn (got {n})"
+        );
+    }
+
+    /// ZEB-884: `latest_handle()` is a live `Arc::clone` view of the cached
+    /// self-card — `None` before any publish, then observing the exact
+    /// `(topic, bytes)` that `publish_now` stored. This is what the publisher-side
+    /// queryable reads to answer a query-on-subscribe without re-signing.
+    #[tokio::test]
+    async fn latest_handle_observes_published_card() {
+        let owner = crate::community_membership::mint_test_owner(0x74);
+        let out = std::sync::Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let sink = std::sync::Arc::new(CapturingSink { out: out.clone() });
+        // spawn_no_burst + long refresh: `latest` is only written by publish_now,
+        // so background republishes can't affect it, but keep the window quiet.
+        let pubr = ProfileCardPublisher::spawn_no_burst(
+            sink.clone(),
+            std::time::Duration::from_secs(3600),
+        );
+        let handle = pubr.latest_handle();
+        assert!(
+            handle.lock().await.is_none(),
+            "nothing published yet -> handle observes None"
+        );
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Qy".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        let bytes = canonical_cbor_encode(&card).unwrap();
+        let topic = card_topic_for(&owner.owner.0);
+        pubr.publish_now(topic.clone(), bytes.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.lock().await.clone(),
+            Some((topic, bytes)),
+            "the same Arc handle now observes the published (topic, bytes)"
         );
     }
 

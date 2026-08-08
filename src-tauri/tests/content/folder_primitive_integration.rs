@@ -303,6 +303,7 @@ async fn spawn_test_runtime() -> TestHarness {
                     None, // ZEB-281 Sub-D Phase 4: profile_broadcast_request_rx not exercised in this test
                     None, // ZEB-341: profile_card_cache not exercised in this test
                     None, // ZEB-341: profile_card_request_rx not exercised in this test
+                    None, // ZEB-884: profile_card_publisher not exercised in this test
                     None, // ZEB-537: community_presence_request_rx not exercised in this test
                     std::sync::Arc::new(tokio::sync::Mutex::new(
                         harmony_app::community_presence::CommunityPresenceMap::new(),

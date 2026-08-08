@@ -1099,6 +1099,10 @@ pub async fn run(
     // loaded; always `Some` when started by production `start_node`.
     profile_card_cache: Option<Arc<crate::profile_card_broadcast::ProfileCardCache>>,
     profile_card_request_rx: Option<mpsc::Receiver<ProfileCardRequest>>,
+    // ZEB-884: our own owner-card publisher, so a queryable on our card topic can
+    // answer a late subscriber's query-on-subscribe GET with the cached signed
+    // bytes (no re-sign). `None` when no owner identity is loaded.
+    profile_card_publisher: Option<Arc<crate::profile_card_broadcast::ProfileCardPublisher>>,
     // ZEB-537: community-presence request receiver (paired with NodeState's
     // `community_presence_request_tx`) + the shared roster map (shared with
     // NodeState so IPC reads + the loop's subscriber/sweeper write the same
@@ -3002,6 +3006,90 @@ pub async fn run(
                                         continue;
                                     }
                                 };
+                                // ZEB-884: query-on-subscribe fast path. A plain
+                                // declare_subscriber only receives FUTURE PUTs, so a
+                                // late joiner would wait up to the 600s publisher
+                                // refresh for a name. Fire a one-shot GET against the
+                                // peer's publisher-side queryable to fetch the current
+                                // card. Run it in a DETACHED task so it NEVER blocks the
+                                // live recv loop below (or a shutdown) for up to the GET
+                                // budget — the recv loop starts immediately and both
+                                // paths feed the same cache (newer-HLC-wins). Local-
+                                // drain into an owned Vec ONLY — never forward a Reply
+                                // into a bounded channel (ZEB-803/812 reply-drain
+                                // wedge). A peer with no queryable / no card yields
+                                // nothing; we fall through to live PUTs.
+                                {
+                                    let session_q = Arc::clone(&session);
+                                    let key_q = key_expr.clone();
+                                    let cache_q = Arc::clone(&cache_for_task);
+                                    let app_q = app_for_task.clone();
+                                    let closing_q = Arc::clone(&closing_task);
+                                    tokio::spawn(async move {
+                                        if closing_q.load(Ordering::SeqCst) {
+                                            return;
+                                        }
+                                        let replies = match session_q.get(&key_q).await {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    error = %e,
+                                                    subscription_id,
+                                                    "profile card query-on-subscribe get failed; relying on PUTs"
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        let fetched = tokio::time::timeout(
+                                            std::time::Duration::from_secs(8),
+                                            async {
+                                                while let Ok(reply) = replies.recv_async().await {
+                                                    match reply.result() {
+                                                        Ok(sample) => {
+                                                            let view = sample.payload().to_bytes();
+                                                            if view.len()
+                                                                <= crate::profile_card_broadcast::MAX_CARD_WIRE_BYTES
+                                                            {
+                                                                return Some(view.to_vec());
+                                                            }
+                                                            tracing::warn!(
+                                                                size = view.len(),
+                                                                max = crate::profile_card_broadcast::MAX_CARD_WIRE_BYTES,
+                                                                subscription_id,
+                                                                "oversized profile card query reply dropped"
+                                                            );
+                                                        }
+                                                        Err(err) => {
+                                                            let msg = String::from_utf8_lossy(
+                                                                &err.payload().to_bytes(),
+                                                            )
+                                                            .into_owned();
+                                                            tracing::debug!(
+                                                                subscription_id,
+                                                                err = %msg,
+                                                                "profile card query reply error"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                None
+                                            },
+                                        )
+                                        .await
+                                        .ok()
+                                        .flatten();
+                                        if let Some(bytes) = fetched {
+                                            ingest_card_bytes(
+                                                &bytes,
+                                                subscription_id,
+                                                owner_id,
+                                                cache_q.as_ref(),
+                                                app_q.as_ref(),
+                                            )
+                                            .await;
+                                        }
+                                    });
+                                }
                                 loop {
                                     match sub.recv_async().await {
                                         Ok(sample) => {
@@ -3021,72 +3109,18 @@ pub async fn run(
                                                 continue;
                                             }
                                             let bytes = bytes_view.to_vec();
-                                            let card: crate::profile_card_broadcast::ProfileCardBroadcast =
-                                                match ciborium::from_reader(&bytes[..]) {
-                                                    Ok(c) => c,
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            error = ?e,
-                                                            subscription_id,
-                                                            "profile card CBOR decode failed"
-                                                        );
-                                                        continue;
-                                                    }
-                                                };
-                                            // Cert model + signature.
-                                            let verified_owner =
-                                                match crate::profile_card_broadcast::verify_card(
-                                                    &card,
-                                                    crate::iroh_friend_acceptor::wall_now_secs(),
-                                                ) {
-                                                    Ok(o) => o,
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                            error = ?e,
-                                                            subscription_id,
-                                                            "profile card verify failed"
-                                                        );
-                                                        continue;
-                                                    }
-                                                };
-                                            // Attribution: bind the verified
-                                            // owner to the SUBSCRIBED owner
-                                            // (the topic's owner).
-                                            if verified_owner != owner_id {
-                                                tracing::warn!(
-                                                    subscription_id,
-                                                    "profile card attribution mismatch"
-                                                );
-                                                continue;
-                                            }
-                                            cache_for_task
-                                                .insert_verified(subscription_id, &card)
-                                                .await;
-                                            if let Some(info) =
-                                                cache_for_task.get_cached(subscription_id).await
-                                            {
-                                                // Flat payload (subscriptionId +
-                                                // DiscoveredCardInfo fields hoisted).
-                                                crate::node_event_sink::emit_ser(
-                                                    app_for_task.as_ref(),
-                                                    "member-card-received",
-                                                    &serde_json::json!({
-                                                        "subscriptionId": subscription_id,
-                                                        "ownerIdHex": info.owner_id_hex,
-                                                        "displayName": info.display_name,
-                                                        "statusText": info.status_text,
-                                                        "avatarCid": info.avatar_cid,
-                                                        // ZEB-345: include the
-                                                        // long-form page root on the
-                                                        // instant PUSH path too, so an
-                                                        // open panel updates without
-                                                        // waiting for the poll fallback
-                                                        // (Cursor). DiscoveredCardInfo
-                                                        // already carries it hex-encoded.
-                                                        "profilePageRoot": info.profile_page_root,
-                                                    }),
-                                                );
-                                            }
+                                            // ZEB-884: one shared pipeline for the
+                                            // live-PUT arm and the query-on-subscribe
+                                            // fast path (decode/verify/attribute/
+                                            // cache/emit).
+                                            ingest_card_bytes(
+                                                &bytes,
+                                                subscription_id,
+                                                owner_id,
+                                                cache_for_task.as_ref(),
+                                                app_for_task.as_ref(),
+                                            )
+                                            .await;
                                         }
                                         Err(_) => {
                                             if !closing_task.load(Ordering::SeqCst) {
@@ -3115,6 +3149,58 @@ pub async fn run(
                             h.abort();
                         }
                         cache_for_loop.drop_subscription(subscription_id).await;
+                    }
+                }
+            }
+        });
+    }
+
+    // ── ZEB-884: self-card queryable ─────────────────────────────────
+    // Answer a peer's query-on-subscribe GET on OUR card topic with our cached
+    // signed card bytes, so a late subscriber resolves our name in <1s instead of
+    // waiting up to the 600s publisher refresh. Gated on our own owner identity
+    // (self_owner from dm_outbox) + the card publisher (its cached `latest`).
+    // Fire-and-forget, mirroring the owner-state root queryable: it self-
+    // terminates on the `closing` flag / session close. `query.reply` back-
+    // pressures only this responder — never an engine channel — so it is not
+    // subject to the reply-drain wedge.
+    if let (Some(dm_outbox_qbl), Some(card_publisher_qbl)) =
+        (dm_outbox.as_ref(), profile_card_publisher.as_ref())
+    {
+        let self_owner = { dm_outbox_qbl.lock().await.self_owner };
+        let key_expr = crate::profile_card_broadcast::card_topic_for(&self_owner.0);
+        let latest = card_publisher_qbl.latest_handle();
+        let session_for_qbl = Arc::clone(&session_arc);
+        let closing_for_qbl = Arc::clone(&closing);
+        tokio::spawn(async move {
+            let qbl = match session_for_qbl.declare_queryable(&key_expr).await {
+                Ok(q) => q,
+                Err(e) => {
+                    if !closing_for_qbl.load(Ordering::SeqCst) {
+                        tracing::warn!(error = %e, "failed to declare self-card queryable");
+                    }
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    res = qbl.recv_async() => {
+                        let Ok(query) = res else { break; };
+                        // Snapshot the cached signed card (no re-sign). `None` =
+                        // we have not published a card yet -> answer nothing, so
+                        // the querying peer falls through to live PUTs.
+                        let snapshot = latest.lock().await.clone();
+                        if let Some((_topic, bytes)) = snapshot {
+                            if let Err(e) = query.reply(query.key_expr(), bytes).await {
+                                tracing::warn!(error = %e, "self-card queryable reply failed");
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if closing_for_qbl.load(Ordering::SeqCst) {
+                            break;
+                        }
                     }
                 }
             }
@@ -7636,6 +7722,143 @@ fn leaf_cap_exceeded(payload_len: usize, max_bytes: Option<usize>) -> Option<usi
     match max_bytes {
         Some(cap) if payload_len > cap => Some(cap),
         _ => None,
+    }
+}
+
+/// ZEB-884: decode → verify → attribute → cache → emit one received owner card.
+/// Shared by the live-PUT subscriber arm and the query-on-subscribe fast path so
+/// both converge through ONE verify/attribution/cache/emit implementation.
+/// `bytes` is a single card payload; oversized / undecodable / unverifiable /
+/// misattributed inputs are dropped (logged), never cached. The oversize guard is
+/// duplicated here (the PUT arm also pre-checks the un-materialized view) so this
+/// is self-contained and safe for any caller.
+async fn ingest_card_bytes(
+    bytes: &[u8],
+    subscription_id: crate::profile_broadcast::SubscriptionId,
+    owner_id: [u8; 16],
+    cache: &crate::profile_card_broadcast::ProfileCardCache,
+    app: &dyn crate::node_event_sink::NodeEventSink,
+) {
+    if bytes.len() > crate::profile_card_broadcast::MAX_CARD_WIRE_BYTES {
+        tracing::warn!(
+            size = bytes.len(),
+            max = crate::profile_card_broadcast::MAX_CARD_WIRE_BYTES,
+            subscription_id,
+            "oversized profile card dropped"
+        );
+        return;
+    }
+    let card: crate::profile_card_broadcast::ProfileCardBroadcast =
+        match ciborium::from_reader(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = ?e, subscription_id, "profile card CBOR decode failed");
+                return;
+            }
+        };
+    // Cert model + signature.
+    let verified_owner = match crate::profile_card_broadcast::verify_card(
+        &card,
+        crate::iroh_friend_acceptor::wall_now_secs(),
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(error = ?e, subscription_id, "profile card verify failed");
+            return;
+        }
+    };
+    // Attribution: bind the verified owner to the SUBSCRIBED owner (the topic's owner).
+    if verified_owner != owner_id {
+        tracing::warn!(subscription_id, "profile card attribution mismatch");
+        return;
+    }
+    cache.insert_verified(subscription_id, &card).await;
+    if let Some(info) = cache.get_cached(subscription_id).await {
+        // Flat payload (subscriptionId + DiscoveredCardInfo fields hoisted).
+        crate::node_event_sink::emit_ser(
+            app,
+            "member-card-received",
+            &serde_json::json!({
+                "subscriptionId": subscription_id,
+                "ownerIdHex": info.owner_id_hex,
+                "displayName": info.display_name,
+                "statusText": info.status_text,
+                "avatarCid": info.avatar_cid,
+                "profilePageRoot": info.profile_page_root,
+            }),
+        );
+    }
+}
+
+#[cfg(test)]
+mod ingest_card_bytes_tests {
+    use super::*;
+
+    fn signed_card(tag: u8, name: &str) -> ([u8; 16], Vec<u8>) {
+        let owner = crate::community_membership::mint_test_owner(tag);
+        let card = crate::profile_card_broadcast::sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            name.into(),
+            String::new(),
+            None,
+            None,
+            owner.cert.clone(),
+            crate::owner_state_types::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(&card).unwrap();
+        (owner.owner.0, bytes)
+    }
+
+    /// A valid card on a matching subscription is cached and emits
+    /// `member-card-received` — the shared pipeline the query path also uses.
+    #[tokio::test]
+    async fn valid_card_is_cached_and_emitted() {
+        let (owner_id, bytes) = signed_card(0x90, "Ada");
+        let cache = crate::profile_card_broadcast::ProfileCardCache::default();
+        let sink = crate::node_event_sink::RecordingSink::new();
+        cache.register(7, owner_id).await;
+        ingest_card_bytes(&bytes, 7, owner_id, &cache, &sink).await;
+        let info = cache.get_cached(7).await.expect("card cached after ingest");
+        assert_eq!(info.display_name, "Ada");
+        assert!(
+            sink.frames()
+                .iter()
+                .any(|(e, p)| e == "member-card-received" && p["displayName"] == "Ada"),
+            "member-card-received emitted with the resolved name"
+        );
+    }
+
+    /// A card whose verified owner != the subscribed owner is dropped (never
+    /// cached, no event) — the attribution guard, shared by both ingest paths.
+    #[tokio::test]
+    async fn attribution_mismatch_is_rejected() {
+        let (owner_a, bytes_a) = signed_card(0x91, "Ada");
+        let (owner_b, _bytes_b) = signed_card(0x92, "Bo");
+        assert_ne!(owner_a, owner_b);
+        let cache = crate::profile_card_broadcast::ProfileCardCache::default();
+        let sink = crate::node_event_sink::RecordingSink::new();
+        cache.register(8, owner_b).await;
+        ingest_card_bytes(&bytes_a, 8, owner_b, &cache, &sink).await;
+        assert!(cache.get_cached(8).await.is_none());
+        assert!(sink.frames().is_empty());
+    }
+
+    /// An oversized payload is dropped before any decode/verify work.
+    #[tokio::test]
+    async fn oversized_is_dropped_before_decode() {
+        let cache = crate::profile_card_broadcast::ProfileCardCache::default();
+        let sink = crate::node_event_sink::RecordingSink::new();
+        let big = vec![0u8; crate::profile_card_broadcast::MAX_CARD_WIRE_BYTES + 1];
+        cache.register(9, [0u8; 16]).await;
+        ingest_card_bytes(&big, 9, [0u8; 16], &cache, &sink).await;
+        assert!(cache.get_cached(9).await.is_none());
+        assert!(sink.frames().is_empty());
     }
 }
 
