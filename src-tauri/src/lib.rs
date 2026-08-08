@@ -12703,6 +12703,11 @@ pub async fn start_node_inner(
                 let profile_card_cache_for_loop =
                     Some(std::sync::Arc::clone(&profile_card_cache_arc));
                 let profile_card_request_rx_for_loop = Some(profile_card_request_rx);
+                // ZEB-884: a clone for the self-card queryable inside the event
+                // loop. Made here (before the `async move` block) so the original
+                // `profile_card_publisher_arc` stays available for the NodeState
+                // commit below.
+                let profile_card_publisher_for_loop = profile_card_publisher_arc.clone();
                 // ZEB-537: thread the community-presence request rx + shared map
                 // into event_loop::run (the loop gets its own map clone; the
                 // NodeState assignment below keeps `..._for_state`).
@@ -12918,6 +12923,9 @@ pub async fn start_node_inner(
                                 profile_broadcast_request_rx_for_loop,
                                 profile_card_cache_for_loop,
                                 profile_card_request_rx_for_loop,
+                                // ZEB-884: our own card publisher, for the
+                                // self-card queryable (answers late subscribers).
+                                profile_card_publisher_for_loop,
                                 community_presence_request_rx_for_loop,
                                 community_presence_map_for_loop,
                                 // ZEB-815: address-book pool inputs (request rx
