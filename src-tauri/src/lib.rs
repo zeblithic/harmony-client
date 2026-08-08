@@ -63463,24 +63463,28 @@ async fn connectivity_set_identity_discoverable(
 }
 
 /// Read the current case-B "Make me discoverable" toggle state from the
-/// persisted settings file. Returns `false` when the file is missing or
-/// the pkarr settings path is not initialized.
+/// persisted settings file. Reflects the stored setting — or the first-run
+/// [`ConnectivitySettings::default`] (ON, post-ZEB-881) when no file exists yet.
+///
+/// ZEB-881 / Qodo: `NodeState.connectivity_settings_path` is cleared on stop
+/// (ZEB-380), so a stopped node / pre-init headless call sees `None`. Resolve
+/// the path via the same app-data-dir fallback the relay manager and setter use
+/// (`connectivity_settings_path`) rather than hard-returning `false` — a hard
+/// `false` would read as an explicit opt-out and disagree with `load_or_default`
+/// (which returns the ON Default for a missing file), mis-seeding the toggle.
+/// (The setter still requires a live publisher: reading the stored intent and
+/// toggling live case-B publication are legitimately different operations.)
 pub(crate) async fn connectivity_get_identity_discoverable_impl(
     state: &std::sync::Mutex<NodeState>,
 ) -> Result<bool, String> {
-    let path = {
+    let state_path = {
         state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?
             .connectivity_settings_path
             .clone()
     };
-    let Some(path) = path else {
-        // Node not running or pkarr not initialized — no settings path to read,
-        // so report the safe "not discoverable" not-ready sentinel. (Distinct
-        // from the ZEB-881 settings default, which is ON once a path exists.)
-        return Ok(false);
-    };
+    let path = connectivity_settings_path(state_path)?;
     // Offload the sync std::fs read off the Tokio worker — this seam is reachable
     // over the async headless API surface.
     tokio::task::spawn_blocking(move || {

@@ -89,7 +89,9 @@ describe('WelcomeModal hard gate + flow', () => {
     });
     const note = getByTestId('welcome-discoverability-note');
     // Lock the accurate framing: discoverability is identity-address (case-B)
-    // discovery, and the note must name the private-mode escape + its location.
+    // discovery, the promise is SCOPED to creating an identity (so Join/Restore
+    // users are not misled), and the note names the private-mode escape hatch.
+    expect(note.textContent).toMatch(/create your identity/i);
     expect(note.textContent).toMatch(/discoverable/i);
     expect(note.textContent).toMatch(/identity address/i);
     expect(note.textContent).toMatch(/private/i);

@@ -56,11 +56,14 @@ default is ON.
 - Add a **dismissible** privacy note to `WelcomeModal`'s welcome/`explain` stage. Do **not** add a
   new wizard step — the mint hard-gate stays a 3-step wizard.
 - Copy (mirrors the Settings → Network panel's own language so the terms stay consistent — the
-  toggle reads "Allow discovery by identity address"): *"You'll be discoverable by identity address
-  — anyone who has it can connect to your devices. You can go private anytime in Settings →
-  Network."* Note: discoverability is case-B identity discovery only; **invites/friend-tokens still
-  work in private mode** (they resolve a separate case-A record keyed by the token secret), so the
-  copy must not tie invites to discoverability.
+  toggle reads "Allow discovery by identity address"): *"When you create your identity, you'll be
+  discoverable by identity address — anyone who has it can connect to your devices. You can go
+  private anytime in Settings → Network."* Two accuracy constraints: (1) discoverability is case-B
+  identity discovery only — **invites/friend-tokens still work in private mode** (they resolve a
+  separate case-A record keyed by the token secret), so the copy must not tie invites to
+  discoverability; (2) the note renders on the shared `explain` chooser, which also offers Join /
+  Restore (existing, possibly-private identities), so the promise is **scoped to "when you create
+  your identity"** and must not unconditionally claim the reader will be discoverable.
 - Dismissal is **local component state** (`$state`), not a persisted flag. The `WelcomeModal` is a
   one-time pre-mint hard-gate, so **no `ownerId` exists yet** to scope a durable flag by — and the
   existing onboarding-flags seam (`onboarding-backup-flags.ts`) is deliberately owner-scoped for

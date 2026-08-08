@@ -1567,35 +1567,52 @@ where
             if let Err(reset_err) =
                 crate::connectivity_settings::ConnectivitySettings::reset_privacy_posture_for_new_identity(cs_path)
             {
-                // The reset write failed; the inherited file (possibly
-                // `identity_discoverable=true`) may still be on disk. Fail SAFE by
-                // removing it so the post-restart `load_or_default` returns Default
-                // (discoverable OFF). Report the cleanup outcome — a swallowed error
-                // here would hide a privacy-fail-open:
-                //   Ok       → removed; the new identity boots on defaults.
-                //   NotFound → nothing was inherited; already safe.
-                //   other Err→ BOTH writes failed: the new identity may load the
-                //              prior posture. Surface it LOUDLY for manual cleanup
-                //              (mirrors `load_or_default`'s fail-closed-and-loud).
-                match std::fs::remove_file(cs_path) {
+                // The reset write failed; the inherited file (possibly the prior
+                // identity's `identity_discoverable=true`) may still be on disk.
+                // ZEB-881: post-flip a MISSING settings file loads Default =
+                // discoverable ON, so we can NO LONGER "fail safe" by deleting the
+                // file — deletion would leave the degraded mint discoverable.
+                // Restore the deliberate fail-closed-on-error intent by writing an
+                // EXPLICIT invisible posture (discoverable OFF, relays preserved),
+                // so a mint whose settings write failed never broadcasts the new
+                // identity. The happy path keeps the ON product default; only this
+                // error path fails closed. Report the outcome — a swallowed error
+                // here would hide a privacy-fail-open.
+                match crate::connectivity_settings::ConnectivitySettings::persist_fail_closed(cs_path) {
                     Ok(()) => tracing::error!(
                         path = %cs_path.display(),
                         error = %reset_err,
-                        "mint: could not reset privacy posture for the new identity; removed the inherited settings file so it fails safe to defaults"
+                        "mint: could not reset privacy posture for the new identity; wrote a fail-closed (non-discoverable) settings file so it stays invisible until the user opts in via Settings → Network"
                     ),
-                    Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {
-                        tracing::warn!(
+                    // The fail-closed write ALSO failed (the disk fault that failed
+                    // the reset likely persists). Remove the inherited file as a
+                    // last resort so we at least don't load the PRIOR identity's
+                    // posture, and surface LOUDLY — a missing file now loads Default
+                    // (discoverable ON), so this doubly-degraded path can leave the
+                    // identity discoverable (mirrors `load_or_default`'s loud fail).
+                    Err(fail_closed_err) => match std::fs::remove_file(cs_path) {
+                        Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {
+                            tracing::warn!(
+                                path = %cs_path.display(),
+                                reset_error = %reset_err,
+                                fail_closed_error = %fail_closed_err,
+                                "mint: privacy-posture reset and fail-closed write both failed, but no settings file exists to inherit — the new identity boots on defaults (discoverable ON)"
+                            )
+                        }
+                        Ok(()) => tracing::error!(
                             path = %cs_path.display(),
-                            error = %reset_err,
-                            "mint: privacy-posture reset write failed, but no settings file exists to inherit — the new identity uses defaults"
-                        )
-                    }
-                    Err(remove_err) => tracing::error!(
-                        path = %cs_path.display(),
-                        reset_error = %reset_err,
-                        remove_error = %remove_err,
-                        "mint: FAILED to reset privacy posture AND to remove the inherited settings file — the new identity may load the prior posture (e.g. identity_discoverable=true); connectivity-settings.json needs manual cleanup"
-                    ),
+                            reset_error = %reset_err,
+                            fail_closed_error = %fail_closed_err,
+                            "mint: reset AND fail-closed write failed; removed the inherited settings file as a last resort — the new identity now loads Default (discoverable ON). Verify the intended posture in Settings → Network"
+                        ),
+                        Err(remove_err) => tracing::error!(
+                            path = %cs_path.display(),
+                            reset_error = %reset_err,
+                            fail_closed_error = %fail_closed_err,
+                            remove_error = %remove_err,
+                            "mint: FAILED to reset privacy posture, to write a fail-closed fallback, AND to remove the inherited settings file — the new identity may load the prior posture; connectivity-settings.json needs manual cleanup"
+                        ),
+                    },
                 }
             }
         }

@@ -281,12 +281,16 @@
           existing identity instead of starting fresh.
         </p>
         {#if !noteDismissed}
-          <!-- ZEB-881: discoverable-by-default reassurance + go-private pointer. -->
+          <!-- ZEB-881: discoverable-by-default reassurance + go-private pointer.
+               Copy is scoped to "when you create your identity" so it does not
+               mispromise discoverability to users who pick Join / Restore below
+               (existing identities, which may be private). -->
           <div class="discoverability-note" data-testid="welcome-discoverability-note" role="note">
             <p>
-              You’ll be <strong>discoverable by identity address</strong> —
-              anyone who has it can connect to your devices. You can go private
-              anytime in <strong>Settings → Network</strong>.
+              When you create your identity, you’ll be
+              <strong>discoverable by identity address</strong> — anyone who has
+              it can connect to your devices. You can go private anytime in
+              <strong>Settings → Network</strong>.
             </p>
             <button
               type="button"

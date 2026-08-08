@@ -8,7 +8,11 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectivitySettings {
-    /// Case B (identity-keyed discoverability) — opt-in, default OFF.
+    /// Case B (identity-keyed discoverability) — default ON (ZEB-881): fresh
+    /// identities are discoverable so first cross-WAN contact works; users opt
+    /// OUT to go private. `#[serde(default)]` fills `false` for a legacy file
+    /// that predates the field (no silent migration), and `fail_closed_defaults`
+    /// keeps it OFF for a corrupt/unreadable file.
     #[serde(default)]
     pub identity_discoverable: bool,
     /// ZEB-371 Task 12 (spec §7.1): per-user "auto-accept known requesters"
@@ -341,6 +345,20 @@ impl ConnectivitySettings {
         }
     }
 
+    /// Persist the fail-closed posture (invisible: `identity_discoverable` OFF,
+    /// `presence_invisible`, auto-accept OFF, intro Closed) while keeping the
+    /// vetted relay pool so connectivity is not bricked.
+    ///
+    /// ZEB-881 mint-recovery use: post-flip a MISSING settings file loads
+    /// [`Default`] = discoverable **ON**, so the mint's privacy-posture reset can
+    /// no longer "fail safe" by deleting the file. When the reset write fails,
+    /// the recovery path writes this explicit non-discoverable state instead, so
+    /// a degraded mint never broadcasts the new identity. The happy path still
+    /// gets the ON product default; only the error path fails closed.
+    pub(crate) fn persist_fail_closed(path: &PathBuf) -> std::io::Result<()> {
+        Self::fail_closed_defaults().save(path)
+    }
+
     pub fn load_or_default(path: &PathBuf) -> Self {
         let contents = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -596,6 +614,25 @@ mod tests {
             !ConnectivitySettings::load_or_default(&path).identity_discoverable,
             "ZEB-881: a persisted opt-out must survive the default flip, not silently migrate to ON"
         );
+    }
+
+    #[test]
+    fn persist_fail_closed_writes_invisible_but_keeps_relays() {
+        // ZEB-881 mint-recovery: the reset-failure path must write an EXPLICIT
+        // non-discoverable state (not rely on delete → Default, which is now ON).
+        // The written file must load back as invisible/opted-out while retaining
+        // the relay pool so connectivity is not bricked.
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        ConnectivitySettings::persist_fail_closed(&path).expect("write fail-closed");
+        let loaded = ConnectivitySettings::load_or_default(&path);
+        assert!(
+            !loaded.identity_discoverable,
+            "fail-closed recovery must leave the new identity NOT discoverable"
+        );
+        assert!(loaded.presence_invisible, "fail-closed recovery must be invisible");
+        assert!(!loaded.friend_auto_accept_known, "fail-closed recovery must not auto-accept");
+        assert!(!loaded.relays.is_empty(), "fail-closed must keep the relay pool, not brick connectivity");
     }
 
     #[test]

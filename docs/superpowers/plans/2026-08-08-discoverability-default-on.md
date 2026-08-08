@@ -223,9 +223,9 @@ In the explain-stage content (inside `{#if stage === 'explain' || stage === 'min
         {#if !noteDismissed}
           <div class="discoverability-note" data-testid="welcome-discoverability-note" role="note">
             <p>
-              You’ll be <strong>discoverable by identity address</strong> — anyone who has it
-              can connect to your devices. You can go private anytime in
-              <strong>Settings → Network</strong>.
+              When you create your identity, you’ll be
+              <strong>discoverable by identity address</strong> — anyone who has it can connect
+              to your devices. You can go private anytime in <strong>Settings → Network</strong>.
             </p>
             <button
               type="button"
