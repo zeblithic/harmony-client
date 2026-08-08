@@ -77,7 +77,12 @@ pub fn default_pkarr_relays() -> Vec<String> {
 impl Default for ConnectivitySettings {
     fn default() -> Self {
         Self {
-            identity_discoverable: false,
+            // ZEB-881: discoverable by default. A fresh identity's pkarr case-B
+            // routing record must publish so first cross-WAN contact works;
+            // default-off was a usability cliff, not a real privacy gain. The
+            // fail-closed path (`fail_closed_defaults`) stays OFF, and existing
+            // persisted files are never migrated (see `load_or_default`).
+            identity_discoverable: true,
             friend_auto_accept_known: default_friend_auto_accept_known(),
             relays: default_pkarr_relays(),
             // Empty = follow the iroh preset's default relay map (n0 stable);
@@ -566,9 +571,11 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_not_discoverable() {
+    fn defaults_to_discoverable() {
+        // ZEB-881: fresh identities are discoverable by default so first
+        // cross-WAN contact works; users opt into privacy, not out of usability.
         let settings = ConnectivitySettings::default();
-        assert!(!settings.identity_discoverable);
+        assert!(settings.identity_discoverable);
     }
 
     #[test]
@@ -583,6 +590,8 @@ mod tests {
         let settings = ConnectivitySettings::load_or_default(&path);
         assert!(!settings.identity_discoverable);
         assert!(!settings.friend_auto_accept_known);
+        // ZEB-881 guard: the ON default must NOT leak into the fail-closed path.
+        assert!(!ConnectivitySettings::fail_closed_defaults().identity_discoverable);
     }
 
     #[test]
@@ -605,7 +614,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("does-not-exist.json");
         let settings = ConnectivitySettings::load_or_default(&path);
-        assert!(!settings.identity_discoverable);
+        assert!(settings.identity_discoverable);
         assert!(settings.friend_auto_accept_known);
     }
 
@@ -634,7 +643,7 @@ mod tests {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("nonexistent.json");
         let settings = ConnectivitySettings::load_or_default(&path);
-        assert!(!settings.identity_discoverable);
+        assert!(settings.identity_discoverable);
     }
 
     #[test]
@@ -935,7 +944,8 @@ mod tests {
 
         let after = ConnectivitySettings::load_or_default(&path);
         // All four privacy/trust toggles back to product Default.
-        assert!(!after.identity_discoverable, "discoverable must reset OFF");
+        // ZEB-881: mint resets to the product Default, which is now ON.
+        assert!(after.identity_discoverable, "discoverable must reset ON");
         assert!(
             after.friend_auto_accept_known,
             "auto-accept-known back to product default ON"
@@ -977,7 +987,9 @@ mod tests {
         std::fs::write(&path, b"{ not valid json").expect("write corrupt");
         ConnectivitySettings::reset_privacy_posture_for_new_identity(&path).expect("reset");
         let after = ConnectivitySettings::load_or_default(&path);
-        assert!(!after.identity_discoverable);
+        // ZEB-881: reset writes product Default (now discoverable ON) over the
+        // fail-closed load; relays fall back to the default pool.
+        assert!(after.identity_discoverable);
         assert_eq!(after.relays, default_pkarr_relays());
         assert_eq!(after, ConnectivitySettings::default());
     }
