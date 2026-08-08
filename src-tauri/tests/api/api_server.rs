@@ -393,7 +393,7 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
         "identity pub is 64 bytes as 128 hex chars"
     );
 
-    // ZEB-512: discoverable defaults false.
+    // ZEB-512 / ZEB-881: discoverable now defaults TRUE for a fresh identity.
     let r = rpc(
         &http,
         &base,
@@ -408,8 +408,8 @@ async fn serve_core_drives_full_flow_over_http_and_ws() {
         "connectivity_get_identity_discoverable must be 200"
     );
     assert!(
-        !r.json::<bool>().await.expect("discoverable body is JSON"),
-        "discoverable must default false"
+        r.json::<bool>().await.expect("discoverable body is JSON"),
+        "ZEB-881: discoverable now defaults true for a fresh identity"
     );
     // ZEB-512: setter is reachable. It needs a pkarr identity publisher in
     // NodeState; this headless boot may not install one (no relay config),
