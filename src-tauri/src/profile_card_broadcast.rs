@@ -785,8 +785,10 @@ mod tests {
         let sink = std::sync::Arc::new(CapturingSink { out: out.clone() });
         // spawn_no_burst + long refresh: `latest` is only written by publish_now,
         // so background republishes can't affect it, but keep the window quiet.
-        let pubr =
-            ProfileCardPublisher::spawn_no_burst(sink.clone(), std::time::Duration::from_secs(3600));
+        let pubr = ProfileCardPublisher::spawn_no_burst(
+            sink.clone(),
+            std::time::Duration::from_secs(3600),
+        );
         let handle = pubr.latest_handle();
         assert!(
             handle.lock().await.is_none(),
@@ -809,7 +811,9 @@ mod tests {
         .unwrap();
         let bytes = canonical_cbor_encode(&card).unwrap();
         let topic = card_topic_for(&owner.owner.0);
-        pubr.publish_now(topic.clone(), bytes.clone()).await.unwrap();
+        pubr.publish_now(topic.clone(), bytes.clone())
+            .await
+            .unwrap();
         assert_eq!(
             handle.lock().await.clone(),
             Some((topic, bytes)),

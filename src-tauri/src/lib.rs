@@ -15285,15 +15285,10 @@ mod pending_owner_card_tests {
     #[tokio::test]
     async fn republish_owner_card_stashes_pending_when_runtime_not_ready() {
         let state = std::sync::Mutex::new(NodeState::default());
-        let err = republish_owner_card_impl(
-            &state,
-            "Ada".to_string(),
-            "coding".to_string(),
-            None,
-            None,
-        )
-        .await
-        .expect_err("a fresh NodeState has no owner runtime wired");
+        let err =
+            republish_owner_card_impl(&state, "Ada".to_string(), "coding".to_string(), None, None)
+                .await
+                .expect_err("a fresh NodeState has no owner runtime wired");
         assert!(
             err.contains("owner card runtime not ready"),
             "unexpected error: {err}"
@@ -29476,7 +29471,8 @@ fn resolve_serve_card_name(flag: Option<String>, profile: Option<String>) -> Opt
             Some(s)
         }
     };
-    flag.and_then(non_blank).or_else(|| profile.and_then(non_blank))
+    flag.and_then(non_blank)
+        .or_else(|| profile.and_then(non_blank))
 }
 
 #[cfg(test)]
