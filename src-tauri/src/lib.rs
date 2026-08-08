@@ -44850,11 +44850,16 @@ pub(crate) async fn set_space_read_receipt_pref_impl(
     space_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    let id_bytes: [u8; 16] = hex::decode(&space_id)
-        .map_err(|e| format!("invalid space_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "space_id must be 16 bytes (32 hex chars)".to_string())?;
+    // Length-check BEFORE decoding so an oversized, attacker-controlled hex
+    // string can't force a large allocation on this externally-invokable
+    // RPC/IPC surface (repo convention — see `clear_space_local_cache_impl`).
+    // Decode straight into the fixed 16-byte buffer; no intermediate `Vec`.
+    if space_id.len() != 32 {
+        return Err("space_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let mut id_bytes = [0u8; 16];
+    hex::decode_to_slice(&space_id, &mut id_bytes)
+        .map_err(|e| format!("invalid space_id hex: {e}"))?;
     let sid = crate::owner_state_types::SpaceId(id_bytes);
     let pref = if enabled {
         crate::owner_state_types::ReadReceiptPref::Broadcast
@@ -44941,11 +44946,13 @@ pub(crate) async fn get_space_read_receipt_pref_impl(
     state_lock: &std::sync::Mutex<NodeState>,
     space_id: String,
 ) -> Result<bool, String> {
-    let id_bytes: [u8; 16] = hex::decode(&space_id)
-        .map_err(|e| format!("invalid space_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "space_id must be 16 bytes (32 hex chars)".to_string())?;
+    // Length-check BEFORE decoding (see `set_space_read_receipt_pref_impl`).
+    if space_id.len() != 32 {
+        return Err("space_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let mut id_bytes = [0u8; 16];
+    hex::decode_to_slice(&space_id, &mut id_bytes)
+        .map_err(|e| format!("invalid space_id hex: {e}"))?;
     let sid = crate::owner_state_types::SpaceId(id_bytes);
     let crdt_state = {
         let g = state_lock
@@ -44982,11 +44989,13 @@ pub(crate) async fn mark_dm_read_impl(
     space_id: String,
     up_to_ms: u64,
 ) -> Result<(), String> {
-    let id_bytes: [u8; 16] = hex::decode(&space_id)
-        .map_err(|e| format!("invalid space_id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "space_id must be 16 bytes (32 hex chars)".to_string())?;
+    // Length-check BEFORE decoding (see `set_space_read_receipt_pref_impl`).
+    if space_id.len() != 32 {
+        return Err("space_id must be 16 bytes (32 hex chars)".to_string());
+    }
+    let mut id_bytes = [0u8; 16];
+    hex::decode_to_slice(&space_id, &mut id_bytes)
+        .map_err(|e| format!("invalid space_id hex: {e}"))?;
     let sid = crate::owner_state_types::SpaceId(id_bytes);
     let (crdt_state, mgr, key, hash, self_owner, device_id, watermarks) = {
         let g = state_lock

@@ -3041,6 +3041,43 @@ mod tests {
                 "{method}: snake_case args must be rejected, got {bad:?}"
             );
         }
+
+        // ZEB-883 hardening (Qodo review): an oversized spaceId is rejected by a
+        // cheap length precheck BEFORE any hex allocation, on every verb — the
+        // repo convention for this externally-invokable surface. The arg struct
+        // accepts any String, so this reaches the `_impl` and must surface the
+        // length `Command` error, not attempt an unbounded decode.
+        let oversized = "ab".repeat(4096); // valid hex chars, wrong length
+        for method in [
+            "set_space_read_receipt_pref",
+            "get_space_read_receipt_pref",
+            "mark_dm_read",
+        ] {
+            let mut args = serde_json::Map::new();
+            args.insert("spaceId".into(), serde_json::json!(oversized));
+            if method == "set_space_read_receipt_pref" {
+                args.insert("enabled".into(), serde_json::json!(true));
+            }
+            if method == "mark_dm_read" {
+                args.insert("upToMs".into(), serde_json::json!(1u64));
+            }
+            let err = reg
+                .dispatch(
+                    method,
+                    test_state(),
+                    test_sink(),
+                    serde_json::Value::Object(args),
+                )
+                .await
+                .unwrap_err();
+            match err {
+                RpcError::Command(msg) => assert!(
+                    msg.contains("16 bytes") || msg.contains("32 hex"),
+                    "{method}: expected length rejection, got: {msg}"
+                ),
+                other => panic!("{method}: expected Command length rejection, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
