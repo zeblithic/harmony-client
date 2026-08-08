@@ -522,6 +522,23 @@ struct ReadDmThreadArgs {
     before_hlc: Option<String>,
 }
 
+// ZEB-883: ZEB-214 read-receipt controls on the headless surface. `get` reuses
+// `SpaceIdHexArgs`. `space_id` is 32-hex; `up_to_ms` is the newest-rendered
+// message's ms timestamp (the watermark the Seen advances to).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetSpaceReadReceiptPrefArgs {
+    space_id: String,
+    enabled: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MarkDmReadArgs {
+    space_id: String,
+    up_to_ms: u64,
+}
+
 // ZEB-775: the three relay-rung RPCs below used to key on `communityIdHex`
 // while every sibling verb — `list_community_members`, `list_channels`,
 // `list_channel_messages`, `generate_invite` — keys on `communityId`, for
@@ -1417,6 +1434,30 @@ pub fn build_registry() -> RpcRegistry {
         |state, _sink, a| async move {
             crate::read_dm_thread_impl(state, a.space_id, a.limit, a.before_hlc).await
         }
+    );
+    // ZEB-214 read receipts, headless parity (ZEB-883): opt in/out, read the
+    // pref, and advance the read watermark (the last fires the Seen).
+    rpc!(
+        m,
+        "set_space_read_receipt_pref",
+        SetSpaceReadReceiptPrefArgs,
+        |state, _sink, a| async move {
+            crate::set_space_read_receipt_pref_impl(state, a.space_id, a.enabled).await
+        }
+    );
+    rpc!(
+        m,
+        "get_space_read_receipt_pref",
+        SpaceIdHexArgs,
+        |state, _sink, a| async move {
+            crate::get_space_read_receipt_pref_impl(state, a.space_id).await
+        }
+    );
+    rpc!(
+        m,
+        "mark_dm_read",
+        MarkDmReadArgs,
+        |state, _sink, a| async move { crate::mark_dm_read_impl(state, a.space_id, a.up_to_ms).await }
     );
     // DM nav rehydration (ZEB-666).
     rpc!(
@@ -2921,6 +2962,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_receipt_rpcs_are_registered_and_wired() {
+        // ZEB-883: the three ZEB-214 read-receipt verbs must be reachable on the
+        // headless surface so an agent node can opt in and *emit* a Seen (not
+        // just observe one). Proves registration + arg parse + wiring to the
+        // right seam, same shape as the vine parity tests above.
+        //
+        // On a default (owner-not-loaded) NodeState:
+        //  - set/get need `crdt_state`, absent here → the seam surfaces its
+        //    owner-not-loaded `Command` error (NOT `UnknownCommand`, which would
+        //    mean unregistered; NOT `BadArgs`, which would mean the arg struct
+        //    rejected the camelCase shape).
+        //  - mark_dm_read is a best-effort no-op when the node isn't fully up
+        //    (tunnel/signing handles absent) → `Ok`. `Ok` is still the wired
+        //    signal: an unregistered verb would be `UnknownCommand`.
+        let reg = build_registry();
+        let space = "ab".repeat(16); // valid 16-byte (32-hex) space id
+
+        let err = reg
+            .dispatch(
+                "set_space_read_receipt_pref",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "spaceId": space, "enabled": true }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::Command(_)),
+            "set_space_read_receipt_pref: expected Command (owner not loaded), got {err:?}"
+        );
+
+        let err = reg
+            .dispatch(
+                "get_space_read_receipt_pref",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "spaceId": space }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RpcError::Command(_)),
+            "get_space_read_receipt_pref: expected Command (owner not loaded), got {err:?}"
+        );
+
+        reg.dispatch(
+            "mark_dm_read",
+            test_state(),
+            test_sink(),
+            serde_json::json!({ "spaceId": space, "upToMs": 1234u64 }),
+        )
+        .await
+        .expect("mark_dm_read is a best-effort no-op on a not-yet-up node → Ok");
+
+        // Each arg struct must REJECT the snake_case wire shape — otherwise the
+        // above would also pass for a verb that silently ignored its arguments.
+        for (method, bad_args) in [
+            (
+                "set_space_read_receipt_pref",
+                serde_json::json!({ "space_id": space, "enabled": true }),
+            ),
+            (
+                "get_space_read_receipt_pref",
+                serde_json::json!({ "space_id": space }),
+            ),
+            (
+                "mark_dm_read",
+                serde_json::json!({ "space_id": space, "up_to_ms": 1234u64 }),
+            ),
+        ] {
+            let bad = reg
+                .dispatch(method, test_state(), test_sink(), bad_args)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(bad, RpcError::BadArgs(_)),
+                "{method}: snake_case args must be rejected, got {bad:?}"
+            );
+        }
+
+        // ZEB-883 hardening (Qodo review): an oversized spaceId is rejected by a
+        // cheap length precheck BEFORE any hex allocation, on every verb — the
+        // repo convention for this externally-invokable surface. The arg struct
+        // accepts any String, so this reaches the `_impl` and must surface the
+        // length `Command` error, not attempt an unbounded decode.
+        let oversized = "ab".repeat(4096); // valid hex chars, wrong length
+        for method in [
+            "set_space_read_receipt_pref",
+            "get_space_read_receipt_pref",
+            "mark_dm_read",
+        ] {
+            let mut args = serde_json::Map::new();
+            args.insert("spaceId".into(), serde_json::json!(oversized));
+            if method == "set_space_read_receipt_pref" {
+                args.insert("enabled".into(), serde_json::json!(true));
+            }
+            if method == "mark_dm_read" {
+                args.insert("upToMs".into(), serde_json::json!(1u64));
+            }
+            let err = reg
+                .dispatch(
+                    method,
+                    test_state(),
+                    test_sink(),
+                    serde_json::Value::Object(args),
+                )
+                .await
+                .unwrap_err();
+            match err {
+                RpcError::Command(msg) => assert!(
+                    msg.contains("16 bytes") || msg.contains("32 hex"),
+                    "{method}: expected length rejection, got: {msg}"
+                ),
+                other => panic!("{method}: expected Command length rejection, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn registry_has_exactly_the_curated_v1_surface() {
         let reg = build_registry();
         let mut names = reg.command_names();
@@ -3028,6 +3188,10 @@ mod tests {
             "add_space",
             "send_dm",
             "read_dm_thread",
+            // ZEB-214 read receipts, headless parity (ZEB-883)
+            "set_space_read_receipt_pref",
+            "get_space_read_receipt_pref",
+            "mark_dm_read",
             // DM nav rehydration (ZEB-666)
             "list_owner_dm_spaces",
             // relay rung (ZEB-487)
