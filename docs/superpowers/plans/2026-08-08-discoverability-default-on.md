@@ -186,7 +186,7 @@ git commit -m "fix(redeem): actionable copy for relay warm-up instead of raw 'no
 
 **Interfaces:**
 - Consumes: the existing `stage === 'explain'` render branch and Svelte 5 runes (`$state`).
-- Produces: a dismissible note gated by a local `noteDismissed` `$state<boolean>` (no persistence — the mint gate is one-time, so cross-session persistence adds nothing).
+- Produces: a dismissible note gated by a local `noteDismissed` `$state<boolean>`. **No persistence, deliberately:** pre-mint there is no `ownerId` to scope a durable flag by, and the owner-scoped onboarding-flags seam (`onboarding-backup-flags.ts`) exists precisely because owner-agnostic global localStorage keys are bundle-scoped (ZEB-587) — a device-global "dismissed" key would suppress the note for every future identity minted on the machine. Re-showing per fresh mint is intended; dismissal holding for the mounted instance is the whole contract.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -196,7 +196,9 @@ In `src/lib/components/__tests__/WelcomeModal.test.ts`, add a test that the note
     const { getByTestId, queryByTestId } = renderWelcome({ open: true });
     const note = getByTestId('welcome-discoverability-note');
     expect(note.textContent).toMatch(/discoverable/i);
-    expect(note.textContent).toMatch(/Settings/i);
+    expect(note.textContent).toMatch(/identity address/i);
+    expect(note.textContent).toMatch(/private/i);
+    expect(note.textContent).toMatch(/Settings\s*→\s*Network/i);
     await fireEvent.click(getByTestId('welcome-discoverability-note-dismiss'));
     expect(queryByTestId('welcome-discoverability-note')).toBeNull();
   });
@@ -221,8 +223,9 @@ In the explain-stage content (inside `{#if stage === 'explain' || stage === 'min
         {#if !noteDismissed}
           <div class="discoverability-note" data-testid="welcome-discoverability-note" role="note">
             <p>
-              You’ll be <strong>discoverable</strong>, so people can reach you with an invite.
-              You can go private anytime in <strong>Settings → Network</strong>.
+              You’ll be <strong>discoverable by identity address</strong> — anyone who has it
+              can connect to your devices. You can go private anytime in
+              <strong>Settings → Network</strong>.
             </p>
             <button
               type="button"

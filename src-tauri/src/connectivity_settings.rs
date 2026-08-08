@@ -579,6 +579,45 @@ mod tests {
     }
 
     #[test]
+    fn persisted_opt_out_is_preserved_not_migrated() {
+        // ZEB-881 no-migration boundary: flipping the *product default* to ON
+        // must NOT rewrite an existing user who explicitly persisted OFF.
+        // `load_or_default` returns a valid persisted file verbatim, so a saved
+        // `identity_discoverable: false` stays false — the new ON default only
+        // reaches fresh profiles (missing file) and mint reset.
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        let persisted = ConnectivitySettings {
+            identity_discoverable: false,
+            ..Default::default()
+        };
+        persisted.save(&path).expect("save");
+        assert!(
+            !ConnectivitySettings::load_or_default(&path).identity_discoverable,
+            "ZEB-881: a persisted opt-out must survive the default flip, not silently migrate to ON"
+        );
+    }
+
+    #[test]
+    fn legacy_file_omitting_discoverable_loads_off_not_default_on() {
+        // A pre-ZEB-881 settings file has no `identity_discoverable` key. The
+        // field's `#[serde(default)]` fills `bool::default()` = FALSE — the
+        // struct's Default (now ON) does NOT apply to individual omitted fields.
+        // This is the intended no-migration contract: an established identity
+        // that predates the flag stays private until it opts in, rather than
+        // being silently broadcast on the next launch.
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("legacy.json");
+        std::fs::write(&path, r#"{"friend_auto_accept_known":true}"#).expect("write");
+        let loaded = ConnectivitySettings::load_or_default(&path);
+        assert!(
+            !loaded.identity_discoverable,
+            "ZEB-881: a legacy file omitting the field must load OFF (serde field default), \
+             never silently inherit the new ON struct default"
+        );
+    }
+
+    #[test]
     fn parse_error_fails_closed_not_open() {
         // A corrupt settings file must fail CLOSED on EVERY privacy/trust toggle,
         // never open. Privacy-fail-open would silently violate a real opt-out —

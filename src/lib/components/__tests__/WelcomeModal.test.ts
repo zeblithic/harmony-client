@@ -88,8 +88,12 @@ describe('WelcomeModal hard gate + flow', () => {
       props: { open: true, onMinted: vi.fn() },
     });
     const note = getByTestId('welcome-discoverability-note');
+    // Lock the accurate framing: discoverability is identity-address (case-B)
+    // discovery, and the note must name the private-mode escape + its location.
     expect(note.textContent).toMatch(/discoverable/i);
-    expect(note.textContent).toMatch(/Settings/i);
+    expect(note.textContent).toMatch(/identity address/i);
+    expect(note.textContent).toMatch(/private/i);
+    expect(note.textContent).toMatch(/Settings\s*→\s*Network/i);
     await fireEvent.click(getByTestId('welcome-discoverability-note-dismiss'));
     expect(queryByTestId('welcome-discoverability-note')).toBeNull();
   });

@@ -55,10 +55,20 @@ default is ON.
 
 - Add a **dismissible** privacy note to `WelcomeModal`'s welcome/`explain` stage. Do **not** add a
   new wizard step — the mint hard-gate stays a 3-step wizard.
-- Copy (final wording tuned in implementation): *"You're discoverable, so people can reach you
-  with an invite. You can go private anytime in Settings → Network."*
-- Persist a one-time "seen/dismissed" flag using the existing onboarding-flags pattern
-  (`onboarding-backup-flags.ts` style) so it shows once and doesn't nag.
+- Copy (mirrors the Settings → Network panel's own language so the terms stay consistent — the
+  toggle reads "Allow discovery by identity address"): *"You'll be discoverable by identity address
+  — anyone who has it can connect to your devices. You can go private anytime in Settings →
+  Network."* Note: discoverability is case-B identity discovery only; **invites/friend-tokens still
+  work in private mode** (they resolve a separate case-A record keyed by the token secret), so the
+  copy must not tie invites to discoverability.
+- Dismissal is **local component state** (`$state`), not a persisted flag. The `WelcomeModal` is a
+  one-time pre-mint hard-gate, so **no `ownerId` exists yet** to scope a durable flag by — and the
+  existing onboarding-flags seam (`onboarding-backup-flags.ts`) is deliberately owner-scoped for
+  exactly this reason: its ZEB-587 header documents that owner-agnostic global localStorage keys are
+  bundle-scoped (not profile-isolated), so a device-global "dismissed" key would suppress the note
+  for *every future identity* minted on the machine. Re-showing the note on each fresh mint is the
+  intended behavior — a new identity's owner should be re-informed they'll be discoverable. Within a
+  session the note stays dismissed after "Got it"; a remount (only reachable pre-mint) re-shows it.
 - Reference Settings → Network (the existing `NetworkDiscoverabilitySettings` toggle) in copy
   rather than adding a new deep-link.
 
@@ -83,10 +93,11 @@ default is ON.
 - **Frontend**:
   - `redeem-invite-errors` test: `mapRedeemInviteError("no relays available (all on cooldown or
     unreachable)")` returns the `relays_warming_up` variant (summary/hint/tag), not FALLBACK.
-  - `WelcomeModal` test: the privacy note renders and is dismissible; dismissal persists.
-- Full CI-parity gate before PR: `cargo fmt --check`, `cargo clippy --all-targets -D warnings`,
-  `cargo nextest run --workspace --all-targets --features test-fixtures`, `npx tsc --noEmit`,
-  `npx vitest run`.
+  - `WelcomeModal` test: the privacy note renders, names the private-mode escape hatch
+    (`Settings → Network`), and is dismissible (dismissal holds for the mounted instance).
+- Full CI-parity gate before PR:
+  - From `src-tauri/`: `cargo fmt --all -- --check`; `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; `cargo nextest run --locked --workspace --all-targets --features test-fixtures`.
+  - From the repository root: `npx tsc --noEmit`; `npx vitest run`.
 
 ## Risks / notes
 

@@ -284,9 +284,9 @@
           <!-- ZEB-881: discoverable-by-default reassurance + go-private pointer. -->
           <div class="discoverability-note" data-testid="welcome-discoverability-note" role="note">
             <p>
-              You’ll be <strong>discoverable</strong>, so people can reach you
-              with an invite. You can go private anytime in
-              <strong>Settings → Network</strong>.
+              You’ll be <strong>discoverable by identity address</strong> —
+              anyone who has it can connect to your devices. You can go private
+              anytime in <strong>Settings → Network</strong>.
             </p>
             <button
               type="button"
