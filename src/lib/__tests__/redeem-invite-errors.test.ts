@@ -70,4 +70,13 @@ describe('mapRedeemInviteError', () => {
     expect(r.summary).toContain('network');
     expect(r.tag).toBe('network_failure');
   });
+
+  it('maps the pkarr relay warm-up error to an actionable, non-misleading message (ZEB-879)', () => {
+    const r = mapRedeemInviteError('no relays available (all on cooldown or unreachable)');
+    expect(r.tag).toBe('relays_warming_up');
+    expect(r.summary).toBe('The network is still warming up.');
+    expect(r.hint).toMatch(/try again/i);
+    // must NOT fall through to the generic network-failure fallback
+    expect(r.tag).not.toBe('network_failure');
+  });
 });

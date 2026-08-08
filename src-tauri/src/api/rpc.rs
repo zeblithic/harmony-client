@@ -2690,7 +2690,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connectivity_get_identity_discoverable_defaults_false() {
+    async fn connectivity_get_identity_discoverable_resolves_default_when_node_stopped() {
+        // ZEB-881 / Qodo: with no settings path on NodeState (node stopped /
+        // headless pre-init), the getter resolves the persisted settings via the
+        // ZEB-380 app-data-dir fallback and reports the stored value — or the
+        // first-run Default (ON) when no file exists — instead of a hard `false`
+        // that would disagree with `load_or_default` and mis-seed the toggle.
+        // Isolate the resolved path to a fresh temp dir (nextest runs each test in
+        // its own process, so the env override does not leak across tests).
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HARMONY_DATA_DIR", tmp.path());
         let reg = build_registry();
         let out = reg
             .dispatch(
@@ -2701,7 +2710,12 @@ mod tests {
             )
             .await
             .expect("verb registered");
-        assert_eq!(out, serde_json::Value::Bool(false));
+        std::env::remove_var("HARMONY_DATA_DIR");
+        assert_eq!(
+            out,
+            serde_json::Value::Bool(true),
+            "a fresh identity with no persisted file is discoverable by default (ZEB-881)"
+        );
     }
 
     #[tokio::test]

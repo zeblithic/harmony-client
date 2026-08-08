@@ -83,6 +83,23 @@ describe('WelcomeModal hard gate + flow', () => {
     expect(getByTestId('welcome-create-identity')).toBeTruthy();
   });
 
+  it('shows a dismissible discoverability privacy note on the welcome stage (ZEB-881)', async () => {
+    const { getByTestId, queryByTestId } = render(WelcomeModal, {
+      props: { open: true, onMinted: vi.fn() },
+    });
+    const note = getByTestId('welcome-discoverability-note');
+    // Lock the accurate framing: discoverability is identity-address (case-B)
+    // discovery, the promise is SCOPED to creating an identity (so Join/Restore
+    // users are not misled), and the note names the private-mode escape hatch.
+    expect(note.textContent).toMatch(/create your identity/i);
+    expect(note.textContent).toMatch(/discoverable/i);
+    expect(note.textContent).toMatch(/identity address/i);
+    expect(note.textContent).toMatch(/private/i);
+    expect(note.textContent).toMatch(/Settings\s*→\s*Network/i);
+    await fireEvent.click(getByTestId('welcome-discoverability-note-dismiss'));
+    expect(queryByTestId('welcome-discoverability-note')).toBeNull();
+  });
+
   it('clicks create-my-identity invokes mint with no args', async () => {
     mintMock.mockResolvedValue({ state: {}, recoveryToken: 'tok' });
     const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });

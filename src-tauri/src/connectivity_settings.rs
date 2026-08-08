@@ -8,7 +8,11 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectivitySettings {
-    /// Case B (identity-keyed discoverability) — opt-in, default OFF.
+    /// Case B (identity-keyed discoverability) — default ON (ZEB-881): fresh
+    /// identities are discoverable so first cross-WAN contact works; users opt
+    /// OUT to go private. `#[serde(default)]` fills `false` for a legacy file
+    /// that predates the field (no silent migration), and `fail_closed_defaults`
+    /// keeps it OFF for a corrupt/unreadable file.
     #[serde(default)]
     pub identity_discoverable: bool,
     /// ZEB-371 Task 12 (spec §7.1): per-user "auto-accept known requesters"
@@ -77,7 +81,12 @@ pub fn default_pkarr_relays() -> Vec<String> {
 impl Default for ConnectivitySettings {
     fn default() -> Self {
         Self {
-            identity_discoverable: false,
+            // ZEB-881: discoverable by default. A fresh identity's pkarr case-B
+            // routing record must publish so first cross-WAN contact works;
+            // default-off was a usability cliff, not a real privacy gain. The
+            // fail-closed path (`fail_closed_defaults`) stays OFF, and existing
+            // persisted files are never migrated (see `load_or_default`).
+            identity_discoverable: true,
             friend_auto_accept_known: default_friend_auto_accept_known(),
             relays: default_pkarr_relays(),
             // Empty = follow the iroh preset's default relay map (n0 stable);
@@ -336,6 +345,20 @@ impl ConnectivitySettings {
         }
     }
 
+    /// Persist the fail-closed posture (invisible: `identity_discoverable` OFF,
+    /// `presence_invisible`, auto-accept OFF, intro Closed) while keeping the
+    /// vetted relay pool so connectivity is not bricked.
+    ///
+    /// ZEB-881 mint-recovery use: post-flip a MISSING settings file loads
+    /// [`Default`] = discoverable **ON**, so the mint's privacy-posture reset can
+    /// no longer "fail safe" by deleting the file. When the reset write fails,
+    /// the recovery path writes this explicit non-discoverable state instead, so
+    /// a degraded mint never broadcasts the new identity. The happy path still
+    /// gets the ON product default; only the error path fails closed.
+    pub(crate) fn persist_fail_closed(path: &PathBuf) -> std::io::Result<()> {
+        Self::fail_closed_defaults().save(path)
+    }
+
     pub fn load_or_default(path: &PathBuf) -> Self {
         let contents = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -566,9 +589,78 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_not_discoverable() {
+    fn defaults_to_discoverable() {
+        // ZEB-881: fresh identities are discoverable by default so first
+        // cross-WAN contact works; users opt into privacy, not out of usability.
         let settings = ConnectivitySettings::default();
-        assert!(!settings.identity_discoverable);
+        assert!(settings.identity_discoverable);
+    }
+
+    #[test]
+    fn persisted_opt_out_is_preserved_not_migrated() {
+        // ZEB-881 no-migration boundary: flipping the *product default* to ON
+        // must NOT rewrite an existing user who explicitly persisted OFF.
+        // `load_or_default` returns a valid persisted file verbatim, so a saved
+        // `identity_discoverable: false` stays false — the new ON default only
+        // reaches fresh profiles (missing file) and mint reset.
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        let persisted = ConnectivitySettings {
+            identity_discoverable: false,
+            ..Default::default()
+        };
+        persisted.save(&path).expect("save");
+        assert!(
+            !ConnectivitySettings::load_or_default(&path).identity_discoverable,
+            "ZEB-881: a persisted opt-out must survive the default flip, not silently migrate to ON"
+        );
+    }
+
+    #[test]
+    fn persist_fail_closed_writes_invisible_but_keeps_relays() {
+        // ZEB-881 mint-recovery: the reset-failure path must write an EXPLICIT
+        // non-discoverable state (not rely on delete → Default, which is now ON).
+        // The written file must load back as invisible/opted-out while retaining
+        // the relay pool so connectivity is not bricked.
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        ConnectivitySettings::persist_fail_closed(&path).expect("write fail-closed");
+        let loaded = ConnectivitySettings::load_or_default(&path);
+        assert!(
+            !loaded.identity_discoverable,
+            "fail-closed recovery must leave the new identity NOT discoverable"
+        );
+        assert!(
+            loaded.presence_invisible,
+            "fail-closed recovery must be invisible"
+        );
+        assert!(
+            !loaded.friend_auto_accept_known,
+            "fail-closed recovery must not auto-accept"
+        );
+        assert!(
+            !loaded.relays.is_empty(),
+            "fail-closed must keep the relay pool, not brick connectivity"
+        );
+    }
+
+    #[test]
+    fn legacy_file_omitting_discoverable_loads_off_not_default_on() {
+        // A pre-ZEB-881 settings file has no `identity_discoverable` key. The
+        // field's `#[serde(default)]` fills `bool::default()` = FALSE — the
+        // struct's Default (now ON) does NOT apply to individual omitted fields.
+        // This is the intended no-migration contract: an established identity
+        // that predates the flag stays private until it opts in, rather than
+        // being silently broadcast on the next launch.
+        let td = TempDir::new().expect("tempdir");
+        let path = td.path().join("legacy.json");
+        std::fs::write(&path, r#"{"friend_auto_accept_known":true}"#).expect("write");
+        let loaded = ConnectivitySettings::load_or_default(&path);
+        assert!(
+            !loaded.identity_discoverable,
+            "ZEB-881: a legacy file omitting the field must load OFF (serde field default), \
+             never silently inherit the new ON struct default"
+        );
     }
 
     #[test]
@@ -583,6 +675,8 @@ mod tests {
         let settings = ConnectivitySettings::load_or_default(&path);
         assert!(!settings.identity_discoverable);
         assert!(!settings.friend_auto_accept_known);
+        // ZEB-881 guard: the ON default must NOT leak into the fail-closed path.
+        assert!(!ConnectivitySettings::fail_closed_defaults().identity_discoverable);
     }
 
     #[test]
@@ -605,7 +699,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("does-not-exist.json");
         let settings = ConnectivitySettings::load_or_default(&path);
-        assert!(!settings.identity_discoverable);
+        assert!(settings.identity_discoverable);
         assert!(settings.friend_auto_accept_known);
     }
 
@@ -634,7 +728,7 @@ mod tests {
         let td = TempDir::new().expect("tempdir");
         let path = td.path().join("nonexistent.json");
         let settings = ConnectivitySettings::load_or_default(&path);
-        assert!(!settings.identity_discoverable);
+        assert!(settings.identity_discoverable);
     }
 
     #[test]
@@ -935,7 +1029,8 @@ mod tests {
 
         let after = ConnectivitySettings::load_or_default(&path);
         // All four privacy/trust toggles back to product Default.
-        assert!(!after.identity_discoverable, "discoverable must reset OFF");
+        // ZEB-881: mint resets to the product Default, which is now ON.
+        assert!(after.identity_discoverable, "discoverable must reset ON");
         assert!(
             after.friend_auto_accept_known,
             "auto-accept-known back to product default ON"
@@ -977,7 +1072,9 @@ mod tests {
         std::fs::write(&path, b"{ not valid json").expect("write corrupt");
         ConnectivitySettings::reset_privacy_posture_for_new_identity(&path).expect("reset");
         let after = ConnectivitySettings::load_or_default(&path);
-        assert!(!after.identity_discoverable);
+        // ZEB-881: reset writes product Default (now discoverable ON) over the
+        // fail-closed load; relays fall back to the default pool.
+        assert!(after.identity_discoverable);
         assert_eq!(after.relays, default_pkarr_relays());
         assert_eq!(after, ConnectivitySettings::default());
     }

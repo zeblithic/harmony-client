@@ -136,8 +136,11 @@ fn mint_resets_inherited_privacy_posture_preserving_relays() {
     // Seed an "inherited" settings file: every privacy/trust toggle flipped away
     // from its product default, plus a custom relay pool the machine configured.
     std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    // Every privacy/trust toggle seeded AWAY from its product default. Post
+    // ZEB-881 the discoverable default is ON, so the "flipped away" value here is
+    // OFF (a prior identity's opt-OUT) — mint must NOT inherit it.
     let inherited = ConnectivitySettings {
-        identity_discoverable: true,
+        identity_discoverable: false,
         friend_auto_accept_known: false,
         presence_invisible: true,
         peer_intro_policy: PeerIntroPolicy::Closed,
@@ -156,8 +159,8 @@ fn mint_resets_inherited_privacy_posture_preserving_relays() {
     // The mint reset the identity-scoped posture to product defaults...
     let after = ConnectivitySettings::load_or_default(&settings_path);
     assert!(
-        !after.identity_discoverable,
-        "mint must reset discoverable OFF (not inherit the prior identity's opt-in)"
+        after.identity_discoverable,
+        "ZEB-881: mint must reset discoverable to the product default ON (not inherit the prior identity's opt-out)"
     );
     assert!(
         after.friend_auto_accept_known,

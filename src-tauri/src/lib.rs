@@ -10139,19 +10139,19 @@ pub async fn start_node_inner(
                     } else {
                         // ZEB-794: log the OFF branch, at info, unconditionally.
                         //
-                        // The default is off and the boot log said nothing either
-                        // way, so an operator reading a fresh `serve` log had no
-                        // way to learn the node was undiscoverable. Meanwhile
-                        // case-C and case-D publish automatically, so the node
-                        // looks like it is publishing — it is, just not the slot
-                        // first contact resolves against. The remote symptom is a
-                        // bare `unreachable`, indistinguishable from offline,
-                        // wrong key, or a broken DHT.
+                        // ZEB-881: OFF is now an explicit user opt-out, not the
+                        // default. An operator reading a `serve` log still needs
+                        // to see it, because case-C and case-D publish
+                        // automatically — so the node looks like it is publishing
+                        // (it is, just not the slot first contact resolves
+                        // against). The remote symptom is a bare `unreachable`,
+                        // indistinguishable from offline, wrong key, or a broken
+                        // DHT.
                         //
-                        // Deliberately NOT a warning: off-by-default is a
-                        // considered privacy posture, not a misconfiguration.
+                        // Deliberately NOT a warning: going private is a
+                        // considered privacy choice, not a misconfiguration.
                         tracing::info!(
-                            "ZEB-794: identity discoverability OFF (default) — case-B not \
+                            "ZEB-794: identity discoverability OFF (opted out) — case-B not \
                              published, so add_friend_by_key against this node returns \
                              `unreachable`. Enable with \
                              `connectivity_set_identity_discoverable {{\"enabled\": true}}`, \
@@ -63463,22 +63463,28 @@ async fn connectivity_set_identity_discoverable(
 }
 
 /// Read the current case-B "Make me discoverable" toggle state from the
-/// persisted settings file. Returns `false` when the file is missing or
-/// the pkarr settings path is not initialized.
+/// persisted settings file. Reflects the stored setting — or the first-run
+/// [`ConnectivitySettings::default`] (ON, post-ZEB-881) when no file exists yet.
+///
+/// ZEB-881 / Qodo: `NodeState.connectivity_settings_path` is cleared on stop
+/// (ZEB-380), so a stopped node / pre-init headless call sees `None`. Resolve
+/// the path via the same app-data-dir fallback the relay manager and setter use
+/// (`connectivity_settings_path`) rather than hard-returning `false` — a hard
+/// `false` would read as an explicit opt-out and disagree with `load_or_default`
+/// (which returns the ON Default for a missing file), mis-seeding the toggle.
+/// (The setter still requires a live publisher: reading the stored intent and
+/// toggling live case-B publication are legitimately different operations.)
 pub(crate) async fn connectivity_get_identity_discoverable_impl(
     state: &std::sync::Mutex<NodeState>,
 ) -> Result<bool, String> {
-    let path = {
+    let state_path = {
         state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?
             .connectivity_settings_path
             .clone()
     };
-    let Some(path) = path else {
-        // Node not running or pkarr not initialized — return the default (off).
-        return Ok(false);
-    };
+    let path = connectivity_settings_path(state_path)?;
     // Offload the sync std::fs read off the Tokio worker — this seam is reachable
     // over the async headless API surface.
     tokio::task::spawn_blocking(move || {
@@ -63714,7 +63720,9 @@ mod epoch_republish_trigger_tests {
 /// publisher's current handle set. case-C/D refresh unconditionally; gating
 /// case-B on `active_handles` left it with no redundancy, so a single dropped
 /// boot publish froze the identity record permanently. Returns false when the
-/// setting is off or the file is missing/unreadable (matches `load_or_default`).
+/// setting is off or the file is unreadable/corrupt (fail-closed). ZEB-881: a
+/// genuinely-missing file is first-run and now defaults discoverable ON, so
+/// republish is enabled there too (matches `load_or_default`).
 fn identity_republish_enabled(settings_path: &std::path::Path) -> bool {
     connectivity_settings::ConnectivitySettings::load_or_default(&settings_path.to_path_buf())
         .identity_discoverable
@@ -63743,8 +63751,9 @@ mod identity_republish_gate_tests {
             "discoverable=false must disable case-B republish"
         );
         assert!(
-            !identity_republish_enabled(&td.path().join("missing.json")),
-            "missing settings file must default to off (no publish)"
+            identity_republish_enabled(&td.path().join("missing.json")),
+            "ZEB-881: a genuinely-missing settings file is first-run and now \
+             defaults discoverable ON, so case-B republish is enabled"
         );
     }
 }

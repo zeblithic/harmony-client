@@ -77,6 +77,15 @@ const VARIANT_PATTERNS: Array<{
     hint: 'Make sure you copied the full URL starting with harmony://invite/.',
     tag: 'malformed_url',
   },
+  {
+    // ZEB-879: the pkarr resolver returns this while its relay pool is still
+    // cold (~1 min after launch, or after sleep/wake). The relays ARE reachable
+    // — surfacing the raw string reads as a hard network outage, which it isn't.
+    match: /no relays available/i,
+    summary: 'The network is still warming up.',
+    hint: 'Discovery relays warm up for about a minute after launch — try again shortly. If it keeps failing, the inviter may not be discoverable yet.',
+    tag: 'relays_warming_up',
+  },
 ];
 
 const FALLBACK = {
