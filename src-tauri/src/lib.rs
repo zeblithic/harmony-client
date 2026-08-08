@@ -44840,6 +44840,16 @@ async fn set_space_read_receipt_pref(
     space_id: String,
     enabled: bool,
 ) -> Result<(), String> {
+    set_space_read_receipt_pref_impl(state_lock.inner(), space_id, enabled).await
+}
+
+/// ZEB-883: shared IPC/RPC seam so the headless `serve`/`api` surface can reach
+/// this exactly as the Tauri command does (mirrors `subscribe_peer_profile`).
+pub(crate) async fn set_space_read_receipt_pref_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    space_id: String,
+    enabled: bool,
+) -> Result<(), String> {
     let id_bytes: [u8; 16] = hex::decode(&space_id)
         .map_err(|e| format!("invalid space_id hex: {e}"))?
         .as_slice()
@@ -44923,6 +44933,14 @@ async fn get_space_read_receipt_pref(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
     space_id: String,
 ) -> Result<bool, String> {
+    get_space_read_receipt_pref_impl(state_lock.inner(), space_id).await
+}
+
+/// ZEB-883: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn get_space_read_receipt_pref_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
+    space_id: String,
+) -> Result<bool, String> {
     let id_bytes: [u8; 16] = hex::decode(&space_id)
         .map_err(|e| format!("invalid space_id hex: {e}"))?
         .as_slice()
@@ -44952,6 +44970,15 @@ async fn get_space_read_receipt_pref(
 #[tauri::command]
 async fn mark_dm_read(
     state_lock: tauri::State<'_, std::sync::Mutex<NodeState>>,
+    space_id: String,
+    up_to_ms: u64,
+) -> Result<(), String> {
+    mark_dm_read_impl(state_lock.inner(), space_id, up_to_ms).await
+}
+
+/// ZEB-883: shared IPC/RPC seam (headless `serve` parity).
+pub(crate) async fn mark_dm_read_impl(
+    state_lock: &std::sync::Mutex<NodeState>,
     space_id: String,
     up_to_ms: u64,
 ) -> Result<(), String> {
