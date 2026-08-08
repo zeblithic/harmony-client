@@ -39,6 +39,11 @@
   type Stage = 'explain' | 'minting' | 'backup' | 'skip-confirm' | 'joining' | 'restore';
   let stage = $state<Stage>('explain');
 
+  // ZEB-881: one-time reassurance that the new identity is discoverable, with a
+  // pointer to go private. Local-only dismiss — the mint gate is itself
+  // one-time, so cross-session persistence would add nothing.
+  let noteDismissed = $state(false);
+
   // ZEB-610 (Commons G): the mint hard gate is a 3-step wizard — Welcome →
   // Create (both sage) → Back up (clay: the one stage where losing the file is
   // irreversible). The pip rail visualizes that arc; clay lives ONLY on the
@@ -275,6 +280,25 @@
           Already have Harmony on another device? You can add this one to your
           existing identity instead of starting fresh.
         </p>
+        {#if !noteDismissed}
+          <!-- ZEB-881: discoverable-by-default reassurance + go-private pointer. -->
+          <div class="discoverability-note" data-testid="welcome-discoverability-note" role="note">
+            <p>
+              You’ll be <strong>discoverable</strong>, so people can reach you
+              with an invite. You can go private anytime in
+              <strong>Settings → Network</strong>.
+            </p>
+            <button
+              type="button"
+              class="note-dismiss"
+              data-testid="welcome-discoverability-note-dismiss"
+              aria-label="Dismiss discoverability note"
+              onclick={() => (noteDismissed = true)}
+            >
+              Got it
+            </button>
+          </div>
+        {/if}
         {#if mintError && !alreadyExists}
           <!-- Map the raw backend mint failure to friendly copy; keep the raw
                string available for bug reports inside a <details> disclosure.
@@ -485,6 +509,25 @@
   }
   .modal-content p { margin: 0 0 1rem; line-height: 1.5; }
   .muted { color: var(--text-secondary); font-size: 0.9rem; }
+
+  /* ZEB-881: discoverability privacy note (subtle, non-clay — informational). */
+  .discoverability-note {
+    margin-top: 0.75rem;
+    padding: 0.6rem 0.75rem;
+    background: var(--surface-raised);
+    border: 1px solid var(--border-default);
+    border-radius: 8px;
+    font-size: 0.9rem;
+  }
+  .discoverability-note p { margin: 0 0 0.4rem; color: var(--text-secondary); }
+  .note-dismiss {
+    padding: 0.25rem 0.6rem;
+    border: 1px solid var(--border-default);
+    background: var(--bg-tertiary);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
 
   /* Step 3 (backup) — the ONE clay stage. Warning callout: you hold the only
      copy. Clay tokens appear here and on the backup pip only; sage elsewhere. */

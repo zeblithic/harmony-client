@@ -83,6 +83,17 @@ describe('WelcomeModal hard gate + flow', () => {
     expect(getByTestId('welcome-create-identity')).toBeTruthy();
   });
 
+  it('shows a dismissible discoverability privacy note on the welcome stage (ZEB-881)', async () => {
+    const { getByTestId, queryByTestId } = render(WelcomeModal, {
+      props: { open: true, onMinted: vi.fn() },
+    });
+    const note = getByTestId('welcome-discoverability-note');
+    expect(note.textContent).toMatch(/discoverable/i);
+    expect(note.textContent).toMatch(/Settings/i);
+    await fireEvent.click(getByTestId('welcome-discoverability-note-dismiss'));
+    expect(queryByTestId('welcome-discoverability-note')).toBeNull();
+  });
+
   it('clicks create-my-identity invokes mint with no args', async () => {
     mintMock.mockResolvedValue({ state: {}, recoveryToken: 'tok' });
     const { getByTestId } = render(WelcomeModal, { props: { open: true, onMinted: vi.fn() } });
