@@ -72,7 +72,7 @@ One Rust enum, `#[derive(Serialize)] #[serde(rename_all = "snake_case")]`, seria
 
 3. **iroh seam** — `connectivity_redeem_invite_iroh{,_impl}` hard-error `String → RedeemInviteError` (poisoned/internal sites → `internal`; the not-fully-booted `Ok(inviter_unreachable)` path is unchanged). The Ok-side `RedemptionOutcome.status` **string constants are re-sourced** from `RedeemInviteErrorCode::….serialize`-equivalent `&'static str` values (a `const`/`as_str()` on the enum) so `status` and `code` share one vocabulary and can't drift. `RedemptionOutcome` itself stays a `String`-status struct (no 25-site retype).
 
-4. **RPC/serve surface (integration point to verify):** `redeem_invite_impl` is the shared IPC/**RPC** seam (ZEB-445). Changing its error type changes what the headless `serve`/`api` WS surface serializes for a redeem failure (today a JSON string; after, a `{code,message}` object). This is an *improvement* but a wire change for our own `api` CLI. Implementation must grep the `api`/serve redeem consumers and update any that parse the error as a bare string. (Same for `connectivity_redeem_invite_iroh_impl` via its serve seam.)
+4. **RPC/serve surface — flatten at the boundary, wire unchanged.** `redeem_invite_impl` is the shared IPC/**RPC** seam (ZEB-445), consumed by the Tauri command (`lib.rs:41524`) and the serve/api RPC (`api/rpc.rs:836`; iroh at `847`). The `rpc!` macro (`api/rpc.rs:51`) flattens every verb's error via `.map_err(RpcError::Command)?`, and `RpcError::Command` wraps a `String` — so each RPC closure must yield `Result<_, String>`. **Decision (revised from earlier draft):** flatten `RedeemInviteError → e.to_string()` (its Display = `message`) at the two rpc.rs call sites, keeping the serve/api WS wire a plain string. The fleet `api` CLI doesn't switch on codes, so propagating the struct there is churn with no consumer. The structured `{code, message}` surfaces **only** on the Tauri GUI command path (Tauri auto-serializes the `Serialize` error to the webview). Net: **no `api`-CLI change**; the wire is untouched.
 
 ## Frontend design
 
@@ -113,7 +113,7 @@ One Rust enum, `#[derive(Serialize)] #[serde(rename_all = "snake_case")]`, seria
 ## Migration / compatibility
 
 - **Tauri IPC is internal** (frontend+backend ship as one binary) — no cross-version skew on the GUI path; both ends change in this PR.
-- **Serve/api RPC is a real wire surface** for our fleet tooling — the error shape change is structured-strictly-better but must land with matching `api`-CLI updates in the same PR (see backend step 4).
+- **Serve/api RPC wire is unchanged** — `RedeemInviteError` is flattened to its `message` string at the rpc.rs boundary (backend step 4), so the fleet `api` CLI / e2e harnesses see the same string-error shape as before. No `api`-CLI change.
 - The `unknown` fallback guarantees forward-compat: a code the frontend hasn't learned yet renders generic copy, never a crash.
 
 ## Non-goals
