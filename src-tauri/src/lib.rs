@@ -10217,12 +10217,15 @@ pub async fn start_node_inner(
                     // Restore case-B if enabled (connectivity_settings loaded above, hoisted by ZEB-380).
                     // ZEB-890/ZEB-894: this uses the pre-publisher settings
                     // snapshot. An opt-out toggled during the boot window (after
-                    // this load, before the publisher is installed at ~13486, so
+                    // this load, before the publisher is installed at ~13535, so
                     // the setter can persist but not disable live) leaves a
-                    // transient persisted=OFF / live=publishing that the periodic
-                    // `reconcile_identity_republish` heals within one tick.
-                    // ZEB-894 tracks tightening that window to ~0 with a
-                    // post-install reconcile.
+                    // transient persisted=OFF / live=publishing. ZEB-894 now
+                    // closes that window: a post-install
+                    // `reconcile_identity_republish` runs on the startup-success
+                    // path (search "ZEB-894: post-install identity reconcile")
+                    // and drives the live publication to the persisted setting
+                    // immediately, so the residual divergence no longer waits for
+                    // the periodic ≤7.5-min tick.
                     if connectivity_settings.identity_discoverable {
                         pkarr_identity_pub.enable().await;
                         tracing::info!(
@@ -14315,6 +14318,57 @@ pub async fn start_node_inner(
                         // pre-reconcile list until the next manual refresh.
                         app.emit("connectivity-relays-changed", serde_json::Value::Null);
                     }
+                }
+            }
+
+            // ZEB-894: reconcile the live identity (case-B) publication against
+            // the persisted discoverable setting now that the
+            // `pkarr_identity_publisher` is stashed and visible. The boot enable
+            // (~:10226) uses the `connectivity_settings` snapshot loaded BEFORE
+            // the publisher is installed into NodeState (~:13535); an
+            // identity-discoverability opt-out toggled in that window persists
+            // (ZEB-890 B2 setter) but has no live handle to `disable()`, leaving
+            // a transient persisted=OFF / live=publishing. Pre-ZEB-894 that
+            // divergence healed only on the first periodic
+            // `reconcile_identity_republish` (the ≤7.5-min routing tick or an
+            // address/fleet/epoch event trigger). Run one reconcile here so it
+            // heals immediately. Unlike the relay reconciles around it this
+            // needs NO `connectivity_settings_write_lock`:
+            // `reconcile_identity_republish` takes the
+            // `IDENTITY_DISCOVERABLE_TOGGLE_LOCK` itself and reads the persisted
+            // value under it, so read+apply already serializes against the
+            // toggle IPC — and that helper's documented lock order forbids
+            // calling it with a NodeState mutex held, so the state guard is
+            // dropped before the await. The generation guard skips a publisher a
+            // newer start_node now owns (mirrors the ZEB-380 relay reconcile
+            // above). Idempotent: on the common (no boot-window toggle) path
+            // this re-applies the same state the boot enable already set.
+            {
+                let target = {
+                    let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
+                    if guard.generation != our_gen {
+                        None
+                    } else {
+                        match (
+                            guard.pkarr_identity_publisher.as_ref(),
+                            guard.connectivity_settings_path.as_ref(),
+                        ) {
+                            (Some(id_pub), Some(path)) => {
+                                Some((std::sync::Arc::clone(id_pub), path.clone()))
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                if let Some((id_pub, path)) = target {
+                    let applied = reconcile_identity_republish(&id_pub, path).await;
+                    tracing::debug!(
+                        ?applied,
+                        "ZEB-894: post-install identity reconcile — live case-B \
+                         publication driven to the persisted discoverable \
+                         setting, healing a boot-window opt-out immediately \
+                         instead of waiting for the periodic reconcile"
+                    );
                 }
             }
 
@@ -64743,6 +64797,68 @@ mod identity_republish_reconcile_tests {
         assert!(
             id_pub.is_active().await,
             "missing file must default ON (Option A), not fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_window_opt_out_heals_at_post_install_reconcile() {
+        // ZEB-894: model the boot window end-to-end and prove the post-install
+        // reconcile heals it immediately. Sequence:
+        //
+        //   1. Boot enable from a stale ON snapshot → live case-B publication ON
+        //      (mirrors `start_node_inner`'s enable at ~:10226, which reads the
+        //      settings snapshot loaded before the publisher is installed).
+        //   2. The user toggles discoverability OFF while the node is still
+        //      mid-boot — routed through the REAL ZEB-890 (B2) setter with a
+        //      `None` publisher (the `pkarr_identity_publisher` field is not yet
+        //      installed into NodeState). The setter PERSISTS the opt-out but has
+        //      no live handle to `disable()`, so live stays ON: the transient
+        //      persisted=OFF / live=publishing divergence.
+        //   3. The publisher lands in NodeState; the post-install reconcile
+        //      (`reconcile_identity_republish`, the block this ticket wires onto
+        //      the startup-success path) drives live to the persisted setting.
+        //
+        // Threading the real setter (not a hand-written JSON opt-out) into the
+        // real reconcile is the point: it proves the two ZEB-890/894 halves
+        // compose into an immediate heal, closing the ≤7.5-min window where the
+        // opt-out otherwise waited for the periodic tick.
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+        let id_pub = make_id_pub(&publisher);
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+
+        // (1) Boot enable from a stale ON snapshot.
+        std::fs::write(&path, r#"{"identity_discoverable":true}"#).expect("seed on");
+        id_pub.enable().await;
+        assert!(
+            id_pub.is_active().await,
+            "precondition: boot-enabled live case-B publication is ON"
+        );
+
+        // (2) Boot-window opt-out via the REAL setter with NO publisher handle.
+        super::set_identity_discoverable_detached(path.clone(), None, false)
+            .await
+            .expect("persist boot-window opt-out with no publisher");
+        assert!(
+            id_pub.is_active().await,
+            "boot window: the setter with no publisher persists the opt-out but \
+             cannot disable the live publication — it stays ON while persisted \
+             is now OFF (the divergence ZEB-894 heals)"
+        );
+
+        // (3) Post-install reconcile drives live to the persisted setting.
+        let applied = reconcile_identity_republish(&id_pub, path).await;
+        assert_eq!(applied, Some(false));
+        assert!(
+            !id_pub.is_active().await,
+            "ZEB-894: the post-install reconcile heals the boot-window opt-out \
+             immediately — the live case-B publication is now DISABLED, not \
+             lagging until the next periodic reconcile"
         );
     }
 }
