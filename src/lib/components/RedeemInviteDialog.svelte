@@ -46,6 +46,10 @@
   let irohPending = $state(false);
   let irohStage = $state<RedemptionStage | null>(null);
   let irohError = $state<string | null>(null);
+  // ZEB-885: structured diagnostics (code + raw message) for an iroh HARD-error
+  // catch, surfaced in a disclosure like the LAN banner. Null for the Ok-side
+  // status branches (plain-language copy, no code to show).
+  let irohErrorDetail = $state<{ code: string; raw: string } | null>(null);
   let showFallbackButton = $state(false);
   /**
    * ZEB-325 Phase 2c: handle for the post-`joined` dismiss timer so it can
@@ -150,6 +154,7 @@
     irohPending = true;
     irohStage = 'resolving';
     irohError = null;
+    irohErrorDetail = null;
     showFallbackButton = false;
     let suppressFinally = false;
     try {
@@ -227,6 +232,8 @@
       const err = toRedeemInviteError(e);
       const copy = redeemInviteCopy(err.code);
       irohError = copy.hint ? `${copy.summary} ${copy.hint}` : copy.summary;
+      // Keep the code + raw message for the diagnostic disclosure / bug reports.
+      irohErrorDetail = { code: err.code, raw: err.message };
       showFallbackButton = IROH_LAN_RECOVERABLE_CODES.has(err.code);
     } finally {
       // The `joined` branch defers `irohPending = false` to the dismiss
@@ -245,6 +252,7 @@
     // `mapped` banner), which would otherwise stack on top of the still-visible
     // iroh banner — two error banners for one redeem attempt (finding 12).
     irohError = null;
+    irohErrorDetail = null;
     onSubmit(url.trim());
   }
 </script>
@@ -269,6 +277,15 @@
   {#if irohError}
     <div class="error-banner" data-testid="iroh-error-banner">
       <p class="summary">{irohError}</p>
+      {#if irohErrorDetail}
+        <details>
+          <summary>Show details</summary>
+          <div class="diagnostic">
+            <div>Code: <code>{irohErrorDetail.code}</code></div>
+            <div>Raw error: <code>{irohErrorDetail.raw}</code></div>
+          </div>
+        </details>
+      {/if}
     </div>
   {/if}
 

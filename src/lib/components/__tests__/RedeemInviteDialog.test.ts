@@ -311,6 +311,9 @@ describe('RedeemInviteDialog', () => {
       const banner = getByTestId('iroh-error-banner');
       expect(banner.textContent).toContain('Something went wrong redeeming the invite');
       expect(banner.textContent).toContain('bug on our side'); // the hint reaches the user
+      // diagnostic disclosure preserves code + raw message for bug reports
+      expect(banner.textContent).toContain('internal');
+      expect(banner.textContent).toContain('boom');
     });
     expect(queryByTestId('fallback-lan-btn')).toBeNull();
   });

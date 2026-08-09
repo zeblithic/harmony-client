@@ -834,8 +834,9 @@ pub fn build_registry() -> RpcRegistry {
     );
     rpc!(m, "redeem_invite", UrlArgs, |state, sink, a| async move {
         // ZEB-885: flatten the structured RedeemInviteError to its message —
-        // the serve/api WS wire stays a string error (the fleet CLI doesn't
-        // switch on codes). The structured form is GUI-only.
+        // the serve/api RPC wire (HTTP POST /v1/rpc/{command}) stays a string
+        // error (the fleet CLI doesn't switch on codes). The structured form is
+        // GUI-only (Tauri IPC).
         crate::redeem_invite_impl(state, sink, a.url)
             .await
             .map_err(|e| e.to_string())
@@ -849,8 +850,8 @@ pub fn build_registry() -> RpcRegistry {
         "connectivity_redeem_invite_iroh",
         UrlArgs,
         |state, sink, a| async move {
-            // ZEB-885: flatten the structured error to its message — WS wire
-            // stays a string (GUI-only structured form).
+            // ZEB-885: flatten the structured error to its message — the
+            // serve/api RPC wire stays a string (structured form is GUI-only).
             crate::connectivity_redeem_invite_iroh_impl(state, sink, a.url)
                 .await
                 .map_err(|e| e.to_string())
