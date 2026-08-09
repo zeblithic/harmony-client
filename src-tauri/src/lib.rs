@@ -10454,30 +10454,30 @@ pub async fn start_node_inner(
                                         }
                                     }
                                 }
-                                // 2. Identity (case B) — re-publish whenever the
-                                //    user has opted in, read from the PERSISTED
-                                //    setting (same source of truth as the boot
-                                //    enable + the toggle IPC), NOT the publisher's
-                                //    current handle set. case-C/D below refresh
+                                // 2. Identity (case B) — reconcile the LIVE
+                                //    publication to the PERSISTED setting (same
+                                //    source of truth as the boot enable + the
+                                //    toggle IPC), NOT the publisher's current
+                                //    handle set. case-C/D below refresh
                                 //    unconditionally; gating case-B on
                                 //    `active_handles` made it the one publication
                                 //    with no redundancy, so a single dropped boot
-                                //    publish froze the identity record forever.
-                                //    Reading the setting self-heals it on the next
-                                //    tick. (ZEB-516)
-                                // Read the persisted setting OFF the executor — a
-                                // sync file read on the tick would block the
-                                // runtime thread; matches the off-executor
-                                // disk-read pattern (PR #207/#280).
-                                let identity_discoverable =
-                                    tokio::task::spawn_blocking(move || {
-                                        identity_republish_enabled(&connectivity_settings_path)
-                                    })
-                                    .await
-                                    .unwrap_or(false);
-                                if identity_discoverable {
-                                    identity_pub.enable().await;
-                                }
+                                //    publish froze the identity record forever —
+                                //    reading the setting self-heals it (ZEB-516).
+                                //    ZEB-890: this is a RECONCILER — it enables
+                                //    when opted in and DISABLES when opted out, all
+                                //    under `IDENTITY_DISCOVERABLE_TOGGLE_LOCK`, so a
+                                //    tick can no longer re-enable publication after
+                                //    the user opts out (the old lock-free,
+                                //    enable-only form left persisted=OFF /
+                                //    live=publishing with nothing to heal it). The
+                                //    off-executor read + lock live in the helper.
+                                let identity_discoverable = reconcile_identity_republish(
+                                    &identity_pub,
+                                    connectivity_settings_path,
+                                )
+                                .await
+                                .unwrap_or(false);
                                 // 3. Community (case C) — re-register under the
                                 //    LIVE epoch key so a post-rotation re-publish
                                 //    advertises the current key (ZEB-597). This is
@@ -64118,7 +64118,7 @@ async fn persist_identity_discoverable_locked(
 /// publication untouched (state never diverges on the error path either).
 async fn set_identity_discoverable_detached(
     path: std::path::PathBuf,
-    id_pub: std::sync::Arc<pkarr_identity_publisher::PkarrIdentityPublisher>,
+    id_pub: Option<std::sync::Arc<pkarr_identity_publisher::PkarrIdentityPublisher>>,
     enabled: bool,
 ) -> Result<(), String> {
     tokio::spawn(async move {
@@ -64131,6 +64131,17 @@ async fn set_identity_discoverable_detached(
         // caller frame) so the pair still survives caller cancellation (ZEB-697).
         let _toggle_guard = identity_discoverable_toggle_lock().lock().await;
         persist_identity_discoverable_locked(path, enabled).await?;
+        // ZEB-890 (B2): the persist above is the durable half and always runs.
+        // Apply the LIVE publication transition only when a node is running
+        // (publisher present); on a stopped/booting node the boot enable picks up
+        // the persisted value at next start. Mirrors
+        // `set_presence_visibility_detached`'s `map: None` path — the setter no
+        // longer refuses an opt-out just because the node is stopped, which is
+        // what left the getter reporting ON (app-data-dir fallback) while the
+        // setter rejected turning it off.
+        let Some(id_pub) = id_pub else {
+            return Ok(());
+        };
         // The runtime toggle used to call enable()/disable() fire-and-forget with
         // NO log on either path, so a stalled enable was indistinguishable from a
         // working one — the "silently unreachable with no error at all" symptom.
@@ -64176,32 +64187,26 @@ pub(crate) async fn connectivity_set_identity_discoverable_impl(
     state: &std::sync::Mutex<NodeState>,
     enabled: bool,
 ) -> Result<(), String> {
-    let not_loaded_msg;
     let (id_pub, settings_path) = {
         let guard = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
-        // ZEB-801: classify from the SAME locked snapshot as the handle read,
-        // so a start/stop `thread` flip can't misclassify (CodeRabbit).
-        not_loaded_msg = guard.owner_not_loaded_msg();
         (
             guard.pkarr_identity_publisher.clone(),
             guard.connectivity_settings_path.clone(),
         )
     };
 
-    // id_pub is owner-identity material; settings_path is a config/startup
-    // dependency — keep their failure messages distinct so a missing settings
-    // path doesn't misdirect the user toward recreating their identity.
-    let Some(id_pub) = id_pub else {
-        return Err(not_loaded_msg.into());
-    };
-    let Some(path) = settings_path else {
-        return Err("connectivity_settings_path missing".into());
-    };
-
-    // Persist + toggle the publication as one cancellation-surviving unit
-    // (ZEB-697; offload + locking rationale on the callees).
+    // ZEB-890 (B2): resolve the settings path via the same app-data-dir fallback
+    // the getter uses (`connectivity_settings_path`) so a stopped / mid-boot node
+    // — where `NodeState.connectivity_settings_path` is cleared (ZEB-380) — can
+    // still PERSIST an opt-out. Previously this required BOTH a live publisher
+    // and a cached path and errored otherwise, so the getter reported ON (via the
+    // fallback) while the setter refused to turn it off, rolling the toggle back
+    // with an identity-flavored error for what was really "node not running".
+    // The callee persists unconditionally and applies the live publication
+    // transition only when a publisher exists (mirrors `set_presence_visibility`).
+    let path = connectivity_settings_path(settings_path)?;
     set_identity_discoverable_detached(path, id_pub, enabled).await
 }
 
@@ -64234,8 +64239,10 @@ async fn connectivity_set_identity_discoverable(
 /// (`connectivity_settings_path`) rather than hard-returning `false` — a hard
 /// `false` would read as an explicit opt-out and disagree with `load_or_default`
 /// (which returns the ON Default for a missing file), mis-seeding the toggle.
-/// (The setter still requires a live publisher: reading the stored intent and
-/// toggling live case-B publication are legitimately different operations.)
+/// (ZEB-890: the setter now resolves the path the same way and PERSISTS the
+/// opt-out unconditionally, applying the live publication transition only when a
+/// publisher exists — so the getter and setter no longer disagree on a stopped
+/// node.)
 pub(crate) async fn connectivity_get_identity_discoverable_impl(
     state: &std::sync::Mutex<NodeState>,
 ) -> Result<bool, String> {
@@ -64490,6 +64497,71 @@ fn identity_republish_enabled(settings_path: &std::path::Path) -> bool {
         .identity_discoverable
 }
 
+/// ZEB-890 (B1): reconcile the LIVE case-B publication to the PERSISTED
+/// discoverability setting on the periodic routing re-publish tick.
+///
+/// The tick is a THIRD writer of the live identity publication (besides the
+/// boot enable and the runtime toggle IPC). Before ZEB-890 it read the
+/// persisted flag lock-free and was enable-only (`if enabled { enable() }`), so
+/// two defects were reachable:
+///
+///  * **Race (the reported bug):** a tick that had already read `persisted=true`
+///    could reach its `enable()` AFTER the user toggled OFF under
+///    `IDENTITY_DISCOVERABLE_TOGGLE_LOCK` (atomic persist + `disable()`). The
+///    result was `persisted=false` but `live=publishing`, and — with no disable
+///    branch — nothing healed it until node restart (Network Health showed
+///    `identityPublished: true` while Settings read OFF).
+///  * **No self-heal:** even absent a race, an explicit opt-out already on disk
+///    was never reflected onto a live publication that a prior tick had enabled.
+///
+/// Both close by (a) taking the SAME toggle lock the runtime toggle holds, so
+/// the read+apply serializes against it (last-writer-wins), and (b) making this
+/// a true reconciler with a disable branch. Returns the persisted value it
+/// applied, or `None` if the off-executor read task failed (then it neither
+/// enables nor disables — it retries next tick rather than risk a spurious
+/// transition).
+///
+/// Missing-file semantics stay PERMISSIVE (ZEB-890 Option A): a genuinely
+/// missing file is first-run/default ON (matches the boot enable,
+/// `load_or_default`, and the ZEB-881 default), so republish stays enabled
+/// there. Failing closed on a missing file would silently un-discover an
+/// upgraded ON-by-default node that booted enabled but has not yet written its
+/// settings file — a ZEB-881-flavored regression.
+///
+/// LOCK ORDER: acquired with NO `NodeState` mutex held (the tick captures only
+/// `Arc` clones) and OUTSIDE `CONNECTIVITY_SETTINGS_WRITE_LOCK`; the persisted
+/// read here does not take the write lock, so it cannot deadlock against the
+/// toggle's persist step.
+async fn reconcile_identity_republish(
+    identity_pub: &pkarr_identity_publisher::PkarrIdentityPublisher,
+    settings_path: std::path::PathBuf,
+) -> Option<bool> {
+    let _toggle_guard = identity_discoverable_toggle_lock().lock().await;
+    // Read the persisted setting OFF the executor (sync std::fs read) while
+    // holding the toggle lock, so read+apply is atomic w.r.t. the runtime
+    // toggle. A JoinError means the blocking task panicked / was aborted at
+    // shutdown: skip this tick rather than default to a transition.
+    let enabled =
+        match tokio::task::spawn_blocking(move || identity_republish_enabled(&settings_path)).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ZEB-890: identity republish reconcile — settings read task failed; \
+                     skipping this tick (no live transition applied)"
+                );
+                return None;
+            }
+        };
+    if enabled {
+        identity_pub.enable().await;
+    } else {
+        identity_pub.disable().await;
+    }
+    Some(enabled)
+}
+
 #[cfg(test)]
 mod identity_republish_gate_tests {
     use super::identity_republish_enabled;
@@ -64516,6 +64588,112 @@ mod identity_republish_gate_tests {
             identity_republish_enabled(&td.path().join("missing.json")),
             "ZEB-881: a genuinely-missing settings file is first-run and now \
              defaults discoverable ON, so case-B republish is enabled"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identity_republish_reconcile_tests {
+    //! ZEB-890 (B1): the periodic re-publish tick is now a RECONCILER — it
+    //! drives the live case-B publication to the persisted setting (enable when
+    //! opted in, DISABLE when opted out) under the toggle lock. These pin the
+    //! disable branch the old enable-only tick lacked and the Option-A
+    //! missing-file semantics.
+    use super::reconcile_identity_republish;
+    use harmony_pkarr::{testing::MockPkarrRelay, PkarrPublisher, RelayClient, RelayPool};
+    use std::sync::Arc;
+
+    fn make_id_pub(
+        publisher: &Arc<PkarrPublisher>,
+    ) -> crate::pkarr_identity_publisher::PkarrIdentityPublisher {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut id_pub_bytes = [0u8; 64];
+        id_pub_bytes[32..].copy_from_slice(&sk.verifying_key().to_bytes());
+        crate::pkarr_identity_publisher::PkarrIdentityPublisher::new(
+            Arc::clone(publisher),
+            sk,
+            id_pub_bytes,
+            Arc::new(|| b"fake-routing".to_vec()),
+        )
+    }
+
+    #[tokio::test]
+    async fn reconcile_disables_when_persisted_off() {
+        // The core ZEB-890 fix: a live publication + an on-disk opt-out must
+        // reconcile to DISABLED. The pre-fix enable-only tick had no disable
+        // branch, so this divergence never healed until node restart.
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+        let id_pub = make_id_pub(&publisher);
+
+        id_pub.enable().await;
+        assert!(
+            id_pub.is_active().await,
+            "precondition: live publication ON"
+        );
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        std::fs::write(&path, r#"{"identity_discoverable":false}"#).expect("seed off");
+
+        let applied = reconcile_identity_republish(&id_pub, path).await;
+        assert_eq!(applied, Some(false));
+        assert!(
+            !id_pub.is_active().await,
+            "reconciler must DISABLE the live publication when persisted=OFF"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_enables_when_persisted_on() {
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+        let id_pub = make_id_pub(&publisher);
+
+        assert!(
+            !id_pub.is_active().await,
+            "precondition: live publication OFF"
+        );
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        std::fs::write(&path, r#"{"identity_discoverable":true}"#).expect("seed on");
+
+        let applied = reconcile_identity_republish(&id_pub, path).await;
+        assert_eq!(applied, Some(true));
+        assert!(
+            id_pub.is_active().await,
+            "reconciler must ENABLE the live publication when persisted=ON"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_missing_file_stays_enabled_option_a() {
+        // ZEB-890 Option A: a genuinely-missing settings file is first-run /
+        // default ON, so the runtime reconciler ENABLES (does not fail closed) —
+        // failing closed would silently un-discover an upgraded ON-by-default
+        // node that booted enabled but has not yet written its settings file.
+        let relay = MockPkarrRelay::start().await;
+        let pool = RelayPool::new(vec![relay.base_url.clone()]);
+        let client = Arc::new(RelayClient::new(pool));
+        let publisher = Arc::new(PkarrPublisher::new(client));
+        let _ph = Arc::clone(&publisher).spawn();
+        let id_pub = make_id_pub(&publisher);
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let missing = td.path().join("does-not-exist.json");
+
+        let applied = reconcile_identity_republish(&id_pub, missing).await;
+        assert_eq!(applied, Some(true));
+        assert!(
+            id_pub.is_active().await,
+            "missing file must default ON (Option A), not fail closed"
         );
     }
 }
@@ -75936,7 +76114,7 @@ mod settings_rmw_cancellation_tests {
 
         let check = path.clone();
         assert_cancelled_toggle_pair_lands(
-            super::set_identity_discoverable_detached(path, id_pub, true),
+            super::set_identity_discoverable_detached(path, Some(id_pub), true),
             move || {
                 let check = check.clone();
                 let publisher = std::sync::Arc::clone(&publisher);
@@ -75994,12 +76172,12 @@ mod settings_rmw_cancellation_tests {
             let (a, b) = tokio::join!(
                 super::set_identity_discoverable_detached(
                     path.clone(),
-                    std::sync::Arc::clone(&id_pub),
+                    Some(std::sync::Arc::clone(&id_pub)),
                     true,
                 ),
                 super::set_identity_discoverable_detached(
                     path.clone(),
-                    std::sync::Arc::clone(&id_pub),
+                    Some(std::sync::Arc::clone(&id_pub)),
                     false,
                 ),
             );
@@ -76020,6 +76198,32 @@ mod settings_rmw_cancellation_tests {
                  ({live}) after a concurrent toggle"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stopped_node_setter_persists_opt_out_without_publisher() {
+        // ZEB-890 (B2): on a stopped / mid-boot node there is no live
+        // `pkarr_identity_publisher`, but an opt-out must still PERSIST — the boot
+        // enable reads it at next start. The detached toggle takes an `Option`
+        // publisher: `None` persists the setting and skips the live transition.
+        // Before ZEB-890 the setter errored here, so the getter's ON default
+        // (resolved via the app-data-dir fallback) could never be turned off on a
+        // stopped node.
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let path = td.path().join("connectivity-settings.json");
+        // Seed ON so the opt-out is an observable transition, not just the default.
+        std::fs::write(&path, r#"{"identity_discoverable":true}"#).expect("seed on");
+
+        super::set_identity_discoverable_detached(path.clone(), None, false)
+            .await
+            .expect("persist opt-out with no publisher");
+
+        let persisted = connectivity_settings::ConnectivitySettings::load_or_default(&path)
+            .identity_discoverable;
+        assert!(
+            !persisted,
+            "a stopped-node opt-out must persist even with no live publisher"
+        );
     }
 
     #[tokio::test]

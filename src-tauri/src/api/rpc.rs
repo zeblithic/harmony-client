@@ -2770,20 +2770,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connectivity_set_identity_discoverable_errs_pre_owner() {
+    async fn connectivity_set_identity_discoverable_persists_pre_owner() {
+        // ZEB-890 (B2): pre-owner / node-stopped there is no live
+        // `pkarr_identity_publisher`, but the setter must still PERSIST the
+        // opt-out (the boot enable reads it at next start) rather than error —
+        // mirroring the getter's ZEB-380 app-data-dir fallback and
+        // `set_presence_visibility`. Before ZEB-890 this returned a Command error,
+        // so the getter's ON default (resolved via the same fallback) was
+        // un-turn-off-able on a stopped node — the reported privacy trap.
+        //
+        // Isolate the resolved path to a fresh temp dir (nextest runs each test in
+        // its own process, so the env override does not leak across tests).
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("HARMONY_DATA_DIR", tmp.path());
         let reg = build_registry();
-        let err = reg
+        let set = reg
             .dispatch(
                 "connectivity_set_identity_discoverable",
                 test_state(),
                 test_sink(),
-                serde_json::json!({ "enabled": true }),
+                serde_json::json!({ "enabled": false }),
             )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, RpcError::Command(_)),
-            "expected Command, got {err:?}"
+            .await;
+        // Read back through the getter (same app-data-dir fallback) to prove the
+        // opt-out durably landed.
+        let got = reg
+            .dispatch(
+                "connectivity_get_identity_discoverable",
+                test_state(),
+                test_sink(),
+                serde_json::Value::Null,
+            )
+            .await;
+        std::env::remove_var("HARMONY_DATA_DIR");
+        set.expect("setter persists the opt-out pre-owner without erroring");
+        assert_eq!(
+            got.expect("getter"),
+            serde_json::Value::Bool(false),
+            "a pre-owner opt-out must persist and read back as OFF (ZEB-890 B2)"
         );
     }
 
