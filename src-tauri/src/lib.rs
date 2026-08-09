@@ -1887,6 +1887,17 @@ impl NodeState {
         // re-derives it from the fresh boot (a recovered keychain clears it).
         self.transport_disabled_reason = None;
         self.iroh_publisher_force = None;
+        // ZEB-895: aborting the driver BEFORE nulling the handle Arcs below is
+        // load-bearing for the boot connectivity-reconciles (ZEB-380/894/624 in
+        // start_node). Each reconciles a live handle to persisted settings after
+        // dropping the NodeState lock, so a concurrent stop can retire the handle
+        // in its clone-then-await window — and stop does NOT bump `generation`,
+        // so the reconcile's pre-await generation guard cannot detect it. It
+        // stays benign precisely because this abort runs first: the retired
+        // publisher/endpoint is then driverless, so a stray
+        // enable()/disable()/set_relays on it mutates only dead in-memory state
+        // that never reaches the DHT, and the next start_node builds fresh
+        // instances. Keep abort-before-null if you edit this.
         // ZEB-323 Phase 2b: abort the pkarr publisher task and drop Arcs.
         if let Some(h) = self.pkarr_publisher_handle.take() {
             h.abort();
@@ -2995,6 +3006,17 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
         // before the final engine publishes, would kill the transport out from
         // under them).
         iroh_endpoint_for_shutdown = guard.iroh_endpoint.clone();
+        // ZEB-895: `stop_inner` deliberately does NOT bump `generation` (only a
+        // successful start does — the ZEB-221 post-install bump). Consequence:
+        // the boot connectivity-reconciles' `generation == our_gen` pre-check
+        // (ZEB-380/894/624 in start_node) cannot observe a stop that lands in
+        // their clone-then-await window, so such a stop leaves them driving an
+        // already-retired handle. Verified benign — `clear_iroh_handles` (next
+        // line) aborts each driver before nulling it, so the retired instance is
+        // driverless and its stray mutation never flushes. We accept that here
+        // rather than bump `generation` and pay the blast radius across the ~30
+        // `snapshot_generation` fences (each would then also discard on a
+        // graceful stop, a broader semantics change than this Low race warrants).
         guard.clear_iroh_handles();
         tup
     };
@@ -14279,6 +14301,11 @@ pub async fn start_node_inner(
             // makes this a no-op when nothing changed (or a concurrent IPC
             // already hot-swapped) — `set_relays` only fires on a genuinely
             // stale boot pool, so the common path resets no per-relay health.
+            //
+            // ZEB-895: the generation guard below is a best-effort pre-check — a
+            // concurrent stop can still retire `pkarr_relay_client` in the
+            // clone-then-await window that follows. Benign by design; see
+            // `clear_iroh_handles` / `stop_inner`.
             {
                 let _relay_boot_guard = connectivity_settings_write_lock().lock().await;
                 let target = {
@@ -14343,6 +14370,11 @@ pub async fn start_node_inner(
             // newer start_node now owns (mirrors the ZEB-380 relay reconcile
             // above). Idempotent: on the common (no boot-window toggle) path
             // this re-applies the same state the boot enable already set.
+            //
+            // ZEB-895: the generation guard below is a best-effort pre-check — a
+            // concurrent stop can still retire `pkarr_identity_publisher` in the
+            // clone-then-await window that follows. Benign by design; see
+            // `clear_iroh_handles` / `stop_inner`.
             {
                 let target = {
                     let guard = state.lock().map_err(|e| format!("lock error: {e}"))?;
@@ -14385,6 +14417,11 @@ pub async fn start_node_inner(
             // diff is `RelayUrl`-valued (`apply_relay_urls`), so it's a genuine
             // no-op when the relay set already matches — the common path applies
             // nothing.
+            //
+            // ZEB-895: the generation guard below is a best-effort pre-check — a
+            // concurrent stop can still retire `iroh_endpoint` in the
+            // clone-then-await window that follows. Benign by design; see
+            // `clear_iroh_handles` / `stop_inner`.
             {
                 let _relay_boot_guard = connectivity_settings_write_lock().lock().await;
                 let target = {
