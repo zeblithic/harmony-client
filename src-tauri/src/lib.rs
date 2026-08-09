@@ -62832,18 +62832,21 @@ where
     // `redeem_invite_inner_with_overrides` below.
     let token_sig = token.sig;
     let registry_evict = std::sync::Arc::clone(&community_registry);
-    let minted = if let Some(cached) = community_registry.get_redemption_mint(token_sig).await {
+    let cache_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let minted = if let Some(cached) = community_registry
+        .get_redemption_mint(token_sig, cache_now_ms)
+        .await
+    {
         cached
     } else {
-        let wall_now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
         let join_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
             &hlc_tracker,
             &adopt_floor,
             &device_id,
-            wall_now_ms,
+            cache_now_ms,
         )
         .await;
         let m = match mint_redemption(
@@ -62861,10 +62864,12 @@ where
                 ));
             }
         };
+        // Atomic get-or-store: on a concurrent same-token redeem this returns the
+        // FIRST-stored mint (discarding `m`), so both callers converge on one
+        // bootstrap_join id instead of caching the id the host will reject.
         community_registry
-            .store_redemption_mint(token_sig, m.clone())
-            .await;
-        m
+            .get_or_store_redemption_mint(token_sig, cache_now_ms, m)
+            .await
     };
 
     // 8''. Build the CommunityInviteSigned packet (same shape

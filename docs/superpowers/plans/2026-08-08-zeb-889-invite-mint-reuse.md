@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - All cargo commands run from `src-tauri/`.
-- Full gate: `cargo nextest run --locked --workspace --all-targets --features test-fixtures`; lint `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; format `cargo fmt --all -- --check`. Iterative runs may use `scripts/test-select --context task`.
+- Full gate: `cargo nextest run --locked --workspace --all-targets --features test-fixtures`; lint `cargo clippy --locked --all-targets --features test-fixtures --no-deps -- -D warnings`; format `cargo fmt --all -- --check`. Iterative runs may use `scripts/test-select --context task` — when you do, copy the emitted `round=… bucket=…` summary line into the task report so the selection is auditable/reproducible.
 - `--locked` and `--features test-fixtures` are load-bearing; never drop them.
 - No change to `verify_event`, P6, the acceptor, or the wire format.
 - Cache is in-memory only (no disk persistence).
