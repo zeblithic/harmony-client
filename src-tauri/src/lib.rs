@@ -324,6 +324,10 @@ pub mod zenoh_iroh_transport;
 // ZEB-368: registers harmony's IrohZenohLinkManager with the vendored
 // zenoh-link factory and forwards accepted inbound links into Zenoh.
 pub mod iroh_zenoh_registration;
+// ZEB-695: durable panic capture — records the causal first panic (with a
+// forced backtrace) before zenoh's poisoned-lock Drop-path re-panic aborts the
+// process and erases it. Auto-installed at zenoh session open; debug/CI-gated.
+pub mod panic_capture;
 // ZEB-373/ZEB-620: iroh dial primitives — the `PeerDialer` trait,
 // `RuntimePeerDialer` (over a live zenoh Runtime), and `deterministic_zid_hex`.
 // The dial-once `run_dial_driver` was retired for the reconnect supervisor.

@@ -13099,6 +13099,11 @@ mod pin_cascade_tests {
 pub async fn open_session_with_runtime(
     config: zenoh::Config,
 ) -> zenoh::Result<(zenoh::internal::runtime::Runtime, zenoh::Session)> {
+    // ZEB-695: install the durable panic-capture hook before any zenoh net
+    // thread exists. The hook is process-global, so once installed here it also
+    // catches panics from sessions opened via other funnels in the same process.
+    // Idempotent + debug/CI-gated, so this is cheap and a no-op in release.
+    crate::panic_capture::install_once();
     let mut runtime = zenoh::internal::runtime::RuntimeBuilder::new(config)
         .build()
         .await?;
