@@ -62820,31 +62820,51 @@ where
     // 8'. Reserve HLC + mint. We mint up-front so the bootstrap_join.id
     // committed to the wire packet is the SAME id the redeem inner
     // below uses (mint_redemption randomizes the 16-byte event_id).
-    let wall_now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let join_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
-        &hlc_tracker,
-        &adopt_floor,
-        &device_id,
-        wall_now_ms,
-    )
-    .await;
-    let minted = match mint_redemption(
-        &payload,
-        self_owner,
-        signing_key.as_ref(),
-        &enrollment_cert,
-        join_hlc,
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(RedeemInviteError::new(
-                RedeemInviteErrorCode::Internal,
-                format!("mint_redemption: {e}"),
-            ));
-        }
+    //
+    // ZEB-889: reuse a cached mint for this invite token if a prior attempt
+    // stored one. A retry whose earlier countersign delivery failed must
+    // re-send the SAME bootstrap_join id — that hits the host's
+    // AlreadyKnown-retransmit path (which re-delivers the countersign), whereas
+    // a fresh random id makes verify_event P6 reject the retry ("already
+    // engaged") and leaves a permanent unredeemable zombie invite. Only mint
+    // fresh — and cache it — on the first attempt for this token. `token_sig` +
+    // the evict handle are captured before `community_registry` is moved into
+    // `redeem_invite_inner_with_overrides` below.
+    let token_sig = token.sig;
+    let registry_evict = std::sync::Arc::clone(&community_registry);
+    let minted = if let Some(cached) = community_registry.get_redemption_mint(token_sig).await {
+        cached
+    } else {
+        let wall_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let join_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+            &hlc_tracker,
+            &adopt_floor,
+            &device_id,
+            wall_now_ms,
+        )
+        .await;
+        let m = match mint_redemption(
+            &payload,
+            self_owner,
+            signing_key.as_ref(),
+            &enrollment_cert,
+            join_hlc,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(RedeemInviteError::new(
+                    RedeemInviteErrorCode::Internal,
+                    format!("mint_redemption: {e}"),
+                ));
+            }
+        };
+        community_registry
+            .store_redemption_mint(token_sig, m.clone())
+            .await;
+        m
     };
 
     // 8''. Build the CommunityInviteSigned packet (same shape
@@ -63176,6 +63196,13 @@ where
 
     match result {
         Ok(dto) => {
+            // ZEB-889: the join committed — the acceptor delivered the
+            // countersign (this Ok arm is reached only after the pre-delivered
+            // countersign was applied) and burned the single-use invite. Drop
+            // the cached mint; no further retry is possible or needed. (A
+            // never-completing redemption keeps its entry until process exit —
+            // bounded, one per distinct invite redeemed this session.)
+            registry_evict.evict_redemption_mint(&token_sig).await;
             // ZEB-427: durable-on-commit fence (ZEB-393 Bug A), mirroring
             // the legacy `redeem_invite` IPC. Fence the joined community's
             // owner-state Space to disk before returning so a non-graceful
