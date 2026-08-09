@@ -42317,6 +42317,126 @@ mod redeem_invite_inner_tests {
     /// ChannelCreate events that arrive via Zenoh sync. In this unit test
     /// there is no Zenoh session, so the deferred queue is empty at commit.
     /// The assertion "no pending tx" is a proxy for "commit was called".
+    /// ZEB-892 (C2, CodeRabbit #642): drive the PRODUCTION `redeem_invite_inner`
+    /// with a forged invite token and assert the returned code is
+    /// `InviteVerifyFailed` — NOT the misleading `inviter_enrollment_invalid`.
+    /// This pins that the production verify site (`redeem_invite_inner_with_
+    /// overrides`) routes through the per-variant `From<CommunityInviteVerifyError>`;
+    /// a revert to the old hardcoded-`InviterEnrollmentInvalid` closure would fail
+    /// here, which the lower-level `From` unit test cannot catch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redeem_inner_forged_token_maps_to_invite_verify_failed() {
+        use ed25519_dalek::Signer;
+
+        let fixture = build_redeem_invite_test_fixture().await;
+        let inviter = crate::community_membership::mint_test_owner(0x42);
+        let wrong = crate::community_membership::mint_test_owner(0x07);
+
+        // Forge the token: sign it with a device key other than the one the
+        // inviter's EnrollmentCert enrolls, so `verify_inviter_enrollment`
+        // returns `InviteTokenSigInvalid` (a non-enrollment verify failure).
+        let unsigned = crate::community_invite::InviteToken {
+            inviter: inviter.owner,
+            invitee_hint: None,
+            minted_at: crate::owner_state_types::Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let bytes = crate::community_invite::canonical_invite_token_bytes(&unsigned)
+            .expect("canonical token bytes");
+        let sig: [u8; 64] = wrong.device_key.sign(&bytes).to_bytes();
+        let token = crate::community_invite::InviteToken { sig, ..unsigned };
+
+        // `encode_invite_url` requires invite-only payloads to carry an admin
+        // bootstrap Join. The forged token still fails first — the ZEB-497
+        // fail-fast `verify_inviter_enrollment` runs at step 2, before the
+        // bootstrap is ever used — but the invite must encode. (Mirrors the
+        // `admin_bootstrap_join` test helper in community_membership.)
+        let community_id = crate::owner_state_types::SpaceId([0xf3; 16]);
+        let admin_bootstrap = {
+            let bootstrap_payload = crate::community_membership::EventPayload {
+                id: [1u8; 16],
+                community_id,
+                kind: crate::community_membership::MembershipEventKind::Join,
+                actor: inviter.owner,
+                at: crate::owner_state_types::Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "admin".into(),
+                },
+            };
+            let ev =
+                crate::community_membership::sign_event(&bootstrap_payload, &inviter.device_key)
+                    .expect("sign admin bootstrap");
+            crate::community_membership::SignedMembershipEvent {
+                enrollment: Some(inviter.cert.clone()),
+                ..ev
+            }
+        };
+
+        let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
+            community_id,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                // 92-byte length is enforced by `encode_invite_url`; the content
+                // is never decrypted because the forged token errors first.
+                sealed_epoch_key: vec![0u8; 92],
+                sealed_epoch_keys: Vec::new(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr: inviter.owner,
+            community_name: "Forged".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(token),
+            admin_bootstrap: Some(admin_bootstrap),
+            // Presence-only requirement of `encode_invite_url`; a dummy value is
+            // fine because the forged token errors at the ZEB-497 fail-fast
+            // verify (step 2), before admin_identity_pub is ever validated.
+            admin_identity_pub: Some([0u8; 64]),
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: Some(inviter.cert.clone()),
+            // Untargeted invite-only requires this (presence-only for encode).
+            untargeted_decrypt_key: Some([0u8; 32]),
+        };
+        let invite_url =
+            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
+
+        let err = redeem_invite_inner(
+            invite_url,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None, // transport_epoch_rx
+            std::sync::Arc::clone(&fixture.dm_outbox),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            || Ok(()),
+            None, // identity_dir
+        )
+        .await
+        .expect_err("a forged invite token must fail the redeem");
+
+        assert_eq!(
+            err.code,
+            crate::community_invite::RedeemInviteErrorCode::InviteVerifyFailed,
+            "forged token must surface invite_verify_failed via the production \
+             verify site, not inviter_enrollment_invalid; got {:?}",
+            err.code
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn happy_path_no_pending_transaction_after_success() {
         let fixture = build_redeem_invite_test_fixture().await;
@@ -62640,6 +62760,14 @@ where
                         }
                     }
                 }
+                // ZEB-892 (CodeAnt #642): a resolver `Err` here folds into
+                // `inviter_unreachable` (below) rather than the initial
+                // resolve's `relays_warming_up`, and that is intentional — we
+                // only reach B4 *after* a confirmed failed dial to the inviter,
+                // so the accurate outcome is "the inviter's endpoint was
+                // unreachable", not "relays are cold". The retry re-resolve
+                // only tries to fetch a *fresher* address; a relay error there
+                // just means we can't, so `inviter_unreachable` stays correct.
                 _ => {
                     tracing::warn!(
                         inviter = %hex::encode(inviter_addr.0),
