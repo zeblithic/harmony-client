@@ -67783,9 +67783,12 @@ async fn set_friend_auto_accept_impl(
     settings_path: Option<std::path::PathBuf>,
     enabled: bool,
 ) -> Result<(), String> {
-    let Some(path) = settings_path else {
-        return Err("connectivity_settings_path missing".into());
-    };
+    // ZEB-893: resolve via the app-data-dir fallback so a stopped / mid-boot node
+    // can still PERSIST this setting — matching the getter (and relays, presence,
+    // and identity-discoverability). friend_auto_accept is captured at boot, so
+    // the persisted value takes effect at next start. Before ZEB-893 this errored
+    // on a stopped node while the getter happily returned a (default) value.
+    let path = connectivity_settings_path(settings_path)?;
 
     // ZEB-629: file RMW under the process-global settings write lock.
     // CodeRabbit PR #397 R1: offload the sync load+save to spawn_blocking
@@ -67851,10 +67854,11 @@ async fn set_friend_auto_accept(
 async fn get_friend_auto_accept_impl(
     settings_path: Option<std::path::PathBuf>,
 ) -> Result<bool, String> {
-    let Some(path) = settings_path else {
-        // Node not running / pkarr not initialized — return the spec default (ON).
-        return Ok(true);
-    };
+    // ZEB-893: resolve via the app-data-dir fallback so a stopped node reflects
+    // the PERSISTED value (or the spec default ON when no file exists yet),
+    // consistent with the setter. Was a hard `Ok(true)` that ignored a persisted
+    // opt-out and disagreed with what the setter would write.
+    let path = connectivity_settings_path(settings_path)?;
     tokio::task::spawn_blocking(move || {
         connectivity_settings::ConnectivitySettings::load_or_default(&path).friend_auto_accept_known
     })
@@ -67868,8 +67872,10 @@ async fn get_friend_auto_accept_impl(
 }
 
 /// Read the current "auto-accept known requesters" toggle from the persisted
-/// settings file. Returns the spec default (ON) when the file is missing or the
-/// pkarr settings path is not initialized.
+/// settings file. Returns the persisted value — or the spec default (ON) when no
+/// settings file exists yet. ZEB-893: resolves the path via the app-data-dir
+/// fallback, so a stopped node reads the same file the setter writes rather than
+/// a hard default.
 #[tauri::command]
 async fn get_friend_auto_accept(state: tauri::State<'_, Mutex<NodeState>>) -> Result<bool, String> {
     let path = {
@@ -67894,9 +67900,11 @@ async fn set_peer_intro_policy_impl(
     settings_path: Option<std::path::PathBuf>,
     policy: crate::friend_graph::PeerIntroPolicy,
 ) -> Result<(), String> {
-    let Some(path) = settings_path else {
-        return Err("connectivity_settings_path missing".into());
-    };
+    // ZEB-893: resolve via the app-data-dir fallback so a stopped / mid-boot node
+    // can still PERSIST this policy (matching the getter). peer_intro_policy is
+    // read fresh from the file per inbound introduction, so persisting IS the
+    // whole effect — no live handle to toggle.
+    let path = connectivity_settings_path(settings_path)?;
 
     // ZEB-629: file RMW under the process-global settings write lock.
     // CodeRabbit PR #476: lock INSIDE the closure — see
@@ -67947,10 +67955,10 @@ async fn set_peer_intro_policy(
 async fn get_peer_intro_policy_impl(
     settings_path: Option<std::path::PathBuf>,
 ) -> Result<crate::friend_graph::PeerIntroPolicy, String> {
-    let Some(path) = settings_path else {
-        // Node not running / pkarr not initialized — return the spec default.
-        return Ok(crate::friend_graph::PeerIntroPolicy::FriendsOfFriends);
-    };
+    // ZEB-893: resolve via the app-data-dir fallback so a stopped node reflects
+    // the PERSISTED policy (or the spec default `FriendsOfFriends` when no file
+    // exists yet), consistent with the setter.
+    let path = connectivity_settings_path(settings_path)?;
     tokio::task::spawn_blocking(move || {
         connectivity_settings::ConnectivitySettings::load_or_default(&path).peer_intro_policy
     })
@@ -67962,7 +67970,9 @@ async fn get_peer_intro_policy_impl(
 }
 
 /// Read the current introduction policy from the persisted settings. Returns the
-/// spec default (`FriendsOfFriends`) when the settings path is not initialized.
+/// persisted policy — or the spec default (`FriendsOfFriends`) when no settings
+/// file exists yet (ZEB-893: resolved via the app-data-dir fallback, consistent
+/// with the setter, rather than a hard default on a stopped node).
 #[tauri::command]
 async fn get_peer_intro_policy(
     state: tauri::State<'_, Mutex<NodeState>>,
@@ -70542,20 +70552,31 @@ mod friend_ipc_tests {
     }
 
     #[tokio::test]
-    async fn friend_auto_accept_impl_none_path() {
-        // No settings path (node not running / pkarr not initialized): the
-        // setter must error and the getter must return the spec default (ON) —
-        // the branches the old inline round-trip never covered.
-        let err = super::set_friend_auto_accept_impl(None, true)
-            .await
-            .expect_err("set without a settings path must fail");
+    #[serial_test::serial] // mutates process-global HARMONY_DATA_DIR (ZEB-893)
+    async fn friend_auto_accept_impl_stopped_node_persists_via_fallback() {
+        // ZEB-893: with no cached settings path (node stopped / mid-boot) the
+        // impls now resolve the app-data-dir fallback, so the setter PERSISTS
+        // (was: errored) and the getter reflects the persisted value (was: a hard
+        // default). Isolate the fallback to a temp dir (nextest = process-per-test;
+        // `#[serial]` also guards `cargo test`).
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::env::set_var("HARMONY_DATA_DIR", tmp.path());
+        // Do every env-dependent op first, then clear the var, then assert — so a
+        // failing assert can't leave the process-global var set.
+        let default_on = super::get_friend_auto_accept_impl(None).await;
+        let set_res = super::set_friend_auto_accept_impl(None, false).await;
+        let after = super::get_friend_auto_accept_impl(None).await;
+        std::env::remove_var("HARMONY_DATA_DIR");
+
         assert!(
-            err.contains("connectivity_settings_path missing"),
-            "unexpected error: {err}"
+            default_on.expect("get default via fallback"),
+            "no file yet → spec default ON"
         );
-        assert!(super::get_friend_auto_accept_impl(None)
-            .await
-            .expect("get default"));
+        set_res.expect("stopped-node set must persist via the fallback, not error");
+        assert!(
+            !after.expect("get persisted via fallback"),
+            "a stopped-node opt-out must persist and read back OFF"
+        );
     }
 
     #[tokio::test]
@@ -70595,20 +70616,30 @@ mod friend_ipc_tests {
     }
 
     #[tokio::test]
-    async fn peer_intro_policy_impl_none_path() {
-        let err =
-            super::set_peer_intro_policy_impl(None, crate::friend_graph::PeerIntroPolicy::AskMe)
-                .await
-                .expect_err("set without a settings path must fail");
-        assert!(
-            err.contains("connectivity_settings_path missing"),
-            "unexpected error: {err}"
-        );
+    #[serial_test::serial] // mutates process-global HARMONY_DATA_DIR (ZEB-893)
+    async fn peer_intro_policy_impl_stopped_node_persists_via_fallback() {
+        // ZEB-893: sibling of the friend-auto-accept case — a stopped node
+        // resolves the app-data-dir fallback, so the setter persists the policy
+        // and the getter reads it back (was: setter errored, getter returned a
+        // hard default). Isolate the fallback to a temp dir.
+        use crate::friend_graph::PeerIntroPolicy;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::env::set_var("HARMONY_DATA_DIR", tmp.path());
+        let default_pol = super::get_peer_intro_policy_impl(None).await;
+        let set_res = super::set_peer_intro_policy_impl(None, PeerIntroPolicy::AskMe).await;
+        let after = super::get_peer_intro_policy_impl(None).await;
+        std::env::remove_var("HARMONY_DATA_DIR");
+
         assert_eq!(
-            super::get_peer_intro_policy_impl(None)
-                .await
-                .expect("get default"),
-            crate::friend_graph::PeerIntroPolicy::FriendsOfFriends
+            default_pol.expect("get default via fallback"),
+            PeerIntroPolicy::FriendsOfFriends,
+            "no file yet → spec default FriendsOfFriends"
+        );
+        set_res.expect("stopped-node set must persist via the fallback, not error");
+        assert_eq!(
+            after.expect("get persisted via fallback"),
+            PeerIntroPolicy::AskMe,
+            "a stopped-node policy change must persist and read back"
         );
     }
 
