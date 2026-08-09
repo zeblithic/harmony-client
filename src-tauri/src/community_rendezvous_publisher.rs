@@ -89,6 +89,13 @@ pub struct CommunityRendezvousPublisher {
     /// Counters feeding the (deferred) self-promotion driver's tuning. Bumped
     /// whenever a slot is newly filled by [`Self::refresh_slot`].
     observability: RendezvousObservability,
+    /// ZEB-891 (CodeRabbit/Qodo #646): edge-trigger flag for the over-budget
+    /// warning — warn once on the false→true transition (re-armed on recovery)
+    /// so a persistent oversized-fixed-fields misconfig doesn't re-log every
+    /// refresh cycle × community. Node-global: the size-driving fixed fields
+    /// (relay URL + butler set) are the same across communities. `Arc` so it can
+    /// be cloned into the per-slot `RecordBuilder` closure (which is `move`).
+    over_budget_warned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CommunityRendezvousPublisher {
@@ -128,6 +135,7 @@ impl CommunityRendezvousPublisher {
             routing_blob_builder,
             registered_slots: Mutex::new(HashMap::new()),
             observability: RendezvousObservability::default(),
+            over_budget_warned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -232,6 +240,7 @@ impl CommunityRendezvousPublisher {
             let device_sk = Arc::clone(&self.device_signing_key);
             let vouch_community = community_id;
             let blob_builder = Arc::clone(&self.routing_blob_builder);
+            let over_budget_warned = Arc::clone(&self.over_budget_warned);
             let builder: RecordBuilder = Arc::new(move |at_ms| {
                 let base = blob_builder();
                 let ttl_at = at_ms + crate::reachability_record::REACHABILITY_RECORD_TTL_MS;
@@ -257,17 +266,47 @@ impl CommunityRendezvousPublisher {
                         // peers. Then bound the addresses (reserving envelope +
                         // the "mv" vouch) so the signed record fits.
                         crate::reachability_bound::cap_butler_set(&mut reach, 1);
-                        let dropped = crate::reachability_bound::bound_direct_addresses(
+                        let bound = crate::reachability_bound::bound_direct_addresses(
                             &mut reach,
                             crate::reachability_bound::RECORD_ENVELOPE_BYTES
                                 + crate::reachability_bound::RENDEZVOUS_VOUCH_BYTES,
                         );
-                        if dropped > 0 {
+                        if bound.dropped > 0 {
                             tracing::debug!(
-                                dropped,
+                                dropped = bound.dropped,
                                 kept = reach.direct_addresses.len(),
                                 "ZEB-880: trimmed rendezvous direct addresses to fit the pkarr record size cap"
                             );
+                        }
+                        if bound.over_budget {
+                            // ZEB-891: even after capping butler to 1 and trimming
+                            // every address, the rendezvous record (fixed fields +
+                            // the "mv" membership vouch) still exceeds the cap. It
+                            // fails `RecordTooLarge` every publish cycle → this node
+                            // is undiscoverable via community rendezvous. No trim can
+                            // recover it; surface it so an operator can shorten the
+                            // configured relay URL. Edge-triggered (warn once per
+                            // false→true transition) so a persistent misconfig
+                            // doesn't flood the log every refresh cycle × community.
+                            if !over_budget_warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                tracing::warn!(
+                                    home_relay_url_len = reach.home_relay_url.len(),
+                                    butler_entries = reach.butler_set.len(),
+                                    max_record_cbor_bytes =
+                                        crate::reachability_bound::MAX_RECORD_CBOR_BYTES,
+                                    "ZEB-891: rendezvous reachability record still exceeds the \
+                                     pkarr size cap after capping butler and trimming ALL direct \
+                                     addresses — its fixed fields plus the membership vouch are \
+                                     too large. It will fail to publish (RecordTooLarge) every \
+                                     cycle, leaving this node undiscoverable via community \
+                                     rendezvous. Shorten the configured relay URL or reduce the \
+                                     butler/fleet set."
+                                );
+                            }
+                        } else {
+                            // Under budget: re-arm so a later breakage warns again.
+                            over_budget_warned.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
                         let vouch = crate::membership_vouch::mint_membership_vouch(
                             &device_sk,

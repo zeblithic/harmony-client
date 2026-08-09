@@ -98,8 +98,12 @@ fn addr_cbor_len(addr: &SocketAddr) -> usize {
 /// (`home_relay_url`, always kept) plus the surviving legs keep the node
 /// dialable; dialing is relay-assisted, so trimming degrades gracefully. Order
 /// of surviving addresses is preserved; a no-op (bytes unchanged) when already
-/// within budget. Returns the number of addresses dropped.
-pub fn bound_direct_addresses(payload: &mut ReachabilityAnnouncePayload, reserved: usize) -> usize {
+/// within budget. Returns an [`AddressBound`] — the number of addresses dropped
+/// AND whether the record is still over budget afterward.
+pub fn bound_direct_addresses(
+    payload: &mut ReachabilityAnnouncePayload,
+    reserved: usize,
+) -> AddressBound {
     let mut dropped = 0usize;
     while encoded_len(payload) + reserved > MAX_RECORD_CBOR_BYTES {
         // Drop the largest-encoding survivor. `position_max`-style scan (first
@@ -111,12 +115,42 @@ pub fn bound_direct_addresses(payload: &mut ReachabilityAnnouncePayload, reserve
             .map(|(i, a)| (i, addr_cbor_len(a)))
             .max_by(|(_, ka), (_, kb)| ka.cmp(kb))
         else {
-            break; // no addresses left to trim — payload's fixed fields alone exceed budget
+            // No addresses left to trim and the loop condition is still true:
+            // the payload's FIXED fields (relay URL(s) + butler set, and any
+            // vouch/seal in `reserved`) alone exceed the cap, so no address trim
+            // can make the record fit. Signal it (ZEB-891) — the caller must
+            // `warn!`, because publishing this over-cap record fails with
+            // `RecordTooLarge` every cycle, leaving the node silently
+            // undiscoverable with only a `debug!` that reads like success.
+            return AddressBound {
+                dropped,
+                over_budget: true,
+            };
         };
         payload.direct_addresses.remove(victim);
         dropped += 1;
     }
-    dropped
+    AddressBound {
+        dropped,
+        over_budget: false,
+    }
+}
+
+/// Outcome of [`bound_direct_addresses`]: how many direct addresses were dropped
+/// to fit the cap, and whether the record is STILL over budget after trimming.
+///
+/// `over_budget == true` means the fixed fields alone exceed
+/// [`MAX_RECORD_CBOR_BYTES`] — trimming drained every address and still can't
+/// fit. It is the ZEB-891 signal callers MUST surface at `warn!` (an over-cap
+/// record never publishes → the node is silently undiscoverable); no address
+/// trim can recover it, so the operator must shorten the configured relay URL(s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressBound {
+    /// Number of `direct_addresses` removed to reach (or attempt) the budget.
+    pub dropped: usize,
+    /// `true` iff the record still exceeds the cap after trimming — the fixed
+    /// fields alone are too large for any address count to fit.
+    pub over_budget: bool,
 }
 
 /// Cap `payload.butler_set` to at most `max_entries` for a rendezvous *dial
@@ -257,7 +291,7 @@ mod tests {
 
         cap_butler_set(&mut p, 1);
         let dropped =
-            bound_direct_addresses(&mut p, RECORD_ENVELOPE_BYTES + RENDEZVOUS_VOUCH_BYTES);
+            bound_direct_addresses(&mut p, RECORD_ENVELOPE_BYTES + RENDEZVOUS_VOUCH_BYTES).dropped;
         let after = sign_record(encode_rendezvous_blob(&p, Some(&vouch())));
         assert!(
             after <= MAX_RECORD_CBOR_BYTES,
@@ -289,8 +323,12 @@ mod tests {
         );
 
         // shared-builder reserve = envelope + case-d seal (covers friend too).
-        let dropped = bound_direct_addresses(&mut p, RECORD_ENVELOPE_BYTES + CASE_D_SEAL_BYTES);
-        assert!(dropped > 0, "expected some addresses trimmed");
+        let bound = bound_direct_addresses(&mut p, RECORD_ENVELOPE_BYTES + CASE_D_SEAL_BYTES);
+        assert!(bound.dropped > 0, "expected some addresses trimmed");
+        assert!(
+            !bound.over_budget,
+            "trimming brought it under budget, so over_budget must be false"
+        );
         assert!(
             !p.butler_set.is_empty(),
             "butler set must be preserved (offline-DM seal-targets) — trim addresses, not butler"
@@ -313,7 +351,7 @@ mod tests {
         // Force exactly one drop by reserving almost the whole budget.
         let target = encoded_len(&p) - 1;
         let reserved = MAX_RECORD_CBOR_BYTES.saturating_sub(target);
-        let dropped = bound_direct_addresses(&mut p, reserved);
+        let dropped = bound_direct_addresses(&mut p, reserved).dropped;
         assert_eq!(dropped, 1, "reserve chosen to force exactly one drop");
         // Both IPv4 legs (public + RFC1918) survive; an IPv6 leg is the one dropped.
         assert!(
@@ -352,8 +390,41 @@ mod tests {
             bs_at: 0,
         };
         let before = p.clone();
-        let dropped = bound_direct_addresses(&mut p, RECORD_ENVELOPE_BYTES + CASE_D_SEAL_BYTES);
-        assert_eq!(dropped, 0);
+        let bound = bound_direct_addresses(&mut p, RECORD_ENVELOPE_BYTES + CASE_D_SEAL_BYTES);
+        assert_eq!(bound.dropped, 0);
+        assert!(
+            !bound.over_budget,
+            "an already-fitting payload is not over budget"
+        );
         assert_eq!(p, before, "under-budget payload must be untouched");
+    }
+
+    /// ZEB-891: when the FIXED fields alone (a long relay URL + butler set)
+    /// exceed the cap, trimming drains every address and STILL can't fit — the
+    /// function must report `over_budget = true` so the caller can `warn!`
+    /// instead of silently publishing an over-cap record (RecordTooLarge every
+    /// cycle = silently undiscoverable). Before ZEB-891 this returned normally
+    /// with no over-budget signal.
+    #[test]
+    fn over_budget_signaled_when_fixed_fields_exceed_cap() {
+        let mut p = avalon_payload();
+        // A pathologically long self-hosted relay URL pushes the fixed fields
+        // over the cap on their own — the ZEB-891 operator-misconfig scenario
+        // (a >~66-char relay URL with a full butler set).
+        p.home_relay_url = format!("https://{}.internal.zeblithic.dev/", "r".repeat(200));
+        let bound = bound_direct_addresses(&mut p, RECORD_ENVELOPE_BYTES + CASE_D_SEAL_BYTES);
+        assert!(
+            p.direct_addresses.is_empty(),
+            "all addresses must be drained trying to fit"
+        );
+        assert!(
+            bound.over_budget,
+            "must signal over_budget when the fixed fields alone exceed the cap"
+        );
+        // The signal is truthful: the payload really is still over budget.
+        assert!(
+            encoded_len(&p) + RECORD_ENVELOPE_BYTES + CASE_D_SEAL_BYTES > MAX_RECORD_CBOR_BYTES,
+            "sanity: payload genuinely still over budget after draining addresses"
+        );
     }
 }
