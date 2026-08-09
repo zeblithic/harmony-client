@@ -5414,6 +5414,37 @@ pub struct CommunitySyncRegistry {
     /// `.await` happens with the guard alive.
     root_fetch_shutdowns:
         tokio::sync::Mutex<std::collections::HashMap<SpaceId, tokio::sync::watch::Sender<bool>>>,
+
+    /// ZEB-889: joiner-side minted-redemption cache, keyed by invite-token sig.
+    /// A failed-delivery retry reuses the cached mint (same `bootstrap_join`
+    /// id/bytes) so the host's `AlreadyKnown`-retransmit path re-delivers the
+    /// countersign, instead of minting a fresh id that P6 then rejects
+    /// ("already-engaged") — the zombie-invite bug. See `InFlightRedemptionMints`.
+    in_flight_redemption_mints: InFlightRedemptionMints,
+}
+
+/// ZEB-889: process-lifetime cache of a joiner's minted redemption, keyed by the
+/// invite-token signature (`InviteToken.sig`). Held on the `CommunitySyncRegistry`
+/// alongside the other per-redemption bookkeeping.
+///
+/// **Lock-discipline:** the map is a `tokio::sync::Mutex`; every method takes the
+/// lock, mutates/clones, and drops the guard — never held across an unrelated
+/// `.await` (mirrors `pending_redemptions` / `root_fetch_shutdowns`).
+#[derive(Default)]
+pub(crate) struct InFlightRedemptionMints {
+    by_token: tokio::sync::Mutex<std::collections::HashMap<[u8; 64], crate::MintedCommunity>>,
+}
+
+impl InFlightRedemptionMints {
+    async fn get(&self, token_sig: [u8; 64]) -> Option<crate::MintedCommunity> {
+        self.by_token.lock().await.get(&token_sig).cloned()
+    }
+    async fn store(&self, token_sig: [u8; 64], mint: crate::MintedCommunity) {
+        self.by_token.lock().await.insert(token_sig, mint);
+    }
+    async fn evict(&self, token_sig: &[u8; 64]) {
+        self.by_token.lock().await.remove(token_sig);
+    }
 }
 
 // ── CommunitySyncSpawnGuard (ZEB-274) ─────────────────────────────────────────
@@ -5595,6 +5626,7 @@ impl CommunitySyncRegistry {
             )),
             nav_emitter,
             root_fetch_shutdowns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            in_flight_redemption_mints: InFlightRedemptionMints::default(),
         }
     }
 
@@ -5855,6 +5887,27 @@ impl CommunitySyncRegistry {
         let mut g = self.pending_redemptions.lock().await;
         g.insert(event_id, sender);
         // guard dropped at end of scope
+    }
+
+    /// ZEB-889: return the cached minted redemption for `token_sig`, if a prior
+    /// (failed-delivery) attempt for this invite stored one. A retry reuses it so
+    /// it re-sends the SAME `bootstrap_join` id and hits the host's
+    /// `AlreadyKnown`-retransmit path (which re-delivers the countersign).
+    pub async fn get_redemption_mint(&self, token_sig: [u8; 64]) -> Option<crate::MintedCommunity> {
+        self.in_flight_redemption_mints.get(token_sig).await
+    }
+
+    /// ZEB-889: cache the minted redemption for `token_sig` so a later retry
+    /// reuses it instead of minting a fresh id (which P6 rejects once the joiner
+    /// is already engaged host-side).
+    pub async fn store_redemption_mint(&self, token_sig: [u8; 64], mint: crate::MintedCommunity) {
+        self.in_flight_redemption_mints.store(token_sig, mint).await;
+    }
+
+    /// ZEB-889: drop the cached mint for `token_sig` once the join has committed
+    /// (the invite is burned; no further retry is possible or needed).
+    pub async fn evict_redemption_mint(&self, token_sig: &[u8; 64]) {
+        self.in_flight_redemption_mints.evict(token_sig).await;
     }
 
     /// ZEB-805: snapshot every live engine's sync counters for
@@ -7937,6 +7990,71 @@ mod tests {
         };
         let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
         crate::community_membership::sign_event(&payload, &sk).expect("sign_event")
+    }
+
+    // ── ZEB-889: in-flight redemption mint cache ──────────────────────────
+    /// Build a throwaway `MintedCommunity` whose `bootstrap_join.id` is
+    /// `[id_byte; 16]`, so two stubs are distinguishable. The cache is a
+    /// key/value map opaque to the value, so any well-formed mint works.
+    fn zeb889_mint_stub(id_byte: u8) -> crate::MintedCommunity {
+        let community_id = SpaceId([id_byte; 16]);
+        let membership_key = EpochKey::new([id_byte; 32]);
+        let space = super::test_community_space(community_id, 0, membership_key.clone());
+        let payload = crate::community_membership::EventPayload {
+            id: [id_byte; 16],
+            community_id,
+            kind: crate::community_membership::MembershipEventKind::Join,
+            actor: crate::community_membership::mint_test_owner(id_byte).owner,
+            at: crate::owner_state_types::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "zeb889-stub".to_string(),
+            },
+        };
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[id_byte.wrapping_add(1); 32]);
+        let bootstrap_join =
+            crate::community_membership::sign_event(&payload, &sk).expect("sign stub");
+        crate::MintedCommunity {
+            community_id,
+            membership_key,
+            space,
+            bootstrap_join,
+        }
+    }
+
+    #[tokio::test]
+    async fn redemption_mint_cache_store_get_evict() {
+        let cache = super::InFlightRedemptionMints::default();
+        let sig = [7u8; 64];
+        assert!(cache.get(sig).await.is_none(), "empty cache misses");
+        let m = zeb889_mint_stub(0x11);
+        let want_id = m.bootstrap_join.id;
+        cache.store(sig, m).await;
+        let got = cache.get(sig).await.expect("stored mint is retrievable");
+        assert_eq!(
+            got.bootstrap_join.id, want_id,
+            "get returns the stored value"
+        );
+        // get is non-consuming — a retry may need it more than once before success.
+        assert!(cache.get(sig).await.is_some(), "get does not consume");
+        cache.evict(&sig).await;
+        assert!(cache.get(sig).await.is_none(), "evicted entry is gone");
+    }
+
+    #[tokio::test]
+    async fn redemption_mint_cache_keys_are_independent() {
+        let cache = super::InFlightRedemptionMints::default();
+        let (a, b) = ([1u8; 64], [2u8; 64]);
+        let (ma, mb) = (zeb889_mint_stub(0xAA), zeb889_mint_stub(0xBB));
+        let (ida, idb) = (ma.bootstrap_join.id, mb.bootstrap_join.id);
+        assert_ne!(ida, idb, "distinct stubs have distinct bootstrap_join ids");
+        cache.store(a, ma).await;
+        cache.store(b, mb).await;
+        assert_eq!(cache.get(a).await.unwrap().bootstrap_join.id, ida);
+        assert_eq!(cache.get(b).await.unwrap().bootstrap_join.id, idb);
+        cache.evict(&a).await;
+        assert!(cache.get(a).await.is_none(), "evicting a leaves b");
+        assert!(cache.get(b).await.is_some(), "b survives a's eviction");
     }
 
     /// `persist_now` durably fences the in-memory CRDT to disk WITHOUT

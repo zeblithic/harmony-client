@@ -35399,6 +35399,10 @@ fn resolve_invitee_device_keys(
 /// Bundle of values produced by `mint_community_creation` — kept as a
 /// plain struct so callers (the `create_community` IPC + tests) can
 /// destructure cleanly.
+///
+/// ZEB-889: `Clone` so the community registry's in-flight-redemption cache can
+/// hand back an owned copy of a joiner's minted redemption for retry reuse.
+#[derive(Clone)]
 pub struct MintedCommunity {
     pub community_id: crate::owner_state_types::SpaceId,
     pub membership_key: crate::owner_state_types::EpochKey,
