@@ -69305,6 +69305,37 @@ pub(crate) fn spawn_friend_link_retry(
     }))
 }
 
+/// RAII guard for a process-global env var in `#[serial]` tests: sets it on
+/// construction and RESTORES the prior value (or unsets it when there was none)
+/// on drop — including on panic. Prevents a test from clobbering an inherited
+/// value or leaking its own into a later same-process test
+/// (CodeRabbit/Qodo/CodeAnt #647). Shared by the connectivity-settings fallback
+/// tests here and the identity-discoverability RPC tests in `api::rpc`.
+#[cfg(test)]
+pub(crate) struct ScopedEnvVar {
+    name: &'static str,
+    prior: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl ScopedEnvVar {
+    pub(crate) fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prior = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, prior }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        match self.prior.take() {
+            Some(v) => std::env::set_var(self.name, v),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 #[cfg(test)]
 mod friend_ipc_tests {
     use super::*;
@@ -70560,21 +70591,23 @@ mod friend_ipc_tests {
         // default). Isolate the fallback to a temp dir (nextest = process-per-test;
         // `#[serial]` also guards `cargo test`).
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        std::env::set_var("HARMONY_DATA_DIR", tmp.path());
-        // Do every env-dependent op first, then clear the var, then assert — so a
-        // failing assert can't leave the process-global var set.
-        let default_on = super::get_friend_auto_accept_impl(None).await;
-        let set_res = super::set_friend_auto_accept_impl(None, false).await;
-        let after = super::get_friend_auto_accept_impl(None).await;
-        std::env::remove_var("HARMONY_DATA_DIR");
+        // Guard restores the prior HARMONY_DATA_DIR on drop (even on panic), so
+        // asserts can run inline without leaking or clobbering the env var.
+        let _env = ScopedEnvVar::set("HARMONY_DATA_DIR", tmp.path());
 
         assert!(
-            default_on.expect("get default via fallback"),
+            super::get_friend_auto_accept_impl(None)
+                .await
+                .expect("get default via fallback"),
             "no file yet → spec default ON"
         );
-        set_res.expect("stopped-node set must persist via the fallback, not error");
+        super::set_friend_auto_accept_impl(None, false)
+            .await
+            .expect("stopped-node set must persist via the fallback, not error");
         assert!(
-            !after.expect("get persisted via fallback"),
+            !super::get_friend_auto_accept_impl(None)
+                .await
+                .expect("get persisted via fallback"),
             "a stopped-node opt-out must persist and read back OFF"
         );
     }
@@ -70624,20 +70657,22 @@ mod friend_ipc_tests {
         // hard default). Isolate the fallback to a temp dir.
         use crate::friend_graph::PeerIntroPolicy;
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        std::env::set_var("HARMONY_DATA_DIR", tmp.path());
-        let default_pol = super::get_peer_intro_policy_impl(None).await;
-        let set_res = super::set_peer_intro_policy_impl(None, PeerIntroPolicy::AskMe).await;
-        let after = super::get_peer_intro_policy_impl(None).await;
-        std::env::remove_var("HARMONY_DATA_DIR");
+        let _env = ScopedEnvVar::set("HARMONY_DATA_DIR", tmp.path());
 
         assert_eq!(
-            default_pol.expect("get default via fallback"),
+            super::get_peer_intro_policy_impl(None)
+                .await
+                .expect("get default via fallback"),
             PeerIntroPolicy::FriendsOfFriends,
             "no file yet → spec default FriendsOfFriends"
         );
-        set_res.expect("stopped-node set must persist via the fallback, not error");
+        super::set_peer_intro_policy_impl(None, PeerIntroPolicy::AskMe)
+            .await
+            .expect("stopped-node set must persist via the fallback, not error");
         assert_eq!(
-            after.expect("get persisted via fallback"),
+            super::get_peer_intro_policy_impl(None)
+                .await
+                .expect("get persisted via fallback"),
             PeerIntroPolicy::AskMe,
             "a stopped-node policy change must persist and read back"
         );

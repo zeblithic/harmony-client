@@ -2751,7 +2751,7 @@ mod tests {
         // Isolate the resolved path to a fresh temp dir (nextest runs each test in
         // its own process, so the env override does not leak across tests).
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HARMONY_DATA_DIR", tmp.path());
+        let _env = crate::ScopedEnvVar::set("HARMONY_DATA_DIR", tmp.path());
         let reg = build_registry();
         let out = reg
             .dispatch(
@@ -2762,7 +2762,6 @@ mod tests {
             )
             .await
             .expect("verb registered");
-        std::env::remove_var("HARMONY_DATA_DIR");
         assert_eq!(
             out,
             serde_json::Value::Bool(true),
@@ -2784,7 +2783,7 @@ mod tests {
         // Isolate the resolved path to a fresh temp dir (nextest runs each test in
         // its own process, so the env override does not leak across tests).
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HARMONY_DATA_DIR", tmp.path());
+        let _env = crate::ScopedEnvVar::set("HARMONY_DATA_DIR", tmp.path());
         let reg = build_registry();
         let set = reg
             .dispatch(
@@ -2804,7 +2803,6 @@ mod tests {
                 serde_json::Value::Null,
             )
             .await;
-        std::env::remove_var("HARMONY_DATA_DIR");
         set.expect("setter persists the opt-out pre-owner without erroring");
         assert_eq!(
             got.expect("getter"),
