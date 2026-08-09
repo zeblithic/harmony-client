@@ -1284,8 +1284,8 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
         .await
         .expect("insert admin join");
 
-    // An admin-signed InviteToken (invite-only joins carry one). Reused for both
-    // bob and Dave — only the inviter sig matters to verify, not the hint.
+    // An admin-signed InviteToken (invite-only joins carry one; only the inviter
+    // sig matters to verify, not the hint).
     // ZEB-888: each invitee gets a DISTINCT single-use token — the `nonce`
     // varies `minted_at` → distinct canonical bytes → distinct sig (Ed25519 is
     // deterministic, so a fixed token would produce the SAME sig for every

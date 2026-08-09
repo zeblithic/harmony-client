@@ -2709,28 +2709,52 @@ pub fn materialize_with_now(
     // records the ONE PendingJoin per invite-token sig that may materialize as
     // Joined — the single-use claim. The winner is the actor of the PendingJoin
     // targeted by the EARLIEST JoinCountersign (by `event_sort_key`) for that
-    // token. Tiebreaking on the COUNTERSIGN (not the PendingJoin) makes the
-    // winner un-displaceable by a later claimant who backdates their own
-    // self-signed PendingJoin: an outsider holding the invite URL cannot author
-    // a valid JoinCountersign. Enforced HERE — a pure function of the event set,
-    // hence convergent — rather than at insert/`verify_event`, which is
-    // order-dependent and would diverge across merge orders (ZEB-888).
+    // token, considering only countersigns that are NOT backdated before the
+    // PendingJoin they approve (`countersign.at.wall_ms >= pending.at.wall_ms`).
+    //
+    // Tiebreaking on the COUNTERSIGN (not the PendingJoin) makes the winner
+    // un-displaceable by a later claimant who backdates their own self-signed
+    // PendingJoin: an outsider holding the invite URL cannot author a valid
+    // JoinCountersign. The wall-clock causality guard closes the complementary
+    // hole (Qodo #643): `verify_event` imposes no past-skew bound on a
+    // JoinCountersign, so without it an already-Joined signer could publish a
+    // *later* countersign carrying an artificially old HLC, become the
+    // "earliest", and demote a Joined member. Requiring the countersign to be at
+    // or after its own target's wall means displacing an honest, recently-minted
+    // claimant now requires ALSO backdating that claimant's PendingJoin — i.e. a
+    // colluding PendingJoin author, not a lone malicious signer. (The residual —
+    // a fully colluding pair who both backdate AND possess the victim's exact
+    // single-use token — is not closed here; fully closing it needs a clock
+    // backdating policy, deliberately out of scope.)
+    //
+    // Enforced HERE — a pure function of the event set, hence convergent —
+    // rather than at insert/`verify_event`, which is order-dependent and would
+    // diverge across merge orders (ZEB-888).
     let canonical_pending_ids: std::collections::HashSet<EventId> = {
         use std::collections::HashMap;
-        // PendingJoin event id -> its invite-token sig.
-        let pending_token: HashMap<EventId, [u8; 64]> = events
+        // PendingJoin event id -> (invite-token sig, the PendingJoin's wall_ms).
+        let pending_token: HashMap<EventId, ([u8; 64], u64)> = events
             .iter()
             .filter_map(|e| match &e.kind {
-                MembershipEventKind::PendingJoin { invite_token } => Some((e.id, invite_token.sig)),
+                MembershipEventKind::PendingJoin { invite_token } => {
+                    Some((e.id, (invite_token.sig, e.at.wall_ms)))
+                }
                 _ => None,
             })
             .collect();
         // token sig -> minimal-`event_sort_key` JoinCountersign targeting a
-        // PendingJoin that carries this token.
+        // PendingJoin that carries this token (causality guard applied).
         let mut best: HashMap<[u8; 64], &SignedMembershipEvent> = HashMap::new();
         for c in events.iter() {
             if let MembershipEventKind::JoinCountersign { target_event_id } = &c.kind {
-                if let Some(tok) = pending_token.get(target_event_id) {
+                if let Some((tok, target_wall)) = pending_token.get(target_event_id) {
+                    // Causality guard: a countersign backdated before the
+                    // PendingJoin it approves cannot fix the canonical claimant.
+                    // Compare wall_ms (not the full `event_sort_key`) so an honest
+                    // same-millisecond countersign is not falsely excluded.
+                    if c.at.wall_ms < *target_wall {
+                        continue;
+                    }
                     match best.get(tok).copied() {
                         Some(cur) if event_sort_key(cur).cmp(&event_sort_key(c)).is_le() => {}
                         _ => {
@@ -16779,6 +16803,50 @@ mod zeb_888_single_use_materialization_tests {
             status(&m, b.owner),
             Some(MemberStatus::Joined),
             "a backdated later claimant must NOT displace the joined member"
+        );
+    }
+
+    // A countersign backdated *below the PendingJoin it approves* cannot become
+    // the canonical "earliest" and demote an already-Joined member (Qodo #643):
+    // the wall-clock causality guard rejects it. Here B's own pending is honest
+    // and recent, so a lone backdated countersign for B cannot flip canonical.
+    #[test]
+    fn backdated_countersign_cannot_demote_joined_member() {
+        let admin = mint_test_owner(0x10);
+        let a = mint_test_owner(0x20);
+        let b = mint_test_owner(0x30);
+        let sig = [0x77u8; 64];
+        let events = vec![
+            admin_join(&admin),
+            // A: honest join on the token, countersigned at wall 4000.
+            pending_ev(
+                &a,
+                [0x02; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_000,
+            ),
+            countersign_ev(&admin, [0x04; 16], [0x02; 16], 1_700_000_004_000),
+            // B: an honest, recently-minted pending on the SAME token...
+            pending_ev(
+                &b,
+                [0x03; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_004_500,
+            ),
+            // ...but a countersign for B backdated to wall 1_000 — before B's own
+            // pending — trying to become "earliest" and steal the claim.
+            countersign_ev(&admin, [0x05; 16], [0x03; 16], 1_000),
+        ];
+        let m = materialize(&events, admin.owner);
+        assert_eq!(
+            status(&m, a.owner),
+            Some(MemberStatus::Joined),
+            "A must remain Joined; a backdated countersign cannot demote it"
+        );
+        assert_ne!(
+            status(&m, b.owner),
+            Some(MemberStatus::Joined),
+            "the backdated countersign (before B's own pending) must not make B canonical"
         );
     }
 

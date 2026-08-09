@@ -2251,7 +2251,21 @@ async fn spawn_auto_counter_sign_task(
     // --- Eligibility + idempotency check under the state lock. ---
     let (self_joined, power_ok, already_signed, token_claimed_by_other) = {
         let state_g = state.lock().await;
-        let mat = state_g.materialize_now(admin_addr);
+        // ZEB-888 (Qodo #643 perf): clone the event log ONCE under the lock and
+        // reuse it for the eligibility materialize, the idempotency scan, and the
+        // single-use guard — `materialize_now` clones the log internally, so
+        // calling it plus a separate clone for the guard cloned twice. Replicate
+        // `materialize_now` exactly (floor None + ZEB-846 forward-skew ceiling)
+        // on the shared clone so behavior is unchanged.
+        let log: Vec<crate::community_membership::SignedMembershipEvent> =
+            state_g.events().cloned().collect();
+        let receiver_now = crate::clock_trust::receiver_now_ms();
+        let mat = crate::community_membership::materialize_with_bounds(
+            &log,
+            admin_addr,
+            None,
+            receiver_now,
+        );
 
         let self_status = mat.members.get(&self_owner).map(|m| m.status);
         let joined = matches!(self_status, Some(MemberStatus::Joined));
@@ -2263,7 +2277,7 @@ async fn spawn_auto_counter_sign_task(
         // escapes the block.
         let power_ok = crate::community_membership::actor_power_meets_invite_tier(&mat, self_owner);
 
-        let signed_already = state_g.events().any(|e| {
+        let signed_already = log.iter().any(|e| {
             e.actor == self_owner
                 && matches!(
                     &e.kind,
@@ -2278,11 +2292,8 @@ async fn spawn_auto_counter_sign_task(
         // single-use fence is the canonical-claimant rule in
         // `materialize_with_now` (a non-canonical claimant never materializes as
         // Joined regardless of this guard).
-        let token_claimed_by_other = {
-            let log: Vec<crate::community_membership::SignedMembershipEvent> =
-                state_g.events().cloned().collect();
-            crate::community_membership::invite_token_claimed_by_other_actor(&log, pending_id)
-        };
+        let token_claimed_by_other =
+            crate::community_membership::invite_token_claimed_by_other_actor(&log, pending_id);
         (joined, power_ok, signed_already, token_claimed_by_other)
     };
 
