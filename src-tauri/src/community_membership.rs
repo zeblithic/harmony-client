@@ -2663,6 +2663,51 @@ pub fn materialize_with_now(
         })
         .collect();
 
+    // ZEB-888 Pre-Pass: the canonical single-use claimant per invite token.
+    // Unlike `countersigned_pending_ids` (EVERY countersigned PendingJoin; still
+    // used for the epoch-catchup-trigger validity check further below), this
+    // records the ONE PendingJoin per invite-token sig that may materialize as
+    // Joined — the single-use claim. The winner is the actor of the PendingJoin
+    // targeted by the EARLIEST JoinCountersign (by `event_sort_key`) for that
+    // token. Tiebreaking on the COUNTERSIGN (not the PendingJoin) makes the
+    // winner un-displaceable by a later claimant who backdates their own
+    // self-signed PendingJoin: an outsider holding the invite URL cannot author
+    // a valid JoinCountersign. Enforced HERE — a pure function of the event set,
+    // hence convergent — rather than at insert/`verify_event`, which is
+    // order-dependent and would diverge across merge orders (ZEB-888).
+    let canonical_pending_ids: std::collections::HashSet<EventId> = {
+        use std::collections::HashMap;
+        // PendingJoin event id -> its invite-token sig.
+        let pending_token: HashMap<EventId, [u8; 64]> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                MembershipEventKind::PendingJoin { invite_token } => Some((e.id, invite_token.sig)),
+                _ => None,
+            })
+            .collect();
+        // token sig -> minimal-`event_sort_key` JoinCountersign targeting a
+        // PendingJoin that carries this token.
+        let mut best: HashMap<[u8; 64], &SignedMembershipEvent> = HashMap::new();
+        for c in events.iter() {
+            if let MembershipEventKind::JoinCountersign { target_event_id } = &c.kind {
+                if let Some(tok) = pending_token.get(target_event_id) {
+                    match best.get(tok).copied() {
+                        Some(cur) if event_sort_key(cur).cmp(&event_sort_key(c)).is_le() => {}
+                        _ => {
+                            best.insert(*tok, c);
+                        }
+                    }
+                }
+            }
+        }
+        best.values()
+            .filter_map(|c| match &c.kind {
+                MembershipEventKind::JoinCountersign { target_event_id } => Some(*target_event_id),
+                _ => None,
+            })
+            .collect()
+    };
+
     // ZEB-250 Pre-Pass: collect per-proposal raw signature data.
     // - quorum_signers[event_id]: set of admin OwnerAddrs who have
     //   signed the proposal (proposer auto-included + each
@@ -3306,9 +3351,14 @@ pub fn materialize_with_now(
                 // Uncountersigned PendingJoin is intentionally NOT accepted:
                 // a still-pending joiner is not yet a member, and no admin
                 // would (or should) issue a catchup for them. The
-                // countersigned-ness check uses the same Pre-Pass set
-                // (`countersigned_pending_ids`) consumed by the PendingJoin
-                // materialize arm, so the two paths stay consistent.
+                // countersigned-ness check uses the `countersigned_pending_ids`
+                // Pre-Pass set. ZEB-888: this is deliberately BROADER than the
+                // `canonical_pending_ids` set the Joined-materialize arm now uses.
+                // Catchup-trigger validity turns on whether a PendingJoin was
+                // countersigned at all (its own key-material catchup), NOT on the
+                // single-use claim winner — so a non-canonical countersigned
+                // PendingJoin never becomes Joined but is still a valid catchup
+                // trigger for its own event.
                 let triggered_event = sorted[..idx].iter().find(|e| e.id == *triggered_by);
                 let join_actor = match triggered_event.map(|e| &e.kind) {
                     Some(MembershipEventKind::Join) => triggered_event.map(|e| e.actor),
@@ -3377,7 +3427,16 @@ pub fn materialize_with_now(
                 // The countersigned set is built by the Pre-Pass above.
                 // Prior-state guard ensures Leave/Kick/Banned aren't
                 // overridden by a late-arriving JoinCountersign.
-                let countersigned = countersigned_pending_ids.contains(&event.id);
+                // ZEB-888: a PendingJoin materializes as Joined only if it is the
+                // CANONICAL single-use claimant for its invite token (earliest
+                // countersign wins). A countersigned-but-non-canonical PendingJoin
+                // (a second actor on the same single-use token) falls through to
+                // the PendingJoin/expiry branch below and never becomes Joined.
+                // `countersigned_pending_ids` is deliberately NOT used here — it
+                // does not encode single-use; it remains correct for the
+                // epoch-catchup-trigger check above (key-material catchup validity,
+                // not membership).
+                let countersigned = canonical_pending_ids.contains(&event.id);
                 let age_ms = current_max_wall_ms.saturating_sub(event.at.wall_ms);
                 let expired = age_ms > MATERIALIZE_PENDING_EXPIRY_MS;
 
@@ -16509,6 +16568,248 @@ mod zeb_339_cross_owner_e2e_tests {
                 .contains(&joiner.cert.device_pubkeys.classical.ed25519_verify),
             "joiner's enrolled device key must be in final materialized state"
         );
+    }
+}
+
+// ZEB-888: single-use invite claim is a convergent materialization rule.
+// A countersigned-but-non-canonical PendingJoin (a second actor on the same
+// single-use token) must NOT materialize as Joined; the canonical claimant is
+// the actor of the PendingJoin targeted by the EARLIEST JoinCountersign, which
+// makes an already-Joined member un-displaceable by a later backdated claimant.
+#[cfg(test)]
+mod zeb_888_single_use_materialization_tests {
+    use super::*;
+    use crate::community_invite::InviteToken;
+
+    const CID: SpaceId = SpaceId([0x88; 16]);
+
+    fn untargeted_token(inviter: OwnerAddr, sig: [u8; 64]) -> InviteToken {
+        InviteToken {
+            inviter,
+            invitee_hint: None,
+            minted_at: Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "admin-dev".into(),
+            },
+            expires_at: None,
+            sig,
+        }
+    }
+
+    fn pending_ev(
+        joiner: &TestOwner,
+        id: [u8; 16],
+        token: InviteToken,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id,
+            community_id: CID,
+            kind: MembershipEventKind::PendingJoin {
+                invite_token: token,
+            },
+            actor: joiner.owner,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "joiner-dev".into(),
+            },
+        };
+        SignedMembershipEvent {
+            enrollment: Some(joiner.cert.clone()),
+            ..sign_event(&payload, &joiner.device_key).expect("sign pending")
+        }
+    }
+
+    fn countersign_ev(
+        signer: &TestOwner,
+        id: [u8; 16],
+        target: EventId,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id,
+            community_id: CID,
+            kind: MembershipEventKind::JoinCountersign {
+                target_event_id: target,
+            },
+            actor: signer.owner,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "admin-dev".into(),
+            },
+        };
+        sign_event(&payload, &signer.device_key).expect("sign countersign")
+    }
+
+    fn admin_join(admin: &TestOwner) -> SignedMembershipEvent {
+        let payload = EventPayload {
+            id: [0x01; 16],
+            community_id: CID,
+            kind: MembershipEventKind::Join,
+            actor: admin.owner,
+            at: Hlc {
+                wall_ms: 1_700_000_001_000,
+                logical: 0,
+                device_id: "admin-dev".into(),
+            },
+        };
+        SignedMembershipEvent {
+            enrollment: Some(admin.cert.clone()),
+            ..sign_event(&payload, &admin.device_key).expect("sign admin join")
+        }
+    }
+
+    fn status(state: &MaterializedMembership, who: OwnerAddr) -> Option<MemberStatus> {
+        state.members.get(&who).map(|s| s.status)
+    }
+
+    // Two distinct actors redeem the same single-use token; only the actor with
+    // the EARLIEST countersign materializes as Joined.
+    #[test]
+    fn two_actors_one_token_only_earliest_countersign_joins() {
+        let admin = mint_test_owner(0x10);
+        let a = mint_test_owner(0x20);
+        let b = mint_test_owner(0x30);
+        let sig = [0x77u8; 64]; // one single-use token, shared by A and B
+
+        let events = vec![
+            admin_join(&admin),
+            pending_ev(
+                &a,
+                [0x02; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_000,
+            ),
+            pending_ev(
+                &b,
+                [0x03; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_500,
+            ),
+            // A countersigned FIRST (lower wall) → A is canonical.
+            countersign_ev(&admin, [0x04; 16], [0x02; 16], 1_700_000_004_000),
+            countersign_ev(&admin, [0x05; 16], [0x03; 16], 1_700_000_005_000),
+        ];
+        let m = materialize(&events, admin.owner);
+        assert_eq!(
+            status(&m, a.owner),
+            Some(MemberStatus::Joined),
+            "A (earliest countersign) must be Joined"
+        );
+        assert_eq!(
+            status(&m, b.owner),
+            Some(MemberStatus::PendingJoin),
+            "B (second claimant on the same single-use token) must NOT be Joined"
+        );
+    }
+
+    // An outsider cannot evict an already-Joined member by backdating their own
+    // self-signed PendingJoin: the tiebreak is on the countersign, which the
+    // outsider cannot author.
+    #[test]
+    fn later_claimant_cannot_displace_joined_member_via_backdated_pending() {
+        let admin = mint_test_owner(0x10);
+        let a = mint_test_owner(0x20);
+        let b = mint_test_owner(0x30);
+        let sig = [0x77u8; 64];
+
+        let events = vec![
+            admin_join(&admin),
+            pending_ev(
+                &a,
+                [0x02; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_000,
+            ),
+            countersign_ev(&admin, [0x04; 16], [0x02; 16], 1_700_000_004_000),
+            // B backdates their PendingJoin far below A's, then gets a later countersign.
+            pending_ev(&b, [0x03; 16], untargeted_token(admin.owner, sig), 1_000),
+            countersign_ev(&admin, [0x05; 16], [0x03; 16], 1_700_000_009_000),
+        ];
+        let m = materialize(&events, admin.owner);
+        assert_eq!(
+            status(&m, a.owner),
+            Some(MemberStatus::Joined),
+            "A must remain Joined (canonical by earliest countersign)"
+        );
+        assert_ne!(
+            status(&m, b.owner),
+            Some(MemberStatus::Joined),
+            "a backdated later claimant must NOT displace the joined member"
+        );
+    }
+
+    // The same actor re-claiming the same token still materializes once — no
+    // panic, no spurious second membership.
+    #[test]
+    fn same_actor_two_pendings_one_token_joins_once() {
+        let admin = mint_test_owner(0x10);
+        let a = mint_test_owner(0x20);
+        let sig = [0x77u8; 64];
+
+        let events = vec![
+            admin_join(&admin),
+            pending_ev(
+                &a,
+                [0x02; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_000,
+            ),
+            pending_ev(
+                &a,
+                [0x03; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_500,
+            ),
+            countersign_ev(&admin, [0x04; 16], [0x02; 16], 1_700_000_004_000),
+            countersign_ev(&admin, [0x05; 16], [0x03; 16], 1_700_000_005_000),
+        ];
+        let m = materialize(&events, admin.owner);
+        assert_eq!(
+            status(&m, a.owner),
+            Some(MemberStatus::Joined),
+            "same-actor re-claim must still be Joined"
+        );
+    }
+
+    // The single-use verdict is a pure function of the event set: shuffling the
+    // input order yields identical membership.
+    #[test]
+    fn single_use_materialization_is_order_independent() {
+        let admin = mint_test_owner(0x10);
+        let a = mint_test_owner(0x20);
+        let b = mint_test_owner(0x30);
+        let sig = [0x77u8; 64];
+
+        let base = vec![
+            admin_join(&admin),
+            pending_ev(
+                &a,
+                [0x02; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_000,
+            ),
+            pending_ev(
+                &b,
+                [0x03; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_500,
+            ),
+            countersign_ev(&admin, [0x04; 16], [0x02; 16], 1_700_000_004_000),
+            countersign_ev(&admin, [0x05; 16], [0x03; 16], 1_700_000_005_000),
+        ];
+        let mut reordered = base.clone();
+        reordered.reverse();
+
+        let m1 = materialize(&base, admin.owner);
+        let m2 = materialize(&reordered, admin.owner);
+        assert_eq!(status(&m1, a.owner), status(&m2, a.owner));
+        assert_eq!(status(&m1, b.owner), status(&m2, b.owner));
+        assert_eq!(status(&m1, a.owner), Some(MemberStatus::Joined));
+        assert_eq!(status(&m1, b.owner), Some(MemberStatus::PendingJoin));
     }
 }
 
