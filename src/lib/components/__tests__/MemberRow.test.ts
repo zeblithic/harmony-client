@@ -40,6 +40,25 @@ describe('MemberRow kebab-matrix', () => {
     expect(queryByRole('menuitem', { name: 'Unban' })).toBeNull();
   });
 
+  it('Escape closes the kebab menu from anywhere in the row (ZEB-386)', async () => {
+    const modMember = makeMember(50, 'joined', 'cc'.repeat(16));
+    const { getByRole, queryByRole } = render(MemberRow, {
+      props: {
+        member: modMember,
+        viewer: { addr: VIEWER_ADDR, power: 100, isLastAdmin: false },
+        onaction: vi.fn(),
+      },
+    });
+
+    await fireEvent.click(getByRole('button', { name: 'Member actions' }));
+    expect(getByRole('menuitem', { name: 'Kick' })).toBeTruthy();
+
+    // The Escape handler is a `menuOpen`-gated document listener (not a listener
+    // on the row/wrapper), so a keydown dispatched anywhere must still close it.
+    await fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(queryByRole('menuitem', { name: 'Kick' })).toBeNull();
+  });
+
   it('Moderator viewer on Member target: sees only Kick', async () => {
     const memberTarget = makeMember(0, 'joined', 'dd'.repeat(16));
     const { getByRole, queryByRole } = render(MemberRow, {

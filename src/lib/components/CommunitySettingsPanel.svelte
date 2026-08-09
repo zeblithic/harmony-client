@@ -435,9 +435,12 @@
   }
 </script>
 
-<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+<!-- Backdrop: click-to-dismiss only (Escape is handled on the focusable panel
+     below); presentation role keeps it out of the a11y tree. -->
+<!-- svelte-ignore a11y_click_events_have_key_events -->
 <div
   class="panel-overlay"
+  role="presentation"
   onclick={handleOverlayClick}
 >
   <div

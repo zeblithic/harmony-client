@@ -4568,7 +4568,9 @@
       class="modal-content"
       role="dialog"
       aria-modal="true"
+      tabindex="-1"
       onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => { if (e.key !== 'Escape') e.stopPropagation(); }}
     >
       <DmCreateDialog
         profiles={pickerContacts}
@@ -4782,6 +4784,7 @@
       class="modal-content"
       role="dialog"
       aria-modal="true"
+      tabindex="-1"
       onclick={(e) => e.stopPropagation()}
       onkeydown={(e) => e.stopPropagation()}
     >

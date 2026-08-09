@@ -524,8 +524,7 @@
     bind:this={canvas}
     onclick={handleClick}
     onmousemove={handleMouseMove}
-    role="img"
-    aria-label="Network topology graph showing {simNodes.length} nodes and {simLinks.length} links"
+    aria-label="Network topology graph"
   ></canvas>
 </div>
 

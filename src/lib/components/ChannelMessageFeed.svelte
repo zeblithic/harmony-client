@@ -988,6 +988,7 @@
                 class="reaction-picker"
                 role="menu"
                 aria-label="Pick a reaction"
+                tabindex="-1"
                 onkeydown={handlePickerKey}
                 use:autofocusFirstMenuItem
               >
