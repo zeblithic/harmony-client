@@ -2267,6 +2267,46 @@ pub fn event_sort_key(e: &SignedMembershipEvent) -> impl Ord + '_ {
     )
 }
 
+/// ZEB-888 (Layer 2, defense-in-depth): true iff some committed
+/// `JoinCountersign` targets a `PendingJoin` carrying the SAME invite-token sig
+/// as `pending_id`'s `PendingJoin` but belonging to a DIFFERENT actor — i.e. the
+/// single-use token is already claimed by someone else. Used to suppress phantom
+/// auto-countersigns for a second claimant. Best-effort (propagation/order
+/// dependent — two members can each sign a second claimant before seeing the
+/// other's countersign), which is why the AUTHORITATIVE single-use fence is the
+/// canonical-claimant rule in `materialize_with_now`, not this guard. Returns
+/// `false` if `pending_id` is not a known `PendingJoin`.
+pub(crate) fn invite_token_claimed_by_other_actor(
+    events: &[SignedMembershipEvent],
+    pending_id: EventId,
+) -> bool {
+    let Some((this_tok, this_actor)) = events.iter().find_map(|e| match &e.kind {
+        MembershipEventKind::PendingJoin { invite_token } if e.id == pending_id => {
+            Some((invite_token.sig, e.actor))
+        }
+        _ => None,
+    }) else {
+        return false;
+    };
+    // PendingJoin event id -> (token sig, actor), for target-of-countersign lookup.
+    let pending_meta: std::collections::HashMap<EventId, ([u8; 64], OwnerAddr)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            MembershipEventKind::PendingJoin { invite_token } => {
+                Some((e.id, (invite_token.sig, e.actor)))
+            }
+            _ => None,
+        })
+        .collect();
+    events.iter().any(|c| match &c.kind {
+        MembershipEventKind::JoinCountersign { target_event_id } => pending_meta
+            .get(target_event_id)
+            .map(|(tok, actor)| *tok == this_tok && *actor != this_actor)
+            .unwrap_or(false),
+        _ => false,
+    })
+}
+
 /// Replay a community's signed event log into a MaterializedMembership.
 ///
 /// Implements the spec's "Materialization rules" verbatim:
@@ -16810,6 +16850,68 @@ mod zeb_888_single_use_materialization_tests {
         assert_eq!(status(&m1, b.owner), status(&m2, b.owner));
         assert_eq!(status(&m1, a.owner), Some(MemberStatus::Joined));
         assert_eq!(status(&m1, b.owner), Some(MemberStatus::PendingJoin));
+    }
+
+    // Layer 2 helper: once A's claim on a token is countersigned, the token
+    // reads as claimed-by-other for B's PendingJoin, but not for A's own.
+    #[test]
+    fn claim_helper_detects_second_claimant() {
+        let admin = mint_test_owner(0x10);
+        let a = mint_test_owner(0x20);
+        let b = mint_test_owner(0x30);
+        let sig = [0x77u8; 64];
+        let events = vec![
+            admin_join(&admin),
+            pending_ev(
+                &a,
+                [0x02; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_000,
+            ),
+            pending_ev(
+                &b,
+                [0x03; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_500,
+            ),
+            countersign_ev(&admin, [0x04; 16], [0x02; 16], 1_700_000_004_000),
+        ];
+        assert!(
+            invite_token_claimed_by_other_actor(&events, [0x03; 16]),
+            "B's pending: token already claimed (countersigned) for A"
+        );
+        assert!(
+            !invite_token_claimed_by_other_actor(&events, [0x02; 16]),
+            "A's own pending: A is the claimant, not 'other'"
+        );
+    }
+
+    // Layer 2 helper: a claim on a DIFFERENT token must not read as claimed.
+    #[test]
+    fn claim_helper_false_for_distinct_tokens() {
+        let admin = mint_test_owner(0x10);
+        let a = mint_test_owner(0x20);
+        let b = mint_test_owner(0x30);
+        let events = vec![
+            admin_join(&admin),
+            pending_ev(
+                &a,
+                [0x02; 16],
+                untargeted_token(admin.owner, [0x77u8; 64]),
+                1_700_000_003_000,
+            ),
+            pending_ev(
+                &b,
+                [0x03; 16],
+                untargeted_token(admin.owner, [0x66u8; 64]),
+                1_700_000_003_500,
+            ),
+            countersign_ev(&admin, [0x04; 16], [0x02; 16], 1_700_000_004_000),
+        ];
+        assert!(
+            !invite_token_claimed_by_other_actor(&events, [0x03; 16]),
+            "B holds a different token; A's claim does not cover it"
+        );
     }
 }
 
