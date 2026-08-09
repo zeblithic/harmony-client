@@ -9993,16 +9993,36 @@ pub async fn start_node_inner(
                             // the relay + surviving addresses keep the node
                             // dialable. The rendezvous publisher re-bounds its
                             // own (butler-stripped) variant separately.
-                            let dropped = crate::reachability_bound::bound_direct_addresses(
+                            let bound = crate::reachability_bound::bound_direct_addresses(
                                 &mut payload,
                                 crate::reachability_bound::RECORD_ENVELOPE_BYTES
                                     + crate::reachability_bound::CASE_D_SEAL_BYTES,
                             );
-                            if dropped > 0 {
+                            if bound.dropped > 0 {
                                 tracing::debug!(
-                                    dropped,
+                                    dropped = bound.dropped,
                                     kept = payload.direct_addresses.len(),
                                     "ZEB-880: trimmed direct addresses to fit the pkarr record size cap"
+                                );
+                            }
+                            if bound.over_budget {
+                                // ZEB-891: trimming every address still didn't fit —
+                                // the fixed fields (relay URL + butler set) alone
+                                // exceed the cap, so no trim can recover it. This
+                                // record fails `RecordTooLarge` every publish cycle,
+                                // leaving the node silently undiscoverable cross-WAN.
+                                // Surface it above debug! so an operator sees the
+                                // misconfiguration (typically a too-long relay URL).
+                                tracing::warn!(
+                                    home_relay_url_len = payload.home_relay_url.len(),
+                                    butler_entries = payload.butler_set.len(),
+                                    max_record_cbor_bytes =
+                                        crate::reachability_bound::MAX_RECORD_CBOR_BYTES,
+                                    "ZEB-891: reachability record still exceeds the pkarr size cap \
+                                     after trimming ALL direct addresses — its fixed fields (relay \
+                                     URL + butler set) alone are too large. It will fail to publish \
+                                     (RecordTooLarge) every cycle, leaving this node silently \
+                                     undiscoverable cross-WAN. Shorten the configured relay URL."
                                 );
                             }
                             let mut out = Vec::new();
