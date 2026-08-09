@@ -447,13 +447,16 @@ impl ConnectivitySettings {
     /// survives: the boot-failure reset (`reset_local_identity`) and profile
     /// reuse preserve it, while the ZEB-842 clean-slate wipe deletes it.
     ///
-    /// Effect: `identity_discoverable` → OFF, `friend_auto_accept_known` → ON,
-    /// `presence_invisible` → visible, `peer_intro_policy` → FriendsOfFriends;
-    /// `relays` / `iroh_relays` carried over from any existing file, else the
-    /// default pool. Uses product [`Default`], not [`Self::fail_closed_defaults`]:
-    /// a deliberate mint is a fresh *install*, not untrusted state — and the one
-    /// safety-critical toggle (`identity_discoverable`) is OFF in both, so the
-    /// fail-safe direction is covered regardless.
+    /// Effect: `identity_discoverable` → ON (the post-ZEB-881 first-run default),
+    /// `friend_auto_accept_known` → ON, `presence_invisible` → visible,
+    /// `peer_intro_policy` → FriendsOfFriends; `relays` / `iroh_relays` carried
+    /// over from any existing file, else the default pool. Uses product
+    /// [`Default`], not [`Self::fail_closed_defaults`]: a deliberate mint is a
+    /// fresh *install* that should adopt the first-run product posture
+    /// (discoverable ON so first cross-WAN contact works — ZEB-881), NOT the
+    /// untrusted-state fail-closed posture. A new identity therefore never
+    /// inherits the PREVIOUS identity's discoverability, but it does start from
+    /// the product default (ON) rather than OFF.
     pub fn reset_privacy_posture_for_new_identity(path: &PathBuf) -> std::io::Result<()> {
         // Carry the machine's relay infra across the reset. `load_or_default`
         // already fails closed on a corrupt/unreadable file (relays fall back to
