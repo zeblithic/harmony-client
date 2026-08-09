@@ -3,6 +3,7 @@ import {
   mapRedeemInviteError,
   redeemInviteCopy,
   toRedeemInviteError,
+  REDEEM_INVITE_ERROR_CODES,
   type RedeemInviteErrorCode,
 } from '../redeem-invite-errors';
 
@@ -11,25 +12,10 @@ import {
 // unlike the pre-885 suite which fed fabricated CamelCase strings the backend
 // never actually emitted.
 
-const ALL_CODES: RedeemInviteErrorCode[] = [
-  'bootstrap_missing',
-  'bootstrap_actor_mismatch',
-  'bootstrap_community_mismatch',
-  'bootstrap_signature_invalid',
-  'bootstrap_kind_invalid',
-  'invite_url_malformed',
-  'inviter_enrollment_invalid',
-  'invite_token_missing',
-  'missing_admin_identity_pub',
-  'inviter_unreachable',
-  'relays_warming_up',
-  'node_not_ready',
-  'generation_changed',
-  'engine_insert_failed',
-  'join_failed',
-  'internal',
-  'unknown',
-];
+// Derived from the source COPY table (which is a `Record<RedeemInviteErrorCode,
+// …>`, so the compiler forces it to cover the whole union) — the exhaustiveness
+// check below can never silently skip a newly added code.
+const ALL_CODES: readonly RedeemInviteErrorCode[] = REDEEM_INVITE_ERROR_CODES;
 
 describe('mapRedeemInviteError', () => {
   it('maps a known code to its copy and preserves the raw message', () => {

@@ -3117,7 +3117,13 @@ async fn redeem_invite_only_rolls_back_owner_state_on_fence_failure() {
         None,
         Arc::clone(&fx.dm_outbox),
         fx.channel_log_registry,
-        || Err("simulated node-stopped fence rejection".to_string()),
+        || {
+            // ZEB-885: fence closures return a typed RedeemInviteError.
+            Err(harmony_app::community_invite::RedeemInviteError::new(
+                harmony_app::community_invite::RedeemInviteErrorCode::GenerationChanged,
+                "simulated node-stopped fence rejection",
+            ))
+        },
         None, // identity_dir
         harmony_app::RedeemInviteOverrides {
             redeem_timeout: Some(std::time::Duration::from_secs(2)),

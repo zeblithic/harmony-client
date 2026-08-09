@@ -288,13 +288,39 @@ describe('RedeemInviteDialog', () => {
     expect(queryByTestId('fallback-lan-btn')).toBeNull();
   });
 
-  it('shows fallback button and code-sourced copy on a structured IPC rejection', async () => {
-    // ZEB-885: the iroh command rejects with a structured { code, message };
-    // the hard-error catch routes its copy through the shared code table
-    // instead of dumping the raw backend message.
+  it('suppresses the LAN fallback for a non-recoverable structured rejection, showing summary + hint', async () => {
+    // ZEB-885: `internal` is a local/internal failure — the Reticulum LAN
+    // fallback reruns the same machinery and can't recover it, so the button is
+    // suppressed. The banner carries the actionable hint, not just the summary.
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'connectivity_redeem_invite_iroh') {
-        return Promise.reject({ code: 'internal', message: 'network error' });
+        return Promise.reject({ code: 'internal', message: 'boom' });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { getByTestId, queryByTestId, getByPlaceholderText } = render(RedeemInviteDialog, {
+      props: { onSubmit: vi.fn(), onCancel: vi.fn() },
+    });
+
+    const input = getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: 'harmony://invite/v1?ci=x' } });
+    await fireEvent.click(getByTestId('iroh-redeem-btn'));
+
+    await waitFor(() => {
+      const banner = getByTestId('iroh-error-banner');
+      expect(banner.textContent).toContain('Something went wrong redeeming the invite');
+      expect(banner.textContent).toContain('bug on our side'); // the hint reaches the user
+    });
+    expect(queryByTestId('fallback-lan-btn')).toBeNull();
+  });
+
+  it('offers the LAN fallback for a network-recoverable structured rejection', async () => {
+    // A reachability failure the LAN path could plausibly resolve → keep the
+    // fallback button.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_redeem_invite_iroh') {
+        return Promise.reject({ code: 'inviter_unreachable', message: 'pkarr timeout' });
       }
       return Promise.resolve(null);
     });
@@ -309,9 +335,7 @@ describe('RedeemInviteDialog', () => {
 
     await waitFor(() => {
       expect(getByTestId('fallback-lan-btn')).toBeTruthy();
-      expect(getByTestId('iroh-error-banner').textContent).toContain(
-        'Something went wrong redeeming the invite',
-      );
+      expect(getByTestId('iroh-error-banner').textContent).toContain('Inviter is offline');
     });
   });
 

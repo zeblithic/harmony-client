@@ -131,6 +131,18 @@
     previewSeq += 1; // discard any in-flight preview resolution
   });
 
+  // ZEB-885: codes for which the Reticulum LAN fallback could actually help.
+  // Local/internal failures (engine_insert_failed, node_not_ready,
+  // generation_changed, internal, join_failed, and invite-defect codes) rerun
+  // the same machinery / carry the same bad invite, so offering the fallback
+  // there is misleading — suppress it.
+  const IROH_LAN_RECOVERABLE_CODES = new Set([
+    'inviter_unreachable',
+    'relays_warming_up',
+    'missing_admin_identity_pub',
+    'unknown',
+  ]);
+
   async function handleIrohRedeem() {
     const trimmed = url.trim();
     if (!trimmed.startsWith('harmony://invite/') || irohPending || pending || previewExpired)
@@ -208,11 +220,14 @@
       }
     } catch (e) {
       irohStage = null;
-      // ZEB-885: the iroh command rejects with a structured { code, message };
-      // route its copy through the shared code table instead of dumping the
-      // raw backend message.
-      irohError = redeemInviteCopy(toRedeemInviteError(e).code).summary;
-      showFallbackButton = true;
+      // ZEB-885: the iroh command rejects with a structured { code, message }.
+      // Route copy through the shared table (summary + actionable hint) instead
+      // of dumping the raw backend message, and only offer the LAN fallback when
+      // it could actually help (see IROH_LAN_RECOVERABLE_CODES).
+      const err = toRedeemInviteError(e);
+      const copy = redeemInviteCopy(err.code);
+      irohError = copy.hint ? `${copy.summary} ${copy.hint}` : copy.summary;
+      showFallbackButton = IROH_LAN_RECOVERABLE_CODES.has(err.code);
     } finally {
       // The `joined` branch defers `irohPending = false` to the dismiss
       // timer so the "Joined ✓" label stays visible across the display

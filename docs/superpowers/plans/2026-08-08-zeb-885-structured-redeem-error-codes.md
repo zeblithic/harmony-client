@@ -92,7 +92,7 @@
 
 ### Task 5: Full sweep + PR
 
-- [ ] **Step 1 — git-status clean check**, then full gates on the working tree: fmt, clippy `--all-targets`, `cargo nextest run --workspace --all-targets`, tsc, vitest. (Local gates run the working tree — commit everything first.)
+- [ ] **Step 1 — git-status clean check**, then full gates on the working tree: fmt, clippy `--all-targets`, `cargo nextest run --locked --workspace --all-targets`, tsc, vitest. (Local gates run the working tree — commit everything first.)
 - [ ] **Step 2 — Self-review the diff** for second-order issues: any error-precedence change? any `Ok`-status accidentally reworded? dead frontend patterns fully removed? `unknown` fallback reachable?
 - [ ] **Step 3 — Push branch, open PR** titled `ZEB-885: structured redeem-invite error codes (switch on code, not prose)`. Body: the reframe (latent bug), the two-path handling, the RPC-wire-unchanged decision, test summary. Attach to Linear.
 - [ ] **Step 4 — Fire `@coderabbitai review` once**; converge all bot buckets → one push per round; never auto-merge; pushover at ready.

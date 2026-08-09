@@ -37,7 +37,9 @@ One Rust enum, `#[derive(Serialize)] #[serde(rename_all = "snake_case")]`, seria
 | `bootstrap_signature_invalid` | `::BootstrapSignatureInvalid` | Signature invalid — regenerate via another channel |
 | `bootstrap_kind_invalid` | `::BootstrapKindInvalid` | Wrong event type — regenerate |
 | `invite_url_malformed` | `InviteUrlError` (all variants; `lib.rs:40428`) | URL isn't a valid Harmony invite |
-| `inviter_enrollment_invalid` | `CommunityInviteVerifyError` (`lib.rs:40438`) | Inviter's enrollment failed to verify |
+| `inviter_enrollment_invalid` | `CommunityInviteVerifyError::InviterEnrollmentCert*` (`lib.rs:40438`) | Inviter's **enrollment cert** didn't check out |
+| `invite_expired` | `CommunityInviteVerifyError::Expired` | Invite expired — get a fresh link |
+| `invite_verify_failed` | `CommunityInviteVerifyError` (all other variants) | Invite failed verification (sig/hint/community mismatch, etc.) |
 | `invite_token_missing` | `lib.rs:40776` | Invite-only payload missing token |
 | `missing_admin_identity_pub` | iroh status | Open invite; no admin binding |
 | `inviter_unreachable` | iroh status; pkarr/dial/handshake fail | Inviter offline — retry later |
@@ -57,7 +59,7 @@ One Rust enum, `#[derive(Serialize)] #[serde(rename_all = "snake_case")]`, seria
    ```rust
    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
    #[serde(rename_all = "snake_case")]
-   pub enum RedeemInviteErrorCode { /* the 17 variants above */ }
+   pub enum RedeemInviteErrorCode { /* the variants in the taxonomy table above */ }
 
    #[derive(Debug, Clone, serde::Serialize)]
    pub struct RedeemInviteError { pub code: RedeemInviteErrorCode, pub message: String }
@@ -65,7 +67,7 @@ One Rust enum, `#[derive(Serialize)] #[serde(rename_all = "snake_case")]`, seria
    - `impl std::fmt::Display for RedeemInviteError` → writes `message` (so existing `format!("{e}")`/logging stays readable).
    - `impl std::error::Error`.
    - `RedeemInviteError::new(code, impl Into<String>)` + convenience constructors.
-   - `From<RedeemBootstrapVerifyError>` (match → code, `message = err.to_string()`), `From<InviteUrlError>` (→ `invite_url_malformed`), `From<CommunityInviteVerifyError>` (→ `inviter_enrollment_invalid`).
+   - `From<RedeemBootstrapVerifyError>` (match → code, `message = err.to_string()`), `From<InviteUrlError>` (→ `invite_url_malformed`), `From<CommunityInviteVerifyError>` (**per-variant** match: `Expired` → `invite_expired`, `InviterEnrollmentCert*` → `inviter_enrollment_invalid`, else → `invite_verify_failed` — NOT a blanket enrollment mapping).
    - A `From<String>`/`From<&str>` → `{ code: internal, message }` catch-all so ad-hoc `?` sites still compile; sites that deserve a *specific* code get an explicit constructor instead of relying on the catch-all.
 
 2. **LAN seam** — change `redeem_invite_inner_with_overrides` (and `redeem_invite_inner`, `redeem_invite_impl`, `redeem_invite`) return type `String → RedeemInviteError`. Each error site assigns a code (bootstrap/url/enrollment via `?`+`From`; snapshot guards → `node_not_ready`; generation fence → `generation_changed`; engine insert → `engine_insert_failed`; oneshot closed / poisoned → `internal`).

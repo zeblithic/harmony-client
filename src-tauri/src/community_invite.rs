@@ -1508,6 +1508,8 @@ pub enum RedeemInviteErrorCode {
     BootstrapKindInvalid,
     InviteUrlMalformed,
     InviterEnrollmentInvalid,
+    InviteExpired,
+    InviteVerifyFailed,
     InviteTokenMissing,
     MissingAdminIdentityPub,
     // ── Reachability / transient — retry. ──
@@ -1537,6 +1539,8 @@ impl RedeemInviteErrorCode {
             Self::BootstrapKindInvalid => "bootstrap_kind_invalid",
             Self::InviteUrlMalformed => "invite_url_malformed",
             Self::InviterEnrollmentInvalid => "inviter_enrollment_invalid",
+            Self::InviteExpired => "invite_expired",
+            Self::InviteVerifyFailed => "invite_verify_failed",
             Self::InviteTokenMissing => "invite_token_missing",
             Self::MissingAdminIdentityPub => "missing_admin_identity_pub",
             Self::InviterUnreachable => "inviter_unreachable",
@@ -1613,10 +1617,21 @@ impl From<InviteUrlError> for RedeemInviteError {
 
 impl From<CommunityInviteVerifyError> for RedeemInviteError {
     fn from(e: CommunityInviteVerifyError) -> Self {
-        Self::new(
-            RedeemInviteErrorCode::InviterEnrollmentInvalid,
-            e.to_string(),
-        )
+        // ZEB-885: `CommunityInviteVerifyError` spans far more than enrollment —
+        // expiry, token/signature failures, hint/community mismatch, etc. Map by
+        // variant so the frontend gives the right remediation instead of blanket
+        // "enrollment invalid". Enrollment-cert variants keep the specific code;
+        // expiry gets its own (actionable: get a fresh link); everything else is
+        // the honest generic `invite_verify_failed` (the message carries detail).
+        let code = match e {
+            CommunityInviteVerifyError::Expired => RedeemInviteErrorCode::InviteExpired,
+            CommunityInviteVerifyError::InviterEnrollmentCertInvalid
+            | CommunityInviteVerifyError::InviterEnrollmentOwnerMismatch => {
+                RedeemInviteErrorCode::InviterEnrollmentInvalid
+            }
+            _ => RedeemInviteErrorCode::InviteVerifyFailed,
+        };
+        Self::new(code, e.to_string())
     }
 }
 
@@ -1642,7 +1657,7 @@ impl From<&str> for RedeemInviteError {
 mod redeem_invite_error_code_tests {
     use super::*;
 
-    const ALL_CODES: [RedeemInviteErrorCode; 17] = [
+    const ALL_CODES: [RedeemInviteErrorCode; 19] = [
         RedeemInviteErrorCode::BootstrapMissing,
         RedeemInviteErrorCode::BootstrapActorMismatch,
         RedeemInviteErrorCode::BootstrapCommunityMismatch,
@@ -1650,6 +1665,8 @@ mod redeem_invite_error_code_tests {
         RedeemInviteErrorCode::BootstrapKindInvalid,
         RedeemInviteErrorCode::InviteUrlMalformed,
         RedeemInviteErrorCode::InviterEnrollmentInvalid,
+        RedeemInviteErrorCode::InviteExpired,
+        RedeemInviteErrorCode::InviteVerifyFailed,
         RedeemInviteErrorCode::InviteTokenMissing,
         RedeemInviteErrorCode::MissingAdminIdentityPub,
         RedeemInviteErrorCode::InviterUnreachable,
@@ -1731,6 +1748,27 @@ mod redeem_invite_error_code_tests {
         let ad_hoc: RedeemInviteError = "some internal failure".to_string().into();
         assert_eq!(ad_hoc.code, RedeemInviteErrorCode::Internal);
         assert_eq!(ad_hoc.message, "some internal failure");
+    }
+
+    #[test]
+    fn community_verify_error_maps_per_variant_not_blanket_enrollment() {
+        // ZEB-885: CommunityInviteVerifyError is NOT all "enrollment invalid".
+        let expired: RedeemInviteError = CommunityInviteVerifyError::Expired.into();
+        assert_eq!(expired.code, RedeemInviteErrorCode::InviteExpired);
+
+        let enrollment: RedeemInviteError =
+            CommunityInviteVerifyError::InviterEnrollmentCertInvalid.into();
+        assert_eq!(
+            enrollment.code,
+            RedeemInviteErrorCode::InviterEnrollmentInvalid
+        );
+
+        // A non-enrollment, non-expiry verify failure → the honest generic code,
+        // NOT inviter_enrollment_invalid.
+        let sig: RedeemInviteError = CommunityInviteVerifyError::InviteTokenSigInvalid.into();
+        assert_eq!(sig.code, RedeemInviteErrorCode::InviteVerifyFailed);
+        let hint: RedeemInviteError = CommunityInviteVerifyError::InviteeHintMismatch.into();
+        assert_eq!(hint.code, RedeemInviteErrorCode::InviteVerifyFailed);
     }
 
     #[test]

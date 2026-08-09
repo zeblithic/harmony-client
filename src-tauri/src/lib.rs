@@ -40351,7 +40351,7 @@ pub async fn redeem_invite_inner<F>(
     identity_dir: Option<std::path::PathBuf>,
 ) -> Result<RedeemInviteResultDto, RedeemInviteError>
 where
-    F: Fn() -> Result<(), String>,
+    F: Fn() -> Result<(), RedeemInviteError>,
 {
     redeem_invite_inner_with_overrides(
         url,
@@ -40424,7 +40424,7 @@ pub async fn redeem_invite_inner_with_overrides<F>(
     overrides: RedeemInviteOverrides,
 ) -> Result<RedeemInviteResultDto, RedeemInviteError>
 where
-    F: Fn() -> Result<(), String>,
+    F: Fn() -> Result<(), RedeemInviteError>,
 {
     // 1. Decode URL.
     let payload = crate::community_invite::decode_invite_url(&url).map_err(|e| {
@@ -41221,10 +41221,10 @@ where
     //    raced our await chain), this returns Err with crdt_state
     //    still untouched.
     // ZEB-274: rollback on Err collapses into community_sync_guard Drop.
-    // ZEB-885: the fence closure returns a String; a tripped generation guard
-    // (node stopped / stop+restart raced) is a generation_changed condition.
-    fence_check()
-        .map_err(|e| RedeemInviteError::new(RedeemInviteErrorCode::GenerationChanged, e))?;
+    // ZEB-885: the fence closure returns a typed RedeemInviteError so it can
+    // distinguish a poisoned lock (internal) from a true generation/teardown
+    // trip (generation_changed); the inner just propagates it.
+    fence_check()?;
 
     // ZEB-254 R5-2: FINAL TOCTOU recheck before commit. The R3 (C2)
     // recheck above narrows but does not close the window between the
@@ -41660,24 +41660,32 @@ pub(crate) async fn redeem_invite_impl(
     // FnOnce) so the inner helper retains the option of re-checking on
     // retries. The closure borrows `state` through this fn's lifetime,
     // which the awaited inner future is bounded by.
-    let fence_check = move || -> Result<(), String> {
-        let g = state
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+    let fence_check = move || -> Result<(), RedeemInviteError> {
+        // ZEB-885: a poisoned lock is an internal error, NOT a generation trip.
+        let g = state.lock().map_err(|e| {
+            RedeemInviteError::new(
+                RedeemInviteErrorCode::Internal,
+                format!("NodeState poisoned: {e}"),
+            )
+        })?;
         if g.generation != snapshot_generation {
-            return Err(format!(
-                "node generation changed during redeem_invite (was {}, now {}); \
-                 redemption minted on a detached crdt_state and won't be persisted — \
-                 engine spawn suppressed",
-                snapshot_generation, g.generation
+            return Err(RedeemInviteError::new(
+                RedeemInviteErrorCode::GenerationChanged,
+                format!(
+                    "node generation changed during redeem_invite (was {}, now {}); \
+                     redemption minted on a detached crdt_state and won't be persisted — \
+                     engine spawn suppressed",
+                    snapshot_generation, g.generation
+                ),
             ));
         }
         if g.community_registry.is_none() {
-            return Err(
+            return Err(RedeemInviteError::new(
+                RedeemInviteErrorCode::GenerationChanged,
                 "community_registry was torn down during redeem_invite — engine spawn \
                  suppressed"
                     .to_string(),
-            );
+            ));
         }
         Ok(())
     };
@@ -41830,7 +41838,7 @@ async fn join_open_community_inner<F>(
     fence_check: F,
 ) -> Result<RedeemInviteResultDto, String>
 where
-    F: Fn() -> Result<(), String>,
+    F: Fn() -> Result<(), RedeemInviteError>,
 {
     let invite_url = crate::library_directory::find_open_community_invite_url_in_snapshot(
         snapshot,
@@ -41951,24 +41959,31 @@ pub(crate) async fn join_open_community_impl(
         )
     };
 
-    let fence_check = move || -> Result<(), String> {
-        let g = state
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+    let fence_check = move || -> Result<(), RedeemInviteError> {
+        let g = state.lock().map_err(|e| {
+            RedeemInviteError::new(
+                RedeemInviteErrorCode::Internal,
+                format!("NodeState poisoned: {e}"),
+            )
+        })?;
         if g.generation != snapshot_generation {
-            return Err(format!(
-                "node generation changed during join_open_community (was {}, now {}); \
-                 join minted on a detached crdt_state and won't be persisted — \
-                 engine spawn suppressed",
-                snapshot_generation, g.generation
+            return Err(RedeemInviteError::new(
+                RedeemInviteErrorCode::GenerationChanged,
+                format!(
+                    "node generation changed during join_open_community (was {}, now {}); \
+                     join minted on a detached crdt_state and won't be persisted — \
+                     engine spawn suppressed",
+                    snapshot_generation, g.generation
+                ),
             ));
         }
         if g.community_registry.is_none() {
-            return Err(
+            return Err(RedeemInviteError::new(
+                RedeemInviteErrorCode::GenerationChanged,
                 "community_registry was torn down during join_open_community — engine \
                  spawn suppressed"
                     .to_string(),
-            );
+            ));
         }
         Ok(())
     };
@@ -43311,7 +43326,10 @@ mod zeb436_orphan_adoption_tests {
                 if fence_ok {
                     Ok(())
                 } else {
-                    Err("node stopped (test fence)".to_string())
+                    Err(super::RedeemInviteError::new(
+                        super::RedeemInviteErrorCode::GenerationChanged,
+                        "node stopped (test fence)",
+                    ))
                 }
             },
             None,
@@ -61456,28 +61474,36 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
         g.generation
     };
-    let fence_check = move || -> Result<(), String> {
+    let fence_check = move || -> Result<(), RedeemInviteError> {
         // ZEB-447: capture `&Mutex<NodeState>` directly (the GUI wrapper
         // cloned the `tauri::State` smart pointer; here `state` is the
         // borrowed mutex, valid for the whole `_impl` future which awaits
         // the inner). Same generation + registry fence as before.
-        let g = state
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+        // ZEB-885: poisoned lock is internal, not a generation trip.
+        let g = state.lock().map_err(|e| {
+            RedeemInviteError::new(
+                RedeemInviteErrorCode::Internal,
+                format!("NodeState poisoned: {e}"),
+            )
+        })?;
         if g.generation != snapshot_generation_for_fence {
-            return Err(format!(
-                "node generation changed during connectivity_redeem_invite_iroh \
-                 (was {}, now {}); redemption minted on a detached crdt_state and \
-                 won't be persisted — engine spawn suppressed",
-                snapshot_generation_for_fence, g.generation
+            return Err(RedeemInviteError::new(
+                RedeemInviteErrorCode::GenerationChanged,
+                format!(
+                    "node generation changed during connectivity_redeem_invite_iroh \
+                     (was {}, now {}); redemption minted on a detached crdt_state and \
+                     won't be persisted — engine spawn suppressed",
+                    snapshot_generation_for_fence, g.generation
+                ),
             ));
         }
         if g.community_registry.is_none() {
-            return Err(
+            return Err(RedeemInviteError::new(
+                RedeemInviteErrorCode::GenerationChanged,
                 "community_registry was torn down during connectivity_redeem_invite_iroh \
                  — engine spawn suppressed"
                     .to_string(),
-            );
+            ));
         }
         Ok(())
     };
@@ -61678,24 +61704,31 @@ pub(crate) async fn connectivity_open_join_iroh_impl(
     // Generation fence (mirrors `redeem_invite` / the iroh invite redeem): the
     // commit is suppressed if the node was stopped (or stop+restart raced) mid
     // first-contact.
-    let fence_check = move || -> Result<(), String> {
-        let g = state
-            .lock()
-            .map_err(|e| format!("NodeState poisoned: {e}"))?;
+    let fence_check = move || -> Result<(), RedeemInviteError> {
+        let g = state.lock().map_err(|e| {
+            RedeemInviteError::new(
+                RedeemInviteErrorCode::Internal,
+                format!("NodeState poisoned: {e}"),
+            )
+        })?;
         if g.generation != snapshot_generation {
-            return Err(format!(
-                "node generation changed during connectivity_open_join_iroh \
-                 (was {}, now {}); join minted on a detached crdt_state and won't \
-                 be persisted — engine spawn suppressed",
-                snapshot_generation, g.generation
+            return Err(RedeemInviteError::new(
+                RedeemInviteErrorCode::GenerationChanged,
+                format!(
+                    "node generation changed during connectivity_open_join_iroh \
+                     (was {}, now {}); join minted on a detached crdt_state and won't \
+                     be persisted — engine spawn suppressed",
+                    snapshot_generation, g.generation
+                ),
             ));
         }
         if g.community_registry.is_none() {
-            return Err(
+            return Err(RedeemInviteError::new(
+                RedeemInviteErrorCode::GenerationChanged,
                 "community_registry was torn down during connectivity_open_join_iroh \
                  — engine spawn suppressed"
                     .to_string(),
-            );
+            ));
         }
         Ok(())
     };
@@ -62163,7 +62196,7 @@ pub async fn connectivity_redeem_invite_iroh_inner<F>(
     fence_check: F,
 ) -> Result<RedemptionOutcome, RedeemInviteError>
 where
-    F: Fn() -> Result<(), String>,
+    F: Fn() -> Result<(), RedeemInviteError>,
 {
     // 1. Decode the invite URL.
     let payload = crate::community_invite::decode_invite_url(&invite_url)

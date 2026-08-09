@@ -13,6 +13,8 @@ export type RedeemInviteErrorCode =
   | 'bootstrap_kind_invalid'
   | 'invite_url_malformed'
   | 'inviter_enrollment_invalid'
+  | 'invite_expired'
+  | 'invite_verify_failed'
   | 'invite_token_missing'
   | 'missing_admin_identity_pub'
   | 'inviter_unreachable'
@@ -27,16 +29,21 @@ export type RedeemInviteErrorCode =
 /**
  * Structured error emitted by the redeem IPC commands. Tauri serializes the
  * Rust `RedeemInviteError` to this exact shape in the command rejection.
+ *
+ * `code` is typed as the known union *plus* an open `string` so a code the
+ * frontend hasn't learned yet (newer backend) is carried through unchanged for
+ * display/bug-reports without an unsound cast — `redeemInviteCopy` falls back
+ * to `unknown` for anything it doesn't recognize.
  */
 export interface RedeemInviteError {
-  code: RedeemInviteErrorCode;
+  code: RedeemInviteErrorCode | (string & {});
   message: string;
 }
 
 export interface RedeemInviteUserError {
   summary: string;
   hint: string;
-  code: RedeemInviteErrorCode;
+  code: RedeemInviteErrorCode | (string & {});
   raw: string;
 }
 
@@ -72,7 +79,15 @@ const COPY: Record<RedeemInviteErrorCode, RedeemInviteCopy> = {
   },
   inviter_enrollment_invalid: {
     summary: "Couldn't verify the inviter.",
-    hint: "Their enrollment or the invite signature didn't check out. Ask them to regenerate the link.",
+    hint: "Their enrollment cert didn't check out. Ask them to regenerate the link.",
+  },
+  invite_expired: {
+    summary: 'This invite has expired.',
+    hint: 'Ask the inviter for a fresh link.',
+  },
+  invite_verify_failed: {
+    summary: "Couldn't verify this invite.",
+    hint: 'The invite failed verification — ask the inviter to regenerate it.',
   },
   invite_token_missing: {
     summary: 'Invite link is incomplete.',
@@ -119,12 +134,21 @@ const COPY: Record<RedeemInviteErrorCode, RedeemInviteCopy> = {
   },
 };
 
+/** Every known code — derived from `COPY` so it can never drift from it. */
+export const REDEEM_INVITE_ERROR_CODES = Object.keys(COPY) as RedeemInviteErrorCode[];
+
 /**
  * User-facing copy for a code, falling back to `unknown` for any code the
  * frontend hasn't learned yet (forward-compat with a newer backend).
+ *
+ * Uses `Object.hasOwn` rather than a bare index/`in` so an inherited
+ * `Object.prototype` key (`'constructor'`, `'toString'`, …) arriving as a code
+ * can't return a truthy non-copy value and blank the banner.
  */
 export function redeemInviteCopy(code: string): RedeemInviteCopy {
-  return COPY[code as RedeemInviteErrorCode] ?? COPY.unknown;
+  return Object.hasOwn(COPY, code)
+    ? COPY[code as RedeemInviteErrorCode]
+    : COPY.unknown;
 }
 
 /**
@@ -138,7 +162,7 @@ export function toRedeemInviteError(e: unknown): RedeemInviteError {
   if (e && typeof e === 'object' && 'code' in e && typeof (e as { code: unknown }).code === 'string') {
     const obj = e as { code: string; message?: unknown };
     return {
-      code: obj.code as RedeemInviteErrorCode,
+      code: obj.code,
       message: typeof obj.message === 'string' ? obj.message : String(e),
     };
   }
