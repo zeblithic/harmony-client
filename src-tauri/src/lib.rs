@@ -40443,15 +40443,14 @@ where
 
     // ZEB-497: fail fast — verify the inviter's enrollment cert + token sig
     // before reserving an HLC, minting the local bootstrap Join, or any network.
-    crate::community_invite::verify_inviter_enrollment(&payload, wall_now_ms / 1000).map_err(
-        |e| {
-            // ZEB-885: CommunityInviteVerifyError → inviter_enrollment_invalid.
-            RedeemInviteError::new(
-                RedeemInviteErrorCode::InviterEnrollmentInvalid,
-                format!("verify inviter enrollment: {e}"),
-            )
-        },
-    )?;
+    // ZEB-892 (C2): map per-variant via `From<CommunityInviteVerifyError>` — a
+    // forged/tampered token (`InviteTokenSigInvalid`) or an expired invite must
+    // NOT be mislabeled "enrollment cert didn't check out". #641 intended this
+    // but hardcoded `InviterEnrollmentInvalid` here, leaving the per-variant
+    // `From` dead in production (Expired → invite_expired, EnrollmentCert* →
+    // inviter_enrollment_invalid, else → invite_verify_failed).
+    crate::community_invite::verify_inviter_enrollment(&payload, wall_now_ms / 1000)
+        .map_err(RedeemInviteError::from)?;
 
     // 4. ZEB-267: atomic HLC reservation. Replaces the
     //    snapshot-then-release pattern + post-commit advance.
@@ -43937,6 +43936,57 @@ mod zeb436_orphan_adoption_tests {
         assert_eq!(
             events_after, 2,
             "adoption must not mint a PendingJoin on top of the two persisted events"
+        );
+    }
+
+    /// ZEB-892 (C3): a malformed invite URL on the iroh wrapper (the primary
+    /// Redeem button the UI drives) must surface `invite_url_malformed` — the
+    /// typed code that tells the user to check their paste — NOT `internal`,
+    /// which #641's iroh inner produced via `format!` → `From<String>` (and
+    /// which, per C1, also suppresses the LAN fallback). Decode is step 1, so
+    /// the connectivity/engine params are never reached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iroh_wrapper_malformed_url_maps_to_invite_url_malformed() {
+        let rig = build_invite_only_orphan_rig(SpaceId([0xf7; 16]), None).await;
+
+        let err = super::connectivity_redeem_invite_iroh_inner(
+            "harmony://invite/@@@not-a-valid-payload@@@".to_string(),
+            None, // pkarr_resolver — never reached (decode fails first)
+            None, // reachability_resolver
+            None, // iroh_endpoint
+            std::sync::Arc::clone(&rig.crdt_state),
+            std::sync::Arc::clone(&rig.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            "joiner-dev".to_string(),
+            rig.joiner_self_owner,
+            std::sync::Arc::clone(&rig.signing_key),
+            rig.joiner_cert.clone(),
+            std::sync::Arc::clone(&rig.community_registry),
+            rig.community_adapter_tx.clone(),
+            None, // transport-epoch watch
+            std::sync::Arc::clone(&rig.dm_outbox),
+            std::sync::Arc::clone(&rig.channel_log_registry),
+            None, // sync_engine
+            Some(rig.identity_dir.clone()),
+            |_progress| {},
+            |_nav| {},
+            super::HandshakeDialConfig {
+                connect_timeout: std::time::Duration::from_millis(50),
+                open_bi_timeout: std::time::Duration::from_millis(50),
+                response_read_timeout: std::time::Duration::from_millis(50),
+                write_timeout: std::time::Duration::from_millis(50),
+            },
+            || Ok(()),
+        )
+        .await
+        .expect_err("a malformed invite URL must Err, not Ok");
+
+        assert_eq!(
+            err.code,
+            crate::community_invite::RedeemInviteErrorCode::InviteUrlMalformed,
+            "malformed URL on the iroh path must be invite_url_malformed, not \
+             internal; got {:?}",
+            err.code
         );
     }
 
@@ -62199,8 +62249,18 @@ where
     F: Fn() -> Result<(), RedeemInviteError>,
 {
     // 1. Decode the invite URL.
-    let payload = crate::community_invite::decode_invite_url(&invite_url)
-        .map_err(|e| format!("decode invite URL: {e}"))?;
+    let payload = crate::community_invite::decode_invite_url(&invite_url).map_err(|e| {
+        // ZEB-892 (C3): InviteUrlError → invite_url_malformed, matching the LAN
+        // sibling in `redeem_invite_inner_with_overrides`. A truncated paste on
+        // the primary (iroh) Redeem button must say "check you copied the full
+        // URL", not "bug on our side" — the latter is what `format!` →
+        // `From<String>` → `internal` produced (and `internal` also suppressed
+        // the LAN fallback, per C1's mechanism).
+        RedeemInviteError::new(
+            RedeemInviteErrorCode::InviteUrlMalformed,
+            format!("decode invite URL: {e}"),
+        )
+    })?;
 
     let invite_id = payload
         .invite_token
@@ -62393,7 +62453,12 @@ where
     let rec = resolver
         .resolve_window_freshest_with(&verifying_keys, &verify)
         .await
-        .map_err(|e| format!("pkarr resolve: {e}"))?;
+        // ZEB-892 (C1): a resolver `Err` is a transport-level pkarr failure
+        // (all relays errored) — recoverable via the LAN fallback. Route it
+        // through the typed `From<PkarrError>` → `relays_warming_up` instead of
+        // letting `format!` fall through `From<String>` → `internal`, which
+        // suppressed the "Try via local network" button offline.
+        .map_err(RedeemInviteError::from)?;
     let Some(rec) = rec else {
         return Ok(RedemptionOutcome {
             status: "inviter_unreachable".to_string(),

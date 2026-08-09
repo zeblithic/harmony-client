@@ -1653,6 +1653,27 @@ impl From<&str> for RedeemInviteError {
     }
 }
 
+/// ZEB-892 (C1): the redeem path's pkarr *resolve* step only ever surfaces a
+/// transport-level failure as `Err`. Per `harmony-pkarr`'s
+/// `resolve_window_freshest_with`, record-validation failures and
+/// confirmed-absence both return `Ok(None)`; `Err` is returned *only* when
+/// every epoch-window key errored at the relay layer (no relays reachable, all
+/// on cooldown, HTTP error, malformed relay response). Every such condition is
+/// a transient network problem the joiner can route around via the LAN
+/// fallback, so it maps to [`RedeemInviteErrorCode::RelaysWarmingUp`] — a
+/// member of the frontend's `IROH_LAN_RECOVERABLE_CODES` set — NOT `internal`
+/// (which would suppress the "Try via local network" button on exactly the
+/// offline/LAN-only redeem the fallback exists for). This also restores the
+/// ZEB-879a "network still warming up" hint that #641 dropped when it replaced
+/// the prose-matching regex, and gives `RelaysWarmingUp` its only producer (a
+/// permanently-dead variant would be the drift signal — pinned by the unit
+/// test below).
+impl From<harmony_pkarr::PkarrError> for RedeemInviteError {
+    fn from(e: harmony_pkarr::PkarrError) -> Self {
+        Self::new(RedeemInviteErrorCode::RelaysWarmingUp, e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod redeem_invite_error_code_tests {
     use super::*;
@@ -1769,6 +1790,28 @@ mod redeem_invite_error_code_tests {
         assert_eq!(sig.code, RedeemInviteErrorCode::InviteVerifyFailed);
         let hint: RedeemInviteError = CommunityInviteVerifyError::InviteeHintMismatch.into();
         assert_eq!(hint.code, RedeemInviteErrorCode::InviteVerifyFailed);
+    }
+
+    #[test]
+    fn pkarr_resolve_error_maps_to_relays_warming_up_not_internal() {
+        // ZEB-892 (C1): a transport-level pkarr resolve failure is recoverable
+        // via the LAN fallback, so it must map to `relays_warming_up` (a member
+        // of the frontend's IROH_LAN_RECOVERABLE_CODES set), NOT `internal`
+        // (which suppresses the "Try via local network" button). This is also
+        // `RelaysWarmingUp`'s only producer — if this breaks, the variant has
+        // gone dead again (the drift signal HunterC flagged).
+        for e in [
+            harmony_pkarr::PkarrError::NoRelaysAvailable,
+            harmony_pkarr::PkarrError::RelayHttpError(503),
+            harmony_pkarr::PkarrError::RelayResponseInvalid,
+        ] {
+            let mapped: RedeemInviteError = e.into();
+            assert_eq!(
+                mapped.code,
+                RedeemInviteErrorCode::RelaysWarmingUp,
+                "a pkarr transport error must be relays_warming_up, not internal"
+            );
+        }
     }
 
     #[test]
