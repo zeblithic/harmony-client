@@ -2109,3 +2109,371 @@ async fn invite_not_burned_when_handshake_fails_after_insert() {
     .await
     .expect("invite_not_burned_when_handshake_fails_after_insert timed out at 60s");
 }
+
+/// ZEB-889 test helper: build the targeted invite-only payload / URL / token_sig
+/// used by the mint-reuse tests (same shape as the negative test's inline copy).
+fn zeb889_build_targeted_invite(s: &TwoPartySetup) -> (CommunityInvitePayload, String, [u8; 64]) {
+    let token_minted_at = Hlc {
+        wall_ms: 100_500,
+        logical: 0,
+        device_id: "alice-dev".into(),
+    };
+    let invite_token_unsigned = InviteToken {
+        inviter: s.alice_addr,
+        invitee_hint: Some(s.bob_addr),
+        minted_at: token_minted_at.clone(),
+        expires_at: None,
+        sig: [0u8; 64],
+    };
+    let token_payload_bytes =
+        canonical_invite_token_bytes(&invite_token_unsigned).expect("canonical token bytes");
+    let token_sig: [u8; 64] = s.alice_comm_sk.sign(&token_payload_bytes).to_bytes();
+    let invite_token = InviteToken {
+        inviter: s.alice_addr,
+        invitee_hint: Some(s.bob_addr),
+        minted_at: token_minted_at,
+        expires_at: None,
+        sig: token_sig,
+    };
+    let bob_x25519_pub = {
+        let verifying_bytes = s.bob_comm_sk.verifying_key().to_bytes();
+        harmony_app::dm_signing::ed25519_pub_to_x25519(&verifying_bytes)
+            .expect("bob_comm ed25519→x25519")
+    };
+    let sealed_epoch_key = harmony_app::dm_signing::seal_to_owner(
+        &bob_x25519_pub,
+        s.alice_minted.membership_key.as_bytes(),
+    )
+    .expect("seal epoch key to bob");
+    let invite_payload = CommunityInvitePayload {
+        inviter_signer_certs: Vec::new(),
+        community_id: s.community_id,
+        epoch_snapshot: InviteEpochSnapshot {
+            epoch: 0,
+            sealed_epoch_key: Vec::new(),
+            sealed_epoch_keys: vec![sealed_epoch_key],
+            state_snapshot: MaterializedCommunityState::default(),
+        },
+        admin_addr: s.alice_addr,
+        community_name: "OptionAHandshakeCommunity".into(),
+        is_invite_only: true,
+        expires_at: None,
+        invite_token: Some(invite_token),
+        admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
+        admin_identity_pub: Some(s.alice_pub),
+        forked_from: None,
+        pre_fork_snapshot: None,
+        inviter_enrollment: Some(s.alice_comm.cert.clone()),
+        untargeted_decrypt_key: None,
+    };
+    let invite_url = community_invite::encode_invite_url(&invite_payload).expect("encode invite");
+    (invite_payload, invite_url, token_sig)
+}
+
+/// ZEB-889: the PRODUCTION first attempt caches its minted redemption, so a
+/// later retry has something to reuse. Drives `connectivity_redeem_invite_iroh_inner`
+/// with `poll_deadline = 0` (the acceptor CountersignTimeouts before delivering,
+/// so the redeem does NOT join) and asserts the mint was stored — the wiring the
+/// seeded retry test relies on but does not itself exercise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zeb889_first_attempt_caches_minted_redemption() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        // poll_deadline = 0 → the acceptor CountersignTimeouts before writing the
+        // countersign, so the redeem fails delivery (does NOT join). The mint is
+        // stored at the mint site BEFORE the dial, so it must be cached regardless.
+        let s = setup_two_party_iroh_handshake_with_config(
+            harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
+                io_deadline: Duration::from_millis(10_000),
+                poll_deadline: Duration::ZERO,
+                poll_interval: Duration::from_millis(20),
+            },
+        )
+        .await;
+
+        let (invite_payload, invite_url, token_sig) = zeb889_build_targeted_invite(&s);
+        // Greptile #644: the cache is keyed by a digest of the whole payload,
+        // not token.sig — mirror the production key here.
+        let cache_key = invite_payload
+            .redemption_mint_cache_key()
+            .expect("payload cache key");
+        s.invite_pub.register_invite(&invite_payload).await;
+        let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+
+        // Real wall-clock now — production reads the cache with SystemTime::now()
+        // and the cache TTL-purges stale entries.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Precondition: nothing cached yet.
+        assert!(
+            s.registry_bob
+                .get_redemption_mint(cache_key, now_ms)
+                .await
+                .is_none(),
+            "precondition: Bob has no cached mint before the first attempt"
+        );
+
+        let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
+            invite_url,
+            Some(Arc::clone(&s.pkarr_resolver)),
+            Some(s.bob_reachability.clone()),
+            Some(Arc::clone(&s.bob_ep)),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            s.bob_adopt_floor.clone(),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            None,
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            None,
+            None,
+            |_| {},
+            |_p: harmony_app::NavUpdatedPayload| {},
+            harmony_app::HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(10_000),
+                open_bi_timeout: Duration::from_millis(10_000),
+                response_read_timeout: Duration::from_millis(10_000),
+                write_timeout: Duration::from_millis(10_000),
+            },
+            || Ok(()),
+        )
+        .await
+        .expect("connectivity_redeem_invite_iroh_inner must Ok (errors → non-joined status)");
+
+        assert_ne!(
+            outcome.status, "joined",
+            "the first attempt must NOT join when the acceptor CountersignTimeouts; \
+             got status={:?}",
+            outcome.status
+        );
+
+        // The load-bearing assertion: the production first attempt cached its mint,
+        // so a subsequent retry can reuse it (the recovery leg this PR enables).
+        assert!(
+            s.registry_bob
+                .get_redemption_mint(cache_key, now_ms)
+                .await
+                .is_some(),
+            "ZEB-889: the first attempt must cache its minted redemption for retry reuse"
+        );
+
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("zeb889_first_attempt_caches_minted_redemption timed out at 60s");
+}
+
+/// ZEB-889: a legitimate joiner whose first countersign delivery failed can
+/// retry and redeem the still-live invite. The retry reuses the cached mint
+/// (same bootstrap_join id) so the host's AlreadyKnown-retransmit path
+/// re-delivers the countersign — instead of minting a fresh id P6 rejects,
+/// which would leave a permanent unredeemable zombie invite.
+///
+/// The "first attempt landed host-side but its delivery failed" state is seeded
+/// deterministically (Alice's engine holds Bob's committed P1 + a genuine CS1,
+/// the invite is still registered, and Bob's registry cache holds P1's mint),
+/// so a single redeem exercises the retry leg under the default (nonzero)
+/// acceptor poll_deadline that delivers the already-present countersign.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let s = setup_two_party_iroh_handshake().await;
+
+        // Targeted invite-only URL (shared builder — same shape as the negative test).
+        let (invite_payload, invite_url, token_sig) = zeb889_build_targeted_invite(&s);
+        // Greptile #644: production keys the cache by a digest of the whole
+        // payload, not token.sig — seed/read the cache with the same key.
+        let cache_key = invite_payload
+            .redemption_mint_cache_key()
+            .expect("payload cache key");
+
+        // Register the case-A invite so active_handles carries it (burn target).
+        s.invite_pub.register_invite(&invite_payload).await;
+        let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+        let invite_handle = format!("invite:{}", hex::encode(token_sig));
+        assert!(
+            s.pkarr_publisher
+                .active_handles()
+                .await
+                .contains(&invite_handle),
+            "precondition: the case-A invite handle must be registered before the retry"
+        );
+
+        // --- Seed the "first attempt landed host-side, delivery failed" state. ---
+        // 1. Mint P1 for Bob exactly as connectivity_redeem_invite_iroh_inner
+        //    would, with a FIXED join_hlc so the seeded copy and Bob's reused
+        //    copy are byte-identical.
+        let join_hlc = Hlc {
+            wall_ms: 100_600,
+            logical: 0,
+            device_id: "bob-dev".into(),
+        };
+        let p1_mint = harmony_app::mint_redemption(
+            &invite_payload,
+            s.bob_addr,
+            s.bob_comm_sk.as_ref(),
+            &s.bob_comm.cert,
+            join_hlc,
+        )
+        .expect("mint P1 for bob");
+        let p1 = p1_mint.bootstrap_join.clone();
+
+        // 2. Seed Bob's registry cache with P1's mint (models the first attempt
+        //    having stored it before its delivery failed). Use real wall-clock
+        //    now — the production redeem reads the cache with SystemTime::now(),
+        //    and the cache TTL-purges entries older than the retry window.
+        let seed_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        s.registry_bob
+            .get_or_store_redemption_mint(cache_key, seed_now_ms, p1_mint.clone())
+            .await;
+
+        // 3. Seed Alice's engine with P1 + a genuine CS1 (Alice's JoinCountersign
+        //    targeting P1.id, signed with her device key). insert_verified_for_test
+        //    bypasses verify/precheck — fine, we are reproducing committed state;
+        //    CS1 carries a real Alice signature so Bob's engine accepts it on
+        //    delivery (Bob's redeem inserts Alice's admin bootstrap first).
+        let cs1 = {
+            use harmony_app::community_membership::{
+                sign_event, EventPayload, MembershipEventKind,
+            };
+            let payload = EventPayload {
+                id: [0xc5; 16],
+                community_id: s.community_id,
+                kind: MembershipEventKind::JoinCountersign {
+                    target_event_id: p1.id,
+                },
+                actor: s.alice_addr,
+                at: Hlc {
+                    wall_ms: 100_700,
+                    logical: 0,
+                    device_id: "alice-dev".into(),
+                },
+            };
+            sign_event(&payload, s.alice_comm_sk.as_ref()).expect("sign CS1")
+        };
+        {
+            let state = s
+                .registry_alice
+                .state_for(&s.community_id)
+                .await
+                .expect("alice state exists");
+            let mut g = state.lock().await;
+            g.insert_verified_for_test(p1.clone());
+            g.insert_verified_for_test(cs1);
+        }
+
+        // --- Drive the retry. Bob reuses P1 from cache → sends P1 → Alice
+        //     AlreadyKnown → the acceptor's poll finds the seeded CS1 → delivers
+        //     → Bob joins, and the acceptor burns the invite. ---
+        let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
+            invite_url,
+            Some(Arc::clone(&s.pkarr_resolver)),
+            Some(s.bob_reachability.clone()),
+            Some(Arc::clone(&s.bob_ep)),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            s.bob_adopt_floor.clone(),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            None,
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            None,
+            None,
+            |_| {},
+            |_p: harmony_app::NavUpdatedPayload| {},
+            harmony_app::HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(10_000),
+                open_bi_timeout: Duration::from_millis(10_000),
+                response_read_timeout: Duration::from_millis(10_000),
+                write_timeout: Duration::from_millis(10_000),
+            },
+            || Ok(()),
+        )
+        .await
+        .expect("connectivity_redeem_invite_iroh_inner must Ok");
+
+        // Load-bearing: only reuse-of-P1 lets this converge. A fresh mint would
+        // hit P6 → EngineRejected → no delivery → not joined + invite still live.
+        assert_eq!(
+            outcome.status, "joined",
+            "ZEB-889: the retry converges by reusing the cached mint; got status={:?}",
+            outcome.status
+        );
+
+        // Poll (rather than a fixed sleep) until the acceptor's post-delivery
+        // burn unregisters the invite — the burn happens on the acceptor task
+        // just after it writes the countersign, so it races the redeem return.
+        let mut burned = false;
+        for _ in 0..50 {
+            if !s
+                .pkarr_publisher
+                .active_handles()
+                .await
+                .contains(&invite_handle)
+            {
+                burned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            burned,
+            "ZEB-889: the single-use invite must be burned once the reused-mint retry \
+             delivers the countersign — handle {invite_handle:?} must no longer be active \
+             (no permanent zombie)"
+        );
+
+        // The join committed, so the reuse cache entry must be evicted (not left
+        // pinning the mint / its epoch key material).
+        assert!(
+            s.registry_bob
+                .get_redemption_mint(cache_key, seed_now_ms)
+                .await
+                .is_none(),
+            "ZEB-889: the cached mint is evicted once the join commits"
+        );
+
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("zeb889_retry_reuses_mint_and_redeems_zombie_invite timed out at 60s");
+}

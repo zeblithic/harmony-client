@@ -5414,6 +5414,92 @@ pub struct CommunitySyncRegistry {
     /// `.await` happens with the guard alive.
     root_fetch_shutdowns:
         tokio::sync::Mutex<std::collections::HashMap<SpaceId, tokio::sync::watch::Sender<bool>>>,
+
+    /// ZEB-889: joiner-side minted-redemption cache, keyed by a digest of the
+    /// whole invite payload (see `CommunityInvitePayload::redemption_mint_cache_key`).
+    /// A failed-delivery retry reuses the cached mint (same `bootstrap_join`
+    /// id/bytes) so the host's `AlreadyKnown`-retransmit path re-delivers the
+    /// countersign, instead of minting a fresh id that P6 then rejects
+    /// ("already-engaged") — the zombie-invite bug. See `InFlightRedemptionMints`.
+    in_flight_redemption_mints: InFlightRedemptionMints,
+}
+
+/// ZEB-889: retry window after which a cached mint is dropped. A redemption that
+/// never completes should not pin a mint (or its epoch key material) forever; a
+/// user who is going to retry does so well within this window.
+const REDEMPTION_MINT_TTL_MS: u64 = 30 * 60 * 1_000;
+/// ZEB-889: hard cap on cached mints so a burst of abandoned redemptions cannot
+/// grow the map without bound. Far above any real count of concurrent in-flight
+/// invites a single user redeems.
+const REDEMPTION_MINT_MAX_ENTRIES: usize = 64;
+
+/// ZEB-889: process-lifetime cache of a joiner's minted redemption, keyed by a
+/// digest of the whole invite payload (`CommunityInvitePayload::redemption_mint_cache_key`).
+/// Held on the `CommunitySyncRegistry` alongside the other per-redemption
+/// bookkeeping. Each entry carries its insertion wall-time so the cache can
+/// bound both lifetime and size.
+///
+/// **Why the payload digest, not `InviteToken.sig` (Greptile #644):** the token
+/// signature covers only the token's own fields; the outer `community_id` /
+/// `epoch_snapshot` / … that `mint_redemption` derives the cached mint from are
+/// unsigned. Keying by `sig` let a tampered invite (legit signature, mutated
+/// outer fields) cache a mismatched mint under the legitimate token's key and
+/// poison a later legitimate redemption. The full-payload digest sends a
+/// tampered variant to a different slot instead.
+///
+/// **Lock-discipline:** the map is a `tokio::sync::Mutex`; every method takes the
+/// lock, mutates/clones, and drops the guard — never held across an unrelated
+/// `.await` (mirrors `pending_redemptions` / `root_fetch_shutdowns`).
+#[derive(Default)]
+pub(crate) struct InFlightRedemptionMints {
+    by_payload_digest:
+        tokio::sync::Mutex<std::collections::HashMap<[u8; 32], (u64, crate::MintedCommunity)>>,
+}
+
+impl InFlightRedemptionMints {
+    /// Drop entries older than the retry window (called under the held lock).
+    fn purge_expired(
+        map: &mut std::collections::HashMap<[u8; 32], (u64, crate::MintedCommunity)>,
+        now_ms: u64,
+    ) {
+        map.retain(|_, (at, _)| now_ms.saturating_sub(*at) < REDEMPTION_MINT_TTL_MS);
+    }
+
+    async fn get(&self, payload_digest: [u8; 32], now_ms: u64) -> Option<crate::MintedCommunity> {
+        let mut g = self.by_payload_digest.lock().await;
+        Self::purge_expired(&mut g, now_ms);
+        g.get(&payload_digest).map(|(_, m)| m.clone())
+    }
+
+    /// Atomic get-or-insert: if a (fresh) entry exists for `payload_digest` it is
+    /// returned and `mint` is discarded; otherwise `mint` is inserted and
+    /// returned. Concurrent redeems for one invite therefore converge on a
+    /// SINGLE `bootstrap_join` id — closing the get→mint→store overwrite race
+    /// that could otherwise cache the id the host rejected (recreating the
+    /// zombie loop). Enforces the size cap by evicting the oldest entry.
+    async fn get_or_store(
+        &self,
+        payload_digest: [u8; 32],
+        now_ms: u64,
+        mint: crate::MintedCommunity,
+    ) -> crate::MintedCommunity {
+        let mut g = self.by_payload_digest.lock().await;
+        Self::purge_expired(&mut g, now_ms);
+        if let Some((_, existing)) = g.get(&payload_digest) {
+            return existing.clone();
+        }
+        if g.len() >= REDEMPTION_MINT_MAX_ENTRIES {
+            if let Some(oldest) = g.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| *k) {
+                g.remove(&oldest);
+            }
+        }
+        g.insert(payload_digest, (now_ms, mint.clone()));
+        mint
+    }
+
+    async fn evict(&self, payload_digest: &[u8; 32]) {
+        self.by_payload_digest.lock().await.remove(payload_digest);
+    }
 }
 
 // ── CommunitySyncSpawnGuard (ZEB-274) ─────────────────────────────────────────
@@ -5595,6 +5681,7 @@ impl CommunitySyncRegistry {
             )),
             nav_emitter,
             root_fetch_shutdowns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            in_flight_redemption_mints: InFlightRedemptionMints::default(),
         }
     }
 
@@ -5855,6 +5942,45 @@ impl CommunitySyncRegistry {
         let mut g = self.pending_redemptions.lock().await;
         g.insert(event_id, sender);
         // guard dropped at end of scope
+    }
+
+    /// ZEB-889: return the cached minted redemption for `payload_digest` (see
+    /// `CommunityInvitePayload::redemption_mint_cache_key`), if a prior
+    /// (failed-delivery) attempt for this invite stored one and it is still
+    /// within the retry window. A retry reuses it so it re-sends the SAME
+    /// `bootstrap_join` id and hits the host's `AlreadyKnown`-retransmit path
+    /// (which re-delivers the countersign). `now_ms` is wall-time for TTL purge.
+    pub async fn get_redemption_mint(
+        &self,
+        payload_digest: [u8; 32],
+        now_ms: u64,
+    ) -> Option<crate::MintedCommunity> {
+        self.in_flight_redemption_mints
+            .get(payload_digest, now_ms)
+            .await
+    }
+
+    /// ZEB-889: atomically cache-or-return the minted redemption for
+    /// `payload_digest`. Returns the AUTHORITATIVE mint — the freshly-minted
+    /// `mint` on first store, or the already-cached mint if a concurrent redeem
+    /// for this invite won the race. Callers MUST use the returned value (not
+    /// their own `mint`) so all concurrent redeems converge on one
+    /// `bootstrap_join` id.
+    pub async fn get_or_store_redemption_mint(
+        &self,
+        payload_digest: [u8; 32],
+        now_ms: u64,
+        mint: crate::MintedCommunity,
+    ) -> crate::MintedCommunity {
+        self.in_flight_redemption_mints
+            .get_or_store(payload_digest, now_ms, mint)
+            .await
+    }
+
+    /// ZEB-889: drop the cached mint for `payload_digest` once the join has
+    /// committed (the invite is burned; no further retry is possible or needed).
+    pub async fn evict_redemption_mint(&self, payload_digest: &[u8; 32]) {
+        self.in_flight_redemption_mints.evict(payload_digest).await;
     }
 
     /// ZEB-805: snapshot every live engine's sync counters for
@@ -7937,6 +8063,134 @@ mod tests {
         };
         let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
         crate::community_membership::sign_event(&payload, &sk).expect("sign_event")
+    }
+
+    // ── ZEB-889: in-flight redemption mint cache ──────────────────────────
+    /// Build a throwaway `MintedCommunity` whose `bootstrap_join.id` is
+    /// `[id_byte; 16]`, so two stubs are distinguishable. The cache is a
+    /// key/value map opaque to the value, so any well-formed mint works.
+    fn zeb889_mint_stub(id_byte: u8) -> crate::MintedCommunity {
+        let community_id = SpaceId([id_byte; 16]);
+        let membership_key = EpochKey::new([id_byte; 32]);
+        let space = super::test_community_space(community_id, 0, membership_key.clone());
+        let payload = crate::community_membership::EventPayload {
+            id: [id_byte; 16],
+            community_id,
+            kind: crate::community_membership::MembershipEventKind::Join,
+            actor: crate::community_membership::mint_test_owner(id_byte).owner,
+            at: crate::owner_state_types::Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "zeb889-stub".to_string(),
+            },
+        };
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[id_byte.wrapping_add(1); 32]);
+        let bootstrap_join =
+            crate::community_membership::sign_event(&payload, &sk).expect("sign stub");
+        crate::MintedCommunity {
+            community_id,
+            membership_key,
+            space,
+            bootstrap_join,
+        }
+    }
+
+    #[tokio::test]
+    async fn redemption_mint_cache_store_get_evict() {
+        let cache = super::InFlightRedemptionMints::default();
+        let sig = [7u8; 32];
+        let now = 1_000_000;
+        assert!(cache.get(sig, now).await.is_none(), "empty cache misses");
+        let m = zeb889_mint_stub(0x11);
+        let want_id = m.bootstrap_join.id;
+        let returned = cache.get_or_store(sig, now, m).await;
+        assert_eq!(
+            returned.bootstrap_join.id, want_id,
+            "get_or_store returns the freshly-stored mint on first store"
+        );
+        let got = cache
+            .get(sig, now)
+            .await
+            .expect("stored mint is retrievable");
+        assert_eq!(
+            got.bootstrap_join.id, want_id,
+            "get returns the stored value"
+        );
+        // get is non-consuming — a retry may need it more than once before success.
+        assert!(cache.get(sig, now).await.is_some(), "get does not consume");
+        cache.evict(&sig).await;
+        assert!(cache.get(sig, now).await.is_none(), "evicted entry is gone");
+    }
+
+    #[tokio::test]
+    async fn redemption_mint_cache_keys_are_independent() {
+        let cache = super::InFlightRedemptionMints::default();
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let now = 1_000_000;
+        let (ma, mb) = (zeb889_mint_stub(0xAA), zeb889_mint_stub(0xBB));
+        let (ida, idb) = (ma.bootstrap_join.id, mb.bootstrap_join.id);
+        assert_ne!(ida, idb, "distinct stubs have distinct bootstrap_join ids");
+        cache.get_or_store(a, now, ma).await;
+        cache.get_or_store(b, now, mb).await;
+        assert_eq!(cache.get(a, now).await.unwrap().bootstrap_join.id, ida);
+        assert_eq!(cache.get(b, now).await.unwrap().bootstrap_join.id, idb);
+        cache.evict(&a).await;
+        assert!(cache.get(a, now).await.is_none(), "evicting a leaves b");
+        assert!(cache.get(b, now).await.is_some(), "b survives a's eviction");
+    }
+
+    /// ZEB-889 (bot convergence): `get_or_store` is atomic get-or-insert — a
+    /// second store for a token that already has an entry returns the FIRST
+    /// mint's id and discards the second. This is what makes concurrent redeems
+    /// for one token converge on a single id instead of caching the loser.
+    #[tokio::test]
+    async fn redemption_mint_cache_get_or_store_is_first_wins() {
+        let cache = super::InFlightRedemptionMints::default();
+        let sig = [9u8; 32];
+        let now = 1_000_000;
+        let first = zeb889_mint_stub(0x33);
+        let second = zeb889_mint_stub(0x44);
+        let (id1, id2) = (first.bootstrap_join.id, second.bootstrap_join.id);
+        assert_ne!(id1, id2);
+        let r1 = cache.get_or_store(sig, now, first).await;
+        assert_eq!(r1.bootstrap_join.id, id1, "first store wins");
+        let r2 = cache.get_or_store(sig, now, second).await;
+        assert_eq!(
+            r2.bootstrap_join.id, id1,
+            "a later store returns the authoritative (first) mint, not its own"
+        );
+        assert_eq!(
+            cache.get(sig, now).await.unwrap().bootstrap_join.id,
+            id1,
+            "cache still holds the first mint"
+        );
+    }
+
+    /// ZEB-889 (bot convergence): a cached mint older than the retry window is
+    /// dropped, so an abandoned redemption cannot pin a mint (or its epoch key
+    /// material) for the whole process lifetime.
+    #[tokio::test]
+    async fn redemption_mint_cache_expires_after_ttl() {
+        let cache = super::InFlightRedemptionMints::default();
+        let sig = [5u8; 32];
+        let t0 = 1_000_000;
+        cache.get_or_store(sig, t0, zeb889_mint_stub(0x55)).await;
+        // Still present just inside the window.
+        assert!(
+            cache
+                .get(sig, t0 + super::REDEMPTION_MINT_TTL_MS - 1)
+                .await
+                .is_some(),
+            "entry survives within the retry window"
+        );
+        // Purged once the window elapses.
+        assert!(
+            cache
+                .get(sig, t0 + super::REDEMPTION_MINT_TTL_MS)
+                .await
+                .is_none(),
+            "entry is dropped after the retry window"
+        );
     }
 
     /// `persist_now` durably fences the in-memory CRDT to disk WITHOUT

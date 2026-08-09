@@ -35399,6 +35399,10 @@ fn resolve_invitee_device_keys(
 /// Bundle of values produced by `mint_community_creation` — kept as a
 /// plain struct so callers (the `create_community` IPC + tests) can
 /// destructure cleanly.
+///
+/// ZEB-889: `Clone` so the community registry's in-flight-redemption cache can
+/// hand back an owned copy of a joiner's minted redemption for retry reuse.
+#[derive(Clone)]
 pub struct MintedCommunity {
     pub community_id: crate::owner_state_types::SpaceId,
     pub membership_key: crate::owner_state_types::EpochKey,
@@ -62816,30 +62820,75 @@ where
     // 8'. Reserve HLC + mint. We mint up-front so the bootstrap_join.id
     // committed to the wire packet is the SAME id the redeem inner
     // below uses (mint_redemption randomizes the 16-byte event_id).
-    let wall_now_ms = std::time::SystemTime::now()
+    //
+    // ZEB-889: reuse a cached mint for this invite if a prior attempt stored
+    // one. A retry whose earlier countersign delivery failed must re-send the
+    // SAME bootstrap_join id — that hits the host's AlreadyKnown-retransmit path
+    // (which re-delivers the countersign), whereas a fresh random id makes
+    // verify_event P6 reject the retry ("already engaged") and leaves a
+    // permanent unredeemable zombie invite. Only mint fresh — and cache it — on
+    // the first attempt for this invite.
+    //
+    // Greptile #644: key the cache by a digest of the WHOLE payload, NOT
+    // `token.sig`. The token signature covers only the token's own fields; the
+    // outer community_id / epoch_snapshot / … that `mint_redemption` derives the
+    // cached mint from are unsigned, so a tampered invite (legit sig, mutated
+    // outer fields) would otherwise cache a mismatched mint under the legitimate
+    // token's key and poison a later legitimate redemption. The full-payload
+    // digest puts a tampered variant in a different slot. `None` only if the
+    // just-decoded payload fails to re-encode (effectively never) — then we
+    // bypass the cache and mint fresh, exactly as pre-ZEB-889. The key + the
+    // evict handle are captured before `community_registry` is moved into
+    // `redeem_invite_inner_with_overrides` below.
+    let redemption_cache_key = payload.redemption_mint_cache_key();
+    let registry_evict = std::sync::Arc::clone(&community_registry);
+    let cache_now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let join_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
-        &hlc_tracker,
-        &adopt_floor,
-        &device_id,
-        wall_now_ms,
-    )
-    .await;
-    let minted = match mint_redemption(
-        &payload,
-        self_owner,
-        signing_key.as_ref(),
-        &enrollment_cert,
-        join_hlc,
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(RedeemInviteError::new(
-                RedeemInviteErrorCode::Internal,
-                format!("mint_redemption: {e}"),
-            ));
+    let cached = match redemption_cache_key {
+        Some(key) => {
+            community_registry
+                .get_redemption_mint(key, cache_now_ms)
+                .await
+        }
+        None => None,
+    };
+    let minted = if let Some(cached) = cached {
+        cached
+    } else {
+        let join_hlc = crate::dm_outbox::reserve_next_hlc_for_device(
+            &hlc_tracker,
+            &adopt_floor,
+            &device_id,
+            cache_now_ms,
+        )
+        .await;
+        let m = match mint_redemption(
+            &payload,
+            self_owner,
+            signing_key.as_ref(),
+            &enrollment_cert,
+            join_hlc,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(RedeemInviteError::new(
+                    RedeemInviteErrorCode::Internal,
+                    format!("mint_redemption: {e}"),
+                ));
+            }
+        };
+        match redemption_cache_key {
+            // Atomic get-or-store: on a concurrent same-invite redeem this returns
+            // the FIRST-stored mint (discarding `m`), so both callers converge on
+            // one bootstrap_join id instead of caching the id the host will reject.
+            Some(key) => {
+                community_registry
+                    .get_or_store_redemption_mint(key, cache_now_ms, m)
+                    .await
+            }
+            None => m,
         }
     };
 
@@ -63172,6 +63221,15 @@ where
 
     match result {
         Ok(dto) => {
+            // ZEB-889: the join committed — the acceptor delivered the
+            // countersign (this Ok arm is reached only after the pre-delivered
+            // countersign was applied) and burned the single-use invite. Drop
+            // the cached mint; no further retry is possible or needed. (A
+            // never-completing redemption keeps its entry until the TTL window
+            // elapses — bounded, one per distinct invite redeemed this session.)
+            if let Some(key) = redemption_cache_key {
+                registry_evict.evict_redemption_mint(&key).await;
+            }
             // ZEB-427: durable-on-commit fence (ZEB-393 Bug A), mirroring
             // the legacy `redeem_invite` IPC. Fence the joined community's
             // owner-state Space to disk before returning so a non-graceful
