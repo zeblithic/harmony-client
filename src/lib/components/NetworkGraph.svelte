@@ -524,7 +524,7 @@
     bind:this={canvas}
     onclick={handleClick}
     onmousemove={handleMouseMove}
-    aria-label="Interactive network topology graph"
+    aria-label="Network topology graph"
   ></canvas>
 </div>
 

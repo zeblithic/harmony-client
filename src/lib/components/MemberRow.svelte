@@ -177,6 +177,18 @@
     if (e.key === 'Escape') menuOpen = false;
   }
 
+  // ZEB-386: close the kebab menu on Escape regardless of where focus sits in
+  // the row. A document-level listener registered only WHILE the menu is open
+  // keeps the Escape handler off the noninteractive <li> (clearing
+  // a11y_no_noninteractive_element_interactions) without narrowing the close
+  // scope to a single wrapper — and, being gated on `menuOpen`, it adds at most
+  // one listener per open menu rather than one per rendered row.
+  $effect(() => {
+    if (!menuOpen) return;
+    document.addEventListener('keydown', handleKeydown);
+    return () => document.removeEventListener('keydown', handleKeydown);
+  });
+
   function handleNameClick(ev: MouseEvent) {
     onOpenCard?.(
       {
@@ -193,9 +205,9 @@
 </script>
 
 <!-- `list-style: none` on the parent strips implicit list semantics in Safari +
-     VoiceOver, so the listitem role is explicit. The Escape-to-close-kebab
-     keydown lives on the interactive kebab-wrapper below (not this listitem), so
-     the row stays a pure listitem with no listener on a noninteractive element. -->
+     VoiceOver, so the listitem role is explicit. Escape-to-close-kebab is handled
+     by a `menuOpen`-gated document listener (see the $effect above), so this row
+     stays a pure listitem with no listener on a noninteractive element. -->
 <li class="member-row" role="listitem">
   <span
     class="presence-dot"
@@ -227,7 +239,7 @@
   <span class="joined-date">{joinedDate}</span>
 
   {#if actions.length > 0}
-    <div class="kebab-wrapper" role="presentation" onkeydown={handleKeydown}>
+    <div class="kebab-wrapper">
       <button
         type="button"
         class="kebab-btn"
