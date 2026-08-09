@@ -2249,9 +2249,23 @@ async fn spawn_auto_counter_sign_task(
     use crate::community_membership::{EventPayload, MemberStatus, MembershipEventKind};
 
     // --- Eligibility + idempotency check under the state lock. ---
-    let (self_joined, power_ok, already_signed) = {
+    let (self_joined, power_ok, already_signed, token_claimed_by_other) = {
         let state_g = state.lock().await;
-        let mat = state_g.materialize_now(admin_addr);
+        // ZEB-888 (Qodo #643 perf): clone the event log ONCE under the lock and
+        // reuse it for the eligibility materialize, the idempotency scan, and the
+        // single-use guard — `materialize_now` clones the log internally, so
+        // calling it plus a separate clone for the guard cloned twice. Replicate
+        // `materialize_now` exactly (floor None + ZEB-846 forward-skew ceiling)
+        // on the shared clone so behavior is unchanged.
+        let log: Vec<crate::community_membership::SignedMembershipEvent> =
+            state_g.events().cloned().collect();
+        let receiver_now = crate::clock_trust::receiver_now_ms();
+        let mat = crate::community_membership::materialize_with_bounds(
+            &log,
+            admin_addr,
+            None,
+            receiver_now,
+        );
 
         let self_status = mat.members.get(&self_owner).map(|m| m.status);
         let joined = matches!(self_status, Some(MemberStatus::Joined));
@@ -2263,7 +2277,7 @@ async fn spawn_auto_counter_sign_task(
         // escapes the block.
         let power_ok = crate::community_membership::actor_power_meets_invite_tier(&mat, self_owner);
 
-        let signed_already = state_g.events().any(|e| {
+        let signed_already = log.iter().any(|e| {
             e.actor == self_owner
                 && matches!(
                     &e.kind,
@@ -2271,10 +2285,19 @@ async fn spawn_auto_counter_sign_task(
                     if *target_event_id == pending_id
                 )
         });
-        (joined, power_ok, signed_already)
+        // ZEB-888 (Layer 2, defense-in-depth): don't auto-countersign a
+        // PendingJoin whose single-use invite token is already claimed
+        // (countersigned) for a DIFFERENT actor — that would mint a phantom
+        // countersign for a second claimant. Best-effort; the authoritative
+        // single-use fence is the canonical-claimant rule in
+        // `materialize_with_now` (a non-canonical claimant never materializes as
+        // Joined regardless of this guard).
+        let token_claimed_by_other =
+            crate::community_membership::invite_token_claimed_by_other_actor(&log, pending_id);
+        (joined, power_ok, signed_already, token_claimed_by_other)
     };
 
-    if !self_joined || !power_ok || already_signed {
+    if !self_joined || !power_ok || already_signed || token_claimed_by_other {
         return;
     }
 
@@ -10823,6 +10846,85 @@ mod tests {
         assert!(
             matches!(res, Err(LocalInsertError::ClaimBoundEventNotPendingJoin)),
             "a non-PendingJoin event must be refused by the claim seam, got: {res:?}"
+        );
+    }
+
+    /// ZEB-888: a second distinct actor whose PendingJoin + countersign reach
+    /// the host via the state-root MERGE path (which inserts with no claim
+    /// precheck) must NOT materialize as Joined. The single-use claim is
+    /// enforced at the materialization view (canonical claimant = earliest
+    /// countersign), so injecting B's countersigned PendingJoin straight into
+    /// the log — exactly what a merge does — cannot admit a second member. This
+    /// closes the ZEB-875 gap: the local-only precheck did not cover the merge
+    /// path.
+    #[tokio::test]
+    async fn zeb888_second_actor_countersigned_via_merge_never_joins() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, EventPayload, MemberStatus, MembershipEventKind,
+            SignedMembershipEvent,
+        };
+        let alice = mint_test_owner(0xAA); // admin / host
+        let bob = mint_test_owner(0xBE); // A — legitimate first claimant
+        let carol = mint_test_owner(0xCA); // B — second actor on the same token
+        let community_id = SpaceId([0x88; 16]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, _sub_tx) = closing_guard_engine(&dir, community_id, &alice);
+
+        // One single-use, untargeted token (invitee_hint: None) shared by A and B.
+        let token = zeb875_stub_token(alice.owner, [0x33u8; 64]);
+
+        let host_countersign =
+            |target: [u8; 16], id: [u8; 16], wall_ms: u64| -> SignedMembershipEvent {
+                let payload = EventPayload {
+                    id,
+                    community_id,
+                    kind: MembershipEventKind::JoinCountersign {
+                        target_event_id: target,
+                    },
+                    actor: alice.owner,
+                    at: Hlc {
+                        wall_ms,
+                        logical: 0,
+                        device_id: "alice-dev".into(),
+                    },
+                };
+                sign_event(&payload, &alice.device_key).expect("sign countersign")
+            };
+
+        // Stage the MERGED world directly (insert_verified_for_test bypasses the
+        // claim precheck, exactly like the merge loop's precheck-less insert):
+        //  - A's PendingJoin + host countersign (earlier) → A is the claimant.
+        //  - B's PendingJoin + host countersign (later)  → the merge-injected
+        //    second claimant that must be refused membership.
+        let members = {
+            let state = engine.state();
+            let mut g = state.lock().await;
+            g.insert_verified_for_test(zeb875_pending_join(
+                community_id,
+                &bob,
+                token.clone(),
+                [0x20; 16],
+            ));
+            g.insert_verified_for_test(host_countersign([0x20; 16], [0x21; 16], 1_700_000_004_000));
+            g.insert_verified_for_test(zeb875_pending_join(
+                community_id,
+                &carol,
+                token.clone(),
+                [0x30; 16],
+            ));
+            g.insert_verified_for_test(host_countersign([0x30; 16], [0x31; 16], 1_700_000_005_000));
+            g.materialize_now(alice.owner)
+        };
+
+        assert_eq!(
+            members.members.get(&bob.owner).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "A (earliest countersign) must be Joined"
+        );
+        assert_ne!(
+            members.members.get(&carol.owner).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "B injected via the merge path must NOT become a second member on one single-use token"
         );
     }
 }

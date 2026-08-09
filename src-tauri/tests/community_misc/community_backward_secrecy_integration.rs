@@ -1284,14 +1284,19 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
         .await
         .expect("insert admin join");
 
-    // An admin-signed InviteToken (invite-only joins carry one). Reused for both
-    // bob and Dave — only the inviter sig matters to verify, not the hint.
-    let mint_admin_token = || {
+    // An admin-signed InviteToken (invite-only joins carry one; only the inviter
+    // sig matters to verify, not the hint).
+    // ZEB-888: each invitee gets a DISTINCT single-use token — the `nonce`
+    // varies `minted_at` → distinct canonical bytes → distinct sig (Ed25519 is
+    // deterministic, so a fixed token would produce the SAME sig for every
+    // joiner). Reusing one token across two joiners is now a single-use
+    // violation the claim rule refuses, so bob and dave carry different tokens.
+    let mint_admin_token = |nonce: u64| {
         let mut tok = InviteToken {
             inviter: admin_addr,
             invitee_hint: None,
             minted_at: Hlc {
-                wall_ms: 50,
+                wall_ms: 50 + nonce,
                 logical: 0,
                 device_id: "admin-dev".into(),
             },
@@ -1313,7 +1318,7 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
             community_id,
             bob_addr,
             MembershipEventKind::PendingJoin {
-                invite_token: mint_admin_token(),
+                invite_token: mint_admin_token(0),
             },
             200,
             &bob_signing_key,
@@ -1390,7 +1395,7 @@ async fn invite_only_pending_join_catchup_synthesized_end_to_end() {
             community_id,
             dave_addr,
             MembershipEventKind::PendingJoin {
-                invite_token: mint_admin_token(),
+                invite_token: mint_admin_token(1),
             },
             2000,
             &dave_signing_key,
