@@ -1,82 +1,106 @@
 import { describe, it, expect } from 'vitest';
-import { mapRedeemInviteError } from '../redeem-invite-errors';
+import {
+  mapRedeemInviteError,
+  redeemInviteCopy,
+  toRedeemInviteError,
+  REDEEM_INVITE_ERROR_CODES,
+  type RedeemInviteErrorCode,
+} from '../redeem-invite-errors';
+
+// ZEB-885: the mapper now switches on the backend's structured error CODE, not
+// on regex-matching raw prose. These tests feed codes (the real wire shape),
+// unlike the pre-885 suite which fed fabricated CamelCase strings the backend
+// never actually emitted.
+
+// Derived from the source COPY table (which is a `Record<RedeemInviteErrorCode,
+// …>`, so the compiler forces it to cover the whole union) — the exhaustiveness
+// check below can never silently skip a newly added code.
+const ALL_CODES: readonly RedeemInviteErrorCode[] = REDEEM_INVITE_ERROR_CODES;
 
 describe('mapRedeemInviteError', () => {
-  it('maps BootstrapMissing to "incomplete" summary', () => {
-    const r = mapRedeemInviteError('BootstrapMissing: invite-only payload missing admin bootstrap');
-    expect(r.summary).toContain('incomplete');
-    expect(r.tag).toBe('bootstrap_missing');
+  it('maps a known code to its copy and preserves the raw message', () => {
+    const r = mapRedeemInviteError({
+      code: 'bootstrap_signature_invalid',
+      message: 'redeem_invite: admin_bootstrap signature verify failed',
+    });
+    expect(r.summary).toBe('Invite link signature is invalid.');
+    expect(r.code).toBe('bootstrap_signature_invalid');
+    expect(r.raw).toBe('redeem_invite: admin_bootstrap signature verify failed');
+    expect(r.hint).toBeTruthy();
   });
 
-  it('maps BootstrapSignatureInvalid to "invalid" summary', () => {
-    const r = mapRedeemInviteError('BootstrapSignatureInvalid: ed25519 verify failed');
-    expect(r.summary).toContain('signature is invalid');
-    expect(r.tag).toBe('bootstrap_signature_invalid');
+  it('gives every known code a non-fallback summary', () => {
+    const fallback = redeemInviteCopy('unknown').summary;
+    for (const code of ALL_CODES) {
+      const r = mapRedeemInviteError({ code, message: 'x' });
+      expect(r.code).toBe(code);
+      if (code !== 'unknown') {
+        expect(r.summary, `code ${code} should have its own copy`).not.toBe(fallback);
+      }
+    }
   });
 
-  it('maps BootstrapAddressMismatch to "malformed" summary', () => {
-    const r = mapRedeemInviteError('BootstrapAddressMismatch: identity_pub address != admin_addr');
-    expect(r.summary).toContain('malformed');
-    expect(r.tag).toBe('bootstrap_address_mismatch');
-  });
-
-  it('maps BootstrapActorMismatch', () => {
-    const r = mapRedeemInviteError('BootstrapActorMismatch: bootstrap.actor != admin_addr');
-    expect(r.tag).toBe('bootstrap_actor_mismatch');
-  });
-
-  it('maps BootstrapCommunityMismatch', () => {
-    const r = mapRedeemInviteError('BootstrapCommunityMismatch');
-    expect(r.summary).toContain('different community');
-    expect(r.tag).toBe('bootstrap_community_mismatch');
-  });
-
-  it('maps BootstrapKindInvalid', () => {
-    const r = mapRedeemInviteError('BootstrapKindInvalid: kind != Join');
-    expect(r.tag).toBe('bootstrap_kind_invalid');
-  });
-
-  it('maps BootstrapInvalidPubkey', () => {
-    const r = mapRedeemInviteError('BootstrapInvalidPubkey: ed25519 from_bytes failed');
-    expect(r.tag).toBe('bootstrap_invalid_pubkey');
-  });
-
-  it('maps BootstrapInsertFailed', () => {
-    const r = mapRedeemInviteError('BootstrapInsertFailed(Foo)');
-    expect(r.summary).toContain("Couldn't bootstrap");
-    expect(r.tag).toBe('bootstrap_insert_failed');
-  });
-
-  it('maps timeout', () => {
-    const r = mapRedeemInviteError('redeem_invite timed out after 15s');
-    expect(r.summary).toContain('offline');
-    expect(r.tag).toBe('inviter_timeout');
-  });
-
-  it('maps already-member', () => {
-    const r = mapRedeemInviteError('already a member of community aabbccdd');
-    expect(r.summary).toContain("already in");
-    expect(r.tag).toBe('already_member');
-  });
-
-  it('maps malformed URL', () => {
-    const r = mapRedeemInviteError('invalid invite URL: missing scheme');
-    expect(r.summary).toContain("doesn't look like");
-    expect(r.tag).toBe('malformed_url');
-  });
-
-  it('falls through to network failure', () => {
-    const r = mapRedeemInviteError('network unreachable');
-    expect(r.summary).toContain('network');
-    expect(r.tag).toBe('network_failure');
-  });
-
-  it('maps the pkarr relay warm-up error to an actionable, non-misleading message (ZEB-879)', () => {
-    const r = mapRedeemInviteError('no relays available (all on cooldown or unreachable)');
-    expect(r.tag).toBe('relays_warming_up');
+  it('maps the pkarr relay warm-up code to an actionable, non-misleading message (ZEB-879)', () => {
+    const r = mapRedeemInviteError({
+      code: 'relays_warming_up',
+      message: 'no relays available (all on cooldown or unreachable)',
+    });
+    expect(r.code).toBe('relays_warming_up');
     expect(r.summary).toBe('The network is still warming up.');
     expect(r.hint).toMatch(/try again/i);
-    // must NOT fall through to the generic network-failure fallback
-    expect(r.tag).not.toBe('network_failure');
+  });
+
+  it('bootstrap failures now surface their specific copy (repairs the pre-885 dead-regex bug)', () => {
+    // Pre-885 these fell through to the generic network_failure fallback
+    // because the Display prose never contained the CamelCase variant name.
+    const r = mapRedeemInviteError({
+      code: 'bootstrap_missing',
+      message: 'redeem_invite: invite-only payload missing admin bootstrap',
+    });
+    expect(r.summary).toContain('incomplete');
+    expect(r.summary).not.toBe(redeemInviteCopy('unknown').summary);
+  });
+
+  it('falls back to the unknown copy for a code the frontend has not learned, keeping the raw code', () => {
+    const r = mapRedeemInviteError({
+      code: 'some_future_code' as RedeemInviteErrorCode,
+      message: 'brand new backend failure',
+    });
+    expect(r.summary).toBe(redeemInviteCopy('unknown').summary);
+    // the original code is preserved for the disclosure / bug report
+    expect(r.code).toBe('some_future_code');
+    expect(r.raw).toBe('brand new backend failure');
+  });
+});
+
+describe('redeemInviteCopy', () => {
+  it('returns the unknown fallback for an unrecognized code', () => {
+    expect(redeemInviteCopy('not_a_real_code')).toEqual(redeemInviteCopy('unknown'));
+  });
+});
+
+describe('toRedeemInviteError', () => {
+  it('passes through a structured { code, message } rejection', () => {
+    const e = toRedeemInviteError({ code: 'inviter_unreachable', message: 'pkarr resolve failed' });
+    expect(e.code).toBe('inviter_unreachable');
+    expect(e.message).toBe('pkarr resolve failed');
+  });
+
+  it('degrades an Error to the unknown code, keeping its message', () => {
+    const e = toRedeemInviteError(new Error('Error: node stopping; operation rejected'));
+    expect(e.code).toBe('unknown');
+    expect(e.message).toBe('Error: node stopping; operation rejected');
+  });
+
+  it('degrades a bare string to the unknown code', () => {
+    const e = toRedeemInviteError('some raw string rejection');
+    expect(e.code).toBe('unknown');
+    expect(e.message).toBe('some raw string rejection');
+  });
+
+  it('handles a coded object missing its message field', () => {
+    const e = toRedeemInviteError({ code: 'internal' });
+    expect(e.code).toBe('internal');
+    expect(typeof e.message).toBe('string');
   });
 });

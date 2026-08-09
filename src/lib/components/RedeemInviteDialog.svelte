@@ -1,7 +1,12 @@
 <script lang="ts">
   import { untrack, onMount, onDestroy } from 'svelte';
   import Modal from './Modal.svelte';
-  import { mapRedeemInviteError } from '../redeem-invite-errors';
+  import {
+    mapRedeemInviteError,
+    redeemInviteCopy,
+    toRedeemInviteError,
+    type RedeemInviteError,
+  } from '../redeem-invite-errors';
   import {
     redeemInviteIroh,
     onResolutionProgress,
@@ -19,7 +24,7 @@
   }: {
     onSubmit: (url: string) => void;
     onCancel: () => void;
-    error?: string | null;
+    error?: RedeemInviteError | null;
     pending?: boolean;
     initialUrl?: string;
     /**
@@ -41,6 +46,10 @@
   let irohPending = $state(false);
   let irohStage = $state<RedemptionStage | null>(null);
   let irohError = $state<string | null>(null);
+  // ZEB-885: structured diagnostics (code + raw message) for an iroh HARD-error
+  // catch, surfaced in a disclosure like the LAN banner. Null for the Ok-side
+  // status branches (plain-language copy, no code to show).
+  let irohErrorDetail = $state<{ code: string; raw: string } | null>(null);
   let showFallbackButton = $state(false);
   /**
    * ZEB-325 Phase 2c: handle for the post-`joined` dismiss timer so it can
@@ -126,6 +135,18 @@
     previewSeq += 1; // discard any in-flight preview resolution
   });
 
+  // ZEB-885: codes for which the Reticulum LAN fallback could actually help.
+  // Local/internal failures (engine_insert_failed, node_not_ready,
+  // generation_changed, internal, join_failed, and invite-defect codes) rerun
+  // the same machinery / carry the same bad invite, so offering the fallback
+  // there is misleading — suppress it.
+  const IROH_LAN_RECOVERABLE_CODES = new Set([
+    'inviter_unreachable',
+    'relays_warming_up',
+    'missing_admin_identity_pub',
+    'unknown',
+  ]);
+
   async function handleIrohRedeem() {
     const trimmed = url.trim();
     if (!trimmed.startsWith('harmony://invite/') || irohPending || pending || previewExpired)
@@ -133,6 +154,7 @@
     irohPending = true;
     irohStage = 'resolving';
     irohError = null;
+    irohErrorDetail = null;
     showFallbackButton = false;
     let suppressFinally = false;
     try {
@@ -203,8 +225,16 @@
       }
     } catch (e) {
       irohStage = null;
-      irohError = e instanceof Error ? e.message : String(e);
-      showFallbackButton = true;
+      // ZEB-885: the iroh command rejects with a structured { code, message }.
+      // Route copy through the shared table (summary + actionable hint) instead
+      // of dumping the raw backend message, and only offer the LAN fallback when
+      // it could actually help (see IROH_LAN_RECOVERABLE_CODES).
+      const err = toRedeemInviteError(e);
+      const copy = redeemInviteCopy(err.code);
+      irohError = copy.hint ? `${copy.summary} ${copy.hint}` : copy.summary;
+      // Keep the code + raw message for the diagnostic disclosure / bug reports.
+      irohErrorDetail = { code: err.code, raw: err.message };
+      showFallbackButton = IROH_LAN_RECOVERABLE_CODES.has(err.code);
     } finally {
       // The `joined` branch defers `irohPending = false` to the dismiss
       // timer so the "Joined ✓" label stays visible across the display
@@ -222,6 +252,7 @@
     // `mapped` banner), which would otherwise stack on top of the still-visible
     // iroh banner — two error banners for one redeem attempt (finding 12).
     irohError = null;
+    irohErrorDetail = null;
     onSubmit(url.trim());
   }
 </script>
@@ -236,7 +267,7 @@
       <details>
         <summary>Show details</summary>
         <div class="diagnostic">
-          <div>Telemetry tag: <code>{mapped.tag}</code></div>
+          <div>Code: <code>{mapped.code}</code></div>
           <div>Raw error: <code>{mapped.raw}</code></div>
         </div>
       </details>
@@ -246,6 +277,15 @@
   {#if irohError}
     <div class="error-banner" data-testid="iroh-error-banner">
       <p class="summary">{irohError}</p>
+      {#if irohErrorDetail}
+        <details>
+          <summary>Show details</summary>
+          <div class="diagnostic">
+            <div>Code: <code>{irohErrorDetail.code}</code></div>
+            <div>Raw error: <code>{irohErrorDetail.raw}</code></div>
+          </div>
+        </details>
+      {/if}
     </div>
   {/if}
 

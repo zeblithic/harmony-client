@@ -1489,6 +1489,309 @@ impl RedeemBootstrapVerifyError {
     }
 }
 
+/// ZEB-885: stable, typed error code for the invite-redeem IPC surface.
+///
+/// The redeem dialog routes its user-facing copy off this code instead of
+/// regex-matching backend prose (which silently broke whenever a message was
+/// reworded — see the ticket, and the dead `Bootstrap*` regexes it repaired).
+/// Serialized `snake_case`; the frontend union in
+/// `src/lib/redeem-invite-errors.ts` mirrors these exact strings. `as_str()`
+/// and the serde repr must stay in lockstep (pinned by test).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedeemInviteErrorCode {
+    // ── Invite-link / verification failures — the link is bad; regenerate. ──
+    BootstrapMissing,
+    BootstrapActorMismatch,
+    BootstrapCommunityMismatch,
+    BootstrapSignatureInvalid,
+    BootstrapKindInvalid,
+    InviteUrlMalformed,
+    InviterEnrollmentInvalid,
+    InviteExpired,
+    InviteVerifyFailed,
+    InviteTokenMissing,
+    MissingAdminIdentityPub,
+    // ── Reachability / transient — retry. ──
+    InviterUnreachable,
+    RelaysWarmingUp,
+    NodeNotReady,
+    GenerationChanged,
+    // ── Local-completion failures — inviter reached (iroh) / local insert failed. ──
+    EngineInsertFailed,
+    JoinFailed,
+    // ── Internal / unknown. ──
+    Internal,
+    Unknown,
+}
+
+impl RedeemInviteErrorCode {
+    /// Stable wire string — MUST equal the serde `snake_case` repr (test-pinned
+    /// by `code_as_str_matches_serde_repr`). Used where a `&'static str` code is
+    /// needed without serializing, e.g. the iroh `RedemptionOutcome.status`
+    /// vocabulary drift-guard.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BootstrapMissing => "bootstrap_missing",
+            Self::BootstrapActorMismatch => "bootstrap_actor_mismatch",
+            Self::BootstrapCommunityMismatch => "bootstrap_community_mismatch",
+            Self::BootstrapSignatureInvalid => "bootstrap_signature_invalid",
+            Self::BootstrapKindInvalid => "bootstrap_kind_invalid",
+            Self::InviteUrlMalformed => "invite_url_malformed",
+            Self::InviterEnrollmentInvalid => "inviter_enrollment_invalid",
+            Self::InviteExpired => "invite_expired",
+            Self::InviteVerifyFailed => "invite_verify_failed",
+            Self::InviteTokenMissing => "invite_token_missing",
+            Self::MissingAdminIdentityPub => "missing_admin_identity_pub",
+            Self::InviterUnreachable => "inviter_unreachable",
+            Self::RelaysWarmingUp => "relays_warming_up",
+            Self::NodeNotReady => "node_not_ready",
+            Self::GenerationChanged => "generation_changed",
+            Self::EngineInsertFailed => "engine_insert_failed",
+            Self::JoinFailed => "join_failed",
+            Self::Internal => "internal",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// ZEB-885: structured error returned by the redeem-invite IPC commands
+/// (`redeem_invite`, `connectivity_redeem_invite_iroh`).
+///
+/// `code` drives the frontend's copy switch; `message` is the human-readable
+/// diagnostic (kept for display + bug reports). Tauri serializes this to
+/// `{ "code": "...", "message": "..." }` in the command rejection. The
+/// serve/api RPC surface flattens it to `message` via `Display` (wire
+/// unchanged) — the structured form is GUI-only.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RedeemInviteError {
+    pub code: RedeemInviteErrorCode,
+    pub message: String,
+}
+
+impl RedeemInviteError {
+    pub fn new(code: RedeemInviteErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RedeemInviteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Display == message, so pre-existing `format!("{e}")` / logging /
+        // the RPC `.to_string()` flatten all keep the exact human diagnostic.
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RedeemInviteError {}
+
+impl From<RedeemBootstrapVerifyError> for RedeemInviteError {
+    fn from(e: RedeemBootstrapVerifyError) -> Self {
+        let code = match e {
+            RedeemBootstrapVerifyError::BootstrapMissing => RedeemInviteErrorCode::BootstrapMissing,
+            RedeemBootstrapVerifyError::BootstrapActorMismatch => {
+                RedeemInviteErrorCode::BootstrapActorMismatch
+            }
+            RedeemBootstrapVerifyError::BootstrapCommunityMismatch => {
+                RedeemInviteErrorCode::BootstrapCommunityMismatch
+            }
+            RedeemBootstrapVerifyError::BootstrapSignatureInvalid => {
+                RedeemInviteErrorCode::BootstrapSignatureInvalid
+            }
+            RedeemBootstrapVerifyError::BootstrapKindInvalid => {
+                RedeemInviteErrorCode::BootstrapKindInvalid
+            }
+        };
+        Self::new(code, e.to_string())
+    }
+}
+
+impl From<InviteUrlError> for RedeemInviteError {
+    fn from(e: InviteUrlError) -> Self {
+        Self::new(RedeemInviteErrorCode::InviteUrlMalformed, e.to_string())
+    }
+}
+
+impl From<CommunityInviteVerifyError> for RedeemInviteError {
+    fn from(e: CommunityInviteVerifyError) -> Self {
+        // ZEB-885: `CommunityInviteVerifyError` spans far more than enrollment —
+        // expiry, token/signature failures, hint/community mismatch, etc. Map by
+        // variant so the frontend gives the right remediation instead of blanket
+        // "enrollment invalid". Enrollment-cert variants keep the specific code;
+        // expiry gets its own (actionable: get a fresh link); everything else is
+        // the honest generic `invite_verify_failed` (the message carries detail).
+        let code = match e {
+            CommunityInviteVerifyError::Expired => RedeemInviteErrorCode::InviteExpired,
+            CommunityInviteVerifyError::InviterEnrollmentCertInvalid
+            | CommunityInviteVerifyError::InviterEnrollmentOwnerMismatch => {
+                RedeemInviteErrorCode::InviterEnrollmentInvalid
+            }
+            _ => RedeemInviteErrorCode::InviteVerifyFailed,
+        };
+        Self::new(code, e.to_string())
+    }
+}
+
+/// Catch-all for the redeem inner's ad-hoc `String`/`&str` error sites. Maps to
+/// [`RedeemInviteErrorCode::Internal`] — sites that warrant a *specific* code
+/// (node-not-ready, generation-changed, engine-insert, token-missing) construct
+/// [`RedeemInviteError::new`] explicitly instead of relying on this. Boundary
+/// tests in `redeem_invite_inner_tests` pin those specific codes so a site that
+/// silently falls through to `internal` here is caught.
+impl From<String> for RedeemInviteError {
+    fn from(message: String) -> Self {
+        Self::new(RedeemInviteErrorCode::Internal, message)
+    }
+}
+
+impl From<&str> for RedeemInviteError {
+    fn from(message: &str) -> Self {
+        Self::new(RedeemInviteErrorCode::Internal, message.to_string())
+    }
+}
+
+#[cfg(test)]
+mod redeem_invite_error_code_tests {
+    use super::*;
+
+    const ALL_CODES: [RedeemInviteErrorCode; 19] = [
+        RedeemInviteErrorCode::BootstrapMissing,
+        RedeemInviteErrorCode::BootstrapActorMismatch,
+        RedeemInviteErrorCode::BootstrapCommunityMismatch,
+        RedeemInviteErrorCode::BootstrapSignatureInvalid,
+        RedeemInviteErrorCode::BootstrapKindInvalid,
+        RedeemInviteErrorCode::InviteUrlMalformed,
+        RedeemInviteErrorCode::InviterEnrollmentInvalid,
+        RedeemInviteErrorCode::InviteExpired,
+        RedeemInviteErrorCode::InviteVerifyFailed,
+        RedeemInviteErrorCode::InviteTokenMissing,
+        RedeemInviteErrorCode::MissingAdminIdentityPub,
+        RedeemInviteErrorCode::InviterUnreachable,
+        RedeemInviteErrorCode::RelaysWarmingUp,
+        RedeemInviteErrorCode::NodeNotReady,
+        RedeemInviteErrorCode::GenerationChanged,
+        RedeemInviteErrorCode::EngineInsertFailed,
+        RedeemInviteErrorCode::JoinFailed,
+        RedeemInviteErrorCode::Internal,
+        RedeemInviteErrorCode::Unknown,
+    ];
+
+    #[test]
+    fn error_serializes_code_and_message() {
+        let e = RedeemInviteError::new(RedeemInviteErrorCode::BootstrapSignatureInvalid, "m");
+        let v = serde_json::to_value(&e).expect("serialize");
+        assert_eq!(v["code"], "bootstrap_signature_invalid");
+        assert_eq!(v["message"], "m");
+    }
+
+    #[test]
+    fn code_as_str_matches_serde_repr() {
+        // as_str() and the serde snake_case form are the wire contract the
+        // frontend union depends on — they must never drift.
+        for code in ALL_CODES {
+            let serialized = serde_json::to_value(code).expect("serialize code");
+            assert_eq!(
+                serde_json::Value::String(code.as_str().to_string()),
+                serialized,
+                "as_str() disagrees with serde for {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_verify_error_maps_to_matching_code_and_tag() {
+        let cases = [
+            (
+                RedeemBootstrapVerifyError::BootstrapMissing,
+                RedeemInviteErrorCode::BootstrapMissing,
+            ),
+            (
+                RedeemBootstrapVerifyError::BootstrapActorMismatch,
+                RedeemInviteErrorCode::BootstrapActorMismatch,
+            ),
+            (
+                RedeemBootstrapVerifyError::BootstrapCommunityMismatch,
+                RedeemInviteErrorCode::BootstrapCommunityMismatch,
+            ),
+            (
+                RedeemBootstrapVerifyError::BootstrapSignatureInvalid,
+                RedeemInviteErrorCode::BootstrapSignatureInvalid,
+            ),
+            (
+                RedeemBootstrapVerifyError::BootstrapKindInvalid,
+                RedeemInviteErrorCode::BootstrapKindInvalid,
+            ),
+        ];
+        for (verr, expected) in cases {
+            // reason_tag() stays the single source for the five bootstrap
+            // strings; the new code must agree with it exactly.
+            assert_eq!(
+                expected.as_str(),
+                verr.reason_tag(),
+                "code.as_str() must equal reason_tag()"
+            );
+            let message = verr.to_string();
+            let converted: RedeemInviteError = verr.into();
+            assert_eq!(converted.code, expected);
+            assert_eq!(converted.message, message);
+        }
+    }
+
+    #[test]
+    fn url_enrollment_and_string_map_to_expected_codes() {
+        let url: RedeemInviteError = InviteUrlError::WrongScheme("nope".to_string()).into();
+        assert_eq!(url.code, RedeemInviteErrorCode::InviteUrlMalformed);
+
+        let ad_hoc: RedeemInviteError = "some internal failure".to_string().into();
+        assert_eq!(ad_hoc.code, RedeemInviteErrorCode::Internal);
+        assert_eq!(ad_hoc.message, "some internal failure");
+    }
+
+    #[test]
+    fn community_verify_error_maps_per_variant_not_blanket_enrollment() {
+        // ZEB-885: CommunityInviteVerifyError is NOT all "enrollment invalid".
+        let expired: RedeemInviteError = CommunityInviteVerifyError::Expired.into();
+        assert_eq!(expired.code, RedeemInviteErrorCode::InviteExpired);
+
+        let enrollment: RedeemInviteError =
+            CommunityInviteVerifyError::InviterEnrollmentCertInvalid.into();
+        assert_eq!(
+            enrollment.code,
+            RedeemInviteErrorCode::InviterEnrollmentInvalid
+        );
+
+        // A non-enrollment, non-expiry verify failure → the honest generic code,
+        // NOT inviter_enrollment_invalid.
+        let sig: RedeemInviteError = CommunityInviteVerifyError::InviteTokenSigInvalid.into();
+        assert_eq!(sig.code, RedeemInviteErrorCode::InviteVerifyFailed);
+        let hint: RedeemInviteError = CommunityInviteVerifyError::InviteeHintMismatch.into();
+        assert_eq!(hint.code, RedeemInviteErrorCode::InviteVerifyFailed);
+    }
+
+    #[test]
+    fn iroh_redemption_failure_statuses_are_valid_codes() {
+        // ZEB-885: the iroh `RedemptionOutcome.status` vocabulary (failure
+        // cases) overlaps the error-code space so the frontend can route both
+        // an iroh status and a redeem error code through one copy table. These
+        // status literals must remain valid codes. (Retyping the `status`
+        // String field into the enum is a deliberate non-goal — see the design
+        // doc — so this guards the overlap from the enum side.)
+        for status in [
+            "inviter_unreachable",
+            "join_failed",
+            "missing_admin_identity_pub",
+        ] {
+            assert!(
+                ALL_CODES.iter().any(|c| c.as_str() == status),
+                "iroh RedemptionOutcome.status {status:?} must be a RedeemInviteErrorCode"
+            );
+        }
+    }
+}
+
 /// Run the binding chain that admits the admin's signed bootstrap event
 /// into the joiner's engine (ZEB-260, updated ZEB-339). Pure / sync.
 ///
