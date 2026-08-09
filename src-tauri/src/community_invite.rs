@@ -262,6 +262,34 @@ impl CanonicalPayload for CommunityInvitePayload {}
 impl CanonicalPayloadSealed for InviteToken {}
 impl CanonicalPayload for InviteToken {}
 
+impl CommunityInvitePayload {
+    /// ZEB-889 (Greptile #644): stable cache key for the joiner-side
+    /// minted-redemption cache — a BLAKE3 digest of the canonical-CBOR
+    /// encoding of the WHOLE payload.
+    ///
+    /// The key MUST bind every field `mint_redemption` derives the cached
+    /// `MintedCommunity` from, not just `invite_token.sig`. That signature
+    /// covers only the token's own signed fields `(inviter, invitee_hint,
+    /// minted_at, expires_at)` — the outer `community_id`, `epoch_snapshot`,
+    /// `community_name`, `admin_addr`, … are unsigned. Keying by `sig` alone
+    /// let a structurally valid *tampered* invite (legitimate signature, mutated
+    /// outer fields) mint a mismatched `MintedCommunity` and cache it under the
+    /// legitimate token's key, so a later legitimate redemption reused the
+    /// poisoned mint until TTL/restart. Digesting the full payload puts a
+    /// tampered variant in a DIFFERENT slot — no cross-poisoning — while a
+    /// legitimate retry of the same invite URL decodes byte-identically and so
+    /// hits the same key (retry convergence and the first-writer race fix both
+    /// preserved).
+    ///
+    /// Returns `None` only if canonical re-encode fails — effectively never for
+    /// a just-decoded payload; the caller then bypasses the cache and mints
+    /// fresh (exactly the pre-ZEB-889 behavior), so redemption still works.
+    pub fn redemption_mint_cache_key(&self) -> Option<[u8; 32]> {
+        let bytes = crate::owner_state_crypto::canonical_cbor_encode(self).ok()?;
+        Some(*blake3::hash(&bytes).as_bytes())
+    }
+}
+
 use crate::community_membership::SignedMembershipEvent;
 use crate::owner_state_types::DeviceIdentityHash;
 
@@ -2886,6 +2914,61 @@ mod tests {
             // targeted path flip invitee_hint to Some and set/clear this field.
             untargeted_decrypt_key: Some([0x99; 32]),
         }
+    }
+
+    /// ZEB-889 (Greptile #644): the minted-redemption cache key must bind the
+    /// WHOLE payload, so a tampered invite (same token signature, mutated
+    /// *unsigned* outer fields) can never land in the legitimate invite's cache
+    /// slot and poison a later legitimate redemption. Proven here: an identical
+    /// payload keys stably; changing any mint-determining outer field — the
+    /// `community_id`, the epoch snapshot, even the token `sig` — yields a
+    /// distinct key.
+    #[test]
+    fn redemption_mint_cache_key_binds_full_payload() {
+        let base = make_invite_only_payload_correct();
+        let base_key = base
+            .redemption_mint_cache_key()
+            .expect("canonical encode of a valid payload succeeds");
+
+        // Stable: re-keying an identical payload gives the same key, so a
+        // legitimate retry of the same invite URL reuses its cached mint.
+        assert_eq!(
+            base_key,
+            base.redemption_mint_cache_key().unwrap(),
+            "an identical payload must key stably"
+        );
+
+        // Tampered `community_id` (an UNsigned outer field mint_redemption
+        // derives MintedCommunity.community_id + the signed bootstrap_join from):
+        // must NOT collide with the legitimate key.
+        let mut tampered_ci = base.clone();
+        tampered_ci.community_id = SpaceId([0xAB; 16]);
+        assert_ne!(
+            base_key,
+            tampered_ci.redemption_mint_cache_key().unwrap(),
+            "a mutated community_id must produce a different cache key (no poisoning)"
+        );
+
+        // Tampered epoch snapshot (feeds the cached membership_key): distinct key.
+        let mut tampered_es = base.clone();
+        tampered_es.epoch_snapshot.epoch = 42;
+        assert_ne!(
+            base_key,
+            tampered_es.redemption_mint_cache_key().unwrap(),
+            "a mutated epoch_snapshot must produce a different cache key"
+        );
+
+        // Even a same-token-but-different-sig variant keys distinctly (subsumed
+        // by full-payload digest, but pins that sig is not the sole binding).
+        let mut tampered_sig = base.clone();
+        if let Some(t) = tampered_sig.invite_token.as_mut() {
+            t.sig = [0x5A; 64];
+        }
+        assert_ne!(
+            base_key,
+            tampered_sig.redemption_mint_cache_key().unwrap(),
+            "a different token sig must produce a different cache key"
+        );
     }
 
     // ── encode_invite_url ────────────────────────────────────────────

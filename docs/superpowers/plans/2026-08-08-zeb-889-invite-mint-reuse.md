@@ -8,6 +8,10 @@
 
 **Tech Stack:** Rust, tokio, `cargo nextest`. Design: `docs/specs/2026-08-08-zeb-889-invite-countersign-redelivery-design.md`.
 
+> **Convergence addendum (post-PR-#644 bot review) — the design of record is the spec; this plan's code snippets are the pre-convergence draft.** Two deltas landed after review and are reflected in the spec + shipped code, not rewritten below:
+> 1. **r1:** the cache write is an **atomic first-writer-wins `get_or_store_redemption_mint`** (not `store`), with a **TTL (`REDEMPTION_MINT_TTL_MS`, 30 min) + size cap (`REDEMPTION_MINT_MAX_ENTRIES`, 64)** — a concurrent-mint race could otherwise cache the id the host rejects.
+> 2. **r2 (Greptile #644):** the cache key is a **BLAKE3 digest of the whole canonical-CBOR payload** (`CommunityInvitePayload::redemption_mint_cache_key`, `[u8; 32]`), **not `InviteToken.sig`** — `sig` leaves the mint-determining outer fields (`community_id`, `epoch_snapshot`, …) unbound, letting a tampered invite poison the legitimate token's slot. Read `token_sig: [u8; 64]` as `payload_digest: [u8; 32]` throughout the snippets below.
+
 ## Global Constraints
 
 - All cargo commands run from `src-tauri/`.

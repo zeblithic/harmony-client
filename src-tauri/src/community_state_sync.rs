@@ -5415,7 +5415,8 @@ pub struct CommunitySyncRegistry {
     root_fetch_shutdowns:
         tokio::sync::Mutex<std::collections::HashMap<SpaceId, tokio::sync::watch::Sender<bool>>>,
 
-    /// ZEB-889: joiner-side minted-redemption cache, keyed by invite-token sig.
+    /// ZEB-889: joiner-side minted-redemption cache, keyed by a digest of the
+    /// whole invite payload (see `CommunityInvitePayload::redemption_mint_cache_key`).
     /// A failed-delivery retry reuses the cached mint (same `bootstrap_join`
     /// id/bytes) so the host's `AlreadyKnown`-retransmit path re-delivers the
     /// countersign, instead of minting a fresh id that P6 then rejects
@@ -5432,50 +5433,59 @@ const REDEMPTION_MINT_TTL_MS: u64 = 30 * 60 * 1_000;
 /// invites a single user redeems.
 const REDEMPTION_MINT_MAX_ENTRIES: usize = 64;
 
-/// ZEB-889: process-lifetime cache of a joiner's minted redemption, keyed by the
-/// invite-token signature (`InviteToken.sig`). Held on the `CommunitySyncRegistry`
-/// alongside the other per-redemption bookkeeping. Each entry carries its
-/// insertion wall-time so the cache can bound both lifetime and size.
+/// ZEB-889: process-lifetime cache of a joiner's minted redemption, keyed by a
+/// digest of the whole invite payload (`CommunityInvitePayload::redemption_mint_cache_key`).
+/// Held on the `CommunitySyncRegistry` alongside the other per-redemption
+/// bookkeeping. Each entry carries its insertion wall-time so the cache can
+/// bound both lifetime and size.
+///
+/// **Why the payload digest, not `InviteToken.sig` (Greptile #644):** the token
+/// signature covers only the token's own fields; the outer `community_id` /
+/// `epoch_snapshot` / … that `mint_redemption` derives the cached mint from are
+/// unsigned. Keying by `sig` let a tampered invite (legit signature, mutated
+/// outer fields) cache a mismatched mint under the legitimate token's key and
+/// poison a later legitimate redemption. The full-payload digest sends a
+/// tampered variant to a different slot instead.
 ///
 /// **Lock-discipline:** the map is a `tokio::sync::Mutex`; every method takes the
 /// lock, mutates/clones, and drops the guard — never held across an unrelated
 /// `.await` (mirrors `pending_redemptions` / `root_fetch_shutdowns`).
 #[derive(Default)]
 pub(crate) struct InFlightRedemptionMints {
-    by_token:
-        tokio::sync::Mutex<std::collections::HashMap<[u8; 64], (u64, crate::MintedCommunity)>>,
+    by_payload_digest:
+        tokio::sync::Mutex<std::collections::HashMap<[u8; 32], (u64, crate::MintedCommunity)>>,
 }
 
 impl InFlightRedemptionMints {
     /// Drop entries older than the retry window (called under the held lock).
     fn purge_expired(
-        map: &mut std::collections::HashMap<[u8; 64], (u64, crate::MintedCommunity)>,
+        map: &mut std::collections::HashMap<[u8; 32], (u64, crate::MintedCommunity)>,
         now_ms: u64,
     ) {
         map.retain(|_, (at, _)| now_ms.saturating_sub(*at) < REDEMPTION_MINT_TTL_MS);
     }
 
-    async fn get(&self, token_sig: [u8; 64], now_ms: u64) -> Option<crate::MintedCommunity> {
-        let mut g = self.by_token.lock().await;
+    async fn get(&self, payload_digest: [u8; 32], now_ms: u64) -> Option<crate::MintedCommunity> {
+        let mut g = self.by_payload_digest.lock().await;
         Self::purge_expired(&mut g, now_ms);
-        g.get(&token_sig).map(|(_, m)| m.clone())
+        g.get(&payload_digest).map(|(_, m)| m.clone())
     }
 
-    /// Atomic get-or-insert: if a (fresh) entry exists for `token_sig` it is
+    /// Atomic get-or-insert: if a (fresh) entry exists for `payload_digest` it is
     /// returned and `mint` is discarded; otherwise `mint` is inserted and
-    /// returned. Concurrent redeems for one token therefore converge on a
+    /// returned. Concurrent redeems for one invite therefore converge on a
     /// SINGLE `bootstrap_join` id — closing the get→mint→store overwrite race
     /// that could otherwise cache the id the host rejected (recreating the
     /// zombie loop). Enforces the size cap by evicting the oldest entry.
     async fn get_or_store(
         &self,
-        token_sig: [u8; 64],
+        payload_digest: [u8; 32],
         now_ms: u64,
         mint: crate::MintedCommunity,
     ) -> crate::MintedCommunity {
-        let mut g = self.by_token.lock().await;
+        let mut g = self.by_payload_digest.lock().await;
         Self::purge_expired(&mut g, now_ms);
-        if let Some((_, existing)) = g.get(&token_sig) {
+        if let Some((_, existing)) = g.get(&payload_digest) {
             return existing.clone();
         }
         if g.len() >= REDEMPTION_MINT_MAX_ENTRIES {
@@ -5483,12 +5493,12 @@ impl InFlightRedemptionMints {
                 g.remove(&oldest);
             }
         }
-        g.insert(token_sig, (now_ms, mint.clone()));
+        g.insert(payload_digest, (now_ms, mint.clone()));
         mint
     }
 
-    async fn evict(&self, token_sig: &[u8; 64]) {
-        self.by_token.lock().await.remove(token_sig);
+    async fn evict(&self, payload_digest: &[u8; 32]) {
+        self.by_payload_digest.lock().await.remove(payload_digest);
     }
 }
 
@@ -5934,39 +5944,43 @@ impl CommunitySyncRegistry {
         // guard dropped at end of scope
     }
 
-    /// ZEB-889: return the cached minted redemption for `token_sig`, if a prior
+    /// ZEB-889: return the cached minted redemption for `payload_digest` (see
+    /// `CommunityInvitePayload::redemption_mint_cache_key`), if a prior
     /// (failed-delivery) attempt for this invite stored one and it is still
     /// within the retry window. A retry reuses it so it re-sends the SAME
     /// `bootstrap_join` id and hits the host's `AlreadyKnown`-retransmit path
     /// (which re-delivers the countersign). `now_ms` is wall-time for TTL purge.
     pub async fn get_redemption_mint(
         &self,
-        token_sig: [u8; 64],
+        payload_digest: [u8; 32],
         now_ms: u64,
     ) -> Option<crate::MintedCommunity> {
-        self.in_flight_redemption_mints.get(token_sig, now_ms).await
+        self.in_flight_redemption_mints
+            .get(payload_digest, now_ms)
+            .await
     }
 
-    /// ZEB-889: atomically cache-or-return the minted redemption for `token_sig`.
-    /// Returns the AUTHORITATIVE mint — the freshly-minted `mint` on first store,
-    /// or the already-cached mint if a concurrent redeem for this token won the
-    /// race. Callers MUST use the returned value (not their own `mint`) so all
-    /// concurrent redeems converge on one `bootstrap_join` id.
+    /// ZEB-889: atomically cache-or-return the minted redemption for
+    /// `payload_digest`. Returns the AUTHORITATIVE mint — the freshly-minted
+    /// `mint` on first store, or the already-cached mint if a concurrent redeem
+    /// for this invite won the race. Callers MUST use the returned value (not
+    /// their own `mint`) so all concurrent redeems converge on one
+    /// `bootstrap_join` id.
     pub async fn get_or_store_redemption_mint(
         &self,
-        token_sig: [u8; 64],
+        payload_digest: [u8; 32],
         now_ms: u64,
         mint: crate::MintedCommunity,
     ) -> crate::MintedCommunity {
         self.in_flight_redemption_mints
-            .get_or_store(token_sig, now_ms, mint)
+            .get_or_store(payload_digest, now_ms, mint)
             .await
     }
 
-    /// ZEB-889: drop the cached mint for `token_sig` once the join has committed
-    /// (the invite is burned; no further retry is possible or needed).
-    pub async fn evict_redemption_mint(&self, token_sig: &[u8; 64]) {
-        self.in_flight_redemption_mints.evict(token_sig).await;
+    /// ZEB-889: drop the cached mint for `payload_digest` once the join has
+    /// committed (the invite is burned; no further retry is possible or needed).
+    pub async fn evict_redemption_mint(&self, payload_digest: &[u8; 32]) {
+        self.in_flight_redemption_mints.evict(payload_digest).await;
     }
 
     /// ZEB-805: snapshot every live engine's sync counters for
@@ -8084,7 +8098,7 @@ mod tests {
     #[tokio::test]
     async fn redemption_mint_cache_store_get_evict() {
         let cache = super::InFlightRedemptionMints::default();
-        let sig = [7u8; 64];
+        let sig = [7u8; 32];
         let now = 1_000_000;
         assert!(cache.get(sig, now).await.is_none(), "empty cache misses");
         let m = zeb889_mint_stub(0x11);
@@ -8111,7 +8125,7 @@ mod tests {
     #[tokio::test]
     async fn redemption_mint_cache_keys_are_independent() {
         let cache = super::InFlightRedemptionMints::default();
-        let (a, b) = ([1u8; 64], [2u8; 64]);
+        let (a, b) = ([1u8; 32], [2u8; 32]);
         let now = 1_000_000;
         let (ma, mb) = (zeb889_mint_stub(0xAA), zeb889_mint_stub(0xBB));
         let (ida, idb) = (ma.bootstrap_join.id, mb.bootstrap_join.id);
@@ -8132,7 +8146,7 @@ mod tests {
     #[tokio::test]
     async fn redemption_mint_cache_get_or_store_is_first_wins() {
         let cache = super::InFlightRedemptionMints::default();
-        let sig = [9u8; 64];
+        let sig = [9u8; 32];
         let now = 1_000_000;
         let first = zeb889_mint_stub(0x33);
         let second = zeb889_mint_stub(0x44);
@@ -8158,7 +8172,7 @@ mod tests {
     #[tokio::test]
     async fn redemption_mint_cache_expires_after_ttl() {
         let cache = super::InFlightRedemptionMints::default();
-        let sig = [5u8; 64];
+        let sig = [5u8; 32];
         let t0 = 1_000_000;
         cache.get_or_store(sig, t0, zeb889_mint_stub(0x55)).await;
         // Still present just inside the window.

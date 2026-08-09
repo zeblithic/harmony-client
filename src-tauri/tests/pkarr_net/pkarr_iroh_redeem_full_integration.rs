@@ -2201,6 +2201,11 @@ async fn zeb889_first_attempt_caches_minted_redemption() {
         .await;
 
         let (invite_payload, invite_url, token_sig) = zeb889_build_targeted_invite(&s);
+        // Greptile #644: the cache is keyed by a digest of the whole payload,
+        // not token.sig — mirror the production key here.
+        let cache_key = invite_payload
+            .redemption_mint_cache_key()
+            .expect("payload cache key");
         s.invite_pub.register_invite(&invite_payload).await;
         let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
 
@@ -2214,7 +2219,7 @@ async fn zeb889_first_attempt_caches_minted_redemption() {
         // Precondition: nothing cached yet.
         assert!(
             s.registry_bob
-                .get_redemption_mint(token_sig, now_ms)
+                .get_redemption_mint(cache_key, now_ms)
                 .await
                 .is_none(),
             "precondition: Bob has no cached mint before the first attempt"
@@ -2263,7 +2268,7 @@ async fn zeb889_first_attempt_caches_minted_redemption() {
         // so a subsequent retry can reuse it (the recovery leg this PR enables).
         assert!(
             s.registry_bob
-                .get_redemption_mint(token_sig, now_ms)
+                .get_redemption_mint(cache_key, now_ms)
                 .await
                 .is_some(),
             "ZEB-889: the first attempt must cache its minted redemption for retry reuse"
@@ -2305,6 +2310,11 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
 
         // Targeted invite-only URL (shared builder — same shape as the negative test).
         let (invite_payload, invite_url, token_sig) = zeb889_build_targeted_invite(&s);
+        // Greptile #644: production keys the cache by a digest of the whole
+        // payload, not token.sig — seed/read the cache with the same key.
+        let cache_key = invite_payload
+            .redemption_mint_cache_key()
+            .expect("payload cache key");
 
         // Register the case-A invite so active_handles carries it (burn target).
         s.invite_pub.register_invite(&invite_payload).await;
@@ -2346,7 +2356,7 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
             .unwrap()
             .as_millis() as u64;
         s.registry_bob
-            .get_or_store_redemption_mint(token_sig, seed_now_ms, p1_mint.clone())
+            .get_or_store_redemption_mint(cache_key, seed_now_ms, p1_mint.clone())
             .await;
 
         // 3. Seed Alice's engine with P1 + a genuine CS1 (Alice's JoinCountersign
@@ -2454,7 +2464,7 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
         // pinning the mint / its epoch key material).
         assert!(
             s.registry_bob
-                .get_redemption_mint(token_sig, seed_now_ms)
+                .get_redemption_mint(cache_key, seed_now_ms)
                 .await
                 .is_none(),
             "ZEB-889: the cached mint is evicted once the join commits"
