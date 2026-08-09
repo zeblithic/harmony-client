@@ -37,15 +37,20 @@
 //! # Where the record lands
 //!
 //! `HARMONY_PANIC_LOG` (verbatim) if set, else a per-process file
-//! `<temp_dir>/harmony-panics-<pid>.log`. Records are appended (never
-//! truncated), so a multi-panic abort sequence — the causal panic followed by
-//! the drop-path re-panic — is preserved in order within one process's file.
-//! After a failed sweep, find the aborting process's file with e.g.
+//! `<temp_dir>/harmony-panics-<pid>-<nanos>.log`. The `<nanos>` (process-start
+//! monotonic-ish suffix) makes the default name unique per launch — so a
+//! recycled PID never appends to a stale run's file — and unguessable, so
+//! nothing can pre-create it under our path on a shared box; on Unix it is
+//! created mode `0600` (owner-only). Records are appended (never truncated) and
+//! each open→write→flush is serialized by a process-global lock, so a
+//! multi-panic abort sequence — the causal panic followed by the drop-path
+//! re-panic — is preserved intact and in order within one process's file. After
+//! a failed sweep, find the aborting process's file with e.g.
 //! `grep -l gateway.rs "$TMPDIR"/harmony-panics-*.log`.
 
 use std::any::Any;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Env var naming the capture-log path; its mere presence also force-enables the
@@ -53,6 +58,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const ENV_LOG_PATH: &str = "HARMONY_PANIC_LOG";
 
 static INSTALL: Once = Once::new();
+
+/// Serializes the open→write→flush of one record. `write_all` under `O_APPEND`
+/// is *not* atomic (it may split a multi-line record across `write` calls), so
+/// without this two threads panicking near-simultaneously in the same process
+/// could interleave and corrupt the very backtrace we exist to preserve.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// The default capture-log path, computed once per process and cached. Kept
+/// stable across every panic in the process so a multi-panic abort sequence all
+/// lands in one file.
+static DEFAULT_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Install the durable panic-capture hook exactly once per process.
 ///
@@ -94,16 +110,27 @@ fn should_install() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENV_LOG_PATH).is_some()
 }
 
-/// Capture-log destination: `HARMONY_PANIC_LOG` verbatim if set, else a
-/// **per-process** file under the temp dir. The default is per-pid so two
-/// processes aborting near-simultaneously (routine under nextest's
-/// process-per-test parallelism) cannot interleave — and thereby corrupt —
-/// each other's multi-line backtrace records.
+/// Capture-log destination: `HARMONY_PANIC_LOG` verbatim (caller-managed) if
+/// set, else a cached, per-process default under the temp dir.
 fn log_path() -> PathBuf {
     match std::env::var_os(ENV_LOG_PATH) {
         Some(p) => PathBuf::from(p),
-        None => std::env::temp_dir().join(format!("harmony-panics-{}.log", std::process::id())),
+        None => default_log_path().clone(),
     }
+}
+
+/// The cached default path: `<temp_dir>/harmony-panics-<pid>-<nanos>.log`. The
+/// nanosecond suffix (sampled once, on first use) makes the name unique per
+/// process launch — a recycled PID can't append to a prior run's file — and
+/// unpredictable, so nothing can plant a file/symlink under our path in advance.
+fn default_log_path() -> &'static PathBuf {
+    DEFAULT_LOG_PATH.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("harmony-panics-{}-{nanos}.log", std::process::id()))
+    })
 }
 
 /// A human-readable label for the current thread — the poisoner is on a zenoh
@@ -159,12 +186,27 @@ fn format_record(
 
 /// Append a record to the capture log, creating it if needed and flushing so the
 /// bytes survive an imminent abort.
+///
+/// The whole open→write→flush is held under [`WRITE_LOCK`] so concurrent panics
+/// in the same process cannot interleave (`write_all` is not atomic under
+/// `O_APPEND`). The lock is never held across foreign code, so it cannot be
+/// poisoned in practice — but a hook must never `unwrap`, so a poisoned guard is
+/// recovered rather than re-panicked on. On Unix the file is created `0600`
+/// (owner-only); the mode is honoured only when this call creates the file, so
+/// a caller-managed `HARMONY_PANIC_LOG` target keeps its own permissions.
 fn append_record(path: &Path, record: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let _guard = WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     file.write_all(record.as_bytes())?;
     file.flush()
 }
@@ -218,6 +260,73 @@ mod tests {
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "first\nsecond\n");
+    }
+
+    #[test]
+    fn concurrent_appends_never_interleave() {
+        // The whole point of the write lock: many threads panicking at once must
+        // still each land a *complete*, unspliced multi-line record. Each record
+        // is three lines that share one `{thread}-{seq}` tag (padded so a record
+        // is large enough that an unserialized `write_all` could split it); if
+        // any two records interleaved, the fixed 3-line grouping below would show
+        // mismatched tags.
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("panics.log"));
+        let threads = 8;
+        let writes_each = 25;
+        let pad = "x".repeat(400);
+
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let path = Arc::clone(&path);
+                let pad = pad.clone();
+                std::thread::spawn(move || {
+                    for n in 0..writes_each {
+                        let record = format!("R{t}-{n}-{pad}\nA{t}-{n}-{pad}\nB{t}-{n}-{pad}\n");
+                        append_record(&path, &record).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let contents = std::fs::read_to_string(&*path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            threads * writes_each * 3,
+            "torn or lost writes"
+        );
+        for chunk in lines.chunks(3) {
+            // Drop the leading R/A/B marker; the remaining `{t}-{n}-{pad}` tag
+            // must be identical across all three lines of one record.
+            assert!(chunk[0].starts_with('R'));
+            assert!(chunk[1].starts_with('A'));
+            assert!(chunk[2].starts_with('B'));
+            assert_eq!(&chunk[0][1..], &chunk[1][1..], "interleaved record");
+            assert_eq!(&chunk[1][1..], &chunk[2][1..], "interleaved record");
+        }
+    }
+
+    #[test]
+    fn default_log_path_is_unique_per_process_and_under_temp_dir() {
+        // No `HARMONY_PANIC_LOG` set here (nextest process isolation) → the
+        // cached default is used. It must live under the temp dir and carry both
+        // the pid and a nanosecond suffix so a recycled pid can't collide.
+        let path = default_log_path();
+        assert!(path.starts_with(std::env::temp_dir()));
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.starts_with(&format!("harmony-panics-{}-", std::process::id())),
+            "unexpected default name: {name}"
+        );
+        assert!(name.ends_with(".log"));
+        // Cached: a second call returns the same path.
+        assert_eq!(path, default_log_path());
     }
 
     #[test]
