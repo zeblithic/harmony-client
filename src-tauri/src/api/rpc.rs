@@ -2741,6 +2741,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial] // mutates process-global HARMONY_DATA_DIR (Qodo/CodeAnt #645)
     async fn connectivity_get_identity_discoverable_resolves_default_when_node_stopped() {
         // ZEB-881 / Qodo: with no settings path on NodeState (node stopped /
         // headless pre-init), the getter resolves the persisted settings via the
@@ -2770,6 +2771,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial] // mutates process-global HARMONY_DATA_DIR (Qodo/CodeAnt #645)
     async fn connectivity_set_identity_discoverable_persists_pre_owner() {
         // ZEB-890 (B2): pre-owner / node-stopped there is no live
         // `pkarr_identity_publisher`, but the setter must still PERSIST the

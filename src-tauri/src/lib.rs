@@ -10178,6 +10178,14 @@ pub async fn start_node_inner(
                     }
 
                     // Restore case-B if enabled (connectivity_settings loaded above, hoisted by ZEB-380).
+                    // ZEB-890/ZEB-894: this uses the pre-publisher settings
+                    // snapshot. An opt-out toggled during the boot window (after
+                    // this load, before the publisher is installed at ~13486, so
+                    // the setter can persist but not disable live) leaves a
+                    // transient persisted=OFF / live=publishing that the periodic
+                    // `reconcile_identity_republish` heals within one tick.
+                    // ZEB-894 tracks tightening that window to ~0 with a
+                    // post-install reconcile.
                     if connectivity_settings.identity_discoverable {
                         pkarr_identity_pub.enable().await;
                         tracing::info!(
@@ -10472,12 +10480,16 @@ pub async fn start_node_inner(
                                 //    enable-only form left persisted=OFF /
                                 //    live=publishing with nothing to heal it). The
                                 //    off-executor read + lock live in the helper.
-                                let identity_discoverable = reconcile_identity_republish(
+                                // `None` = the off-executor settings read failed
+                                // and NO enable/disable transition was applied
+                                // (unknown, not OFF) — keep it distinct in the log
+                                // below rather than collapsing it to `false`
+                                // (Qodo #645).
+                                let identity_reconciled = reconcile_identity_republish(
                                     &identity_pub,
                                     connectivity_settings_path,
                                 )
-                                .await
-                                .unwrap_or(false);
+                                .await;
                                 // 3. Community (case C) — re-register under the
                                 //    LIVE epoch key so a post-rotation re-publish
                                 //    advertises the current key (ZEB-597). This is
@@ -10515,7 +10527,7 @@ pub async fn start_node_inner(
                                     .await;
                                 }
                                 tracing::debug!(
-                                    identity = identity_discoverable,
+                                    identity = ?identity_reconciled,
                                     friends = friends_snapshot.len(),
                                     "ZEB-418 P2: routing-record re-publish completed"
                                 );
