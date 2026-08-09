@@ -7,6 +7,7 @@ use ed25519_dalek::Signer;
 use harmony_app::community_invite::{
     canonical_invite_token_bytes, verify_inviter_enrollment, CommunityInvitePayload,
     CommunityInviteVerifyError, InviteEpochSnapshot, InviteToken, MaterializedCommunityState,
+    RedeemInviteError, RedeemInviteErrorCode,
 };
 use harmony_app::community_membership::mint_test_owner;
 use harmony_app::owner_state_types::{Hlc, OwnerAddr, SpaceId};
@@ -72,6 +73,26 @@ fn forged_token_sig_rejected() {
     assert_eq!(
         verify_inviter_enrollment(&payload, NOW_SECS),
         Err(CommunityInviteVerifyError::InviteTokenSigInvalid)
+    );
+}
+
+/// ZEB-892 (C2): the redeem path maps `verify_inviter_enrollment` failures
+/// per-variant via `From<CommunityInviteVerifyError>`. A forged/tampered token
+/// (`InviteTokenSigInvalid`) must surface as `invite_verify_failed`, NOT the
+/// misleading `inviter_enrollment_invalid` — #641 hardcoded the latter at the
+/// production site, leaving the per-variant `From` dead. This drives the REAL
+/// verify function through the exact production mapping.
+#[test]
+fn forged_token_maps_to_invite_verify_failed_not_enrollment() {
+    let inviter = mint_test_owner(0x42);
+    let wrong = mint_test_owner(0x07);
+    let payload = invite_only_payload(inviter.owner, &wrong.device_key, inviter.cert.clone());
+    let err = verify_inviter_enrollment(&payload, NOW_SECS).expect_err("forged token must reject");
+    let mapped = RedeemInviteError::from(err);
+    assert_eq!(
+        mapped.code,
+        RedeemInviteErrorCode::InviteVerifyFailed,
+        "a forged token is a verify failure, not an enrollment-cert problem"
     );
 }
 

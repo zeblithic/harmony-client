@@ -40443,15 +40443,14 @@ where
 
     // ZEB-497: fail fast — verify the inviter's enrollment cert + token sig
     // before reserving an HLC, minting the local bootstrap Join, or any network.
-    crate::community_invite::verify_inviter_enrollment(&payload, wall_now_ms / 1000).map_err(
-        |e| {
-            // ZEB-885: CommunityInviteVerifyError → inviter_enrollment_invalid.
-            RedeemInviteError::new(
-                RedeemInviteErrorCode::InviterEnrollmentInvalid,
-                format!("verify inviter enrollment: {e}"),
-            )
-        },
-    )?;
+    // ZEB-892 (C2): map per-variant via `From<CommunityInviteVerifyError>` — a
+    // forged/tampered token (`InviteTokenSigInvalid`) or an expired invite must
+    // NOT be mislabeled "enrollment cert didn't check out". #641 intended this
+    // but hardcoded `InviterEnrollmentInvalid` here, leaving the per-variant
+    // `From` dead in production (Expired → invite_expired, EnrollmentCert* →
+    // inviter_enrollment_invalid, else → invite_verify_failed).
+    crate::community_invite::verify_inviter_enrollment(&payload, wall_now_ms / 1000)
+        .map_err(RedeemInviteError::from)?;
 
     // 4. ZEB-267: atomic HLC reservation. Replaces the
     //    snapshot-then-release pattern + post-commit advance.
@@ -42318,6 +42317,126 @@ mod redeem_invite_inner_tests {
     /// ChannelCreate events that arrive via Zenoh sync. In this unit test
     /// there is no Zenoh session, so the deferred queue is empty at commit.
     /// The assertion "no pending tx" is a proxy for "commit was called".
+    /// ZEB-892 (C2, CodeRabbit #642): drive the PRODUCTION `redeem_invite_inner`
+    /// with a forged invite token and assert the returned code is
+    /// `InviteVerifyFailed` — NOT the misleading `inviter_enrollment_invalid`.
+    /// This pins that the production verify site (`redeem_invite_inner_with_
+    /// overrides`) routes through the per-variant `From<CommunityInviteVerifyError>`;
+    /// a revert to the old hardcoded-`InviterEnrollmentInvalid` closure would fail
+    /// here, which the lower-level `From` unit test cannot catch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redeem_inner_forged_token_maps_to_invite_verify_failed() {
+        use ed25519_dalek::Signer;
+
+        let fixture = build_redeem_invite_test_fixture().await;
+        let inviter = crate::community_membership::mint_test_owner(0x42);
+        let wrong = crate::community_membership::mint_test_owner(0x07);
+
+        // Forge the token: sign it with a device key other than the one the
+        // inviter's EnrollmentCert enrolls, so `verify_inviter_enrollment`
+        // returns `InviteTokenSigInvalid` (a non-enrollment verify failure).
+        let unsigned = crate::community_invite::InviteToken {
+            inviter: inviter.owner,
+            invitee_hint: None,
+            minted_at: crate::owner_state_types::Hlc {
+                wall_ms: 1_700_000_000_000,
+                logical: 0,
+                device_id: "d".into(),
+            },
+            expires_at: None,
+            sig: [0u8; 64],
+        };
+        let bytes = crate::community_invite::canonical_invite_token_bytes(&unsigned)
+            .expect("canonical token bytes");
+        let sig: [u8; 64] = wrong.device_key.sign(&bytes).to_bytes();
+        let token = crate::community_invite::InviteToken { sig, ..unsigned };
+
+        // `encode_invite_url` requires invite-only payloads to carry an admin
+        // bootstrap Join. The forged token still fails first — the ZEB-497
+        // fail-fast `verify_inviter_enrollment` runs at step 2, before the
+        // bootstrap is ever used — but the invite must encode. (Mirrors the
+        // `admin_bootstrap_join` test helper in community_membership.)
+        let community_id = crate::owner_state_types::SpaceId([0xf3; 16]);
+        let admin_bootstrap = {
+            let bootstrap_payload = crate::community_membership::EventPayload {
+                id: [1u8; 16],
+                community_id,
+                kind: crate::community_membership::MembershipEventKind::Join,
+                actor: inviter.owner,
+                at: crate::owner_state_types::Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "admin".into(),
+                },
+            };
+            let ev =
+                crate::community_membership::sign_event(&bootstrap_payload, &inviter.device_key)
+                    .expect("sign admin bootstrap");
+            crate::community_membership::SignedMembershipEvent {
+                enrollment: Some(inviter.cert.clone()),
+                ..ev
+            }
+        };
+
+        let invite_payload = CommunityInvitePayload {
+            inviter_signer_certs: Vec::new(),
+            community_id,
+            epoch_snapshot: crate::community_invite::InviteEpochSnapshot {
+                epoch: 0,
+                // 92-byte length is enforced by `encode_invite_url`; the content
+                // is never decrypted because the forged token errors first.
+                sealed_epoch_key: vec![0u8; 92],
+                sealed_epoch_keys: Vec::new(),
+                state_snapshot: crate::community_invite::MaterializedCommunityState::default(),
+            },
+            admin_addr: inviter.owner,
+            community_name: "Forged".into(),
+            is_invite_only: true,
+            expires_at: None,
+            invite_token: Some(token),
+            admin_bootstrap: Some(admin_bootstrap),
+            // Presence-only requirement of `encode_invite_url`; a dummy value is
+            // fine because the forged token errors at the ZEB-497 fail-fast
+            // verify (step 2), before admin_identity_pub is ever validated.
+            admin_identity_pub: Some([0u8; 64]),
+            forked_from: None,
+            pre_fork_snapshot: None,
+            inviter_enrollment: Some(inviter.cert.clone()),
+            // Untargeted invite-only requires this (presence-only for encode).
+            untargeted_decrypt_key: Some([0u8; 32]),
+        };
+        let invite_url =
+            crate::community_invite::encode_invite_url(&invite_payload).expect("encode invite url");
+
+        let err = redeem_invite_inner(
+            invite_url,
+            std::sync::Arc::clone(&fixture.crdt_state),
+            std::sync::Arc::clone(&fixture.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            fixture.device_id.clone(),
+            fixture.self_owner,
+            std::sync::Arc::clone(&fixture.signing_key),
+            fixture.enrollment_cert.clone(),
+            std::sync::Arc::clone(&fixture.community_registry),
+            fixture.community_adapter_tx.clone(),
+            None, // transport_epoch_rx
+            std::sync::Arc::clone(&fixture.dm_outbox),
+            std::sync::Arc::clone(&fixture.channel_log_registry),
+            || Ok(()),
+            None, // identity_dir
+        )
+        .await
+        .expect_err("a forged invite token must fail the redeem");
+
+        assert_eq!(
+            err.code,
+            crate::community_invite::RedeemInviteErrorCode::InviteVerifyFailed,
+            "forged token must surface invite_verify_failed via the production \
+             verify site, not inviter_enrollment_invalid; got {:?}",
+            err.code
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn happy_path_no_pending_transaction_after_success() {
         let fixture = build_redeem_invite_test_fixture().await;
@@ -43937,6 +44056,57 @@ mod zeb436_orphan_adoption_tests {
         assert_eq!(
             events_after, 2,
             "adoption must not mint a PendingJoin on top of the two persisted events"
+        );
+    }
+
+    /// ZEB-892 (C3): a malformed invite URL on the iroh wrapper (the primary
+    /// Redeem button the UI drives) must surface `invite_url_malformed` — the
+    /// typed code that tells the user to check their paste — NOT `internal`,
+    /// which #641's iroh inner produced via `format!` → `From<String>` (and
+    /// which, per C1, also suppresses the LAN fallback). Decode is step 1, so
+    /// the connectivity/engine params are never reached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iroh_wrapper_malformed_url_maps_to_invite_url_malformed() {
+        let rig = build_invite_only_orphan_rig(SpaceId([0xf7; 16]), None).await;
+
+        let err = super::connectivity_redeem_invite_iroh_inner(
+            "harmony://invite/@@@not-a-valid-payload@@@".to_string(),
+            None, // pkarr_resolver — never reached (decode fails first)
+            None, // reachability_resolver
+            None, // iroh_endpoint
+            std::sync::Arc::clone(&rig.crdt_state),
+            std::sync::Arc::clone(&rig.hlc_tracker),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            "joiner-dev".to_string(),
+            rig.joiner_self_owner,
+            std::sync::Arc::clone(&rig.signing_key),
+            rig.joiner_cert.clone(),
+            std::sync::Arc::clone(&rig.community_registry),
+            rig.community_adapter_tx.clone(),
+            None, // transport-epoch watch
+            std::sync::Arc::clone(&rig.dm_outbox),
+            std::sync::Arc::clone(&rig.channel_log_registry),
+            None, // sync_engine
+            Some(rig.identity_dir.clone()),
+            |_progress| {},
+            |_nav| {},
+            super::HandshakeDialConfig {
+                connect_timeout: std::time::Duration::from_millis(50),
+                open_bi_timeout: std::time::Duration::from_millis(50),
+                response_read_timeout: std::time::Duration::from_millis(50),
+                write_timeout: std::time::Duration::from_millis(50),
+            },
+            || Ok(()),
+        )
+        .await
+        .expect_err("a malformed invite URL must Err, not Ok");
+
+        assert_eq!(
+            err.code,
+            crate::community_invite::RedeemInviteErrorCode::InviteUrlMalformed,
+            "malformed URL on the iroh path must be invite_url_malformed, not \
+             internal; got {:?}",
+            err.code
         );
     }
 
@@ -62199,8 +62369,18 @@ where
     F: Fn() -> Result<(), RedeemInviteError>,
 {
     // 1. Decode the invite URL.
-    let payload = crate::community_invite::decode_invite_url(&invite_url)
-        .map_err(|e| format!("decode invite URL: {e}"))?;
+    let payload = crate::community_invite::decode_invite_url(&invite_url).map_err(|e| {
+        // ZEB-892 (C3): InviteUrlError → invite_url_malformed, matching the LAN
+        // sibling in `redeem_invite_inner_with_overrides`. A truncated paste on
+        // the primary (iroh) Redeem button must say "check you copied the full
+        // URL", not "bug on our side" — the latter is what `format!` →
+        // `From<String>` → `internal` produced (and `internal` also suppressed
+        // the LAN fallback, per C1's mechanism).
+        RedeemInviteError::new(
+            RedeemInviteErrorCode::InviteUrlMalformed,
+            format!("decode invite URL: {e}"),
+        )
+    })?;
 
     let invite_id = payload
         .invite_token
@@ -62393,7 +62573,12 @@ where
     let rec = resolver
         .resolve_window_freshest_with(&verifying_keys, &verify)
         .await
-        .map_err(|e| format!("pkarr resolve: {e}"))?;
+        // ZEB-892 (C1): a resolver `Err` is a transport-level pkarr failure
+        // (all relays errored) — recoverable via the LAN fallback. Route it
+        // through the typed `From<PkarrError>` → `relays_warming_up` instead of
+        // letting `format!` fall through `From<String>` → `internal`, which
+        // suppressed the "Try via local network" button offline.
+        .map_err(RedeemInviteError::from)?;
     let Some(rec) = rec else {
         return Ok(RedemptionOutcome {
             status: "inviter_unreachable".to_string(),
@@ -62575,6 +62760,14 @@ where
                         }
                     }
                 }
+                // ZEB-892 (CodeAnt #642): a resolver `Err` here folds into
+                // `inviter_unreachable` (below) rather than the initial
+                // resolve's `relays_warming_up`, and that is intentional — we
+                // only reach B4 *after* a confirmed failed dial to the inviter,
+                // so the accurate outcome is "the inviter's endpoint was
+                // unreachable", not "relays are cold". The retry re-resolve
+                // only tries to fetch a *fresher* address; a relay error there
+                // just means we can't, so `inviter_unreachable` stays correct.
                 _ => {
                     tracing::warn!(
                         inviter = %hex::encode(inviter_addr.0),
