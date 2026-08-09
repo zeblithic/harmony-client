@@ -256,11 +256,13 @@ impl InboundAdmission {
     /// the global population cap, taken atomically under the per-source lock so N
     /// concurrent admits cannot overshoot either cap.
     fn try_admit(&self, source: [u8; 32], now_ms: u64) -> Result<InboundPermit, ShedReason> {
-        // Layer 1 — rate shield. Records on admit; holds no permit. Recording
-        // before the inner caps is deliberate: a source hammering at its
-        // concurrency cap SHOULD burn rate budget, and an honest source hitting
-        // rare global saturation loses a negligible slice of a generous budget.
-        if !self.lock_rate().admit(source, now_ms) {
+        // Layer 1 — rate shield PEEK (non-recording). The token is committed only
+        // after the capacity gates below also pass (see the commit call at the
+        // end), so a connection shed by the per-source or global cap does NOT
+        // spend the source's rate budget. This matters inside this fix's own
+        // threat model: a Sybil that saturates the global cap must not also cause
+        // honest peers' retries to be rate-punished for tunnels they never got.
+        if !self.lock_rate().would_admit(source, now_ms) {
             return Err(ShedReason::Rate);
         }
         // Layer 2 — per-source concurrency + global population, atomic under the
@@ -274,6 +276,14 @@ impl InboundAdmission {
             .try_acquire_owned()
             .map_err(|_| ShedReason::Population)?;
         *counts.entry(source).or_insert(0) += 1;
+        drop(counts);
+        // Commit the rate token now that a slot is actually secured. The
+        // peek→commit is not one atomic step, so N concurrent admits can overshoot
+        // the window by up to N — acceptable for a soft DoS-hygiene bound (same
+        // posture as `open_join_admit`'s ZEB-865 `would_admit`→`admit`
+        // composition). `admit` here always records because the peek just passed
+        // and no held permit consumes rate budget.
+        self.lock_rate().admit(source, now_ms);
         Ok(InboundPermit {
             _global: global,
             per_source: Arc::clone(&self.per_source),
@@ -552,6 +562,86 @@ mod tests {
         assert_eq!(
             admission.note_rejection(ShedReason::Population, REJECT_WARN_INTERVAL_MS + 1),
             None,
+        );
+    }
+
+    // ZEB-758 (Qodo): production wires the limiter through `InboundAdmission::new()`
+    // (the default constants), while every other test uses the `with_caps` tuning
+    // constructor — so a regression that mis-wires `new()`'s defaults would ship
+    // green. This asserts the production defaults themselves enforce both caps.
+    #[test]
+    fn production_defaults_enforce_the_declared_caps() {
+        let admission = InboundAdmission::new();
+
+        // Global default: distinct single-permit sources (each well under the
+        // per-source cap) fill MAX_INBOUND_TUNNEL_SESSIONS; the next distinct
+        // source is shed on the global population default. now_ms fixed and each
+        // source admits once (<= the rate cap) so the rate shield never interferes.
+        let mut held: Vec<InboundPermit> = Vec::new();
+        for i in 0..MAX_INBOUND_TUNNEL_SESSIONS {
+            let key = src(u8::try_from(i).expect("global cap fits u8"));
+            held.push(
+                admission
+                    .try_admit(key, 0)
+                    .unwrap_or_else(|_| panic!("source {i} admitted within the global default")),
+            );
+        }
+        assert!(
+            matches!(
+                admission.try_admit(src(200), 0),
+                Err(ShedReason::Population)
+            ),
+            "MAX_INBOUND_TUNNEL_SESSIONS distinct sources saturate the global default"
+        );
+        drop(held);
+
+        // Per-source default: with the global cap freed, one source may hold
+        // exactly PER_SOURCE_INBOUND_TUNNEL_MAX live tunnels, then sheds PerSource.
+        let s = src(201);
+        let mut mine: Vec<InboundPermit> = Vec::new();
+        for i in 0..PER_SOURCE_INBOUND_TUNNEL_MAX {
+            mine.push(
+                admission.try_admit(s, 0).unwrap_or_else(|_| {
+                    panic!("permit {i} within the per-source default admitted")
+                }),
+            );
+        }
+        assert!(
+            matches!(admission.try_admit(s, 0), Err(ShedReason::PerSource)),
+            "one source is capped at PER_SOURCE_INBOUND_TUNNEL_MAX by the production default"
+        );
+    }
+
+    // ZEB-758 (CodeAnt): a connection shed by a CAPACITY gate (per-source or
+    // global) must NOT spend the source's rate budget — the rate token is
+    // committed only after a slot is secured. Otherwise an honest peer retrying
+    // while the host is saturated (e.g. under a Sybil attack this fix targets)
+    // would be rate-shed for tunnels it never got.
+    #[test]
+    fn capacity_shed_does_not_spend_the_rate_budget() {
+        // Global cap 1, generous per-source, rate cap 2/window. Source A holds the
+        // only global slot; source B is repeatedly shed on Population.
+        let admission = InboundAdmission::with_caps(1, 8, 2, 60_000);
+        let a = admission
+            .try_admit(src(1), 0)
+            .expect("A takes the only global slot");
+
+        // Five Population-sheds from B. If capacity-sheds recorded rate tokens, B
+        // would flip to Err(Rate) on the 3rd attempt (cap 2); it must stay
+        // Population — its budget is untouched.
+        for i in 0..5 {
+            assert!(
+                matches!(admission.try_admit(src(2), 0), Err(ShedReason::Population)),
+                "attempt {i} from B is shed on capacity, never on rate"
+            );
+        }
+
+        // Free the slot: B is admitted immediately, proving its rate budget was
+        // never spent by the capacity-sheds.
+        drop(a);
+        assert!(
+            admission.try_admit(src(2), 0).is_ok(),
+            "B is admitted as soon as a slot frees — capacity-sheds never spent its rate budget"
         );
     }
 }
