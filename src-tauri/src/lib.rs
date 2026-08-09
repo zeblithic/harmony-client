@@ -9896,6 +9896,13 @@ pub async fn start_node_inner(
                     let fleet_net_snapshot_for_blob = std::sync::Arc::clone(&fleet_net_snapshot);
                     let fleet_vk_map_for_blob = std::sync::Arc::clone(&fleet_vk_map);
                     let device_id_for_blob = device_id.clone();
+                    // ZEB-891 (CodeRabbit/Qodo #646): edge-trigger the over-budget
+                    // warning — warn once on the false→true transition and re-arm
+                    // on recovery, so a persistent misconfig doesn't re-log every
+                    // publish cycle × record type (this `blob_builder` is a
+                    // per-cycle `Fn` invoked once per record type).
+                    let reachability_over_budget_warned =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let blob_builder: std::sync::Arc<dyn Fn() -> Vec<u8> + Send + Sync> =
                         std::sync::Arc::new(move || {
                             let Some(ref ep) = ep_for_blob else {
@@ -10011,19 +10018,29 @@ pub async fn start_node_inner(
                                 // exceed the cap, so no trim can recover it. This
                                 // record fails `RecordTooLarge` every publish cycle,
                                 // leaving the node silently undiscoverable cross-WAN.
-                                // Surface it above debug! so an operator sees the
-                                // misconfiguration (typically a too-long relay URL).
-                                tracing::warn!(
-                                    home_relay_url_len = payload.home_relay_url.len(),
-                                    butler_entries = payload.butler_set.len(),
-                                    max_record_cbor_bytes =
-                                        crate::reachability_bound::MAX_RECORD_CBOR_BYTES,
-                                    "ZEB-891: reachability record still exceeds the pkarr size cap \
-                                     after trimming ALL direct addresses — its fixed fields (relay \
-                                     URL + butler set) alone are too large. It will fail to publish \
-                                     (RecordTooLarge) every cycle, leaving this node silently \
-                                     undiscoverable cross-WAN. Shorten the configured relay URL."
-                                );
+                                // Edge-triggered (warn once per false→true
+                                // transition) so a persistent misconfig doesn't
+                                // flood the log every cycle × record type.
+                                if !reachability_over_budget_warned
+                                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    tracing::warn!(
+                                        home_relay_url_len = payload.home_relay_url.len(),
+                                        butler_entries = payload.butler_set.len(),
+                                        max_record_cbor_bytes =
+                                            crate::reachability_bound::MAX_RECORD_CBOR_BYTES,
+                                        "ZEB-891: reachability record still exceeds the pkarr size \
+                                         cap after trimming ALL direct addresses — its fixed fields \
+                                         (relay URL + butler set) alone are too large. It will fail \
+                                         to publish (RecordTooLarge) every cycle, leaving this node \
+                                         silently undiscoverable cross-WAN. Shorten the configured \
+                                         relay URL or reduce the butler/fleet set."
+                                    );
+                                }
+                            } else {
+                                // Under budget: re-arm so a later breakage warns again.
+                                reachability_over_budget_warned
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
                             }
                             let mut out = Vec::new();
                             if ciborium::into_writer(&payload, &mut out).is_err() {
