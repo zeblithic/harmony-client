@@ -623,6 +623,7 @@
     role="dialog"
     aria-modal="true"
     aria-label="Community members"
+    tabindex="-1"
     onclick={(e) => { if (e.target === e.currentTarget) communityMembersPanelOpen = false; }}
   >
     <div class="community-members-overlay-inner">

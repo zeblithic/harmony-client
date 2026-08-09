@@ -192,12 +192,11 @@
   }
 </script>
 
-<!-- The row carries an Escape-to-close handler for the kebab menu; it stays a
-     listitem (not a button), so suppress the interaction-on-noninteractive
-     warnings for the keydown. `list-style: none` on the parent strips implicit
-     list semantics in Safari + VoiceOver, so the role is explicit. -->
-<!-- svelte-ignore a11y_no_static_element_interactions a11y_no_noninteractive_element_interactions -->
-<li class="member-row" role="listitem" onkeydown={handleKeydown}>
+<!-- `list-style: none` on the parent strips implicit list semantics in Safari +
+     VoiceOver, so the listitem role is explicit. The Escape-to-close-kebab
+     keydown lives on the interactive kebab-wrapper below (not this listitem), so
+     the row stays a pure listitem with no listener on a noninteractive element. -->
+<li class="member-row" role="listitem">
   <span
     class="presence-dot"
     class:online
@@ -228,7 +227,7 @@
   <span class="joined-date">{joinedDate}</span>
 
   {#if actions.length > 0}
-    <div class="kebab-wrapper">
+    <div class="kebab-wrapper" role="presentation" onkeydown={handleKeydown}>
       <button
         type="button"
         class="kebab-btn"
