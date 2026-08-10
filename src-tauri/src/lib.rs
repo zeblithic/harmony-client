@@ -61533,6 +61533,61 @@ pub struct RedemptionOutcome {
     /// community (`status` ∈ `"joined" | "join_failed" |
     /// "pkarr_resolved_no_handshake"`).
     pub community_id: Option<String>,
+    /// ZEB-902: for a `"joined"` outcome, whether the join landed as a
+    /// *pending* member — a deposited PendingJoin still awaiting the admin's
+    /// countersign — rather than a fully-ratified member. Carried straight
+    /// from `dto.pending` (the same flag already forwarded to the nav node
+    /// and surfaced by the LAN redeem path, ZEB-254). Always `false` for the
+    /// non-`"joined"` statuses (no membership landed). Lets
+    /// `RedeemInviteDialog` show an honest terminal state ("Join request
+    /// sent — unlocks once the admin approves") instead of a flat "Joined ✓".
+    pub pending: bool,
+}
+
+impl RedemptionOutcome {
+    /// The inviter was not reached / could not be verified — no membership
+    /// landed (`community_id` is `None`, `pending` is definitionally
+    /// `false`).
+    fn unreachable() -> Self {
+        Self {
+            status: "inviter_unreachable".to_string(),
+            community_id: None,
+            pending: false,
+        }
+    }
+
+    /// Open invite carrying no `admin_identity_pub` binding — case-A
+    /// discovery is not applicable. No membership landed.
+    fn missing_admin_identity_pub() -> Self {
+        Self {
+            status: "missing_admin_identity_pub".to_string(),
+            community_id: None,
+            pending: false,
+        }
+    }
+
+    /// The inviter WAS reached and delivered a valid countersign, but the
+    /// local `redeem_invite_inner_with_overrides` failed. No membership
+    /// landed (`pending` is `false`); `community_id` is carried so the UI can
+    /// name the community.
+    fn join_failed(community_id: String) -> Self {
+        Self {
+            status: "join_failed".to_string(),
+            community_id: Some(community_id),
+            pending: false,
+        }
+    }
+
+    /// The join landed. `pending` distinguishes a fully-ratified member
+    /// (`false`) from a deposited PendingJoin awaiting the admin's countersign
+    /// (`true`) — carried straight from `dto.pending`.
+    fn joined(community_id: String, pending: bool) -> Self {
+        Self {
+            status: "joined".to_string(),
+            community_id: Some(community_id),
+            pending,
+        }
+    }
 }
 
 /// Stage of an in-flight cross-WAN invite redemption, emitted from
@@ -61736,10 +61791,7 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         dm_outbox,
     )
     else {
-        return Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        });
+        return Ok(RedemptionOutcome::unreachable());
     };
 
     // ZEB-339: the self-Join / PendingJoin minted on this iroh-handshake path
@@ -62628,10 +62680,7 @@ where
                     parent_id: None,
                     pending: Some(dto.pending),
                 });
-                Ok(RedemptionOutcome {
-                    status: "joined".to_string(),
-                    community_id: Some(dto.community_id),
-                })
+                Ok(RedemptionOutcome::joined(dto.community_id, dto.pending))
             }
             Err(e) => {
                 tracing::warn!(
@@ -62639,47 +62688,31 @@ where
                     community_id = %hex::encode(payload.community_id.0),
                     "ZEB-436: local adoption redeem failed"
                 );
-                Ok(RedemptionOutcome {
-                    status: "join_failed".to_string(),
-                    community_id: Some(hex::encode(payload.community_id.0)),
-                })
+                Ok(RedemptionOutcome::join_failed(hex::encode(
+                    payload.community_id.0,
+                )))
             }
         };
     }
 
     // 2. Case-A keying material guards.
     let Some(ref token) = payload.invite_token else {
-        return Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        });
+        return Ok(RedemptionOutcome::unreachable());
     };
     let Some(admin_id_pub) = payload.admin_identity_pub else {
-        return Ok(RedemptionOutcome {
-            status: "missing_admin_identity_pub".to_string(),
-            community_id: None,
-        });
+        return Ok(RedemptionOutcome::missing_admin_identity_pub());
     };
 
     // 3. Acquire the resolvers + iroh endpoint.
     let Some(resolver) = pkarr_resolver else {
-        return Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        });
+        return Ok(RedemptionOutcome::unreachable());
     };
     let Some(reachability_resolver) = reachability_resolver else {
-        return Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        });
+        return Ok(RedemptionOutcome::unreachable());
     };
     let Some(iroh_endpoint) = iroh_endpoint else {
         // No iroh endpoint = no way to dial; surface as unreachable.
-        return Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        });
+        return Ok(RedemptionOutcome::unreachable());
     };
 
     // 4. Derive 3-epoch tolerance window of case-A keys.
@@ -62728,10 +62761,7 @@ where
         // suppressed the "Try via local network" button offline.
         .map_err(RedeemInviteError::from)?;
     let Some(rec) = rec else {
-        return Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        });
+        return Ok(RedemptionOutcome::unreachable());
     };
 
     // 7. Decode the inner routing payload.
@@ -62927,10 +62957,7 @@ where
         }
     }
     let Some(conn) = conn else {
-        return Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        });
+        return Ok(RedemptionOutcome::unreachable());
     };
     let (mut send, mut recv) =
         match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
@@ -62942,10 +62969,7 @@ where
                     "ZEB-325 Phase 2c option A: open_bi failed"
                 );
                 conn.close(0u32.into(), b"open_bi-failed");
-                return Ok(RedemptionOutcome {
-                    status: "inviter_unreachable".to_string(),
-                    community_id: None,
-                });
+                return Ok(RedemptionOutcome::unreachable());
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -62954,10 +62978,7 @@ where
                     "ZEB-325 Phase 2c option A: open_bi timeout"
                 );
                 conn.close(0u32.into(), b"open_bi-timeout");
-                return Ok(RedemptionOutcome {
-                    status: "inviter_unreachable".to_string(),
-                    community_id: None,
-                });
+                return Ok(RedemptionOutcome::unreachable());
             }
         };
 
@@ -63135,10 +63156,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request length-prefix write failed"
             );
             conn.close(0u32.into(), b"request-write-failed");
-            return Ok(RedemptionOutcome {
-                status: "inviter_unreachable".to_string(),
-                community_id: None,
-            });
+            return Ok(RedemptionOutcome::unreachable());
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -63146,10 +63164,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request length-prefix write timeout"
             );
             conn.close(0u32.into(), b"write-timeout");
-            return Ok(RedemptionOutcome {
-                status: "inviter_unreachable".to_string(),
-                community_id: None,
-            });
+            return Ok(RedemptionOutcome::unreachable());
         }
     }
     let write_body = async {
@@ -63165,10 +63180,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request body write failed"
             );
             conn.close(0u32.into(), b"request-write-failed");
-            return Ok(RedemptionOutcome {
-                status: "inviter_unreachable".to_string(),
-                community_id: None,
-            });
+            return Ok(RedemptionOutcome::unreachable());
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -63176,10 +63188,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request body write timeout"
             );
             conn.close(0u32.into(), b"write-timeout");
-            return Ok(RedemptionOutcome {
-                status: "inviter_unreachable".to_string(),
-                community_id: None,
-            });
+            return Ok(RedemptionOutcome::unreachable());
         }
     }
     // ZEB-325 PR #159 R4-1 (CodeRabbit MAJOR): normalize send.finish()
@@ -63193,10 +63202,7 @@ where
             "ZEB-325 Phase 2c option A: handshake send.finish() failed"
         );
         conn.close(0u32.into(), b"send-finish-failed");
-        return Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        });
+        return Ok(RedemptionOutcome::unreachable());
     }
 
     // Stage 4/5: `awaiting_countersig` — emitted BEFORE the read so
@@ -63246,10 +63252,7 @@ where
                 // released. CONNECTION_CLOSE lets the peer release
                 // immediately.
                 conn.close(0u32.into(), b"response-read-failed");
-                return Ok(RedemptionOutcome {
-                    status: "inviter_unreachable".to_string(),
-                    community_id: None,
-                });
+                return Ok(RedemptionOutcome::unreachable());
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -63257,10 +63260,7 @@ where
                     "ZEB-325 Phase 2c option A: handshake response timeout (read)"
                 );
                 conn.close(0u32.into(), b"response-read-timeout");
-                return Ok(RedemptionOutcome {
-                    status: "inviter_unreachable".to_string(),
-                    community_id: None,
-                });
+                return Ok(RedemptionOutcome::unreachable());
             }
         };
 
@@ -63270,10 +63270,7 @@ where
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "ZEB-325 Phase 2c option A: response CBOR decode failed");
-                return Ok(RedemptionOutcome {
-                    status: "inviter_unreachable".to_string(),
-                    community_id: None,
-                });
+                return Ok(RedemptionOutcome::unreachable());
             }
         };
     // Defensive: ensure it's a JoinCountersign for our bootstrap_join.
@@ -63286,17 +63283,11 @@ where
         tracing::warn!(
             "ZEB-325 Phase 2c option A: response is not a JoinCountersign for our bootstrap_join.id"
         );
-        return Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        });
+        return Ok(RedemptionOutcome::unreachable());
     }
     if countersign.community_id != minted.community_id {
         tracing::warn!("ZEB-325 Phase 2c option A: countersign community_id mismatch");
-        return Ok(RedemptionOutcome {
-            status: "inviter_unreachable".to_string(),
-            community_id: None,
-        });
+        return Ok(RedemptionOutcome::unreachable());
     }
 
     // Cleanly close the iroh connection. The acceptor's
@@ -63425,10 +63416,7 @@ where
                 parent_id: None,
                 pending: Some(dto.pending),
             });
-            Ok(RedemptionOutcome {
-                status: "joined".to_string(),
-                community_id: Some(dto.community_id),
-            })
+            Ok(RedemptionOutcome::joined(dto.community_id, dto.pending))
         }
         Err(e) => {
             // ZEB-325 PR #159 F1: distinguish post-handshake local
@@ -63449,10 +63437,9 @@ where
                 "ZEB-325 Phase 2c option A: redeem_invite_inner_with_overrides failed \
                  after iroh handshake countersign delivery"
             );
-            Ok(RedemptionOutcome {
-                status: "join_failed".to_string(),
-                community_id: Some(hex::encode(payload.community_id.0)),
-            })
+            Ok(RedemptionOutcome::join_failed(hex::encode(
+                payload.community_id.0,
+            )))
         }
     }
 }

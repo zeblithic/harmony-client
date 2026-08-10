@@ -51,6 +51,12 @@
   // status branches (plain-language copy, no code to show).
   let irohErrorDetail = $state<{ code: string; raw: string } | null>(null);
   let showFallbackButton = $state(false);
+  // ZEB-902: a `joined` outcome may actually be a deposited PendingJoin —
+  // the join landed locally but is still awaiting the admin's countersign
+  // (the inviter was slow/unreachable). When true, the terminal state shows
+  // an honest "Join request sent — unlocks once the admin approves" instead
+  // of a flat "Joined ✓", mirroring the LAN redeem path's copy (ZEB-254).
+  let irohJoinedPending = $state(false);
   /**
    * ZEB-325 Phase 2c: handle for the post-`joined` dismiss timer so it can
    * be cancelled if the dialog is torn down before it fires.
@@ -156,6 +162,7 @@
     irohError = null;
     irohErrorDetail = null;
     showFallbackButton = false;
+    irohJoinedPending = false;
     let suppressFinally = false;
     try {
       const outcome = await redeemInviteIroh(trimmed);
@@ -176,6 +183,14 @@
         // progress row (`{#if irohPending && irohStage}`) stays visible
         // and Cancel stays disabled; the timer clears both before firing
         // `onCancel`.
+        //
+        // ZEB-902: carry the pending flag so the terminal label is honest.
+        // A deposited PendingJoin (awaiting the admin's countersign — e.g.
+        // the inviter was slow/unreachable at redeem time) is not the same
+        // as a fully-ratified member, even though both land the community
+        // locally. `outcome.pending` is absent on older payloads → treat as
+        // a full join (the prior behaviour).
+        irohJoinedPending = outcome.pending === true;
         irohStage = 'joined';
         suppressFinally = true;
         joinedDismissTimer = setTimeout(() => {
@@ -301,7 +316,13 @@
   {#if irohPending && irohStage}
     <div class="pending-row" data-testid="iroh-progress">
       <div class="spinner" role="status" aria-label="Connecting via network"></div>
-      <span data-testid="iroh-stage-label">{STAGE_LABELS[irohStage]}</span>
+      <!-- ZEB-902: a pending `joined` (deposited PendingJoin awaiting the
+           admin's countersign) gets an honest label instead of "Joined ✓". -->
+      <span data-testid="iroh-stage-label">
+        {irohStage === 'joined' && irohJoinedPending
+          ? 'Join request sent ✓ — unlocks once the admin approves'
+          : STAGE_LABELS[irohStage]}
+      </span>
     </div>
   {/if}
 
