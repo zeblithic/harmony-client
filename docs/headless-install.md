@@ -510,48 +510,53 @@ Beyond the RPC surface: `GET /v1/status` (liveness + identity + uptime),
 > channel verbs like `list_channel_messages` do error (`no engine for …`) —
 > there the missing engine is the whole request.
 
-> **`add_friend_by_key` needs the TARGET to be discoverable, and that is off
-> by default.** Case-B — the public identity slot this verb resolves against
-> — is opt-in. A fresh node publishes case-C (community) and case-D
-> (friend-private) automatically, so it looks like it is publishing; it is,
-> just not the slot first contact reads. Dialling an opted-out node returns a
-> bare `unreachable`, which is the same answer you get for offline, wrong
-> key, or a broken DHT.
+> **`add_friend_by_key` needs the TARGET to be discoverable — which is now ON
+> by default (ZEB-881), but can be turned off.** Case-B — the public identity
+> slot this verb resolves against — publishes automatically for a fresh
+> identity, so first contact works out of the box. A node whose operator
+> explicitly disabled discoverability (or one still in the fail-closed
+> untrusted-state posture) does not publish case-B; dialling it returns a bare
+> `unreachable`, the same answer you get for offline, wrong key, or a broken
+> DHT.
 >
-> On the **target** node:
+> To confirm a target is reachable (or diagnose an `unreachable`):
 >
 > ```bash
-> harmony-app api --profile <name> connectivity_set_identity_discoverable '{"enabled": true}'
 > harmony-app api --profile <name> connectivity_pkarr_publication_status '{}'
 > #   → { "identityActive": true, ... }   ← the direct answer
+> # only if it was turned off:
+> harmony-app api --profile <name> connectivity_set_identity_discoverable '{"enabled": true}'
 > ```
 >
 > `identityActive: false` means no dialler can find you, whatever they do.
-> The node also states this at boot now — grep the log for `ZEB-794`.
+> The node also states its discoverability at boot — grep the log for `ZEB-794`.
 >
-> **The friend-token path does not need any of this.** `generate_friend_token`
+> **The friend-token path needs no discoverability at all.** `generate_friend_token`
 > publishes case-A as part of minting the token, so
-> `generate_friend_token` → `redeem_friend_token` works against a node that
-> has never enabled discoverability. If you only need the two nodes to become
-> friends, that path has fewer preconditions.
+> `generate_friend_token` → `redeem_friend_token` works even against a node
+> whose discoverability was turned off. If you only need the two nodes to
+> become friends, that path has the fewest preconditions.
 
-> **A freshly-minted identity is a clean slate for privacy posture (ZEB-796).**
-> `mint_owner_identity` now resets the four connectivity privacy/trust toggles
-> — `identity_discoverable` (→ OFF), `friend_auto_accept_known`,
-> `presence_invisible`, `peer_intro_policy` — to their product first-run
-> defaults, so a re-minted identity does **not** inherit the previous
-> identity's discoverability. The machine's relay pool (`relays` /
-> `iroh_relays`) is operational infra and **persists** across a mint.
+> **A freshly-minted identity starts from the product privacy defaults
+> (ZEB-796 + ZEB-881).** `mint_owner_identity` normalizes the four connectivity
+> privacy/trust toggles — `identity_discoverable` (→ **ON**),
+> `friend_auto_accept_known`, `presence_invisible`, `peer_intro_policy` — to
+> their product first-run defaults, so a re-minted identity neither inherits the
+> previous identity's posture nor drops into the fail-closed (untrusted-state)
+> posture: a deliberate mint is treated as a fresh install, and discoverable-ON
+> is what makes first cross-WAN contact work (ZEB-881). The machine's relay pool
+> (`relays` / `iroh_relays`) is operational infra and **persists** across a mint.
 >
 > This matters when you use "mint a fresh profile" as a test control:
 > `connectivity-settings.json` is keyed to the app-data dir, not the identity,
-> so *before* ZEB-796 it outlived the identity — a 2-minute-old identity could
-> read `identity_discoverable: true` inherited from a prior one (this produced
-> a false conclusion during the ZEB-770 exercise: `enrolledAt` dates the
-> *identity*, but the flag lived in a longer-lived file). Post-ZEB-796 a fresh
-> mint reads `false` unless you explicitly re-enable it, so it is again a valid
-> clean-slate control **for discoverability** — but remember relays are
-> deliberately carried over.
+> so it outlives the identity. Pre-ZEB-796 a new identity inherited whatever
+> flag the file already held (this produced a false conclusion during the
+> ZEB-770 exercise: `enrolledAt` dates the *identity*, but the flag lived in a
+> longer-lived file). Now a fresh mint deterministically reads
+> `identity_discoverable: true` — a valid clean-slate control, but the clean
+> state is **discoverable ON**, so to exercise the opted-out path you must
+> disable it explicitly after minting. Relays are deliberately carried over
+> either way.
 
 > **Sharing files: `grant_read` requires an Active friend.** Grants deliver
 > over the friend transport, so sharing with someone you merely share a
