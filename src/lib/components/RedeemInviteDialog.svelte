@@ -167,29 +167,30 @@
     try {
       const outcome = await redeemInviteIroh(trimmed);
       if (outcome.status === 'joined') {
-        // ZEB-325 Phase 2c: full handshake completed (pkarr resolve →
-        // iroh connect → PendingJoin → counter-signed Join applied). The
-        // backend has already mutated community state and (per PR #159
-        // R3-1) emits the same `nav-updated` event the Reticulum
-        // `redeem_invite` IPC emits, so the join is visible in the
-        // sidebar without any frontend-side refresh. Show the
-        // "Joined ✓" success label briefly, then dismiss the dialog
-        // via `onCancel` — same end state as the Reticulum path,
-        // which closes via the parent's `onSubmit` handler after
-        // `communityService.redeemInvite` resolves (see App.svelte
-        // ~line 1762).
+        // ZEB-325 Phase 2c / ZEB-902: `status === 'joined'` means the join
+        // landed and the community is now visible locally. That is EITHER a
+        // fully counter-signed member OR (when `outcome.pending`, see below) a
+        // deposited PendingJoin still awaiting the admin's countersign — e.g.
+        // the inviter was slow/unreachable at redeem time. Either way the
+        // backend has already mutated community state and (per PR #159 R3-1)
+        // emits the same `nav-updated` event the Reticulum `redeem_invite` IPC
+        // emits, so the join is visible in the sidebar without any
+        // frontend-side refresh. Show the terminal success label briefly —
+        // "Joined ✓" for a full join, or the honest "Join request sent …"
+        // affirmation for a pending join — then dismiss the dialog via
+        // `onCancel`, the same end state as the Reticulum path (which closes
+        // via the parent's `onSubmit` handler after
+        // `communityService.redeemInvite` resolves, see App.svelte ~line 1762).
         //
         // Keep `irohPending` true across the display window so the
         // progress row (`{#if irohPending && irohStage}`) stays visible
         // and Cancel stays disabled; the timer clears both before firing
         // `onCancel`.
         //
-        // ZEB-902: carry the pending flag so the terminal label is honest.
-        // A deposited PendingJoin (awaiting the admin's countersign — e.g.
-        // the inviter was slow/unreachable at redeem time) is not the same
-        // as a fully-ratified member, even though both land the community
-        // locally. `outcome.pending` is absent on older payloads → treat as
-        // a full join (the prior behaviour).
+        // `outcome.pending` distinguishes the two: a deposited PendingJoin is
+        // not a fully-ratified member even though both land the community
+        // locally. It is absent on older payloads → treat as a full join
+        // (the prior behaviour).
         irohJoinedPending = outcome.pending === true;
         irohStage = 'joined';
         suppressFinally = true;
