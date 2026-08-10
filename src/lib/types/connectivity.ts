@@ -111,6 +111,17 @@ export interface RedemptionOutcome {
     | 'fallback_reticulum'
     | string;
   communityId?: string;
+  /**
+   * ZEB-902: for a `'joined'` outcome, whether the join landed as a *pending*
+   * member (a deposited PendingJoin still awaiting the admin's countersign)
+   * rather than a fully-ratified member. Mirrors the `dto.pending` flag the
+   * LAN redeem path already surfaces (ZEB-254). Always `false`/absent for the
+   * non-`'joined'` statuses. Optional for defensive parsing (older payloads /
+   * mocks) — treat missing as `false`. Lets the dialog show an honest
+   * terminal state ("Join request sent — unlocks once the admin approves")
+   * instead of a flat "Joined ✓".
+   */
+  pending?: boolean;
 }
 
 /**

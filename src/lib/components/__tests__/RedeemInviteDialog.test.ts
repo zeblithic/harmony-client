@@ -422,6 +422,46 @@ describe('RedeemInviteDialog', () => {
       vi.useRealTimers();
     }
   });
+
+  it('shows "Join request sent" (not "Joined ✓") when iroh redeem returns status="joined" with pending=true', async () => {
+    // ZEB-902: a `joined` outcome can be a deposited PendingJoin still
+    // awaiting the admin's countersign (the inviter was slow/unreachable at
+    // redeem time). The community lands locally, but the terminal label must
+    // be honest — "Join request sent — unlocks once the admin approves" —
+    // mirroring the LAN redeem path's pending copy (ZEB-254), NOT a flat
+    // "Joined ✓" that overstates the state.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const onCancel = vi.fn();
+      mockInvoke.mockImplementation((cmd: string) => {
+        if (cmd === 'connectivity_redeem_invite_iroh') {
+          return Promise.resolve({ status: 'joined', communityId: 'abc123', pending: true });
+        }
+        return Promise.resolve(null);
+      });
+
+      const { getByTestId, getByPlaceholderText } = render(RedeemInviteDialog, {
+        props: { onSubmit: vi.fn(), onCancel, joinedDismissDelayMs: 50 },
+      });
+
+      const input = getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+      await fireEvent.input(input, { target: { value: 'harmony://invite/v1?ci=x' } });
+      await fireEvent.click(getByTestId('iroh-redeem-btn'));
+
+      // The honest pending-affirmation label appears — and NOT "Joined ✓".
+      await waitFor(() => {
+        const label = getByTestId('iroh-stage-label');
+        expect(label.textContent).toContain('Join request sent');
+        expect(label.textContent).not.toContain('Joined ✓');
+      });
+
+      // Still auto-dismisses via the same timer path as a full join.
+      await vi.advanceTimersByTimeAsync(50);
+      expect(onCancel).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
