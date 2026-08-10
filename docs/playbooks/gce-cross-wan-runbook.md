@@ -174,6 +174,23 @@ the blob. Filed as **ZEB-705**; its fix (bounded fetch retry + ROSTER
 barrier) makes this window deterministic. Session cost ≈$0.15 (VM up ~30 min,
 stop-not-delete). Artifacts: `~/.cache/gce-xwan-logs/20260717-101952/`.
 
+**2026-08-10 — 0.2.5 RC cross-WAN validation** (`c438ca3e`, VM recreated from scratch
+after a prior full delete; cold build **28m09s**). Purpose: prove the flows 0.2.4 shipped
+broken work cross-WAN before cutting 0.2.5. **T1 PASS** (first-contact attempt 1). **T2:
+DMs both directions PASS; the both-sides-`direct` assertion FAILED** — root-caused live as
+a **snapshot-timing artifact, not a transport failure**: the assert snapshots ~3 min after
+the last DM, by which point the home-NAT side's peer entry has idle-evicted (empty `peers`
+array) while GCE still held Koya `direct`. Re-probing the peer table **during active
+traffic** showed `direct` in open (8/8) and **filtered (5/8, 0 relay — zero-ingress ⇒
+genuine hole-punch)**. Union of runs: each direction achieved `direct`; the connection is
+**direct-or-idle, never relay-only when connected**. Real change vs 2026-07-04 (`9d12a9a4`,
+which held both sides `direct` simultaneously): **peer entries evict faster when idle** —
+filed non-blocking; recommend the T2 assert snapshot during active traffic (or add a
+keepalive). Hand-driven V1–V4 (fresh never-toggled local vs live remote) all PASS both
+modes (see `docs/playbooks/0.2.5-fleet-validation.md`). Also: IPv6 QADv6 `No route to host`
+log spam on IPv4-only Koya (benign; log-cleanliness). VM stopped (disk preserved). Session
+cost ≈$0.30.
+
 The 2026-07-04 session is the **first proven cross-WAN direct-path NAT traversal**
 for Harmony: `connectionMode: "direct"` on both a home-NAT node and the GCE node,
 in open mode AND in filtered mode (relay-coordinated hole-punch with zero ingress
