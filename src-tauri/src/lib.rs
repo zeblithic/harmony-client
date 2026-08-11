@@ -9059,6 +9059,37 @@ pub async fn start_node_inner(
                         }
                     }
 
+                    // ZEB-906: counter-signer-side restart heal — the mirror
+                    // of the joiner-side C3 pass above. An un-countersigned
+                    // PendingJoin whose insert-time auto-counter-sign spawn
+                    // was skipped (shutdown `closing` fence, sign failure,
+                    // crash) has NO other recovery: the C1 re-derive needs an
+                    // `AlreadyKnown` re-insert, and the ingest gate rejects
+                    // the stranded member's publishes before any insert. The
+                    // live-path re-drive in `handle_incoming_publish` covers
+                    // a running process; this covers restarts. Idempotent:
+                    // candidates are pre-filtered to pendings with no
+                    // self-authored countersign, and the spawned task
+                    // re-checks eligibility/idempotency under the state lock.
+                    {
+                        let zeb906_candidates: Vec<crate::owner_state_types::SpaceId> = {
+                            let g = crdt_state.lock().await;
+                            g.spaces
+                                .iter()
+                                .filter(|(_, s)| {
+                                    s.kind == crate::owner_state_types::SpaceKind::Community
+                                        && s.left_at.is_none()
+                                })
+                                .map(|(id, _)| *id)
+                                .collect()
+                        };
+                        for space_id in zeb906_candidates {
+                            if let Some(engine) = registry.engine_arc(&space_id).await {
+                                engine.recheck_uncountersigned_pending_joins().await;
+                            }
+                        }
+                    }
+
                     community_registry_arc = Some(std::sync::Arc::clone(&registry));
 
                     tracing::info!(
