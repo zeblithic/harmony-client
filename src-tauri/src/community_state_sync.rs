@@ -1391,6 +1391,7 @@ impl CommunitySyncEngine {
             identity_resolver: cfg.identity_resolver,
             error_tx: cfg.error_tx,
             root_size_watermark_seen: std::sync::atomic::AtomicU8::new(0),
+            zeb906_redrive_recent: std::sync::Mutex::new(std::collections::HashMap::new()),
             delta_tx: cfg.delta_tx,
             pending_redemptions: cfg.pending_redemptions,
             crdt_state: crdt_state_for_task,
@@ -2270,6 +2271,19 @@ struct InternalCtx {
     /// per-call, because `encode_root_packet` runs on every query-serve
     /// request.
     root_size_watermark_seen: std::sync::atomic::AtomicU8,
+    /// ZEB-906 (Greptile #655 r2): per-pending-id cooldown for the ingest-seam
+    /// countersign re-drive. A burst of publishes from the same stranded
+    /// member would otherwise evaluate `materialize_with_bounds` and spawn a
+    /// full-log-cloning recovery task PER REJECTED PUBLISH before insert-time
+    /// dedup catches the duplicates — and a persistently-failing sign would
+    /// re-warn every cycle. Checked (and pruned) BEFORE the materialize so
+    /// coalesced frames skip the expensive work entirely. `std::sync::Mutex`:
+    /// never held across an await. Deliberately NOT applied to the
+    /// insert-path spawns — a fresh redeem's countersign must never be
+    /// swallowed by a cooldown or the redeem degrades to `pending`.
+    zeb906_redrive_recent: std::sync::Mutex<
+        std::collections::HashMap<crate::community_membership::EventId, std::time::Instant>,
+    >,
     delta_tx: Option<mpsc::Sender<CommunityMembershipDelta>>,
     /// ZEB-262 Phase 4: shared pending-redemption map. Used by
     /// `handle_incoming_publish` to fire any oneshot registered
@@ -4423,52 +4437,84 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             // re-drive. Boot-time analogue:
             // `recheck_uncountersigned_pending_joins`.
             if matches!(status_now, Some(MemberStatus::PendingJoin)) {
-                // CodeRabbit #655 r1: `status_now` is the status at the
-                // PUBLISH's HLC — correct for the authorization reject
-                // above, but recovery must ALSO require the member's
-                // CURRENT status to be PendingJoin: a backdated or replayed
-                // publish stamped inside a since-cancelled window
-                // (PendingJoin → Leave, or → Kick) must not mint a
-                // countersign for an attempt that is no longer live.
-                let receiver_now = crate::clock_trust::receiver_now_ms();
-                let mat_now = crate::community_membership::materialize_with_bounds(
-                    &events,
-                    ctx.admin_addr,
-                    None,
-                    receiver_now,
-                );
-                let currently_pending = matches!(
-                    mat_now
-                        .members
-                        .get(&payload.publisher_addr)
-                        .map(|m| m.status),
-                    Some(MemberStatus::PendingJoin)
-                );
-                let latest_pending = currently_pending
-                    .then(|| {
-                        events
-                            .iter()
-                            .filter(|e| {
-                                e.actor == payload.publisher_addr
-                                    && matches!(
-                                        e.kind,
-                                        crate::community_membership::MembershipEventKind::PendingJoin { .. }
-                                    )
-                            })
-                            .max_by(|a, b| {
-                                crate::community_membership::event_sort_key(a)
-                                    .cmp(&crate::community_membership::event_sort_key(b))
-                            })
+                // Order of gates, cheapest first (Greptile #655 r2): locate
+                // the latest PendingJoin (linear scan), coalesce via the
+                // per-pending cooldown, and only THEN pay the materialize.
+                let latest_pending = events
+                    .iter()
+                    .filter(|e| {
+                        e.actor == payload.publisher_addr
+                            && matches!(
+                                e.kind,
+                                crate::community_membership::MembershipEventKind::PendingJoin { .. }
+                            )
                     })
-                    .flatten();
+                    .max_by(|a, b| {
+                        crate::community_membership::event_sort_key(a)
+                            .cmp(&crate::community_membership::event_sort_key(b))
+                    });
                 if let Some(pending_ev) = latest_pending {
-                    tracing::info!(
-                        community_id = ?ctx.community_id,
-                        publisher = ?payload.publisher_addr,
-                        pending_event_id = %hex::encode(pending_ev.id),
-                        "ZEB-906: re-driving countersign for known-PendingJoin publisher"
-                    );
-                    maybe_spawn_auto_counter_sign_for_ctx(ctx, pending_ev);
+                    // Greptile #655 r2: coalesce burst publishes from the
+                    // same stranded member — at most one re-drive evaluation
+                    // (materialize + spawned task, and one warn on a
+                    // persistently-failing sign) per pending id per cooldown
+                    // window. Insert-time dedup remains the correctness
+                    // guard; this only removes the redundant work.
+                    const ZEB906_REDRIVE_COOLDOWN: std::time::Duration =
+                        std::time::Duration::from_secs(60);
+                    let fire = {
+                        let mut recent = ctx
+                            .zeb906_redrive_recent
+                            .lock()
+                            .expect("zeb906_redrive_recent poisoned");
+                        let now = std::time::Instant::now();
+                        recent.retain(|_, t| now.duration_since(*t) < ZEB906_REDRIVE_COOLDOWN);
+                        match recent.entry(pending_ev.id) {
+                            std::collections::hash_map::Entry::Occupied(_) => false,
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                v.insert(now);
+                                true
+                            }
+                        }
+                    };
+                    // CodeRabbit #655 r1: `status_now` is the status at the
+                    // PUBLISH's HLC — correct for the authorization reject
+                    // below, but recovery must ALSO require the member's
+                    // CURRENT status to be PendingJoin: a backdated or
+                    // replayed publish stamped inside a since-cancelled
+                    // window (PendingJoin → Leave, or → Kick) must not mint
+                    // a countersign for an attempt that is no longer live.
+                    let currently_pending = fire && {
+                        let receiver_now = crate::clock_trust::receiver_now_ms();
+                        let mat_now = crate::community_membership::materialize_with_bounds(
+                            &events,
+                            ctx.admin_addr,
+                            None,
+                            receiver_now,
+                        );
+                        matches!(
+                            mat_now
+                                .members
+                                .get(&payload.publisher_addr)
+                                .map(|m| m.status),
+                            Some(MemberStatus::PendingJoin)
+                        )
+                    };
+                    if currently_pending {
+                        tracing::info!(
+                            community_id = ?ctx.community_id,
+                            publisher = ?payload.publisher_addr,
+                            pending_event_id = %hex::encode(pending_ev.id),
+                            "ZEB-906: re-driving countersign for known-PendingJoin publisher"
+                        );
+                        maybe_spawn_auto_counter_sign_for_ctx(ctx, pending_ev);
+                    } else if !fire {
+                        tracing::debug!(
+                            community_id = ?ctx.community_id,
+                            publisher = ?payload.publisher_addr,
+                            "ZEB-906: re-drive coalesced (cooldown window)"
+                        );
+                    }
                 }
             }
             return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
@@ -11424,6 +11470,85 @@ mod tests {
             0,
             "a cancelled (PendingJoin→Leave) attempt must never be countersigned \
              off a backdated publish"
+        );
+    }
+
+    /// A5 (Greptile #655 r2): a burst of publishes from the same stranded
+    /// member coalesces — the cooldown lets the first frame through and
+    /// swallows the rest, and insert-time dedup backstops the end state:
+    /// exactly one countersign.
+    #[tokio::test]
+    async fn zeb906_burst_publishes_coalesce_to_one_countersign() {
+        use crate::community_membership::MemberStatus;
+
+        let community_id = SpaceId([0x99; 16]);
+        let alice = crate::community_membership::mint_test_owner(0xA6);
+        let bob = crate::community_membership::mint_test_owner(0xB6);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, sub_tx, _floor, _cs, membership_key) =
+            zeb906_engine(&dir, community_id, &alice, &alice);
+
+        let state = engine.state();
+        {
+            let mut g = state.lock().await;
+            g.insert_verified_for_test(closing_guard_bootstrap_join(
+                community_id,
+                &alice,
+                [0x10; 16],
+                0,
+            ));
+            g.insert_verified_for_test(zeb875_pending_join(
+                community_id,
+                &bob,
+                zeb875_signed_token(&alice, 11),
+                [0x2B; 16],
+            ));
+        }
+
+        let cid = harmony_content::cid::ContentId::for_book(
+            b"zeb906-burst",
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid");
+        for i in 0..4u64 {
+            sub_tx
+                .send(zeb906_publish_wire(
+                    &membership_key,
+                    bob.owner,
+                    101_000 + i,
+                    cid,
+                    None,
+                ))
+                .await
+                .expect("inject burst publish");
+        }
+
+        zeb906_wait_for_countersign(&state, alice.owner, [0x2B; 16]).await;
+
+        let g = state.lock().await;
+        assert_eq!(
+            g.events()
+                .filter(|e| {
+                    matches!(
+                        &e.kind,
+                        crate::community_membership::MembershipEventKind::JoinCountersign { target_event_id }
+                        if *target_event_id == [0x2B; 16]
+                    )
+                })
+                .count(),
+            1,
+            "a publish burst must yield exactly one countersign"
+        );
+        assert_eq!(
+            g.materialize_now(alice.owner)
+                .members
+                .get(&bob.owner)
+                .map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "the burst member still promotes"
         );
     }
 
