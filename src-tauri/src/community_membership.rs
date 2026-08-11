@@ -643,6 +643,19 @@ pub struct SignedMembershipEvent {
     pub signer_certs: Vec<EnrollmentCert>,
 }
 
+/// ZEB-911 (Qodo r3): irreducible floor, in bytes, of one serialized
+/// [`SignedMembershipEvent`]. The three fixed-width byte fields alone —
+/// `sg` (64) + `id` (16) + `ci` (16) — occupy 96 payload bytes before any
+/// CBOR framing, the 2-char field keys, or the remaining required fields
+/// (`kn`/`ac`/`at`), so no valid encoding can be smaller. The redeem
+/// joiner divides `HANDSHAKE_MAX_PACKET_LEN` by this floor to derive its
+/// admission-chain length backstop (`ZEB911_MAX_CHAIN_EVENTS` in
+/// `connectivity_redeem_invite_iroh_inner`), keeping the count bound
+/// consistent-by-construction with the byte cap the acceptor enforces
+/// when it decides whether a chain fits. Pinned by
+/// `zeb911_admission_chain_tests::min_encoded_len_is_a_true_floor`.
+pub(crate) const MIN_SIGNED_EVENT_ENCODED_LEN: usize = 96;
+
 /// Counter-signature appended by an existing community member to vouch
 /// for a new joiner in an invite-only community. The signer's power
 /// must be ≥ POWER_THRESHOLDS.invite at the time of signing.
@@ -19860,6 +19873,28 @@ mod zeb911_admission_chain_tests {
         assert!(
             admission_chain_for(&events, admin.owner, admin.owner).is_empty(),
             "the admin's chain is empty by construction (legacy response shape)"
+        );
+    }
+
+    /// Qodo r3: `MIN_SIGNED_EVENT_ENCODED_LEN` must be a TRUE floor. The
+    /// redeem joiner's chain cap is `HANDSHAKE_MAX_PACKET_LEN / floor`, and
+    /// that cap is only guaranteed never to reject a response the acceptor's
+    /// byte guard allowed if no event can serialize smaller than the floor.
+    /// A payload-free `Leave` with a 1-char device id is as small as a valid
+    /// event gets; if this assert ever fails (a fixed-width field was
+    /// removed or shrunk), lower the constant to the new irreducible floor.
+    #[test]
+    fn min_encoded_len_is_a_true_floor() {
+        let w = mint_test_owner(1);
+        let smallest = ev(0x01, MembershipEventKind::Leave, w.owner, &w.device_key, 0);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&smallest, &mut bytes).expect("serialize smallest event");
+        assert!(
+            bytes.len() >= MIN_SIGNED_EVENT_ENCODED_LEN,
+            "smallest event serialized to {} bytes — below the {}-byte floor \
+             the joiner-side chain cap divides by",
+            bytes.len(),
+            MIN_SIGNED_EVENT_ENCODED_LEN
         );
     }
 }

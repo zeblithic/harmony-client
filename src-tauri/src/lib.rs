@@ -62616,6 +62616,38 @@ pub(crate) fn dedup_witness_candidates(
         .collect()
 }
 
+/// ZEB-911 (Qodo r3): classify the outcome when neither the admin rung nor
+/// the witness ladder produced a connection.
+///
+/// * Any witness dial attempted → `no_member_reachable` (the ladder was
+///   genuinely exercised; the community, not just the inviter, was tried).
+/// * NOTHING was ever dialed (the admin rung never synthesized an addr AND
+///   the ladder yielded zero candidates) and at least one slot resolve
+///   failed at the pkarr transport layer → propagate the typed error the
+///   admin resolve already uses (`From<PkarrError>` → `relays_warming_up`,
+///   which steers the "Try via local network" affordance) instead of
+///   collapsing a relay outage into `inviter_unreachable`.
+/// * Otherwise → `inviter_unreachable`. In particular a resolve error AFTER
+///   a confirmed failed dial stays `inviter_unreachable` — the ZEB-892
+///   CodeAnt #642 rationale (see the B4 retry above): once a dial to a
+///   verified record has failed, "unreachable" is the accurate outcome and
+///   a relay error merely means we couldn't fetch a *fresher* address.
+fn witness_ladder_fallback_outcome(
+    witness_dials_attempted: usize,
+    admin_dial_attempted: bool,
+    ladder_resolve_err: Option<RedeemInviteError>,
+) -> Result<RedemptionOutcome, RedeemInviteError> {
+    if witness_dials_attempted > 0 {
+        return Ok(RedemptionOutcome::no_member_reachable());
+    }
+    if !admin_dial_attempted {
+        if let Some(e) = ladder_resolve_err {
+            return Err(e);
+        }
+    }
+    Ok(RedemptionOutcome::unreachable())
+}
+
 #[cfg(test)]
 mod zeb911_witness_ladder_tests {
     use super::{dedup_witness_candidates, witness_slot_window_keys, WitnessCandidate};
@@ -62688,6 +62720,48 @@ mod zeb911_witness_ladder_tests {
         let out = dedup_witness_candidates(cands, None);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].owner, OwnerAddr([1; 16]));
+    }
+
+    // Qodo r3: the zero-connection decision table. A pkarr transport failure
+    // must keep its typed classification (`relays_warming_up` steers the LAN
+    // fallback) — but ONLY when nothing was ever dialed; after any confirmed
+    // failed dial the ZEB-892 CodeAnt #642 rationale holds and the outcome
+    // stays "unreachable".
+    use super::witness_ladder_fallback_outcome;
+    use crate::community_invite::{RedeemInviteError, RedeemInviteErrorCode};
+
+    fn transport_err() -> RedeemInviteError {
+        RedeemInviteError::new(
+            RedeemInviteErrorCode::RelaysWarmingUp,
+            "all relays errored".to_string(),
+        )
+    }
+
+    #[test]
+    fn fallback_outcome_witness_dials_win_over_resolve_error() {
+        let out = witness_ladder_fallback_outcome(1, false, Some(transport_err()))
+            .expect("dialed ladder is an outcome, not an error");
+        assert_eq!(out.status, "no_member_reachable");
+    }
+
+    #[test]
+    fn fallback_outcome_zero_dials_transport_error_stays_typed() {
+        let err = witness_ladder_fallback_outcome(0, false, Some(transport_err()))
+            .expect_err("undialed transport failure must surface typed");
+        assert_eq!(err.code, RedeemInviteErrorCode::RelaysWarmingUp);
+    }
+
+    #[test]
+    fn fallback_outcome_after_admin_dial_resolve_error_is_unreachable() {
+        let out = witness_ladder_fallback_outcome(0, true, Some(transport_err()))
+            .expect("post-dial resolve error folds into an outcome");
+        assert_eq!(out.status, "inviter_unreachable");
+    }
+
+    #[test]
+    fn fallback_outcome_zero_dials_no_error_is_unreachable() {
+        let out = witness_ladder_fallback_outcome(0, false, None).expect("legacy outcome");
+        assert_eq!(out.status, "inviter_unreachable");
     }
 }
 
@@ -63463,6 +63537,10 @@ where
     // admin-only behavior (spec §5, accepted v1 limitation; ZEB-918).
     let mut dialed_owner = inviter_addr;
     let mut witness_dials_attempted = 0usize;
+    // Qodo r3: first pkarr TRANSPORT failure among the slot resolves, already
+    // converted to its typed form. Consulted only on the zero-dials outcome
+    // path (`witness_ladder_fallback_outcome`).
+    let mut ladder_resolve_err: Option<RedeemInviteError> = None;
     let conn = if let Some(c) = conn {
         Some(c)
     } else {
@@ -63510,6 +63588,15 @@ where
                             Ok(None) => continue,
                             Err(e) => {
                                 tracing::debug!(error = %e, slot, "ZEB-911: witness slot resolve error");
+                                // Qodo r3: a resolver `Err` is a transport-level
+                                // pkarr failure (all relays errored for this
+                                // slot's window) — remember the first one so the
+                                // zero-dials outcome below keeps its typed
+                                // classification instead of reporting a relay
+                                // outage as `inviter_unreachable`.
+                                if ladder_resolve_err.is_none() {
+                                    ladder_resolve_err = Some(RedeemInviteError::from(e));
+                                }
                                 continue;
                             }
                         };
@@ -63619,12 +63706,15 @@ where
     let Some(conn) = conn else {
         // Distinguish "we actually tried witnesses too" from the legacy
         // single-target outcome so the UI stops blaming the inviter when
-        // the whole community was unreachable.
-        return Ok(if witness_dials_attempted > 0 {
-            RedemptionOutcome::no_member_reachable()
-        } else {
-            RedemptionOutcome::unreachable()
-        });
+        // the whole community was unreachable — and (Qodo r3) surface a
+        // typed pkarr transport failure when nothing was ever dialed.
+        // Decision table pinned by
+        // `zeb911_witness_ladder_tests::fallback_outcome_*`.
+        return witness_ladder_fallback_outcome(
+            witness_dials_attempted,
+            admin_node_id.is_some(),
+            ladder_resolve_err,
+        );
     };
     // Review r2 (non-blocking): post-dial stream failures keep witness-aware
     // classification. After a WITNESS connection, a died stream must not
@@ -63948,7 +64038,20 @@ where
     // so this joiner can verify a countersign authored by a member its
     // fresh CRDT has never seen. Dispatch on the first byte's major type —
     // the two shapes are structurally unambiguous.
-    const ZEB911_MAX_CHAIN_EVENTS: usize = 64;
+    // Qodo r3: derive the joiner's chain-length bound from the SAME byte cap
+    // the acceptor enforces when deciding whether the chain fits (and that
+    // the frame read above already applied), so the two ends cannot
+    // disagree: any response the read cap admits decodes to fewer events
+    // than this (each event serializes to at least
+    // `MIN_SIGNED_EVENT_ENCODED_LEN` bytes). The count check is therefore
+    // pure defense-in-depth against a decoder bug — not an independent
+    // policy. The previous flat 64 was one: acceptors degrade on BYTES
+    // only, and a long-history community (every DeviceAnnounce rides the
+    // admission timeline, and countersigner timelines recurse in) can
+    // legitimately ship hundreds of events under the byte cap, which this
+    // joiner then rejected as malformed.
+    const ZEB911_MAX_CHAIN_EVENTS: usize = crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN
+        / crate::community_membership::MIN_SIGNED_EVENT_ENCODED_LEN;
     let (chain, countersign): (
         Vec<crate::community_membership::SignedMembershipEvent>,
         crate::community_membership::SignedMembershipEvent,
