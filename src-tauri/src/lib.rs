@@ -41204,6 +41204,7 @@ where
                     }
                 }
             }
+            let countersign_actor = cs.actor;
             match engine_arc
                 .insert_local_event_with_pubs(cs, admin_pub, None)
                 .await
@@ -41242,13 +41243,35 @@ where
                         .await;
                 }
                 Ok(crate::community_state_crdt::InsertOutcome::Rejected(verify_err)) => {
-                    let _ = community_registry
-                        .take_pending_redemption(&minted.bootstrap_join.id)
-                        .await;
-                    return Err(RedeemInviteError::new(
-                        RedeemInviteErrorCode::EngineInsertFailed,
-                        format!("engine rejected pre_delivered_countersign: {verify_err}"),
-                    ));
+                    // ZEB-911: a WITNESS-authored countersign that arrived
+                    // WITHOUT its admission chain (the acceptor degrades to
+                    // the legacy single-event shape when the chain exceeds
+                    // the handshake cap) is expected to reject here — the
+                    // witness is unknown to this fresh CRDT. Don't hard-fail
+                    // the redeem: fall through WITHOUT resolving the oneshot,
+                    // so step 7d times out into the honest ZEB-254
+                    // `pending: true` outcome and membership converges over
+                    // Zenoh once the seeded witness link syncs state-root.
+                    // An ADMIN-authored rejection (or a rejection despite a
+                    // delivered chain) stays a hard error — those indicate
+                    // real bugs, not the degraded-response path.
+                    let cs_is_witness_authored = countersign_actor != engine_arc.admin_addr();
+                    if cs_is_witness_authored && overrides.pre_delivered_chain.is_empty() {
+                        tracing::warn!(
+                            community_id = %hex::encode(minted.community_id.0),
+                            error = %verify_err,
+                            "ZEB-911: chain-less witness countersign rejected — degrading \
+                             to the pending fallback (state converges via Zenoh)"
+                        );
+                    } else {
+                        let _ = community_registry
+                            .take_pending_redemption(&minted.bootstrap_join.id)
+                            .await;
+                        return Err(RedeemInviteError::new(
+                            RedeemInviteErrorCode::EngineInsertFailed,
+                            format!("engine rejected pre_delivered_countersign: {verify_err}"),
+                        ));
+                    }
                 }
                 Err(insert_err) => {
                     let _ = community_registry
@@ -63193,10 +63216,21 @@ where
             break 'rung0;
         };
 
-        // 7. Decode the inner routing payload.
+        // 7. Decode the inner routing payload. ZEB-911 (review r1): a
+        // malformed record is equivalent to no record — fall through to the
+        // witness ladder instead of aborting the whole redemption.
         let routing: crate::reachability_record::ReachabilityAnnouncePayload =
-            ciborium::from_reader(rec.routing_blob.as_slice())
-                .map_err(|e| format!("decode routing_blob: {e}"))?;
+            match ciborium::from_reader(rec.routing_blob.as_slice()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ZEB-911: admin routing_blob decode failed — skipping to the witness ladder"
+                    );
+                    emit_stage(RedemptionStage::Connecting);
+                    break 'rung0;
+                }
+            };
 
         // Seed the local ReachabilityResolver. Option A doesn't strictly
         // need this — the iroh bi-stream below opens with an explicit
@@ -63224,8 +63258,18 @@ where
         // synthesis for a Zenoh ALPN dial). The `iroh_node_id` is the iroh
         // EndpointId (32-byte Ed25519 pub); skip malformed relay URLs
         // silently (direct addrs alone may still succeed).
-        let mut alice_addr = endpoint_addr_from_routing(&routing)
-            .map_err(|e| format!("synthesize inviter addr: {e}"))?;
+        let mut alice_addr = match endpoint_addr_from_routing(&routing) {
+            Ok(a) => a,
+            Err(e) => {
+                // ZEB-911 (review r1): same fallthrough as a decode failure —
+                // an unsynthesizable admin record must not dead-end the ladder.
+                tracing::warn!(
+                    error = %e,
+                    "ZEB-911: admin addr synthesize failed — skipping to the witness ladder"
+                );
+                break 'rung0;
+            }
+        };
         admin_node_id = Some(*alice_addr.id.as_bytes());
 
         // 8. Open the iroh QUIC connection on the handshake ALPN.
@@ -63430,102 +63474,143 @@ where
                 None
             }
             Ok(epoch_key) => {
-                let ladder_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
-                let mut candidates: Vec<WitnessCandidate> = Vec::new();
-                for slot in 0..crate::community_rendezvous::RENDEZVOUS_SLOT_COUNT as u16 {
-                    let slot_keys = witness_slot_window_keys(&epoch_key, slot, ladder_now_ms);
-                    let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
-                        rec.verify_inner_sig().is_ok()
-                            && rec.verify_freshness(ladder_now_ms).is_ok()
-                    };
-                    let rec = match resolver
-                        .resolve_window_freshest_with(&slot_keys, &verify)
-                        .await
-                    {
-                        Ok(Some(rec)) => rec,
-                        Ok(None) => continue,
-                        Err(e) => {
-                            tracing::debug!(error = %e, slot, "ZEB-911: witness slot resolve error");
-                            continue;
-                        }
-                    };
-                    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
-                        match ciborium::from_reader(rec.routing_blob.as_slice()) {
-                            Ok(r) => r,
+                // Review r1: the whole witness phase runs under one wall-clock
+                // budget, and the four slot resolves run CONCURRENTLY (one
+                // resolve round instead of four sequential ones), so a
+                // community full of stale beacons can't pin this IPC on the
+                // `Connecting` stage indefinitely. The candidate/dial count is
+                // already structurally ≤ RENDEZVOUS_SLOT_COUNT after dedup.
+                const WITNESS_LADDER_BUDGET_MS: u64 = 20_000;
+                let ladder = async {
+                    let ladder_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+                    let resolves = (0..crate::community_rendezvous::RENDEZVOUS_SLOT_COUNT as u16)
+                        .map(|slot| {
+                            let slot_keys =
+                                witness_slot_window_keys(&epoch_key, slot, ladder_now_ms);
+                            let resolver = &resolver;
+                            async move {
+                                let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+                                    rec.verify_inner_sig().is_ok()
+                                        && rec.verify_freshness(ladder_now_ms).is_ok()
+                                };
+                                (
+                                    slot,
+                                    resolver
+                                        .resolve_window_freshest_with(&slot_keys, &verify)
+                                        .await,
+                                )
+                            }
+                        });
+                    let mut candidates: Vec<WitnessCandidate> = Vec::new();
+                    for (slot, resolved) in futures::future::join_all(resolves).await {
+                        let rec = match resolved {
+                            Ok(Some(rec)) => rec,
+                            Ok(None) => continue,
                             Err(e) => {
-                                tracing::debug!(error = %e, slot, "ZEB-911: witness routing_blob decode failed");
+                                tracing::debug!(error = %e, slot, "ZEB-911: witness slot resolve error");
                                 continue;
                             }
                         };
-                    // Derive the beacon's owner from the outer record's
-                    // identity (gateway-driver parity). Unparseable identity
-                    // bytes on an inner-sig-verified record indicate a
-                    // publisher bug, not an attack — skip.
-                    let owner = match harmony_identity::Identity::from_public_bytes(
-                        &rec.harmony_identity_pub,
-                    ) {
-                        Ok(identity) => crate::owner_state_types::OwnerAddr(identity.address_hash),
-                        Err(_) => {
-                            tracing::debug!(slot, "ZEB-911: witness record identity unparseable");
-                            continue;
-                        }
-                    };
-                    candidates.push(WitnessCandidate { routing, owner });
-                }
-                let candidates = dedup_witness_candidates(candidates, admin_node_id);
-                tracing::info!(
-                    community_id = %hex::encode(payload.community_id.0),
-                    candidates = candidates.len(),
-                    "ZEB-911: witness ladder resolved candidates"
-                );
-                let mut found = None;
-                for cand in candidates {
-                    let cand_addr = match endpoint_addr_from_routing(&cand.routing) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            tracing::debug!(error = %e, "ZEB-911: witness addr synthesize failed");
-                            continue;
-                        }
-                    };
-                    // Seed the resolver under the witness's owner BEFORE the
-                    // dial so a successful handshake leaves the follow-up
-                    // Zenoh link (`IrohZenohLinkManager::new_link` reads this
-                    // seed) pointed at the peer we actually reached — the
-                    // witness-rung analogue of the rung-0 seed above.
-                    reachability_resolver
-                        .seed_from_pkarr(
-                            cand.owner,
-                            crate::owner_state_types::DeviceIdentityHash([0u8; 16]),
-                            cand.routing.clone(),
+                        let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+                            match ciborium::from_reader(rec.routing_blob.as_slice()) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::debug!(error = %e, slot, "ZEB-911: witness routing_blob decode failed");
+                                    continue;
+                                }
+                            };
+                        // Derive the beacon's owner from the outer record's
+                        // identity (gateway-driver parity). Unparseable identity
+                        // bytes on an inner-sig-verified record indicate a
+                        // publisher bug, not an attack — skip.
+                        let owner = match harmony_identity::Identity::from_public_bytes(
+                            &rec.harmony_identity_pub,
+                        ) {
+                            Ok(identity) => {
+                                crate::owner_state_types::OwnerAddr(identity.address_hash)
+                            }
+                            Err(_) => {
+                                tracing::debug!(
+                                    slot,
+                                    "ZEB-911: witness record identity unparseable"
+                                );
+                                continue;
+                            }
+                        };
+                        candidates.push(WitnessCandidate { routing, owner });
+                    }
+                    let candidates = dedup_witness_candidates(candidates, admin_node_id);
+                    tracing::info!(
+                        community_id = %hex::encode(payload.community_id.0),
+                        candidates = candidates.len(),
+                        "ZEB-911: witness ladder resolved candidates"
+                    );
+                    let mut found = None;
+                    for cand in candidates {
+                        let cand_addr = match endpoint_addr_from_routing(&cand.routing) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::debug!(error = %e, "ZEB-911: witness addr synthesize failed");
+                                continue;
+                            }
+                        };
+                        // Seed the resolver under the witness's owner BEFORE the
+                        // dial so a successful handshake leaves the follow-up
+                        // Zenoh link (`IrohZenohLinkManager::new_link` reads this
+                        // seed) pointed at the peer we actually reached — the
+                        // witness-rung analogue of the rung-0 seed above.
+                        reachability_resolver
+                            .seed_from_pkarr(
+                                cand.owner,
+                                crate::owner_state_types::DeviceIdentityHash([0u8; 16]),
+                                cand.routing.clone(),
+                            )
+                            .await;
+                        witness_dials_attempted += 1;
+                        match tokio::time::timeout(
+                            dial_config.connect_timeout,
+                            iroh_endpoint.inner().connect(
+                                cand_addr,
+                                crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1,
+                            ),
                         )
-                        .await;
-                    witness_dials_attempted += 1;
-                    match tokio::time::timeout(
-                        dial_config.connect_timeout,
-                        iroh_endpoint
-                            .inner()
-                            .connect(cand_addr, crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1),
-                    )
-                    .await
-                    {
-                        Ok(Ok(c)) => {
-                            tracing::info!(
-                                witness = %hex::encode(cand.owner.0),
-                                "ZEB-911: witness dial connected — proceeding with handshake"
-                            );
-                            dialed_owner = cand.owner;
-                            found = Some(c);
-                            break;
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, witness = %hex::encode(cand.owner.0), "ZEB-911: witness connect failed");
-                        }
-                        Err(_elapsed) => {
-                            tracing::warn!(witness = %hex::encode(cand.owner.0), "ZEB-911: witness connect timeout");
+                        .await
+                        {
+                            Ok(Ok(c)) => {
+                                tracing::info!(
+                                    witness = %hex::encode(cand.owner.0),
+                                    "ZEB-911: witness dial connected — proceeding with handshake"
+                                );
+                                dialed_owner = cand.owner;
+                                found = Some(c);
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, witness = %hex::encode(cand.owner.0), "ZEB-911: witness connect failed");
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(witness = %hex::encode(cand.owner.0), "ZEB-911: witness connect timeout");
+                            }
                         }
                     }
+                    found
+                };
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(WITNESS_LADDER_BUDGET_MS),
+                    ladder,
+                )
+                .await
+                {
+                    Ok(found) => found,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            budget_ms = WITNESS_LADDER_BUDGET_MS,
+                            community_id = %hex::encode(payload.community_id.0),
+                            "ZEB-911: witness ladder budget exhausted"
+                        );
+                        None
+                    }
                 }
-                found
             }
         }
     };

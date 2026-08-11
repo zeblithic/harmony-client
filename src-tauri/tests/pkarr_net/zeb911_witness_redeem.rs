@@ -433,14 +433,19 @@ async fn publish_rendezvous_slot(
         )
         .await;
 
-    let slot_vk =
-        rendezvous_slot_verifying_key(epoch_key, 0, harmony_pkarr::current_epoch_id(now_ms()));
+    // Probe the whole epoch tolerance window (review r1): deriving from a
+    // single `current_epoch_id` snapshot races an epoch-boundary crossing
+    // between `refresh_slot`'s publication and this derivation. The redeem
+    // path itself resolves across the window, so the readiness probe must too.
     let mut visible = false;
-    for _ in 0..50 {
+    'probe: for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Ok(Some(_)) = s.pkarr_resolver.resolve(&slot_vk).await {
-            visible = true;
-            break;
+        for epoch_id in harmony_pkarr::epoch_tolerance_window(now_ms()) {
+            let slot_vk = rendezvous_slot_verifying_key(epoch_key, 0, epoch_id);
+            if let Ok(Some(_)) = s.pkarr_resolver.resolve(&slot_vk).await {
+                visible = true;
+                break 'probe;
+            }
         }
     }
     assert!(

@@ -220,7 +220,7 @@ describe('RedeemInviteDialog', () => {
       const banner = getByTestId('iroh-error-banner');
       // Community-oriented copy: names the community, not the inviter.
       expect(banner.textContent).toContain('No member of this community is reachable');
-      expect(banner.textContent).not.toContain('inviter');
+      expect(banner.textContent).not.toMatch(/inviter/i);
     });
     expect(getByTestId('fallback-lan-btn')).toBeTruthy();
   });

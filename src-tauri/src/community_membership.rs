@@ -5974,8 +5974,13 @@ pub fn admission_chain_for(
         for ev in events.iter().filter(|e| e.actor == actor) {
             match &ev.kind {
                 // Legacy pre-ZEB-254 shape: counter-signed bare Join (the
-                // countersig rides inline on the event itself).
+                // countersig rides inline on the event itself). The inline
+                // countersig's SIGNER must be verifiable too (review r1) —
+                // recurse into their admission before emitting the Join.
                 MembershipEventKind::Join => {
+                    if let Some(cs) = &ev.countersig {
+                        visit(events, cs.signer, admin_addr, visiting, emitted, out);
+                    }
                     if emitted.insert(ev.id) {
                         out.push(ev.clone());
                     }
@@ -6001,6 +6006,22 @@ pub fn admission_chain_for(
                     }
                 }
                 _ => {}
+            }
+        }
+        // Review r1: a countersign may be signed by a device the actor
+        // enrolled AFTER admission (`DeviceAnnounce`, ZEB-340 Part 2). Carry
+        // the actor's DeviceAnnounce events so the joiner's materialized
+        // `enrolled_device_keys` covers every signing device. Emitted after
+        // the actor's admission events (they only verify once the actor
+        // materializes as a member) and — because the parent frame pushes a
+        // countersign only after `visit(countersigner)` returns — before any
+        // countersign this actor authored.
+        for ev in events
+            .iter()
+            .filter(|e| e.actor == actor && matches!(&e.kind, MembershipEventKind::DeviceAnnounce))
+        {
+            if emitted.insert(ev.id) {
+                out.push(ev.clone());
             }
         }
     }
