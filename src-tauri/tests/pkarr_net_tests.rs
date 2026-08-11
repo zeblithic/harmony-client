@@ -32,3 +32,8 @@ mod pkarr_identity_discovery_integration;
 mod pkarr_invite_redemption_integration;
 #[path = "pkarr_net/pkarr_iroh_redeem_full_integration.rs"]
 mod pkarr_iroh_redeem_full_integration;
+// ZEB-911 slice 2: the witness discovery ladder. Reuses the two-party harness
+// above (Alice = admin, Bob = joiner, mock pkarr relay) and adds a third
+// party — the witness node — on top of it.
+#[path = "pkarr_net/zeb911_witness_redeem.rs"]
+mod zeb911_witness_redeem;
