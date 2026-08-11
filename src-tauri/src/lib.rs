@@ -40277,6 +40277,14 @@ pub struct RedeemInviteOverrides {
     /// the post-Inserted hook to wake the registered oneshot.
     pub pre_delivered_countersign: Option<crate::community_membership::SignedMembershipEvent>,
 
+    /// ZEB-911: the countersigner's admission chain, delivered alongside a
+    /// WITNESS-authored `pre_delivered_countersign` (empty for the legacy
+    /// admin-authored response). Inserted into the joiner's engine, in
+    /// order, BEFORE the countersign — the chain's cert-carrying
+    /// `PendingJoin` is what makes the witness's signer resolvable and its
+    /// Joined status materializable on a fresh CRDT.
+    pub pre_delivered_chain: Vec<crate::community_membership::SignedMembershipEvent>,
+
     /// Admin identity pub for inserting the pre-delivered countersign.
     /// The joiner's engine has no resolver entry for admin pre-bootstrap,
     /// so `insert_local_event_with_pubs` is called with explicit pubs.
@@ -41161,6 +41169,40 @@ where
                         hex::encode(minted.bootstrap_join.id)
                     ),
                 ));
+            }
+            // ZEB-911: a WITNESS-authored countersign is unverifiable on a
+            // fresh joiner's CRDT (only the admin is known) unless the
+            // witness's own admission chain lands first — its cert-carrying
+            // PendingJoin makes the signer resolvable, and materializing it
+            // Joined satisfies verify_event's JoinCountersignActorNotJoined
+            // gate. The acceptor delivers the chain dependency-ordered;
+            // AlreadyKnown is fine (retry or raced CRDT sync).
+            for chain_ev in overrides.pre_delivered_chain.clone() {
+                let chain_ev_id = chain_ev.id;
+                match engine_arc.insert_local_event(chain_ev).await {
+                    Ok(crate::community_state_crdt::InsertOutcome::Inserted)
+                    | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {}
+                    Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
+                        let _ = community_registry
+                            .take_pending_redemption(&minted.bootstrap_join.id)
+                            .await;
+                        return Err(format!(
+                            "engine rejected witness admission-chain event {}: {verr}",
+                            hex::encode(chain_ev_id)
+                        )
+                        .into());
+                    }
+                    Err(e) => {
+                        let _ = community_registry
+                            .take_pending_redemption(&minted.bootstrap_join.id)
+                            .await;
+                        return Err(format!(
+                            "witness admission-chain insert failed for {}: {e}",
+                            hex::encode(chain_ev_id)
+                        )
+                        .into());
+                    }
+                }
             }
             match engine_arc
                 .insert_local_event_with_pubs(cs, admin_pub, None)
@@ -63802,15 +63844,53 @@ where
             }
         };
 
-    // 11. CBOR-decode response as SignedMembershipEvent.
-    let countersign: crate::community_membership::SignedMembershipEvent =
-        match ciborium::from_reader(response_bytes.as_slice()) {
+    // 11. CBOR-decode the response. A legacy/admin acceptor returns a single
+    // SignedMembershipEvent (CBOR map, major type 5). A ZEB-911 witness
+    // returns an array (major type 4) of [admission chain ..., countersign]
+    // so this joiner can verify a countersign authored by a member its
+    // fresh CRDT has never seen. Dispatch on the first byte's major type —
+    // the two shapes are structurally unambiguous.
+    const ZEB911_MAX_CHAIN_EVENTS: usize = 64;
+    let (chain, countersign): (
+        Vec<crate::community_membership::SignedMembershipEvent>,
+        crate::community_membership::SignedMembershipEvent,
+    ) = if response_bytes.first().map(|b| b >> 5) == Some(4) {
+        let mut events: Vec<crate::community_membership::SignedMembershipEvent> =
+            match ciborium::from_reader(response_bytes.as_slice()) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "ZEB-911: chain response CBOR decode failed");
+                    return Ok(RedemptionOutcome::unreachable());
+                }
+            };
+        if events.len() < 2 || events.len() > ZEB911_MAX_CHAIN_EVENTS {
+            tracing::warn!(
+                len = events.len(),
+                "ZEB-911: chain response length out of bounds"
+            );
+            return Ok(RedemptionOutcome::unreachable());
+        }
+        // Defensive: every chain event must belong to the community we are
+        // redeeming into (each is also fully re-verified by the engine's
+        // verify_event at insert — this just fails fast with a clear log).
+        if events.iter().any(|e| e.community_id != minted.community_id) {
+            tracing::warn!("ZEB-911: chain response carries a foreign community_id");
+            return Ok(RedemptionOutcome::unreachable());
+        }
+        let cs = events.pop().expect("len >= 2 checked above");
+        (events, cs)
+    } else {
+        let cs: crate::community_membership::SignedMembershipEvent = match ciborium::from_reader(
+            response_bytes.as_slice(),
+        ) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "ZEB-325 Phase 2c option A: response CBOR decode failed");
                 return Ok(RedemptionOutcome::unreachable());
             }
         };
+        (Vec::new(), cs)
+    };
     // Defensive: ensure it's a JoinCountersign for our bootstrap_join.
     let target_ok = matches!(
         &countersign.kind,
@@ -63865,6 +63945,7 @@ where
     let overrides = RedeemInviteOverrides {
         pre_minted: Some(minted),
         pre_delivered_countersign: Some(countersign),
+        pre_delivered_chain: chain,
         admin_identity_pub: Some(admin_id_pub),
         // ZEB-501: production uses the env-or-5s default (the pre-delivered
         // countersign resolves the oneshot well within it).

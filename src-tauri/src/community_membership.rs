@@ -5941,6 +5941,83 @@ pub fn actor_power_meets_invite_tier(mat: &MaterializedMembership, actor: OwnerA
     mat.power_levels.get(&actor).copied().unwrap_or(0) >= mat.power_thresholds.invite
 }
 
+/// ZEB-911: the minimal admission chain a fresh joiner needs to verify that
+/// `actor` is a Joined member. A cold joiner's log holds only the admin
+/// bootstrap + its own PendingJoin, so a countersign authored by anyone but
+/// the admin is unverifiable (signer unresolvable + `JoinCountersignActorNotJoined`)
+/// unless the response also carries the author's own admission events:
+/// their identity-introducing event (cert-carrying `PendingJoin`, or a
+/// legacy counter-signed `Join`) plus the countersigns that ratified it,
+/// recursively up the countersigner graph, terminating at the admin (whose
+/// bootstrap every joiner already holds from the invite payload).
+///
+/// Returned in dependency order — an actor's admission events precede any
+/// countersign they authored, and a `PendingJoin` precedes the countersigns
+/// targeting it — deduped by event id, cycle-safe. Pure function of the
+/// log; the admin yields an empty chain (legacy wire shape preserved).
+pub fn admission_chain_for(
+    events: &[SignedMembershipEvent],
+    actor: OwnerAddr,
+    admin_addr: OwnerAddr,
+) -> Vec<SignedMembershipEvent> {
+    fn visit(
+        events: &[SignedMembershipEvent],
+        actor: OwnerAddr,
+        admin_addr: OwnerAddr,
+        visiting: &mut std::collections::HashSet<OwnerAddr>,
+        emitted: &mut std::collections::HashSet<[u8; 16]>,
+        out: &mut Vec<SignedMembershipEvent>,
+    ) {
+        if actor == admin_addr || !visiting.insert(actor) {
+            return;
+        }
+        for ev in events.iter().filter(|e| e.actor == actor) {
+            match &ev.kind {
+                // Legacy pre-ZEB-254 shape: counter-signed bare Join (the
+                // countersig rides inline on the event itself).
+                MembershipEventKind::Join => {
+                    if emitted.insert(ev.id) {
+                        out.push(ev.clone());
+                    }
+                }
+                MembershipEventKind::PendingJoin { .. } => {
+                    if emitted.insert(ev.id) {
+                        out.push(ev.clone());
+                    }
+                    let pending_id = ev.id;
+                    for cs in events.iter().filter(|c| {
+                        matches!(
+                            &c.kind,
+                            MembershipEventKind::JoinCountersign { target_event_id }
+                            if *target_event_id == pending_id
+                        )
+                    }) {
+                        // The countersigner's own admission must precede
+                        // their countersign in the joiner's insert order.
+                        visit(events, cs.actor, admin_addr, visiting, emitted, out);
+                        if emitted.insert(cs.id) {
+                            out.push(cs.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut visiting = std::collections::HashSet::new();
+    let mut emitted = std::collections::HashSet::new();
+    visit(
+        events,
+        actor,
+        admin_addr,
+        &mut visiting,
+        &mut emitted,
+        &mut out,
+    );
+    out
+}
+
 /// ZEB-733: does `actor`'s power meet the community's MODERATOR (kick) tier?
 ///
 /// Shared local pre-check for the moderation audit-feed gates
