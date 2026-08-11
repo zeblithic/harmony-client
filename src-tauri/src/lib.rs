@@ -62487,13 +62487,42 @@ async fn merge_live_endpoint_addrs(
     let Some(info) = endpoint.remote_info(addr.id).await else {
         return false;
     };
+    merge_transport_addrs(
+        addr,
+        info.into_addrs().map(|ta| {
+            let active = matches!(ta.usage(), iroh::endpoint::TransportAddrUsage::Active);
+            (ta.into_addr(), active)
+        }),
+    )
+}
+
+/// Pure merge step behind [`merge_live_endpoint_addrs`], split out so both the
+/// relay and IP branches are unit-testable without standing up a live
+/// relay-backed endpoint pair (this crate's hermetic rigs are relay-disabled).
+///
+/// Folds each learned `(TransportAddr, is_active)` into `addr`:
+/// * **relays** are folded unconditionally — a relay the peer is registered
+///   with is a valid store-and-forward fallback for a *new* dial whether or not
+///   the *existing* session currently routes through it, and it is the
+///   load-bearing fallback for a NAT'd inviter, so it must not be dropped on a
+///   transient "inactive" snapshot;
+/// * **direct IPs** are folded only when currently active, so a stale/dead
+///   direct address can neither pad the result nor send magicsock probing a
+///   path that no longer routes.
+///
+/// Additive (`EndpointAddr` stores a set, so duplicates are dropped). Returns
+/// whether anything new was added.
+fn merge_transport_addrs(
+    addr: &mut iroh::EndpointAddr,
+    learned: impl Iterator<Item = (iroh::TransportAddr, bool)>,
+) -> bool {
     let before = addr.relay_urls().count() + addr.ip_addrs().count();
     let mut merged = addr.clone();
-    for ta in info.into_addrs() {
-        match ta.into_addr() {
+    for (ta, active) in learned {
+        match ta {
             iroh::TransportAddr::Relay(url) => merged = merged.with_relay_url(url),
-            iroh::TransportAddr::Ip(sa) => merged = merged.with_ip_addr(sa),
-            // Custom transports aren't used by this client's handshake path.
+            iroh::TransportAddr::Ip(sa) if active => merged = merged.with_ip_addr(sa),
+            // Inactive direct IPs and custom transports are skipped.
             _ => {}
         }
     }
@@ -62594,6 +62623,53 @@ mod zeb908_reuse_live_session_tests {
         assert_eq!(unknown.relay_urls().count(), 0);
 
         accept_task.abort();
+    }
+
+    /// Pure-logic coverage of the merge policy (no relay server required):
+    /// relays fold in regardless of usage, active direct IPs fold in, inactive
+    /// direct IPs are skipped, and a re-merge of existing addrs is a no-op.
+    #[test]
+    fn merge_transport_addrs_folds_relay_and_active_ip_skips_inactive() {
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let id = SecretKey::from_bytes(&[7u8; 32]).public();
+        let relay: iroh::RelayUrl = "https://relay.invalid/".parse().expect("relay url");
+        let active_ip: SocketAddr = (Ipv4Addr::new(10, 0, 0, 1), 4000).into();
+        let inactive_ip: SocketAddr = (Ipv4Addr::new(10, 0, 0, 2), 4001).into();
+
+        let mut addr = EndpointAddr::new(id);
+        let merged = super::merge_transport_addrs(
+            &mut addr,
+            [
+                // An idle relay must still fold in — it is the load-bearing
+                // fallback for a NAT'd inviter.
+                (TransportAddr::Relay(relay.clone()), false),
+                (TransportAddr::Ip(active_ip), true),
+                // A stale/inactive direct IP must be skipped.
+                (TransportAddr::Ip(inactive_ip), false),
+            ]
+            .into_iter(),
+        );
+        assert!(merged);
+        assert!(
+            addr.relay_urls().any(|u| u == &relay),
+            "relay must be folded regardless of usage"
+        );
+        assert!(
+            addr.ip_addrs().any(|a| a == &active_ip),
+            "active direct IP must be folded"
+        );
+        assert!(
+            !addr.ip_addrs().any(|a| a == &inactive_ip),
+            "inactive direct IP must be skipped"
+        );
+
+        // Re-merging addrs already present adds nothing.
+        let again = super::merge_transport_addrs(
+            &mut addr,
+            [(TransportAddr::Relay(relay.clone()), false)].into_iter(),
+        );
+        assert!(!again, "re-merging existing addrs is a no-op");
     }
 }
 
