@@ -108,7 +108,7 @@ impl IdentityResolver for TwoIdentityResolver {
 
 /// Extract the canonical 32-byte ed25519 seed from a `PrivateIdentity`
 /// (bytes 32..64 of `to_private_bytes()`).
-fn signing_key_from(identity: &PrivateIdentity) -> SigningKey {
+pub(crate) fn signing_key_from(identity: &PrivateIdentity) -> SigningKey {
     let priv_bytes = identity.to_private_bytes();
     let mut secret = [0u8; 32];
     secret.copy_from_slice(&priv_bytes[32..64]);
@@ -129,7 +129,7 @@ fn dup_identity(src: &PrivateIdentity) -> PrivateIdentity {
 /// branch when it builds the PendingJoin's `joiner_identity_pub`. See
 /// the matching helper in `pkarr_invite_redemption_integration.rs`
 /// (Task 3 single-engine test).
-fn derive_composite_owner(sk: &SigningKey) -> (OwnerAddr, [u8; 64]) {
+pub(crate) fn derive_composite_owner(sk: &SigningKey) -> (OwnerAddr, [u8; 64]) {
     let x25519_priv = harmony_app::dm_signing::ed25519_priv_to_x25519(sk);
     let x25519_pub = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*x25519_priv));
     let ed25519_pub = sk.verifying_key().to_bytes();
@@ -145,7 +145,7 @@ fn derive_composite_owner(sk: &SigningKey) -> (OwnerAddr, [u8; 64]) {
 /// no pkarr publisher, no DERP relays. Both ALPNs are registered so
 /// the dialer can hit either; the accept side dispatches on negotiated
 /// ALPN inside `IrohZenohLinkManager::spawn_accept_loop`.
-async fn build_hermetic_endpoint() -> Arc<IrohEndpoint> {
+pub(crate) async fn build_hermetic_endpoint() -> Arc<IrohEndpoint> {
     let secret = SecretKey::generate();
     let inner = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
@@ -169,7 +169,7 @@ async fn build_hermetic_endpoint() -> Arc<IrohEndpoint> {
 /// handshake — which doesn't ride through CAS — but kept in case
 /// future assertions exercise the full membership materialization
 /// path, which still touches CAS for community-config blobs).
-fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
+pub(crate) fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
     let cas: Arc<TokioMutex<HashMap<harmony_content::cid::ContentId, Vec<u8>>>> =
         Arc::new(TokioMutex::new(HashMap::new()));
     let (cas_op_tx, mut cas_op_rx) = mpsc::channel::<CasOp>(64);
@@ -228,62 +228,63 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
 /// Everything the two roundtrip tests need after the shared two-party setup.
 /// Fields prefixed `_` are keep-alive handles (spawned tasks, accept loops,
 /// tempdirs, the mock relay server) that must outlive the redeem call.
-struct TwoPartySetup {
+pub(crate) struct TwoPartySetup {
     // ── Identities / community ──────────────────────────────────────────
-    alice_comm: harmony_app::community_membership::TestOwner,
-    bob_comm: harmony_app::community_membership::TestOwner,
-    alice_comm_sk: Arc<SigningKey>,
-    bob_comm_sk: Arc<SigningKey>,
-    alice_addr: OwnerAddr,
-    bob_addr: OwnerAddr,
-    alice_pub: [u8; 64],
-    alice_minted: harmony_app::MintedCommunity,
-    community_id: harmony_app::owner_state_types::SpaceId,
+    pub(crate) alice_comm: harmony_app::community_membership::TestOwner,
+    pub(crate) bob_comm: harmony_app::community_membership::TestOwner,
+    pub(crate) alice_comm_sk: Arc<SigningKey>,
+    pub(crate) bob_comm_sk: Arc<SigningKey>,
+    pub(crate) alice_addr: OwnerAddr,
+    pub(crate) bob_addr: OwnerAddr,
+    pub(crate) alice_pub: [u8; 64],
+    pub(crate) alice_minted: harmony_app::MintedCommunity,
+    pub(crate) community_id: harmony_app::owner_state_types::SpaceId,
 
     // ── Endpoints (for teardown) ────────────────────────────────────────
-    alice_ep: Arc<IrohEndpoint>,
-    bob_ep: Arc<IrohEndpoint>,
+    pub(crate) alice_ep: Arc<IrohEndpoint>,
+    pub(crate) bob_ep: Arc<IrohEndpoint>,
 
     // ── Registries (for post-redeem assertions) ─────────────────────────
-    registry_alice: Arc<CommunitySyncRegistry>,
-    registry_bob: Arc<CommunitySyncRegistry>,
+    pub(crate) registry_alice: Arc<CommunitySyncRegistry>,
+    pub(crate) registry_bob: Arc<CommunitySyncRegistry>,
 
     // ── Bob redeem deps ─────────────────────────────────────────────────
-    bob_reachability: ReachabilityResolver,
-    bob_crdt_state: Arc<TokioMutex<OwnerState>>,
-    bob_hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
-    bob_dm_outbox: Arc<TokioMutex<DmOutbox>>,
-    bob_channel_log_registry: Arc<ChannelLogRegistry>,
+    pub(crate) bob_reachability: ReachabilityResolver,
+    pub(crate) bob_crdt_state: Arc<TokioMutex<OwnerState>>,
+    pub(crate) bob_hlc_tracker: Arc<TokioMutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
+    pub(crate) bob_dm_outbox: Arc<TokioMutex<DmOutbox>>,
+    pub(crate) bob_channel_log_registry: Arc<ChannelLogRegistry>,
     // ZEB-790: Bob's single adoption floor — shared by registry_bob, Bob's
     // channel-log registry, every redeem call, and the durability SyncEngine.
     // (Alice's registry_alice holds its own floor — a separate node.)
-    bob_adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor,
-    bob_adapter_tx: mpsc::Sender<CommunityAdapterRequest>,
+    pub(crate) bob_adopt_floor: harmony_app::hlc_adopt_floor::HlcAdoptFloor,
+    pub(crate) bob_adapter_tx: mpsc::Sender<CommunityAdapterRequest>,
     // ZEB-473 (Move 1a): `bob_unicast_tx` removed with the Reticulum carrier.
     // `bob_unicast_count` stays at 0 structurally (no unicast producer exists);
     // the post-redeem assertion now documents that structural invariant.
-    bob_unicast_count: Arc<AtomicUsize>,
+    pub(crate) bob_unicast_count: Arc<AtomicUsize>,
 
     // ── pkarr ───────────────────────────────────────────────────────────
-    invite_pub: Arc<harmony_app::pkarr_invite_publisher::PkarrInvitePublisher>,
-    pkarr_resolver: Arc<harmony_pkarr::PkarrResolver>,
-    pkarr_publisher: Arc<harmony_pkarr::PkarrPublisher>,
+    pub(crate) invite_pub: Arc<harmony_app::pkarr_invite_publisher::PkarrInvitePublisher>,
+    pub(crate) pkarr_resolver: Arc<harmony_pkarr::PkarrResolver>,
+    pub(crate) pkarr_publisher: Arc<harmony_pkarr::PkarrPublisher>,
 
     // ── keep-alive ──────────────────────────────────────────────────────
-    _alice_accept: tokio::task::JoinHandle<()>,
-    _bob_accept: tokio::task::JoinHandle<()>,
-    _relay: harmony_pkarr::testing::MockPkarrRelay,
+    pub(crate) _alice_accept: tokio::task::JoinHandle<()>,
+    pub(crate) _bob_accept: tokio::task::JoinHandle<()>,
+    pub(crate) _relay: harmony_pkarr::testing::MockPkarrRelay,
     // Aborted during teardown (not just dropped) so the long-lived pkarr publisher
     // task can't bleed background work into later tests. Not underscore-prefixed:
     // it is actively used (.abort()), unlike the pure keep-alive fields above.
-    publisher_handle: tokio::task::JoinHandle<()>,
-    _dir_alice: tempfile::TempDir,
-    _dir_bob: tempfile::TempDir,
+    pub(crate) publisher_handle: tokio::task::JoinHandle<()>,
+    pub(crate) _dir_alice: tempfile::TempDir,
+    pub(crate) _dir_bob: tempfile::TempDir,
 }
 
 /// The acceptor config the four happy-path roundtrips use (short wall-clock
 /// budgets so a stall surfaces as a timeout in seconds, not at the outer 60s).
-fn default_acceptor_config() -> harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
+pub(crate) fn default_acceptor_config() -> harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig
+{
     harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
         io_deadline: Duration::from_millis(10_000),
         poll_deadline: Duration::from_millis(10_000),
@@ -301,7 +302,7 @@ async fn setup_two_party_iroh_handshake() -> TwoPartySetup {
 /// `acceptor_config` lets the ZEB-874 negative test force a deterministic
 /// post-insert failure (`poll_deadline = 0` → CountersignTimeout before the
 /// countersign write); the happy-path tests pass `default_acceptor_config()`.
-async fn setup_two_party_iroh_handshake_with_config(
+pub(crate) async fn setup_two_party_iroh_handshake_with_config(
     acceptor_config: harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig,
 ) -> TwoPartySetup {
     // ── 1. Identities. ───────────────────────────────────────────────
@@ -2112,7 +2113,9 @@ async fn invite_not_burned_when_handshake_fails_after_insert() {
 
 /// ZEB-889 test helper: build the targeted invite-only payload / URL / token_sig
 /// used by the mint-reuse tests (same shape as the negative test's inline copy).
-fn zeb889_build_targeted_invite(s: &TwoPartySetup) -> (CommunityInvitePayload, String, [u8; 64]) {
+pub(crate) fn zeb889_build_targeted_invite(
+    s: &TwoPartySetup,
+) -> (CommunityInvitePayload, String, [u8; 64]) {
     let token_minted_at = Hlc {
         wall_ms: 100_500,
         logical: 0,

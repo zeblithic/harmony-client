@@ -40041,36 +40041,25 @@ pub struct NavUpdatedPayload {
     pub pending: Option<bool>,
 }
 
-/// Pure function: builds the joiner-side `MintedCommunity` from an
-/// invite payload — derives a Community Space row from `payload.name`
-/// / `is_invite_only`, and signs a self-Join `SignedMembershipEvent`
-/// (actor = `self_owner`, community_id = `payload.community_id`).
+/// Joiner-side extraction of the community epoch key from an invite payload.
 ///
-/// Pure / sync / no I/O — the caller supplies `join_hlc`. This lets
-/// the test (`redeem_invite_inner_tests`) cover the full mint without
-/// spawning channels, mutexes, or a Tauri runtime.
+/// - Open communities: `sealed_epoch_key` is the raw 32-byte EpochKey
+///   (publicly shareable — anyone with the link gets it).
+/// - Invite-only communities: `sealed_epoch_key` / `sealed_epoch_keys` are
+///   X25519-sealed envelopes (32 ephemeral_pub + 12 nonce + 32 ct + 16 tag)
+///   opened with the invitee's enrolled device-#2 X25519 key (targeted,
+///   RFC 7748 §5 via `ed25519_priv_to_x25519`) or the URL's one-time
+///   ephemeral key (`untargeted_decrypt_key`, ZEB-367).
 ///
-/// ZEB-267: Caller pre-reserves `join_hlc` via
-/// `dm_outbox::reserve_next_hlc_for_device`.
-pub fn mint_redemption(
+/// ZEB-911: extracted from `mint_redemption` so the witness-discovery
+/// ladder in `connectivity_redeem_invite_iroh_inner` can derive rendezvous
+/// slot keys from the same epoch key BEFORE any dial. Behavior-preserving
+/// move — including the ZEB-369 invitee-hint early reject.
+pub fn open_invite_epoch_key(
     payload: &crate::community_invite::CommunityInvitePayload,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: &ed25519_dalek::SigningKey,
-    enrollment_cert: &harmony_owner::certs::EnrollmentCert,
-    join_hlc: crate::owner_state_types::Hlc,
-) -> Result<MintedCommunity, String> {
-    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
-    use crate::owner_state_types::{EpochKey, Space, SpaceKind};
-    use rand::RngCore;
-
-    // ZEB-249 / M3: extract the epoch key from the snapshot.
-    // - Open communities: sealed_epoch_key is the raw 32-byte EpochKey
-    //   (publicly shareable — anyone with the link gets it).
-    // - Invite-only communities: sealed_epoch_key is a 92-byte X25519-sealed
-    //   envelope (32 ephemeral_pub + 12 nonce + 32 ct + 16 tag) encrypted
-    //   to the invitee's X25519 pubkey. Derive the invitee's X25519 private
-    //   scalar from signing_key (RFC 7748 §5 via ed25519_priv_to_x25519)
-    //   and decrypt here.
+) -> Result<crate::owner_state_types::EpochKey, String> {
     let epoch_key_bytes: [u8; 32] = if payload.is_invite_only {
         // Invite-only path: decrypt the X25519-sealed epoch key.
         // ZEB-369 defense-in-depth: a TARGETED invite binds the token to a
@@ -40149,7 +40138,32 @@ pub fn mint_redemption(
                 )
             })?
     };
-    let membership_key = EpochKey::new(epoch_key_bytes);
+    Ok(crate::owner_state_types::EpochKey::new(epoch_key_bytes))
+}
+
+/// Pure function: builds the joiner-side `MintedCommunity` from an
+/// invite payload — derives a Community Space row from `payload.name`
+/// / `is_invite_only`, and signs a self-Join `SignedMembershipEvent`
+/// (actor = `self_owner`, community_id = `payload.community_id`).
+///
+/// Pure / sync / no I/O — the caller supplies `join_hlc`. This lets
+/// the test (`redeem_invite_inner_tests`) cover the full mint without
+/// spawning channels, mutexes, or a Tauri runtime.
+///
+/// ZEB-267: Caller pre-reserves `join_hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
+pub fn mint_redemption(
+    payload: &crate::community_invite::CommunityInvitePayload,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    signing_key: &ed25519_dalek::SigningKey,
+    enrollment_cert: &harmony_owner::certs::EnrollmentCert,
+    join_hlc: crate::owner_state_types::Hlc,
+) -> Result<MintedCommunity, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use crate::owner_state_types::{Space, SpaceKind};
+    use rand::RngCore;
+
+    let membership_key = open_invite_epoch_key(payload, self_owner, signing_key)?;
     let epoch = payload.epoch_snapshot.epoch;
 
     let mut rng = rand::thread_rng();
@@ -40262,6 +40276,14 @@ pub struct RedeemInviteOverrides {
     /// `target_event_id` must equal `pre_minted.bootstrap_join.id` for
     /// the post-Inserted hook to wake the registered oneshot.
     pub pre_delivered_countersign: Option<crate::community_membership::SignedMembershipEvent>,
+
+    /// ZEB-911: the countersigner's admission chain, delivered alongside a
+    /// WITNESS-authored `pre_delivered_countersign` (empty for the legacy
+    /// admin-authored response). Inserted into the joiner's engine, in
+    /// order, BEFORE the countersign — the chain's cert-carrying
+    /// `PendingJoin` is what makes the witness's signer resolvable and its
+    /// Joined status materializable on a fresh CRDT.
+    pub pre_delivered_chain: Vec<crate::community_membership::SignedMembershipEvent>,
 
     /// Admin identity pub for inserting the pre-delivered countersign.
     /// The joiner's engine has no resolver entry for admin pre-bootstrap,
@@ -41148,6 +41170,41 @@ where
                     ),
                 ));
             }
+            // ZEB-911: a WITNESS-authored countersign is unverifiable on a
+            // fresh joiner's CRDT (only the admin is known) unless the
+            // witness's own admission chain lands first — its cert-carrying
+            // PendingJoin makes the signer resolvable, and materializing it
+            // Joined satisfies verify_event's JoinCountersignActorNotJoined
+            // gate. The acceptor delivers the chain dependency-ordered;
+            // AlreadyKnown is fine (retry or raced CRDT sync).
+            for chain_ev in overrides.pre_delivered_chain.clone() {
+                let chain_ev_id = chain_ev.id;
+                match engine_arc.insert_local_event(chain_ev).await {
+                    Ok(crate::community_state_crdt::InsertOutcome::Inserted)
+                    | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {}
+                    Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
+                        let _ = community_registry
+                            .take_pending_redemption(&minted.bootstrap_join.id)
+                            .await;
+                        return Err(format!(
+                            "engine rejected witness admission-chain event {}: {verr}",
+                            hex::encode(chain_ev_id)
+                        )
+                        .into());
+                    }
+                    Err(e) => {
+                        let _ = community_registry
+                            .take_pending_redemption(&minted.bootstrap_join.id)
+                            .await;
+                        return Err(format!(
+                            "witness admission-chain insert failed for {}: {e}",
+                            hex::encode(chain_ev_id)
+                        )
+                        .into());
+                    }
+                }
+            }
+            let countersign_actor = cs.actor;
             match engine_arc
                 .insert_local_event_with_pubs(cs, admin_pub, None)
                 .await
@@ -41186,13 +41243,35 @@ where
                         .await;
                 }
                 Ok(crate::community_state_crdt::InsertOutcome::Rejected(verify_err)) => {
-                    let _ = community_registry
-                        .take_pending_redemption(&minted.bootstrap_join.id)
-                        .await;
-                    return Err(RedeemInviteError::new(
-                        RedeemInviteErrorCode::EngineInsertFailed,
-                        format!("engine rejected pre_delivered_countersign: {verify_err}"),
-                    ));
+                    // ZEB-911: a WITNESS-authored countersign that arrived
+                    // WITHOUT its admission chain (the acceptor degrades to
+                    // the legacy single-event shape when the chain exceeds
+                    // the handshake cap) is expected to reject here — the
+                    // witness is unknown to this fresh CRDT. Don't hard-fail
+                    // the redeem: fall through WITHOUT resolving the oneshot,
+                    // so step 7d times out into the honest ZEB-254
+                    // `pending: true` outcome and membership converges over
+                    // Zenoh once the seeded witness link syncs state-root.
+                    // An ADMIN-authored rejection (or a rejection despite a
+                    // delivered chain) stays a hard error — those indicate
+                    // real bugs, not the degraded-response path.
+                    let cs_is_witness_authored = countersign_actor != engine_arc.admin_addr();
+                    if cs_is_witness_authored && overrides.pre_delivered_chain.is_empty() {
+                        tracing::warn!(
+                            community_id = %hex::encode(minted.community_id.0),
+                            error = %verify_err,
+                            "ZEB-911: chain-less witness countersign rejected — degrading \
+                             to the pending fallback (state converges via Zenoh)"
+                        );
+                    } else {
+                        let _ = community_registry
+                            .take_pending_redemption(&minted.bootstrap_join.id)
+                            .await;
+                        return Err(RedeemInviteError::new(
+                            RedeemInviteErrorCode::EngineInsertFailed,
+                            format!("engine rejected pre_delivered_countersign: {verify_err}"),
+                        ));
+                    }
                 }
                 Err(insert_err) => {
                     let _ = community_registry
@@ -61514,6 +61593,11 @@ pub struct RedemptionOutcome {
     ///   record, OR the iroh dial / open_bi / response read failed
     ///   before the inviter delivered a JoinCountersign. The inviter
     ///   was NOT reached. `community_id` is `None`.
+    /// * `"no_member_reachable"` — ZEB-911: the admin dial failed AND the
+    ///   witness ladder dialed at least one rendezvous-resolved candidate,
+    ///   all unreachable. Same retry semantics as `"inviter_unreachable"`;
+    ///   distinct so the UI names the community, not the inviter.
+    ///   `community_id` is `None`.
     /// * `"join_failed"` — pkarr resolved AND the iroh handshake
     ///   completed AND a valid JoinCountersign was delivered, but the
     ///   subsequent local `redeem_invite_inner_with_overrides` failed
@@ -61551,6 +61635,22 @@ impl RedemptionOutcome {
     fn unreachable() -> Self {
         Self {
             status: "inviter_unreachable".to_string(),
+            community_id: None,
+            pending: false,
+        }
+    }
+
+    /// ZEB-911: the witness ladder was genuinely exercised — either the
+    /// admin's Case-A dial failed and at least one rendezvous-resolved
+    /// witness candidate was dialed and failed, or a WITNESS connection was
+    /// established and the handshake stream then died (review r2:
+    /// witness-aware post-dial classification). Distinct from
+    /// `"inviter_unreachable"` so the frontend can say "no community member
+    /// is currently reachable" instead of blaming the inviter, while mapping
+    /// to the same retry affordance. No membership landed.
+    fn no_member_reachable() -> Self {
+        Self {
+            status: "no_member_reachable".to_string(),
             community_id: None,
             pending: false,
         }
@@ -62463,6 +62563,208 @@ pub(crate) fn endpoint_addr_from_routing(
     Ok(addr)
 }
 
+/// ZEB-911: a rendezvous-resolved witness candidate for the redeem dial
+/// ladder — a Joined member's advertised routing payload plus the owner
+/// identity derived from the outer pkarr record (gateway-driver parity:
+/// `OwnerAddr(identity.address_hash)`), used as the ReachabilityResolver
+/// seed key if this candidate is dialed.
+#[derive(Debug, Clone)]
+pub(crate) struct WitnessCandidate {
+    pub(crate) routing: crate::reachability_record::ReachabilityAnnouncePayload,
+    pub(crate) owner: crate::owner_state_types::OwnerAddr,
+}
+
+/// ZEB-911: pkarr verifying keys for ONE community-rendezvous slot across
+/// the wall-clock epoch tolerance window — the witness-ladder analogue of
+/// the Case-A window derivation in `connectivity_redeem_invite_iroh_inner`.
+/// Slot keys are a pure function of (community epoch key, slot index,
+/// 7-day wall bucket), so an invite holder can derive every slot with no
+/// additional material. Publisher parity is pinned by
+/// `zeb911_witness_ladder_tests::slot_window_keys_match_publisher_derivation`.
+pub(crate) fn witness_slot_window_keys(
+    epoch_key: &crate::owner_state_types::EpochKey,
+    slot_index: u16,
+    now_ms: u64,
+) -> Vec<ed25519_dalek::VerifyingKey> {
+    harmony_pkarr::epoch_tolerance_window(now_ms)
+        .iter()
+        .map(|&epoch_id| {
+            crate::community_rendezvous::rendezvous_slot_verifying_key(
+                epoch_key, slot_index, epoch_id,
+            )
+        })
+        .collect()
+}
+
+/// ZEB-911: drop witness candidates that would re-dial an endpoint the
+/// ladder already tried — the rung-0 admin dial (`exclude_node_id`) and
+/// earlier candidates (one advertiser can hold several slots across the
+/// epoch window; the admin may itself be an advertiser). Order-preserving:
+/// slot order is the deterministic advertiser ranking, so earlier slots
+/// stay first.
+pub(crate) fn dedup_witness_candidates(
+    candidates: Vec<WitnessCandidate>,
+    exclude_node_id: Option<[u8; 32]>,
+) -> Vec<WitnessCandidate> {
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    if let Some(id) = exclude_node_id {
+        seen.insert(id);
+    }
+    candidates
+        .into_iter()
+        .filter(|c| seen.insert(c.routing.iroh_node_id))
+        .collect()
+}
+
+/// ZEB-911 (Qodo r3): classify the outcome when neither the admin rung nor
+/// the witness ladder produced a connection.
+///
+/// * Any witness dial attempted → `no_member_reachable` (the ladder was
+///   genuinely exercised; the community, not just the inviter, was tried).
+/// * NOTHING was ever dialed (the admin rung never synthesized an addr AND
+///   the ladder yielded zero candidates) and at least one slot resolve
+///   failed at the pkarr transport layer → propagate the typed error the
+///   admin resolve already uses (`From<PkarrError>` → `relays_warming_up`,
+///   which steers the "Try via local network" affordance) instead of
+///   collapsing a relay outage into `inviter_unreachable`.
+/// * Otherwise → `inviter_unreachable`. In particular a resolve error AFTER
+///   a confirmed failed dial stays `inviter_unreachable` — the ZEB-892
+///   CodeAnt #642 rationale (see the B4 retry above): once a dial to a
+///   verified record has failed, "unreachable" is the accurate outcome and
+///   a relay error merely means we couldn't fetch a *fresher* address.
+fn witness_ladder_fallback_outcome(
+    witness_dials_attempted: usize,
+    admin_dial_attempted: bool,
+    ladder_resolve_err: Option<RedeemInviteError>,
+) -> Result<RedemptionOutcome, RedeemInviteError> {
+    if witness_dials_attempted > 0 {
+        return Ok(RedemptionOutcome::no_member_reachable());
+    }
+    if !admin_dial_attempted {
+        if let Some(e) = ladder_resolve_err {
+            return Err(e);
+        }
+    }
+    Ok(RedemptionOutcome::unreachable())
+}
+
+#[cfg(test)]
+mod zeb911_witness_ladder_tests {
+    use super::{dedup_witness_candidates, witness_slot_window_keys, WitnessCandidate};
+    use crate::owner_state_types::{EpochKey, OwnerAddr};
+    use crate::reachability_record::ReachabilityAnnouncePayload;
+
+    fn payload_with_node(node: u8) -> ReachabilityAnnouncePayload {
+        ReachabilityAnnouncePayload {
+            iroh_node_id: [node; 32],
+            home_relay_url: String::new(),
+            direct_addresses: vec![],
+            announced_at_ms: 0,
+            identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
+        }
+    }
+
+    fn candidate(node: u8, owner: u8) -> WitnessCandidate {
+        WitnessCandidate {
+            routing: payload_with_node(node),
+            owner: OwnerAddr([owner; 16]),
+        }
+    }
+
+    /// The joiner-side window derivation must equal the publisher's
+    /// per-(slot, epoch) derivation exactly — a drift here silently blinds
+    /// the whole witness ladder (records exist, joiner queries the wrong
+    /// keys, resolve returns empty).
+    #[test]
+    fn slot_window_keys_match_publisher_derivation() {
+        let epoch_key = EpochKey::new([0x5a; 32]);
+        let now_ms: u64 = 1_750_000_000_000;
+        let window = harmony_pkarr::epoch_tolerance_window(now_ms);
+        assert!(!window.is_empty());
+        for slot in 0..crate::community_rendezvous::RENDEZVOUS_SLOT_COUNT as u16 {
+            let keys = witness_slot_window_keys(&epoch_key, slot, now_ms);
+            assert_eq!(keys.len(), window.len());
+            for (i, &epoch_id) in window.iter().enumerate() {
+                let expected = crate::community_rendezvous::rendezvous_slot_verifying_key(
+                    &epoch_key, slot, epoch_id,
+                );
+                assert_eq!(keys[i], expected, "slot {slot} epoch {epoch_id}");
+            }
+        }
+        // Distinct slots must never derive the same key (would alias two
+        // advertisers onto one DHT record).
+        let s0 = witness_slot_window_keys(&epoch_key, 0, now_ms);
+        let s1 = witness_slot_window_keys(&epoch_key, 1, now_ms);
+        assert_ne!(s0[0], s1[0]);
+    }
+
+    #[test]
+    fn dedup_drops_admin_node_and_repeats_preserving_order() {
+        let cands = vec![
+            candidate(0xAA, 1), // == excluded admin node
+            candidate(0xBB, 2),
+            candidate(0xBB, 2), // repeat of BB
+            candidate(0xCC, 3),
+        ];
+        let out = dedup_witness_candidates(cands, Some([0xAA; 32]));
+        let nodes: Vec<u8> = out.iter().map(|c| c.routing.iroh_node_id[0]).collect();
+        assert_eq!(nodes, vec![0xBB, 0xCC]);
+        assert_eq!(out[0].owner, OwnerAddr([2; 16]));
+    }
+
+    #[test]
+    fn dedup_without_exclusion_keeps_first_occurrence() {
+        let cands = vec![candidate(0xAA, 1), candidate(0xAA, 9), candidate(0xBB, 2)];
+        let out = dedup_witness_candidates(cands, None);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].owner, OwnerAddr([1; 16]));
+    }
+
+    // Qodo r3: the zero-connection decision table. A pkarr transport failure
+    // must keep its typed classification (`relays_warming_up` steers the LAN
+    // fallback) — but ONLY when nothing was ever dialed; after any confirmed
+    // failed dial the ZEB-892 CodeAnt #642 rationale holds and the outcome
+    // stays "unreachable".
+    use super::witness_ladder_fallback_outcome;
+    use crate::community_invite::{RedeemInviteError, RedeemInviteErrorCode};
+
+    fn transport_err() -> RedeemInviteError {
+        RedeemInviteError::new(
+            RedeemInviteErrorCode::RelaysWarmingUp,
+            "all relays errored".to_string(),
+        )
+    }
+
+    #[test]
+    fn fallback_outcome_witness_dials_win_over_resolve_error() {
+        let out = witness_ladder_fallback_outcome(1, false, Some(transport_err()))
+            .expect("dialed ladder is an outcome, not an error");
+        assert_eq!(out.status, "no_member_reachable");
+    }
+
+    #[test]
+    fn fallback_outcome_zero_dials_transport_error_stays_typed() {
+        let err = witness_ladder_fallback_outcome(0, false, Some(transport_err()))
+            .expect_err("undialed transport failure must surface typed");
+        assert_eq!(err.code, RedeemInviteErrorCode::RelaysWarmingUp);
+    }
+
+    #[test]
+    fn fallback_outcome_after_admin_dial_resolve_error_is_unreachable() {
+        let out = witness_ladder_fallback_outcome(0, true, Some(transport_err()))
+            .expect("post-dial resolve error folds into an outcome");
+        assert_eq!(out.status, "inviter_unreachable");
+    }
+
+    #[test]
+    fn fallback_outcome_zero_dials_no_error_is_unreachable() {
+        let out = witness_ladder_fallback_outcome(0, false, None).expect("legacy outcome");
+        assert_eq!(out.status, "inviter_unreachable");
+    }
+}
+
 /// ZEB-908: fold the transport addresses iroh currently holds for a peer's
 /// node — most importantly its relay locator — into `addr`, so a fresh
 /// handshake/redeem dial reuses an already-established live session's path.
@@ -62970,216 +63272,460 @@ where
         // letting `format!` fall through `From<String>` → `internal`, which
         // suppressed the "Try via local network" button offline.
         .map_err(RedeemInviteError::from)?;
-    let Some(rec) = rec else {
-        return Ok(RedemptionOutcome::unreachable());
-    };
-
-    // 7. Decode the inner routing payload.
-    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
-        ciborium::from_reader(rec.routing_blob.as_slice())
-            .map_err(|e| format!("decode routing_blob: {e}"))?;
-
-    // Seed the local ReachabilityResolver. Option A doesn't strictly
-    // need this — the iroh bi-stream below opens with an explicit
-    // EndpointAddr — but the seed remains useful for future Zenoh-CRDT-
-    // sync once Phase 1's iroh→zenoh ingestion is wired, and is
-    // harmless on the option-A path.
+    // ZEB-911: rung 0 of the dial ladder — the admin's Case-A record. An
+    // absent/stale record no longer dead-ends the redeem (`'rung0:` falls
+    // through with `conn = None`): the witness ladder below can still reach
+    // a live community member even when the admin has been offline past the
+    // record's freshness window — the exact scenario ZEB-911 exists for.
     let inviter_addr = payload.admin_addr;
-    let inviter_device_hash = crate::owner_state_types::DeviceIdentityHash([0u8; 16]);
-    reachability_resolver
-        .seed_from_pkarr(inviter_addr, inviter_device_hash, routing.clone())
-        .await;
-
-    tracing::info!(
-        community_id = %hex::encode(payload.community_id.0),
-        inviter = %hex::encode(inviter_addr.0),
-        "ZEB-325 Phase 2c option A: pkarr resolved + ReachabilityResolver seeded; \
-         opening iroh handshake bi-stream"
-    );
-
-    // Stage 2/5: `connecting` — about to dial the inviter's iroh
-    // endpoint on `harmony/handshake/v1`.
-    emit_stage(RedemptionStage::Connecting);
-
-    // 7'. Synthesize an EndpointAddr from the verified routing record.
-    // Mirrors `IrohZenohLinkManager::new_link` (which would do the same
-    // synthesis for a Zenoh ALPN dial). The `iroh_node_id` is the iroh
-    // EndpointId (32-byte Ed25519 pub); skip malformed relay URLs
-    // silently (direct addrs alone may still succeed).
-    let mut alice_addr = endpoint_addr_from_routing(&routing)
-        .map_err(|e| format!("synthesize inviter addr: {e}"))?;
-
-    // 8. Open the iroh QUIC connection on the handshake ALPN.
-    //
-    // ZEB-325 PR #159 F3: bound `connect()` and `open_bi()` by the
-    // dialer config so a peer that we can route packets to but that
-    // never finishes the QUIC handshake (NAT in flux, blackhole, etc.)
-    // cannot pin this IPC for the duration of the underlying
-    // QUIC-level timeout (minutes, on some configurations). Distinct
-    // tracing for dial-timeout vs open_bi-timeout vs response-timeout
-    // so diagnostics can attribute failures.
-    //
-    // B4: a single diverse-relay re-resolve retry. The first
-    // `resolve_window` hit may have come from a stale relay serving a
-    // dead endpoint; on the FIRST connect failure we re-resolve the
-    // freshest record across ALL relays (`resolve_window_freshest`),
-    // re-verify + re-decode + re-synthesize the addr, and dial once
-    // more. Only CONNECT failures trigger the retry — a fresher addr
-    // fixes "can't reach the endpoint", not a post-connect stream
-    // failure (open_bi stays one-shot below).
     let mut conn = None;
-    for attempt in 0..2 {
-        // ZEB-908: before dialing, fold the addressing iroh already holds for
-        // this inviter's node (crucially its relay) into `alice_addr`, so a
-        // redeem to a peer we already have a live session with reuses that path
-        // instead of failing "inviter offline" on a pkarr blob that carried no
-        // usable relay. No-op when no live info exists (cold-start unchanged);
-        // runs each attempt so the B4 re-resolved addr is enriched too.
-        if merge_live_endpoint_addrs(iroh_endpoint.inner(), &mut alice_addr).await {
+    let mut admin_node_id: Option<[u8; 32]> = None;
+    'rung0: {
+        let Some(rec) = rec else {
             tracing::info!(
-                inviter = %hex::encode(inviter_addr.0),
-                "ZEB-908: reused live session addressing for redeem handshake dial"
+                community_id = %hex::encode(payload.community_id.0),
+                "ZEB-911: no fresh verified admin Case-A record — skipping to the witness ladder"
             );
-        }
-        match tokio::time::timeout(
-            dial_config.connect_timeout,
-            iroh_endpoint.inner().connect(
-                alice_addr.clone(),
-                crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(c)) => {
-                conn = Some(c);
-                break;
-            }
-            Ok(Err(e)) => {
+            // Stage 2/5 normally fires after the admin seed below; keep the
+            // staged UI moving when rung 0 is skipped.
+            emit_stage(RedemptionStage::Connecting);
+            break 'rung0;
+        };
+
+        // 7. Decode the inner routing payload. ZEB-911 (review r1): a
+        // malformed record is equivalent to no record — fall through to the
+        // witness ladder instead of aborting the whole redemption.
+        let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+            match ciborium::from_reader(rec.routing_blob.as_slice()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ZEB-911: admin routing_blob decode failed — skipping to the witness ladder"
+                    );
+                    emit_stage(RedemptionStage::Connecting);
+                    break 'rung0;
+                }
+            };
+
+        // Seed the local ReachabilityResolver. Option A doesn't strictly
+        // need this — the iroh bi-stream below opens with an explicit
+        // EndpointAddr — but the seed remains useful for future Zenoh-CRDT-
+        // sync once Phase 1's iroh→zenoh ingestion is wired, and is
+        // harmless on the option-A path.
+        let inviter_device_hash = crate::owner_state_types::DeviceIdentityHash([0u8; 16]);
+        reachability_resolver
+            .seed_from_pkarr(inviter_addr, inviter_device_hash, routing.clone())
+            .await;
+
+        tracing::info!(
+            community_id = %hex::encode(payload.community_id.0),
+            inviter = %hex::encode(inviter_addr.0),
+            "ZEB-325 Phase 2c option A: pkarr resolved + ReachabilityResolver seeded; \
+             opening iroh handshake bi-stream"
+        );
+
+        // Stage 2/5: `connecting` — about to dial the inviter's iroh
+        // endpoint on `harmony/handshake/v1`.
+        emit_stage(RedemptionStage::Connecting);
+
+        // 7'. Synthesize an EndpointAddr from the verified routing record.
+        // Mirrors `IrohZenohLinkManager::new_link` (which would do the same
+        // synthesis for a Zenoh ALPN dial). The `iroh_node_id` is the iroh
+        // EndpointId (32-byte Ed25519 pub); skip malformed relay URLs
+        // silently (direct addrs alone may still succeed).
+        let mut alice_addr = match endpoint_addr_from_routing(&routing) {
+            Ok(a) => a,
+            Err(e) => {
+                // ZEB-911 (review r1): same fallthrough as a decode failure —
+                // an unsynthesizable admin record must not dead-end the ladder.
                 tracing::warn!(
                     error = %e,
-                    attempt,
+                    "ZEB-911: admin addr synthesize failed — skipping to the witness ladder"
+                );
+                break 'rung0;
+            }
+        };
+        admin_node_id = Some(*alice_addr.id.as_bytes());
+
+        // 8. Open the iroh QUIC connection on the handshake ALPN.
+        //
+        // ZEB-325 PR #159 F3: bound `connect()` and `open_bi()` by the
+        // dialer config so a peer that we can route packets to but that
+        // never finishes the QUIC handshake (NAT in flux, blackhole, etc.)
+        // cannot pin this IPC for the duration of the underlying
+        // QUIC-level timeout (minutes, on some configurations). Distinct
+        // tracing for dial-timeout vs open_bi-timeout vs response-timeout
+        // so diagnostics can attribute failures.
+        //
+        // B4: a single diverse-relay re-resolve retry. The first
+        // `resolve_window` hit may have come from a stale relay serving a
+        // dead endpoint; on the FIRST connect failure we re-resolve the
+        // freshest record across ALL relays (`resolve_window_freshest`),
+        // re-verify + re-decode + re-synthesize the addr, and dial once
+        // more. Only CONNECT failures trigger the retry — a fresher addr
+        // fixes "can't reach the endpoint", not a post-connect stream
+        // failure (open_bi stays one-shot below).
+        for attempt in 0..2 {
+            // ZEB-908: before dialing, fold the addressing iroh already holds for
+            // this inviter's node (crucially its relay) into `alice_addr`, so a
+            // redeem to a peer we already have a live session with reuses that path
+            // instead of failing "inviter offline" on a pkarr blob that carried no
+            // usable relay. No-op when no live info exists (cold-start unchanged);
+            // runs each attempt so the B4 re-resolved addr is enriched too.
+            if merge_live_endpoint_addrs(iroh_endpoint.inner(), &mut alice_addr).await {
+                tracing::info!(
                     inviter = %hex::encode(inviter_addr.0),
-                    "ZEB-325 Phase 2c option A: iroh connect failed"
+                    "ZEB-908: reused live session addressing for redeem handshake dial"
                 );
             }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    timeout_ms = dial_config.connect_timeout.as_millis() as u64,
-                    attempt,
-                    inviter = %hex::encode(inviter_addr.0),
-                    "ZEB-325 Phase 2c option A: iroh connect timeout (dial)"
-                );
+            match tokio::time::timeout(
+                dial_config.connect_timeout,
+                iroh_endpoint.inner().connect(
+                    alice_addr.clone(),
+                    crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(c)) => {
+                    conn = Some(c);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        attempt,
+                        inviter = %hex::encode(inviter_addr.0),
+                        "ZEB-325 Phase 2c option A: iroh connect failed"
+                    );
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_ms = dial_config.connect_timeout.as_millis() as u64,
+                        attempt,
+                        inviter = %hex::encode(inviter_addr.0),
+                        "ZEB-325 Phase 2c option A: iroh connect timeout (dial)"
+                    );
+                }
             }
-        }
-        // After the first failure, try a diverse-relay re-resolve before
-        // the final attempt. If the freshest record fails to resolve,
-        // verify, decode, or synthesize, fall through to the
-        // unreachable outcome below.
-        if attempt == 0 {
-            // ZEB-825 (mirrors ZEB-817 `resolve_vine_relays`): verify each
-            // candidate INSIDE the resolver via `_with`, not the single
-            // freshest-by-seq winner after the fact. An attacker who already
-            // holds the invite material can publish a self-consistent record
-            // under a sibling epoch-window key (its inner sig verifies against
-            // its OWN embedded identity pub); post-hoc-verifying only the
-            // resolver's freshest-by-seq pick would let that squat shadow the
-            // genuine record AND pin the resolver's seq-highwater + positive
-            // cache with itself, hiding the real record for the process
-            // lifetime. `_with` ranks freshest-first and returns the first
-            // candidate passing this predicate; failing candidates touch
-            // neither surface.
-            //
-            // `retry_now_ms` is sampled BEFORE the resolve here (a one-shot
-            // dial samples after): the predicate runs per-candidate DURING
-            // resolution, so sample-after is not expressible with `_with`. The
-            // freshness window it feeds spans whole epochs, so the seconds-scale
-            // sampling shift is immaterial — the same tradeoff
-            // `resolve_vine_relays` makes.
-            let retry_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
-            let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
-                rec.verify_inner_sig().is_ok()
-                    && rec.verify_identity_match(&admin_id_pub).is_ok()
-                    && rec.verify_freshness(retry_now_ms).is_ok()
-            };
-            let rec2_opt = resolver
-                .resolve_window_freshest_with(&verifying_keys, &verify)
-                .await;
-            // Qodo review: the predicate above ran against the pre-resolve
-            // `retry_now_ms`. Re-sample the wall clock AFTER the await and
-            // re-check the winner's freshness before the retry dial, so a record
-            // that expired *during* the multi-second all-relays resolve is
-            // treated as no usable record (→ break). The predicate keeps the
-            // anti-shadowing guarantee (a squat fails `verify_identity_match` and
-            // never becomes the winner); this recheck restores the one-shot
-            // dial's freshness-at-use strictness on the genuine winner.
-            let retry_dial_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
-            match rec2_opt {
-                Ok(Some(rec2)) if rec2.verify_freshness(retry_dial_now_ms).is_ok() => {
-                    match ciborium::from_reader::<
-                        crate::reachability_record::ReachabilityAnnouncePayload,
-                        _,
-                    >(rec2.routing_blob.as_slice())
-                    {
-                        Ok(routing2) => match endpoint_addr_from_routing(&routing2) {
-                            Ok(addr2) => {
-                                tracing::info!(
-                                    inviter = %hex::encode(inviter_addr.0),
-                                    "ZEB-325 Phase 2c option A: connect failed — \
-                                     re-resolved freshest record across all relays, \
-                                     retrying dial"
-                                );
-                                // Re-seed the ReachabilityResolver with the
-                                // fresher record so a follow-up dial (e.g.
-                                // IrohZenohLinkManager::new_link, which reads the
-                                // resolver to synthesize an EndpointAddr) targets
-                                // the same endpoint we're about to dial — not the
-                                // stale pre-retry one.
-                                reachability_resolver
-                                    .seed_from_pkarr(
-                                        inviter_addr,
-                                        crate::owner_state_types::DeviceIdentityHash([0u8; 16]),
-                                        routing2.clone(),
-                                    )
-                                    .await;
-                                alice_addr = addr2;
-                            }
+            // After the first failure, try a diverse-relay re-resolve before
+            // the final attempt. If the freshest record fails to resolve,
+            // verify, decode, or synthesize, fall through to the
+            // unreachable outcome below.
+            if attempt == 0 {
+                // ZEB-825 (mirrors ZEB-817 `resolve_vine_relays`): verify each
+                // candidate INSIDE the resolver via `_with`, not the single
+                // freshest-by-seq winner after the fact. An attacker who already
+                // holds the invite material can publish a self-consistent record
+                // under a sibling epoch-window key (its inner sig verifies against
+                // its OWN embedded identity pub); post-hoc-verifying only the
+                // resolver's freshest-by-seq pick would let that squat shadow the
+                // genuine record AND pin the resolver's seq-highwater + positive
+                // cache with itself, hiding the real record for the process
+                // lifetime. `_with` ranks freshest-first and returns the first
+                // candidate passing this predicate; failing candidates touch
+                // neither surface.
+                //
+                // `retry_now_ms` is sampled BEFORE the resolve here (a one-shot
+                // dial samples after): the predicate runs per-candidate DURING
+                // resolution, so sample-after is not expressible with `_with`. The
+                // freshness window it feeds spans whole epochs, so the seconds-scale
+                // sampling shift is immaterial — the same tradeoff
+                // `resolve_vine_relays` makes.
+                let retry_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+                let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+                    rec.verify_inner_sig().is_ok()
+                        && rec.verify_identity_match(&admin_id_pub).is_ok()
+                        && rec.verify_freshness(retry_now_ms).is_ok()
+                };
+                let rec2_opt = resolver
+                    .resolve_window_freshest_with(&verifying_keys, &verify)
+                    .await;
+                // Qodo review: the predicate above ran against the pre-resolve
+                // `retry_now_ms`. Re-sample the wall clock AFTER the await and
+                // re-check the winner's freshness before the retry dial, so a record
+                // that expired *during* the multi-second all-relays resolve is
+                // treated as no usable record (→ break). The predicate keeps the
+                // anti-shadowing guarantee (a squat fails `verify_identity_match` and
+                // never becomes the winner); this recheck restores the one-shot
+                // dial's freshness-at-use strictness on the genuine winner.
+                let retry_dial_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+                match rec2_opt {
+                    Ok(Some(rec2)) if rec2.verify_freshness(retry_dial_now_ms).is_ok() => {
+                        match ciborium::from_reader::<
+                            crate::reachability_record::ReachabilityAnnouncePayload,
+                            _,
+                        >(rec2.routing_blob.as_slice())
+                        {
+                            Ok(routing2) => match endpoint_addr_from_routing(&routing2) {
+                                Ok(addr2) => {
+                                    tracing::info!(
+                                        inviter = %hex::encode(inviter_addr.0),
+                                        "ZEB-325 Phase 2c option A: connect failed — \
+                                         re-resolved freshest record across all relays, \
+                                         retrying dial"
+                                    );
+                                    // Re-seed the ReachabilityResolver with the
+                                    // fresher record so a follow-up dial (e.g.
+                                    // IrohZenohLinkManager::new_link, which reads the
+                                    // resolver to synthesize an EndpointAddr) targets
+                                    // the same endpoint we're about to dial — not the
+                                    // stale pre-retry one.
+                                    reachability_resolver
+                                        .seed_from_pkarr(
+                                            inviter_addr,
+                                            crate::owner_state_types::DeviceIdentityHash([0u8; 16]),
+                                            routing2.clone(),
+                                        )
+                                        .await;
+                                    alice_addr = addr2;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "B4: re-resolved record synthesize failed"
+                                    );
+                                    break;
+                                }
+                            },
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
-                                    "B4: re-resolved record synthesize failed"
+                                    "B4: re-resolved routing_blob decode failed"
                                 );
                                 break;
                             }
-                        },
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "B4: re-resolved routing_blob decode failed"
-                            );
-                            break;
                         }
                     }
-                }
-                // ZEB-892 (CodeAnt #642): a resolver `Err` here folds into
-                // `inviter_unreachable` (below) rather than the initial
-                // resolve's `relays_warming_up`, and that is intentional — we
-                // only reach B4 *after* a confirmed failed dial to the inviter,
-                // so the accurate outcome is "the inviter's endpoint was
-                // unreachable", not "relays are cold". The retry re-resolve
-                // only tries to fetch a *fresher* address; a relay error there
-                // just means we can't, so `inviter_unreachable` stays correct.
-                _ => {
-                    tracing::warn!(
-                        inviter = %hex::encode(inviter_addr.0),
-                        "B4: diverse-relay re-resolve found no fresh verified record"
-                    );
-                    break;
+                    // ZEB-892 (CodeAnt #642): a resolver `Err` here folds into
+                    // `inviter_unreachable` (below) rather than the initial
+                    // resolve's `relays_warming_up`, and that is intentional — we
+                    // only reach B4 *after* a confirmed failed dial to the inviter,
+                    // so the accurate outcome is "the inviter's endpoint was
+                    // unreachable", not "relays are cold". The retry re-resolve
+                    // only tries to fetch a *fresher* address; a relay error there
+                    // just means we can't, so `inviter_unreachable` stays correct.
+                    _ => {
+                        tracing::warn!(
+                            inviter = %hex::encode(inviter_addr.0),
+                            "B4: diverse-relay re-resolve found no fresh verified record"
+                        );
+                        break;
+                    }
                 }
             }
         }
     }
+
+    // ZEB-911 witness ladder, rungs 1-4: the admin's Case-A rung yielded no
+    // connection (record absent/stale, or dial failed), so fall back to the
+    // community's rendezvous advertiser slots. Any Joined
+    // member reached this way is a complete redeem endpoint (slice 1
+    // relaxed the acceptor's inviter-identity policy): it verifies the
+    // packet against the admin's enrolled keys, performs the claim-bound
+    // PendingJoin insert, auto-counter-signs, and returns the countersign
+    // on this same bi-stream — byte-identical wire protocol to rung 0.
+    //
+    // Records are resolved with inner-sig + freshness verification only —
+    // NO identity match, because the joiner doesn't know the witnesses
+    // (spec §6: a decoy beacon costs one wasted dial + IP exposure to an
+    // epoch-key holder; admission integrity is CRDT-enforced end-to-end,
+    // same trust posture as open-join). Slot keys derive from the invite's
+    // epoch key; a community that rotated epochs since mint yields no
+    // matching records here and the ladder degrades to today's
+    // admin-only behavior (spec §5, accepted v1 limitation; ZEB-918).
+    let mut dialed_owner = inviter_addr;
+    let mut witness_dials_attempted = 0usize;
+    // Qodo r3: first pkarr TRANSPORT failure among the slot resolves, already
+    // converted to its typed form. Consulted only on the zero-dials outcome
+    // path (`witness_ladder_fallback_outcome`).
+    let mut ladder_resolve_err: Option<RedeemInviteError> = None;
+    let conn = if let Some(c) = conn {
+        Some(c)
+    } else {
+        match open_invite_epoch_key(&payload, self_owner, signing_key.as_ref()) {
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    community_id = %hex::encode(payload.community_id.0),
+                    "ZEB-911: cannot open invite epoch key — skipping witness ladder"
+                );
+                None
+            }
+            Ok(epoch_key) => {
+                // Review r1: the whole witness phase runs under one wall-clock
+                // budget, and the four slot resolves run CONCURRENTLY (one
+                // resolve round instead of four sequential ones), so a
+                // community full of stale beacons can't pin this IPC on the
+                // `Connecting` stage indefinitely. The candidate/dial count is
+                // already structurally ≤ RENDEZVOUS_SLOT_COUNT after dedup.
+                const WITNESS_LADDER_BUDGET_MS: u64 = 20_000;
+                let ladder = async {
+                    let ladder_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+                    let resolves = (0..crate::community_rendezvous::RENDEZVOUS_SLOT_COUNT as u16)
+                        .map(|slot| {
+                            let slot_keys =
+                                witness_slot_window_keys(&epoch_key, slot, ladder_now_ms);
+                            let resolver = &resolver;
+                            async move {
+                                let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+                                    rec.verify_inner_sig().is_ok()
+                                        && rec.verify_freshness(ladder_now_ms).is_ok()
+                                };
+                                (
+                                    slot,
+                                    resolver
+                                        .resolve_window_freshest_with(&slot_keys, &verify)
+                                        .await,
+                                )
+                            }
+                        });
+                    let mut candidates: Vec<WitnessCandidate> = Vec::new();
+                    for (slot, resolved) in futures::future::join_all(resolves).await {
+                        let rec = match resolved {
+                            Ok(Some(rec)) => rec,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                tracing::debug!(error = %e, slot, "ZEB-911: witness slot resolve error");
+                                // Qodo r3: a resolver `Err` is a transport-level
+                                // pkarr failure (all relays errored for this
+                                // slot's window) — remember the first one so the
+                                // zero-dials outcome below keeps its typed
+                                // classification instead of reporting a relay
+                                // outage as `inviter_unreachable`.
+                                if ladder_resolve_err.is_none() {
+                                    ladder_resolve_err = Some(RedeemInviteError::from(e));
+                                }
+                                continue;
+                            }
+                        };
+                        let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+                            match ciborium::from_reader(rec.routing_blob.as_slice()) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::debug!(error = %e, slot, "ZEB-911: witness routing_blob decode failed");
+                                    continue;
+                                }
+                            };
+                        // Derive the beacon's owner from the outer record's
+                        // identity (gateway-driver parity). Unparseable identity
+                        // bytes on an inner-sig-verified record indicate a
+                        // publisher bug, not an attack — skip.
+                        let owner = match harmony_identity::Identity::from_public_bytes(
+                            &rec.harmony_identity_pub,
+                        ) {
+                            Ok(identity) => {
+                                crate::owner_state_types::OwnerAddr(identity.address_hash)
+                            }
+                            Err(_) => {
+                                tracing::debug!(
+                                    slot,
+                                    "ZEB-911: witness record identity unparseable"
+                                );
+                                continue;
+                            }
+                        };
+                        candidates.push(WitnessCandidate { routing, owner });
+                    }
+                    let candidates = dedup_witness_candidates(candidates, admin_node_id);
+                    tracing::info!(
+                        community_id = %hex::encode(payload.community_id.0),
+                        candidates = candidates.len(),
+                        "ZEB-911: witness ladder resolved candidates"
+                    );
+                    let mut found = None;
+                    for cand in candidates {
+                        let cand_addr = match endpoint_addr_from_routing(&cand.routing) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::debug!(error = %e, "ZEB-911: witness addr synthesize failed");
+                                continue;
+                            }
+                        };
+                        // Seed the resolver under the witness's owner BEFORE the
+                        // dial so a successful handshake leaves the follow-up
+                        // Zenoh link (`IrohZenohLinkManager::new_link` reads this
+                        // seed) pointed at the peer we actually reached — the
+                        // witness-rung analogue of the rung-0 seed above.
+                        reachability_resolver
+                            .seed_from_pkarr(
+                                cand.owner,
+                                crate::owner_state_types::DeviceIdentityHash([0u8; 16]),
+                                cand.routing.clone(),
+                            )
+                            .await;
+                        witness_dials_attempted += 1;
+                        match tokio::time::timeout(
+                            dial_config.connect_timeout,
+                            iroh_endpoint.inner().connect(
+                                cand_addr,
+                                crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(c)) => {
+                                tracing::info!(
+                                    witness = %hex::encode(cand.owner.0),
+                                    "ZEB-911: witness dial connected — proceeding with handshake"
+                                );
+                                dialed_owner = cand.owner;
+                                found = Some(c);
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, witness = %hex::encode(cand.owner.0), "ZEB-911: witness connect failed");
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(witness = %hex::encode(cand.owner.0), "ZEB-911: witness connect timeout");
+                            }
+                        }
+                    }
+                    found
+                };
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(WITNESS_LADDER_BUDGET_MS),
+                    ladder,
+                )
+                .await
+                {
+                    Ok(found) => found,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            budget_ms = WITNESS_LADDER_BUDGET_MS,
+                            community_id = %hex::encode(payload.community_id.0),
+                            "ZEB-911: witness ladder budget exhausted"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    };
     let Some(conn) = conn else {
-        return Ok(RedemptionOutcome::unreachable());
+        // Distinguish "we actually tried witnesses too" from the legacy
+        // single-target outcome so the UI stops blaming the inviter when
+        // the whole community was unreachable — and (Qodo r3) surface a
+        // typed pkarr transport failure when nothing was ever dialed.
+        // Decision table pinned by
+        // `zeb911_witness_ladder_tests::fallback_outcome_*`.
+        return witness_ladder_fallback_outcome(
+            witness_dials_attempted,
+            admin_node_id.is_some(),
+            ladder_resolve_err,
+        );
+    };
+    // Review r2 (non-blocking): post-dial stream failures keep witness-aware
+    // classification. After a WITNESS connection, a died stream must not
+    // resurface in the UI as "the inviter is offline" — the inviter was
+    // never part of that exchange.
+    let post_dial_failure_outcome = || {
+        if dialed_owner == inviter_addr {
+            RedemptionOutcome::unreachable()
+        } else {
+            RedemptionOutcome::no_member_reachable()
+        }
     };
     let (mut send, mut recv) =
         match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
@@ -63187,20 +63733,20 @@ where
             Ok(Err(e)) => {
                 tracing::warn!(
                     error = %e,
-                    inviter = %hex::encode(inviter_addr.0),
+                    dialed = %hex::encode(dialed_owner.0),
                     "ZEB-325 Phase 2c option A: open_bi failed"
                 );
                 conn.close(0u32.into(), b"open_bi-failed");
-                return Ok(RedemptionOutcome::unreachable());
+                return Ok(post_dial_failure_outcome());
             }
             Err(_elapsed) => {
                 tracing::warn!(
                     timeout_ms = dial_config.open_bi_timeout.as_millis() as u64,
-                    inviter = %hex::encode(inviter_addr.0),
+                    dialed = %hex::encode(dialed_owner.0),
                     "ZEB-325 Phase 2c option A: open_bi timeout"
                 );
                 conn.close(0u32.into(), b"open_bi-timeout");
-                return Ok(RedemptionOutcome::unreachable());
+                return Ok(post_dial_failure_outcome());
             }
         };
 
@@ -63378,7 +63924,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request length-prefix write failed"
             );
             conn.close(0u32.into(), b"request-write-failed");
-            return Ok(RedemptionOutcome::unreachable());
+            return Ok(post_dial_failure_outcome());
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -63386,7 +63932,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request length-prefix write timeout"
             );
             conn.close(0u32.into(), b"write-timeout");
-            return Ok(RedemptionOutcome::unreachable());
+            return Ok(post_dial_failure_outcome());
         }
     }
     let write_body = async {
@@ -63402,7 +63948,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request body write failed"
             );
             conn.close(0u32.into(), b"request-write-failed");
-            return Ok(RedemptionOutcome::unreachable());
+            return Ok(post_dial_failure_outcome());
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -63410,7 +63956,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request body write timeout"
             );
             conn.close(0u32.into(), b"write-timeout");
-            return Ok(RedemptionOutcome::unreachable());
+            return Ok(post_dial_failure_outcome());
         }
     }
     // ZEB-325 PR #159 R4-1 (CodeRabbit MAJOR): normalize send.finish()
@@ -63424,7 +63970,7 @@ where
             "ZEB-325 Phase 2c option A: handshake send.finish() failed"
         );
         conn.close(0u32.into(), b"send-finish-failed");
-        return Ok(RedemptionOutcome::unreachable());
+        return Ok(post_dial_failure_outcome());
     }
 
     // Stage 4/5: `awaiting_countersig` — emitted BEFORE the read so
@@ -63474,7 +64020,7 @@ where
                 // released. CONNECTION_CLOSE lets the peer release
                 // immediately.
                 conn.close(0u32.into(), b"response-read-failed");
-                return Ok(RedemptionOutcome::unreachable());
+                return Ok(post_dial_failure_outcome());
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -63482,19 +64028,70 @@ where
                     "ZEB-325 Phase 2c option A: handshake response timeout (read)"
                 );
                 conn.close(0u32.into(), b"response-read-timeout");
-                return Ok(RedemptionOutcome::unreachable());
+                return Ok(post_dial_failure_outcome());
             }
         };
 
-    // 11. CBOR-decode response as SignedMembershipEvent.
-    let countersign: crate::community_membership::SignedMembershipEvent =
-        match ciborium::from_reader(response_bytes.as_slice()) {
+    // 11. CBOR-decode the response. A legacy/admin acceptor returns a single
+    // SignedMembershipEvent (CBOR map, major type 5). A ZEB-911 witness
+    // returns an array (major type 4) of [admission chain ..., countersign]
+    // so this joiner can verify a countersign authored by a member its
+    // fresh CRDT has never seen. Dispatch on the first byte's major type —
+    // the two shapes are structurally unambiguous.
+    // Qodo r3: derive the joiner's chain-length bound from the SAME byte cap
+    // the acceptor enforces when deciding whether the chain fits (and that
+    // the frame read above already applied), so the two ends cannot
+    // disagree: any response the read cap admits decodes to fewer events
+    // than this (each event serializes to at least
+    // `MIN_SIGNED_EVENT_ENCODED_LEN` bytes). The count check is therefore
+    // pure defense-in-depth against a decoder bug — not an independent
+    // policy. The previous flat 64 was one: acceptors degrade on BYTES
+    // only, and a long-history community (every DeviceAnnounce rides the
+    // admission timeline, and countersigner timelines recurse in) can
+    // legitimately ship hundreds of events under the byte cap, which this
+    // joiner then rejected as malformed.
+    const ZEB911_MAX_CHAIN_EVENTS: usize = crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN
+        / crate::community_membership::MIN_SIGNED_EVENT_ENCODED_LEN;
+    let (chain, countersign): (
+        Vec<crate::community_membership::SignedMembershipEvent>,
+        crate::community_membership::SignedMembershipEvent,
+    ) = if response_bytes.first().map(|b| b >> 5) == Some(4) {
+        let mut events: Vec<crate::community_membership::SignedMembershipEvent> =
+            match ciborium::from_reader(response_bytes.as_slice()) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "ZEB-911: chain response CBOR decode failed");
+                    return Ok(post_dial_failure_outcome());
+                }
+            };
+        if events.len() < 2 || events.len() > ZEB911_MAX_CHAIN_EVENTS {
+            tracing::warn!(
+                len = events.len(),
+                "ZEB-911: chain response length out of bounds"
+            );
+            return Ok(post_dial_failure_outcome());
+        }
+        // Defensive: every chain event must belong to the community we are
+        // redeeming into (each is also fully re-verified by the engine's
+        // verify_event at insert — this just fails fast with a clear log).
+        if events.iter().any(|e| e.community_id != minted.community_id) {
+            tracing::warn!("ZEB-911: chain response carries a foreign community_id");
+            return Ok(post_dial_failure_outcome());
+        }
+        let cs = events.pop().expect("len >= 2 checked above");
+        (events, cs)
+    } else {
+        let cs: crate::community_membership::SignedMembershipEvent = match ciborium::from_reader(
+            response_bytes.as_slice(),
+        ) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "ZEB-325 Phase 2c option A: response CBOR decode failed");
-                return Ok(RedemptionOutcome::unreachable());
+                return Ok(post_dial_failure_outcome());
             }
         };
+        (Vec::new(), cs)
+    };
     // Defensive: ensure it's a JoinCountersign for our bootstrap_join.
     let target_ok = matches!(
         &countersign.kind,
@@ -63505,11 +64102,11 @@ where
         tracing::warn!(
             "ZEB-325 Phase 2c option A: response is not a JoinCountersign for our bootstrap_join.id"
         );
-        return Ok(RedemptionOutcome::unreachable());
+        return Ok(post_dial_failure_outcome());
     }
     if countersign.community_id != minted.community_id {
         tracing::warn!("ZEB-325 Phase 2c option A: countersign community_id mismatch");
-        return Ok(RedemptionOutcome::unreachable());
+        return Ok(post_dial_failure_outcome());
     }
 
     // Cleanly close the iroh connection. The acceptor's
@@ -63549,6 +64146,7 @@ where
     let overrides = RedeemInviteOverrides {
         pre_minted: Some(minted),
         pre_delivered_countersign: Some(countersign),
+        pre_delivered_chain: chain,
         admin_identity_pub: Some(admin_id_pub),
         // ZEB-501: production uses the env-or-5s default (the pre-delivered
         // countersign resolves the oneshot well within it).

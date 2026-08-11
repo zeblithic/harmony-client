@@ -517,14 +517,66 @@ where
             tokio::time::sleep(self.config.poll_interval).await;
         };
 
+        // ZEB-911: a WITNESS's countersign is unverifiable on the joiner's
+        // fresh CRDT (only the admin is known there) unless the response also
+        // carries this node's own admission chain — its cert-carrying
+        // PendingJoin plus the countersigns that ratified it, recursively.
+        // The admin's chain is empty by construction, so the admin path keeps
+        // the legacy single-event response byte-for-byte; a witness responds
+        // with a CBOR array [chain ..., countersign], which the joiner
+        // distinguishes from the legacy map by major type.
+        let admission_chain = {
+            let engine_arc = self
+                .community_registry
+                .engine_arc(&community_id)
+                .await
+                .ok_or(HandshakeAcceptError::CommunityNotFound { community_id })?;
+            let admin_addr = engine_arc.admin_addr();
+            let g = state_arc.lock().await;
+            let events: Vec<SignedMembershipEvent> = g.events().cloned().collect();
+            drop(g);
+            crate::community_membership::admission_chain_for(&events, self_owner, admin_addr)
+        };
+
         // Write [u32 LE length-prefix][canonical CBOR of the
-        // SignedMembershipEvent] then finish(). We use the shared
-        // CBOR-writer helper: SignedMembershipEvent already has a stable
-        // canonical form (it's signed; the wire bytes must be reproducible
-        // across peers — Bob's engine receives these bytes and calls
-        // insert_local_event_with_pubs against them).
-        self.write_len_prefixed_cbor(&mut send, &countersign)
-            .await?;
+        // SignedMembershipEvent, or of the chain array] then finish(). We use
+        // the shared CBOR-writer helper: SignedMembershipEvent already has a
+        // stable canonical form (it's signed; the wire bytes must be
+        // reproducible across peers — Bob's engine receives these bytes and
+        // re-verifies them at insert).
+        if admission_chain.is_empty() {
+            self.write_len_prefixed_cbor(&mut send, &countersign)
+                .await?;
+        } else {
+            let mut response: Vec<SignedMembershipEvent> = admission_chain;
+            response.push(countersign);
+            // Encode ONCE and measure (the open-join snapshot pattern below): a
+            // deep countersigner graph of cert-carrying events can exceed the
+            // handshake cap, and `write_len_prefixed_cbor`'s ResponseTooLarge
+            // would fire AFTER the PendingJoin insert — every retry then hits
+            // the same oversize error while the invite stays live. Degrade to
+            // the legacy single-countersign shape instead: the joiner cannot
+            // verify it chain-less, but its redeem parks at the honest ZEB-254
+            // `pending: true` fallback and converges over Zenoh.
+            let mut resp_bytes = Vec::new();
+            ciborium::into_writer(&response, &mut resp_bytes)
+                .map_err(|e| HandshakeAcceptError::EncodeResponse(e.to_string()))?;
+            if resp_bytes.len() > HANDSHAKE_MAX_PACKET_LEN {
+                tracing::warn!(
+                    encoded_len = resp_bytes.len(),
+                    max = HANDSHAKE_MAX_PACKET_LEN,
+                    chain_events = response.len() - 1,
+                    "ZEB-911: admission-chain response exceeds handshake cap; \
+                     sending countersign alone (joiner degrades to pending + Zenoh)"
+                );
+                let countersign_only = response.pop().expect("countersign was just pushed");
+                self.write_len_prefixed_cbor(&mut send, &countersign_only)
+                    .await?;
+            } else {
+                self.write_len_prefixed_bytes(&mut send, &resp_bytes)
+                    .await?;
+            }
+        }
 
         // ZEB-874: burn the single-use invite ONLY now that the countersign
         // response has been handed to the transport. The `?` above means any

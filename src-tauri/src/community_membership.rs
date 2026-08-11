@@ -643,6 +643,19 @@ pub struct SignedMembershipEvent {
     pub signer_certs: Vec<EnrollmentCert>,
 }
 
+/// ZEB-911 (Qodo r3): irreducible floor, in bytes, of one serialized
+/// [`SignedMembershipEvent`]. The three fixed-width byte fields alone —
+/// `sg` (64) + `id` (16) + `ci` (16) — occupy 96 payload bytes before any
+/// CBOR framing, the 2-char field keys, or the remaining required fields
+/// (`kn`/`ac`/`at`), so no valid encoding can be smaller. The redeem
+/// joiner divides `HANDSHAKE_MAX_PACKET_LEN` by this floor to derive its
+/// admission-chain length backstop (`ZEB911_MAX_CHAIN_EVENTS` in
+/// `connectivity_redeem_invite_iroh_inner`), keeping the count bound
+/// consistent-by-construction with the byte cap the acceptor enforces
+/// when it decides whether a chain fits. Pinned by
+/// `zeb911_admission_chain_tests::min_encoded_len_is_a_true_floor`.
+pub(crate) const MIN_SIGNED_EVENT_ENCODED_LEN: usize = 96;
+
 /// Counter-signature appended by an existing community member to vouch
 /// for a new joiner in an invite-only community. The signer's power
 /// must be ≥ POWER_THRESHOLDS.invite at the time of signing.
@@ -5939,6 +5952,102 @@ pub fn local_actor_can_mint_set_power(mat: &MaterializedMembership, self_owner: 
 /// 0 per spec §4.
 pub fn actor_power_meets_invite_tier(mat: &MaterializedMembership, actor: OwnerAddr) -> bool {
     mat.power_levels.get(&actor).copied().unwrap_or(0) >= mat.power_thresholds.invite
+}
+
+/// ZEB-911: the minimal admission chain a fresh joiner needs to verify that
+/// `actor` is a Joined member. A cold joiner's log holds only the admin
+/// bootstrap + its own PendingJoin, so a countersign authored by anyone but
+/// the admin is unverifiable (signer unresolvable + `JoinCountersignActorNotJoined`)
+/// unless the response also carries the author's own admission events:
+/// their identity-introducing event (cert-carrying `PendingJoin`, or a
+/// legacy counter-signed `Join`) plus the countersigns that ratified it,
+/// recursively up the countersigner graph, terminating at the admin (whose
+/// bootstrap every joiner already holds from the invite payload).
+///
+/// Ships each visited actor's FULL membership-status timeline (admissions,
+/// ratifying countersigns, `Leave`s, `Kick`s targeting them, and
+/// `DeviceAnnounce` key growth) in `event_sort_key` order, with each
+/// signer's own timeline recursed ahead of their signature — so the
+/// joiner's replay is exact, never a lossy summary (a leave/rejoin history
+/// must include the `Leave`, or the rejoin `PendingJoin` is
+/// unreplayable). Deduped by event id, cycle-safe. Pure function of the
+/// log; the admin yields an empty chain (legacy wire shape preserved).
+pub fn admission_chain_for(
+    events: &[SignedMembershipEvent],
+    actor: OwnerAddr,
+    admin_addr: OwnerAddr,
+) -> Vec<SignedMembershipEvent> {
+    fn visit(
+        events: &[SignedMembershipEvent],
+        actor: OwnerAddr,
+        admin_addr: OwnerAddr,
+        visiting: &mut std::collections::HashSet<OwnerAddr>,
+        emitted: &mut std::collections::HashSet<[u8; 16]>,
+        out: &mut Vec<SignedMembershipEvent>,
+    ) {
+        if actor == admin_addr || !visiting.insert(actor) {
+            return;
+        }
+        // The actor's FULL membership-status timeline, in `event_sort_key`
+        // order: admissions (`PendingJoin` / legacy counter-signed `Join`),
+        // the `JoinCountersign`s that ratified them, `Leave`s, `Kick`s
+        // targeting them, and `DeviceAnnounce` key growth (review r1). Every
+        // event then re-verifies on the joiner at its own HLC against exactly
+        // the prior state it originally verified against.
+        //
+        // Review r2 (P1): shipping only the admission events broke valid
+        // leave/rejoin histories — without the intervening `Leave`, the
+        // witness's SECOND `PendingJoin` hit `PendingJoinAlreadyMember` on
+        // the joiner and aborted the redeem through a perfectly valid
+        // witness. The timeline projection makes the joiner's replay of the
+        // actor's status history exact, not a lossy summary.
+        let mut timeline: Vec<&SignedMembershipEvent> = events
+            .iter()
+            .filter(|e| match &e.kind {
+                MembershipEventKind::PendingJoin { .. }
+                | MembershipEventKind::Join
+                | MembershipEventKind::Leave
+                | MembershipEventKind::DeviceAnnounce => e.actor == actor,
+                MembershipEventKind::JoinCountersign { target_event_id } => events
+                    .iter()
+                    .any(|p| p.id == *target_event_id && p.actor == actor),
+                MembershipEventKind::Kick { target, .. } => *target == actor,
+                _ => false,
+            })
+            .collect();
+        timeline.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
+        for ev in timeline {
+            // Dependencies first: whoever signed an event ABOUT this actor
+            // (countersigner, kicker, or the legacy Join's inline countersig
+            // signer) must be verifiable before their signature lands.
+            match &ev.kind {
+                MembershipEventKind::JoinCountersign { .. } | MembershipEventKind::Kick { .. } => {
+                    visit(events, ev.actor, admin_addr, visiting, emitted, out);
+                }
+                MembershipEventKind::Join => {
+                    if let Some(cs) = &ev.countersig {
+                        visit(events, cs.signer, admin_addr, visiting, emitted, out);
+                    }
+                }
+                _ => {}
+            }
+            if emitted.insert(ev.id) {
+                out.push(ev.clone());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut visiting = std::collections::HashSet::new();
+    let mut emitted = std::collections::HashSet::new();
+    visit(
+        events,
+        actor,
+        admin_addr,
+        &mut visiting,
+        &mut emitted,
+        &mut out,
+    );
+    out
 }
 
 /// ZEB-733: does `actor`'s power meet the community's MODERATOR (kick) tier?
@@ -19581,6 +19690,211 @@ mod zeb846_forward_ceiling {
         assert!(
             member_is_present(&applied, &m),
             "advancing now re-admits the deferred event"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zeb911_admission_chain_tests {
+    use super::*;
+    use crate::owner_state_types::{Hlc, SpaceId};
+
+    fn ev(
+        id_byte: u8,
+        kind: MembershipEventKind,
+        actor: OwnerAddr,
+        key: &ed25519_dalek::SigningKey,
+        wall_ms: u64,
+    ) -> SignedMembershipEvent {
+        sign_event(
+            &EventPayload {
+                id: [id_byte; 16],
+                community_id: SpaceId([9; 16]),
+                kind,
+                actor,
+                at: Hlc {
+                    wall_ms,
+                    logical: 0,
+                    device_id: "d".into(),
+                },
+            },
+            key,
+        )
+        .expect("sign test event")
+    }
+
+    fn dummy_token(inviter: OwnerAddr) -> crate::community_invite::InviteToken {
+        crate::community_invite::InviteToken {
+            inviter,
+            invitee_hint: None,
+            minted_at: Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "a".into(),
+            },
+            expires_at: None,
+            sig: [0u8; 64],
+        }
+    }
+
+    /// Review r2 (P1): a leave/rejoin witness's chain must carry the FULL
+    /// status timeline in order. Omitting the `Leave` made the second
+    /// `PendingJoin` unreplayable on the joiner (`PendingJoinAlreadyMember`)
+    /// and aborted redemption through a perfectly valid witness.
+    #[test]
+    fn chain_preserves_leave_rejoin_timeline_in_order() {
+        let admin = mint_test_owner(1);
+        let witness = mint_test_owner(2);
+        let events = vec![
+            ev(
+                0x10,
+                MembershipEventKind::PendingJoin {
+                    invite_token: dummy_token(admin.owner),
+                },
+                witness.owner,
+                &witness.device_key,
+                100,
+            ),
+            ev(
+                0x11,
+                MembershipEventKind::JoinCountersign {
+                    target_event_id: [0x10; 16],
+                },
+                admin.owner,
+                &admin.device_key,
+                200,
+            ),
+            ev(
+                0x12,
+                MembershipEventKind::Leave,
+                witness.owner,
+                &witness.device_key,
+                300,
+            ),
+            ev(
+                0x13,
+                MembershipEventKind::PendingJoin {
+                    invite_token: dummy_token(admin.owner),
+                },
+                witness.owner,
+                &witness.device_key,
+                400,
+            ),
+            ev(
+                0x14,
+                MembershipEventKind::JoinCountersign {
+                    target_event_id: [0x13; 16],
+                },
+                admin.owner,
+                &admin.device_key,
+                500,
+            ),
+        ];
+        let chain = admission_chain_for(&events, witness.owner, admin.owner);
+        let ids: Vec<u8> = chain.iter().map(|e| e.id[0]).collect();
+        assert_eq!(
+            ids,
+            vec![0x10, 0x11, 0x12, 0x13, 0x14],
+            "full status timeline, chronological — Leave included between the two admissions"
+        );
+    }
+
+    /// A witness admitted BY another witness: the countersigner's own
+    /// timeline is emitted before their countersign, and the admin
+    /// terminates recursion with an empty chain.
+    #[test]
+    fn chain_recurses_countersigner_timeline_before_their_countersign() {
+        let admin = mint_test_owner(1);
+        let w1 = mint_test_owner(2);
+        let w2 = mint_test_owner(3);
+        let events = vec![
+            ev(
+                0x20,
+                MembershipEventKind::PendingJoin {
+                    invite_token: dummy_token(admin.owner),
+                },
+                w2.owner,
+                &w2.device_key,
+                300,
+            ),
+            ev(
+                0x21,
+                MembershipEventKind::JoinCountersign {
+                    target_event_id: [0x20; 16],
+                },
+                w1.owner,
+                &w1.device_key,
+                400,
+            ),
+            ev(
+                0x10,
+                MembershipEventKind::PendingJoin {
+                    invite_token: dummy_token(admin.owner),
+                },
+                w1.owner,
+                &w1.device_key,
+                100,
+            ),
+            ev(
+                0x11,
+                MembershipEventKind::JoinCountersign {
+                    target_event_id: [0x10; 16],
+                },
+                admin.owner,
+                &admin.device_key,
+                200,
+            ),
+        ];
+        let chain = admission_chain_for(&events, w2.owner, admin.owner);
+        let ids: Vec<u8> = chain.iter().map(|e| e.id[0]).collect();
+        // The invariant is replay-dependency order, not one fixed
+        // interleaving: every event must be verifiable given the events
+        // before it. Concretely: w1's own admission (0x10, 0x11) lands
+        // before the countersign w1 authored (0x21), and each PendingJoin
+        // lands before the countersigns targeting it.
+        let pos = |id: u8| {
+            ids.iter()
+                .position(|&x| x == id)
+                .unwrap_or_else(|| panic!("event {id:#x} missing from chain {ids:?}"))
+        };
+        assert_eq!(ids.len(), 4, "all four events ride the chain: {ids:?}");
+        assert!(
+            pos(0x10) < pos(0x21) && pos(0x11) < pos(0x21),
+            "w1's admission timeline must precede w1's countersign for w2: {ids:?}"
+        );
+        assert!(
+            pos(0x10) < pos(0x11),
+            "w1's PendingJoin precedes its countersign: {ids:?}"
+        );
+        assert!(
+            pos(0x20) < pos(0x21),
+            "w2's PendingJoin precedes the countersign targeting it: {ids:?}"
+        );
+        assert!(
+            admission_chain_for(&events, admin.owner, admin.owner).is_empty(),
+            "the admin's chain is empty by construction (legacy response shape)"
+        );
+    }
+
+    /// Qodo r3: `MIN_SIGNED_EVENT_ENCODED_LEN` must be a TRUE floor. The
+    /// redeem joiner's chain cap is `HANDSHAKE_MAX_PACKET_LEN / floor`, and
+    /// that cap is only guaranteed never to reject a response the acceptor's
+    /// byte guard allowed if no event can serialize smaller than the floor.
+    /// A payload-free `Leave` with a 1-char device id is as small as a valid
+    /// event gets; if this assert ever fails (a fixed-width field was
+    /// removed or shrunk), lower the constant to the new irreducible floor.
+    #[test]
+    fn min_encoded_len_is_a_true_floor() {
+        let w = mint_test_owner(1);
+        let smallest = ev(0x01, MembershipEventKind::Leave, w.owner, &w.device_key, 0);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&smallest, &mut bytes).expect("serialize smallest event");
+        assert!(
+            bytes.len() >= MIN_SIGNED_EVENT_ENCODED_LEN,
+            "smallest event serialized to {} bytes — below the {}-byte floor \
+             the joiner-side chain cap divides by",
+            bytes.len(),
+            MIN_SIGNED_EVENT_ENCODED_LEN
         );
     }
 }
