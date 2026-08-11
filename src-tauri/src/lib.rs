@@ -63131,216 +63131,234 @@ where
         // letting `format!` fall through `From<String>` → `internal`, which
         // suppressed the "Try via local network" button offline.
         .map_err(RedeemInviteError::from)?;
-    let Some(rec) = rec else {
-        return Ok(RedemptionOutcome::unreachable());
-    };
-
-    // 7. Decode the inner routing payload.
-    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
-        ciborium::from_reader(rec.routing_blob.as_slice())
-            .map_err(|e| format!("decode routing_blob: {e}"))?;
-
-    // Seed the local ReachabilityResolver. Option A doesn't strictly
-    // need this — the iroh bi-stream below opens with an explicit
-    // EndpointAddr — but the seed remains useful for future Zenoh-CRDT-
-    // sync once Phase 1's iroh→zenoh ingestion is wired, and is
-    // harmless on the option-A path.
+    // ZEB-911: rung 0 of the dial ladder — the admin's Case-A record. An
+    // absent/stale record no longer dead-ends the redeem (`'rung0:` falls
+    // through with `conn = None`): the witness ladder below can still reach
+    // a live community member even when the admin has been offline past the
+    // record's freshness window — the exact scenario ZEB-911 exists for.
     let inviter_addr = payload.admin_addr;
-    let inviter_device_hash = crate::owner_state_types::DeviceIdentityHash([0u8; 16]);
-    reachability_resolver
-        .seed_from_pkarr(inviter_addr, inviter_device_hash, routing.clone())
-        .await;
-
-    tracing::info!(
-        community_id = %hex::encode(payload.community_id.0),
-        inviter = %hex::encode(inviter_addr.0),
-        "ZEB-325 Phase 2c option A: pkarr resolved + ReachabilityResolver seeded; \
-         opening iroh handshake bi-stream"
-    );
-
-    // Stage 2/5: `connecting` — about to dial the inviter's iroh
-    // endpoint on `harmony/handshake/v1`.
-    emit_stage(RedemptionStage::Connecting);
-
-    // 7'. Synthesize an EndpointAddr from the verified routing record.
-    // Mirrors `IrohZenohLinkManager::new_link` (which would do the same
-    // synthesis for a Zenoh ALPN dial). The `iroh_node_id` is the iroh
-    // EndpointId (32-byte Ed25519 pub); skip malformed relay URLs
-    // silently (direct addrs alone may still succeed).
-    let mut alice_addr = endpoint_addr_from_routing(&routing)
-        .map_err(|e| format!("synthesize inviter addr: {e}"))?;
-
-    // 8. Open the iroh QUIC connection on the handshake ALPN.
-    //
-    // ZEB-325 PR #159 F3: bound `connect()` and `open_bi()` by the
-    // dialer config so a peer that we can route packets to but that
-    // never finishes the QUIC handshake (NAT in flux, blackhole, etc.)
-    // cannot pin this IPC for the duration of the underlying
-    // QUIC-level timeout (minutes, on some configurations). Distinct
-    // tracing for dial-timeout vs open_bi-timeout vs response-timeout
-    // so diagnostics can attribute failures.
-    //
-    // B4: a single diverse-relay re-resolve retry. The first
-    // `resolve_window` hit may have come from a stale relay serving a
-    // dead endpoint; on the FIRST connect failure we re-resolve the
-    // freshest record across ALL relays (`resolve_window_freshest`),
-    // re-verify + re-decode + re-synthesize the addr, and dial once
-    // more. Only CONNECT failures trigger the retry — a fresher addr
-    // fixes "can't reach the endpoint", not a post-connect stream
-    // failure (open_bi stays one-shot below).
     let mut conn = None;
-    for attempt in 0..2 {
-        // ZEB-908: before dialing, fold the addressing iroh already holds for
-        // this inviter's node (crucially its relay) into `alice_addr`, so a
-        // redeem to a peer we already have a live session with reuses that path
-        // instead of failing "inviter offline" on a pkarr blob that carried no
-        // usable relay. No-op when no live info exists (cold-start unchanged);
-        // runs each attempt so the B4 re-resolved addr is enriched too.
-        if merge_live_endpoint_addrs(iroh_endpoint.inner(), &mut alice_addr).await {
+    let mut admin_node_id: Option<[u8; 32]> = None;
+    'rung0: {
+        let Some(rec) = rec else {
             tracing::info!(
-                inviter = %hex::encode(inviter_addr.0),
-                "ZEB-908: reused live session addressing for redeem handshake dial"
+                community_id = %hex::encode(payload.community_id.0),
+                "ZEB-911: no fresh verified admin Case-A record — skipping to the witness ladder"
             );
-        }
-        match tokio::time::timeout(
-            dial_config.connect_timeout,
-            iroh_endpoint.inner().connect(
-                alice_addr.clone(),
-                crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(c)) => {
-                conn = Some(c);
-                break;
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    error = %e,
-                    attempt,
+            // Stage 2/5 normally fires after the admin seed below; keep the
+            // staged UI moving when rung 0 is skipped.
+            emit_stage(RedemptionStage::Connecting);
+            break 'rung0;
+        };
+
+        // 7. Decode the inner routing payload.
+        let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+            ciborium::from_reader(rec.routing_blob.as_slice())
+                .map_err(|e| format!("decode routing_blob: {e}"))?;
+
+        // Seed the local ReachabilityResolver. Option A doesn't strictly
+        // need this — the iroh bi-stream below opens with an explicit
+        // EndpointAddr — but the seed remains useful for future Zenoh-CRDT-
+        // sync once Phase 1's iroh→zenoh ingestion is wired, and is
+        // harmless on the option-A path.
+        let inviter_device_hash = crate::owner_state_types::DeviceIdentityHash([0u8; 16]);
+        reachability_resolver
+            .seed_from_pkarr(inviter_addr, inviter_device_hash, routing.clone())
+            .await;
+
+        tracing::info!(
+            community_id = %hex::encode(payload.community_id.0),
+            inviter = %hex::encode(inviter_addr.0),
+            "ZEB-325 Phase 2c option A: pkarr resolved + ReachabilityResolver seeded; \
+             opening iroh handshake bi-stream"
+        );
+
+        // Stage 2/5: `connecting` — about to dial the inviter's iroh
+        // endpoint on `harmony/handshake/v1`.
+        emit_stage(RedemptionStage::Connecting);
+
+        // 7'. Synthesize an EndpointAddr from the verified routing record.
+        // Mirrors `IrohZenohLinkManager::new_link` (which would do the same
+        // synthesis for a Zenoh ALPN dial). The `iroh_node_id` is the iroh
+        // EndpointId (32-byte Ed25519 pub); skip malformed relay URLs
+        // silently (direct addrs alone may still succeed).
+        let mut alice_addr = endpoint_addr_from_routing(&routing)
+            .map_err(|e| format!("synthesize inviter addr: {e}"))?;
+        admin_node_id = Some(*alice_addr.id.as_bytes());
+
+        // 8. Open the iroh QUIC connection on the handshake ALPN.
+        //
+        // ZEB-325 PR #159 F3: bound `connect()` and `open_bi()` by the
+        // dialer config so a peer that we can route packets to but that
+        // never finishes the QUIC handshake (NAT in flux, blackhole, etc.)
+        // cannot pin this IPC for the duration of the underlying
+        // QUIC-level timeout (minutes, on some configurations). Distinct
+        // tracing for dial-timeout vs open_bi-timeout vs response-timeout
+        // so diagnostics can attribute failures.
+        //
+        // B4: a single diverse-relay re-resolve retry. The first
+        // `resolve_window` hit may have come from a stale relay serving a
+        // dead endpoint; on the FIRST connect failure we re-resolve the
+        // freshest record across ALL relays (`resolve_window_freshest`),
+        // re-verify + re-decode + re-synthesize the addr, and dial once
+        // more. Only CONNECT failures trigger the retry — a fresher addr
+        // fixes "can't reach the endpoint", not a post-connect stream
+        // failure (open_bi stays one-shot below).
+        for attempt in 0..2 {
+            // ZEB-908: before dialing, fold the addressing iroh already holds for
+            // this inviter's node (crucially its relay) into `alice_addr`, so a
+            // redeem to a peer we already have a live session with reuses that path
+            // instead of failing "inviter offline" on a pkarr blob that carried no
+            // usable relay. No-op when no live info exists (cold-start unchanged);
+            // runs each attempt so the B4 re-resolved addr is enriched too.
+            if merge_live_endpoint_addrs(iroh_endpoint.inner(), &mut alice_addr).await {
+                tracing::info!(
                     inviter = %hex::encode(inviter_addr.0),
-                    "ZEB-325 Phase 2c option A: iroh connect failed"
+                    "ZEB-908: reused live session addressing for redeem handshake dial"
                 );
             }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    timeout_ms = dial_config.connect_timeout.as_millis() as u64,
-                    attempt,
-                    inviter = %hex::encode(inviter_addr.0),
-                    "ZEB-325 Phase 2c option A: iroh connect timeout (dial)"
-                );
+            match tokio::time::timeout(
+                dial_config.connect_timeout,
+                iroh_endpoint.inner().connect(
+                    alice_addr.clone(),
+                    crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(c)) => {
+                    conn = Some(c);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        attempt,
+                        inviter = %hex::encode(inviter_addr.0),
+                        "ZEB-325 Phase 2c option A: iroh connect failed"
+                    );
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_ms = dial_config.connect_timeout.as_millis() as u64,
+                        attempt,
+                        inviter = %hex::encode(inviter_addr.0),
+                        "ZEB-325 Phase 2c option A: iroh connect timeout (dial)"
+                    );
+                }
             }
-        }
-        // After the first failure, try a diverse-relay re-resolve before
-        // the final attempt. If the freshest record fails to resolve,
-        // verify, decode, or synthesize, fall through to the
-        // unreachable outcome below.
-        if attempt == 0 {
-            // ZEB-825 (mirrors ZEB-817 `resolve_vine_relays`): verify each
-            // candidate INSIDE the resolver via `_with`, not the single
-            // freshest-by-seq winner after the fact. An attacker who already
-            // holds the invite material can publish a self-consistent record
-            // under a sibling epoch-window key (its inner sig verifies against
-            // its OWN embedded identity pub); post-hoc-verifying only the
-            // resolver's freshest-by-seq pick would let that squat shadow the
-            // genuine record AND pin the resolver's seq-highwater + positive
-            // cache with itself, hiding the real record for the process
-            // lifetime. `_with` ranks freshest-first and returns the first
-            // candidate passing this predicate; failing candidates touch
-            // neither surface.
-            //
-            // `retry_now_ms` is sampled BEFORE the resolve here (a one-shot
-            // dial samples after): the predicate runs per-candidate DURING
-            // resolution, so sample-after is not expressible with `_with`. The
-            // freshness window it feeds spans whole epochs, so the seconds-scale
-            // sampling shift is immaterial — the same tradeoff
-            // `resolve_vine_relays` makes.
-            let retry_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
-            let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
-                rec.verify_inner_sig().is_ok()
-                    && rec.verify_identity_match(&admin_id_pub).is_ok()
-                    && rec.verify_freshness(retry_now_ms).is_ok()
-            };
-            let rec2_opt = resolver
-                .resolve_window_freshest_with(&verifying_keys, &verify)
-                .await;
-            // Qodo review: the predicate above ran against the pre-resolve
-            // `retry_now_ms`. Re-sample the wall clock AFTER the await and
-            // re-check the winner's freshness before the retry dial, so a record
-            // that expired *during* the multi-second all-relays resolve is
-            // treated as no usable record (→ break). The predicate keeps the
-            // anti-shadowing guarantee (a squat fails `verify_identity_match` and
-            // never becomes the winner); this recheck restores the one-shot
-            // dial's freshness-at-use strictness on the genuine winner.
-            let retry_dial_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
-            match rec2_opt {
-                Ok(Some(rec2)) if rec2.verify_freshness(retry_dial_now_ms).is_ok() => {
-                    match ciborium::from_reader::<
-                        crate::reachability_record::ReachabilityAnnouncePayload,
-                        _,
-                    >(rec2.routing_blob.as_slice())
-                    {
-                        Ok(routing2) => match endpoint_addr_from_routing(&routing2) {
-                            Ok(addr2) => {
-                                tracing::info!(
-                                    inviter = %hex::encode(inviter_addr.0),
-                                    "ZEB-325 Phase 2c option A: connect failed — \
-                                     re-resolved freshest record across all relays, \
-                                     retrying dial"
-                                );
-                                // Re-seed the ReachabilityResolver with the
-                                // fresher record so a follow-up dial (e.g.
-                                // IrohZenohLinkManager::new_link, which reads the
-                                // resolver to synthesize an EndpointAddr) targets
-                                // the same endpoint we're about to dial — not the
-                                // stale pre-retry one.
-                                reachability_resolver
-                                    .seed_from_pkarr(
-                                        inviter_addr,
-                                        crate::owner_state_types::DeviceIdentityHash([0u8; 16]),
-                                        routing2.clone(),
-                                    )
-                                    .await;
-                                alice_addr = addr2;
-                            }
+            // After the first failure, try a diverse-relay re-resolve before
+            // the final attempt. If the freshest record fails to resolve,
+            // verify, decode, or synthesize, fall through to the
+            // unreachable outcome below.
+            if attempt == 0 {
+                // ZEB-825 (mirrors ZEB-817 `resolve_vine_relays`): verify each
+                // candidate INSIDE the resolver via `_with`, not the single
+                // freshest-by-seq winner after the fact. An attacker who already
+                // holds the invite material can publish a self-consistent record
+                // under a sibling epoch-window key (its inner sig verifies against
+                // its OWN embedded identity pub); post-hoc-verifying only the
+                // resolver's freshest-by-seq pick would let that squat shadow the
+                // genuine record AND pin the resolver's seq-highwater + positive
+                // cache with itself, hiding the real record for the process
+                // lifetime. `_with` ranks freshest-first and returns the first
+                // candidate passing this predicate; failing candidates touch
+                // neither surface.
+                //
+                // `retry_now_ms` is sampled BEFORE the resolve here (a one-shot
+                // dial samples after): the predicate runs per-candidate DURING
+                // resolution, so sample-after is not expressible with `_with`. The
+                // freshness window it feeds spans whole epochs, so the seconds-scale
+                // sampling shift is immaterial — the same tradeoff
+                // `resolve_vine_relays` makes.
+                let retry_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+                let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+                    rec.verify_inner_sig().is_ok()
+                        && rec.verify_identity_match(&admin_id_pub).is_ok()
+                        && rec.verify_freshness(retry_now_ms).is_ok()
+                };
+                let rec2_opt = resolver
+                    .resolve_window_freshest_with(&verifying_keys, &verify)
+                    .await;
+                // Qodo review: the predicate above ran against the pre-resolve
+                // `retry_now_ms`. Re-sample the wall clock AFTER the await and
+                // re-check the winner's freshness before the retry dial, so a record
+                // that expired *during* the multi-second all-relays resolve is
+                // treated as no usable record (→ break). The predicate keeps the
+                // anti-shadowing guarantee (a squat fails `verify_identity_match` and
+                // never becomes the winner); this recheck restores the one-shot
+                // dial's freshness-at-use strictness on the genuine winner.
+                let retry_dial_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+                match rec2_opt {
+                    Ok(Some(rec2)) if rec2.verify_freshness(retry_dial_now_ms).is_ok() => {
+                        match ciborium::from_reader::<
+                            crate::reachability_record::ReachabilityAnnouncePayload,
+                            _,
+                        >(rec2.routing_blob.as_slice())
+                        {
+                            Ok(routing2) => match endpoint_addr_from_routing(&routing2) {
+                                Ok(addr2) => {
+                                    tracing::info!(
+                                        inviter = %hex::encode(inviter_addr.0),
+                                        "ZEB-325 Phase 2c option A: connect failed — \
+                                         re-resolved freshest record across all relays, \
+                                         retrying dial"
+                                    );
+                                    // Re-seed the ReachabilityResolver with the
+                                    // fresher record so a follow-up dial (e.g.
+                                    // IrohZenohLinkManager::new_link, which reads the
+                                    // resolver to synthesize an EndpointAddr) targets
+                                    // the same endpoint we're about to dial — not the
+                                    // stale pre-retry one.
+                                    reachability_resolver
+                                        .seed_from_pkarr(
+                                            inviter_addr,
+                                            crate::owner_state_types::DeviceIdentityHash([0u8; 16]),
+                                            routing2.clone(),
+                                        )
+                                        .await;
+                                    alice_addr = addr2;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "B4: re-resolved record synthesize failed"
+                                    );
+                                    break;
+                                }
+                            },
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
-                                    "B4: re-resolved record synthesize failed"
+                                    "B4: re-resolved routing_blob decode failed"
                                 );
                                 break;
                             }
-                        },
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "B4: re-resolved routing_blob decode failed"
-                            );
-                            break;
                         }
                     }
-                }
-                // ZEB-892 (CodeAnt #642): a resolver `Err` here folds into
-                // `inviter_unreachable` (below) rather than the initial
-                // resolve's `relays_warming_up`, and that is intentional — we
-                // only reach B4 *after* a confirmed failed dial to the inviter,
-                // so the accurate outcome is "the inviter's endpoint was
-                // unreachable", not "relays are cold". The retry re-resolve
-                // only tries to fetch a *fresher* address; a relay error there
-                // just means we can't, so `inviter_unreachable` stays correct.
-                _ => {
-                    tracing::warn!(
-                        inviter = %hex::encode(inviter_addr.0),
-                        "B4: diverse-relay re-resolve found no fresh verified record"
-                    );
-                    break;
+                    // ZEB-892 (CodeAnt #642): a resolver `Err` here folds into
+                    // `inviter_unreachable` (below) rather than the initial
+                    // resolve's `relays_warming_up`, and that is intentional — we
+                    // only reach B4 *after* a confirmed failed dial to the inviter,
+                    // so the accurate outcome is "the inviter's endpoint was
+                    // unreachable", not "relays are cold". The retry re-resolve
+                    // only tries to fetch a *fresher* address; a relay error there
+                    // just means we can't, so `inviter_unreachable` stays correct.
+                    _ => {
+                        tracing::warn!(
+                            inviter = %hex::encode(inviter_addr.0),
+                            "B4: diverse-relay re-resolve found no fresh verified record"
+                        );
+                        break;
+                    }
                 }
             }
         }
     }
-    // ZEB-911 witness ladder, rungs 1-4: the admin's Case-A dial failed, so
-    // fall back to the community's rendezvous advertiser slots. Any Joined
+
+    // ZEB-911 witness ladder, rungs 1-4: the admin's Case-A rung yielded no
+    // connection (record absent/stale, or dial failed), so fall back to the
+    // community's rendezvous advertiser slots. Any Joined
     // member reached this way is a complete redeem endpoint (slice 1
     // relaxed the acceptor's inviter-identity policy): it verifies the
     // packet against the admin's enrolled keys, performs the claim-bound
@@ -63412,7 +63430,6 @@ where
                     };
                     candidates.push(WitnessCandidate { routing, owner });
                 }
-                let admin_node_id: Option<[u8; 32]> = Some(*alice_addr.id.as_bytes());
                 let candidates = dedup_witness_candidates(candidates, admin_node_id);
                 tracing::info!(
                     community_id = %hex::encode(payload.community_id.0),
