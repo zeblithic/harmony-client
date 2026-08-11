@@ -1575,15 +1575,55 @@ impl CommunitySyncEngine {
     /// ZEB-888 claimed-by-other guard), so racing this with a concurrent
     /// insert-time spawn is safe.
     pub(crate) async fn recheck_uncountersigned_pending_joins(&self) {
-        use crate::community_membership::MembershipEventKind;
+        use crate::community_membership::{MemberStatus, MembershipEventKind};
         let candidates: Vec<crate::community_membership::SignedMembershipEvent> = {
             let g = self.state.lock().await;
             let events: Vec<crate::community_membership::SignedMembershipEvent> =
                 g.events().cloned().collect();
             drop(g);
-            events
+            // CodeRabbit #655 r1: recovery targets only the ACTIVE pending
+            // attempt. A raw log scan alone would also pick up (a) a
+            // PendingJoin the actor cancelled via Leave (or was kicked
+            // after) — their CURRENT status is no longer PendingJoin and no
+            // countersign should ever be minted for it — and (b) an older
+            // attempt of a leave→rejoin actor, where only the LATEST
+            // PendingJoin is the live one (the C3 pass's R4-5 specificity
+            // rationale). So: latest PendingJoin per actor, kept only while
+            // the actor's materialized-now status is still PendingJoin.
+            let receiver_now = crate::clock_trust::receiver_now_ms();
+            let mat = crate::community_membership::materialize_with_bounds(
+                &events,
+                self.admin_addr,
+                None,
+                receiver_now,
+            );
+            let mut latest_by_actor: std::collections::HashMap<
+                OwnerAddr,
+                &crate::community_membership::SignedMembershipEvent,
+            > = std::collections::HashMap::new();
+            for e in events
                 .iter()
                 .filter(|e| matches!(e.kind, MembershipEventKind::PendingJoin { .. }))
+            {
+                latest_by_actor
+                    .entry(e.actor)
+                    .and_modify(|cur| {
+                        if crate::community_membership::event_sort_key(e)
+                            > crate::community_membership::event_sort_key(cur)
+                        {
+                            *cur = e;
+                        }
+                    })
+                    .or_insert(e);
+            }
+            latest_by_actor
+                .into_values()
+                .filter(|pending| {
+                    matches!(
+                        mat.members.get(&pending.actor).map(|m| m.status),
+                        Some(MemberStatus::PendingJoin)
+                    )
+                })
                 .filter(|pending| {
                     !events.iter().any(|cs| {
                         cs.actor == self.self_owner
@@ -4383,19 +4423,44 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             // re-drive. Boot-time analogue:
             // `recheck_uncountersigned_pending_joins`.
             if matches!(status_now, Some(MemberStatus::PendingJoin)) {
-                let latest_pending = events
-                    .iter()
-                    .filter(|e| {
-                        e.actor == payload.publisher_addr
-                            && matches!(
-                                e.kind,
-                                crate::community_membership::MembershipEventKind::PendingJoin { .. }
-                            )
+                // CodeRabbit #655 r1: `status_now` is the status at the
+                // PUBLISH's HLC — correct for the authorization reject
+                // above, but recovery must ALSO require the member's
+                // CURRENT status to be PendingJoin: a backdated or replayed
+                // publish stamped inside a since-cancelled window
+                // (PendingJoin → Leave, or → Kick) must not mint a
+                // countersign for an attempt that is no longer live.
+                let receiver_now = crate::clock_trust::receiver_now_ms();
+                let mat_now = crate::community_membership::materialize_with_bounds(
+                    &events,
+                    ctx.admin_addr,
+                    None,
+                    receiver_now,
+                );
+                let currently_pending = matches!(
+                    mat_now
+                        .members
+                        .get(&payload.publisher_addr)
+                        .map(|m| m.status),
+                    Some(MemberStatus::PendingJoin)
+                );
+                let latest_pending = currently_pending
+                    .then(|| {
+                        events
+                            .iter()
+                            .filter(|e| {
+                                e.actor == payload.publisher_addr
+                                    && matches!(
+                                        e.kind,
+                                        crate::community_membership::MembershipEventKind::PendingJoin { .. }
+                                    )
+                            })
+                            .max_by(|a, b| {
+                                crate::community_membership::event_sort_key(a)
+                                    .cmp(&crate::community_membership::event_sort_key(b))
+                            })
                     })
-                    .max_by(|a, b| {
-                        crate::community_membership::event_sort_key(a)
-                            .cmp(&crate::community_membership::event_sort_key(b))
-                    });
+                    .flatten();
                 if let Some(pending_ev) = latest_pending {
                     tracing::info!(
                         community_id = ?ctx.community_id,
@@ -11267,6 +11332,101 @@ mod tests {
         );
     }
 
+    /// A4 (CodeRabbit #655 r1): a CANCELLED pending attempt
+    /// (PendingJoin → Leave) must not be revived by a backdated publish
+    /// stamped inside the pre-cancel window — the at-HLC gate sees
+    /// PendingJoin there, but the current-status check must refuse the
+    /// re-drive. Dora's fresh re-drive is the liveness control.
+    #[tokio::test]
+    async fn zeb906_cancelled_pending_backdated_publish_does_not_redrive() {
+        use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+
+        let community_id = SpaceId([0x97; 16]);
+        let alice = crate::community_membership::mint_test_owner(0xAF);
+        let bob = crate::community_membership::mint_test_owner(0xBF);
+        let dora = crate::community_membership::mint_test_owner(0xDF);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, sub_tx, _floor, _cs, membership_key) =
+            zeb906_engine(&dir, community_id, &alice, &alice);
+
+        let bob_leave_payload = EventPayload {
+            id: [0x38; 16],
+            community_id,
+            kind: MembershipEventKind::Leave,
+            actor: bob.owner,
+            at: Hlc {
+                wall_ms: 100_600,
+                logical: 0,
+                device_id: "joiner-dev".into(),
+            },
+        };
+        let bob_leave = sign_event(&bob_leave_payload, &bob.device_key).expect("sign leave");
+        let state = engine.state();
+        {
+            let mut g = state.lock().await;
+            g.insert_verified_for_test(closing_guard_bootstrap_join(
+                community_id,
+                &alice,
+                [0x10; 16],
+                0,
+            ));
+            g.insert_verified_for_test(zeb875_pending_join(
+                community_id,
+                &bob,
+                zeb875_signed_token(&alice, 8),
+                [0x28; 16],
+            ));
+            g.insert_verified_for_test(bob_leave);
+            g.insert_verified_for_test(zeb875_pending_join(
+                community_id,
+                &dora,
+                zeb875_signed_token(&alice, 9),
+                [0x29; 16],
+            ));
+        }
+
+        let cid = harmony_content::cid::ContentId::for_book(
+            b"zeb906-cancelled-pending",
+            harmony_content::cid::ContentFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+        )
+        .expect("cid");
+        // Bob's publish stamped 100_550: AFTER his PendingJoin (100_500)
+        // but BEFORE his Leave (100_600) — at-HLC status is PendingJoin,
+        // current status is not.
+        sub_tx
+            .send(zeb906_publish_wire(
+                &membership_key,
+                bob.owner,
+                100_550,
+                cid,
+                None,
+            ))
+            .await
+            .expect("inject bob backdated publish");
+        sub_tx
+            .send(zeb906_publish_wire(
+                &membership_key,
+                dora.owner,
+                101_500,
+                cid,
+                None,
+            ))
+            .await
+            .expect("inject dora publish");
+
+        zeb906_wait_for_countersign(&state, alice.owner, [0x29; 16]).await;
+
+        assert_eq!(
+            zeb906_countersign_count(&state, [0x28; 16]).await,
+            0,
+            "a cancelled (PendingJoin→Leave) attempt must never be countersigned \
+             off a backdated publish"
+        );
+    }
+
     /// A3: a backdated publish (stamped between the PendingJoin and an
     /// EXISTING countersign, so the at-HLC gate still sees PendingJoin)
     /// re-drives idempotently — the spawned task's already-signed check
@@ -11330,8 +11490,10 @@ mod tests {
         )
         .expect("cid");
         // Bob's publish backdated BETWEEN pending (100_500) and cs
-        // (102_000): the at-HLC gate sees PendingJoin → reject arm →
-        // re-drive → task no-ops on already_signed.
+        // (102_000): the at-HLC gate sees PendingJoin → reject arm. Two
+        // layers keep this from duplicating: the current-status check skips
+        // the re-drive (bob materializes Joined now), and even if spawned,
+        // the task no-ops on already_signed.
         sub_tx
             .send(zeb906_publish_wire(
                 &membership_key,
@@ -11489,6 +11651,61 @@ mod tests {
             zeb906_countersign_count(&state, [0x27; 16]).await,
             1,
             "recheck must not duplicate an existing countersign"
+        );
+    }
+
+    /// B4 (CodeRabbit #655 r1): a cancelled pending (PendingJoin → Leave)
+    /// is not a recheck candidate — the boot healing pass keys on the
+    /// actor's CURRENT materialized status, not raw log presence. (B1 is
+    /// the machinery-liveness control for this absence assertion.)
+    #[tokio::test]
+    async fn zeb906_recheck_skips_cancelled_pending() {
+        use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+
+        let community_id = SpaceId([0x98; 16]);
+        let alice = crate::community_membership::mint_test_owner(0xA7);
+        let bob = crate::community_membership::mint_test_owner(0xB7);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, _sub_tx, _floor, _cs, _mk) = zeb906_engine(&dir, community_id, &alice, &alice);
+
+        let bob_leave_payload = EventPayload {
+            id: [0x39; 16],
+            community_id,
+            kind: MembershipEventKind::Leave,
+            actor: bob.owner,
+            at: Hlc {
+                wall_ms: 100_600,
+                logical: 0,
+                device_id: "joiner-dev".into(),
+            },
+        };
+        let bob_leave = sign_event(&bob_leave_payload, &bob.device_key).expect("sign leave");
+        let state = engine.state();
+        {
+            let mut g = state.lock().await;
+            g.insert_verified_for_test(closing_guard_bootstrap_join(
+                community_id,
+                &alice,
+                [0x10; 16],
+                0,
+            ));
+            g.insert_verified_for_test(zeb875_pending_join(
+                community_id,
+                &bob,
+                zeb875_signed_token(&alice, 10),
+                [0x2A; 16],
+            ));
+            g.insert_verified_for_test(bob_leave);
+        }
+
+        engine.recheck_uncountersigned_pending_joins().await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            zeb906_countersign_count(&state, [0x2A; 16]).await,
+            0,
+            "a cancelled (PendingJoin→Leave) attempt must not be countersigned at recheck"
         );
     }
 
