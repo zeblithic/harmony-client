@@ -62463,6 +62463,140 @@ pub(crate) fn endpoint_addr_from_routing(
     Ok(addr)
 }
 
+/// ZEB-908: fold the transport addresses iroh currently holds for a peer's
+/// node — most importantly its relay locator — into `addr`, so a fresh
+/// handshake/redeem dial reuses an already-established live session's path.
+///
+/// `endpoint_addr_from_routing` synthesizes the dial target purely from the
+/// inviter's pkarr routing blob; when that blob carries no usable relay
+/// (empty/malformed `home_relay_url`) the addr is direct-only, so a dial to an
+/// inviter reachable only via relay (NAT / asymmetric LAN) fails "inviter
+/// offline" even though a healthy relay-backed session to that same node is
+/// already live and carrying traffic. `Endpoint::remote_info` exposes the
+/// addressing iroh learned for a recently/currently-connected peer; folding it
+/// in (additive — `EndpointAddr` stores a set, so duplicates are dropped) makes
+/// magicsock's relay fallback deterministic. Self-gating: returns `false` and
+/// leaves `addr` untouched when no live info exists, so the cold-start dial is
+/// byte-for-byte unchanged. Only ever adds addressing for `addr.id` — the exact
+/// node we already intended to dial — so it cannot redirect the handshake to a
+/// different endpoint. Returns whether anything was merged.
+async fn merge_live_endpoint_addrs(
+    endpoint: &iroh::Endpoint,
+    addr: &mut iroh::EndpointAddr,
+) -> bool {
+    let Some(info) = endpoint.remote_info(addr.id).await else {
+        return false;
+    };
+    let before = addr.relay_urls().count() + addr.ip_addrs().count();
+    let mut merged = addr.clone();
+    for ta in info.into_addrs() {
+        match ta.into_addr() {
+            iroh::TransportAddr::Relay(url) => merged = merged.with_relay_url(url),
+            iroh::TransportAddr::Ip(sa) => merged = merged.with_ip_addr(sa),
+            // Custom transports aren't used by this client's handshake path.
+            _ => {}
+        }
+    }
+    let after = merged.relay_urls().count() + merged.ip_addrs().count();
+    *addr = merged;
+    after > before
+}
+
+#[cfg(test)]
+mod zeb908_reuse_live_session_tests {
+    //! ZEB-908: the redeem/handshake dialer must reuse an already-established
+    //! live session's addressing (esp. the relay) rather than dialing only the
+    //! pkarr-synthesized address — so a redeem to an inviter we're already
+    //! connected to doesn't fail "inviter offline" when the pkarr blob carried
+    //! no usable relay.
+
+    use iroh::endpoint::{presets, Endpoint, RelayMode};
+    use iroh::{EndpointAddr, SecretKey, TransportAddr};
+    use rand::RngCore;
+    use std::net::Ipv4Addr;
+
+    async fn hermetic_loopback_endpoint() -> Endpoint {
+        let mut buf = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut buf);
+        Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&buf))
+            .alpns(vec![crate::iroh_endpoint::alpn::HARMONY_ZENOH_V1.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .dns_resolver(crate::iroh_endpoint::hermetic_dns_resolver())
+            .clear_ip_transports()
+            .bind_addr((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind_addr")
+            .bind()
+            .await
+            .expect("bind")
+    }
+
+    #[tokio::test]
+    async fn merge_reuses_live_session_addrs_for_connected_peer() {
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), inner())
+            .await
+            .expect("must complete within 30s");
+    }
+
+    async fn inner() {
+        let ep_a = hermetic_loopback_endpoint().await;
+        let ep_b = hermetic_loopback_endpoint().await;
+        let ep_b_id = ep_b.id();
+        let ep_b_addr = EndpointAddr::from_parts(
+            ep_b_id,
+            ep_b.bound_sockets().into_iter().map(TransportAddr::Ip),
+        );
+
+        // B accepts and holds the connection open for the test's duration, so A
+        // retains live addressing for B's node in its remote map.
+        let ep_b_clone = ep_b.clone();
+        let accept_task = tokio::spawn(async move {
+            let incoming = ep_b_clone.accept().await.expect("incoming");
+            let conn = incoming.await.expect("established");
+            let _ = conn.closed().await;
+        });
+
+        // A dials B → A now holds B's addressing in its remote map.
+        let _conn = ep_a
+            .connect(ep_b_addr, crate::iroh_endpoint::alpn::HARMONY_ZENOH_V1)
+            .await
+            .expect("connect");
+
+        // A bare, addressing-stripped EndpointAddr — what
+        // `endpoint_addr_from_routing` produces when the pkarr blob has no
+        // usable relay/direct addrs.
+        let mut bare = EndpointAddr::new(ep_b_id);
+        assert_eq!(bare.ip_addrs().count(), 0);
+        assert_eq!(bare.relay_urls().count(), 0);
+
+        let merged = super::merge_live_endpoint_addrs(&ep_a, &mut bare).await;
+        assert!(
+            merged,
+            "expected live-session addressing to be merged for a connected peer"
+        );
+        assert!(
+            bare.ip_addrs().count() >= 1,
+            "bare addr should gain the live direct addr(s) A learned for B"
+        );
+
+        // Negative: a node we never connected to has no live info → no-op.
+        let mut buf_c = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut buf_c);
+        let unknown_id = SecretKey::from_bytes(&buf_c).public();
+        let mut unknown = EndpointAddr::new(unknown_id);
+        let merged_unknown = super::merge_live_endpoint_addrs(&ep_a, &mut unknown).await;
+        assert!(
+            !merged_unknown,
+            "unknown peer has no live info; merge must be a no-op"
+        );
+        assert_eq!(unknown.ip_addrs().count(), 0);
+        assert_eq!(unknown.relay_urls().count(), 0);
+
+        accept_task.abort();
+    }
+}
+
 /// Inner orchestration body of `connectivity_redeem_invite_iroh`, split out
 /// so integration tests can drive it with explicit resources rather than
 /// the full Tauri AppState. ZEB-325 Phase 2c **option A**: direct iroh
@@ -62819,6 +62953,18 @@ where
     // failure (open_bi stays one-shot below).
     let mut conn = None;
     for attempt in 0..2 {
+        // ZEB-908: before dialing, fold the addressing iroh already holds for
+        // this inviter's node (crucially its relay) into `alice_addr`, so a
+        // redeem to a peer we already have a live session with reuses that path
+        // instead of failing "inviter offline" on a pkarr blob that carried no
+        // usable relay. No-op when no live info exists (cold-start unchanged);
+        // runs each attempt so the B4 re-resolved addr is enriched too.
+        if merge_live_endpoint_addrs(iroh_endpoint.inner(), &mut alice_addr).await {
+            tracing::info!(
+                inviter = %hex::encode(inviter_addr.0),
+                "ZEB-908: reused live session addressing for redeem handshake dial"
+            );
+        }
         match tokio::time::timeout(
             dial_config.connect_timeout,
             iroh_endpoint.inner().connect(
