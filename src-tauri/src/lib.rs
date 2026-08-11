@@ -61640,12 +61640,14 @@ impl RedemptionOutcome {
         }
     }
 
-    /// ZEB-911: the full witness ladder ran — the admin's Case-A dial failed
-    /// AND at least one rendezvous-resolved witness candidate was dialed and
-    /// failed. Distinct from `"inviter_unreachable"` so the frontend can say
-    /// "no community member is currently reachable" instead of blaming the
-    /// inviter, while mapping to the same retry affordance. No membership
-    /// landed.
+    /// ZEB-911: the witness ladder was genuinely exercised — either the
+    /// admin's Case-A dial failed and at least one rendezvous-resolved
+    /// witness candidate was dialed and failed, or a WITNESS connection was
+    /// established and the handshake stream then died (review r2:
+    /// witness-aware post-dial classification). Distinct from
+    /// `"inviter_unreachable"` so the frontend can say "no community member
+    /// is currently reachable" instead of blaming the inviter, while mapping
+    /// to the same retry affordance. No membership landed.
     fn no_member_reachable() -> Self {
         Self {
             status: "no_member_reachable".to_string(),
@@ -63624,6 +63626,17 @@ where
             RedemptionOutcome::unreachable()
         });
     };
+    // Review r2 (non-blocking): post-dial stream failures keep witness-aware
+    // classification. After a WITNESS connection, a died stream must not
+    // resurface in the UI as "the inviter is offline" — the inviter was
+    // never part of that exchange.
+    let post_dial_failure_outcome = || {
+        if dialed_owner == inviter_addr {
+            RedemptionOutcome::unreachable()
+        } else {
+            RedemptionOutcome::no_member_reachable()
+        }
+    };
     let (mut send, mut recv) =
         match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
             Ok(Ok(s)) => s,
@@ -63634,7 +63647,7 @@ where
                     "ZEB-325 Phase 2c option A: open_bi failed"
                 );
                 conn.close(0u32.into(), b"open_bi-failed");
-                return Ok(RedemptionOutcome::unreachable());
+                return Ok(post_dial_failure_outcome());
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -63643,7 +63656,7 @@ where
                     "ZEB-325 Phase 2c option A: open_bi timeout"
                 );
                 conn.close(0u32.into(), b"open_bi-timeout");
-                return Ok(RedemptionOutcome::unreachable());
+                return Ok(post_dial_failure_outcome());
             }
         };
 
@@ -63821,7 +63834,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request length-prefix write failed"
             );
             conn.close(0u32.into(), b"request-write-failed");
-            return Ok(RedemptionOutcome::unreachable());
+            return Ok(post_dial_failure_outcome());
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -63829,7 +63842,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request length-prefix write timeout"
             );
             conn.close(0u32.into(), b"write-timeout");
-            return Ok(RedemptionOutcome::unreachable());
+            return Ok(post_dial_failure_outcome());
         }
     }
     let write_body = async {
@@ -63845,7 +63858,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request body write failed"
             );
             conn.close(0u32.into(), b"request-write-failed");
-            return Ok(RedemptionOutcome::unreachable());
+            return Ok(post_dial_failure_outcome());
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -63853,7 +63866,7 @@ where
                 "ZEB-325 Phase 2c option A: handshake request body write timeout"
             );
             conn.close(0u32.into(), b"write-timeout");
-            return Ok(RedemptionOutcome::unreachable());
+            return Ok(post_dial_failure_outcome());
         }
     }
     // ZEB-325 PR #159 R4-1 (CodeRabbit MAJOR): normalize send.finish()
@@ -63867,7 +63880,7 @@ where
             "ZEB-325 Phase 2c option A: handshake send.finish() failed"
         );
         conn.close(0u32.into(), b"send-finish-failed");
-        return Ok(RedemptionOutcome::unreachable());
+        return Ok(post_dial_failure_outcome());
     }
 
     // Stage 4/5: `awaiting_countersig` — emitted BEFORE the read so
@@ -63917,7 +63930,7 @@ where
                 // released. CONNECTION_CLOSE lets the peer release
                 // immediately.
                 conn.close(0u32.into(), b"response-read-failed");
-                return Ok(RedemptionOutcome::unreachable());
+                return Ok(post_dial_failure_outcome());
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -63925,7 +63938,7 @@ where
                     "ZEB-325 Phase 2c option A: handshake response timeout (read)"
                 );
                 conn.close(0u32.into(), b"response-read-timeout");
-                return Ok(RedemptionOutcome::unreachable());
+                return Ok(post_dial_failure_outcome());
             }
         };
 
@@ -63945,7 +63958,7 @@ where
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(error = %e, "ZEB-911: chain response CBOR decode failed");
-                    return Ok(RedemptionOutcome::unreachable());
+                    return Ok(post_dial_failure_outcome());
                 }
             };
         if events.len() < 2 || events.len() > ZEB911_MAX_CHAIN_EVENTS {
@@ -63953,14 +63966,14 @@ where
                 len = events.len(),
                 "ZEB-911: chain response length out of bounds"
             );
-            return Ok(RedemptionOutcome::unreachable());
+            return Ok(post_dial_failure_outcome());
         }
         // Defensive: every chain event must belong to the community we are
         // redeeming into (each is also fully re-verified by the engine's
         // verify_event at insert — this just fails fast with a clear log).
         if events.iter().any(|e| e.community_id != minted.community_id) {
             tracing::warn!("ZEB-911: chain response carries a foreign community_id");
-            return Ok(RedemptionOutcome::unreachable());
+            return Ok(post_dial_failure_outcome());
         }
         let cs = events.pop().expect("len >= 2 checked above");
         (events, cs)
@@ -63971,7 +63984,7 @@ where
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "ZEB-325 Phase 2c option A: response CBOR decode failed");
-                return Ok(RedemptionOutcome::unreachable());
+                return Ok(post_dial_failure_outcome());
             }
         };
         (Vec::new(), cs)
@@ -63986,11 +63999,11 @@ where
         tracing::warn!(
             "ZEB-325 Phase 2c option A: response is not a JoinCountersign for our bootstrap_join.id"
         );
-        return Ok(RedemptionOutcome::unreachable());
+        return Ok(post_dial_failure_outcome());
     }
     if countersign.community_id != minted.community_id {
         tracing::warn!("ZEB-325 Phase 2c option A: countersign community_id mismatch");
-        return Ok(RedemptionOutcome::unreachable());
+        return Ok(post_dial_failure_outcome());
     }
 
     // Cleanly close the iroh connection. The acceptor's
