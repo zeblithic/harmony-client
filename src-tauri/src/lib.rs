@@ -40041,36 +40041,25 @@ pub struct NavUpdatedPayload {
     pub pending: Option<bool>,
 }
 
-/// Pure function: builds the joiner-side `MintedCommunity` from an
-/// invite payload — derives a Community Space row from `payload.name`
-/// / `is_invite_only`, and signs a self-Join `SignedMembershipEvent`
-/// (actor = `self_owner`, community_id = `payload.community_id`).
+/// Joiner-side extraction of the community epoch key from an invite payload.
 ///
-/// Pure / sync / no I/O — the caller supplies `join_hlc`. This lets
-/// the test (`redeem_invite_inner_tests`) cover the full mint without
-/// spawning channels, mutexes, or a Tauri runtime.
+/// - Open communities: `sealed_epoch_key` is the raw 32-byte EpochKey
+///   (publicly shareable — anyone with the link gets it).
+/// - Invite-only communities: `sealed_epoch_key` / `sealed_epoch_keys` are
+///   X25519-sealed envelopes (32 ephemeral_pub + 12 nonce + 32 ct + 16 tag)
+///   opened with the invitee's enrolled device-#2 X25519 key (targeted,
+///   RFC 7748 §5 via `ed25519_priv_to_x25519`) or the URL's one-time
+///   ephemeral key (`untargeted_decrypt_key`, ZEB-367).
 ///
-/// ZEB-267: Caller pre-reserves `join_hlc` via
-/// `dm_outbox::reserve_next_hlc_for_device`.
-pub fn mint_redemption(
+/// ZEB-911: extracted from `mint_redemption` so the witness-discovery
+/// ladder in `connectivity_redeem_invite_iroh_inner` can derive rendezvous
+/// slot keys from the same epoch key BEFORE any dial. Behavior-preserving
+/// move — including the ZEB-369 invitee-hint early reject.
+pub fn open_invite_epoch_key(
     payload: &crate::community_invite::CommunityInvitePayload,
     self_owner: crate::owner_state_types::OwnerAddr,
     signing_key: &ed25519_dalek::SigningKey,
-    enrollment_cert: &harmony_owner::certs::EnrollmentCert,
-    join_hlc: crate::owner_state_types::Hlc,
-) -> Result<MintedCommunity, String> {
-    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
-    use crate::owner_state_types::{EpochKey, Space, SpaceKind};
-    use rand::RngCore;
-
-    // ZEB-249 / M3: extract the epoch key from the snapshot.
-    // - Open communities: sealed_epoch_key is the raw 32-byte EpochKey
-    //   (publicly shareable — anyone with the link gets it).
-    // - Invite-only communities: sealed_epoch_key is a 92-byte X25519-sealed
-    //   envelope (32 ephemeral_pub + 12 nonce + 32 ct + 16 tag) encrypted
-    //   to the invitee's X25519 pubkey. Derive the invitee's X25519 private
-    //   scalar from signing_key (RFC 7748 §5 via ed25519_priv_to_x25519)
-    //   and decrypt here.
+) -> Result<crate::owner_state_types::EpochKey, String> {
     let epoch_key_bytes: [u8; 32] = if payload.is_invite_only {
         // Invite-only path: decrypt the X25519-sealed epoch key.
         // ZEB-369 defense-in-depth: a TARGETED invite binds the token to a
@@ -40149,7 +40138,32 @@ pub fn mint_redemption(
                 )
             })?
     };
-    let membership_key = EpochKey::new(epoch_key_bytes);
+    Ok(crate::owner_state_types::EpochKey::new(epoch_key_bytes))
+}
+
+/// Pure function: builds the joiner-side `MintedCommunity` from an
+/// invite payload — derives a Community Space row from `payload.name`
+/// / `is_invite_only`, and signs a self-Join `SignedMembershipEvent`
+/// (actor = `self_owner`, community_id = `payload.community_id`).
+///
+/// Pure / sync / no I/O — the caller supplies `join_hlc`. This lets
+/// the test (`redeem_invite_inner_tests`) cover the full mint without
+/// spawning channels, mutexes, or a Tauri runtime.
+///
+/// ZEB-267: Caller pre-reserves `join_hlc` via
+/// `dm_outbox::reserve_next_hlc_for_device`.
+pub fn mint_redemption(
+    payload: &crate::community_invite::CommunityInvitePayload,
+    self_owner: crate::owner_state_types::OwnerAddr,
+    signing_key: &ed25519_dalek::SigningKey,
+    enrollment_cert: &harmony_owner::certs::EnrollmentCert,
+    join_hlc: crate::owner_state_types::Hlc,
+) -> Result<MintedCommunity, String> {
+    use crate::community_membership::{sign_event, EventPayload, MembershipEventKind};
+    use crate::owner_state_types::{Space, SpaceKind};
+    use rand::RngCore;
+
+    let membership_key = open_invite_epoch_key(payload, self_owner, signing_key)?;
     let epoch = payload.epoch_snapshot.epoch;
 
     let mut rng = rand::thread_rng();
@@ -61514,6 +61528,11 @@ pub struct RedemptionOutcome {
     ///   record, OR the iroh dial / open_bi / response read failed
     ///   before the inviter delivered a JoinCountersign. The inviter
     ///   was NOT reached. `community_id` is `None`.
+    /// * `"no_member_reachable"` — ZEB-911: the admin dial failed AND the
+    ///   witness ladder dialed at least one rendezvous-resolved candidate,
+    ///   all unreachable. Same retry semantics as `"inviter_unreachable"`;
+    ///   distinct so the UI names the community, not the inviter.
+    ///   `community_id` is `None`.
     /// * `"join_failed"` — pkarr resolved AND the iroh handshake
     ///   completed AND a valid JoinCountersign was delivered, but the
     ///   subsequent local `redeem_invite_inner_with_overrides` failed
@@ -61551,6 +61570,20 @@ impl RedemptionOutcome {
     fn unreachable() -> Self {
         Self {
             status: "inviter_unreachable".to_string(),
+            community_id: None,
+            pending: false,
+        }
+    }
+
+    /// ZEB-911: the full witness ladder ran — the admin's Case-A dial failed
+    /// AND at least one rendezvous-resolved witness candidate was dialed and
+    /// failed. Distinct from `"inviter_unreachable"` so the frontend can say
+    /// "no community member is currently reachable" instead of blaming the
+    /// inviter, while mapping to the same retry affordance. No membership
+    /// landed.
+    fn no_member_reachable() -> Self {
+        Self {
+            status: "no_member_reachable".to_string(),
             community_id: None,
             pending: false,
         }
@@ -62463,6 +62496,134 @@ pub(crate) fn endpoint_addr_from_routing(
     Ok(addr)
 }
 
+/// ZEB-911: a rendezvous-resolved witness candidate for the redeem dial
+/// ladder — a Joined member's advertised routing payload plus the owner
+/// identity derived from the outer pkarr record (gateway-driver parity:
+/// `OwnerAddr(identity.address_hash)`), used as the ReachabilityResolver
+/// seed key if this candidate is dialed.
+#[derive(Debug, Clone)]
+pub(crate) struct WitnessCandidate {
+    pub(crate) routing: crate::reachability_record::ReachabilityAnnouncePayload,
+    pub(crate) owner: crate::owner_state_types::OwnerAddr,
+}
+
+/// ZEB-911: pkarr verifying keys for ONE community-rendezvous slot across
+/// the wall-clock epoch tolerance window — the witness-ladder analogue of
+/// the Case-A window derivation in `connectivity_redeem_invite_iroh_inner`.
+/// Slot keys are a pure function of (community epoch key, slot index,
+/// 7-day wall bucket), so an invite holder can derive every slot with no
+/// additional material. Publisher parity is pinned by
+/// `zeb911_witness_ladder_tests::slot_window_keys_match_publisher_derivation`.
+pub(crate) fn witness_slot_window_keys(
+    epoch_key: &crate::owner_state_types::EpochKey,
+    slot_index: u16,
+    now_ms: u64,
+) -> Vec<ed25519_dalek::VerifyingKey> {
+    harmony_pkarr::epoch_tolerance_window(now_ms)
+        .iter()
+        .map(|&epoch_id| {
+            crate::community_rendezvous::rendezvous_slot_verifying_key(
+                epoch_key, slot_index, epoch_id,
+            )
+        })
+        .collect()
+}
+
+/// ZEB-911: drop witness candidates that would re-dial an endpoint the
+/// ladder already tried — the rung-0 admin dial (`exclude_node_id`) and
+/// earlier candidates (one advertiser can hold several slots across the
+/// epoch window; the admin may itself be an advertiser). Order-preserving:
+/// slot order is the deterministic advertiser ranking, so earlier slots
+/// stay first.
+pub(crate) fn dedup_witness_candidates(
+    candidates: Vec<WitnessCandidate>,
+    exclude_node_id: Option<[u8; 32]>,
+) -> Vec<WitnessCandidate> {
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    if let Some(id) = exclude_node_id {
+        seen.insert(id);
+    }
+    candidates
+        .into_iter()
+        .filter(|c| seen.insert(c.routing.iroh_node_id))
+        .collect()
+}
+
+#[cfg(test)]
+mod zeb911_witness_ladder_tests {
+    use super::{dedup_witness_candidates, witness_slot_window_keys, WitnessCandidate};
+    use crate::owner_state_types::{EpochKey, OwnerAddr};
+    use crate::reachability_record::ReachabilityAnnouncePayload;
+
+    fn payload_with_node(node: u8) -> ReachabilityAnnouncePayload {
+        ReachabilityAnnouncePayload {
+            iroh_node_id: [node; 32],
+            home_relay_url: String::new(),
+            direct_addresses: vec![],
+            announced_at_ms: 0,
+            identity_signature: [0; 64],
+            butler_set: Vec::new(),
+            bs_at: 0,
+        }
+    }
+
+    fn candidate(node: u8, owner: u8) -> WitnessCandidate {
+        WitnessCandidate {
+            routing: payload_with_node(node),
+            owner: OwnerAddr([owner; 16]),
+        }
+    }
+
+    /// The joiner-side window derivation must equal the publisher's
+    /// per-(slot, epoch) derivation exactly — a drift here silently blinds
+    /// the whole witness ladder (records exist, joiner queries the wrong
+    /// keys, resolve returns empty).
+    #[test]
+    fn slot_window_keys_match_publisher_derivation() {
+        let epoch_key = EpochKey::new([0x5a; 32]);
+        let now_ms: u64 = 1_750_000_000_000;
+        let window = harmony_pkarr::epoch_tolerance_window(now_ms);
+        assert!(!window.is_empty());
+        for slot in 0..crate::community_rendezvous::RENDEZVOUS_SLOT_COUNT as u16 {
+            let keys = witness_slot_window_keys(&epoch_key, slot, now_ms);
+            assert_eq!(keys.len(), window.len());
+            for (i, &epoch_id) in window.iter().enumerate() {
+                let expected = crate::community_rendezvous::rendezvous_slot_verifying_key(
+                    &epoch_key, slot, epoch_id,
+                );
+                assert_eq!(keys[i], expected, "slot {slot} epoch {epoch_id}");
+            }
+        }
+        // Distinct slots must never derive the same key (would alias two
+        // advertisers onto one DHT record).
+        let s0 = witness_slot_window_keys(&epoch_key, 0, now_ms);
+        let s1 = witness_slot_window_keys(&epoch_key, 1, now_ms);
+        assert_ne!(s0[0], s1[0]);
+    }
+
+    #[test]
+    fn dedup_drops_admin_node_and_repeats_preserving_order() {
+        let cands = vec![
+            candidate(0xAA, 1), // == excluded admin node
+            candidate(0xBB, 2),
+            candidate(0xBB, 2), // repeat of BB
+            candidate(0xCC, 3),
+        ];
+        let out = dedup_witness_candidates(cands, Some([0xAA; 32]));
+        let nodes: Vec<u8> = out.iter().map(|c| c.routing.iroh_node_id[0]).collect();
+        assert_eq!(nodes, vec![0xBB, 0xCC]);
+        assert_eq!(out[0].owner, OwnerAddr([2; 16]));
+    }
+
+    #[test]
+    fn dedup_without_exclusion_keeps_first_occurrence() {
+        let cands = vec![candidate(0xAA, 1), candidate(0xAA, 9), candidate(0xBB, 2)];
+        let out = dedup_witness_candidates(cands, None);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].owner, OwnerAddr([1; 16]));
+    }
+}
+
 /// ZEB-908: fold the transport addresses iroh currently holds for a peer's
 /// node — most importantly its relay locator — into `addr`, so a fresh
 /// handshake/redeem dial reuses an already-established live session's path.
@@ -63178,8 +63339,146 @@ where
             }
         }
     }
+    // ZEB-911 witness ladder, rungs 1-4: the admin's Case-A dial failed, so
+    // fall back to the community's rendezvous advertiser slots. Any Joined
+    // member reached this way is a complete redeem endpoint (slice 1
+    // relaxed the acceptor's inviter-identity policy): it verifies the
+    // packet against the admin's enrolled keys, performs the claim-bound
+    // PendingJoin insert, auto-counter-signs, and returns the countersign
+    // on this same bi-stream — byte-identical wire protocol to rung 0.
+    //
+    // Records are resolved with inner-sig + freshness verification only —
+    // NO identity match, because the joiner doesn't know the witnesses
+    // (spec §6: a decoy beacon costs one wasted dial + IP exposure to an
+    // epoch-key holder; admission integrity is CRDT-enforced end-to-end,
+    // same trust posture as open-join). Slot keys derive from the invite's
+    // epoch key; a community that rotated epochs since mint yields no
+    // matching records here and the ladder degrades to today's
+    // admin-only behavior (spec §5, accepted v1 limitation; ZEB-918).
+    let mut dialed_owner = inviter_addr;
+    let mut witness_dials_attempted = 0usize;
+    let conn = if let Some(c) = conn {
+        Some(c)
+    } else {
+        match open_invite_epoch_key(&payload, self_owner, signing_key.as_ref()) {
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    community_id = %hex::encode(payload.community_id.0),
+                    "ZEB-911: cannot open invite epoch key — skipping witness ladder"
+                );
+                None
+            }
+            Ok(epoch_key) => {
+                let ladder_now_ms = crate::iroh_friend_acceptor::wall_now_ms();
+                let mut candidates: Vec<WitnessCandidate> = Vec::new();
+                for slot in 0..crate::community_rendezvous::RENDEZVOUS_SLOT_COUNT as u16 {
+                    let slot_keys = witness_slot_window_keys(&epoch_key, slot, ladder_now_ms);
+                    let verify = |rec: &harmony_pkarr::PkarrRoutingRecord| {
+                        rec.verify_inner_sig().is_ok()
+                            && rec.verify_freshness(ladder_now_ms).is_ok()
+                    };
+                    let rec = match resolver
+                        .resolve_window_freshest_with(&slot_keys, &verify)
+                        .await
+                    {
+                        Ok(Some(rec)) => rec,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            tracing::debug!(error = %e, slot, "ZEB-911: witness slot resolve error");
+                            continue;
+                        }
+                    };
+                    let routing: crate::reachability_record::ReachabilityAnnouncePayload =
+                        match ciborium::from_reader(rec.routing_blob.as_slice()) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::debug!(error = %e, slot, "ZEB-911: witness routing_blob decode failed");
+                                continue;
+                            }
+                        };
+                    // Derive the beacon's owner from the outer record's
+                    // identity (gateway-driver parity). Unparseable identity
+                    // bytes on an inner-sig-verified record indicate a
+                    // publisher bug, not an attack — skip.
+                    let owner = match harmony_identity::Identity::from_public_bytes(
+                        &rec.harmony_identity_pub,
+                    ) {
+                        Ok(identity) => crate::owner_state_types::OwnerAddr(identity.address_hash),
+                        Err(_) => {
+                            tracing::debug!(slot, "ZEB-911: witness record identity unparseable");
+                            continue;
+                        }
+                    };
+                    candidates.push(WitnessCandidate { routing, owner });
+                }
+                let admin_node_id: Option<[u8; 32]> = Some(*alice_addr.id.as_bytes());
+                let candidates = dedup_witness_candidates(candidates, admin_node_id);
+                tracing::info!(
+                    community_id = %hex::encode(payload.community_id.0),
+                    candidates = candidates.len(),
+                    "ZEB-911: witness ladder resolved candidates"
+                );
+                let mut found = None;
+                for cand in candidates {
+                    let cand_addr = match endpoint_addr_from_routing(&cand.routing) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "ZEB-911: witness addr synthesize failed");
+                            continue;
+                        }
+                    };
+                    // Seed the resolver under the witness's owner BEFORE the
+                    // dial so a successful handshake leaves the follow-up
+                    // Zenoh link (`IrohZenohLinkManager::new_link` reads this
+                    // seed) pointed at the peer we actually reached — the
+                    // witness-rung analogue of the rung-0 seed above.
+                    reachability_resolver
+                        .seed_from_pkarr(
+                            cand.owner,
+                            crate::owner_state_types::DeviceIdentityHash([0u8; 16]),
+                            cand.routing.clone(),
+                        )
+                        .await;
+                    witness_dials_attempted += 1;
+                    match tokio::time::timeout(
+                        dial_config.connect_timeout,
+                        iroh_endpoint
+                            .inner()
+                            .connect(cand_addr, crate::iroh_endpoint::alpn::HARMONY_HANDSHAKE_V1),
+                    )
+                    .await
+                    {
+                        Ok(Ok(c)) => {
+                            tracing::info!(
+                                witness = %hex::encode(cand.owner.0),
+                                "ZEB-911: witness dial connected — proceeding with handshake"
+                            );
+                            dialed_owner = cand.owner;
+                            found = Some(c);
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, witness = %hex::encode(cand.owner.0), "ZEB-911: witness connect failed");
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(witness = %hex::encode(cand.owner.0), "ZEB-911: witness connect timeout");
+                        }
+                    }
+                }
+                found
+            }
+        }
+    };
     let Some(conn) = conn else {
-        return Ok(RedemptionOutcome::unreachable());
+        // Distinguish "we actually tried witnesses too" from the legacy
+        // single-target outcome so the UI stops blaming the inviter when
+        // the whole community was unreachable.
+        return Ok(if witness_dials_attempted > 0 {
+            RedemptionOutcome::no_member_reachable()
+        } else {
+            RedemptionOutcome::unreachable()
+        });
     };
     let (mut send, mut recv) =
         match tokio::time::timeout(dial_config.open_bi_timeout, conn.open_bi()).await {
@@ -63187,7 +63486,7 @@ where
             Ok(Err(e)) => {
                 tracing::warn!(
                     error = %e,
-                    inviter = %hex::encode(inviter_addr.0),
+                    dialed = %hex::encode(dialed_owner.0),
                     "ZEB-325 Phase 2c option A: open_bi failed"
                 );
                 conn.close(0u32.into(), b"open_bi-failed");
@@ -63196,7 +63495,7 @@ where
             Err(_elapsed) => {
                 tracing::warn!(
                     timeout_ms = dial_config.open_bi_timeout.as_millis() as u64,
-                    inviter = %hex::encode(inviter_addr.0),
+                    dialed = %hex::encode(dialed_owner.0),
                     "ZEB-325 Phase 2c option A: open_bi timeout"
                 );
                 conn.close(0u32.into(), b"open_bi-timeout");
