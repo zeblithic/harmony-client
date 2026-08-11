@@ -10,8 +10,9 @@
 //! builds via its `mod` declaration below.
 //!
 //! Scope: the remaining community domain — admin quorum, backward secrecy,
-//! invite/join (invite unit, invite-only flow, inviter enrollment), membership,
-//! pending join, reachability, relay, and serve allowlist.
+//! invite/join (invite unit, invite-only flow, inviter enrollment, ZEB-911
+//! witness acceptance), membership, pending join, reachability, relay, and
+//! serve allowlist.
 //!
 //! Full `community_*` basenames are preserved (the subdir was moved, not renamed)
 //! so the cross-references to these tests from other tests and from production
@@ -48,3 +49,5 @@ mod community_reachability_two_engine_integration;
 mod community_relay_integration;
 #[path = "community_misc/community_serve_allowlist_integration.rs"]
 mod community_serve_allowlist_integration;
+#[path = "community_misc/zeb911_witness_acceptance.rs"]
+mod zeb911_witness_acceptance;
