@@ -199,6 +199,32 @@ describe('RedeemInviteDialog', () => {
     expect(getByTestId('fallback-lan-btn')).toBeTruthy();
   });
 
+  // ZEB-911: ladder-exhausted outcome — witness dials ran and failed too.
+  it('shows no_member_reachable community-oriented message and fallback button', async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_redeem_invite_iroh') {
+        return Promise.resolve({ status: 'no_member_reachable' });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { getByTestId, getByPlaceholderText } = render(RedeemInviteDialog, {
+      props: { onSubmit: vi.fn(), onCancel: vi.fn() },
+    });
+
+    const input = getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: 'harmony://invite/v1?ci=x' } });
+    await fireEvent.click(getByTestId('iroh-redeem-btn'));
+
+    await waitFor(() => {
+      const banner = getByTestId('iroh-error-banner');
+      // Community-oriented copy: names the community, not the inviter.
+      expect(banner.textContent).toContain('No member of this community is reachable');
+      expect(banner.textContent).not.toContain('inviter');
+    });
+    expect(getByTestId('fallback-lan-btn')).toBeTruthy();
+  });
+
   it('fallback button calls onSubmit (LAN path) after iroh failure', async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'connectivity_redeem_invite_iroh') {

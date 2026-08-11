@@ -216,6 +216,15 @@
         irohError =
           "Couldn't reach the inviter through the network right now. They may be offline; try again later.";
         showFallbackButton = true;
+      } else if (outcome.status === 'no_member_reachable') {
+        // ZEB-911: the witness ladder ran — the inviter AND every advertised
+        // community member we could discover were unreachable. Same retry
+        // affordances as inviter_unreachable, but name the community rather
+        // than blaming the inviter specifically.
+        irohStage = null;
+        irohError =
+          'No member of this community is reachable right now. Try again later.';
+        showFallbackButton = true;
       } else if (outcome.status === 'join_failed') {
         // ZEB-325 PR #159 R1: the inviter WAS reached and we received a
         // valid JoinCountersign, but the local insert/commit failed

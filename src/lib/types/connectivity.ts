@@ -91,6 +91,11 @@ export interface PkarrPublicationStatus {
  *  - `'inviter_unreachable'` — pkarr lookup returned nothing OR the post-
  *    seed redeem path failed (backend collapses both into one user-facing
  *    message).
+ *  - `'no_member_reachable'` — ZEB-911: the admin dial failed AND the
+ *    witness ladder dialed at least one rendezvous-resolved community
+ *    member, all unreachable. Same retry semantics as
+ *    `'inviter_unreachable'`; distinct so the copy names the community,
+ *    not the inviter.
  *  - `'join_failed'` — ZEB-325 PR #159 F1: the inviter WAS reached and a
  *    valid JoinCountersign was delivered, but the subsequent local
  *    `redeem_invite_inner_with_overrides` errored (engine insert, fence,
@@ -106,6 +111,7 @@ export interface RedemptionOutcome {
     | 'joined'
     | 'pkarr_resolved_no_handshake'
     | 'inviter_unreachable'
+    | 'no_member_reachable'
     | 'join_failed'
     | 'missing_admin_identity_pub'
     | 'fallback_reticulum'
