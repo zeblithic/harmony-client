@@ -761,9 +761,8 @@ mod verify_rejection_tests {
 
         let err = verify_packet_pure(
             &signed,
-            OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect_err("must reject");
         assert!(matches!(err, CommunityInviteVerifyError::JoinSigInvalid));
@@ -781,9 +780,8 @@ mod verify_rejection_tests {
 
         let err = verify_packet_pure(
             &signed,
-            OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect_err("must reject");
         assert!(matches!(
@@ -792,28 +790,83 @@ mod verify_rejection_tests {
         ));
     }
 
+    /// ZEB-911: a witness (whose own identity plays no role in the pure
+    /// verify) accepts a packet whose token was minted by the admin, as long
+    /// as the caller-resolved `token_signer_keys` slice contains the admin's
+    /// enrolled key. The former step-4 "token.inviter == self" policy is
+    /// deleted; there is no self identity in this function at all.
     #[test]
-    fn community_invite_signer_mismatch_rejected() {
-        // InviteToken.signer is some other OwnerAddr (not self).
-        let self_id = harmony_identity::PrivateIdentity::from_seed(&[0xa5; 32]);
-        let self_device_sk = device_sk_from_identity(&self_id);
+    fn zeb911_witness_accepts_admin_minted_token_via_key_slice() {
+        let admin_id = harmony_identity::PrivateIdentity::from_seed(&[0xa5; 32]);
+        let admin_device_sk = device_sk_from_identity(&admin_id);
         let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xb6; 32]);
         let community_id = SpaceId([0x10; 16]);
-        let mut signed = make_valid_packet(&self_id, &self_device_sk, &joiner_id, community_id);
+        let signed = make_valid_packet(&admin_id, &admin_device_sk, &joiner_id, community_id);
+        let expected_actor = signed.join_event.actor;
 
-        signed.invite_token.inviter = OwnerAddr([0xaa; 16]); // not self
-
-        let err = verify_packet_pure(
+        // The witness resolves the ADMIN's enrolled key from its own
+        // materialized membership and passes it here — its own device key
+        // never enters the check.
+        let join_event = verify_packet_pure(
             &signed,
-            OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[admin_device_sk.verifying_key().to_bytes()],
         )
-        .expect_err("must reject");
+        .expect("witness must accept an admin-minted token via the key slice");
+        assert_eq!(join_event.actor, expected_actor);
+    }
+
+    /// ZEB-911: no key in the caller-resolved slice verifies the token sig →
+    /// `InviteTokenSigInvalid` (the step-6 rejection now covers what the old
+    /// step-4 identity mismatch used to smuggle in).
+    #[test]
+    fn zeb911_token_sig_no_matching_key_rejected() {
+        let admin_id = harmony_identity::PrivateIdentity::from_seed(&[0xa5; 32]);
+        let admin_device_sk = device_sk_from_identity(&admin_id);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xb6; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let signed = make_valid_packet(&admin_id, &admin_device_sk, &joiner_id, community_id);
+
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
+        let err = verify_packet_pure(&signed, now_ms, &[stranger.verifying_key().to_bytes()])
+            .expect_err("must reject");
         assert!(matches!(
             err,
-            CommunityInviteVerifyError::InviteSignerMismatch { .. }
+            CommunityInviteVerifyError::InviteTokenSigInvalid
         ));
+
+        // Empty slice: nothing can verify — same rejection.
+        let err =
+            verify_packet_pure(&signed, now_ms, &[]).expect_err("empty key slice must reject");
+        assert!(matches!(
+            err,
+            CommunityInviteVerifyError::InviteTokenSigInvalid
+        ));
+    }
+
+    /// ZEB-911: the slice is try-each (mirrors
+    /// `verify_invite_token_sig_with_enrolled`) — a match anywhere in the
+    /// slice admits, including last position.
+    #[test]
+    fn zeb911_token_sig_multi_key_last_matches_accepted() {
+        let admin_id = harmony_identity::PrivateIdentity::from_seed(&[0xa5; 32]);
+        let admin_device_sk = device_sk_from_identity(&admin_id);
+        let joiner_id = harmony_identity::PrivateIdentity::from_seed(&[0xb6; 32]);
+        let community_id = SpaceId([0x10; 16]);
+        let signed = make_valid_packet(&admin_id, &admin_device_sk, &joiner_id, community_id);
+
+        let wrong_a = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let wrong_b = ed25519_dalek::SigningKey::from_bytes(&[0x72; 32]);
+        verify_packet_pure(
+            &signed,
+            now_ms,
+            &[
+                wrong_a.verifying_key().to_bytes(),
+                wrong_b.verifying_key().to_bytes(),
+                admin_device_sk.verifying_key().to_bytes(),
+            ],
+        )
+        .expect("a matching key anywhere in the slice must admit");
     }
 
     #[test]
@@ -829,9 +882,8 @@ mod verify_rejection_tests {
 
         let err = verify_packet_pure(
             &signed,
-            OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect_err("must reject");
         assert!(matches!(
@@ -853,9 +905,8 @@ mod verify_rejection_tests {
 
         let err = verify_packet_pure(
             &signed,
-            OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect_err("must reject");
         assert!(matches!(
@@ -879,9 +930,8 @@ mod verify_rejection_tests {
 
         let err = verify_packet_pure(
             &signed,
-            OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect_err("must reject");
         assert!(matches!(err, CommunityInviteVerifyError::Expired));
@@ -913,9 +963,8 @@ mod verify_rejection_tests {
 
         let err = verify_packet_pure(
             &signed,
-            OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect_err("must reject");
         assert!(matches!(
@@ -946,9 +995,8 @@ mod verify_rejection_tests {
 
         let join_event = verify_packet_pure(
             &signed,
-            OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect("join_event.at.wall_ms exactly at the skew boundary must admit");
         assert_eq!(join_event.actor, expected_actor);
@@ -1024,9 +1072,8 @@ mod verify_rejection_tests {
         let self_device_sk = device_sk_from_identity(&self_id);
         let err = verify_packet_pure(
             &signed,
-            self_owner,
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect_err("must reject");
         assert!(matches!(err, CommunityInviteVerifyError::Expired));
@@ -1090,9 +1137,8 @@ mod verify_rejection_tests {
 
         let err = verify_packet_pure(
             &signed,
-            self_owner,
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect_err("must reject — sig binds expires_at");
         assert!(matches!(
@@ -1112,9 +1158,8 @@ mod verify_rejection_tests {
 
         let join_event = verify_packet_pure(
             &signed,
-            OwnerAddr(self_id.identity.address_hash),
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect("must admit");
         assert_eq!(join_event.actor, expected_actor);
@@ -1170,9 +1215,8 @@ mod verify_rejection_tests {
 
         let admitted = verify_packet_pure(
             &signed,
-            self_owner,
             now_ms,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect("future expires_at must admit");
         assert_eq!(admitted.actor, joiner_owner);
@@ -1256,9 +1300,8 @@ mod verify_rejection_tests {
         let self_device_sk = device_sk_from_identity(&self_id);
         let err = verify_packet_pure(
             &signed,
-            self_owner,
             now_after_expiry,
-            &self_device_sk.verifying_key().to_bytes(),
+            &[self_device_sk.verifying_key().to_bytes()],
         )
         .expect_err("must reject — receive-time past expiry");
         assert!(matches!(err, CommunityInviteVerifyError::Expired));

@@ -1322,13 +1322,16 @@ pub enum CommunityInviteVerifyError {
     /// InviteToken sig failed.
     #[error("InviteToken sig invalid")]
     InviteTokenSigInvalid,
-    /// InviteToken.inviter != self_owner. v1 only counter-signs invites
-    /// we issued. ZEB-251 broadens this to any joined member with
-    /// power ≥ invite_threshold.
-    #[error("invite signer mismatch: token says {signer:?}, we are {self_owner:?}")]
-    InviteSignerMismatch {
+    /// ZEB-911: the token's minter (`invite_token.inviter`) is absent from
+    /// the receiver's materialized membership, so its enrolled device keys
+    /// cannot be resolved for the step-5 token-sig check. For a Joined
+    /// receiver this should be unreachable for a legitimate packet — the
+    /// admin's bootstrap Join is in every replica — so it flags either a
+    /// forged token or a badly stale receiver. Receiver surface; engine-
+    /// coupled (raised by `handle_unicast`, not `verify_packet_pure`).
+    #[error("invite token signer unknown to receiver: {signer:?}")]
+    InviteTokenSignerUnknown {
         signer: crate::owner_state_types::OwnerAddr,
-        self_owner: crate::owner_state_types::OwnerAddr,
     },
     /// community_id disagreement across envelope, Join, and token.
     #[error("community_id mismatch across envelope/Join/token")]
@@ -1416,7 +1419,7 @@ impl CommunityInviteVerifyError {
             Self::DeviceHashMismatch => "community_invite_device_hash_mismatch",
             Self::JoinSigInvalid => "community_invite_join_sig_invalid",
             Self::InviteTokenSigInvalid => "community_invite_token_sig_invalid",
-            Self::InviteSignerMismatch { .. } => "community_invite_signer_mismatch",
+            Self::InviteTokenSignerUnknown { .. } => "community_invite_token_signer_unknown",
             Self::CommunityIdMismatch => "community_invite_id_mismatch",
             Self::Expired => "community_invite_expired",
             Self::JoinEventFutureSkew => "community_invite_join_event_future_skew",
@@ -2192,19 +2195,23 @@ pub fn build_signed_open_join_packet(
 /// separate from `created_at` above (which only bounds the request envelope)
 /// because the Join event is what actually lands in the persisted log.
 ///
-/// `self_device_ed25519` must be the counter-signer's enrolled device #2
-/// ed25519 verifying key (32 bytes). This aligns step 6 with
-/// `verify_event`'s P5 gate (`verify_invite_token_sig_with_enrolled`),
-/// which resolves the same key from materialized membership.
+/// `token_signer_keys` must be the TOKEN MINTER's enrolled device #2
+/// ed25519 verifying keys (32 bytes each), resolved by the caller from its
+/// materialized membership (`members[token.inviter].enrolled_device_keys`).
+/// This aligns step 5 with `verify_event`'s P5 gate
+/// (`verify_invite_token_sig_with_enrolled`), which walks the same key set.
 ///
-/// Membership-state-dependent checks (`SelfNotJoined`, `CommunityUnknown`,
-/// `SelfPowerInsufficient`) are NOT raised here — they require engine
-/// state and ship in Task 9's `handle_unicast`.
+/// ZEB-911: the pre-witness step 4 (`token.inviter == self_owner`) is
+/// deleted — the accepting node no longer needs to BE the inviter. Any
+/// node can run this pure verify; *eligibility* to act on the packet
+/// (Joined + power ≥ invite threshold) is a membership-state check that
+/// lives in `handle_unicast`, alongside `SelfNotJoined`,
+/// `CommunityUnknown`, `SelfPowerInsufficient`, and
+/// `InviteTokenSignerUnknown`, which are NOT raised here.
 pub fn verify_packet_pure<F>(
     signed: &CommunityInviteSigned,
-    self_owner: crate::owner_state_types::OwnerAddr,
     now_fn: F,
-    self_device_ed25519: &[u8; 32],
+    token_signer_keys: &[[u8; 32]],
 ) -> Result<crate::community_membership::SignedMembershipEvent, CommunityInviteVerifyError>
 where
     F: FnOnce() -> u64,
@@ -2268,15 +2275,13 @@ where
         return Err(CommunityInviteVerifyError::JoinEventFutureSkew);
     }
 
-    // 4. InviteToken signer == self.
-    if signed.invite_token.inviter != self_owner {
-        return Err(CommunityInviteVerifyError::InviteSignerMismatch {
-            signer: signed.invite_token.inviter,
-            self_owner,
-        });
-    }
+    // (Former step 4 — `token.inviter == self_owner` — deleted by ZEB-911:
+    // any Joined member may accept the handshake. Token authenticity is
+    // fully carried by step 5 below against the minter's enrolled keys, and
+    // the admin-only minting invariant is enforced independently on every
+    // replica by `verify_event` P2.)
 
-    // 5. Inner Join event MEMBERSHIP sig (ZEB-339).
+    // 4. Inner Join event MEMBERSHIP sig (ZEB-339).
     //    The inner join_event is a community-membership event: it is signed by
     //    the joiner's enrolled device key (#2) and carries the joiner's Master
     //    EnrollmentCert (attached at the redeem mint, Task 7). So its MEMBERSHIP
@@ -2289,14 +2294,19 @@ where
     crate::community_membership::verify_membership_signer(&signed.join_event, &signer)
         .map_err(|_| CommunityInviteVerifyError::JoinSigInvalid)?;
 
-    // 6. InviteToken sig — verify against the counter-signer's enrolled
-    //    device #2 key (ZEB-339 consistency fix). Step 4 already binds
-    //    `signed.invite_token.inviter == self_owner`, so this is exactly
-    //    the key that `verify_event`'s P5 gate (`verify_invite_token_sig_with_enrolled`)
-    //    resolves from materialized membership. Both paths now agree: only a
-    //    device-#2-signed token satisfies the invite-only redemption chain.
-    verify_invite_token_sig_device_key(&signed.invite_token, self_device_ed25519)
-        .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
+    // 5. InviteToken sig — try each of the MINTER's enrolled device #2 keys
+    //    (ZEB-911; caller resolves them from materialized membership). This
+    //    is the same try-each walk `verify_event`'s P5 gate
+    //    (`verify_invite_token_sig_with_enrolled`) performs at insert/merge,
+    //    so the handshake path and the CRDT-authoritative path agree: only
+    //    a token signed by one of the minter's enrolled device keys
+    //    satisfies the invite-only redemption chain.
+    if !token_signer_keys
+        .iter()
+        .any(|key| verify_invite_token_sig_device_key(&signed.invite_token, key).is_ok())
+    {
+        return Err(CommunityInviteVerifyError::InviteTokenSigInvalid);
+    }
 
     Ok(signed.join_event.clone())
 }
@@ -2542,51 +2552,32 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         return Err(CommunityInviteVerifyError::EnvelopeSigInvalid);
     };
 
-    // 2. Snapshot self_owner + community_signing_key (#2) from dm_outbox under
-    //    its lock; drop the guard before any further `.await`. ZEB-339:
-    //    `verify_packet_pure` step 6 verifies the InviteToken sig against the
-    //    enrolled device key (#2), consistent with `verify_event`'s P5 gate.
-    //    (ZEB-875 removed the legacy counter-sign branch that also needed
-    //    `private_identity` for its Reticulum `countersigner_pub` field.)
-    let (self_owner, community_signing_key) = {
+    // 2. Snapshot self_owner from dm_outbox under its lock; drop the guard
+    //    before any further `.await`. ZEB-911: the community signing key is
+    //    no longer snapshotted here — the pure verify's token-sig check now
+    //    runs against the token MINTER's enrolled keys resolved from
+    //    materialized membership (step 5 below), not this node's own device
+    //    key, so any Joined member can accept the handshake.
+    let self_owner = {
         let outbox_g = dm_outbox.lock().await;
-        (
-            outbox_g.self_owner,
-            std::sync::Arc::clone(&outbox_g.community_signing_key),
-        )
+        outbox_g.self_owner
     };
 
-    // 3a. Path B envelope sig over signed_bytes (joiner's signature
-    //     over the canonical-CBOR body).
+    // 3. Path B envelope sig over signed_bytes (joiner's signature
+    //    over the canonical-CBOR body).
     if let Err(e) = verify_envelope_sig(&signed_bytes, &signature, &signed.joiner_identity_pub) {
         emit_degraded(app, &signed.community_id, e.reason_tag());
         return Err(e);
     }
-    // 3b. Pure verify chain (community_id agreement, invitee_hint,
-    //     expiry/clock-skew, InviteToken signer == self, Join sig,
-    //     InviteToken sig). Step 6 verifies the InviteToken sig against the
-    //     counter-signer's enrolled device key (#2), consistent with
-    //     `verify_event`'s P5 gate.
-    let self_device_vk = community_signing_key.verifying_key().to_bytes();
-    let join_event = match verify_packet_pure(
-        &signed,
-        self_owner,
-        || {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
-        },
-        &self_device_vk,
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            emit_degraded(app, &signed.community_id, e.reason_tag());
-            return Err(e);
-        }
-    };
 
     // 4. Resolve engine + state for community_id.
+    //
+    //    ZEB-911: moved ahead of the pure verify — the token-sig check needs
+    //    the minter's enrolled keys out of materialized membership. Error
+    //    precedence consequently shifts: a packet that fails BOTH a
+    //    membership-state check and a pure-verify check now reports the
+    //    membership-state error first (was reversed). Both surfaces are
+    //    degraded-telemetry only; no wire or IPC contract observes the order.
     let engine_arc = match community_registry.engine_arc(&signed.community_id).await {
         Some(e) => e,
         None => {
@@ -2608,9 +2599,13 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         }
     };
 
-    // 5. Self-eligibility: must be Joined; power ≥ invite_threshold
-    //    (= 0 in v1 — structural no-op + stable hook for ZEB-251).
-    let (self_status, self_power) = {
+    // 5. Materialize once for the ZEB-911 witness gates: self-eligibility
+    //    (self must be Joined with power ≥ the community's materialized
+    //    invite tier — the SAME predicate `verify_event` applies to
+    //    `JoinCountersign` actors, so acceptance eligibility and
+    //    counter-sign authority can never drift) and the token MINTER's
+    //    enrolled device keys for the pure verify below.
+    let (self_status, self_power, invite_threshold, token_signer_keys) = {
         let s = state_arc.lock().await;
         let events: Vec<_> = s.events().cloned().collect();
         drop(s);
@@ -2629,14 +2624,18 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         );
         let st = mat.members.get(&self_owner).map(|m| m.status);
         let pw = mat.power_levels.get(&self_owner).copied().unwrap_or(0);
-        (st, pw)
+        let keys: Vec<[u8; 32]> = mat
+            .members
+            .get(&signed.invite_token.inviter)
+            .map(|m| m.enrolled_device_keys.iter().copied().collect())
+            .unwrap_or_default();
+        (st, pw, mat.power_thresholds.invite, keys)
     };
     if self_status != Some(crate::community_membership::MemberStatus::Joined) {
         let e = CommunityInviteVerifyError::SelfNotJoined;
         emit_degraded(app, &signed.community_id, e.reason_tag());
         return Err(e);
     }
-    let invite_threshold: u8 = 0;
     if self_power < invite_threshold {
         let e = CommunityInviteVerifyError::SelfPowerInsufficient {
             self_power,
@@ -2645,6 +2644,38 @@ pub async fn handle_unicast<H: AppHandleEmit>(
         emit_degraded(app, &signed.community_id, e.reason_tag());
         return Err(e);
     }
+    // ZEB-911: the token minter must be resolvable in our materialized
+    // membership (absent member and member-with-no-enrolled-keys both fold
+    // here — neither could have minted a verifiable token). For a Joined
+    // receiver this is unreachable for legitimate packets: the admin's
+    // bootstrap Join is in every replica.
+    if token_signer_keys.is_empty() {
+        let e = CommunityInviteVerifyError::InviteTokenSignerUnknown {
+            signer: signed.invite_token.inviter,
+        };
+        emit_degraded(app, &signed.community_id, e.reason_tag());
+        return Err(e);
+    }
+
+    // 6. Pure verify chain (community_id agreement, invitee_hint,
+    //    expiry/clock-skew, Join sig, InviteToken sig vs the minter's
+    //    enrolled keys — ZEB-911 witness model).
+    let join_event = match verify_packet_pure(
+        &signed,
+        || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        },
+        &token_signer_keys,
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            emit_degraded(app, &signed.community_id, e.reason_tag());
+            return Err(e);
+        }
+    };
 
     // ZEB-254: Two-event flow for invite-only counter-sign.
     //
