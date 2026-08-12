@@ -338,6 +338,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             community_id,
             channel_id,
             channel_key.clone(),
+            None,
             Arc::clone(&state_a),
             Arc::clone(&tracker_a),
         )
@@ -352,6 +353,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             community_id,
             channel_id,
             channel_key.clone(),
+            None,
             Arc::clone(&state_b),
             Arc::clone(&tracker_b),
         )
@@ -532,6 +534,7 @@ async fn two_engines_live_then_offline_backfill_with_replay_rejection() {
             community_id,
             channel_id,
             channel_key.clone(),
+            None,
             Arc::clone(&state_b),
             Arc::clone(&tracker_b),
         )

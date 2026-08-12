@@ -257,6 +257,7 @@ async fn spawn_channel(
             community_id,
             channel_id,
             channel_key.clone(),
+            None,
             Arc::clone(state),
             Arc::clone(&h.tracker),
         )
