@@ -3667,6 +3667,18 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
     ctx.content_store
         .put_serveable(root_cid, manifest_ciphertext)
         .await?;
+    // ZEB-922: re-affirm every reused segment's serve lease. Newly-sealed
+    // segments were just put_serveable'd in step 3; REUSED segments were put
+    // by an earlier publish — possibly a previous process, whose allowlist
+    // died with it — and are deliberately not re-put (O(delta)). Without
+    // this, a restarted publisher serves the manifest but silently refuses
+    // every reused-segment GET (the ZEB-706/398 stall class), and long-idle
+    // segment leases would decay while still referenced. Running here means
+    // it fires on every publish AND every peer root GET, so current segments
+    // are re-affirmed exactly before a requester fetches them.
+    for seg_ref in &manifest.segments {
+        ctx.content_store.affirm_serveable(seg_ref.segment_cid);
+    }
     // Persist the sidecar only when the index actually changed. `encode_root_
     // packet` runs on the query-serve path too (every peer GET), so an
     // unconditional `write_atomic` here would be one disk write per serve
@@ -8525,6 +8537,193 @@ mod tests {
         };
         let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
         crate::community_membership::sign_event(&payload, &sk).expect("sign_event")
+    }
+
+    // ── ZEB-922: root serve re-affirms reused segment leases ──────────────
+
+    /// Distinct-id variant of [`seed_membership_event`] for bulk seeding
+    /// (the fixed-`id` helper would collapse to one CRDT event).
+    fn seed_membership_event_n(community_id: SpaceId, k: u64) -> SignedMembershipEvent {
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&k.to_be_bytes());
+        id[8] = 0xe2;
+        let payload = crate::community_membership::EventPayload {
+            id,
+            community_id,
+            kind: crate::community_membership::MembershipEventKind::Join,
+            actor: OwnerAddr([0xb1; 16]),
+            at: crate::owner_state_types::Hlc {
+                wall_ms: 1_000 + k,
+                logical: 0,
+                device_id: "seed-dev".to_string(),
+            },
+        };
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        crate::community_membership::sign_event(&payload, &sk).expect("sign_event")
+    }
+
+    /// ZEB-922: a WORKING in-memory CAS (unlike the fixture's dropped-rx
+    /// `RuntimeContentStore`) that records which CIDs were `put_serveable`'d
+    /// vs `affirm_serveable`'d, so the test can distinguish "re-sealed" from
+    /// "lease re-affirmed".
+    #[derive(Default)]
+    struct RecordingAffirmStore {
+        blobs: std::sync::Mutex<
+            std::collections::HashMap<crate::owner_state_types::ContentId, Vec<u8>>,
+        >,
+        puts_serveable: std::sync::Mutex<Vec<crate::owner_state_types::ContentId>>,
+        affirmed: std::sync::Mutex<Vec<crate::owner_state_types::ContentId>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for RecordingAffirmStore {
+        async fn put(
+            &self,
+            cid: crate::owner_state_types::ContentId,
+            blob: Vec<u8>,
+        ) -> Result<(), crate::content_store::ContentStoreError> {
+            self.blobs.lock().unwrap().insert(cid, blob);
+            Ok(())
+        }
+        async fn get(
+            &self,
+            cid: &crate::owner_state_types::ContentId,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            Ok(self.blobs.lock().unwrap().get(cid).cloned())
+        }
+        async fn put_serveable(
+            &self,
+            cid: crate::owner_state_types::ContentId,
+            blob: Vec<u8>,
+        ) -> Result<(), crate::content_store::ContentStoreError> {
+            self.puts_serveable.lock().unwrap().push(cid);
+            self.put(cid, blob).await
+        }
+        fn affirm_serveable(&self, cid: crate::owner_state_types::ContentId) {
+            self.affirmed.lock().unwrap().push(cid);
+        }
+    }
+
+    /// Spec §3.2/§4 U4 (the ZEB-706/398 restart-stall pin): a publisher whose
+    /// serve-intent state is wiped (restart) must re-affirm every REUSED
+    /// manifest segment on the next peer root GET — via `affirm_serveable`,
+    /// not a re-seal — so the requester's subsequent segment fetches pass the
+    /// serve gate.
+    #[tokio::test]
+    async fn zeb922_root_serve_reaffirms_every_manifest_segment() {
+        let store = std::sync::Arc::new(RecordingAffirmStore::default());
+        let cs: std::sync::Arc<dyn ContentStore> = store.clone();
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let identity_dir = tempdir.path().to_path_buf();
+        let registry = std::sync::Arc::new(CommunitySyncRegistry::new(CommunityRegistryConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            device_id: "dev".into(),
+            content_store: cs,
+            identity_resolver: std::sync::Arc::new(NopResolver),
+            identity_dir: identity_dir.clone(),
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            error_tx: None,
+            delta_tx: None,
+            self_owner: OwnerAddr([0x01; 16]),
+            signing_key: std::sync::Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0x42; 32])),
+            crdt_state: None,
+            nav_emitter: None,
+            presence_resync_rx: None,
+        }));
+        let (community_adapter_tx, _adapter_rx_hold) = mpsc::channel(64);
+
+        let community_id = SpaceId([0xe2; 16]);
+        let (pub_tx, pub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        // Engine half of the root-serve channel goes in via CatchUpChannels;
+        // we keep the tx to drive peer root GETs ourselves.
+        let (root_serve_tx, root_serve_rx) = mpsc::channel::<RootServeRequest>(8);
+
+        let mut guard = std::sync::Arc::clone(&registry).begin_spawn_guard(community_id);
+        let engine = std::sync::Arc::clone(&registry)
+            .spawn_engine_with_guard(
+                &mut guard,
+                community_id,
+                EpochKey::new([0xa1; 32]),
+                OwnerAddr([0xb1; 16]),
+                false,
+                pub_tx,
+                sub_rx,
+                pub_rx,
+                sub_tx,
+                community_adapter_tx.clone(),
+                CatchUpChannels {
+                    root_serve_rx: Some(root_serve_rx),
+                    fetch_request_tx: None,
+                    transport_epoch_rx: None,
+                },
+                dummy_root_serve_tx(),
+                dummy_fetch_request_rx(),
+            )
+            .await
+            .expect("spawn_engine_with_guard");
+        guard.commit();
+
+        // Seed enough distinct events that the publish seals ≥1 segment.
+        {
+            let st = engine.state();
+            let mut g = st.lock().await;
+            for k in 0..(crate::community_state_segments::SEGMENT_SEAL_EVENTS as u64 + 8) {
+                g.insert_verified_for_test(seed_membership_event_n(community_id, k));
+            }
+        }
+        engine
+            .flush_now()
+            .await
+            .expect("publish must succeed against the working CAS");
+
+        // Authoritative current-segment set = the persisted sidecar index.
+        let segments_path = identity_dir
+            .join("communities")
+            .join(hex::encode(community_id.0))
+            .join("segments.cbor");
+        let index = crate::community_state_persist::load_segment_index(&segments_path)
+            .expect("segment index persisted by the publish");
+        assert!(
+            !index.sealed.is_empty(),
+            "fixture must seal at least one segment or the test is vacuous"
+        );
+
+        // Model the restart: bytes persist (the store's map), serve-intent
+        // records are gone.
+        store.puts_serveable.lock().unwrap().clear();
+        store.affirmed.lock().unwrap().clear();
+
+        // A peer root GET (the query-serve path).
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        root_serve_tx.send(reply_tx).await.expect("engine alive");
+        let packet = reply_rx
+            .await
+            .expect("engine replied")
+            .expect("root packet encodes");
+        assert!(!packet.is_empty());
+
+        // Every reused segment must be re-AFFIRMED by the serve…
+        let affirmed: std::collections::HashSet<_> =
+            store.affirmed.lock().unwrap().iter().copied().collect();
+        for entry in &index.sealed {
+            assert!(
+                affirmed.contains(&entry.segment_cid),
+                "reused segment {:?} must be re-affirmed on root serve",
+                entry.segment_cid
+            );
+        }
+        // …and must NOT have been re-sealed (that would defeat O(delta)).
+        let reput: Vec<_> = store.puts_serveable.lock().unwrap().clone();
+        for entry in &index.sealed {
+            assert!(
+                !reput.contains(&entry.segment_cid),
+                "reused segment must not be re-put on serve"
+            );
+        }
+
+        engine.shutdown().await.ok();
     }
 
     // ── ZEB-889: in-flight redemption mint cache ──────────────────────────
