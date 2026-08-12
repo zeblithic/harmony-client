@@ -85801,7 +85801,23 @@ mod zeb_898_headless_card_flow_tests {
         .await
         .expect("mint + real restart must succeed");
 
-        // (d) The drain ran inside the restart (before start_node_inner
+        // (d) From here the real node is running — guarantee teardown even on
+        //     a failed assertion (panic unwind), so a red run can't leak the
+        //     booted node's background tasks into subsequent same-process
+        //     tests (plain `cargo test`; nextest isolates per process).
+        //     Declared AFTER the env guards so it drops FIRST — `stop_inner`
+        //     still sees the tempdir HOME. `stop_inner` is async-context-safe
+        //     (ephemeral runtime inside `std::thread::scope`; see the mint
+        //     Phase 1 note in `owner_commands.rs`).
+        struct StopGuard(std::sync::Arc<Mutex<NodeState>>);
+        impl Drop for StopGuard {
+            fn drop(&mut self) {
+                crate::stop_inner(&self.0, None);
+            }
+        }
+        let _stop = StopGuard(std::sync::Arc::clone(&state));
+
+        // (e) The drain ran inside the restart (before start_node_inner
         //     returned), so both observables are already settled — no polling.
         let publisher = {
             let guard = state.lock().expect("NodeState lock");
@@ -85822,9 +85838,7 @@ mod zeb_898_headless_card_flow_tests {
             ciborium::de::from_reader(&bytes[..]).expect("cached card decodes");
         assert_eq!(decoded.display_name, "Zeb898");
         assert_eq!(decoded.status_text, "");
-
-        // (e) Teardown before the env guards drop.
-        crate::stop_inner(&state, None);
+        // Teardown runs via `_stop` (also on panic), before the env guards drop.
     }
 }
 
