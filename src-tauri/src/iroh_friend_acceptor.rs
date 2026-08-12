@@ -2546,6 +2546,29 @@ pub struct MultiplexHandshakeDispatcher {
     gate: Arc<InFlightHandshakeGate>,
 }
 
+/// ZEB-905: dispatcher slot filler for a keyless (local-only) boot. The friend
+/// handshake seals a per-friend rendezvous secret under the owner KeyTree —
+/// without fleet key material the accept CANNOT complete, so inbound friend
+/// connections are refused up front instead of failing mid-handshake. The
+/// dialer sees the connection close, indistinguishable from a not-yet-installed
+/// acceptor; the refusal is logged here for the local operator.
+pub struct KeylessRefusingDispatcher {
+    /// Short label for the refused surface (e.g. `"friend"`), for the log line.
+    pub surface: &'static str,
+}
+
+#[async_trait::async_trait]
+impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for KeylessRefusingDispatcher {
+    async fn handle_connection(&self, conn: Connection) {
+        tracing::info!(
+            surface = self.surface,
+            "refusing inbound handshake: no fleet crypto (local-only mode; \
+             restore the recovery phrase to re-enable)"
+        );
+        conn.close(0u32.into(), b"local-only mode");
+    }
+}
+
 impl MultiplexHandshakeDispatcher {
     /// Build a multiplexer over the invite + friend + friend-PEX acceptors,
     /// with the production in-flight gate caps.

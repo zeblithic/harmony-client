@@ -77,9 +77,11 @@ With owner material but no fleet crypto, the device runs in **local-only mode**:
 | Works fully | Honestly disabled (needs fleet KeyTree) |
 |---|---|
 | Owner-state CRDT ops (create/join community, settings, profile) | Fleet replication (all fleet dataset engines) |
-| Communities: membership, channels, voting (per-community epoch keys) | Friend features: handshake accept, friend-token redeem, friend-secret unsealing, DM grant unseal |
-| Local persistence + restart durability | Case-D friend-slot pkarr reconcile; epoch-window close/prune |
-| Address book, tunnels, relays, profile broadcast | Enroll/backup (already seed-gated; unchanged) |
+| Communities: membership, channels, voting (per-community epoch keys) | Friend features: handshake accept, friend-token redeem, friend-secret unsealing, friend resolve, DM grant unseal |
+| Local persistence + restart durability | Encrypted file-share grants (`ingest_content_encrypted`, `grant_read` — per-file keys seal under the owner KeyTree) |
+| Address book, tunnels, community relay *resolution*, profile broadcast | Community relay *serving*/deposit rung (rides the relay-hold/optin fleet docs) |
+| Reachability publish (self-only butler set) | Case-D friend-slot pkarr reconcile; epoch-window close/prune |
+| | Enroll/backup (already seed-gated; unchanged) |
 
 ### 3.2 Keyless engine mode (`fleet_sync.rs`)
 

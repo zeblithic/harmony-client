@@ -4684,6 +4684,9 @@ pub async fn start_node_inner(
         > = None;
         let mut dm_inbox_device_id_opt: Option<String> = None;
         let mut dm_inbox_sync_handles_opt: Option<crate::event_loop::DmInboxSyncHandles> = None;
+        // ZEB-905: lifted so the iroh butler-deposit acceptor (community/iroh
+        // band) can reach the fleet-band ingest nudge; None on keyless boots.
+        let mut dm_inbox_nudge_weak_opt: Option<tokio::sync::mpsc::WeakSender<()>> = None;
         // ZEB-458 P4 Phase B: relay-hold + relay-optin fleet datasets. Lifted
         // to outer scope so the NodeState assignment (relay_hold_*/relay_optin_*
         // + resolver) and the event_loop::run call site can reach them. Built
@@ -4794,6 +4797,9 @@ pub async fn start_node_inner(
         > = None;
         let mut fleet_net_device_id_opt: Option<String> = None;
         let mut fleet_net_enrolled_opt: Option<std::collections::BTreeSet<String>> = None;
+        // ZEB-905: lifted so the community-band snapshot refresh task can take
+        // the fleet-band nudge receiver; None (task not spawned) on keyless boots.
+        let mut fleet_net_snap_nudge_rx_opt: Option<tokio::sync::mpsc::Receiver<()>> = None;
         let mut p2_sync_handles_opt: Option<crate::event_loop::P2SyncHandles> = None;
         // ZEB-668 S1: owner-trust replication engine + handles. Built in the
         // owner-loaded block (mirrors fleet-net); lifted to outer scope so the
@@ -4851,6 +4857,12 @@ pub async fn start_node_inner(
         // ZEB-668 S3: the retire-deposit sweeper's nudge sender, stashed in
         // NodeState so revoke_device can nudge after a LOCAL revocation.
         let mut community_device_retire_nudge_opt: Option<tokio::sync::mpsc::Sender<()>> = None;
+        // ZEB-905: lifted so the community-band sweepers (which need the
+        // just-built registry) can take the fleet-band nudge receivers;
+        // None (sweepers not spawned) on keyless boots.
+        let mut community_device_intro_nudge_rx_opt: Option<tokio::sync::mpsc::Receiver<()>> = None;
+        let mut retire_deposit_nudge_rx_opt: Option<tokio::sync::mpsc::Receiver<()>> = None;
+        let mut retire_deposit_nudge_tx_opt: Option<tokio::sync::mpsc::Sender<()>> = None;
         let mut community_device_intro_tracker_opt: Option<
             std::sync::Arc<
                 tokio::sync::Mutex<
@@ -5554,57 +5566,75 @@ pub async fn start_node_inner(
                     // seed-first precedence and degrade like the "no material at
                     // all" case rather than crashing. With a multi-epoch slot a
                     // single bad entry only drops that epoch.
-                    loaded.fleet_keytree.as_ref().and_then(|materials| {
-                        let mut trees: Vec<std::sync::Arc<crate::owner_state_crypto::KeyTree>> =
-                            Vec::new();
-                        for material in materials {
-                            match crate::owner_state_crypto::KeyTree::from_fleet_material(material)
-                            {
-                                Ok(kt) => trees.push(std::sync::Arc::new(kt)),
-                                Err(e) => tracing::warn!(
+                    match loaded.fleet_keytree.as_ref() {
+                        Some(materials) => {
+                            let mut trees: Vec<std::sync::Arc<crate::owner_state_crypto::KeyTree>> =
+                                Vec::new();
+                            for material in materials {
+                                match crate::owner_state_crypto::KeyTree::from_fleet_material(
+                                    material,
+                                ) {
+                                    Ok(kt) => trees.push(std::sync::Arc::new(kt)),
+                                    Err(e) => tracing::warn!(
                                     "fleet KeyTree material unusable ({e}); skipping that epoch"
                                 ),
-                            }
-                        }
-                        // Pinned = lowest epoch (epoch 0 by the vault invariant:
-                        // epoch-0 material is never pruned).
-                        let kt0 = trees
-                            .iter()
-                            .min_by_key(|k| k.epoch)
-                            .map(std::sync::Arc::clone);
-                        match kt0 {
-                            Some(kt0) => {
-                                // Data accept set: epoch-0 participates ONLY
-                                // when it is the sole epoch (pre-bump fleet).
-                                // Once any higher epoch exists in the vault, a
-                                // reboot must not re-admit epoch-0 data
-                                // publishes — a revoked device holds epoch-0
-                                // forever; the post-close prune keeps epoch-0
-                                // purely as the carrier key. (First-bump
-                                // stragglers mid-window degrade to CRDT
-                                // catch-up once they install N+1.)
-                                let max_epoch = trees.iter().map(|k| k.epoch).max().unwrap_or(0);
-                                let mut data_trees = trees
-                                    .into_iter()
-                                    .filter(|k| k.epoch != 0 || max_epoch == 0);
-                                let keys = crate::owner_state_crypto::FleetKeySet::new(
-                                    data_trees
-                                        .next()
-                                        .expect("vault holds at least one non-excluded epoch"),
-                                );
-                                for kt in data_trees {
-                                    keys.install(kt);
                                 }
-                                Some((kt0, keys))
                             }
-                            None => {
-                                tracing::warn!(
+                            // Pinned = lowest epoch (epoch 0 by the vault invariant:
+                            // epoch-0 material is never pruned).
+                            let kt0 = trees
+                                .iter()
+                                .min_by_key(|k| k.epoch)
+                                .map(std::sync::Arc::clone);
+                            match kt0 {
+                                Some(kt0) => {
+                                    // Data accept set: epoch-0 participates ONLY
+                                    // when it is the sole epoch (pre-bump fleet).
+                                    // Once any higher epoch exists in the vault, a
+                                    // reboot must not re-admit epoch-0 data
+                                    // publishes — a revoked device holds epoch-0
+                                    // forever; the post-close prune keeps epoch-0
+                                    // purely as the carrier key. (First-bump
+                                    // stragglers mid-window degrade to CRDT
+                                    // catch-up once they install N+1.)
+                                    let max_epoch =
+                                        trees.iter().map(|k| k.epoch).max().unwrap_or(0);
+                                    let mut data_trees = trees
+                                        .into_iter()
+                                        .filter(|k| k.epoch != 0 || max_epoch == 0);
+                                    let keys = crate::owner_state_crypto::FleetKeySet::new(
+                                        data_trees
+                                            .next()
+                                            .expect("vault holds at least one non-excluded epoch"),
+                                    );
+                                    for kt in data_trees {
+                                        keys.install(kt);
+                                    }
+                                    Some((kt0, keys))
+                                }
+                                None => {
+                                    tracing::warn!(
                                     "no usable fleet KeyTree material; booting without fleet engines"
                                 );
-                                None
+                                    None
+                                }
                             }
                         }
-                    })
+                        // ZEB-904: this arm was the SILENT half-alive boot —
+                        // seed wiped AND no fleet material (legacy pre-ZEB-492
+                        // identity, or a joiner paired from an inviter that
+                        // delivered no material). Post-ZEB-905 the node runs
+                        // local-only; say so once, loudly.
+                        None => {
+                            tracing::warn!(
+                                "ZEB-904: owner present but no master seed and no fleet \
+                                 KeyTree material — booting LOCAL-ONLY (fleet sync + \
+                                 friend features disabled). Restore the recovery phrase \
+                                 or re-pair from a seed-holding device to re-enable."
+                            );
+                            None
+                        }
+                    }
                 }
             }
             None => None,
@@ -5612,7 +5642,18 @@ pub async fn start_node_inner(
 
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
-                if let Some((kt, keys)) = fleet_crypto.clone() {
+                // ZEB-905: owner scope (plain block, not a fleet gate). From
+                // here through the community/iroh wiring below, everything
+                // needs only owner material — device keys, enrollment cert,
+                // the owner CRDT + tracker, per-community epoch keys. Fleet
+                // key material gates ONLY the fleet-engine band (the
+                // BOOT-PROBE 02→08 stretch), wrapped in its own `if let`
+                // further down; the handful of key-consuming sites in the
+                // community/iroh band take `fleet_crypto.as_ref()` and skip
+                // gracefully. A seedless, no-material device therefore boots
+                // local-only instead of skipping ALL owner wiring (the
+                // ZEB-904 half-alive bug).
+                {
                     let device_id = loaded
                         .device_signing_key
                         .verifying_key()
@@ -5809,10 +5850,10 @@ pub async fn start_node_inner(
                         std::sync::Arc::new(crate::dm_outbox::DepositOnlyDmTransport);
 
                     let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
-                        // ZEB-905 T1 interim: still inside the fleet gate, so
-                        // keys are unconditionally present; T2 hoists this
-                        // construction and passes the boot-computed Option.
-                        Some(keys.clone()),
+                        // ZEB-905: None on a seedless, no-material boot — the
+                        // engine then runs local-only (persist works, wire
+                        // frames skip; see owner_state_sync::SyncEngine::new).
+                        fleet_crypto.as_ref().map(|(_, keys)| keys.clone()),
                         device_id.clone(),
                         std::sync::Arc::clone(&crdt_state),
                         std::sync::Arc::clone(&tracker),
@@ -5851,28 +5892,44 @@ pub async fn start_node_inner(
                         root_serve_tx: engine.root_serve_tx(),
                     });
 
-                    tracing::info!("BOOT-PROBE 02: iroh/pkarr/profile sections done, entering mint sync engine");
-                    // ── Mint Phase 2 sync engine ─────────────────────────────
-                    //
-                    // Construct MintSyncEngine now that kt, device_id, and
-                    // content_store are available. The engine is channel-based
-                    // (mirrors owner_state_sync): mint_out_tx / mint_in_rx are
-                    // bridged to Zenoh by event_loop on the
-                    // `harmony/owner/{addr_hex}/mint-root-v1` topic.
-                    'mint_init: {
-                        let mint_sync_state_path = app_data_dir
-                            .join("mint")
-                            .join(crate::mint_sync_persist::MINT_SYNC_STATE_FILENAME);
-                        // `mint_sync_persist::load` returns Ok(default) for
-                        // NotFound. Any other error (corrupt CBOR, schema-too-new,
-                        // I/O glitch) means the file exists but can't be trusted.
-                        // Rather than crashing the whole node, we log at error
-                        // level, break out of the init block leaving
-                        // mint_sync_engine_opt as None, and let the rest of the
-                        // node start normally. The user will see mint sync disabled
-                        // but all other features keep working.
-                        let initial_sync_state =
-                            match crate::mint_sync_persist::load(&mint_sync_state_path) {
+                    // Shared resolver Arc (community id → advertising relay
+                    // endpoints). ZEB-905: hoisted out of the fleet band — a
+                    // plain constructor the community-band relay machinery
+                    // needs on every owner boot, keyed or not.
+                    let community_relay_resolver = std::sync::Arc::new(
+                        crate::community_relay_resolver::CommunityRelayResolver::new(),
+                    );
+                    community_relay_resolver_opt =
+                        Some(std::sync::Arc::clone(&community_relay_resolver));
+
+                    // ZEB-905: the fleet-engine band. Every engine in here
+                    // replicates a fleet dataset sealed with the fleet
+                    // KeyTree, so the whole band requires fleet crypto; a
+                    // keyless (local-only) boot skips it as one unit.
+                    if let Some((kt, keys)) = fleet_crypto.clone() {
+                        tracing::info!("BOOT-PROBE 02: iroh/pkarr/profile sections done, entering mint sync engine");
+                        // ── Mint Phase 2 sync engine ─────────────────────────────
+                        //
+                        // Construct MintSyncEngine now that kt, device_id, and
+                        // content_store are available. The engine is channel-based
+                        // (mirrors owner_state_sync): mint_out_tx / mint_in_rx are
+                        // bridged to Zenoh by event_loop on the
+                        // `harmony/owner/{addr_hex}/mint-root-v1` topic.
+                        'mint_init: {
+                            let mint_sync_state_path = app_data_dir
+                                .join("mint")
+                                .join(crate::mint_sync_persist::MINT_SYNC_STATE_FILENAME);
+                            // `mint_sync_persist::load` returns Ok(default) for
+                            // NotFound. Any other error (corrupt CBOR, schema-too-new,
+                            // I/O glitch) means the file exists but can't be trusted.
+                            // Rather than crashing the whole node, we log at error
+                            // level, break out of the init block leaving
+                            // mint_sync_engine_opt as None, and let the rest of the
+                            // node start normally. The user will see mint sync disabled
+                            // but all other features keep working.
+                            let initial_sync_state = match crate::mint_sync_persist::load(
+                                &mint_sync_state_path,
+                            ) {
                                 Ok(state) => state,
                                 Err(e) => {
                                     tracing::error!(
@@ -5887,416 +5944,434 @@ pub async fn start_node_inner(
                                     break 'mint_init;
                                 }
                             };
-                        let mint_sync_state =
-                            std::sync::Arc::new(tokio::sync::Mutex::new(initial_sync_state));
-                        let (mint_out_tx, mint_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                        let (mint_in_tx, mint_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                        // Open (or reuse cached) mint DB for the engine.
-                        // We can't call `mint_db_handle` here because that
-                        // function takes a `tauri::State` wrapper; instead
-                        // mirror its logic directly.
-                        //
-                        // Failure path: same degradation policy as the
-                        // mint_sync_persist::load above — log at error level
-                        // and break out of 'mint_init so the rest of the node
-                        // starts normally. A corrupt or unreadable ledger.db
-                        // should not block bringing the app online.
-                        let mint_db_for_engine = {
-                            // Fast path: already cached.
-                            let cached = match state.lock() {
-                                Ok(node) => node.mint_db.clone(),
-                                Err(e) => {
-                                    tracing::error!(
-                                        target: "mint_sync",
-                                        error = %e,
-                                        "NodeState lock failed while reading mint_db cache — mint sync disabled"
-                                    );
-                                    break 'mint_init;
+                            let mint_sync_state =
+                                std::sync::Arc::new(tokio::sync::Mutex::new(initial_sync_state));
+                            let (mint_out_tx, mint_out_rx) =
+                                tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                            let (mint_in_tx, mint_in_rx) =
+                                tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                            // Open (or reuse cached) mint DB for the engine.
+                            // We can't call `mint_db_handle` here because that
+                            // function takes a `tauri::State` wrapper; instead
+                            // mirror its logic directly.
+                            //
+                            // Failure path: same degradation policy as the
+                            // mint_sync_persist::load above — log at error level
+                            // and break out of 'mint_init so the rest of the node
+                            // starts normally. A corrupt or unreadable ledger.db
+                            // should not block bringing the app online.
+                            let mint_db_for_engine = {
+                                // Fast path: already cached.
+                                let cached = match state.lock() {
+                                    Ok(node) => node.mint_db.clone(),
+                                    Err(e) => {
+                                        tracing::error!(
+                                            target: "mint_sync",
+                                            error = %e,
+                                            "NodeState lock failed while reading mint_db cache — mint sync disabled"
+                                        );
+                                        break 'mint_init;
+                                    }
+                                };
+                                if let Some(arc) = cached {
+                                    arc
+                                } else {
+                                    let mint_dir = app_data_dir.join("mint");
+                                    if let Err(e) = std::fs::create_dir_all(&mint_dir) {
+                                        tracing::error!(
+                                            target: "mint_sync",
+                                            path = %mint_dir.display(),
+                                            error = %e,
+                                            "failed to create mint directory — mint sync disabled \
+                                             for this session, but other features will start normally"
+                                        );
+                                        break 'mint_init;
+                                    }
+                                    let db_path = mint_dir.join("ledger.db");
+                                    let conn = match crate::mint::open_database(&db_path) {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                target: "mint_sync",
+                                                path = %db_path.display(),
+                                                error = %e,
+                                                "failed to open ledger.db — mint sync disabled for \
+                                                 this session, but other features will start normally. \
+                                                 Delete or repair the file to re-enable mint sync."
+                                            );
+                                            break 'mint_init;
+                                        }
+                                    };
+                                    let arc = std::sync::Arc::new(std::sync::Mutex::new(conn));
+                                    let mut node = match state.lock() {
+                                        Ok(n) => n,
+                                        Err(e) => {
+                                            tracing::error!(
+                                                target: "mint_sync",
+                                                error = %e,
+                                                "NodeState lock failed while installing mint_db — mint sync disabled"
+                                            );
+                                            break 'mint_init;
+                                        }
+                                    };
+                                    if let Some(existing) = node.mint_db.as_ref() {
+                                        existing.clone()
+                                    } else {
+                                        node.mint_db = Some(arc.clone());
+                                        arc
+                                    }
                                 }
                             };
-                            if let Some(arc) = cached {
-                                arc
-                            } else {
-                                let mint_dir = app_data_dir.join("mint");
-                                if let Err(e) = std::fs::create_dir_all(&mint_dir) {
-                                    tracing::error!(
-                                        target: "mint_sync",
-                                        path = %mint_dir.display(),
-                                        error = %e,
-                                        "failed to create mint directory — mint sync disabled \
-                                         for this session, but other features will start normally"
-                                    );
-                                    break 'mint_init;
-                                }
-                                let db_path = mint_dir.join("ledger.db");
-                                let conn = match crate::mint::open_database(&db_path) {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            target: "mint_sync",
-                                            path = %db_path.display(),
-                                            error = %e,
-                                            "failed to open ledger.db — mint sync disabled for \
-                                             this session, but other features will start normally. \
-                                             Delete or repair the file to re-enable mint sync."
-                                        );
-                                        break 'mint_init;
-                                    }
-                                };
-                                let arc = std::sync::Arc::new(std::sync::Mutex::new(conn));
-                                let mut node = match state.lock() {
-                                    Ok(n) => n,
-                                    Err(e) => {
-                                        tracing::error!(
-                                            target: "mint_sync",
-                                            error = %e,
-                                            "NodeState lock failed while installing mint_db — mint sync disabled"
-                                        );
-                                        break 'mint_init;
-                                    }
-                                };
-                                if let Some(existing) = node.mint_db.as_ref() {
-                                    existing.clone()
-                                } else {
-                                    node.mint_db = Some(arc.clone());
-                                    arc
-                                }
-                            }
-                        };
-                        let (mint_engine, _mint_handle) = crate::mint_sync::MintSyncEngine::new(
-                            keys.clone(),
-                            device_id.clone(),
-                            mint_db_for_engine,
-                            std::sync::Arc::clone(&content_store),
-                            mint_sync_state,
-                            mint_sync_state_path,
-                            mint_out_tx,
-                            mint_in_rx,
-                            crate::mint_sync::DEFAULT_DEBOUNCE_MS,
-                            app.clone(),
-                            adopt_floor.clone(), // ZEB-845: node-wide bounded-adoption floor
-                        )
-                        .await;
-                        // Boot-hook flush: emit the local snapshot shortly
-                        // after startup so peers that are already online
-                        // receive our current state. Mirrors the
-                        // new_for_test_with_boot_delay pattern.
-                        let mint_engine_arc = std::sync::Arc::new(mint_engine);
-                        // Boot-hook flush: emit the local snapshot shortly after
-                        // startup so peers that are already online receive our
-                        // current state. Mirrors new_for_test_with_boot_delay.
-                        {
-                            let boot_engine = std::sync::Arc::clone(&mint_engine_arc);
-                            tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    crate::mint_sync::DEFAULT_BOOT_FLUSH_DELAY_MS,
-                                ))
+                            let (mint_engine, _mint_handle) =
+                                crate::mint_sync::MintSyncEngine::new(
+                                    keys.clone(),
+                                    device_id.clone(),
+                                    mint_db_for_engine,
+                                    std::sync::Arc::clone(&content_store),
+                                    mint_sync_state,
+                                    mint_sync_state_path,
+                                    mint_out_tx,
+                                    mint_in_rx,
+                                    crate::mint_sync::DEFAULT_DEBOUNCE_MS,
+                                    app.clone(),
+                                    adopt_floor.clone(), // ZEB-845: node-wide bounded-adoption floor
+                                )
                                 .await;
-                                // Ignore error — engine may have shut down
-                                // before the boot delay elapsed.
-                                let _ = boot_engine.flush_now().await;
+                            // Boot-hook flush: emit the local snapshot shortly
+                            // after startup so peers that are already online
+                            // receive our current state. Mirrors the
+                            // new_for_test_with_boot_delay pattern.
+                            let mint_engine_arc = std::sync::Arc::new(mint_engine);
+                            // Boot-hook flush: emit the local snapshot shortly after
+                            // startup so peers that are already online receive our
+                            // current state. Mirrors new_for_test_with_boot_delay.
+                            {
+                                let boot_engine = std::sync::Arc::clone(&mint_engine_arc);
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        crate::mint_sync::DEFAULT_BOOT_FLUSH_DELAY_MS,
+                                    ))
+                                    .await;
+                                    // Ignore error — engine may have shut down
+                                    // before the boot delay elapsed.
+                                    let _ = boot_engine.flush_now().await;
+                                });
+                            }
+                            mint_sync_engine_opt = Some(mint_engine_arc);
+                            mint_sync_handles_opt = Some(crate::event_loop::MintSyncHandles {
+                                addr_hex: owner_addr_hex.clone(),
+                                outbound_rx: mint_out_rx,
+                                inbound_tx: mint_in_tx,
                             });
                         }
-                        mint_sync_engine_opt = Some(mint_engine_arc);
-                        mint_sync_handles_opt = Some(crate::event_loop::MintSyncHandles {
-                            addr_hex: owner_addr_hex.clone(),
-                            outbound_rx: mint_out_rx,
-                            inbound_tx: mint_in_tx,
-                        });
-                    }
 
-                    tracing::info!("BOOT-PROBE 03: mint engine constructed");
-                    // ── ZEB-417 SP1: Notes fleet-sync engine ────────────────
-                    //
-                    // Owner-private Notes dataset. Construct the generic
-                    // `FleetSyncEngine<NotesDoc>` now that kt, device_id, and
-                    // content_store are available. Channel-based like mint:
-                    // notes_out_tx / notes_in_rx are bridged to Zenoh by
-                    // event_loop on the `harmony/owner/{addr_hex}/ds/notes-v1`
-                    // topic. Reuses the SAME kt / device_id / content_store /
-                    // owner_addr_hex the mint + owner engines share.
-                    let notes_path = identity_dir.join(crate::notes_persist::NOTES_FILENAME);
-                    let notes_replay_path =
-                        identity_dir.join(crate::notes_persist::NOTES_REPLAY_FILENAME);
-                    let notes_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::notes_persist::load_doc_or_recover(&notes_path)
-                            .map_err(|e| format!("load notes doc: {e}"))?,
-                    ));
-                    let notes_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        harmony_crdt_sync::ReplayTracker::from_accepted(
-                            device_id.clone(),
-                            crate::notes_persist::load_replay_or_recover(&notes_replay_path)
-                                .map_err(|e| format!("load notes replay: {e}"))?,
-                        ),
-                    ));
-                    let (notes_out_tx, notes_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let (notes_in_tx, notes_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let notes_merger: crate::fleet_sync::Merger<crate::notes_crdt::NotesDoc> =
-                        std::sync::Arc::new(|local, remote| local.merge_from(remote));
-                    let notes_app = app.clone();
-                    let notes_sync = std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
-                        crate::fleet_sync::FleetSyncConfig {
-                            keys: Some(keys.clone()),
-                            device_id: device_id.clone(),
-                            state: std::sync::Arc::clone(&notes_doc),
-                            adopt_floor: adopt_floor.clone(),
-                            merger: notes_merger,
-                            replay_tracker: std::sync::Arc::clone(&notes_tracker),
-                            content_store: std::sync::Arc::clone(&content_store),
-                            publisher_tx: notes_out_tx,
-                            subscriber_rx: notes_in_rx,
-                            persist: std::sync::Arc::new(crate::notes_persist::NotesPersist {
-                                doc_path: notes_path,
-                                replay_path: notes_replay_path,
-                            }),
-                            lookup_key_tag: b"notes-v1",
-                            debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
-                            publish_seen: true,
-                            on_applied: Some(std::sync::Arc::new(move || {
-                                notes_app.emit("notes-changed", serde_json::Value::Null);
-                            })),
-                            sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                harmony_crdt_sync::MonotoneMap::new(),
-                            )),
-                        },
-                    ));
-                    notes_doc_opt = Some(std::sync::Arc::clone(&notes_doc));
-                    notes_tracker_opt = Some(std::sync::Arc::clone(&notes_tracker));
-                    notes_sync_engine_opt = Some(std::sync::Arc::clone(&notes_sync));
-                    notes_device_id_opt = Some(device_id.clone());
-                    notes_sync_handles_opt = Some(crate::event_loop::NotesSyncHandles {
-                        addr_hex: owner_addr_hex.clone(),
-                        outbound_rx: notes_out_rx,
-                        inbound_tx: notes_in_tx,
-                    });
-
-                    tracing::info!("BOOT-PROBE 04: notes engine constructed");
-                    // ── ZEB-418 SP2 P1: dm-inbox fleet-sync engine + ingestion ─
-                    //
-                    // Butler dm-inbox dataset (spec §5): deposited-but-not-
-                    // yet-ingested DM deliveries, replicated across the
-                    // owner's fleet. Mirrors the notes wiring above
-                    // site-for-site with two deliberate differences:
-                    // `publish_seen` stays true because GC depends on
-                    // sibling ig-acks propagating (spec §5), and
-                    // `on_applied` nudges the ingestion sweeper instead of
-                    // emitting a UI event (the UI event for this dataset is
-                    // the `dm-received` emit fired by ingestion itself).
-                    let dm_inbox_path =
-                        identity_dir.join(crate::dm_inbox_persist::DM_INBOX_FILENAME);
-                    let dm_inbox_replay_path =
-                        identity_dir.join(crate::dm_inbox_persist::DM_INBOX_REPLAY_FILENAME);
-                    let dm_inbox_first_observed_path = identity_dir
-                        .join(crate::dm_inbox_persist::DM_INBOX_FIRST_OBSERVED_FILENAME);
-                    // ZEB-862: restore the LOCAL first-observation clock from its
-                    // sidecar so TTL GC survives restart (else the first sweep
-                    // re-stamps every entry at `now`).
-                    let dm_inbox_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
-                        let mut doc = crate::dm_inbox_persist::load_doc_or_recover(&dm_inbox_path)
-                            .map_err(|e| format!("load dm-inbox doc: {e}"))?;
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        doc.restore_first_observed(
-                            crate::dm_inbox_persist::load_first_observed_or_recover(
-                                &dm_inbox_first_observed_path,
-                            )
-                            .map_err(|e| format!("load dm-inbox first-observed: {e}"))?,
-                            now_ms,
-                        );
-                        doc
-                    }));
-                    let dm_inbox_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        harmony_crdt_sync::ReplayTracker::from_accepted(
-                            device_id.clone(),
-                            crate::dm_inbox_persist::load_replay_or_recover(&dm_inbox_replay_path)
-                                .map_err(|e| format!("load dm-inbox replay: {e}"))?,
-                        ),
-                    ));
-                    let (dm_inbox_out_tx, dm_inbox_out_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let (dm_inbox_in_tx, dm_inbox_in_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let dm_inbox_merger: crate::fleet_sync::Merger<
-                        crate::dm_inbox_crdt::DmInboxDoc,
-                    > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
-                    // Ingestion-nudge channel (dm_inbox_ingest.rs trigger
-                    // model): capacity-1 level trigger. The engine's
-                    // `on_applied` closure owns the only STRONG sender, so
-                    // the sweeper exits exactly when the engine shuts down;
-                    // the deposit acceptor gets a WeakSender (its post-
-                    // deposit nudge must never keep the sweeper alive past
-                    // engine shutdown).
-                    let (dm_inbox_nudge_tx, dm_inbox_nudge_rx) =
-                        tokio::sync::mpsc::channel::<()>(1);
-                    let dm_inbox_nudge_weak = dm_inbox_nudge_tx.downgrade();
-                    let dm_inbox_sync =
-                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
-                            crate::fleet_sync::FleetSyncConfig {
-                                keys: Some(keys.clone()),
-                                device_id: device_id.clone(),
-                                state: std::sync::Arc::clone(&dm_inbox_doc),
-                                adopt_floor: adopt_floor.clone(),
-                                merger: dm_inbox_merger,
-                                replay_tracker: std::sync::Arc::clone(&dm_inbox_tracker),
-                                content_store: std::sync::Arc::clone(&content_store),
-                                publisher_tx: dm_inbox_out_tx,
-                                subscriber_rx: dm_inbox_in_rx,
-                                persist: std::sync::Arc::new(
-                                    crate::dm_inbox_persist::DmInboxPersist {
-                                        doc_path: dm_inbox_path,
-                                        replay_path: dm_inbox_replay_path,
-                                        first_observed_path: dm_inbox_first_observed_path,
-                                    },
-                                ),
-                                lookup_key_tag: b"dm-inbox-v1",
-                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
-                                publish_seen: true,
-                                on_applied: Some(crate::dm_inbox_ingest::ingest_nudge_on_applied(
-                                    dm_inbox_nudge_tx,
-                                )),
-                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    harmony_crdt_sync::MonotoneMap::new(),
-                                )),
-                            },
+                        tracing::info!("BOOT-PROBE 03: mint engine constructed");
+                        // ── ZEB-417 SP1: Notes fleet-sync engine ────────────────
+                        //
+                        // Owner-private Notes dataset. Construct the generic
+                        // `FleetSyncEngine<NotesDoc>` now that kt, device_id, and
+                        // content_store are available. Channel-based like mint:
+                        // notes_out_tx / notes_in_rx are bridged to Zenoh by
+                        // event_loop on the `harmony/owner/{addr_hex}/ds/notes-v1`
+                        // topic. Reuses the SAME kt / device_id / content_store /
+                        // owner_addr_hex the mint + owner engines share.
+                        let notes_path = identity_dir.join(crate::notes_persist::NOTES_FILENAME);
+                        let notes_replay_path =
+                            identity_dir.join(crate::notes_persist::NOTES_REPLAY_FILENAME);
+                        let notes_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            crate::notes_persist::load_doc_or_recover(&notes_path)
+                                .map_err(|e| format!("load notes doc: {e}"))?,
                         ));
-                    // Production ingestion context over real handles. The
-                    // enrolled snapshot maps the harmony_owner
-                    // `OwnerState.enrollments` certs through the SP1 64-hex
-                    // device-id form (enrollment changes require a node
-                    // restart, so a start_node-time snapshot tracks the set
-                    // for the engine's lifetime).
-                    let dm_inbox_enrolled: std::collections::BTreeSet<String> = loaded
-                        .state
-                        .enrollments
-                        .values()
-                        .map(|cert| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
-                        .collect();
-                    let dm_inbox_ingest_ctx: std::sync::Arc<
-                        dyn crate::dm_inbox_ingest::DmInboxIngestCtx,
-                    > = std::sync::Arc::new(crate::dm_inbox_ingest::ProdDmInboxIngestCtx {
-                        device_id: device_id.clone(),
-                        // ZEB-483: this node's own OwnerAddr — the deposit
-                        // recipient, needed to bootstrap the DM Space from a
-                        // deposited invite on recover (apply_deposited_invite).
-                        self_owner,
-                        crdt_state: std::sync::Arc::clone(&crdt_state),
-                        content_store: std::sync::Arc::clone(&content_store),
-                        sink: app.clone(),
-                        // ZEB-236: stage non-friend deposited invites + emit.
-                        pending_dm_invites: Some(std::sync::Arc::clone(
-                            &pending_dm_invites_for_state,
-                        )),
-                        enrolled: dm_inbox_enrolled,
-                        // ZEB-580 S2: shared-community revocation cutoff handle.
-                        revoked: revoked_device_projection.clone(),
-                        // ZEB-691 B6: flush the owner-state CRDT after an
-                        // ingested friend-revocation mutates `revoked_dm_devices`
-                        // (persist + replicate). Same owner-state engine handle the
-                        // tunnel drain uses to build its `mark_owner_state_dirty`.
-                        notify_owner_state_dirty: {
-                            let e = std::sync::Arc::clone(&owner_state_engine_for_dirty);
-                            Some(std::sync::Arc::new(move || e.notify_dirty())
-                                as std::sync::Arc<dyn Fn() + Send + Sync>)
-                        },
-                        // ZEB-674 (C4): this device's X25519 private — derived
-                        // from the cert-bound ed25519 signing key exactly as the
-                        // butler acceptor derives its seal target
-                        // (`ed25519_priv_to_x25519(&community_signing_key_arc)`),
-                        // so `apply_grant_push` opens the per-device grant blob a
-                        // sender sealed to `birational(vk)` of this device.
-                        device_x25519_priv: crate::dm_signing::ed25519_priv_to_x25519(
-                            &community_signing_key_arc,
-                        ),
-                        // ZEB-674 (C4): the grantee's shared (pinned epoch-0)
-                        // fleet KeyTree — the SAME tree `file_deks` seals under —
-                        // so a received grant re-sealed at ingest opens on any of
-                        // the owner's bound devices (Flow A).
-                        owner_keytree: std::sync::Arc::clone(&kt),
-                    });
-                    // The ingest sweeper: one startup sweep (entries
-                    // deposited while this device was offline), then one
-                    // debounced sweep per on_applied nudge burst. Exits when
-                    // the engine shuts down (see the nudge-channel comment
-                    // above) — stop_inner's engine shutdown is its shutdown.
-                    {
-                        let sweeper_engine = std::sync::Arc::clone(&dm_inbox_sync);
-                        // ZEB-862: local-only persist trigger for stamp-only
-                        // sweeps (durable first-observation clock without a
-                        // fleet republish).
-                        let persist_engine = std::sync::Arc::clone(&dm_inbox_sync);
-                        let dm_inbox_persist_now: crate::dm_inbox_ingest::PersistNowFn =
-                            std::sync::Arc::new(move || {
-                                let e = std::sync::Arc::clone(&persist_engine);
-                                Box::pin(async move { e.persist_now().await })
-                            });
-                        tokio::spawn(crate::dm_inbox_ingest::run_dm_inbox_ingest_sweeper(
-                            std::sync::Arc::clone(&dm_inbox_doc),
-                            dm_inbox_ingest_ctx,
-                            dm_inbox_nudge_rx,
-                            std::sync::Arc::new(move || sweeper_engine.notify_dirty()),
-                            dm_inbox_persist_now,
-                            std::time::Duration::from_millis(
-                                crate::dm_inbox_ingest::INGEST_SWEEP_DEBOUNCE_MS,
+                        let notes_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            harmony_crdt_sync::ReplayTracker::from_accepted(
+                                device_id.clone(),
+                                crate::notes_persist::load_replay_or_recover(&notes_replay_path)
+                                    .map_err(|e| format!("load notes replay: {e}"))?,
                             ),
                         ));
-                    }
-                    dm_inbox_doc_opt = Some(std::sync::Arc::clone(&dm_inbox_doc));
-                    dm_inbox_tracker_opt = Some(std::sync::Arc::clone(&dm_inbox_tracker));
-                    dm_inbox_sync_engine_opt = Some(std::sync::Arc::clone(&dm_inbox_sync));
-                    dm_inbox_device_id_opt = Some(device_id.clone());
-                    dm_inbox_sync_handles_opt = Some(crate::event_loop::DmInboxSyncHandles {
-                        addr_hex: owner_addr_hex.clone(),
-                        outbound_rx: dm_inbox_out_rx,
-                        inbound_tx: dm_inbox_in_tx,
-                    });
+                        let (notes_out_tx, notes_out_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let (notes_in_tx, notes_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let notes_merger: crate::fleet_sync::Merger<crate::notes_crdt::NotesDoc> =
+                            std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                        let notes_app = app.clone();
+                        let notes_sync =
+                            std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                                crate::fleet_sync::FleetSyncConfig {
+                                    keys: Some(keys.clone()),
+                                    device_id: device_id.clone(),
+                                    state: std::sync::Arc::clone(&notes_doc),
+                                    adopt_floor: adopt_floor.clone(),
+                                    merger: notes_merger,
+                                    replay_tracker: std::sync::Arc::clone(&notes_tracker),
+                                    content_store: std::sync::Arc::clone(&content_store),
+                                    publisher_tx: notes_out_tx,
+                                    subscriber_rx: notes_in_rx,
+                                    persist: std::sync::Arc::new(
+                                        crate::notes_persist::NotesPersist {
+                                            doc_path: notes_path,
+                                            replay_path: notes_replay_path,
+                                        },
+                                    ),
+                                    lookup_key_tag: b"notes-v1",
+                                    debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                    publish_seen: true,
+                                    on_applied: Some(std::sync::Arc::new(move || {
+                                        notes_app.emit("notes-changed", serde_json::Value::Null);
+                                    })),
+                                    sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                        harmony_crdt_sync::MonotoneMap::new(),
+                                    )),
+                                },
+                            ));
+                        notes_doc_opt = Some(std::sync::Arc::clone(&notes_doc));
+                        notes_tracker_opt = Some(std::sync::Arc::clone(&notes_tracker));
+                        notes_sync_engine_opt = Some(std::sync::Arc::clone(&notes_sync));
+                        notes_device_id_opt = Some(device_id.clone());
+                        notes_sync_handles_opt = Some(crate::event_loop::NotesSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: notes_out_rx,
+                            inbound_tx: notes_in_tx,
+                        });
 
-                    tracing::info!("BOOT-PROBE 05: dm-inbox engine constructed");
-                    // ── ZEB-495 (ZEB-340 Part 2): community-device-intro ──────
-                    //
-                    // Fleet dataset (Option A relay): deposited-but-not-yet-
-                    // relayed `DeviceAnnounce` membership events, replicated
-                    // across the owner's fleet so an already-enrolled sibling
-                    // can relay a second device's self-introduction into the
-                    // community engine. Mirrors the dm-inbox engine above
-                    // site-for-site (publish_seen stays true — GC depends on
-                    // sibling relay-acks propagating; on_applied nudges the
-                    // relay sweeper). The sweeper itself is spawned LATER, after
-                    // the CommunitySyncRegistry is built (its ProdCtx needs the
-                    // registry to look up community engines).
-                    let community_device_intro_path =
-                        identity_dir.join(crate::community_device_intro_persist::FILENAME);
-                    let community_device_intro_replay_path =
-                        identity_dir.join(crate::community_device_intro_persist::REPLAY_FILENAME);
-                    let community_device_intro_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::community_device_intro_persist::load_doc_or_recover(
-                            &community_device_intro_path,
-                        )
-                        .map_err(|e| format!("load community-device-intro doc: {e}"))?,
-                    ));
-                    let community_device_intro_tracker = std::sync::Arc::new(
-                        tokio::sync::Mutex::new(harmony_crdt_sync::ReplayTracker::from_accepted(
-                            device_id.clone(),
-                            crate::community_device_intro_persist::load_replay_or_recover(
-                                &community_device_intro_replay_path,
-                            )
-                            .map_err(|e| format!("load community-device-intro replay: {e}"))?,
-                        )),
-                    );
-                    let (community_device_intro_out_tx, community_device_intro_out_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let (community_device_intro_in_tx, community_device_intro_in_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let community_device_intro_merger: crate::fleet_sync::Merger<
-                        crate::community_device_intro_crdt::CommunityDeviceIntroDoc,
-                    > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
-                    // Relay-nudge channel (capacity-1 level trigger). The
-                    // engine's `on_applied` owns the only STRONG sender, so the
-                    // sweeper exits exactly when the engine shuts down.
-                    let (community_device_intro_nudge_tx, community_device_intro_nudge_rx) =
-                        tokio::sync::mpsc::channel::<()>(1);
-                    let community_device_intro_sync = std::sync::Arc::new(
+                        tracing::info!("BOOT-PROBE 04: notes engine constructed");
+                        // ── ZEB-418 SP2 P1: dm-inbox fleet-sync engine + ingestion ─
+                        //
+                        // Butler dm-inbox dataset (spec §5): deposited-but-not-
+                        // yet-ingested DM deliveries, replicated across the
+                        // owner's fleet. Mirrors the notes wiring above
+                        // site-for-site with two deliberate differences:
+                        // `publish_seen` stays true because GC depends on
+                        // sibling ig-acks propagating (spec §5), and
+                        // `on_applied` nudges the ingestion sweeper instead of
+                        // emitting a UI event (the UI event for this dataset is
+                        // the `dm-received` emit fired by ingestion itself).
+                        let dm_inbox_path =
+                            identity_dir.join(crate::dm_inbox_persist::DM_INBOX_FILENAME);
+                        let dm_inbox_replay_path =
+                            identity_dir.join(crate::dm_inbox_persist::DM_INBOX_REPLAY_FILENAME);
+                        let dm_inbox_first_observed_path = identity_dir
+                            .join(crate::dm_inbox_persist::DM_INBOX_FIRST_OBSERVED_FILENAME);
+                        // ZEB-862: restore the LOCAL first-observation clock from its
+                        // sidecar so TTL GC survives restart (else the first sweep
+                        // re-stamps every entry at `now`).
+                        let dm_inbox_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
+                            let mut doc =
+                                crate::dm_inbox_persist::load_doc_or_recover(&dm_inbox_path)
+                                    .map_err(|e| format!("load dm-inbox doc: {e}"))?;
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            doc.restore_first_observed(
+                                crate::dm_inbox_persist::load_first_observed_or_recover(
+                                    &dm_inbox_first_observed_path,
+                                )
+                                .map_err(|e| format!("load dm-inbox first-observed: {e}"))?,
+                                now_ms,
+                            );
+                            doc
+                        }));
+                        let dm_inbox_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            harmony_crdt_sync::ReplayTracker::from_accepted(
+                                device_id.clone(),
+                                crate::dm_inbox_persist::load_replay_or_recover(
+                                    &dm_inbox_replay_path,
+                                )
+                                .map_err(|e| format!("load dm-inbox replay: {e}"))?,
+                            ),
+                        ));
+                        let (dm_inbox_out_tx, dm_inbox_out_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let (dm_inbox_in_tx, dm_inbox_in_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let dm_inbox_merger: crate::fleet_sync::Merger<
+                            crate::dm_inbox_crdt::DmInboxDoc,
+                        > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                        // Ingestion-nudge channel (dm_inbox_ingest.rs trigger
+                        // model): capacity-1 level trigger. The engine's
+                        // `on_applied` closure owns the only STRONG sender, so
+                        // the sweeper exits exactly when the engine shuts down;
+                        // the deposit acceptor gets a WeakSender (its post-
+                        // deposit nudge must never keep the sweeper alive past
+                        // engine shutdown).
+                        let (dm_inbox_nudge_tx, dm_inbox_nudge_rx) =
+                            tokio::sync::mpsc::channel::<()>(1);
+                        let dm_inbox_nudge_weak = dm_inbox_nudge_tx.downgrade();
+                        let dm_inbox_sync =
+                            std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                                crate::fleet_sync::FleetSyncConfig {
+                                    keys: Some(keys.clone()),
+                                    device_id: device_id.clone(),
+                                    state: std::sync::Arc::clone(&dm_inbox_doc),
+                                    adopt_floor: adopt_floor.clone(),
+                                    merger: dm_inbox_merger,
+                                    replay_tracker: std::sync::Arc::clone(&dm_inbox_tracker),
+                                    content_store: std::sync::Arc::clone(&content_store),
+                                    publisher_tx: dm_inbox_out_tx,
+                                    subscriber_rx: dm_inbox_in_rx,
+                                    persist: std::sync::Arc::new(
+                                        crate::dm_inbox_persist::DmInboxPersist {
+                                            doc_path: dm_inbox_path,
+                                            replay_path: dm_inbox_replay_path,
+                                            first_observed_path: dm_inbox_first_observed_path,
+                                        },
+                                    ),
+                                    lookup_key_tag: b"dm-inbox-v1",
+                                    debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                    publish_seen: true,
+                                    on_applied: Some(
+                                        crate::dm_inbox_ingest::ingest_nudge_on_applied(
+                                            dm_inbox_nudge_tx,
+                                        ),
+                                    ),
+                                    sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                        harmony_crdt_sync::MonotoneMap::new(),
+                                    )),
+                                },
+                            ));
+                        // Production ingestion context over real handles. The
+                        // enrolled snapshot maps the harmony_owner
+                        // `OwnerState.enrollments` certs through the SP1 64-hex
+                        // device-id form (enrollment changes require a node
+                        // restart, so a start_node-time snapshot tracks the set
+                        // for the engine's lifetime).
+                        let dm_inbox_enrolled: std::collections::BTreeSet<String> = loaded
+                            .state
+                            .enrollments
+                            .values()
+                            .map(|cert| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
+                            .collect();
+                        let dm_inbox_ingest_ctx: std::sync::Arc<
+                            dyn crate::dm_inbox_ingest::DmInboxIngestCtx,
+                        > = std::sync::Arc::new(crate::dm_inbox_ingest::ProdDmInboxIngestCtx {
+                            device_id: device_id.clone(),
+                            // ZEB-483: this node's own OwnerAddr — the deposit
+                            // recipient, needed to bootstrap the DM Space from a
+                            // deposited invite on recover (apply_deposited_invite).
+                            self_owner,
+                            crdt_state: std::sync::Arc::clone(&crdt_state),
+                            content_store: std::sync::Arc::clone(&content_store),
+                            sink: app.clone(),
+                            // ZEB-236: stage non-friend deposited invites + emit.
+                            pending_dm_invites: Some(std::sync::Arc::clone(
+                                &pending_dm_invites_for_state,
+                            )),
+                            enrolled: dm_inbox_enrolled,
+                            // ZEB-580 S2: shared-community revocation cutoff handle.
+                            revoked: revoked_device_projection.clone(),
+                            // ZEB-691 B6: flush the owner-state CRDT after an
+                            // ingested friend-revocation mutates `revoked_dm_devices`
+                            // (persist + replicate). Same owner-state engine handle the
+                            // tunnel drain uses to build its `mark_owner_state_dirty`.
+                            notify_owner_state_dirty: {
+                                let e = std::sync::Arc::clone(&owner_state_engine_for_dirty);
+                                Some(std::sync::Arc::new(move || e.notify_dirty())
+                                    as std::sync::Arc<dyn Fn() + Send + Sync>)
+                            },
+                            // ZEB-674 (C4): this device's X25519 private — derived
+                            // from the cert-bound ed25519 signing key exactly as the
+                            // butler acceptor derives its seal target
+                            // (`ed25519_priv_to_x25519(&community_signing_key_arc)`),
+                            // so `apply_grant_push` opens the per-device grant blob a
+                            // sender sealed to `birational(vk)` of this device.
+                            device_x25519_priv: crate::dm_signing::ed25519_priv_to_x25519(
+                                &community_signing_key_arc,
+                            ),
+                            // ZEB-674 (C4): the grantee's shared (pinned epoch-0)
+                            // fleet KeyTree — the SAME tree `file_deks` seals under —
+                            // so a received grant re-sealed at ingest opens on any of
+                            // the owner's bound devices (Flow A).
+                            owner_keytree: std::sync::Arc::clone(&kt),
+                        });
+                        // The ingest sweeper: one startup sweep (entries
+                        // deposited while this device was offline), then one
+                        // debounced sweep per on_applied nudge burst. Exits when
+                        // the engine shuts down (see the nudge-channel comment
+                        // above) — stop_inner's engine shutdown is its shutdown.
+                        {
+                            let sweeper_engine = std::sync::Arc::clone(&dm_inbox_sync);
+                            // ZEB-862: local-only persist trigger for stamp-only
+                            // sweeps (durable first-observation clock without a
+                            // fleet republish).
+                            let persist_engine = std::sync::Arc::clone(&dm_inbox_sync);
+                            let dm_inbox_persist_now: crate::dm_inbox_ingest::PersistNowFn =
+                                std::sync::Arc::new(move || {
+                                    let e = std::sync::Arc::clone(&persist_engine);
+                                    Box::pin(async move { e.persist_now().await })
+                                });
+                            tokio::spawn(crate::dm_inbox_ingest::run_dm_inbox_ingest_sweeper(
+                                std::sync::Arc::clone(&dm_inbox_doc),
+                                dm_inbox_ingest_ctx,
+                                dm_inbox_nudge_rx,
+                                std::sync::Arc::new(move || sweeper_engine.notify_dirty()),
+                                dm_inbox_persist_now,
+                                std::time::Duration::from_millis(
+                                    crate::dm_inbox_ingest::INGEST_SWEEP_DEBOUNCE_MS,
+                                ),
+                            ));
+                        }
+                        dm_inbox_doc_opt = Some(std::sync::Arc::clone(&dm_inbox_doc));
+                        dm_inbox_tracker_opt = Some(std::sync::Arc::clone(&dm_inbox_tracker));
+                        dm_inbox_nudge_weak_opt = Some(dm_inbox_nudge_weak.clone());
+                        dm_inbox_sync_engine_opt = Some(std::sync::Arc::clone(&dm_inbox_sync));
+                        dm_inbox_device_id_opt = Some(device_id.clone());
+                        dm_inbox_sync_handles_opt = Some(crate::event_loop::DmInboxSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: dm_inbox_out_rx,
+                            inbound_tx: dm_inbox_in_tx,
+                        });
+
+                        tracing::info!("BOOT-PROBE 05: dm-inbox engine constructed");
+                        // ── ZEB-495 (ZEB-340 Part 2): community-device-intro ──────
+                        //
+                        // Fleet dataset (Option A relay): deposited-but-not-yet-
+                        // relayed `DeviceAnnounce` membership events, replicated
+                        // across the owner's fleet so an already-enrolled sibling
+                        // can relay a second device's self-introduction into the
+                        // community engine. Mirrors the dm-inbox engine above
+                        // site-for-site (publish_seen stays true — GC depends on
+                        // sibling relay-acks propagating; on_applied nudges the
+                        // relay sweeper). The sweeper itself is spawned LATER, after
+                        // the CommunitySyncRegistry is built (its ProdCtx needs the
+                        // registry to look up community engines).
+                        let community_device_intro_path =
+                            identity_dir.join(crate::community_device_intro_persist::FILENAME);
+                        let community_device_intro_replay_path = identity_dir
+                            .join(crate::community_device_intro_persist::REPLAY_FILENAME);
+                        let community_device_intro_doc =
+                            std::sync::Arc::new(tokio::sync::Mutex::new(
+                                crate::community_device_intro_persist::load_doc_or_recover(
+                                    &community_device_intro_path,
+                                )
+                                .map_err(|e| format!("load community-device-intro doc: {e}"))?,
+                            ));
+                        let community_device_intro_tracker =
+                            std::sync::Arc::new(tokio::sync::Mutex::new(
+                                harmony_crdt_sync::ReplayTracker::from_accepted(
+                                    device_id.clone(),
+                                    crate::community_device_intro_persist::load_replay_or_recover(
+                                        &community_device_intro_replay_path,
+                                    )
+                                    .map_err(|e| {
+                                        format!("load community-device-intro replay: {e}")
+                                    })?,
+                                ),
+                            ));
+                        let (community_device_intro_out_tx, community_device_intro_out_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let (community_device_intro_in_tx, community_device_intro_in_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let community_device_intro_merger: crate::fleet_sync::Merger<
+                            crate::community_device_intro_crdt::CommunityDeviceIntroDoc,
+                        > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                        // Relay-nudge channel (capacity-1 level trigger). The
+                        // engine's `on_applied` owns the only STRONG sender, so the
+                        // sweeper exits exactly when the engine shuts down.
+                        let (community_device_intro_nudge_tx, community_device_intro_nudge_rx) =
+                            tokio::sync::mpsc::channel::<()>(1);
+                        community_device_intro_nudge_rx_opt = Some(community_device_intro_nudge_rx);
+                        let community_device_intro_sync = std::sync::Arc::new(
                         crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
                                 keys: Some(keys.clone()),
@@ -6330,515 +6405,521 @@ pub async fn start_node_inner(
                             },
                         ),
                     );
-                    community_device_intro_doc_opt =
-                        Some(std::sync::Arc::clone(&community_device_intro_doc));
-                    community_device_intro_tracker_opt =
-                        Some(std::sync::Arc::clone(&community_device_intro_tracker));
-                    community_device_intro_sync_engine_opt =
-                        Some(std::sync::Arc::clone(&community_device_intro_sync));
-                    community_device_intro_device_id_opt = Some(device_id.clone());
-                    community_device_intro_sync_handles_opt =
-                        Some(crate::event_loop::DatasetSyncHandles {
-                            addr_hex: owner_addr_hex.clone(),
-                            outbound_rx: community_device_intro_out_rx,
-                            inbound_tx: community_device_intro_in_tx,
-                        });
-                    // ZEB-668 S3 (CodeRabbit PR #453): the relay sweeper's GC
-                    // coverage set is computed LIVE from the trust doc on
-                    // every sweep (`live_enrolled_intro_ids` — enrolled minus
-                    // revoked), replacing the pre-S3 boot-time snapshot. A
-                    // device revoked mid-session leaves the coverage set
-                    // immediately instead of stalling every entry's
-                    // coverage-GC to the 30-day TTL.
+                        community_device_intro_doc_opt =
+                            Some(std::sync::Arc::clone(&community_device_intro_doc));
+                        community_device_intro_tracker_opt =
+                            Some(std::sync::Arc::clone(&community_device_intro_tracker));
+                        community_device_intro_sync_engine_opt =
+                            Some(std::sync::Arc::clone(&community_device_intro_sync));
+                        community_device_intro_device_id_opt = Some(device_id.clone());
+                        community_device_intro_sync_handles_opt =
+                            Some(crate::event_loop::DatasetSyncHandles {
+                                addr_hex: owner_addr_hex.clone(),
+                                outbound_rx: community_device_intro_out_rx,
+                                inbound_tx: community_device_intro_in_tx,
+                            });
+                        // ZEB-668 S3 (CodeRabbit PR #453): the relay sweeper's GC
+                        // coverage set is computed LIVE from the trust doc on
+                        // every sweep (`live_enrolled_intro_ids` — enrolled minus
+                        // revoked), replacing the pre-S3 boot-time snapshot. A
+                        // device revoked mid-session leaves the coverage set
+                        // immediately instead of stalling every entry's
+                        // coverage-GC to the 30-day TTL.
 
-                    tracing::info!("BOOT-PROBE 05c: community-device-intro engine constructed");
-                    // ── ZEB-458 P4 Phase B: relay-hold + relay-optin datasets ─
-                    //
-                    // Two new fleet-replicated datasets, each wired exactly
-                    // like the dm-inbox engine above:
-                    //   * `relay-hold-v1` (D38): the relay's held opaque blobs,
-                    //     replicated across the relay's OWN fleet so any device
-                    //     of a volunteering owner can serve a recipient pull.
-                    //   * `relay-optin-v1` (D43): the per-community opt-in flags,
-                    //     replicated across the volunteer's fleet so every online
-                    //     device advertises + serves for an opted-in community.
-                    //
-                    // Both use `owner_addr_hex` as their fleet scope (siblings on
-                    // the same owner replicate), `publish_seen: true` (LWW datasets
-                    // — the merged whole-doc is the unit of replication), and
-                    // `on_applied: None` (no local ingest sweeper on the relay
-                    // side; the resolver-feed + GC sweep + acceptors are the later
-                    // active-machinery task, T11b). The publisher/pull-driver
-                    // tasks + the resolver-feed are NOT spawned here.
-                    let relay_hold_path =
-                        identity_dir.join(crate::relay_hold_persist::RELAY_HOLD_FILENAME);
-                    let relay_hold_replay_path =
-                        identity_dir.join(crate::relay_hold_persist::RELAY_HOLD_REPLAY_FILENAME);
-                    let relay_hold_first_observed_path = identity_dir
-                        .join(crate::relay_hold_persist::RELAY_HOLD_FIRST_OBSERVED_FILENAME);
-                    // ZEB-862: restore the LOCAL first-observation clock from its
-                    // sidecar so TTL GC survives restart (else the first sweep
-                    // re-stamps every entry at `now`).
-                    let relay_hold_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
-                        let mut doc =
-                            crate::relay_hold_persist::load_doc_or_recover(&relay_hold_path)
-                                .map_err(|e| format!("load relay-hold doc: {e}"))?;
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        doc.restore_first_observed(
-                            crate::relay_hold_persist::load_first_observed_or_recover(
-                                &relay_hold_first_observed_path,
-                            )
-                            .map_err(|e| format!("load relay-hold first-observed: {e}"))?,
-                            now_ms,
-                        );
-                        doc
-                    }));
-                    let relay_hold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        harmony_crdt_sync::ReplayTracker::from_accepted(
-                            device_id.clone(),
-                            crate::relay_hold_persist::load_replay_or_recover(
-                                &relay_hold_replay_path,
-                            )
-                            .map_err(|e| format!("load relay-hold replay: {e}"))?,
-                        ),
-                    ));
-                    let (relay_hold_out_tx, relay_hold_out_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let (relay_hold_in_tx, relay_hold_in_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let relay_hold_merger: crate::fleet_sync::Merger<
-                        crate::community_relay_hold_crdt::RelayHoldDoc,
-                    > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
-                    let relay_hold_sync =
-                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
-                            crate::fleet_sync::FleetSyncConfig {
-                                keys: Some(keys.clone()),
-                                device_id: device_id.clone(),
-                                state: std::sync::Arc::clone(&relay_hold_doc),
-                                adopt_floor: adopt_floor.clone(),
-                                merger: relay_hold_merger,
-                                replay_tracker: std::sync::Arc::clone(&relay_hold_tracker),
-                                content_store: std::sync::Arc::clone(&content_store),
-                                publisher_tx: relay_hold_out_tx,
-                                subscriber_rx: relay_hold_in_rx,
-                                persist: std::sync::Arc::new(
-                                    crate::relay_hold_persist::RelayHoldPersist {
-                                        doc_path: relay_hold_path,
-                                        replay_path: relay_hold_replay_path,
-                                        first_observed_path: relay_hold_first_observed_path,
-                                    },
-                                ),
-                                lookup_key_tag: b"relay-hold-v1",
-                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
-                                publish_seen: true,
-                                on_applied: None,
-                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    harmony_crdt_sync::MonotoneMap::new(),
-                                )),
-                            },
-                        ));
-                    let relay_optin_path =
-                        identity_dir.join(crate::relay_optin_persist::RELAY_OPTIN_FILENAME);
-                    let relay_optin_replay_path =
-                        identity_dir.join(crate::relay_optin_persist::RELAY_OPTIN_REPLAY_FILENAME);
-                    let relay_optin_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::relay_optin_persist::load_doc_or_recover(&relay_optin_path)
-                            .map_err(|e| format!("load relay-optin doc: {e}"))?,
-                    ));
-                    let relay_optin_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        harmony_crdt_sync::ReplayTracker::from_accepted(
-                            device_id.clone(),
-                            crate::relay_optin_persist::load_replay_or_recover(
-                                &relay_optin_replay_path,
-                            )
-                            .map_err(|e| format!("load relay-optin replay: {e}"))?,
-                        ),
-                    ));
-                    let (relay_optin_out_tx, relay_optin_out_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let (relay_optin_in_tx, relay_optin_in_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let relay_optin_merger: crate::fleet_sync::Merger<
-                        crate::community_relay_optin::RelayOptInDoc,
-                    > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
-                    let relay_optin_sync =
-                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
-                            crate::fleet_sync::FleetSyncConfig {
-                                keys: Some(keys.clone()),
-                                device_id: device_id.clone(),
-                                state: std::sync::Arc::clone(&relay_optin_doc),
-                                adopt_floor: adopt_floor.clone(),
-                                merger: relay_optin_merger,
-                                replay_tracker: std::sync::Arc::clone(&relay_optin_tracker),
-                                content_store: std::sync::Arc::clone(&content_store),
-                                publisher_tx: relay_optin_out_tx,
-                                subscriber_rx: relay_optin_in_rx,
-                                persist: std::sync::Arc::new(
-                                    crate::relay_optin_persist::RelayOptInPersist {
-                                        doc_path: relay_optin_path,
-                                        replay_path: relay_optin_replay_path,
-                                    },
-                                ),
-                                lookup_key_tag: b"relay-optin-v1",
-                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
-                                publish_seen: true,
-                                on_applied: None,
-                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    harmony_crdt_sync::MonotoneMap::new(),
-                                )),
-                            },
-                        ));
-                    // Shared resolver Arc (community id → advertising relay
-                    // endpoints). Built here so the NodeState assignment can stash
-                    // it; T11b's announce/pull machinery feeds + reads it.
-                    let community_relay_resolver = std::sync::Arc::new(
-                        crate::community_relay_resolver::CommunityRelayResolver::new(),
-                    );
-                    relay_hold_doc_opt = Some(std::sync::Arc::clone(&relay_hold_doc));
-                    relay_hold_tracker_opt = Some(std::sync::Arc::clone(&relay_hold_tracker));
-                    relay_hold_sync_engine_opt = Some(std::sync::Arc::clone(&relay_hold_sync));
-                    relay_optin_doc_opt = Some(std::sync::Arc::clone(&relay_optin_doc));
-                    relay_optin_tracker_opt = Some(std::sync::Arc::clone(&relay_optin_tracker));
-                    relay_optin_sync_engine_opt = Some(std::sync::Arc::clone(&relay_optin_sync));
-                    community_relay_resolver_opt =
-                        Some(std::sync::Arc::clone(&community_relay_resolver));
-                    relay_sync_handles_opt = Some(crate::event_loop::RelaySyncHandles {
-                        hold: crate::event_loop::DatasetSyncHandles {
-                            addr_hex: owner_addr_hex.clone(),
-                            outbound_rx: relay_hold_out_rx,
-                            inbound_tx: relay_hold_in_tx,
-                        },
-                        optin: crate::event_loop::DatasetSyncHandles {
-                            addr_hex: owner_addr_hex.clone(),
-                            outbound_rx: relay_optin_out_rx,
-                            inbound_tx: relay_optin_in_tx,
-                        },
-                    });
-
-                    tracing::info!("BOOT-PROBE 05b: relay-hold + relay-optin engines constructed");
-                    // ── ZEB-418 SP2 P2 Task 6: dm-outhold fleet-sync engine ─
-                    //
-                    // Sender-side outbound-hold dataset (spec D12):
-                    // send_dm's storage blobs replicated across the owner's
-                    // fleet so siblings can serve CidNotify fetch-backs and
-                    // build butler deposits. Mirrors the dm-inbox wiring
-                    // above site-for-site. `on_applied` nudges the apply
-                    // sweeper (CAS admit + status-driven GC). Unlike
-                    // dm-inbox there is NO acceptor-side nudger — the
-                    // engine's `on_applied` closure holds the only sender,
-                    // so a plain channel(1) suffices (no WeakSender split).
-                    let dm_outhold_path =
-                        identity_dir.join(crate::dm_outhold_persist::DM_OUTHOLD_FILENAME);
-                    let dm_outhold_replay_path =
-                        identity_dir.join(crate::dm_outhold_persist::DM_OUTHOLD_REPLAY_FILENAME);
-                    let dm_outhold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::dm_outhold_persist::load_doc_or_recover(&dm_outhold_path)
-                            .map_err(|e| format!("load dm-outhold doc: {e}"))?,
-                    ));
-                    let dm_outhold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        harmony_crdt_sync::ReplayTracker::from_accepted(
-                            device_id.clone(),
-                            crate::dm_outhold_persist::load_replay_or_recover(
-                                &dm_outhold_replay_path,
-                            )
-                            .map_err(|e| format!("load dm-outhold replay: {e}"))?,
-                        ),
-                    ));
-                    let (dm_outhold_out_tx, dm_outhold_out_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let (dm_outhold_in_tx, dm_outhold_in_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let dm_outhold_merger: crate::fleet_sync::Merger<
-                        crate::dm_outhold::DmOutholdDoc,
-                    > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
-                    let (dm_outhold_nudge_tx, dm_outhold_nudge_rx) =
-                        tokio::sync::mpsc::channel::<()>(1);
-                    let dm_outhold_sync =
-                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
-                            crate::fleet_sync::FleetSyncConfig {
-                                keys: Some(keys.clone()),
-                                device_id: device_id.clone(),
-                                state: std::sync::Arc::clone(&dm_outhold_doc),
-                                adopt_floor: adopt_floor.clone(),
-                                merger: dm_outhold_merger,
-                                replay_tracker: std::sync::Arc::clone(&dm_outhold_tracker),
-                                content_store: std::sync::Arc::clone(&content_store),
-                                publisher_tx: dm_outhold_out_tx,
-                                subscriber_rx: dm_outhold_in_rx,
-                                persist: std::sync::Arc::new(
-                                    crate::dm_outhold_persist::DmOutholdPersist {
-                                        doc_path: dm_outhold_path,
-                                        replay_path: dm_outhold_replay_path,
-                                    },
-                                ),
-                                lookup_key_tag: b"dm-outhold-v1",
-                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
-                                publish_seen: true,
-                                on_applied: Some(
-                                    crate::dm_outhold_apply::outhold_nudge_on_applied(
-                                        dm_outhold_nudge_tx,
-                                    ),
-                                ),
-                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    harmony_crdt_sync::MonotoneMap::new(),
-                                )),
-                            },
-                        ));
-                    // The apply sweeper: one startup sweep (rows that
-                    // replicated while this device was offline), then one
-                    // debounced sweep per on_applied nudge burst. Exits when
-                    // the engine shuts down (its on_applied closure owns the
-                    // only nudge sender) — stop_inner's engine shutdown is
-                    // its shutdown. Mirrors the dm-inbox sweeper spawn.
-                    {
-                        let dm_outhold_ctx: std::sync::Arc<
-                            dyn crate::dm_outhold_apply::DmOutholdCtx,
-                        > = std::sync::Arc::new(crate::dm_outhold_apply::ProdDmOutholdCtx {
-                            crdt_state: std::sync::Arc::clone(&crdt_state),
-                            content_store: std::sync::Arc::clone(&content_store),
-                        });
-                        let sweeper_engine = std::sync::Arc::clone(&dm_outhold_sync);
-                        tokio::spawn(crate::dm_outhold_apply::run_dm_outhold_sweeper(
-                            std::sync::Arc::clone(&dm_outhold_doc),
-                            dm_outhold_ctx,
-                            dm_outhold_nudge_rx,
-                            std::sync::Arc::new(move || sweeper_engine.notify_dirty()),
-                            std::time::Duration::from_millis(
-                                crate::dm_outhold_apply::OUTHOLD_SWEEP_DEBOUNCE_MS,
+                        tracing::info!("BOOT-PROBE 05c: community-device-intro engine constructed");
+                        // ── ZEB-458 P4 Phase B: relay-hold + relay-optin datasets ─
+                        //
+                        // Two new fleet-replicated datasets, each wired exactly
+                        // like the dm-inbox engine above:
+                        //   * `relay-hold-v1` (D38): the relay's held opaque blobs,
+                        //     replicated across the relay's OWN fleet so any device
+                        //     of a volunteering owner can serve a recipient pull.
+                        //   * `relay-optin-v1` (D43): the per-community opt-in flags,
+                        //     replicated across the volunteer's fleet so every online
+                        //     device advertises + serves for an opted-in community.
+                        //
+                        // Both use `owner_addr_hex` as their fleet scope (siblings on
+                        // the same owner replicate), `publish_seen: true` (LWW datasets
+                        // — the merged whole-doc is the unit of replication), and
+                        // `on_applied: None` (no local ingest sweeper on the relay
+                        // side; the resolver-feed + GC sweep + acceptors are the later
+                        // active-machinery task, T11b). The publisher/pull-driver
+                        // tasks + the resolver-feed are NOT spawned here.
+                        let relay_hold_path =
+                            identity_dir.join(crate::relay_hold_persist::RELAY_HOLD_FILENAME);
+                        let relay_hold_replay_path = identity_dir
+                            .join(crate::relay_hold_persist::RELAY_HOLD_REPLAY_FILENAME);
+                        let relay_hold_first_observed_path = identity_dir
+                            .join(crate::relay_hold_persist::RELAY_HOLD_FIRST_OBSERVED_FILENAME);
+                        // ZEB-862: restore the LOCAL first-observation clock from its
+                        // sidecar so TTL GC survives restart (else the first sweep
+                        // re-stamps every entry at `now`).
+                        let relay_hold_doc = std::sync::Arc::new(tokio::sync::Mutex::new({
+                            let mut doc =
+                                crate::relay_hold_persist::load_doc_or_recover(&relay_hold_path)
+                                    .map_err(|e| format!("load relay-hold doc: {e}"))?;
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            doc.restore_first_observed(
+                                crate::relay_hold_persist::load_first_observed_or_recover(
+                                    &relay_hold_first_observed_path,
+                                )
+                                .map_err(|e| format!("load relay-hold first-observed: {e}"))?,
+                                now_ms,
+                            );
+                            doc
+                        }));
+                        let relay_hold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            harmony_crdt_sync::ReplayTracker::from_accepted(
+                                device_id.clone(),
+                                crate::relay_hold_persist::load_replay_or_recover(
+                                    &relay_hold_replay_path,
+                                )
+                                .map_err(|e| format!("load relay-hold replay: {e}"))?,
                             ),
                         ));
-                    }
-                    dm_outhold_doc_opt = Some(std::sync::Arc::clone(&dm_outhold_doc));
-                    dm_outhold_tracker_opt = Some(std::sync::Arc::clone(&dm_outhold_tracker));
-                    dm_outhold_sync_engine_opt = Some(std::sync::Arc::clone(&dm_outhold_sync));
-                    dm_outhold_device_id_opt = Some(device_id.clone());
-
-                    tracing::info!("BOOT-PROBE 06: dm-outhold engine constructed");
-                    // ── ZEB-418 SP2 P2 Task 6: fleet-net fleet-sync engine ─
-                    //
-                    // Per-device network info (iroh endpoint id + home
-                    // relay) + owner-level pinned butler (spec §5–§6),
-                    // feeding the butler-set advertisement in the owner's
-                    // pkarr routing record. Same recipe as dm-outhold.
-                    let fleet_net_path =
-                        identity_dir.join(crate::fleet_net_persist::FLEET_NET_FILENAME);
-                    let fleet_net_replay_path =
-                        identity_dir.join(crate::fleet_net_persist::FLEET_NET_REPLAY_FILENAME);
-                    let initial_fleet_net_doc =
-                        crate::fleet_net_persist::load_doc_or_recover(&fleet_net_path)
-                            .map_err(|e| format!("load fleet-net doc: {e}"))?;
-                    // ZEB-418 P2 Task 7 (D15): SYNCHRONOUS snapshot of the
-                    // fleet-net doc, seeded from the loaded doc. The pkarr
-                    // routing-blob builder is a sync `Fn() -> Vec<u8>` and
-                    // cannot lock the tokio doc mutex — it reads this
-                    // std::sync::RwLock instead. Kept in step (a) by the
-                    // nudge task below (on_applied) and (b) by local
-                    // self-row upserts (clone under the doc lock).
-                    let fleet_net_snapshot: std::sync::Arc<
-                        std::sync::RwLock<crate::fleet_net::FleetNetDoc>,
-                    > = std::sync::Arc::new(std::sync::RwLock::new(initial_fleet_net_doc.clone()));
-                    let fleet_net_doc =
-                        std::sync::Arc::new(tokio::sync::Mutex::new(initial_fleet_net_doc));
-                    let fleet_net_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        harmony_crdt_sync::ReplayTracker::from_accepted(
-                            device_id.clone(),
-                            crate::fleet_net_persist::load_replay_or_recover(
-                                &fleet_net_replay_path,
-                            )
-                            .map_err(|e| format!("load fleet-net replay: {e}"))?,
-                        ),
-                    ));
-                    let (fleet_net_out_tx, fleet_net_out_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    let (fleet_net_in_tx, fleet_net_in_rx) =
-                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
-                    // Snapshot-refresh nudge channel (same capacity-1
-                    // level-trigger model as dm-inbox ingestion): the
-                    // engine's `on_applied` closure owns the ONLY sender, so
-                    // the refresh task (spawned in the pkarr block below,
-                    // where `routing_republish` exists) exits exactly when
-                    // the engine shuts down. `on_applied` is sync and the
-                    // doc sits behind a tokio Mutex, so the closure only
-                    // sends the nudge — the spawned task does the async
-                    // lock + clone + RwLock write.
-                    let (fleet_net_snap_nudge_tx, fleet_net_snap_nudge_rx) =
-                        tokio::sync::mpsc::channel::<()>(1);
-                    let fleet_net_merger: crate::fleet_sync::Merger<crate::fleet_net::FleetNetDoc> =
-                        std::sync::Arc::new(|local, remote| local.merge_from(remote));
-                    let fleet_net_sync =
-                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
-                            crate::fleet_sync::FleetSyncConfig {
-                                keys: Some(keys.clone()),
-                                device_id: device_id.clone(),
-                                state: std::sync::Arc::clone(&fleet_net_doc),
-                                adopt_floor: adopt_floor.clone(),
-                                merger: fleet_net_merger,
-                                replay_tracker: std::sync::Arc::clone(&fleet_net_tracker),
-                                content_store: std::sync::Arc::clone(&content_store),
-                                publisher_tx: fleet_net_out_tx,
-                                subscriber_rx: fleet_net_in_rx,
-                                persist: std::sync::Arc::new(
-                                    crate::fleet_net_persist::FleetNetPersist {
-                                        doc_path: fleet_net_path,
-                                        replay_path: fleet_net_replay_path,
-                                    },
-                                ),
-                                lookup_key_tag: b"fleet-net-v1",
-                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
-                                publish_seen: true,
-                                // ZEB-418 P2 Task 7: an applied remote row
-                                // changes the advertised butler set — nudge
-                                // the snapshot-refresh task (reusing the
-                                // generic dm_inbox_ingest nudge helper; it
-                                // just try_sends a `()`).
-                                on_applied: Some(crate::dm_inbox_ingest::ingest_nudge_on_applied(
-                                    fleet_net_snap_nudge_tx,
-                                )),
-                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    harmony_crdt_sync::MonotoneMap::new(),
-                                )),
-                            },
-                        ));
-                    tracing::info!(
-                        "BOOT-PROBE 07: fleet-net engine constructed, writing self-row + flush"
-                    );
-                    // Fleet-net self-row upsert: when the iroh endpoint
-                    // bound (it binds earlier in start_node, before this
-                    // owner-loaded block), record this device's network
-                    // coordinates so the doc contains our row by the end of
-                    // start_node. `home_relay` may still be empty this soon
-                    // after bind (`unwrap_or_default`, same as the pkarr
-                    // blob_builder snapshot) — Task 7's refresh re-stamps
-                    // it. The HLC comes from `reserve_next_hlc_for_device`
-                    // over the owner HLC tracker (same recipe as the
-                    // reachability publisher's startup-time stamps; no
-                    // outbox lock needed). Failure to flush is log-warn
-                    // only — never fails start_node.
-                    if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let seen_at = crate::dm_outbox::reserve_next_hlc_for_device(
-                            &tracker,
-                            &adopt_floor,
-                            &device_id,
-                            now_ms,
-                        )
-                        .await;
-                        {
-                            tracing::info!(
-                                "BOOT-PROBE 07a: self-row HLC reserved, locking fleet-net doc"
-                            );
-                            let mut doc = fleet_net_doc.lock().await;
-                            // ZEB-678 S2: preserve any existing feed_binding —
-                            // the self-row rewrite must NEVER drop it, else a
-                            // reboot would propagate `None` with a newer seen_at
-                            // via LWW and wipe the seed-holder's master-revoke
-                            // material (a revocation-evasion hole). It is
-                            // (re)set on first migrated publish.
-                            let feed_binding = doc
-                                .devices
-                                .get(&device_id)
-                                .and_then(|r| r.feed_binding.clone());
-                            doc.devices.insert(
-                                device_id.clone(),
-                                crate::fleet_net::FleetNetRow {
-                                    iroh_endpoint_id: *ep_arc.node_id().as_bytes(),
-                                    home_relay: ep_arc
-                                        .home_relay()
-                                        .map(|r| r.to_string())
-                                        .unwrap_or_default(),
-                                    seen_at,
-                                    feed_binding,
+                        let (relay_hold_out_tx, relay_hold_out_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let (relay_hold_in_tx, relay_hold_in_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let relay_hold_merger: crate::fleet_sync::Merger<
+                            crate::community_relay_hold_crdt::RelayHoldDoc,
+                        > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                        let relay_hold_sync =
+                            std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                                crate::fleet_sync::FleetSyncConfig {
+                                    keys: Some(keys.clone()),
+                                    device_id: device_id.clone(),
+                                    state: std::sync::Arc::clone(&relay_hold_doc),
+                                    adopt_floor: adopt_floor.clone(),
+                                    merger: relay_hold_merger,
+                                    replay_tracker: std::sync::Arc::clone(&relay_hold_tracker),
+                                    content_store: std::sync::Arc::clone(&content_store),
+                                    publisher_tx: relay_hold_out_tx,
+                                    subscriber_rx: relay_hold_in_rx,
+                                    persist: std::sync::Arc::new(
+                                        crate::relay_hold_persist::RelayHoldPersist {
+                                            doc_path: relay_hold_path,
+                                            replay_path: relay_hold_replay_path,
+                                            first_observed_path: relay_hold_first_observed_path,
+                                        },
+                                    ),
+                                    lookup_key_tag: b"relay-hold-v1",
+                                    debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                    publish_seen: true,
+                                    on_applied: None,
+                                    sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                        harmony_crdt_sync::MonotoneMap::new(),
+                                    )),
                                 },
-                            );
-                            // ZEB-418 P2 Task 7: keep the sync snapshot in
-                            // step with the local write, under the same doc
-                            // lock (local writes never fire `on_applied`).
-                            *fleet_net_snapshot
-                                .write()
-                                .unwrap_or_else(|p| p.into_inner()) = doc.clone();
-                        }
-                        tracing::info!("BOOT-PROBE 07b: self-row written + snapshot updated, deferring boot flush");
-                        fleet_net_sync.notify_dirty();
-                        // Deferred boot flush (same pattern as the mint/notes/
-                        // dm-inbox/outhold boot flushes above): flush_now's
-                        // publish round-trips through ContentStore::put, whose
-                        // CasOp reply is only serviced once event_loop::run
-                        // spawns (far below). Awaiting it inline here deadlocks
-                        // start_node — the event loop can never start because
-                        // start_node never returns. The self-row itself is
-                        // already staged in the doc + snapshot above; this
-                        // flush only publishes to siblings + persists, both of
-                        // which are safe to complete after the loop is up.
+                            ));
+                        let relay_optin_path =
+                            identity_dir.join(crate::relay_optin_persist::RELAY_OPTIN_FILENAME);
+                        let relay_optin_replay_path = identity_dir
+                            .join(crate::relay_optin_persist::RELAY_OPTIN_REPLAY_FILENAME);
+                        let relay_optin_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            crate::relay_optin_persist::load_doc_or_recover(&relay_optin_path)
+                                .map_err(|e| format!("load relay-optin doc: {e}"))?,
+                        ));
+                        let relay_optin_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            harmony_crdt_sync::ReplayTracker::from_accepted(
+                                device_id.clone(),
+                                crate::relay_optin_persist::load_replay_or_recover(
+                                    &relay_optin_replay_path,
+                                )
+                                .map_err(|e| format!("load relay-optin replay: {e}"))?,
+                            ),
+                        ));
+                        let (relay_optin_out_tx, relay_optin_out_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let (relay_optin_in_tx, relay_optin_in_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let relay_optin_merger: crate::fleet_sync::Merger<
+                            crate::community_relay_optin::RelayOptInDoc,
+                        > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                        let relay_optin_sync =
+                            std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                                crate::fleet_sync::FleetSyncConfig {
+                                    keys: Some(keys.clone()),
+                                    device_id: device_id.clone(),
+                                    state: std::sync::Arc::clone(&relay_optin_doc),
+                                    adopt_floor: adopt_floor.clone(),
+                                    merger: relay_optin_merger,
+                                    replay_tracker: std::sync::Arc::clone(&relay_optin_tracker),
+                                    content_store: std::sync::Arc::clone(&content_store),
+                                    publisher_tx: relay_optin_out_tx,
+                                    subscriber_rx: relay_optin_in_rx,
+                                    persist: std::sync::Arc::new(
+                                        crate::relay_optin_persist::RelayOptInPersist {
+                                            doc_path: relay_optin_path,
+                                            replay_path: relay_optin_replay_path,
+                                        },
+                                    ),
+                                    lookup_key_tag: b"relay-optin-v1",
+                                    debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                    publish_seen: true,
+                                    on_applied: None,
+                                    sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                        harmony_crdt_sync::MonotoneMap::new(),
+                                    )),
+                                },
+                            ));
+                        // Shared resolver Arc (community id → advertising relay
+                        // endpoints). ZEB-905: construction hoisted to the owner
+                        // band (it is a plain map, no fleet dependency) so the
+                        // community-band relay machinery works on keyless boots;
+                        // only these fleet-doc lifts stay here.
+                        relay_hold_doc_opt = Some(std::sync::Arc::clone(&relay_hold_doc));
+                        relay_hold_tracker_opt = Some(std::sync::Arc::clone(&relay_hold_tracker));
+                        relay_hold_sync_engine_opt = Some(std::sync::Arc::clone(&relay_hold_sync));
+                        relay_optin_doc_opt = Some(std::sync::Arc::clone(&relay_optin_doc));
+                        relay_optin_tracker_opt = Some(std::sync::Arc::clone(&relay_optin_tracker));
+                        relay_optin_sync_engine_opt =
+                            Some(std::sync::Arc::clone(&relay_optin_sync));
+                        relay_sync_handles_opt = Some(crate::event_loop::RelaySyncHandles {
+                            hold: crate::event_loop::DatasetSyncHandles {
+                                addr_hex: owner_addr_hex.clone(),
+                                outbound_rx: relay_hold_out_rx,
+                                inbound_tx: relay_hold_in_tx,
+                            },
+                            optin: crate::event_loop::DatasetSyncHandles {
+                                addr_hex: owner_addr_hex.clone(),
+                                outbound_rx: relay_optin_out_rx,
+                                inbound_tx: relay_optin_in_tx,
+                            },
+                        });
+
+                        tracing::info!(
+                            "BOOT-PROBE 05b: relay-hold + relay-optin engines constructed"
+                        );
+                        // ── ZEB-418 SP2 P2 Task 6: dm-outhold fleet-sync engine ─
+                        //
+                        // Sender-side outbound-hold dataset (spec D12):
+                        // send_dm's storage blobs replicated across the owner's
+                        // fleet so siblings can serve CidNotify fetch-backs and
+                        // build butler deposits. Mirrors the dm-inbox wiring
+                        // above site-for-site. `on_applied` nudges the apply
+                        // sweeper (CAS admit + status-driven GC). Unlike
+                        // dm-inbox there is NO acceptor-side nudger — the
+                        // engine's `on_applied` closure holds the only sender,
+                        // so a plain channel(1) suffices (no WeakSender split).
+                        let dm_outhold_path =
+                            identity_dir.join(crate::dm_outhold_persist::DM_OUTHOLD_FILENAME);
+                        let dm_outhold_replay_path = identity_dir
+                            .join(crate::dm_outhold_persist::DM_OUTHOLD_REPLAY_FILENAME);
+                        let dm_outhold_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            crate::dm_outhold_persist::load_doc_or_recover(&dm_outhold_path)
+                                .map_err(|e| format!("load dm-outhold doc: {e}"))?,
+                        ));
+                        let dm_outhold_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            harmony_crdt_sync::ReplayTracker::from_accepted(
+                                device_id.clone(),
+                                crate::dm_outhold_persist::load_replay_or_recover(
+                                    &dm_outhold_replay_path,
+                                )
+                                .map_err(|e| format!("load dm-outhold replay: {e}"))?,
+                            ),
+                        ));
+                        let (dm_outhold_out_tx, dm_outhold_out_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let (dm_outhold_in_tx, dm_outhold_in_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let dm_outhold_merger: crate::fleet_sync::Merger<
+                            crate::dm_outhold::DmOutholdDoc,
+                        > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                        let (dm_outhold_nudge_tx, dm_outhold_nudge_rx) =
+                            tokio::sync::mpsc::channel::<()>(1);
+                        let dm_outhold_sync =
+                            std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                                crate::fleet_sync::FleetSyncConfig {
+                                    keys: Some(keys.clone()),
+                                    device_id: device_id.clone(),
+                                    state: std::sync::Arc::clone(&dm_outhold_doc),
+                                    adopt_floor: adopt_floor.clone(),
+                                    merger: dm_outhold_merger,
+                                    replay_tracker: std::sync::Arc::clone(&dm_outhold_tracker),
+                                    content_store: std::sync::Arc::clone(&content_store),
+                                    publisher_tx: dm_outhold_out_tx,
+                                    subscriber_rx: dm_outhold_in_rx,
+                                    persist: std::sync::Arc::new(
+                                        crate::dm_outhold_persist::DmOutholdPersist {
+                                            doc_path: dm_outhold_path,
+                                            replay_path: dm_outhold_replay_path,
+                                        },
+                                    ),
+                                    lookup_key_tag: b"dm-outhold-v1",
+                                    debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                    publish_seen: true,
+                                    on_applied: Some(
+                                        crate::dm_outhold_apply::outhold_nudge_on_applied(
+                                            dm_outhold_nudge_tx,
+                                        ),
+                                    ),
+                                    sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                        harmony_crdt_sync::MonotoneMap::new(),
+                                    )),
+                                },
+                            ));
+                        // The apply sweeper: one startup sweep (rows that
+                        // replicated while this device was offline), then one
+                        // debounced sweep per on_applied nudge burst. Exits when
+                        // the engine shuts down (its on_applied closure owns the
+                        // only nudge sender) — stop_inner's engine shutdown is
+                        // its shutdown. Mirrors the dm-inbox sweeper spawn.
                         {
-                            let boot_flush = std::sync::Arc::clone(&fleet_net_sync);
-                            tokio::spawn(async move {
-                                if let Err(e) = boot_flush.flush_now().await {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "ZEB-418 P2: fleet-net self-row boot flush failed; \
-                                         the debounced publisher will retry on the next dirty mark"
-                                    );
-                                }
+                            let dm_outhold_ctx: std::sync::Arc<
+                                dyn crate::dm_outhold_apply::DmOutholdCtx,
+                            > = std::sync::Arc::new(crate::dm_outhold_apply::ProdDmOutholdCtx {
+                                crdt_state: std::sync::Arc::clone(&crdt_state),
+                                content_store: std::sync::Arc::clone(&content_store),
                             });
+                            let sweeper_engine = std::sync::Arc::clone(&dm_outhold_sync);
+                            tokio::spawn(crate::dm_outhold_apply::run_dm_outhold_sweeper(
+                                std::sync::Arc::clone(&dm_outhold_doc),
+                                dm_outhold_ctx,
+                                dm_outhold_nudge_rx,
+                                std::sync::Arc::new(move || sweeper_engine.notify_dirty()),
+                                std::time::Duration::from_millis(
+                                    crate::dm_outhold_apply::OUTHOLD_SWEEP_DEBOUNCE_MS,
+                                ),
+                            ));
                         }
-                    }
-                    // ZEB-510: seed same-owner fleet siblings' iroh endpoints
-                    // into the reachability resolver so P can dial a butler
-                    // sibling B2 for async-DM deposits. `fleet_net.cbor` already
-                    // persists each enrolled sibling's endpoint (consumed today
-                    // only to build the pkarr butler-set advert) — this is the
-                    // missing wire from that durable doc to the dialer. The self
-                    // row is excluded (never dial ourselves). Mirrors the
-                    // address-book boot seed further below (search
-                    // `BOOT-PROBE 10`), which ZEB-815 put in place of the
-                    // ReachabilityAnnounce event replay this once pointed at.
-                    {
-                        let siblings = {
-                            let doc = fleet_net_doc.lock().await;
-                            crate::fleet_net::sibling_rows(&doc, &device_id)
-                        };
-                        for (_dev_id, row) in siblings {
-                            reachability_resolver.update_with_source(
-                                self_owner,
-                                crate::fleet_net::sibling_reachability_payload(&row),
-                                row.seen_at.clone(),
-                                crate::reachability_resolver::ReachabilitySource::FleetSibling,
-                            );
-                        }
-                    }
-                    // ZEB-510 step 2: feed SAS first-contact seeds into the
-                    // resolver so P can dial a freshly-paired sibling BEFORE
-                    // fleet-net has ever converged. A real FleetNetDoc row for
-                    // the same node (fed by the step-1 hook above) supersedes a
-                    // seed via LWW once it exists; correctness does not depend on
-                    // the ordering (same stable node_id either way).
-                    {
-                        let self_node_id = iroh_endpoint_arc
-                            .as_ref()
-                            .map(|ep| *ep.node_id().as_bytes());
-                        let seed_path = identity_dir
-                            .join(crate::fleet_peer_seed_persist::FLEET_PEER_SEED_FILENAME);
-                        // Best-effort (mirrors the write side in
-                        // pairing/persist.rs::persist_peer_seed): a transient read
-                        // failure of this accelerator store must NOT abort boot —
-                        // the device simply proceeds without the seed and gains
-                        // sibling reachability once fleet-net converges (the
-                        // pre-step-2 behavior). load_doc_or_recover already
-                        // self-heals a corrupt file to default(), so only a
-                        // transient I/O error reaches the Err arm.
-                        match crate::fleet_peer_seed_persist::load_doc_or_recover(&seed_path) {
-                            Ok(seed_doc) => {
-                                for row in seed_doc.seeds.values() {
-                                    if Some(row.iroh_node_id) == self_node_id {
-                                        continue; // never seed ourselves
+                        dm_outhold_doc_opt = Some(std::sync::Arc::clone(&dm_outhold_doc));
+                        dm_outhold_tracker_opt = Some(std::sync::Arc::clone(&dm_outhold_tracker));
+                        dm_outhold_sync_engine_opt = Some(std::sync::Arc::clone(&dm_outhold_sync));
+                        dm_outhold_device_id_opt = Some(device_id.clone());
+
+                        tracing::info!("BOOT-PROBE 06: dm-outhold engine constructed");
+                        // ── ZEB-418 SP2 P2 Task 6: fleet-net fleet-sync engine ─
+                        //
+                        // Per-device network info (iroh endpoint id + home
+                        // relay) + owner-level pinned butler (spec §5–§6),
+                        // feeding the butler-set advertisement in the owner's
+                        // pkarr routing record. Same recipe as dm-outhold.
+                        let fleet_net_path =
+                            identity_dir.join(crate::fleet_net_persist::FLEET_NET_FILENAME);
+                        let fleet_net_replay_path =
+                            identity_dir.join(crate::fleet_net_persist::FLEET_NET_REPLAY_FILENAME);
+                        let initial_fleet_net_doc =
+                            crate::fleet_net_persist::load_doc_or_recover(&fleet_net_path)
+                                .map_err(|e| format!("load fleet-net doc: {e}"))?;
+                        // ZEB-418 P2 Task 7 (D15): SYNCHRONOUS snapshot of the
+                        // fleet-net doc, seeded from the loaded doc. The pkarr
+                        // routing-blob builder is a sync `Fn() -> Vec<u8>` and
+                        // cannot lock the tokio doc mutex — it reads this
+                        // std::sync::RwLock instead. Kept in step (a) by the
+                        // nudge task below (on_applied) and (b) by local
+                        // self-row upserts (clone under the doc lock).
+                        let fleet_net_snapshot: std::sync::Arc<
+                            std::sync::RwLock<crate::fleet_net::FleetNetDoc>,
+                        > = std::sync::Arc::new(std::sync::RwLock::new(
+                            initial_fleet_net_doc.clone(),
+                        ));
+                        let fleet_net_doc =
+                            std::sync::Arc::new(tokio::sync::Mutex::new(initial_fleet_net_doc));
+                        let fleet_net_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            harmony_crdt_sync::ReplayTracker::from_accepted(
+                                device_id.clone(),
+                                crate::fleet_net_persist::load_replay_or_recover(
+                                    &fleet_net_replay_path,
+                                )
+                                .map_err(|e| format!("load fleet-net replay: {e}"))?,
+                            ),
+                        ));
+                        let (fleet_net_out_tx, fleet_net_out_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        let (fleet_net_in_tx, fleet_net_in_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                        // Snapshot-refresh nudge channel (same capacity-1
+                        // level-trigger model as dm-inbox ingestion): the
+                        // engine's `on_applied` closure owns the ONLY sender, so
+                        // the refresh task (spawned in the pkarr block below,
+                        // where `routing_republish` exists) exits exactly when
+                        // the engine shuts down. `on_applied` is sync and the
+                        // doc sits behind a tokio Mutex, so the closure only
+                        // sends the nudge — the spawned task does the async
+                        // lock + clone + RwLock write.
+                        let (fleet_net_snap_nudge_tx, fleet_net_snap_nudge_rx) =
+                            tokio::sync::mpsc::channel::<()>(1);
+                        fleet_net_snap_nudge_rx_opt = Some(fleet_net_snap_nudge_rx);
+                        let fleet_net_merger: crate::fleet_sync::Merger<
+                            crate::fleet_net::FleetNetDoc,
+                        > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                        let fleet_net_sync =
+                            std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                                crate::fleet_sync::FleetSyncConfig {
+                                    keys: Some(keys.clone()),
+                                    device_id: device_id.clone(),
+                                    state: std::sync::Arc::clone(&fleet_net_doc),
+                                    adopt_floor: adopt_floor.clone(),
+                                    merger: fleet_net_merger,
+                                    replay_tracker: std::sync::Arc::clone(&fleet_net_tracker),
+                                    content_store: std::sync::Arc::clone(&content_store),
+                                    publisher_tx: fleet_net_out_tx,
+                                    subscriber_rx: fleet_net_in_rx,
+                                    persist: std::sync::Arc::new(
+                                        crate::fleet_net_persist::FleetNetPersist {
+                                            doc_path: fleet_net_path,
+                                            replay_path: fleet_net_replay_path,
+                                        },
+                                    ),
+                                    lookup_key_tag: b"fleet-net-v1",
+                                    debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                    publish_seen: true,
+                                    // ZEB-418 P2 Task 7: an applied remote row
+                                    // changes the advertised butler set — nudge
+                                    // the snapshot-refresh task (reusing the
+                                    // generic dm_inbox_ingest nudge helper; it
+                                    // just try_sends a `()`).
+                                    on_applied: Some(
+                                        crate::dm_inbox_ingest::ingest_nudge_on_applied(
+                                            fleet_net_snap_nudge_tx,
+                                        ),
+                                    ),
+                                    sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                        harmony_crdt_sync::MonotoneMap::new(),
+                                    )),
+                                },
+                            ));
+                        tracing::info!(
+                            "BOOT-PROBE 07: fleet-net engine constructed, writing self-row + flush"
+                        );
+                        // Fleet-net self-row upsert: when the iroh endpoint
+                        // bound (it binds earlier in start_node, before this
+                        // owner-loaded block), record this device's network
+                        // coordinates so the doc contains our row by the end of
+                        // start_node. `home_relay` may still be empty this soon
+                        // after bind (`unwrap_or_default`, same as the pkarr
+                        // blob_builder snapshot) — Task 7's refresh re-stamps
+                        // it. The HLC comes from `reserve_next_hlc_for_device`
+                        // over the owner HLC tracker (same recipe as the
+                        // reachability publisher's startup-time stamps; no
+                        // outbox lock needed). Failure to flush is log-warn
+                        // only — never fails start_node.
+                        if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let seen_at = crate::dm_outbox::reserve_next_hlc_for_device(
+                                &tracker,
+                                &adopt_floor,
+                                &device_id,
+                                now_ms,
+                            )
+                            .await;
+                            {
+                                tracing::info!(
+                                    "BOOT-PROBE 07a: self-row HLC reserved, locking fleet-net doc"
+                                );
+                                let mut doc = fleet_net_doc.lock().await;
+                                // ZEB-678 S2: preserve any existing feed_binding —
+                                // the self-row rewrite must NEVER drop it, else a
+                                // reboot would propagate `None` with a newer seen_at
+                                // via LWW and wipe the seed-holder's master-revoke
+                                // material (a revocation-evasion hole). It is
+                                // (re)set on first migrated publish.
+                                let feed_binding = doc
+                                    .devices
+                                    .get(&device_id)
+                                    .and_then(|r| r.feed_binding.clone());
+                                doc.devices.insert(
+                                    device_id.clone(),
+                                    crate::fleet_net::FleetNetRow {
+                                        iroh_endpoint_id: *ep_arc.node_id().as_bytes(),
+                                        home_relay: ep_arc
+                                            .home_relay()
+                                            .map(|r| r.to_string())
+                                            .unwrap_or_default(),
+                                        seen_at,
+                                        feed_binding,
+                                    },
+                                );
+                                // ZEB-418 P2 Task 7: keep the sync snapshot in
+                                // step with the local write, under the same doc
+                                // lock (local writes never fire `on_applied`).
+                                *fleet_net_snapshot
+                                    .write()
+                                    .unwrap_or_else(|p| p.into_inner()) = doc.clone();
+                            }
+                            tracing::info!("BOOT-PROBE 07b: self-row written + snapshot updated, deferring boot flush");
+                            fleet_net_sync.notify_dirty();
+                            // Deferred boot flush (same pattern as the mint/notes/
+                            // dm-inbox/outhold boot flushes above): flush_now's
+                            // publish round-trips through ContentStore::put, whose
+                            // CasOp reply is only serviced once event_loop::run
+                            // spawns (far below). Awaiting it inline here deadlocks
+                            // start_node — the event loop can never start because
+                            // start_node never returns. The self-row itself is
+                            // already staged in the doc + snapshot above; this
+                            // flush only publishes to siblings + persists, both of
+                            // which are safe to complete after the loop is up.
+                            {
+                                let boot_flush = std::sync::Arc::clone(&fleet_net_sync);
+                                tokio::spawn(async move {
+                                    if let Err(e) = boot_flush.flush_now().await {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "ZEB-418 P2: fleet-net self-row boot flush failed; \
+                                             the debounced publisher will retry on the next dirty mark"
+                                        );
                                     }
-                                    reachability_resolver.update_with_source(
+                                });
+                            }
+                        }
+                        // ZEB-510: seed same-owner fleet siblings' iroh endpoints
+                        // into the reachability resolver so P can dial a butler
+                        // sibling B2 for async-DM deposits. `fleet_net.cbor` already
+                        // persists each enrolled sibling's endpoint (consumed today
+                        // only to build the pkarr butler-set advert) — this is the
+                        // missing wire from that durable doc to the dialer. The self
+                        // row is excluded (never dial ourselves). Mirrors the
+                        // address-book boot seed further below (search
+                        // `BOOT-PROBE 10`), which ZEB-815 put in place of the
+                        // ReachabilityAnnounce event replay this once pointed at.
+                        {
+                            let siblings = {
+                                let doc = fleet_net_doc.lock().await;
+                                crate::fleet_net::sibling_rows(&doc, &device_id)
+                            };
+                            for (_dev_id, row) in siblings {
+                                reachability_resolver.update_with_source(
+                                    self_owner,
+                                    crate::fleet_net::sibling_reachability_payload(&row),
+                                    row.seen_at.clone(),
+                                    crate::reachability_resolver::ReachabilitySource::FleetSibling,
+                                );
+                            }
+                        }
+                        // ZEB-510 step 2: feed SAS first-contact seeds into the
+                        // resolver so P can dial a freshly-paired sibling BEFORE
+                        // fleet-net has ever converged. A real FleetNetDoc row for
+                        // the same node (fed by the step-1 hook above) supersedes a
+                        // seed via LWW once it exists; correctness does not depend on
+                        // the ordering (same stable node_id either way).
+                        {
+                            let self_node_id = iroh_endpoint_arc
+                                .as_ref()
+                                .map(|ep| *ep.node_id().as_bytes());
+                            let seed_path = identity_dir
+                                .join(crate::fleet_peer_seed_persist::FLEET_PEER_SEED_FILENAME);
+                            // Best-effort (mirrors the write side in
+                            // pairing/persist.rs::persist_peer_seed): a transient read
+                            // failure of this accelerator store must NOT abort boot —
+                            // the device simply proceeds without the seed and gains
+                            // sibling reachability once fleet-net converges (the
+                            // pre-step-2 behavior). load_doc_or_recover already
+                            // self-heals a corrupt file to default(), so only a
+                            // transient I/O error reaches the Err arm.
+                            match crate::fleet_peer_seed_persist::load_doc_or_recover(&seed_path) {
+                                Ok(seed_doc) => {
+                                    for row in seed_doc.seeds.values() {
+                                        if Some(row.iroh_node_id) == self_node_id {
+                                            continue; // never seed ourselves
+                                        }
+                                        reachability_resolver.update_with_source(
                                         self_owner,
                                         crate::fleet_peer_seed::seed_reachability_payload(row),
                                         crate::owner_state_types::Hlc {
@@ -6848,305 +6929,321 @@ pub async fn start_node_inner(
                                         },
                                         crate::reachability_resolver::ReachabilitySource::FleetSibling,
                                     );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "fleet-peer-seed load failed at boot; skipping dial-seed feed (sibling reachability will arrive on fleet-net convergence)"
+                                    );
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "fleet-peer-seed load failed at boot; skipping dial-seed feed (sibling reachability will arrive on fleet-net convergence)"
-                                );
-                            }
                         }
-                    }
-                    fleet_net_doc_opt = Some(std::sync::Arc::clone(&fleet_net_doc));
-                    fleet_net_tracker_opt = Some(std::sync::Arc::clone(&fleet_net_tracker));
-                    fleet_net_sync_engine_opt = Some(std::sync::Arc::clone(&fleet_net_sync));
-                    // ZEB-418 P2 Task 8: wire the extra handles for set_butler_pin.
-                    fleet_net_snapshot_opt = Some(std::sync::Arc::clone(&fleet_net_snapshot));
-                    fleet_net_device_id_opt = Some(device_id.clone());
-                    fleet_net_enrolled_opt = Some(
-                        loaded
-                            .state
-                            .enrollments
-                            .values()
-                            .map(|cert| hex::encode(cert.device_pubkeys.classical.ed25519_verify))
-                            .collect(),
-                    );
-                    p2_sync_handles_opt = Some(crate::event_loop::P2SyncHandles {
-                        outhold: crate::event_loop::DatasetSyncHandles {
-                            addr_hex: owner_addr_hex.clone(),
-                            outbound_rx: dm_outhold_out_rx,
-                            inbound_tx: dm_outhold_in_tx,
-                        },
-                        fleet_net: crate::event_loop::DatasetSyncHandles {
-                            addr_hex: owner_addr_hex.clone(),
-                            outbound_rx: fleet_net_out_rx,
-                            inbound_tx: fleet_net_in_tx,
-                        },
-                    });
+                        fleet_net_doc_opt = Some(std::sync::Arc::clone(&fleet_net_doc));
+                        fleet_net_tracker_opt = Some(std::sync::Arc::clone(&fleet_net_tracker));
+                        fleet_net_sync_engine_opt = Some(std::sync::Arc::clone(&fleet_net_sync));
+                        // ZEB-418 P2 Task 8: wire the extra handles for set_butler_pin.
+                        fleet_net_snapshot_opt = Some(std::sync::Arc::clone(&fleet_net_snapshot));
+                        fleet_net_device_id_opt = Some(device_id.clone());
+                        fleet_net_enrolled_opt = Some(
+                            loaded
+                                .state
+                                .enrollments
+                                .values()
+                                .map(|cert| {
+                                    hex::encode(cert.device_pubkeys.classical.ed25519_verify)
+                                })
+                                .collect(),
+                        );
+                        p2_sync_handles_opt = Some(crate::event_loop::P2SyncHandles {
+                            outhold: crate::event_loop::DatasetSyncHandles {
+                                addr_hex: owner_addr_hex.clone(),
+                                outbound_rx: dm_outhold_out_rx,
+                                inbound_tx: dm_outhold_in_tx,
+                            },
+                            fleet_net: crate::event_loop::DatasetSyncHandles {
+                                addr_hex: owner_addr_hex.clone(),
+                                outbound_rx: fleet_net_out_rx,
+                                inbound_tx: fleet_net_in_tx,
+                            },
+                        });
 
-                    // ── ZEB-668 S1: owner-trust replication engine ─────────
-                    // The resident trust doc is seeded from the state loaded
-                    // for this boot (`loaded.state`); disk source of truth
-                    // stays owner_state.cbor, written through TrustPersist on
-                    // every debounced engine pass. Mirrors the fleet-net
-                    // block above.
-                    let trust_replay_path =
-                        identity_dir.join(crate::owner_trust_sync::OWNER_TRUST_REPLAY_FILENAME);
-                    let owner_trust_doc =
-                        std::sync::Arc::new(tokio::sync::Mutex::new(loaded.state.clone()));
-                    let owner_trust_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        harmony_crdt_sync::ReplayTracker::from_accepted(
-                            device_id.clone(),
-                            crate::owner_trust_sync::load_trust_replay_or_recover(
-                                &trust_replay_path,
-                            ),
-                        ),
-                    ));
-                    let (trust_out_tx, trust_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-                    let (trust_in_tx, trust_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-                    let (trust_nudge_tx, trust_nudge_rx) = tokio::sync::mpsc::channel::<()>(8);
-                    // ZEB-668 S3: retire-deposit sweeper nudge. Created here
-                    // so the trust engine's on_applied can nudge BOTH the S1
-                    // revoked-self detector and the S3 retire-deposit sweep
-                    // (a remote merge is how a sibling's revocation reaches
-                    // this device). The rx is consumed by the sweeper spawn
-                    // after the community registry is built; a second sender
-                    // is stashed in NodeState for the local-revoke path.
-                    let (retire_deposit_nudge_tx, retire_deposit_nudge_rx) =
-                        tokio::sync::mpsc::channel::<()>(1);
-                    let owner_trust_sync = std::sync::Arc::new(
-                        crate::fleet_sync::FleetSyncEngine::new(
-                            crate::fleet_sync::FleetSyncConfig {
-                                keys: Some(keys.clone()),
-                                device_id: device_id.clone(),
-                                state: std::sync::Arc::clone(&owner_trust_doc),
-                                adopt_floor: adopt_floor.clone(),
-                                merger: crate::owner_trust_sync::trust_merger(),
-                                replay_tracker: owner_trust_tracker,
-                                content_store: std::sync::Arc::clone(&content_store),
-                                publisher_tx: trust_out_tx,
-                                subscriber_rx: trust_in_rx,
-                                persist: std::sync::Arc::new(
-                                    crate::owner_trust_sync::TrustPersist {
-                                        identity_dir: identity_dir.clone(),
-                                        replay_path: trust_replay_path,
-                                    },
+                        // ── ZEB-668 S1: owner-trust replication engine ─────────
+                        // The resident trust doc is seeded from the state loaded
+                        // for this boot (`loaded.state`); disk source of truth
+                        // stays owner_state.cbor, written through TrustPersist on
+                        // every debounced engine pass. Mirrors the fleet-net
+                        // block above.
+                        let trust_replay_path =
+                            identity_dir.join(crate::owner_trust_sync::OWNER_TRUST_REPLAY_FILENAME);
+                        let owner_trust_doc =
+                            std::sync::Arc::new(tokio::sync::Mutex::new(loaded.state.clone()));
+                        let owner_trust_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            harmony_crdt_sync::ReplayTracker::from_accepted(
+                                device_id.clone(),
+                                crate::owner_trust_sync::load_trust_replay_or_recover(
+                                    &trust_replay_path,
                                 ),
-                                lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
-                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
-                                publish_seen: true,
-                                on_applied: Some({
-                                    // ZEB-668: one applied-merge, two consumers —
-                                    // the S1 revoked-self detector and the S3
-                                    // retire-deposit sweeper.
-                                    let detector = crate::dm_inbox_ingest::ingest_nudge_on_applied(
-                                        trust_nudge_tx,
-                                    );
-                                    let retire =
+                            ),
+                        ));
+                        let (trust_out_tx, trust_out_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                        let (trust_in_tx, trust_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                        let (trust_nudge_tx, trust_nudge_rx) = tokio::sync::mpsc::channel::<()>(8);
+                        // ZEB-668 S3: retire-deposit sweeper nudge. Created here
+                        // so the trust engine's on_applied can nudge BOTH the S1
+                        // revoked-self detector and the S3 retire-deposit sweep
+                        // (a remote merge is how a sibling's revocation reaches
+                        // this device). The rx is consumed by the sweeper spawn
+                        // after the community registry is built; a second sender
+                        // is stashed in NodeState for the local-revoke path.
+                        let (retire_deposit_nudge_tx, retire_deposit_nudge_rx) =
+                            tokio::sync::mpsc::channel::<()>(1);
+                        retire_deposit_nudge_rx_opt = Some(retire_deposit_nudge_rx);
+                        retire_deposit_nudge_tx_opt = Some(retire_deposit_nudge_tx.clone());
+                        let owner_trust_sync = std::sync::Arc::new(
+                            crate::fleet_sync::FleetSyncEngine::new(
+                                crate::fleet_sync::FleetSyncConfig {
+                                    keys: Some(keys.clone()),
+                                    device_id: device_id.clone(),
+                                    state: std::sync::Arc::clone(&owner_trust_doc),
+                                    adopt_floor: adopt_floor.clone(),
+                                    merger: crate::owner_trust_sync::trust_merger(),
+                                    replay_tracker: owner_trust_tracker,
+                                    content_store: std::sync::Arc::clone(&content_store),
+                                    publisher_tx: trust_out_tx,
+                                    subscriber_rx: trust_in_rx,
+                                    persist: std::sync::Arc::new(
+                                        crate::owner_trust_sync::TrustPersist {
+                                            identity_dir: identity_dir.clone(),
+                                            replay_path: trust_replay_path,
+                                        },
+                                    ),
+                                    lookup_key_tag: crate::owner_trust_sync::OWNER_TRUST_LOOKUP_TAG,
+                                    debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                    publish_seen: true,
+                                    on_applied: Some({
+                                        // ZEB-668: one applied-merge, two consumers —
+                                        // the S1 revoked-self detector and the S3
+                                        // retire-deposit sweeper.
+                                        let detector =
+                                            crate::dm_inbox_ingest::ingest_nudge_on_applied(
+                                                trust_nudge_tx,
+                                            );
+                                        let retire =
                                         crate::community_device_retire_deposit::retire_deposit_nudge(
                                             retire_deposit_nudge_tx.clone(),
                                         );
-                                    std::sync::Arc::new(move || {
-                                        detector();
-                                        retire();
-                                    })
-                                }),
-                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    harmony_crdt_sync::MonotoneMap::new(),
-                                )),
-                            },
-                        ),
-                    );
-                    owner_trust_doc_opt = Some(std::sync::Arc::clone(&owner_trust_doc));
-                    owner_trust_sync_engine_opt = Some(std::sync::Arc::clone(&owner_trust_sync));
-                    // ZEB-410: capture the device signing key for the liveness
-                    // heartbeat here (loaded is in scope); moved into the task
-                    // closure at the spawn block, never onto NodeState.
-                    heartbeat_device_sk_opt =
-                        Some(std::sync::Arc::new(loaded.device_signing_key.clone()));
-                    trust_sync_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
-                        addr_hex: owner_addr_hex.clone(),
-                        outbound_rx: trust_out_rx,
-                        inbound_tx: trust_in_tx,
-                    });
-                    // ── ZEB-677 S3: owner-quorum-req replication engine ────
-                    // Pending co-sign requests (quorum revocation ceremony).
-                    // Mirrors the trust block above; the doc persists to its
-                    // own file pair. The applied task is the initiator's
-                    // completion sweep: on each inbound merge (or the one
-                    // boot tick) it assembles K=2 certs from arrived
-                    // co-signatures and applies them through the trust doc.
-                    let quorum_doc_path =
-                        identity_dir.join(crate::owner_quorum_sync::OWNER_QUORUM_DOC_FILENAME);
-                    let quorum_replay_path =
-                        identity_dir.join(crate::owner_quorum_sync::OWNER_QUORUM_REPLAY_FILENAME);
-                    let owner_quorum_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::owner_quorum_sync::load_quorum_doc_or_recover(&quorum_doc_path),
-                    ));
-                    let owner_quorum_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        harmony_crdt_sync::ReplayTracker::from_accepted(
-                            device_id.clone(),
-                            crate::owner_quorum_sync::load_quorum_replay_or_recover(
-                                &quorum_replay_path,
+                                        std::sync::Arc::new(move || {
+                                            detector();
+                                            retire();
+                                        })
+                                    }),
+                                    sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                        harmony_crdt_sync::MonotoneMap::new(),
+                                    )),
+                                },
                             ),
-                        ),
-                    ));
-                    let (quorum_out_tx, quorum_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-                    let (quorum_in_tx, quorum_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-                    let (quorum_nudge_tx, quorum_nudge_rx) = tokio::sync::mpsc::channel::<()>(8);
-                    let owner_quorum_sync_engine =
-                        std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
-                            crate::fleet_sync::FleetSyncConfig {
-                                keys: Some(keys.clone()),
-                                device_id: device_id.clone(),
-                                state: std::sync::Arc::clone(&owner_quorum_doc),
-                                adopt_floor: adopt_floor.clone(),
-                                merger: crate::owner_quorum_sync::quorum_merger(),
-                                replay_tracker: owner_quorum_tracker,
-                                content_store: std::sync::Arc::clone(&content_store),
-                                publisher_tx: quorum_out_tx,
-                                subscriber_rx: quorum_in_rx,
-                                persist: std::sync::Arc::new(
-                                    crate::owner_quorum_sync::QuorumPersist {
-                                        doc_path: quorum_doc_path,
-                                        replay_path: quorum_replay_path,
-                                    },
-                                ),
-                                lookup_key_tag: crate::owner_quorum_sync::OWNER_QUORUM_LOOKUP_TAG,
-                                debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
-                                publish_seen: true,
-                                on_applied: Some(crate::dm_inbox_ingest::ingest_nudge_on_applied(
-                                    quorum_nudge_tx.clone(),
-                                )),
-                                sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
-                                    harmony_crdt_sync::MonotoneMap::new(),
-                                )),
-                            },
-                        ));
-                    owner_quorum_doc_opt = Some(std::sync::Arc::clone(&owner_quorum_doc));
-                    owner_quorum_sync_engine_opt =
-                        Some(std::sync::Arc::clone(&owner_quorum_sync_engine));
-                    quorum_sync_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
-                        addr_hex: owner_addr_hex.clone(),
-                        outbound_rx: quorum_out_rx,
-                        inbound_tx: quorum_in_tx,
-                    });
-                    {
-                        let emit_sink = std::sync::Arc::clone(&app);
-                        let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
-                            std::sync::Arc::new(move |name: &str| {
-                                crate::node_event_sink::emit_ser(
-                                    &*emit_sink,
-                                    name,
-                                    &serde_json::Value::Null,
-                                );
-                            });
-                        crate::owner_quorum_sync::spawn_quorum_applied_task(
-                            quorum_nudge_rx,
-                            std::sync::Arc::clone(&owner_quorum_doc),
-                            std::sync::Arc::clone(&owner_quorum_sync_engine),
-                            std::sync::Arc::clone(&owner_trust_doc),
-                            std::sync::Arc::clone(&owner_trust_sync),
-                            loaded.device_signing_key.clone(),
-                            crate::owner_state::device_id_from_signing_key(
-                                &loaded.device_signing_key,
-                            ),
-                            emit,
-                            Some(retire_deposit_nudge_tx.clone()),
-                            std::sync::Arc::clone(&quorum_carrier_slot),
                         );
-                        // Boot tick: complete ceremonies whose co-signatures
-                        // arrived while this device was offline.
-                        let _ = quorum_nudge_tx.try_send(());
-                    }
-                    tracing::info!("BOOT-PROBE 08b-quorum: owner-quorum engine constructed");
-                    // ZEB-668 S1 T4: revoked-self detector. Each applied
-                    // remote merge nudges this task → owner-devices-updated;
-                    // a merge revealing THIS device revoked latches the flag,
-                    // emits device-revoked-self once, and shuts down the
-                    // fleet engines a revoked device must stop driving
-                    // (owner-state, fleet-net, trust).
-                    {
-                        let trust_revoked_flag = {
-                            let guard = state
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            std::sync::Arc::clone(&guard.owner_trust_revoked_self)
-                        };
-                        let emit_sink = std::sync::Arc::clone(&app);
-                        let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
-                            std::sync::Arc::new(move |name: &str| {
-                                crate::node_event_sink::emit_ser(
-                                    &*emit_sink,
-                                    name,
-                                    &serde_json::Value::Null,
-                                );
-                            });
-                        let halt_owner_sync = std::sync::Arc::clone(&engine);
-                        let halt_fleet_net = std::sync::Arc::clone(&fleet_net_sync);
-                        let halt_trust = std::sync::Arc::clone(&owner_trust_sync);
-                        let halt_quorum = std::sync::Arc::clone(&owner_quorum_sync_engine);
-                        let halt: crate::owner_trust_sync::HaltFn = Box::new(move || {
-                            Box::pin(async move {
-                                if let Err(e) = halt_owner_sync.shutdown().await {
-                                    tracing::error!(error = %e, "revoked-self halt: owner-state engine shutdown failed");
-                                }
-                                if let Err(e) = halt_fleet_net.shutdown().await {
-                                    tracing::error!(error = %e, "revoked-self halt: fleet-net engine shutdown failed");
-                                }
-                                if let Err(e) = halt_trust.shutdown().await {
-                                    tracing::error!(error = %e, "revoked-self halt: trust engine shutdown failed");
-                                }
-                                // ZEB-677 S3: a revoked device must stop
-                                // driving the quorum-request dataset too.
-                                if let Err(e) = halt_quorum.shutdown().await {
-                                    tracing::error!(error = %e, "revoked-self halt: quorum engine shutdown failed");
-                                }
-                            })
+                        owner_trust_doc_opt = Some(std::sync::Arc::clone(&owner_trust_doc));
+                        owner_trust_sync_engine_opt =
+                            Some(std::sync::Arc::clone(&owner_trust_sync));
+                        // ZEB-410: capture the device signing key for the liveness
+                        // heartbeat here (loaded is in scope); moved into the task
+                        // closure at the spawn block, never onto NodeState.
+                        heartbeat_device_sk_opt =
+                            Some(std::sync::Arc::new(loaded.device_signing_key.clone()));
+                        trust_sync_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: trust_out_rx,
+                            inbound_tx: trust_in_tx,
                         });
-                        crate::owner_trust_sync::spawn_trust_applied_task(
-                            trust_nudge_rx,
-                            std::sync::Arc::clone(&owner_trust_doc),
-                            crate::owner_state::device_id_from_signing_key(
-                                &loaded.device_signing_key,
+                        // ── ZEB-677 S3: owner-quorum-req replication engine ────
+                        // Pending co-sign requests (quorum revocation ceremony).
+                        // Mirrors the trust block above; the doc persists to its
+                        // own file pair. The applied task is the initiator's
+                        // completion sweep: on each inbound merge (or the one
+                        // boot tick) it assembles K=2 certs from arrived
+                        // co-signatures and applies them through the trust doc.
+                        let quorum_doc_path =
+                            identity_dir.join(crate::owner_quorum_sync::OWNER_QUORUM_DOC_FILENAME);
+                        let quorum_replay_path = identity_dir
+                            .join(crate::owner_quorum_sync::OWNER_QUORUM_REPLAY_FILENAME);
+                        let owner_quorum_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            crate::owner_quorum_sync::load_quorum_doc_or_recover(&quorum_doc_path),
+                        ));
+                        let owner_quorum_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            harmony_crdt_sync::ReplayTracker::from_accepted(
+                                device_id.clone(),
+                                crate::owner_quorum_sync::load_quorum_replay_or_recover(
+                                    &quorum_replay_path,
+                                ),
                             ),
-                            trust_revoked_flag,
-                            emit,
-                            halt,
-                        );
-                    }
-                    tracing::info!("BOOT-PROBE 08-trust: owner-trust engine constructed");
-                    // ── ZEB-668 S5: fleet-keys carrier engine ──────────────
-                    // The ninth fleet dataset. Permanently keyed by the
-                    // PINNED epoch-0 tree (`kt`) — never the swappable set —
-                    // so any enrolled device, however many epochs behind,
-                    // can read it to learn of newer epochs. Authenticity
-                    // comes from the master signature + monotonic-epoch
-                    // merge, not from the dataset encryption (a revoked
-                    // device still holds epoch-0). See fleet_key_epoch.rs.
-                    let fleet_keys_doc_path =
-                        identity_dir.join(crate::fleet_key_epoch::FLEET_KEYS_FILENAME);
-                    let fleet_keys_replay_path =
-                        identity_dir.join(crate::fleet_key_epoch::FLEET_KEYS_REPLAY_FILENAME);
-                    let fleet_keys_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        crate::fleet_key_epoch::load_doc_or_recover(
-                            &fleet_keys_doc_path,
-                            &loaded.state.owner_id,
-                        ),
-                    ));
-                    let fleet_keys_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
-                        harmony_crdt_sync::ReplayTracker::from_accepted(
-                            device_id.clone(),
-                            crate::fleet_key_epoch::load_replay_or_recover(&fleet_keys_replay_path),
-                        ),
-                    ));
-                    let (fkeys_out_tx, fkeys_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-                    let (fkeys_in_tx, fkeys_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-                    let (fkeys_nudge_tx, mut fkeys_nudge_rx) = tokio::sync::mpsc::channel::<()>(1);
-                    let fkeys_nudge_tx_boot = fkeys_nudge_tx.clone();
-                    let fleet_keys_owner_id = loaded.state.owner_id;
-                    let fleet_keys_sync =
+                        ));
+                        let (quorum_out_tx, quorum_out_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                        let (quorum_in_tx, quorum_in_rx) =
+                            tokio::sync::mpsc::channel::<Vec<u8>>(32);
+                        let (quorum_nudge_tx, quorum_nudge_rx) =
+                            tokio::sync::mpsc::channel::<()>(8);
+                        let owner_quorum_sync_engine =
+                            std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
+                                crate::fleet_sync::FleetSyncConfig {
+                                    keys: Some(keys.clone()),
+                                    device_id: device_id.clone(),
+                                    state: std::sync::Arc::clone(&owner_quorum_doc),
+                                    adopt_floor: adopt_floor.clone(),
+                                    merger: crate::owner_quorum_sync::quorum_merger(),
+                                    replay_tracker: owner_quorum_tracker,
+                                    content_store: std::sync::Arc::clone(&content_store),
+                                    publisher_tx: quorum_out_tx,
+                                    subscriber_rx: quorum_in_rx,
+                                    persist: std::sync::Arc::new(
+                                        crate::owner_quorum_sync::QuorumPersist {
+                                            doc_path: quorum_doc_path,
+                                            replay_path: quorum_replay_path,
+                                        },
+                                    ),
+                                    lookup_key_tag:
+                                        crate::owner_quorum_sync::OWNER_QUORUM_LOOKUP_TAG,
+                                    debounce_ms: crate::fleet_sync::DEFAULT_DEBOUNCE_MS,
+                                    publish_seen: true,
+                                    on_applied: Some(
+                                        crate::dm_inbox_ingest::ingest_nudge_on_applied(
+                                            quorum_nudge_tx.clone(),
+                                        ),
+                                    ),
+                                    sibling_acks: std::sync::Arc::new(tokio::sync::Mutex::new(
+                                        harmony_crdt_sync::MonotoneMap::new(),
+                                    )),
+                                },
+                            ));
+                        owner_quorum_doc_opt = Some(std::sync::Arc::clone(&owner_quorum_doc));
+                        owner_quorum_sync_engine_opt =
+                            Some(std::sync::Arc::clone(&owner_quorum_sync_engine));
+                        quorum_sync_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: quorum_out_rx,
+                            inbound_tx: quorum_in_tx,
+                        });
+                        {
+                            let emit_sink = std::sync::Arc::clone(&app);
+                            let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+                                std::sync::Arc::new(move |name: &str| {
+                                    crate::node_event_sink::emit_ser(
+                                        &*emit_sink,
+                                        name,
+                                        &serde_json::Value::Null,
+                                    );
+                                });
+                            crate::owner_quorum_sync::spawn_quorum_applied_task(
+                                quorum_nudge_rx,
+                                std::sync::Arc::clone(&owner_quorum_doc),
+                                std::sync::Arc::clone(&owner_quorum_sync_engine),
+                                std::sync::Arc::clone(&owner_trust_doc),
+                                std::sync::Arc::clone(&owner_trust_sync),
+                                loaded.device_signing_key.clone(),
+                                crate::owner_state::device_id_from_signing_key(
+                                    &loaded.device_signing_key,
+                                ),
+                                emit,
+                                Some(retire_deposit_nudge_tx.clone()),
+                                std::sync::Arc::clone(&quorum_carrier_slot),
+                            );
+                            // Boot tick: complete ceremonies whose co-signatures
+                            // arrived while this device was offline.
+                            let _ = quorum_nudge_tx.try_send(());
+                        }
+                        tracing::info!("BOOT-PROBE 08b-quorum: owner-quorum engine constructed");
+                        // ZEB-668 S1 T4: revoked-self detector. Each applied
+                        // remote merge nudges this task → owner-devices-updated;
+                        // a merge revealing THIS device revoked latches the flag,
+                        // emits device-revoked-self once, and shuts down the
+                        // fleet engines a revoked device must stop driving
+                        // (owner-state, fleet-net, trust).
+                        {
+                            let trust_revoked_flag = {
+                                let guard = state
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                std::sync::Arc::clone(&guard.owner_trust_revoked_self)
+                            };
+                            let emit_sink = std::sync::Arc::clone(&app);
+                            let emit: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+                                std::sync::Arc::new(move |name: &str| {
+                                    crate::node_event_sink::emit_ser(
+                                        &*emit_sink,
+                                        name,
+                                        &serde_json::Value::Null,
+                                    );
+                                });
+                            let halt_owner_sync = std::sync::Arc::clone(&engine);
+                            let halt_fleet_net = std::sync::Arc::clone(&fleet_net_sync);
+                            let halt_trust = std::sync::Arc::clone(&owner_trust_sync);
+                            let halt_quorum = std::sync::Arc::clone(&owner_quorum_sync_engine);
+                            let halt: crate::owner_trust_sync::HaltFn = Box::new(move || {
+                                Box::pin(async move {
+                                    if let Err(e) = halt_owner_sync.shutdown().await {
+                                        tracing::error!(error = %e, "revoked-self halt: owner-state engine shutdown failed");
+                                    }
+                                    if let Err(e) = halt_fleet_net.shutdown().await {
+                                        tracing::error!(error = %e, "revoked-self halt: fleet-net engine shutdown failed");
+                                    }
+                                    if let Err(e) = halt_trust.shutdown().await {
+                                        tracing::error!(error = %e, "revoked-self halt: trust engine shutdown failed");
+                                    }
+                                    // ZEB-677 S3: a revoked device must stop
+                                    // driving the quorum-request dataset too.
+                                    if let Err(e) = halt_quorum.shutdown().await {
+                                        tracing::error!(error = %e, "revoked-self halt: quorum engine shutdown failed");
+                                    }
+                                })
+                            });
+                            crate::owner_trust_sync::spawn_trust_applied_task(
+                                trust_nudge_rx,
+                                std::sync::Arc::clone(&owner_trust_doc),
+                                crate::owner_state::device_id_from_signing_key(
+                                    &loaded.device_signing_key,
+                                ),
+                                trust_revoked_flag,
+                                emit,
+                                halt,
+                            );
+                        }
+                        tracing::info!("BOOT-PROBE 08-trust: owner-trust engine constructed");
+                        // ── ZEB-668 S5: fleet-keys carrier engine ──────────────
+                        // The ninth fleet dataset. Permanently keyed by the
+                        // PINNED epoch-0 tree (`kt`) — never the swappable set —
+                        // so any enrolled device, however many epochs behind,
+                        // can read it to learn of newer epochs. Authenticity
+                        // comes from the master signature + monotonic-epoch
+                        // merge, not from the dataset encryption (a revoked
+                        // device still holds epoch-0). See fleet_key_epoch.rs.
+                        let fleet_keys_doc_path =
+                            identity_dir.join(crate::fleet_key_epoch::FLEET_KEYS_FILENAME);
+                        let fleet_keys_replay_path =
+                            identity_dir.join(crate::fleet_key_epoch::FLEET_KEYS_REPLAY_FILENAME);
+                        let fleet_keys_doc = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            crate::fleet_key_epoch::load_doc_or_recover(
+                                &fleet_keys_doc_path,
+                                &loaded.state.owner_id,
+                            ),
+                        ));
+                        let fleet_keys_tracker = std::sync::Arc::new(tokio::sync::Mutex::new(
+                            harmony_crdt_sync::ReplayTracker::from_accepted(
+                                device_id.clone(),
+                                crate::fleet_key_epoch::load_replay_or_recover(
+                                    &fleet_keys_replay_path,
+                                ),
+                            ),
+                        ));
+                        let (fkeys_out_tx, fkeys_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+                        let (fkeys_in_tx, fkeys_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+                        let (fkeys_nudge_tx, mut fkeys_nudge_rx) =
+                            tokio::sync::mpsc::channel::<()>(1);
+                        let fkeys_nudge_tx_boot = fkeys_nudge_tx.clone();
+                        let fleet_keys_owner_id = loaded.state.owner_id;
+                        let fleet_keys_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
                                 keys: Some(crate::owner_state_crypto::FleetKeySet::new(
@@ -7189,90 +7286,90 @@ pub async fn start_node_inner(
                                 )),
                             },
                         ));
-                    fleet_keys_doc_opt = Some(std::sync::Arc::clone(&fleet_keys_doc));
-                    fleet_keys_sync_engine_opt = Some(std::sync::Arc::clone(&fleet_keys_sync));
-                    fleet_keys_set_opt = Some(keys.clone());
-                    // ZEB-677 S5 — hand the carrier to the running quorum sweep
-                    // task so it can install quorum-signed epoch bumps (bundled
-                    // with a revocation or a standalone rotation).
-                    *quorum_carrier_slot.lock().await =
-                        Some(crate::owner_quorum_sync::QuorumSweepCarrier {
-                            carrier_doc: std::sync::Arc::clone(&fleet_keys_doc),
-                            carrier_engine: std::sync::Arc::clone(&fleet_keys_sync),
-                            fleet_keys: keys.clone(),
+                        fleet_keys_doc_opt = Some(std::sync::Arc::clone(&fleet_keys_doc));
+                        fleet_keys_sync_engine_opt = Some(std::sync::Arc::clone(&fleet_keys_sync));
+                        fleet_keys_set_opt = Some(keys.clone());
+                        // ZEB-677 S5 — hand the carrier to the running quorum sweep
+                        // task so it can install quorum-signed epoch bumps (bundled
+                        // with a revocation or a standalone rotation).
+                        *quorum_carrier_slot.lock().await =
+                            Some(crate::owner_quorum_sync::QuorumSweepCarrier {
+                                carrier_doc: std::sync::Arc::clone(&fleet_keys_doc),
+                                carrier_engine: std::sync::Arc::clone(&fleet_keys_sync),
+                                fleet_keys: keys.clone(),
+                            });
+                        fleet_keys_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
+                            addr_hex: owner_addr_hex.clone(),
+                            outbound_rx: fkeys_out_rx,
+                            inbound_tx: fkeys_in_tx,
                         });
-                    fleet_keys_handles_opt = Some(crate::event_loop::DatasetSyncHandles {
-                        addr_hex: owner_addr_hex.clone(),
-                        outbound_rx: fkeys_out_rx,
-                        inbound_tx: fkeys_in_tx,
-                    });
-                    // Install task: each applied carrier merge (and one boot
-                    // nudge for the replayed doc) installs the doc's epoch
-                    // into the shared key set — seed path re-derives, cert
-                    // path unseals its blob and persists the enlarged vault
-                    // set. Failures are logged and re-tried on the next
-                    // applied merge; the device keeps running on its current
-                    // epochs meanwhile.
-                    {
-                        let apply_doc = std::sync::Arc::clone(&fleet_keys_doc);
-                        let apply_keys = keys.clone();
-                        let apply_device_sk = loaded.device_signing_key.clone();
-                        let apply_device_id16_hex =
-                            hex::encode(crate::owner_state::device_id_from_signing_key(
-                                &loaded.device_signing_key,
-                            ));
-                        let apply_identity_dir = identity_dir.clone();
-                        let apply_emit = std::sync::Arc::clone(&app);
-                        // PR #455 round 2 (Greptile P1): the install path runs
-                        // the window-close decision itself, so a restarted
-                        // seed-holder (boot set = {0}) lands on the CORRECT
-                        // post-install state instead of accepting epoch-0
-                        // until the next republish tick.
-                        let apply_trust = std::sync::Arc::clone(&owner_trust_doc);
-                        let apply_fleet_net = std::sync::Arc::clone(&fleet_net_doc);
-                        // ZEB-428 seam (PR #455 round 1): the keychain enters
-                        // the task as an injected factory, never constructed
-                        // at the use sites.
-                        let boot_keychain: crate::owner_commands::KeychainFactory =
-                            crate::owner_commands::prod_keychain;
-                        // Boot nudge: the replayed doc may already be ahead of
-                        // the booted key set (e.g. seed-holder that bumped and
-                        // restarted). Capacity-1 channel: a failed send means a
-                        // nudge is already pending, which is exactly right.
-                        let boot_nudge = fkeys_nudge_tx_boot;
-                        let _ = boot_nudge.try_send(());
-                        tokio::spawn(async move {
-                            while fkeys_nudge_rx.recv().await.is_some() {
-                                let doc_snapshot = { apply_doc.lock().await.clone() };
-                                if doc_snapshot.epoch <= apply_keys.newest().epoch {
-                                    continue;
-                                }
-                                if !doc_snapshot.verify(&fleet_keys_owner_id) {
-                                    tracing::warn!(
-                                        "fleet-keys applied doc failed verification; ignoring"
-                                    );
-                                    continue;
-                                }
-                                // Window state for the epoch being installed:
-                                // closed → newest only; open → {N-1, N}.
-                                let window_closed = {
-                                    let survivor_seen = crate::fleet_epoch_survivor_seen_ms(
-                                        &apply_trust,
-                                        &apply_fleet_net,
-                                    )
-                                    .await;
-                                    let now_ms = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis()
-                                        as u64;
-                                    crate::owner_commands::fleet_epoch_window_should_close(
-                                        doc_snapshot.bump_wall_ms,
-                                        now_ms,
-                                        &survivor_seen,
-                                    )
-                                };
-                                let installed = tokio::task::spawn_blocking({
+                        // Install task: each applied carrier merge (and one boot
+                        // nudge for the replayed doc) installs the doc's epoch
+                        // into the shared key set — seed path re-derives, cert
+                        // path unseals its blob and persists the enlarged vault
+                        // set. Failures are logged and re-tried on the next
+                        // applied merge; the device keeps running on its current
+                        // epochs meanwhile.
+                        {
+                            let apply_doc = std::sync::Arc::clone(&fleet_keys_doc);
+                            let apply_keys = keys.clone();
+                            let apply_device_sk = loaded.device_signing_key.clone();
+                            let apply_device_id16_hex =
+                                hex::encode(crate::owner_state::device_id_from_signing_key(
+                                    &loaded.device_signing_key,
+                                ));
+                            let apply_identity_dir = identity_dir.clone();
+                            let apply_emit = std::sync::Arc::clone(&app);
+                            // PR #455 round 2 (Greptile P1): the install path runs
+                            // the window-close decision itself, so a restarted
+                            // seed-holder (boot set = {0}) lands on the CORRECT
+                            // post-install state instead of accepting epoch-0
+                            // until the next republish tick.
+                            let apply_trust = std::sync::Arc::clone(&owner_trust_doc);
+                            let apply_fleet_net = std::sync::Arc::clone(&fleet_net_doc);
+                            // ZEB-428 seam (PR #455 round 1): the keychain enters
+                            // the task as an injected factory, never constructed
+                            // at the use sites.
+                            let boot_keychain: crate::owner_commands::KeychainFactory =
+                                crate::owner_commands::prod_keychain;
+                            // Boot nudge: the replayed doc may already be ahead of
+                            // the booted key set (e.g. seed-holder that bumped and
+                            // restarted). Capacity-1 channel: a failed send means a
+                            // nudge is already pending, which is exactly right.
+                            let boot_nudge = fkeys_nudge_tx_boot;
+                            let _ = boot_nudge.try_send(());
+                            tokio::spawn(async move {
+                                while fkeys_nudge_rx.recv().await.is_some() {
+                                    let doc_snapshot = { apply_doc.lock().await.clone() };
+                                    if doc_snapshot.epoch <= apply_keys.newest().epoch {
+                                        continue;
+                                    }
+                                    if !doc_snapshot.verify(&fleet_keys_owner_id) {
+                                        tracing::warn!(
+                                            "fleet-keys applied doc failed verification; ignoring"
+                                        );
+                                        continue;
+                                    }
+                                    // Window state for the epoch being installed:
+                                    // closed → newest only; open → {N-1, N}.
+                                    let window_closed = {
+                                        let survivor_seen = crate::fleet_epoch_survivor_seen_ms(
+                                            &apply_trust,
+                                            &apply_fleet_net,
+                                        )
+                                        .await;
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                            as u64;
+                                        crate::owner_commands::fleet_epoch_window_should_close(
+                                            doc_snapshot.bump_wall_ms,
+                                            now_ms,
+                                            &survivor_seen,
+                                        )
+                                    };
+                                    let installed = tokio::task::spawn_blocking({
                                     let doc = doc_snapshot.clone();
                                     let device_sk = apply_device_sk.clone();
                                     let device_id16_hex = apply_device_id16_hex.clone();
@@ -7355,29 +7452,35 @@ pub async fn start_node_inner(
                                 .await
                                 .map_err(|e| format!("install task join: {e}"))
                                 .and_then(|r| r);
-                                match installed {
-                                    Ok(epoch) => {
-                                        tracing::info!(
-                                            epoch,
-                                            "fleet-keys: installed new fleet epoch"
-                                        );
-                                        crate::node_event_sink::emit_ser(
-                                            &*apply_emit,
-                                            "owner-devices-updated",
-                                            &serde_json::Value::Null,
-                                        );
+                                    match installed {
+                                        Ok(epoch) => {
+                                            tracing::info!(
+                                                epoch,
+                                                "fleet-keys: installed new fleet epoch"
+                                            );
+                                            crate::node_event_sink::emit_ser(
+                                                &*apply_emit,
+                                                "owner-devices-updated",
+                                                &serde_json::Value::Null,
+                                            );
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "fleet-keys: could not install applied epoch; will retry on next merge"
+                                        ),
                                     }
-                                    Err(e) => tracing::warn!(
-                                        error = %e,
-                                        "fleet-keys: could not install applied epoch; will retry on next merge"
-                                    ),
                                 }
-                            }
-                        });
-                    }
-                    tracing::info!("BOOT-PROBE 08-fleet-keys: carrier engine constructed");
+                            });
+                        }
+                        tracing::info!("BOOT-PROBE 08-fleet-keys: carrier engine constructed");
 
-                    tracing::info!("BOOT-PROBE 08: fleet-net self-row staged (flush deferred), entering per-community CRDT sync");
+                        tracing::info!("BOOT-PROBE 08: fleet-net self-row staged (flush deferred), entering per-community CRDT sync");
+                    } else {
+                        // ZEB-904: this line is the whole band's skip marker —
+                        // pair it with the boot warn! at the fleet_crypto
+                        // construction when diagnosing a local-only boot.
+                        tracing::info!("skipping fleet engines: no fleet crypto (local-only mode)");
+                    }
                     // ── ZEB-217 Sub-C Phase 2 + Phase 3 Task 8: per-community state CRDT sync ─
                     //
                     // Build the registry (owns the multi-community engine pool)
@@ -7512,7 +7615,19 @@ pub async fn start_node_inner(
                     // sweep per on_applied nudge burst; exits when the engine
                     // shuts down (the nudge channel's only strong sender is the
                     // engine's on_applied). Mirrors the dm-inbox ingest sweeper.
-                    {
+                    // ZEB-905: intro/trust docs are fleet datasets — keyless
+                    // boots have none, so the sweeper is not spawned.
+                    if let (
+                        Some(community_device_intro_doc),
+                        Some(community_device_intro_sync),
+                        Some(owner_trust_doc),
+                        Some(community_device_intro_nudge_rx),
+                    ) = (
+                        community_device_intro_doc_opt.clone(),
+                        community_device_intro_sync_engine_opt.clone(),
+                        owner_trust_doc_opt.clone(),
+                        community_device_intro_nudge_rx_opt.take(),
+                    ) {
                         let community_device_intro_ingest_ctx: std::sync::Arc<
                             dyn crate::community_device_intro_ingest::CommunityDeviceIntroIngestCtx,
                         > = std::sync::Arc::new(
@@ -7546,7 +7661,20 @@ pub async fn start_node_inner(
                     // then one debounced pass per nudge (trust on_applied +
                     // local revoke_device). Exits when both senders drop
                     // (trust engine shutdown + NodeState clear).
-                    {
+                    // ZEB-905: same fleet-dataset gate as the relay sweeper above.
+                    if let (
+                        Some(community_device_intro_doc),
+                        Some(community_device_intro_sync),
+                        Some(owner_trust_doc),
+                        Some(retire_deposit_nudge_rx),
+                        Some(retire_deposit_nudge_tx),
+                    ) = (
+                        community_device_intro_doc_opt.clone(),
+                        community_device_intro_sync_engine_opt.clone(),
+                        owner_trust_doc_opt.clone(),
+                        retire_deposit_nudge_rx_opt.take(),
+                        retire_deposit_nudge_tx_opt.take(),
+                    ) {
                         let retire_ctx: std::sync::Arc<
                             dyn crate::community_device_retire_deposit::CommunityDeviceRetireDepositCtx,
                         > = std::sync::Arc::new(
@@ -7978,10 +8106,11 @@ pub async fn start_node_inner(
                                 // reaches this code (it fails boot earlier) and so
                                 // simply never self-introduces. Best-effort +
                                 // logged; never panics the delta consumer.
-                                let device_intro_doc =
-                                    std::sync::Arc::clone(&community_device_intro_doc);
+                                // ZEB-905: Options — the intro dataset is fleet
+                                // material; the trigger below skips keyless.
+                                let device_intro_doc = community_device_intro_doc_opt.clone();
                                 let device_intro_engine =
-                                    std::sync::Arc::clone(&community_device_intro_sync);
+                                    community_device_intro_sync_engine_opt.clone();
                                 let device_intro_signing_key =
                                     std::sync::Arc::clone(&community_signing_key_arc);
                                 let device_intro_cert =
@@ -8081,10 +8210,8 @@ pub async fn start_node_inner(
                                     // ZEB-495: per-invocation clones for the
                                     // self-introduce trigger (async block moves
                                     // them).
-                                    let device_intro_doc =
-                                        std::sync::Arc::clone(&device_intro_doc);
-                                    let device_intro_engine =
-                                        std::sync::Arc::clone(&device_intro_engine);
+                                    let device_intro_doc = device_intro_doc.clone();
+                                    let device_intro_engine = device_intro_engine.clone();
                                     let device_intro_signing_key =
                                         std::sync::Arc::clone(&device_intro_signing_key);
                                     let device_intro_cert = device_intro_cert.clone();
@@ -8447,7 +8574,13 @@ pub async fn start_node_inner(
                                         // (device, community) per session.
                                         // Best-effort + logged; a failure here
                                         // never affects the rest of the consumer.
-                                        {
+                                        // ZEB-905: skipped keyless — there is no
+                                        // intro dataset to deposit into (and no
+                                        // sibling could relay it anyway).
+                                        if let (Some(device_intro_doc), Some(device_intro_engine)) = (
+                                            device_intro_doc.clone(),
+                                            device_intro_engine.clone(),
+                                        ) {
                                             // Cheap session dedupe FIRST (avoid
                                             // re-materializing on every delta once
                                             // this (device, community) is settled).
@@ -9324,7 +9457,11 @@ pub async fn start_node_inner(
                         // appended to the end of the reachability publish.
                         let friend_pub_cell_for_cb = std::sync::Arc::clone(&friend_pub_cell);
                         let crdt_state_for_cb = std::sync::Arc::clone(&crdt_state);
-                        let kt_for_cb = std::sync::Arc::clone(&kt);
+                        // ZEB-905: Option — the Case-D friend reconcile skips
+                        // keyless (friend slots are KeyTree-sealed).
+                        let kt_for_cb = fleet_crypto
+                            .as_ref()
+                            .map(|(kt, _)| std::sync::Arc::clone(kt));
                         // ZEB-339: the inner `identity_signature` must be made
                         // with the enrolled device key (#2), NOT the
                         // Reticulum-derived PrivateIdentity — every verifier
@@ -9345,7 +9482,9 @@ pub async fn start_node_inner(
                         // view because it can't lock the async crdt mutex), this
                         // publish_fn is async and already captures `crdt_state`,
                         // so it locks and builds the vk-map inline per publish.
-                        let fleet_net_snapshot_for_pub = std::sync::Arc::clone(&fleet_net_snapshot);
+                        // ZEB-905: Option — keyless boots have no fleet-net
+                        // sibling view; the butler set degrades to self-only.
+                        let fleet_net_snapshot_for_pub = fleet_net_snapshot_opt.clone();
                         let butler_self_device_id_hash_for_pub = this_device_id_hash;
                         let butler_self_device_vk_for_pub =
                             loaded.device_signing_key.verifying_key().to_bytes();
@@ -9385,10 +9524,9 @@ pub async fn start_node_inner(
                                 let friend_pub_cell =
                                     std::sync::Arc::clone(&friend_pub_cell_for_cb);
                                 let crdt_state = std::sync::Arc::clone(&crdt_state_for_cb);
-                                let kt = std::sync::Arc::clone(&kt_for_cb);
+                                let kt = kt_for_cb.clone();
                                 // Task 2 per-invocation butler-set clones.
-                                let fleet_net_snapshot =
-                                    std::sync::Arc::clone(&fleet_net_snapshot_for_pub);
+                                let fleet_net_snapshot = fleet_net_snapshot_for_pub.clone();
                                 let butler_self_device_id_hash = butler_self_device_id_hash_for_pub;
                                 let butler_self_device_vk = butler_self_device_vk_for_pub;
                                 // ZEB-621 per-invocation clone for the address delta.
@@ -9457,9 +9595,16 @@ pub async fn start_node_inner(
                                             &device_id,
                                             butler_self_device_vk,
                                         );
-                                        let snap = fleet_net_snapshot
-                                            .read()
-                                            .unwrap_or_else(|p| p.into_inner());
+                                        // ZEB-905: keyless boots have no fleet-net
+                                        // view — an empty doc yields a self-only
+                                        // butler set (build_butler_set always
+                                        // includes `self_entry`).
+                                        let snap = match fleet_net_snapshot.as_ref() {
+                                            Some(s) => {
+                                                s.read().unwrap_or_else(|p| p.into_inner()).clone()
+                                            }
+                                            None => crate::fleet_net::FleetNetDoc::default(),
+                                        };
                                         let self_entry =
                                             crate::reachability_record::ButlerSetEntry {
                                                 device_id: butler_self_device_id_hash,
@@ -9701,7 +9846,9 @@ pub async fn start_node_inner(
                                     // friend map under the CRDT lock, drop the
                                     // guard, THEN do pkarr IO — never hold the
                                     // owner-state lock across network awaits.
-                                    if let Some(friend_pub) = friend_pub_cell.get() {
+                                    if let (Some(friend_pub), Some(kt)) =
+                                        (friend_pub_cell.get(), kt.as_ref())
+                                    {
                                         let friends_snapshot = {
                                             let state = crdt_state.lock().await;
                                             state.friend_graph.friends.clone()
@@ -9709,7 +9856,7 @@ pub async fn start_node_inner(
                                         crate::pkarr_friend_publisher::sync_case_d_handles(
                                             friend_pub,
                                             &friends_snapshot,
-                                            &kt,
+                                            kt,
                                         )
                                         .await;
                                     }
@@ -9953,7 +10100,8 @@ pub async fn start_node_inner(
                             ),
                         ))
                     };
-                    let fleet_net_snapshot_for_blob = std::sync::Arc::clone(&fleet_net_snapshot);
+                    // ZEB-905: Option — keyless boots build self-only butler sets.
+                    let fleet_net_snapshot_for_blob = fleet_net_snapshot_opt.clone();
                     let fleet_vk_map_for_blob = std::sync::Arc::clone(&fleet_vk_map);
                     let device_id_for_blob = device_id.clone();
                     // ZEB-891 (CodeRabbit/Qodo #646): edge-trigger the over-budget
@@ -10005,9 +10153,12 @@ pub async fn start_node_inner(
                                 pinned: false,
                             };
                             let butler_set = {
-                                let doc = fleet_net_snapshot_for_blob
-                                    .read()
-                                    .unwrap_or_else(|p| p.into_inner());
+                                // ZEB-905: no fleet-net view keyless — an empty
+                                // doc yields a self-only butler set.
+                                let doc = match fleet_net_snapshot_for_blob.as_ref() {
+                                    Some(s) => s.read().unwrap_or_else(|p| p.into_inner()).clone(),
+                                    None => crate::fleet_net::FleetNetDoc::default(),
+                                };
                                 let vk_map = fleet_vk_map_for_blob
                                     .read()
                                     .unwrap_or_else(|p| p.into_inner());
@@ -10180,7 +10331,9 @@ pub async fn start_node_inner(
                     // friend graph under the CRDT lock, drop the guard, THEN do
                     // pkarr IO — never hold the owner-state lock across network
                     // awaits.
-                    {
+                    // ZEB-905: keyless boots skip the startup Case-D publish —
+                    // friend slots are KeyTree-sealed.
+                    if let Some((kt, _)) = fleet_crypto.as_ref() {
                         let friends_snapshot = {
                             let state = crdt_state.lock().await;
                             state.friend_graph.friends.clone()
@@ -10189,7 +10342,7 @@ pub async fn start_node_inner(
                             crate::pkarr_friend_publisher::sync_case_d_handles(
                                 &pkarr_friend_pub,
                                 &friends_snapshot,
-                                &kt,
+                                kt,
                             )
                             .await;
                             tracing::info!(
@@ -10253,9 +10406,12 @@ pub async fn start_node_inner(
                             // reader, so each publish aggregates self + siblings.
                             device_id.clone(),
                             {
-                                let fs = std::sync::Arc::clone(&fleet_net_snapshot);
-                                std::sync::Arc::new(move || {
-                                    fs.read().unwrap_or_else(|p| p.into_inner()).clone()
+                                // ZEB-905: keyless boots have no fleet-net view;
+                                // an empty doc publishes a self-only relay set.
+                                let fs = fleet_net_snapshot_opt.clone();
+                                std::sync::Arc::new(move || match fs.as_ref() {
+                                    Some(s) => s.read().unwrap_or_else(|p| p.into_inner()).clone(),
+                                    None => crate::fleet_net::FleetNetDoc::default(),
                                 })
                                     as std::sync::Arc<
                                         dyn Fn() -> crate::fleet_net::FleetNetDoc + Send + Sync,
@@ -10395,18 +10551,24 @@ pub async fn start_node_inner(
                         let friend_pub = std::sync::Arc::clone(&pkarr_friend_pub);
                         let registry = std::sync::Arc::clone(&registry);
                         let crdt_state = std::sync::Arc::clone(&crdt_state);
-                        let kt = std::sync::Arc::clone(&kt);
-                        let fleet_doc = std::sync::Arc::clone(&fleet_net_doc);
-                        let fleet_engine = std::sync::Arc::clone(&fleet_net_sync);
-                        let fleet_snapshot = std::sync::Arc::clone(&fleet_net_snapshot);
+                        // ZEB-905: the fleet-coupled steps (self-row re-stamp,
+                        // epoch-window close, case-D friend refresh) capture
+                        // Options and skip when keyless; cases B/C (identity +
+                        // community records) run on every owner boot.
+                        let kt = fleet_crypto
+                            .as_ref()
+                            .map(|(kt, _)| std::sync::Arc::clone(kt));
+                        let fleet_doc = fleet_net_doc_opt.clone();
+                        let fleet_engine = fleet_net_sync_engine_opt.clone();
+                        let fleet_snapshot = fleet_net_snapshot_opt.clone();
                         let hlc_tracker = std::sync::Arc::clone(&tracker);
                         let republish_adopt_floor = adopt_floor.clone();
                         let republish_device_id = device_id.clone();
                         let ep_opt = iroh_endpoint_arc.clone();
                         // ZEB-668 S5: window-close check handles.
-                        let window_keys = keys.clone();
-                        let window_carrier = std::sync::Arc::clone(&fleet_keys_doc);
-                        let window_trust = std::sync::Arc::clone(&owner_trust_doc);
+                        let window_keys = fleet_crypto.as_ref().map(|(_, keys)| keys.clone());
+                        let window_carrier = fleet_keys_doc_opt.clone();
+                        let window_trust = owner_trust_doc_opt.clone();
                         let window_identity_dir = identity_dir.clone();
                         let window_keychain: crate::owner_commands::KeychainFactory =
                             crate::owner_commands::prod_keychain;
@@ -10421,18 +10583,18 @@ pub async fn start_node_inner(
                             let friend_pub = std::sync::Arc::clone(&friend_pub);
                             let registry = std::sync::Arc::clone(&registry);
                             let crdt_state = std::sync::Arc::clone(&crdt_state);
-                            let kt = std::sync::Arc::clone(&kt);
-                            let fleet_doc = std::sync::Arc::clone(&fleet_doc);
-                            let fleet_engine = std::sync::Arc::clone(&fleet_engine);
-                            let fleet_snapshot = std::sync::Arc::clone(&fleet_snapshot);
+                            let kt = kt.clone();
+                            let fleet_doc = fleet_doc.clone();
+                            let fleet_engine = fleet_engine.clone();
+                            let fleet_snapshot = fleet_snapshot.clone();
                             let hlc_tracker = std::sync::Arc::clone(&hlc_tracker);
                             let adopt_floor = republish_adopt_floor.clone();
                             let device_id = republish_device_id.clone();
                             let ep_opt = ep_opt.clone();
                             let connectivity_settings_path = connectivity_settings_path.clone();
                             let window_keys = window_keys.clone();
-                            let window_carrier = std::sync::Arc::clone(&window_carrier);
-                            let window_trust = std::sync::Arc::clone(&window_trust);
+                            let window_carrier = window_carrier.clone();
+                            let window_trust = window_trust.clone();
                             let window_identity_dir = window_identity_dir.clone();
                             let window_keychain = window_keychain;
                             tokio::spawn(async move {
@@ -10441,8 +10603,19 @@ pub async fn start_node_inner(
                                 //    start_node upsert. Stamp-only changes
                                 //    are NOT selection-relevant, so this
                                 //    never feeds back into the debounced
-                                //    fleet-change trigger.
-                                if let Some(ref ep) = ep_opt {
+                                //    fleet-change trigger. ZEB-905: skipped
+                                //    keyless (no fleet-net doc to stamp).
+                                if let (
+                                    Some(ep),
+                                    Some(fleet_doc),
+                                    Some(fleet_engine),
+                                    Some(fleet_snapshot),
+                                ) = (
+                                    ep_opt.as_ref(),
+                                    fleet_doc.as_ref(),
+                                    fleet_engine.as_ref(),
+                                    fleet_snapshot.as_ref(),
+                                ) {
                                     let now_ms = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
@@ -10488,7 +10661,34 @@ pub async fn start_node_inner(
                                 //     old one once every surviving device's
                                 //     fleet-net seen_at postdates the bump, or
                                 //     after 7 days — whichever comes first.
-                                if window_keys.epochs().len() > 1 {
+                                //     ZEB-905: all four handles are fleet-band
+                                //     material — keyless boots have none, and a
+                                //     single installed epoch can't close anyway.
+                                let window_close_handles = match (
+                                    &window_keys,
+                                    &window_carrier,
+                                    &window_trust,
+                                    &fleet_doc,
+                                ) {
+                                    (Some(k), Some(c), Some(t), Some(d))
+                                        if k.epochs().len() > 1 =>
+                                    {
+                                        Some((
+                                            k.clone(),
+                                            std::sync::Arc::clone(c),
+                                            std::sync::Arc::clone(t),
+                                            std::sync::Arc::clone(d),
+                                        ))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((
+                                    window_keys,
+                                    window_carrier,
+                                    window_trust,
+                                    fleet_doc,
+                                )) = window_close_handles
+                                {
                                     let (bump_ms, _carrier_epoch) = {
                                         let doc = window_carrier.lock().await;
                                         (doc.bump_wall_ms, doc.epoch)
@@ -10619,12 +10819,19 @@ pub async fn start_node_inner(
                                     state.friend_graph.friends.clone()
                                 };
                                 if !friends_snapshot.is_empty() {
-                                    crate::pkarr_friend_publisher::sync_case_d_handles(
-                                        &friend_pub,
-                                        &friends_snapshot,
-                                        &kt,
-                                    )
-                                    .await;
+                                    if let Some(kt) = kt.as_ref() {
+                                        crate::pkarr_friend_publisher::sync_case_d_handles(
+                                            &friend_pub,
+                                            &friends_snapshot,
+                                            kt,
+                                        )
+                                        .await;
+                                    } else {
+                                        tracing::debug!(
+                                            "case-D friend refresh skipped: no fleet crypto \
+                                             (local-only mode)"
+                                        );
+                                    }
                                 }
                                 tracing::debug!(
                                     identity = ?identity_reconciled,
@@ -10671,7 +10878,19 @@ pub async fn start_node_inner(
                     // already-scheduled republish. Exits when the engine
                     // shuts down (the on_applied closure owns the only
                     // nudge sender).
-                    {
+                    // ZEB-905: fleet-net is a fleet dataset — no doc, snapshot,
+                    // or nudge on a keyless boot, so the refresh task is not
+                    // spawned (routing_republish simply never gets fleet-driven
+                    // triggers).
+                    if let (
+                        Some(fleet_net_doc),
+                        Some(fleet_net_snapshot),
+                        Some(fleet_net_snap_nudge_rx),
+                    ) = (
+                        fleet_net_doc_opt.clone(),
+                        fleet_net_snapshot_opt.clone(),
+                        fleet_net_snap_nudge_rx_opt.take(),
+                    ) {
                         let task_doc = std::sync::Arc::clone(&fleet_net_doc);
                         let task_snapshot = std::sync::Arc::clone(&fleet_net_snapshot);
                         let task_vk_map = std::sync::Arc::clone(&fleet_vk_map);
@@ -11026,9 +11245,16 @@ pub async fn start_node_inner(
                                 pq_kem_pubkey: dm_local_kem_pubkey_owned.clone(),
                             }
                         });
+                        // ZEB-905: the friend accept KeyTree-seals the per-friend
+                        // rendezvous secret — impossible without fleet crypto, so
+                        // a keyless boot installs an up-front refusing dispatcher
+                        // in the friend slot instead of an acceptor that would
+                        // fail mid-handshake.
                         let friend_acceptor: std::sync::Arc<
                             dyn crate::iroh_invite_acceptor::IrohHandshakeDispatcher,
-                        > = std::sync::Arc::new(
+                        > =
+                            if let Some((kt, _)) = fleet_crypto.as_ref() {
+                                std::sync::Arc::new(
                             crate::iroh_friend_acceptor::IrohFriendHandshakeAcceptor::<
                                 std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
                             >::new(
@@ -11039,7 +11265,7 @@ pub async fn start_node_inner(
                                 None,
                                 own_enrollment_cert_for_friend.clone(),
                                 std::sync::Arc::clone(&community_signing_key_arc),
-                                std::sync::Arc::clone(&kt),
+                                std::sync::Arc::clone(kt),
                                 Some(std::sync::Arc::new(app.clone())),
                                 pkarr_invite_publisher_for_state.clone(),
                             )
@@ -11105,13 +11331,20 @@ pub async fn start_node_inner(
                             // signed accept carries this node's own-fleet
                             // revocations, built fresh per handshake (a device
                             // revoked after start_node is still carried).
-                            .with_self_trust_doc(Some(std::sync::Arc::clone(&owner_trust_doc)))
+                            .with_self_trust_doc(owner_trust_doc_opt.clone())
                             // ZEB-804: stamp served friend handshakes into the
                             // shared per-peer traffic registry.
                             .with_traffic_registry(std::sync::Arc::clone(&peer_traffic_registry))
                             // ZEB-790: node-wide bounded-adoption floor.
                             .with_adopt_floor(adopt_floor.clone()),
-                        );
+                            )
+                            } else {
+                                std::sync::Arc::new(
+                                    crate::iroh_friend_acceptor::KeylessRefusingDispatcher {
+                                        surface: "friend",
+                                    },
+                                )
+                            };
 
                         // ZEB-375 (Friends Phase 2a): build the friend-PEX
                         // referral-catalog acceptor from the SAME read-only
@@ -11141,7 +11374,14 @@ pub async fn start_node_inner(
                             // the `IntroduceRequest` arm can dial X and relay the
                             // signed Introduction.
                             .with_pkarr_resolver(pkarr_resolver_for_state.clone())
-                            .with_owner_keytree(Some(std::sync::Arc::clone(&kt)))
+                            // ZEB-905: Option-shaped from birth — None on a
+                            // keyless boot degrades the IntroduceRequest arm
+                            // (no friend-secret seal) while browse stays live.
+                            .with_owner_keytree(
+                                fleet_crypto
+                                    .as_ref()
+                                    .map(|(kt, _)| std::sync::Arc::clone(kt)),
+                            )
                             .with_iroh_endpoint(iroh_endpoint_arc.clone())
                             // ZEB-376 Task 10: thread X's self-dial handles so the
                             // `Introduction` arm can rebuild X's own dialer
@@ -11178,8 +11418,9 @@ pub async fn start_node_inner(
                             .with_revoked(revoked_device_projection.clone())
                             // ZEB-680 §2: wire the LIVE owner trust doc so X's
                             // auto-Proceed introduction link carries X's own-fleet
-                            // revocations (built fresh per introduction).
-                            .with_self_trust_doc(Some(std::sync::Arc::clone(&owner_trust_doc)))
+                            // revocations (built fresh per introduction). ZEB-905:
+                            // None on keyless boots (no fleet trust doc).
+                            .with_self_trust_doc(owner_trust_doc_opt.clone())
                             // ZEB-804: stamp served PEX requests into the shared
                             // per-peer traffic registry.
                             .with_traffic_registry(std::sync::Arc::clone(&peer_traffic_registry))
@@ -11226,6 +11467,12 @@ pub async fn start_node_inner(
                         // `harmony/butler-deposit/v1` connections
                         // gracefully until this set lands).
                         //
+                        // ZEB-905: the dm-inbox is a fleet dataset — a keyless
+                        // boot has no inbox doc to deposit into, so the butler
+                        // deposit acceptor is not installed (pre-install
+                        // connections keep closing gracefully, exactly the
+                        // not-yet-installed behavior).
+                        //
                         // `community_signing_key_arc` IS this device's
                         // cert-bound ed25519 signing key (the clone of
                         // `loaded.device_signing_key` made above) — its
@@ -11233,55 +11480,74 @@ pub async fn start_node_inner(
                         // publishes as `vk`, so `ed25519_priv_to_x25519`
                         // of it is exactly the seal target senders derive
                         // as `birational(vk)`.
-                        let deposit_ctx: std::sync::Arc<
-                            dyn crate::iroh_butler_acceptor::ButlerDepositCtx,
-                        > = std::sync::Arc::new(
-                            crate::iroh_butler_acceptor::ProdButlerDepositCtx {
-                                self_owner: self_owner.0,
-                                device_id: device_id.clone(),
-                                crdt_state: std::sync::Arc::clone(&crdt_state),
-                                device_x25519_priv: crate::dm_signing::ed25519_priv_to_x25519(
-                                    &community_signing_key_arc,
+                        if let (
+                            Some(dm_inbox_doc),
+                            Some(dm_inbox_tracker),
+                            Some(dm_inbox_sync),
+                            Some(dm_inbox_nudge_weak),
+                        ) = (
+                            dm_inbox_doc_opt.clone(),
+                            dm_inbox_tracker_opt.clone(),
+                            dm_inbox_sync_engine_opt.clone(),
+                            dm_inbox_nudge_weak_opt.clone(),
+                        ) {
+                            let deposit_ctx: std::sync::Arc<
+                                dyn crate::iroh_butler_acceptor::ButlerDepositCtx,
+                            > = std::sync::Arc::new(
+                                crate::iroh_butler_acceptor::ProdButlerDepositCtx {
+                                    self_owner: self_owner.0,
+                                    device_id: device_id.clone(),
+                                    crdt_state: std::sync::Arc::clone(&crdt_state),
+                                    device_x25519_priv: crate::dm_signing::ed25519_priv_to_x25519(
+                                        &community_signing_key_arc,
+                                    ),
+                                    dm_inbox_doc: std::sync::Arc::clone(&dm_inbox_doc),
+                                    dm_inbox_tracker: std::sync::Arc::clone(&dm_inbox_tracker),
+                                    adopt_floor: adopt_floor.clone(),
+                                    dm_inbox_engine: std::sync::Arc::clone(&dm_inbox_sync),
+                                    ingest_nudge: dm_inbox_nudge_weak.clone(),
+                                },
+                            );
+                            let butler_acceptor = std::sync::Arc::new(
+                                crate::iroh_butler_acceptor::IrohButlerDepositAcceptor::new(
+                                    deposit_ctx,
+                                )
+                                // ZEB-804: stamp accepted deposits into the shared
+                                // per-peer traffic registry.
+                                .with_traffic_registry(
+                                    std::sync::Arc::clone(&peer_traffic_registry),
                                 ),
-                                dm_inbox_doc: std::sync::Arc::clone(&dm_inbox_doc),
-                                dm_inbox_tracker: std::sync::Arc::clone(&dm_inbox_tracker),
-                                adopt_floor: adopt_floor.clone(),
-                                dm_inbox_engine: std::sync::Arc::clone(&dm_inbox_sync),
-                                ingest_nudge: dm_inbox_nudge_weak.clone(),
-                            },
-                        );
-                        let butler_acceptor = std::sync::Arc::new(
-                            crate::iroh_butler_acceptor::IrohButlerDepositAcceptor::new(
-                                deposit_ctx,
-                            )
-                            // ZEB-804: stamp accepted deposits into the shared
-                            // per-peer traffic registry.
-                            .with_traffic_registry(std::sync::Arc::clone(&peer_traffic_registry)),
-                        );
-                        // ZEB-702 T5 (Component D): capture the decision-counter
-                        // handle before the acceptor moves into the link manager,
-                        // but hand it to the outer scope (for the NH build — this
-                        // block closes first) only on SUCCESSFUL install. In the
-                        // OnceLock-refusal branch the link manager keeps the PRIOR
-                        // acceptor, whose stats handle is unreachable here —
-                        // surfacing this orphan's zeroed counters would misreport,
-                        // so the snapshot section honestly stays absent.
-                        let butler_deposit_stats = butler_acceptor.deposit_stats();
-                        if link_mgr
-                            .install_butler_deposit_acceptor(butler_acceptor)
-                            .is_err()
-                        {
-                            // Pre-installed (OnceLock refused the second
-                            // set). Production shouldn't hit this — log so
-                            // it's diagnosable if it ever fires (mirrors
-                            // the handshake-dispatcher branch above).
-                            tracing::warn!(
-                                "ZEB-418: butler deposit acceptor already \
+                            );
+                            // ZEB-702 T5 (Component D): capture the decision-counter
+                            // handle before the acceptor moves into the link manager,
+                            // but hand it to the outer scope (for the NH build — this
+                            // block closes first) only on SUCCESSFUL install. In the
+                            // OnceLock-refusal branch the link manager keeps the PRIOR
+                            // acceptor, whose stats handle is unreachable here —
+                            // surfacing this orphan's zeroed counters would misreport,
+                            // so the snapshot section honestly stays absent.
+                            let butler_deposit_stats = butler_acceptor.deposit_stats();
+                            if link_mgr
+                                .install_butler_deposit_acceptor(butler_acceptor)
+                                .is_err()
+                            {
+                                // Pre-installed (OnceLock refused the second
+                                // set). Production shouldn't hit this — log so
+                                // it's diagnosable if it ever fires (mirrors
+                                // the handshake-dispatcher branch above).
+                                tracing::warn!(
+                                    "ZEB-418: butler deposit acceptor already \
                                  installed on iroh link manager — keeping \
                                  the prior instance"
-                            );
+                                );
+                            } else {
+                                butler_deposit_stats_for_state = Some(butler_deposit_stats);
+                            }
                         } else {
-                            butler_deposit_stats_for_state = Some(butler_deposit_stats);
+                            tracing::info!(
+                                "butler deposit acceptor not installed: no fleet crypto \
+                                 (local-only mode)"
+                            );
                         }
 
                         // ── ZEB-473 (DM-over-iroh, Move 1a) Task 6/7: build the
@@ -11541,51 +11807,72 @@ pub async fn start_node_inner(
                         //    (advertises THIS node), and the GC sweep are
                         //    unchanged.
 
-                        // One shared registry-backed membership lookup, reused by
-                        // every relay ctx/client built below.
-                        let relay_membership: std::sync::Arc<
-                            dyn crate::community_relay_prod::CommunityMembershipLookup,
-                        > = std::sync::Arc::new(
-                            crate::community_relay_prod::ProdCommunityMembershipLookup {
-                                registry: std::sync::Arc::clone(&registry),
-                            },
-                        );
+                        // ZEB-905: blocks B–E below all ride the relay-hold /
+                        // relay-optin fleet docs (deposit/pull acceptors, pull
+                        // driver, sender deposit client, relay publisher). One
+                        // gate for the whole stretch; a keyless boot still
+                        // RESOLVES community relays (address-book ingest feeds
+                        // the resolver above) — it just cannot SERVE as one.
+                        if let (
+                            Some(relay_hold_doc),
+                            Some(relay_hold_tracker),
+                            Some(relay_hold_sync),
+                            Some(relay_optin_doc),
+                        ) = (
+                            relay_hold_doc_opt.clone(),
+                            relay_hold_tracker_opt.clone(),
+                            relay_hold_sync_engine_opt.clone(),
+                            relay_optin_doc_opt.clone(),
+                        ) {
+                            // One shared registry-backed membership lookup, reused by
+                            // every relay ctx/client built below.
+                            let relay_membership: std::sync::Arc<
+                                dyn crate::community_relay_prod::CommunityMembershipLookup,
+                            > = std::sync::Arc::new(
+                                crate::community_relay_prod::ProdCommunityMembershipLookup {
+                                    registry: std::sync::Arc::clone(&registry),
+                                },
+                            );
 
-                        // B. Deposit + pull acceptors over the relay-hold/optin
-                        //    runtime Arcs (the SAME in-scope Arcs the T11a engines
-                        //    were built from). `device_id` IS the 64-hex of this
-                        //    device's ed25519 verify key (same form butler uses),
-                        //    stamped as `held_by`.
-                        let relay_deposit_ctx: std::sync::Arc<
-                            dyn crate::iroh_community_relay_acceptor::RelayDepositCtx,
-                        > = std::sync::Arc::new(crate::community_relay_prod::ProdRelayDepositCtx {
-                            self_owner: self_owner.0,
-                            relay_device_id: device_id.clone(),
-                            relay_hold_doc: std::sync::Arc::clone(&relay_hold_doc),
-                            relay_hold_tracker: std::sync::Arc::clone(&relay_hold_tracker),
-                            adopt_floor: adopt_floor.clone(),
-                            flush: std::sync::Arc::new(
-                                crate::community_relay_prod::EngineRelayHoldFlush(
-                                    std::sync::Arc::clone(&relay_hold_sync),
-                                ),
-                            ),
-                            optin: std::sync::Arc::clone(&relay_optin_doc),
-                            membership: std::sync::Arc::clone(&relay_membership),
-                        });
-                        let relay_pull_ctx: std::sync::Arc<
-                            dyn crate::iroh_community_relay_acceptor::RelayPullCtx,
-                        > = std::sync::Arc::new(crate::community_relay_prod::ProdRelayPullCtx {
-                            self_owner: self_owner.0,
-                            relay_hold_doc: std::sync::Arc::clone(&relay_hold_doc),
-                            flush: std::sync::Arc::new(
-                                crate::community_relay_prod::EngineRelayHoldFlush(
-                                    std::sync::Arc::clone(&relay_hold_sync),
-                                ),
-                            ),
-                            optin: std::sync::Arc::clone(&relay_optin_doc),
-                            membership: std::sync::Arc::clone(&relay_membership),
-                        });
-                        if link_mgr
+                            // B. Deposit + pull acceptors over the relay-hold/optin
+                            //    runtime Arcs (the SAME in-scope Arcs the T11a engines
+                            //    were built from). `device_id` IS the 64-hex of this
+                            //    device's ed25519 verify key (same form butler uses),
+                            //    stamped as `held_by`.
+                            let relay_deposit_ctx: std::sync::Arc<
+                                dyn crate::iroh_community_relay_acceptor::RelayDepositCtx,
+                            > = std::sync::Arc::new(
+                                crate::community_relay_prod::ProdRelayDepositCtx {
+                                    self_owner: self_owner.0,
+                                    relay_device_id: device_id.clone(),
+                                    relay_hold_doc: std::sync::Arc::clone(&relay_hold_doc),
+                                    relay_hold_tracker: std::sync::Arc::clone(&relay_hold_tracker),
+                                    adopt_floor: adopt_floor.clone(),
+                                    flush: std::sync::Arc::new(
+                                        crate::community_relay_prod::EngineRelayHoldFlush(
+                                            std::sync::Arc::clone(&relay_hold_sync),
+                                        ),
+                                    ),
+                                    optin: std::sync::Arc::clone(&relay_optin_doc),
+                                    membership: std::sync::Arc::clone(&relay_membership),
+                                },
+                            );
+                            let relay_pull_ctx: std::sync::Arc<
+                                dyn crate::iroh_community_relay_acceptor::RelayPullCtx,
+                            > = std::sync::Arc::new(
+                                crate::community_relay_prod::ProdRelayPullCtx {
+                                    self_owner: self_owner.0,
+                                    relay_hold_doc: std::sync::Arc::clone(&relay_hold_doc),
+                                    flush: std::sync::Arc::new(
+                                        crate::community_relay_prod::EngineRelayHoldFlush(
+                                            std::sync::Arc::clone(&relay_hold_sync),
+                                        ),
+                                    ),
+                                    optin: std::sync::Arc::clone(&relay_optin_doc),
+                                    membership: std::sync::Arc::clone(&relay_membership),
+                                },
+                            );
+                            if link_mgr
                             .install_community_relay_deposit_acceptor(std::sync::Arc::new(
                                 crate::iroh_community_relay_acceptor::IrohCommunityRelayDepositAcceptor::new(
                                     // ZEB-524: the deposit client below shares this
@@ -11608,13 +11895,13 @@ pub async fn start_node_inner(
                                  instance"
                             );
                         }
-                        // ZEB-803: build the serving telemetry here and keep a
-                        // clone for the health service — the acceptor itself is
-                        // moved into the link manager and is unreachable after.
-                        let relay_serving_telemetry = std::sync::Arc::new(
-                            crate::network_health::CommunityRelayServingTelemetry::new(),
-                        );
-                        if link_mgr
+                            // ZEB-803: build the serving telemetry here and keep a
+                            // clone for the health service — the acceptor itself is
+                            // moved into the link manager and is unreachable after.
+                            let relay_serving_telemetry = std::sync::Arc::new(
+                                crate::network_health::CommunityRelayServingTelemetry::new(),
+                            );
+                            if link_mgr
                             .install_community_relay_pull_acceptor(std::sync::Arc::new(
                                 crate::iroh_community_relay_acceptor::IrohCommunityRelayPullAcceptor::new(
                                     // ZEB-806: the pull driver below shares this
@@ -11658,114 +11945,119 @@ pub async fn start_node_inner(
                                 Some(relay_serving_telemetry);
                         }
 
-                        // ZEB-811: install the vine-relay serve acceptor
-                        // (public-read descriptor + content fan-out). Ctx
-                        // holds the SAME vine_feed_cache + content_store Arcs
-                        // already in scope; the acceptor's telemetry Arc is
-                        // built here (mirroring the community-relay serving
-                        // telemetry just above) so Task 8 can pick it up for
-                        // the health-snapshot wiring without re-touching this
-                        // install site's shape.
-                        let vine_relay_serving_telemetry = std::sync::Arc::new(
-                            crate::network_health::VineRelayServingTelemetry::new(),
-                        );
-                        let vine_relay_ctx: std::sync::Arc<
-                            dyn crate::vine_relay::VineRelayServeCtx,
-                        > = std::sync::Arc::new(crate::vine_relay::ProdVineRelayServeCtx {
-                            cache: std::sync::Arc::clone(&vine_feed_cache),
-                            content_store: std::sync::Arc::clone(&content_store),
-                            // ZEB-811 final review: request-time share gate +
-                            // own-creator scope — see `ProdVineRelayServeCtx`
-                            // doc. Same atomic `PkarrVinesPublisher` toggles.
-                            own_creator_addr: node_addr.clone(),
-                            share_gate: std::sync::Arc::clone(&vine_share_publicly_gate),
-                        });
-                        if link_mgr
-                            .install_vine_relay_acceptor(std::sync::Arc::new(
-                                crate::vine_relay::VineRelayAcceptor::new(vine_relay_ctx)
-                                    .with_telemetry(std::sync::Arc::clone(
-                                        &vine_relay_serving_telemetry,
-                                    ))
-                                    // ZEB-804: stamp served vine sessions into
-                                    // the shared per-peer traffic registry.
-                                    .with_traffic_registry(std::sync::Arc::clone(
-                                        &peer_traffic_registry,
-                                    )),
-                            ))
-                            .is_err()
-                        {
-                            tracing::warn!(
-                                "ZEB-811: vine-relay acceptor already installed on \
-                                 iroh link manager — keeping the prior instance"
+                            // ZEB-811: install the vine-relay serve acceptor
+                            // (public-read descriptor + content fan-out). Ctx
+                            // holds the SAME vine_feed_cache + content_store Arcs
+                            // already in scope; the acceptor's telemetry Arc is
+                            // built here (mirroring the community-relay serving
+                            // telemetry just above) so Task 8 can pick it up for
+                            // the health-snapshot wiring without re-touching this
+                            // install site's shape.
+                            let vine_relay_serving_telemetry = std::sync::Arc::new(
+                                crate::network_health::VineRelayServingTelemetry::new(),
                             );
-                        } else {
-                            // ZEB-811 Task 8: publish the source ONLY on the
-                            // success path, mirroring the community-relay
-                            // serving telemetry above (CodeRabbit, PR #556) —
-                            // otherwise a duplicate-install warning would leave
-                            // this telemetry attached to an acceptor instance
-                            // nobody holds, sitting at zero forever while the
-                            // live (prior) acceptor serves normally.
-                            vine_relay_serving_telemetry_for_state =
-                                Some(vine_relay_serving_telemetry);
-                        }
-
-                        // C/D/E. The pull driver, sender deposit client, and
-                        //    publisher all need the iroh endpoint (dial/announce
-                        //    coordinates). Gate the whole rung on a bound
-                        //    endpoint + a canonicalizable own cert — without
-                        //    either there is no relay transport, exactly like the
-                        //    butler rung above.
-                        if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
-                            match harmony_owner::cbor::to_canonical(&own_enrollment_cert_for_friend)
+                            let vine_relay_ctx: std::sync::Arc<
+                                dyn crate::vine_relay::VineRelayServeCtx,
+                            > = std::sync::Arc::new(crate::vine_relay::ProdVineRelayServeCtx {
+                                cache: std::sync::Arc::clone(&vine_feed_cache),
+                                content_store: std::sync::Arc::clone(&content_store),
+                                // ZEB-811 final review: request-time share gate +
+                                // own-creator scope — see `ProdVineRelayServeCtx`
+                                // doc. Same atomic `PkarrVinesPublisher` toggles.
+                                own_creator_addr: node_addr.clone(),
+                                share_gate: std::sync::Arc::clone(&vine_share_publicly_gate),
+                            });
+                            if link_mgr
+                                .install_vine_relay_acceptor(std::sync::Arc::new(
+                                    crate::vine_relay::VineRelayAcceptor::new(vine_relay_ctx)
+                                        .with_telemetry(std::sync::Arc::clone(
+                                            &vine_relay_serving_telemetry,
+                                        ))
+                                        // ZEB-804: stamp served vine sessions into
+                                        // the shared per-peer traffic registry.
+                                        .with_traffic_registry(std::sync::Arc::clone(
+                                            &peer_traffic_registry,
+                                        )),
+                                ))
+                                .is_err()
                             {
-                                Ok(relay_cert_bytes) => {
-                                    // C. Recipient pull path: ingest ctx +
-                                    //    transport + background pull driver. The
-                                    //    ingest ctx runs pulled blobs through the
-                                    //    SAME normal DM receive path (sink =
-                                    //    `app`, identical to ProdDmInboxIngestCtx).
-                                    let relay_ingest_ctx: std::sync::Arc<
-                                        dyn crate::community_relay_pull::RelayIngestCtx,
-                                    > = std::sync::Arc::new(
-                                        crate::community_relay_prod::ProdRelayIngestCtx {
-                                            device_id: device_id.clone(),
-                                            device_x25519_privs: vec![
-                                                crate::dm_signing::ed25519_priv_to_x25519(
-                                                    &community_signing_key_arc,
+                                tracing::warn!(
+                                    "ZEB-811: vine-relay acceptor already installed on \
+                                 iroh link manager — keeping the prior instance"
+                                );
+                            } else {
+                                // ZEB-811 Task 8: publish the source ONLY on the
+                                // success path, mirroring the community-relay
+                                // serving telemetry above (CodeRabbit, PR #556) —
+                                // otherwise a duplicate-install warning would leave
+                                // this telemetry attached to an acceptor instance
+                                // nobody holds, sitting at zero forever while the
+                                // live (prior) acceptor serves normally.
+                                vine_relay_serving_telemetry_for_state =
+                                    Some(vine_relay_serving_telemetry);
+                            }
+
+                            // C/D/E. The pull driver, sender deposit client, and
+                            //    publisher all need the iroh endpoint (dial/announce
+                            //    coordinates). Gate the whole rung on a bound
+                            //    endpoint + a canonicalizable own cert — without
+                            //    either there is no relay transport, exactly like the
+                            //    butler rung above.
+                            if let Some(ep_arc) = iroh_endpoint_arc.as_ref() {
+                                match harmony_owner::cbor::to_canonical(
+                                    &own_enrollment_cert_for_friend,
+                                ) {
+                                    Ok(relay_cert_bytes) => {
+                                        // C. Recipient pull path: ingest ctx +
+                                        //    transport + background pull driver. The
+                                        //    ingest ctx runs pulled blobs through the
+                                        //    SAME normal DM receive path (sink =
+                                        //    `app`, identical to ProdDmInboxIngestCtx).
+                                        let relay_ingest_ctx: std::sync::Arc<
+                                            dyn crate::community_relay_pull::RelayIngestCtx,
+                                        > = std::sync::Arc::new(
+                                            crate::community_relay_prod::ProdRelayIngestCtx {
+                                                device_id: device_id.clone(),
+                                                device_x25519_privs: vec![
+                                                    crate::dm_signing::ed25519_priv_to_x25519(
+                                                        &community_signing_key_arc,
+                                                    ),
+                                                ],
+                                                // ZEB-483: this node's own OwnerAddr (the
+                                                // deposit recipient) — bootstraps the DM
+                                                // Space from a relay-held deposited invite
+                                                // on recover (apply_deposited_invite).
+                                                self_owner,
+                                                crdt_state: std::sync::Arc::clone(&crdt_state),
+                                                content_store: std::sync::Arc::clone(
+                                                    &content_store,
                                                 ),
-                                            ],
-                                            // ZEB-483: this node's own OwnerAddr (the
-                                            // deposit recipient) — bootstraps the DM
-                                            // Space from a relay-held deposited invite
-                                            // on recover (apply_deposited_invite).
-                                            self_owner,
-                                            crdt_state: std::sync::Arc::clone(&crdt_state),
-                                            content_store: std::sync::Arc::clone(&content_store),
-                                            sink: app.clone(),
-                                            // ZEB-236: stage non-friend
-                                            // relay-recovered invites + emit.
-                                            pending_dm_invites: Some(std::sync::Arc::clone(
-                                                &pending_dm_invites_for_state,
-                                            )),
-                                            // ZEB-580 S2: shared-community
-                                            // revocation cutoff handle.
-                                            revoked: revoked_device_projection.clone(),
-                                            // ZEB-709: relay-recovered writes
-                                            // into owner-state must arm ITS
-                                            // engine's flush (the relay ack +
-                                            // coverage-GC otherwise outrun the
-                                            // un-persisted payload).
-                                            notify_owner_state_dirty: {
-                                                let e = std::sync::Arc::clone(
-                                                    &owner_state_engine_for_dirty,
-                                                );
-                                                Some(std::sync::Arc::new(move || e.notify_dirty())
-                                                    as std::sync::Arc<dyn Fn() + Send + Sync>)
+                                                sink: app.clone(),
+                                                // ZEB-236: stage non-friend
+                                                // relay-recovered invites + emit.
+                                                pending_dm_invites: Some(std::sync::Arc::clone(
+                                                    &pending_dm_invites_for_state,
+                                                )),
+                                                // ZEB-580 S2: shared-community
+                                                // revocation cutoff handle.
+                                                revoked: revoked_device_projection.clone(),
+                                                // ZEB-709: relay-recovered writes
+                                                // into owner-state must arm ITS
+                                                // engine's flush (the relay ack +
+                                                // coverage-GC otherwise outrun the
+                                                // un-persisted payload).
+                                                notify_owner_state_dirty: {
+                                                    let e = std::sync::Arc::clone(
+                                                        &owner_state_engine_for_dirty,
+                                                    );
+                                                    Some(std::sync::Arc::new(move || {
+                                                        e.notify_dirty()
+                                                    })
+                                                        as std::sync::Arc<dyn Fn() + Send + Sync>)
+                                                },
                                             },
-                                        },
-                                    );
-                                    let relay_pull_transport: std::sync::Arc<
+                                        );
+                                        let relay_pull_transport: std::sync::Arc<
                                         dyn crate::community_relay_pull_driver::RelayPullTransport,
                                     > = std::sync::Arc::new(
                                         crate::community_relay_pull_driver::IrohRelayPullTransport {
@@ -11776,77 +12068,83 @@ pub async fn start_node_inner(
                                         },
                                     );
 
-                                    // Joined-communities snapshot + a refresher
-                                    // task. The driver reads the snapshot through
-                                    // a sync closure (no await); this spawned
-                                    // background task (re)materializes joined-ness
-                                    // on an immediate first pass then every ~60s,
-                                    // writing back the snapshot. The pull driver's
-                                    // first pass may observe an empty snapshot
-                                    // until the refresher's first pass completes
-                                    // (acceptable — the periodic pull cadence and
-                                    // the resolver wake catch up). This avoids any
-                                    // inline await into an event-loop channel.
-                                    let joined_snapshot =
-                                        std::sync::Arc::new(std::sync::Mutex::new(Vec::<
-                                            crate::owner_state_types::SpaceId,
-                                        >::new(
-                                        )));
-                                    {
-                                        let refresher_registry = std::sync::Arc::clone(&registry);
-                                        let refresher_membership =
-                                            std::sync::Arc::clone(&relay_membership);
-                                        let refresher_snapshot =
-                                            std::sync::Arc::clone(&joined_snapshot);
-                                        let refresher_self_owner = self_owner.0;
-                                        community_relay_refresher_handle_opt =
-                                            Some(tokio::spawn(async move {
-                                                let mut ticker = tokio::time::interval(
-                                                    std::time::Duration::from_secs(60),
-                                                );
-                                                // After a slow refresh pass
-                                                // (many communities), Tokio's
-                                                // default `Burst` behavior would
-                                                // fire every missed tick
-                                                // back-to-back. `Skip` collapses
-                                                // the backlog to a single tick on
-                                                // the next period boundary.
-                                                ticker.set_missed_tick_behavior(
-                                                    tokio::time::MissedTickBehavior::Skip,
-                                                );
-                                                loop {
-                                                    let ids = refresher_registry.known_ids().await;
-                                                    let mut joined = Vec::new();
-                                                    for c in ids {
-                                                        if refresher_membership
-                                                            .is_joined(&c, &refresher_self_owner)
-                                                            .await
-                                                        {
-                                                            joined.push(c);
+                                        // Joined-communities snapshot + a refresher
+                                        // task. The driver reads the snapshot through
+                                        // a sync closure (no await); this spawned
+                                        // background task (re)materializes joined-ness
+                                        // on an immediate first pass then every ~60s,
+                                        // writing back the snapshot. The pull driver's
+                                        // first pass may observe an empty snapshot
+                                        // until the refresher's first pass completes
+                                        // (acceptable — the periodic pull cadence and
+                                        // the resolver wake catch up). This avoids any
+                                        // inline await into an event-loop channel.
+                                        let joined_snapshot =
+                                            std::sync::Arc::new(std::sync::Mutex::new(Vec::<
+                                                crate::owner_state_types::SpaceId,
+                                            >::new(
+                                            )));
+                                        {
+                                            let refresher_registry =
+                                                std::sync::Arc::clone(&registry);
+                                            let refresher_membership =
+                                                std::sync::Arc::clone(&relay_membership);
+                                            let refresher_snapshot =
+                                                std::sync::Arc::clone(&joined_snapshot);
+                                            let refresher_self_owner = self_owner.0;
+                                            community_relay_refresher_handle_opt =
+                                                Some(tokio::spawn(async move {
+                                                    let mut ticker = tokio::time::interval(
+                                                        std::time::Duration::from_secs(60),
+                                                    );
+                                                    // After a slow refresh pass
+                                                    // (many communities), Tokio's
+                                                    // default `Burst` behavior would
+                                                    // fire every missed tick
+                                                    // back-to-back. `Skip` collapses
+                                                    // the backlog to a single tick on
+                                                    // the next period boundary.
+                                                    ticker.set_missed_tick_behavior(
+                                                        tokio::time::MissedTickBehavior::Skip,
+                                                    );
+                                                    loop {
+                                                        let ids =
+                                                            refresher_registry.known_ids().await;
+                                                        let mut joined = Vec::new();
+                                                        for c in ids {
+                                                            if refresher_membership
+                                                                .is_joined(
+                                                                    &c,
+                                                                    &refresher_self_owner,
+                                                                )
+                                                                .await
+                                                            {
+                                                                joined.push(c);
+                                                            }
                                                         }
+                                                        *refresher_snapshot
+                                                            .lock()
+                                                            .unwrap_or_else(|p| p.into_inner()) =
+                                                            joined;
+                                                        ticker.tick().await;
                                                     }
-                                                    *refresher_snapshot
-                                                        .lock()
-                                                        .unwrap_or_else(|p| p.into_inner()) =
-                                                        joined;
-                                                    ticker.tick().await;
-                                                }
-                                            }));
-                                    }
-                                    let joined_communities: crate::community_relay_pull_driver::JoinedCommunitiesFn = {
+                                                }));
+                                        }
+                                        let joined_communities: crate::community_relay_pull_driver::JoinedCommunitiesFn = {
                                         let s = std::sync::Arc::clone(&joined_snapshot);
                                         std::sync::Arc::new(move || {
                                             s.lock().unwrap_or_else(|p| p.into_inner()).clone()
                                         })
                                     };
-                                    // ZEB-803: pull-side telemetry. Cloned out
-                                    // before the driver is moved into `spawn`.
-                                    let relay_pull_telemetry = std::sync::Arc::new(
-                                        crate::network_health::CommunityRelayPullTelemetry::new(),
-                                    );
-                                    community_relay_pull_telemetry_for_state =
-                                        Some(std::sync::Arc::clone(&relay_pull_telemetry));
-                                    let pull_driver = std::sync::Arc::new(
+                                        // ZEB-803: pull-side telemetry. Cloned out
+                                        // before the driver is moved into `spawn`.
+                                        let relay_pull_telemetry = std::sync::Arc::new(
+                                            crate::network_health::CommunityRelayPullTelemetry::new(
+                                            ),
+                                        );
+                                        community_relay_pull_telemetry_for_state =
+                                            Some(std::sync::Arc::clone(&relay_pull_telemetry));
+                                        let pull_driver = std::sync::Arc::new(
                                         crate::community_relay_pull_driver::CommunityRelayPullDriver::new(
                                             self_owner.0,
                                             relay_cert_bytes.clone(),
@@ -11867,22 +12165,22 @@ pub async fn start_node_inner(
                                             &relay_pull_ctx,
                                         )),
                                     );
-                                    community_relay_pull_driver_handle_opt =
-                                        Some(pull_driver.spawn());
+                                        community_relay_pull_driver_handle_opt =
+                                            Some(pull_driver.spawn());
 
-                                    // ZEB-811 Task 8: vine-pull follower
-                                    // driver. Spawned in this same
-                                    // iroh-endpoint gate as the community-relay
-                                    // wiring above, but needs none of that
-                                    // wiring's dial-cert material — only this
-                                    // device's own iroh endpoint id (to filter
-                                    // a creator's self-relay entry, ZEB-806)
-                                    // and a dial deadline. `driver.spawn()`
-                                    // returns immediately (the loop runs in
-                                    // its own task) — never inline-awaited
-                                    // here, per the start_node inline-await
-                                    // hazard.
-                                    let vine_pull_transport: std::sync::Arc<
+                                        // ZEB-811 Task 8: vine-pull follower
+                                        // driver. Spawned in this same
+                                        // iroh-endpoint gate as the community-relay
+                                        // wiring above, but needs none of that
+                                        // wiring's dial-cert material — only this
+                                        // device's own iroh endpoint id (to filter
+                                        // a creator's self-relay entry, ZEB-806)
+                                        // and a dial deadline. `driver.spawn()`
+                                        // returns immediately (the loop runs in
+                                        // its own task) — never inline-awaited
+                                        // here, per the start_node inline-await
+                                        // hazard.
+                                        let vine_pull_transport: std::sync::Arc<
                                         dyn crate::vine_pull_driver::VinePullTransport,
                                     > = std::sync::Arc::new(
                                         crate::vine_pull_driver::IrohVinePullTransport {
@@ -11892,88 +12190,90 @@ pub async fn start_node_inner(
                                             ),
                                         },
                                     );
-                                    let vine_pull_ingest: std::sync::Arc<
-                                        dyn crate::vine_pull_driver::VineIngestCtx,
-                                    > = std::sync::Arc::new(
-                                        crate::vine_pull_driver::ProdVineIngestCtx {
-                                            cache: std::sync::Arc::clone(&vine_feed_cache),
-                                            followed_set: std::sync::Arc::clone(&followed_set),
-                                        },
-                                    );
-                                    let vine_pull_followed_set =
-                                        std::sync::Arc::clone(&followed_set);
-                                    let vine_pull_followed_creators: crate::vine_pull_driver::FollowedCreatorsFn =
+                                        let vine_pull_ingest: std::sync::Arc<
+                                            dyn crate::vine_pull_driver::VineIngestCtx,
+                                        > = std::sync::Arc::new(
+                                            crate::vine_pull_driver::ProdVineIngestCtx {
+                                                cache: std::sync::Arc::clone(&vine_feed_cache),
+                                                followed_set: std::sync::Arc::clone(&followed_set),
+                                            },
+                                        );
+                                        let vine_pull_followed_set =
+                                            std::sync::Arc::clone(&followed_set);
+                                        let vine_pull_followed_creators: crate::vine_pull_driver::FollowedCreatorsFn =
                                         std::sync::Arc::new(move || {
                                             vine_pull_followed_set
                                                 .lock()
                                                 .map(|g| g.iter().cloned().collect())
                                                 .unwrap_or_default()
                                         });
-                                    let vine_pull_cache_for_recency =
-                                        std::sync::Arc::clone(&vine_feed_cache);
-                                    let vine_pull_last_received_ms: crate::vine_pull_driver::LastReceivedMsFn =
+                                        let vine_pull_cache_for_recency =
+                                            std::sync::Arc::clone(&vine_feed_cache);
+                                        let vine_pull_last_received_ms: crate::vine_pull_driver::LastReceivedMsFn =
                                         std::sync::Arc::new(move |creator: &str| {
                                             vine_pull_cache_for_recency
                                                 .lock()
                                                 .ok()
                                                 .and_then(|c| c.last_received_ms_for_creator(creator))
                                         });
-                                    let vine_pull_telemetry = std::sync::Arc::new(
-                                        crate::network_health::VinePullTelemetry::new(),
-                                    );
-                                    vine_pull_telemetry_for_state =
-                                        Some(std::sync::Arc::clone(&vine_pull_telemetry));
-                                    let vine_pull_driver = std::sync::Arc::new(
-                                        crate::vine_pull_driver::VinePullDriver::new(
-                                            *ep_arc.node_id().as_bytes(),
-                                            std::sync::Arc::clone(&pkarr_resolver_arc),
-                                            vine_pull_transport,
-                                            vine_pull_ingest,
-                                            vine_pull_followed_creators,
-                                            vine_pull_last_received_ms,
-                                            app_data_dir.join("vine_pull.cbor"),
-                                        )
-                                        .with_telemetry(vine_pull_telemetry),
-                                    );
-                                    vine_pull_wake_opt = Some(vine_pull_driver.wake_handle());
-                                    // ZEB-811 Task 9: clone the Arc BEFORE
-                                    // `.spawn()` below moves the original
-                                    // (its receiver is `self: Arc<Self>`) —
-                                    // this clone is what NodeState stashes
-                                    // for `cached_relays_for` reads; the one
-                                    // `.spawn()` takes only ever powers the
-                                    // background loop.
-                                    vine_pull_driver_opt =
-                                        Some(std::sync::Arc::clone(&vine_pull_driver));
-                                    vine_pull_driver_handle_opt = Some(vine_pull_driver.spawn());
+                                        let vine_pull_telemetry = std::sync::Arc::new(
+                                            crate::network_health::VinePullTelemetry::new(),
+                                        );
+                                        vine_pull_telemetry_for_state =
+                                            Some(std::sync::Arc::clone(&vine_pull_telemetry));
+                                        let vine_pull_driver = std::sync::Arc::new(
+                                            crate::vine_pull_driver::VinePullDriver::new(
+                                                *ep_arc.node_id().as_bytes(),
+                                                std::sync::Arc::clone(&pkarr_resolver_arc),
+                                                vine_pull_transport,
+                                                vine_pull_ingest,
+                                                vine_pull_followed_creators,
+                                                vine_pull_last_received_ms,
+                                                app_data_dir.join("vine_pull.cbor"),
+                                            )
+                                            .with_telemetry(vine_pull_telemetry),
+                                        );
+                                        vine_pull_wake_opt = Some(vine_pull_driver.wake_handle());
+                                        // ZEB-811 Task 9: clone the Arc BEFORE
+                                        // `.spawn()` below moves the original
+                                        // (its receiver is `self: Arc<Self>`) —
+                                        // this clone is what NodeState stashes
+                                        // for `cached_relays_for` reads; the one
+                                        // `.spawn()` takes only ever powers the
+                                        // background loop.
+                                        vine_pull_driver_opt =
+                                            Some(std::sync::Arc::clone(&vine_pull_driver));
+                                        vine_pull_driver_handle_opt =
+                                            Some(vine_pull_driver.spawn());
 
-                                    // ZEB-824: member session-bootstrap driver
-                                    // ("gateway dial"). Spawned in this same
-                                    // iroh-endpoint gate; a feeder for the
-                                    // reconnect supervisor — resolves the
-                                    // community rendezvous beacon from pkarr
-                                    // when a community has no live member
-                                    // session and seeds it into the
-                                    // reachability resolver.
-                                    // `driver.spawn()` returns immediately
-                                    // (never inline-awaited here, per the
-                                    // start_node inline-await hazard).
-                                    let gateway_bootstrap_telemetry = std::sync::Arc::new(
-                                        crate::network_health::GatewayBootstrapTelemetry::new(),
-                                    );
-                                    gateway_bootstrap_telemetry_for_state =
-                                        Some(std::sync::Arc::clone(&gateway_bootstrap_telemetry));
-                                    // A second reader over the SAME snapshot the
-                                    // relay pull driver reads (and the refresher
-                                    // task above writes) — sync closure, no
-                                    // await.
-                                    let gateway_joined: crate::community_relay_pull_driver::JoinedCommunitiesFn = {
+                                        // ZEB-824: member session-bootstrap driver
+                                        // ("gateway dial"). Spawned in this same
+                                        // iroh-endpoint gate; a feeder for the
+                                        // reconnect supervisor — resolves the
+                                        // community rendezvous beacon from pkarr
+                                        // when a community has no live member
+                                        // session and seeds it into the
+                                        // reachability resolver.
+                                        // `driver.spawn()` returns immediately
+                                        // (never inline-awaited here, per the
+                                        // start_node inline-await hazard).
+                                        let gateway_bootstrap_telemetry = std::sync::Arc::new(
+                                            crate::network_health::GatewayBootstrapTelemetry::new(),
+                                        );
+                                        gateway_bootstrap_telemetry_for_state = Some(
+                                            std::sync::Arc::clone(&gateway_bootstrap_telemetry),
+                                        );
+                                        // A second reader over the SAME snapshot the
+                                        // relay pull driver reads (and the refresher
+                                        // task above writes) — sync closure, no
+                                        // await.
+                                        let gateway_joined: crate::community_relay_pull_driver::JoinedCommunitiesFn = {
                                         let s = std::sync::Arc::clone(&joined_snapshot);
                                         std::sync::Arc::new(move || {
                                             s.lock().unwrap_or_else(|p| p.into_inner()).clone()
                                         })
                                     };
-                                    let gateway_driver = std::sync::Arc::new(
+                                        let gateway_driver = std::sync::Arc::new(
                                         crate::community_gateway_dial_driver::CommunityGatewayDialDriver::new(
                                             std::sync::Arc::new(
                                                 crate::community_gateway_dial_driver::ProdGatewayDialCtx {
@@ -12001,15 +12301,16 @@ pub async fn start_node_inner(
                                         )
                                         .with_telemetry(gateway_bootstrap_telemetry),
                                     );
-                                    gateway_dial_driver_handle_opt = Some(gateway_driver.spawn());
+                                        gateway_dial_driver_handle_opt =
+                                            Some(gateway_driver.spawn());
 
-                                    // D. Sender relay deposit client → inject into
-                                    //    the DmOutbox (the drain's last-resort
-                                    //    relay rung). Same identity material as
-                                    //    the butler client; adds the relay
-                                    //    resolver + the shared-community
-                                    //    membership gate.
-                                    let relay_deposit_client: std::sync::Arc<
+                                        // D. Sender relay deposit client → inject into
+                                        //    the DmOutbox (the drain's last-resort
+                                        //    relay rung). Same identity material as
+                                        //    the butler client; adds the relay
+                                        //    resolver + the shared-community
+                                        //    membership gate.
+                                        let relay_deposit_client: std::sync::Arc<
                                         dyn crate::community_relay::CommunityRelayDepositClient,
                                     > = std::sync::Arc::new(
                                         crate::community_relay_prod::ProdCommunityRelayDepositClient {
@@ -12047,25 +12348,24 @@ pub async fn start_node_inner(
                                             )),
                                         },
                                     );
-                                    outbox
-                                        .lock()
-                                        .await
-                                        .set_community_relay_deposit_client(relay_deposit_client);
+                                        outbox.lock().await.set_community_relay_deposit_client(
+                                            relay_deposit_client,
+                                        );
 
-                                    // E. Relay publish-fn + publisher. Mirrors the
-                                    //    reachability publish-fn: for each opted-in
-                                    //    community this node is ALSO a Joined
-                                    //    member of, mint an HLC and build the signed
-                                    //    CommunityRelayAnnounce (inner sig HLC ==
-                                    //    the row's `at`). ZEB-815: the payload
-                                    //    becomes an `AddressBookRow` published via
-                                    //    `address_book_sync::publish_own_rows` — no
-                                    //    community-CRDT event is minted. The
-                                    //    rendezvous slot refresh runs AFTER that
-                                    //    publish, because it ranks this node
-                                    //    against a relay resolver the publish has
-                                    //    just fed with our own ad.
-                                    let relay_publish_fn: crate::community_relay_publisher::RelayPublishFn = {
+                                        // E. Relay publish-fn + publisher. Mirrors the
+                                        //    reachability publish-fn: for each opted-in
+                                        //    community this node is ALSO a Joined
+                                        //    member of, mint an HLC and build the signed
+                                        //    CommunityRelayAnnounce (inner sig HLC ==
+                                        //    the row's `at`). ZEB-815: the payload
+                                        //    becomes an `AddressBookRow` published via
+                                        //    `address_book_sync::publish_own_rows` — no
+                                        //    community-CRDT event is minted. The
+                                        //    rendezvous slot refresh runs AFTER that
+                                        //    publish, because it ranks this node
+                                        //    against a relay resolver the publish has
+                                        //    just fed with our own ad.
+                                        let relay_publish_fn: crate::community_relay_publisher::RelayPublishFn = {
                                         let registry = std::sync::Arc::clone(&registry);
                                         let signing_key =
                                             std::sync::Arc::clone(&community_signing_key_arc);
@@ -12315,32 +12615,42 @@ pub async fn start_node_inner(
                                                 as futures::future::BoxFuture<'static, ()>
                                         })
                                     };
-                                    let relay_publisher = std::sync::Arc::new(
+                                        let relay_publisher = std::sync::Arc::new(
                                         crate::community_relay_publisher::CommunityRelayPublisher::new(
                                             relay_publish_fn,
                                         ),
                                     );
-                                    community_relay_publisher_force_opt =
-                                        Some(relay_publisher.force_handle());
-                                    community_relay_publisher_handle_opt =
-                                        Some(std::sync::Arc::clone(&relay_publisher).spawn());
+                                        community_relay_publisher_force_opt =
+                                            Some(relay_publisher.force_handle());
+                                        community_relay_publisher_handle_opt =
+                                            Some(std::sync::Arc::clone(&relay_publisher).spawn());
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        "ZEB-458: cannot canonicalize own enrollment \
+                                         cert; relay pull/deposit/publish rung disabled"
+                                    ),
                                 }
-                                Err(e) => tracing::warn!(
-                                    error = %e,
-                                    "ZEB-458: cannot canonicalize own enrollment \
-                                     cert; relay pull/deposit/publish rung disabled"
-                                ),
                             }
+                        } else {
+                            tracing::info!(
+                                "community-relay serve/deposit rung disabled: no fleet crypto \
+                                 (local-only mode; relay RESOLUTION still active)"
+                            );
                         }
 
                         // F. Relay-hold GC sweep — the ONLY storage-reclaim path.
                         //    Standalone task, every RELAY_HOLD_GC_INTERVAL_MS:
                         //    sweep TTL-expired + fully-covered entries under the
                         //    doc lock; on any removal, mark dirty + durably flush
-                        //    so the reclaim replicates. Installed unconditionally
-                        //    (no iroh needed — pure local CRDT GC). stop_inner
-                        //    aborts it via community_relay_gc_handle.
-                        {
+                        //    so the reclaim replicates. No iroh needed — pure
+                        //    local CRDT GC. ZEB-905: gated only on the fleet
+                        //    relay-hold doc existing (keyless boots have none).
+                        //    stop_inner aborts it via community_relay_gc_handle.
+                        if let (Some(relay_hold_doc), Some(relay_hold_sync)) = (
+                            relay_hold_doc_opt.clone(),
+                            relay_hold_sync_engine_opt.clone(),
+                        ) {
                             let gc_doc = std::sync::Arc::clone(&relay_hold_doc);
                             let gc_sync = std::sync::Arc::clone(&relay_hold_sync);
                             community_relay_gc_handle_opt = Some(tokio::spawn(async move {
@@ -12405,12 +12715,17 @@ pub async fn start_node_inner(
 
                     // ZEB-418 SP2 P2 Task 6: install the outbound-hold
                     // handles on the DmOutbox so send_dm's hold write
-                    // (Task 3) fires. Installed UNCONDITIONALLY (outside
-                    // the iroh-gated deposit-client block above): the hold
+                    // (Task 3) fires. Installed independent of the
+                    // iroh-gated deposit-client block above: the hold
                     // write is a local CRDT mutation replicated over the
                     // zenoh fleet-sync path — it does not depend on the
-                    // iroh butler transport being up.
-                    {
+                    // iroh butler transport being up. ZEB-905: it IS a
+                    // fleet dataset, so a keyless boot has no outhold doc
+                    // to install (DMs are key-gated anyway).
+                    if let (Some(dm_outhold_doc), Some(dm_outhold_sync)) = (
+                        dm_outhold_doc_opt.clone(),
+                        dm_outhold_sync_engine_opt.clone(),
+                    ) {
                         let outhold_engine = std::sync::Arc::clone(&dm_outhold_sync);
                         outbox.lock().await.set_outhold(
                             std::sync::Arc::clone(&dm_outhold_doc),
@@ -12459,7 +12774,12 @@ pub async fn start_node_inner(
                     // manager being present).
                     dm_tunnel_sign_material_for_state =
                         Some((dm_tunnel_sign_key_arc.clone(), dm_tunnel_sign_hash));
-                    keytree_for_state = Some(std::sync::Arc::clone(&kt));
+                    // ZEB-905: None on a keyless boot — `NodeState.owner_keytree`
+                    // consumers (friend-token redeem et al.) surface the honest
+                    // "restore your recovery phrase" copy instead of wiring in.
+                    keytree_for_state = fleet_crypto
+                        .as_ref()
+                        .map(|(kt, _)| std::sync::Arc::clone(kt));
                     crdt_state_for_state = Some(crdt_state);
                     tracker_for_state = Some(tracker);
                     adopt_floor_for_state = adopt_floor.clone();
@@ -12468,8 +12788,6 @@ pub async fn start_node_inner(
                     dm_transport_arc = Some(transport);
 
                     Some(engine)
-                } else {
-                    None
                 }
             } else {
                 None
