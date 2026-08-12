@@ -4170,6 +4170,10 @@ pub async fn run(
             // roster device-set change, waking that community's snapshot
             // requester (spec §2: snapshot on presence roster change).
             let addrbook_hub_for_presence = addrbook_resync_hub.clone();
+            // ZEB-919: owner-state handle so presence seals/opens under the
+            // LIVE epoch key (None only pre-owner-load, which cannot reach a
+            // Subscribe — degraded spawn-key mode is for tests).
+            let crdt_state_for_presence = crdt_state.clone();
             tokio::spawn(async move {
                 use std::collections::HashMap;
                 let mut handles: HashMap<
@@ -4244,6 +4248,8 @@ pub async fn run(
                                     ),
                                     Arc::clone(&presence_visible),
                                     Arc::clone(&closing_for_presence),
+                                    // ZEB-919: live epoch-key seal.
+                                    crdt_state_for_presence.clone(),
                                 );
                             let sub_handle =
                                 crate::community_presence::spawn_community_presence_subscriber(
@@ -4266,6 +4272,8 @@ pub async fn run(
                                     // ZEB-815: and wakes this community's
                                     // address-book snapshot requester.
                                     Some(addrbook_hub_for_presence.handle(community_id)),
+                                    // ZEB-919: live epoch-key open candidates.
+                                    crdt_state_for_presence.clone(),
                                 );
                             handles.insert(community_id, (pub_handle, sub_handle));
                             // Emit an INITIAL empty roster so the UI has a
