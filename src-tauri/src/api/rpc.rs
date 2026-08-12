@@ -640,10 +640,13 @@ struct PeerAddrArgs {
 }
 
 /// ZEB-464: `republish_owner_card` args (avatar/profile-page CIDs optional).
+/// ZEB-898: `status_text` optional too (default "") — headless agents set
+/// only the display name; an empty status is the natural "no status" card.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RepublishOwnerCardArgs {
     display_name: String,
+    #[serde(default)]
     status_text: String,
     avatar_cid: Option<String>,
     profile_page_root: Option<String>,
@@ -2656,6 +2659,34 @@ mod tests {
             }
             other => panic!("republish_owner_card: expected Command, got {other:?}"),
         }
+
+        // ZEB-898: statusText is optional on the RPC surface — omitting it
+        // must parse (default "") and reach the same pre-node Command error,
+        // not BadArgs. Headless agents setting only a display name were
+        // getting HTTP 400 `missing field statusText`.
+        let err = reg
+            .dispatch(
+                "republish_owner_card",
+                test_state(),
+                test_sink(),
+                serde_json::json!({ "displayName": "OnlyName" }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            RpcError::Command(msg) => {
+                assert_eq!(msg, "owner card runtime not ready")
+            }
+            other => {
+                panic!("republish_owner_card sans statusText: expected Command, got {other:?}")
+            }
+        }
+
+        // The omitted field must default to "" specifically (not garbage).
+        let args: RepublishOwnerCardArgs =
+            serde_json::from_value(serde_json::json!({ "displayName": "OnlyName" }))
+                .expect("statusText omitted must deserialize");
+        assert_eq!(args.status_text, "");
     }
 
     #[tokio::test]

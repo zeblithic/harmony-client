@@ -16021,6 +16021,30 @@ mod pending_owner_card_tests {
             .expect("not-ready drain must leave the latch for the next start");
         assert_eq!(pending.display_name, "Ada");
     }
+
+    /// ZEB-898: mint's Phase 1 calls `stop_inner` before the mint+restart, and
+    /// the fresh-mint headless flow depends on the boot-stashed card SURVIVING
+    /// that stop so the post-mint start's drain can publish it. Pin it: a
+    /// "clear stale state" sweep added to `stop_inner` would silently
+    /// reintroduce the ZEB-898 field failure (peers resolve hex forever).
+    #[tokio::test]
+    async fn stop_inner_preserves_pending_card_latch() {
+        let state = std::sync::Mutex::new(NodeState::default());
+        state.lock().unwrap().pending_card = Some(PendingCard {
+            display_name: "Zeb898".to_string(),
+            status_text: String::new(),
+            avatar_cid: None,
+            profile_page_root: None,
+        });
+        // None = unconditional stop, exactly what mint Phase 1 passes.
+        crate::stop_inner(&state, None);
+        let guard = state.lock().unwrap();
+        let pending = guard
+            .pending_card
+            .as_ref()
+            .expect("stop_inner must leave the pending-card latch for the next start");
+        assert_eq!(pending.display_name, "Zeb898");
+    }
 }
 
 /// Send a channel message to the mesh network via Zenoh pub/sub.
@@ -85677,6 +85701,144 @@ mod zeb_687_revoked_feed_boot_tests {
         //     test — matches serve_cli / api_server teardown. Runs while HOME is
         //     still the tempdir; the env guards drop after this at end of scope.
         let _ = stop_inner(&state, None);
+    }
+}
+
+/// ZEB-898: end-to-end pin of the fresh-mint HEADLESS display-name flow —
+/// the field failure class that broke silently pre-#635 and was fixed
+/// incidentally to the ZEB-882 GUI boot-race fix. Drives the exact
+/// `serve --display-name` + `api mint_owner_identity` sequence at the impl
+/// level: boot-publish stashes (runtime not ready) → mint (stop → persist →
+/// REAL `start_node_inner` restart, the same closure shape production's
+/// `mint_owner_identity_impl` passes) → the start's drain publishes the
+/// stashed card. If any joint regresses (stash dropped, latch cleared on
+/// stop, drain skipped/reordered, publisher unwired at drain time) this
+/// fails.
+///
+/// Gated on `test-fixtures` for `mint_owner_identity_inner_for_test`
+/// (mirrors `zeb_687_revoked_feed_boot_tests`).
+#[cfg(all(test, feature = "test-fixtures"))]
+mod zeb_898_headless_card_flow_tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// RAII guard: sets an env var, restores the prior value (or removes it)
+    /// on drop, incl. panic. Boot-path env (HOME etc.) is process-global;
+    /// module-local copy by convention (ZEB-193).
+    struct EnvVarGuard {
+        name: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let prev = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    /// NO outer whole-test timeout: a full node boot legitimately runs
+    /// 80-130s under `--workspace --all-targets` sweep contention (see the
+    /// sibling full-boot tests' note in `zeb_687_revoked_feed_boot_tests`).
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn fresh_mint_headless_flow_publishes_stashed_display_name() {
+        // (a) Scope every boot-path env var to this test (ZEB-428 posture).
+        let home = tempfile::tempdir().expect("tempdir for HOME override");
+        let home_str = home
+            .path()
+            .to_str()
+            .expect("tempdir path is valid utf8")
+            .to_string();
+        let _g_home = EnvVarGuard::set("HOME", &home_str);
+        let _g_userprofile = EnvVarGuard::set("USERPROFILE", &home_str);
+        let _g_pass = EnvVarGuard::set("HARMONY_PASSPHRASE", "zeb898-headless-card-pin");
+        let _g_xdg = EnvVarGuard::set("XDG_DATA_HOME", &format!("{home_str}/xdg-data"));
+        let _g_appdata = EnvVarGuard::set("APPDATA", &format!("{home_str}/appdata"));
+        let _g_nokeychain = EnvVarGuard::set("HARMONY_DISABLE_KEYCHAIN", "1");
+
+        // (b) The headless serve boot publish, pre-mint: no owner runtime →
+        //     not-ready Err AND the card is stashed (exactly what
+        //     `serve_cli` hits on a fresh profile with --display-name).
+        let state = std::sync::Arc::new(Mutex::new(NodeState::default()));
+        let err =
+            republish_owner_card_impl(&state, "Zeb898".to_string(), String::new(), None, None)
+                .await
+                .expect_err("fresh NodeState has no owner runtime wired");
+        assert!(
+            err.contains("owner card runtime not ready"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            state.lock().unwrap().pending_card.is_some(),
+            "boot publish must stash the card for the post-mint drain"
+        );
+
+        // (c) Mint with the REAL node restart — the same closure shape
+        //     production's `mint_owner_identity_impl` passes. The restart's
+        //     `start_node_inner` success path drains the latch. Prime the
+        //     one-time global iroh bind first (ZEB-347) so it isn't paid
+        //     under the assertion.
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        let events = crate::api::events::ApiEventSink::new();
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(events.clone());
+        let state_for_restart = std::sync::Arc::clone(&state);
+        let sink_for_restart = std::sync::Arc::clone(&sink);
+        crate::owner_commands::mint_owner_identity_inner_for_test(&state, move || async move {
+            start_node_inner(None, sink_for_restart, None, &state_for_restart, None)
+                .await
+                .map(|_| ())
+        })
+        .await
+        .expect("mint + real restart must succeed");
+
+        // (d) From here the real node is running — guarantee teardown even on
+        //     a failed assertion (panic unwind), so a red run can't leak the
+        //     booted node's background tasks into subsequent same-process
+        //     tests (plain `cargo test`; nextest isolates per process).
+        //     Declared AFTER the env guards so it drops FIRST — `stop_inner`
+        //     still sees the tempdir HOME. `stop_inner` is async-context-safe
+        //     (ephemeral runtime inside `std::thread::scope`; see the mint
+        //     Phase 1 note in `owner_commands.rs`).
+        struct StopGuard(std::sync::Arc<Mutex<NodeState>>);
+        impl Drop for StopGuard {
+            fn drop(&mut self) {
+                crate::stop_inner(&self.0, None);
+            }
+        }
+        let _stop = StopGuard(std::sync::Arc::clone(&state));
+
+        // (e) The drain ran inside the restart (before start_node_inner
+        //     returned), so both observables are already settled — no polling.
+        let publisher = {
+            let guard = state.lock().expect("NodeState lock");
+            assert!(
+                guard.pending_card.is_none(),
+                "post-mint start must drain the pending-card latch"
+            );
+            guard
+                .profile_card_publisher
+                .clone()
+                .expect("profile_card_publisher wired after identity boot")
+        };
+        let latest = publisher.latest_handle();
+        let cached = latest.lock().await.clone();
+        let (_topic, bytes) =
+            cached.expect("drained publish must cache the card for refresh/queryable");
+        let decoded: crate::profile_card_broadcast::ProfileCardBroadcast =
+            ciborium::de::from_reader(&bytes[..]).expect("cached card decodes");
+        assert_eq!(decoded.display_name, "Zeb898");
+        assert_eq!(decoded.status_text, "");
+        // Teardown runs via `_stop` (also on panic), before the env guards drop.
     }
 }
 
