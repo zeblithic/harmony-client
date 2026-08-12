@@ -48,10 +48,17 @@ pub trait GatewayDialCtx: Send + Sync {
     /// Joined members of `community` EXCLUDING self, from the locally
     /// materialized membership (persisted CRDT — survives rebuilds).
     async fn members_of(&self, community: &SpaceId) -> Vec<OwnerAddr>;
-    /// The engine's spawn-time `membership_key()`. MUST match the rendezvous
-    /// publisher's key choice (`lib.rs:11298`) — never the live epoch key
-    /// (spec §5.3). `None` = engine not registered (transient); skip.
-    async fn epoch_key_of(&self, community: &SpaceId) -> Option<EpochKey>;
+    /// ZEB-918: ordered membership-epoch key candidates for beacon
+    /// resolution — the LIVE current key first, then (when one exists) the
+    /// immediately-previous epoch's archived key; never more than one epoch
+    /// back. MUST stay coherent with the rendezvous publisher's key choice
+    /// (the slot-refresh arm in `lib.rs`, which publishes under the live key
+    /// and degrades to the spawn-time key when the live read is unavailable —
+    /// this ctx degrades identically, so pub/resolver match in both modes).
+    /// `None` = engine not registered (transient); skip — load-bearing:
+    /// it is the ONLY signal separating `engineUnregistered` from
+    /// `soloCommunity`. `Some(v)` is non-empty.
+    async fn epoch_key_candidates_of(&self, community: &SpaceId) -> Option<Vec<EpochKey>>;
     /// ZEB-827: union of Joined (non-self) members' effective enrolled device
     /// verify keys — the set a beacon's membership-vouch key must belong to.
     async fn enrolled_device_keys_of(&self, community: &SpaceId) -> HashSet<[u8; 32]>;
@@ -179,6 +186,10 @@ fn enrolled_keys_from_members(
 pub struct ProdGatewayDialCtx {
     pub registry: Arc<crate::community_state_sync::CommunitySyncRegistry>,
     pub self_owner: OwnerAddr,
+    /// ZEB-918: live owner-state handle for epoch-key candidate reads.
+    /// `None` (test/legacy wiring) degrades every read to the engine's
+    /// spawn-time key — matching the publisher's degraded mode.
+    pub crdt_state: Option<Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
 }
 
 #[async_trait::async_trait]
@@ -203,13 +214,27 @@ impl GatewayDialCtx for ProdGatewayDialCtx {
             .collect()
     }
 
-    async fn epoch_key_of(&self, community: &SpaceId) -> Option<EpochKey> {
-        // Spawn-time membership_key(), matching the key the rendezvous
-        // PUBLISHER slots under (start_node's `refresh_slot` loop passes
-        // `engine.membership_key()`) — deliberately NOT live_epoch_key
-        // (spec §5.3/§9). A mismatch derives a different slot keypair and
-        // silently resolves nothing, forever.
-        Some(self.registry.engine_arc(community).await?.membership_key())
+    async fn epoch_key_candidates_of(&self, community: &SpaceId) -> Option<Vec<EpochKey>> {
+        // ZEB-918: live current key first, previous epoch's archived key
+        // second — coherent with the publisher, which now publishes under
+        // the live key (and degrades to the spawn-time key exactly when
+        // this read does, so a mismatched slot keypair can no longer arise
+        // from process lifetime alone; pre-ZEB-918 both sides pinned the
+        // spawn-time key and rotation broke discovery until restart).
+        //
+        // Engine presence stays the None-gate: "no engine registered" must
+        // keep reaching the ladder as EngineUnregistered, distinct from
+        // "no members".
+        let engine = self.registry.engine_arc(community).await?;
+        let fallback = engine.membership_key();
+        Some(
+            crate::community_state_sync::epoch_key_candidates(
+                *community,
+                self.crdt_state.as_ref(),
+                &fallback,
+            )
+            .await,
+        )
     }
 
     async fn enrolled_device_keys_of(&self, community: &SpaceId) -> HashSet<[u8; 32]> {
@@ -374,7 +399,7 @@ impl CommunityGatewayDialDriver {
             // by a full rung on every boot race. Registration gaps also CLEAR
             // any armed backoff, so the first real attempt after
             // re-registration is never delayed by a stale rung.
-            let Some(epoch_key) = self.ctx.epoch_key_of(&community).await else {
+            let Some(epoch_keys) = self.ctx.epoch_key_candidates_of(&community).await else {
                 tracing::debug!(community = ?community, "ZEB-824: no engine registered; skipping this pass");
                 let cleared = self
                     .ladders
@@ -457,11 +482,31 @@ impl CommunityGatewayDialDriver {
             // widens); if a beacon WAS present but rejected, the resolve returns
             // `RejectedNonMember`.
             let enrolled_keys = Arc::new(self.ctx.enrolled_device_keys_of(&community).await);
-            let hit = match self
-                .beacons
-                .resolve_beacon(&epoch_key, community, enrolled_keys, now_ms)
-                .await
-            {
+            // ZEB-918: try candidates in order (live current first, previous
+            // epoch second); stop at the first live beacon. When nothing is
+            // found, the CURRENT-key attempt's outcome is recorded — it is
+            // the canonical health signal, and the previous-key attempt
+            // exists only to heal rotation skew (finding not-yet-rotated
+            // members so the rotation event itself can reach them), so it
+            // must not mask current-key telemetry. A candidate attempt that
+            // finds a beacon always wins — including over a current-key
+            // RejectedNonMember, which condemns one publisher's bad vouch,
+            // not the whole previous-epoch audience.
+            let mut resolution = BeaconResolution::NotFound;
+            for (i, candidate) in epoch_keys.iter().enumerate() {
+                let attempt = self
+                    .beacons
+                    .resolve_beacon(candidate, community, Arc::clone(&enrolled_keys), now_ms)
+                    .await;
+                let found = matches!(attempt, BeaconResolution::Found(_));
+                if i == 0 || found {
+                    resolution = attempt;
+                }
+                if found {
+                    break;
+                }
+            }
+            let hit = match resolution {
                 BeaconResolution::Found(hit) => hit,
                 BeaconResolution::RejectedNonMember => {
                     self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
@@ -593,13 +638,15 @@ mod tests {
 
     struct StubCtx {
         members: Mutex<HashMap<SpaceId, Vec<OwnerAddr>>>,
-        keys: Mutex<HashMap<SpaceId, EpochKey>>,
+        /// Ordered epoch-key candidates per community (ZEB-918): entry
+        /// absent = engine unregistered.
+        keys: Mutex<HashMap<SpaceId, Vec<EpochKey>>>,
     }
 
     impl StubCtx {
         fn new(
             members: HashMap<SpaceId, Vec<OwnerAddr>>,
-            keys: HashMap<SpaceId, EpochKey>,
+            keys: HashMap<SpaceId, Vec<EpochKey>>,
         ) -> Self {
             Self {
                 members: Mutex::new(members),
@@ -618,7 +665,7 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         }
-        async fn epoch_key_of(&self, c: &SpaceId) -> Option<EpochKey> {
+        async fn epoch_key_candidates_of(&self, c: &SpaceId) -> Option<Vec<EpochKey>> {
             self.keys.lock().unwrap().get(c).cloned()
         }
         async fn enrolled_device_keys_of(&self, _c: &SpaceId) -> HashSet<[u8; 32]> {
@@ -632,7 +679,13 @@ mod tests {
 
     struct StubBeacons {
         resolution: Mutex<BeaconResolution>,
+        /// ZEB-918: per-epoch-key overrides (by key bytes). A key with no
+        /// entry falls back to the global `resolution`, so pre-ZEB-918
+        /// single-key tests are unaffected.
+        by_key: Mutex<HashMap<[u8; 32], BeaconResolution>>,
         calls: AtomicU64,
+        /// ZEB-918: epoch keys in probe order, for candidate-order pins.
+        key_log: Mutex<Vec<[u8; 32]>>,
     }
 
     impl StubBeacons {
@@ -643,15 +696,25 @@ mod tests {
             };
             Self {
                 resolution: Mutex::new(resolution),
+                by_key: Mutex::new(HashMap::new()),
                 calls: AtomicU64::new(0),
+                key_log: Mutex::new(Vec::new()),
             }
         }
         /// Swap the stubbed resolution mid-test (e.g. to `ResolveError`).
         fn set_resolution(&self, r: BeaconResolution) {
             *self.resolution.lock().unwrap() = r;
         }
+        /// ZEB-918: stub a per-key resolution (keyed by epoch-key bytes).
+        fn set_resolution_for_key(&self, key: [u8; 32], r: BeaconResolution) {
+            self.by_key.lock().unwrap().insert(key, r);
+        }
         fn calls(&self) -> u64 {
             self.calls.load(Ordering::SeqCst)
+        }
+        /// ZEB-918: epoch keys probed so far, in order.
+        fn probed_keys(&self) -> Vec<[u8; 32]> {
+            self.key_log.lock().unwrap().clone()
         }
     }
 
@@ -659,12 +722,16 @@ mod tests {
     impl BeaconResolver for StubBeacons {
         async fn resolve_beacon(
             &self,
-            _k: &EpochKey,
+            k: &EpochKey,
             _community: SpaceId,
             _enrolled: Arc<HashSet<[u8; 32]>>,
             _now: u64,
         ) -> BeaconResolution {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.key_log.lock().unwrap().push(*k.as_bytes());
+            if let Some(r) = self.by_key.lock().unwrap().get(k.as_bytes()) {
+                return r.clone();
+            }
             self.resolution.lock().unwrap().clone()
         }
     }
@@ -827,7 +894,7 @@ mod tests {
             resolver.set_supervisor(h);
         }
         let keys = if with_key {
-            HashMap::from([(community, EpochKey::new([0x33; 32]))])
+            HashMap::from([(community, vec![EpochKey::new([0x33; 32])])])
         } else {
             HashMap::new()
         };
@@ -901,6 +968,150 @@ mod tests {
             Some("beaconSeeded")
         );
         assert_eq!(h.telemetry.summary().beacons_seeded, 1);
+        // ZEB-918: the healthy single-candidate path costs exactly one probe —
+        // the previous-epoch rung must add no cost when there is no rotation.
+        assert_eq!(h.beacons.calls(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // ZEB-918: ordered epoch-key candidate iteration — the rotation-skew
+    // healing rung. Rotation propagates THROUGH connectivity, so a rotated
+    // resolver must keep finding not-yet-rotated members' beacons (published
+    // under the previous epoch key) or the community partitions into
+    // rotated/un-rotated islands exactly when the un-rotated island needs a
+    // connection to receive the rotation event.
+    // ------------------------------------------------------------------
+
+    const K_NEW: [u8; 32] = [0x44; 32];
+    const K_OLD: [u8; 32] = [0x33; 32];
+
+    /// Harness with two epoch-key candidates `[K_NEW, K_OLD]` (a resolver
+    /// that has ingested a rotation) and per-key stub resolutions.
+    fn rotation_harness(
+        community: SpaceId,
+        members: Vec<OwnerAddr>,
+        new_key: BeaconResolution,
+        old_key: BeaconResolution,
+    ) -> Harness {
+        let h = harness(community, members, None, true, None);
+        h.ctx
+            .keys
+            .lock()
+            .unwrap()
+            .insert(community, vec![EpochKey::new(K_NEW), EpochKey::new(K_OLD)]);
+        h.beacons.set_resolution_for_key(K_NEW, new_key);
+        h.beacons.set_resolution_for_key(K_OLD, old_key);
+        h
+    }
+
+    /// (a) Rotation skew, resolver ahead: nothing under the new key yet, a
+    /// not-yet-rotated member's beacon under the previous key → seeded, with
+    /// the current key probed FIRST.
+    #[tokio::test]
+    async fn rotation_skew_previous_epoch_candidate_heals() {
+        let community = SpaceId([0x91; 16]);
+        let (member_pub, member_owner) = test_member(21);
+        let beacon_node_id = [0x2A; 32];
+        let h = rotation_harness(
+            community,
+            vec![member_owner],
+            BeaconResolution::NotFound,
+            BeaconResolution::Found(beacon(member_pub, beacon_node_id)),
+        );
+
+        h.driver.run_one_pass().await;
+
+        assert_eq!(h.beacons.calls(), 2, "current key missed, previous tried");
+        assert_eq!(
+            h.beacons.probed_keys(),
+            vec![K_NEW, K_OLD],
+            "the LIVE current key must be probed before the previous epoch's"
+        );
+        assert!(
+            h.resolver.resolve_by_node_id(&beacon_node_id).is_some(),
+            "previous-epoch beacon must seed the resolver"
+        );
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("beaconSeeded")
+        );
+    }
+
+    /// (c) Nothing under either candidate: the CURRENT-key attempt's outcome
+    /// is what telemetry records — the previous-epoch rung heals skew but
+    /// must not mask current-key health signals.
+    #[tokio::test]
+    async fn no_beacon_under_any_candidate_records_current_key_outcome() {
+        let community = SpaceId([0x92; 16]);
+        let (_member_pub, member_owner) = test_member(22);
+        let h = rotation_harness(
+            community,
+            vec![member_owner],
+            BeaconResolution::NotFound,
+            // Previous-key infrastructure trouble must not upgrade/replace
+            // the current-key NotFound in telemetry.
+            BeaconResolution::ResolveError,
+        );
+
+        h.driver.run_one_pass().await;
+
+        assert_eq!(h.beacons.calls(), 2);
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("noBeacon"),
+            "current-key outcome (NotFound) is the canonical health signal"
+        );
+    }
+
+    /// (d) RejectedNonMember under the current key, valid beacon under the
+    /// previous: healing wins. The reject condemns one publisher's bad vouch,
+    /// not the whole previous-epoch audience.
+    #[tokio::test]
+    async fn rejected_current_key_still_heals_via_previous_epoch() {
+        let community = SpaceId([0x93; 16]);
+        let (member_pub, member_owner) = test_member(23);
+        let beacon_node_id = [0x2B; 32];
+        let h = rotation_harness(
+            community,
+            vec![member_owner],
+            BeaconResolution::RejectedNonMember,
+            BeaconResolution::Found(beacon(member_pub, beacon_node_id)),
+        );
+
+        h.driver.run_one_pass().await;
+
+        assert!(
+            h.resolver.resolve_by_node_id(&beacon_node_id).is_some(),
+            "a valid previous-epoch beacon must seed despite a current-key reject"
+        );
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("beaconSeeded")
+        );
+    }
+
+    /// A found beacon under the FIRST candidate stops the iteration — the
+    /// previous-epoch key is never probed when the current key answers.
+    #[tokio::test]
+    async fn found_under_current_key_skips_previous_probe() {
+        let community = SpaceId([0x94; 16]);
+        let (member_pub, member_owner) = test_member(24);
+        let beacon_node_id = [0x2C; 32];
+        let h = rotation_harness(
+            community,
+            vec![member_owner],
+            BeaconResolution::Found(beacon(member_pub, beacon_node_id)),
+            BeaconResolution::NotFound,
+        );
+
+        h.driver.run_one_pass().await;
+
+        assert_eq!(h.beacons.calls(), 1, "current-key hit must short-circuit");
+        assert_eq!(h.beacons.probed_keys(), vec![K_NEW]);
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("beaconSeeded")
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1427,7 +1638,7 @@ mod tests {
             .keys
             .lock()
             .unwrap()
-            .insert(community, EpochKey::new([0x33; 32]));
+            .insert(community, vec![EpochKey::new([0x33; 32])]);
         driver.run_one_pass().await;
         assert_eq!(
             h.beacons.calls(),
@@ -1446,8 +1657,8 @@ mod tests {
         // solo community produces. A members-first pass therefore records every
         // registration gap as `soloCommunity` and `engineUnregistered` never
         // fires in production at all. This ctx reproduces the prod shape exactly
-        // (`epoch_key_of` → None AND `members_of` → []), so it can only pass if
-        // the epoch-key probe runs first.
+        // (`epoch_key_candidates_of` → None AND `members_of` → []), so it can
+        // only pass if the epoch-key probe runs first.
         let community = SpaceId([0x1E; 16]);
         let (member_pub, _member_owner) = test_member(16);
         let h = harness(
@@ -1554,7 +1765,7 @@ mod tests {
         let resolver = Arc::new(ReachabilityResolver::new());
         let ctx = Arc::new(StubCtx::new(
             HashMap::from([(community, vec![member_owner])]),
-            HashMap::from([(community, EpochKey::new([0x33; 32]))]),
+            HashMap::from([(community, vec![EpochKey::new([0x33; 32])])]),
         ));
         let beacons = Arc::new(StubBeacons::new(None));
         let telemetry = Arc::new(GatewayBootstrapTelemetry::new());
@@ -1656,7 +1867,7 @@ mod tests {
             .keys
             .lock()
             .unwrap()
-            .insert(community, EpochKey::new([0x33; 32]));
+            .insert(community, vec![EpochKey::new([0x33; 32])]);
         driver.run_one_pass().await;
         assert_eq!(
             h.beacons.calls(),

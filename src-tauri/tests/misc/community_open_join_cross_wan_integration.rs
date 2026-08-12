@@ -1542,8 +1542,8 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
                     vec![]
                 }
             }
-            async fn epoch_key_of(&self, _c: &SpaceId) -> Option<EpochKey> {
-                Some(self.key.clone())
+            async fn epoch_key_candidates_of(&self, _c: &SpaceId) -> Option<Vec<EpochKey>> {
+                Some(vec![self.key.clone()])
             }
             async fn enrolled_device_keys_of(
                 &self,
@@ -1660,8 +1660,8 @@ async fn gateway_dial_rejects_beacon_when_device_not_enrolled() {
                     vec![]
                 }
             }
-            async fn epoch_key_of(&self, _c: &SpaceId) -> Option<EpochKey> {
-                Some(self.key.clone())
+            async fn epoch_key_candidates_of(&self, _c: &SpaceId) -> Option<Vec<EpochKey>> {
+                Some(vec![self.key.clone()])
             }
             async fn enrolled_device_keys_of(
                 &self,

@@ -3361,6 +3361,48 @@ pub(crate) async fn community_publish_epoch_key(
     }
 }
 
+/// ZEB-918: ordered membership-epoch key candidates for rendezvous beacon
+/// RESOLUTION — the live current key first, then the immediately-previous
+/// epoch's archived key (`Space.old_epoch_keys[current_epoch - 1]`) when one
+/// exists. Never more than one epoch back: the previous-key attempt exists
+/// only to heal rotation skew (a rotated resolver finding not-yet-rotated
+/// publishers, so the rotation event itself can propagate to them), not to
+/// keep arbitrarily old capabilities alive.
+///
+/// Falls back to `[fallback]` (the engine's spawn-time key) when the live
+/// read is unavailable — no `crdt_state`, Space absent, or Space epoch
+/// fields incomplete. This is publisher-degrades coherence (ZEB-597 mirror),
+/// NOT the seeker-skip of `community_contexts_for_target` (ZEB-596): the
+/// gateway ladder is the community's healing path, and in degraded mode the
+/// rendezvous publisher falls back to the same spawn key, so probing under
+/// it beats not probing at all.
+pub(crate) async fn epoch_key_candidates(
+    community_id: SpaceId,
+    crdt_state: Option<&Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+    fallback: &EpochKey,
+) -> Vec<EpochKey> {
+    let Some(cs) = crdt_state else {
+        return vec![fallback.clone()];
+    };
+    let guard = cs.lock().await;
+    let Some(space) = guard.spaces.get(&community_id) else {
+        return vec![fallback.clone()];
+    };
+    match (&space.current_epoch_key, space.current_epoch) {
+        (Some(k), Some(e)) => {
+            let mut out = vec![k.clone()];
+            if let Some(prev) = e
+                .checked_sub(1)
+                .and_then(|pe| space.old_epoch_keys.get(&pe))
+            {
+                out.push(prev.clone());
+            }
+            out
+        }
+        _ => vec![fallback.clone()],
+    }
+}
+
 /// Build one complete state-root wire packet: epoch-stable snapshot,
 /// blob encrypt + CAS pin (put_serveable), signed payload with a
 /// strictly-newer HLC, wire-envelope encrypt. Shared by the debounced
@@ -12341,6 +12383,92 @@ mod envelope_tests {
             key, [0x42u8; 32],
             "missing Space must degrade to the spawn-time fallback key"
         );
+    }
+
+    /// ZEB-918: candidate-list assertions compare key bytes (EpochKey is
+    /// deliberately not Debug).
+    fn candidate_bytes(v: &[EpochKey]) -> Vec<[u8; 32]> {
+        v.iter().map(|k| *k.as_bytes()).collect()
+    }
+
+    /// ZEB-918: no owner-state handle (test/legacy wiring) degrades to the
+    /// spawn-time key — matching the publisher's degraded mode so the
+    /// publisher/resolver pair stays coherent.
+    #[tokio::test]
+    async fn candidates_no_crdt_state_falls_back_to_spawn_key() {
+        let fb = EpochKey::new([0x42u8; 32]);
+        let got = epoch_key_candidates(SpaceId([0xaa; 16]), None, &fb).await;
+        assert_eq!(candidate_bytes(&got), vec![[0x42u8; 32]]);
+    }
+
+    /// ZEB-918: before any rotation there is exactly one candidate — no
+    /// phantom previous-epoch probe on the healthy path.
+    #[tokio::test]
+    async fn candidates_pre_rotation_is_current_only() {
+        let cid = SpaceId([0xaa; 16]);
+        let fb = EpochKey::new([0x42u8; 32]);
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        os.spaces.insert(
+            cid,
+            build_test_community_space(0, EpochKey::new([0x11; 32])),
+        );
+        let crdt = Arc::new(Mutex::new(os));
+        let got = epoch_key_candidates(cid, Some(&crdt), &fb).await;
+        assert_eq!(candidate_bytes(&got), vec![[0x11u8; 32]]);
+    }
+
+    /// ZEB-918: after a rotation the candidates are [current, previous] in
+    /// that pinned order — the current key is the canonical probe, the
+    /// archived previous key is the rotation-skew healing rung.
+    #[tokio::test]
+    async fn candidates_post_rotation_is_current_then_previous() {
+        let cid = SpaceId([0xaa; 16]);
+        let fb = EpochKey::new([0x42u8; 32]);
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        let mut space = build_test_community_space(1, EpochKey::new([0x22; 32]));
+        space.old_epoch_keys.insert(0, EpochKey::new([0x11; 32]));
+        os.spaces.insert(cid, space);
+        let crdt = Arc::new(Mutex::new(os));
+        let got = epoch_key_candidates(cid, Some(&crdt), &fb).await;
+        assert_eq!(candidate_bytes(&got), vec![[0x22u8; 32], [0x11u8; 32]]);
+    }
+
+    /// ZEB-918: never more than ONE epoch back — an archive entry for an
+    /// older epoch (but not the immediately-previous one) is not a candidate.
+    #[tokio::test]
+    async fn candidates_missing_archive_entry_is_current_only() {
+        let cid = SpaceId([0xaa; 16]);
+        let fb = EpochKey::new([0x42u8; 32]);
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        let mut space = build_test_community_space(2, EpochKey::new([0x33; 32]));
+        space.old_epoch_keys.insert(0, EpochKey::new([0x11; 32]));
+        os.spaces.insert(cid, space);
+        let crdt = Arc::new(Mutex::new(os));
+        let got = epoch_key_candidates(cid, Some(&crdt), &fb).await;
+        assert_eq!(candidate_bytes(&got), vec![[0x33u8; 32]]);
+    }
+
+    /// ZEB-918: a wired owner state whose Space is absent or epoch-incomplete
+    /// degrades to the spawn key (publisher-degrades mirror; contrast
+    /// `live_epoch_key`, which surfaces `LiveEpochKeyMissing` for its
+    /// backward-secrecy callers).
+    #[tokio::test]
+    async fn candidates_space_missing_or_incomplete_degrades_to_spawn_key() {
+        let cid = SpaceId([0xaa; 16]);
+        let fb = EpochKey::new([0x42u8; 32]);
+        // Space absent entirely.
+        let crdt = Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
+        let got = epoch_key_candidates(cid, Some(&crdt), &fb).await;
+        assert_eq!(candidate_bytes(&got), vec![[0x42u8; 32]]);
+        // Space present but epoch fields incomplete.
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        let mut space = build_test_community_space(0, EpochKey::new([0x11; 32]));
+        space.current_epoch = None;
+        space.current_epoch_key = None;
+        os.spaces.insert(cid, space);
+        let crdt = Arc::new(Mutex::new(os));
+        let got = epoch_key_candidates(cid, Some(&crdt), &fb).await;
+        assert_eq!(candidate_bytes(&got), vec![[0x42u8; 32]]);
     }
 
     #[test]
