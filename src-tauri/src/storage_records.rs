@@ -59,6 +59,23 @@ pub const HOSTING_REFRESH_INTERVAL_MS: u64 = 300_000;
 /// Receiver-side staleness bound for hosting reports (spec §3: ≥ 3
 /// refresh intervals).
 pub const HOSTING_REPORT_STALE_MS: u64 = 3 * HOSTING_REFRESH_INTERVAL_MS;
+/// ZEB-923: cadence at which the local node re-mints, re-signs, and
+/// republishes its (non-empty) pledge list and backup set — the renewal
+/// signal for the receiver-side TTL below. Checked by the storage-record
+/// publisher task's 30 s poll.
+pub const STORAGE_RECORD_REFRESH_INTERVAL_MS: u64 = 3_600_000;
+/// ZEB-923: receiver-side TTL for pledge lists and backup sets, keyed on
+/// the LOCAL receipt clock (`received_at_ms`), never the peer-controlled
+/// `updated_at`. Deliberately not the in-file 3× refresh idiom: 72
+/// refresh intervals positions decay as a growth bound for
+/// permanently-dark owners, not liveness detection.
+pub const STORAGE_RECORD_TTL_MS: u64 = 3 * 24 * 60 * 60 * 1_000;
+/// ZEB-923: minimum post-boot runway `apply_boot_grace` guarantees every
+/// reloaded record before it can decay — ample for any alive buddy's
+/// hourly renewal to land, so a long-offline receiver never mass-decays
+/// alive buddies at boot.
+pub const STORAGE_RECORD_BOOT_GRACE_MS: u64 = 12 * 60 * 60 * 1_000;
+const _: () = assert!(STORAGE_RECORD_BOOT_GRACE_MS < STORAGE_RECORD_TTL_MS);
 
 const RECORDS_FILE_VERSION: u32 = 1;
 
@@ -94,9 +111,9 @@ impl RecordOutcome {
 pub struct PledgeListRecord {
     pub pledges: Vec<PledgeEntry>,
     pub updated_at: u64,
-    /// Local receipt clock (ms) — no trust meaning (mirrors
-    /// `HostingReportRecord::received_at_ms` and
-    /// `StorageSignerPin::pinned_at_ms`). Never the peer `updated_at`.
+    /// Local receipt clock (ms) — drives the ZEB-923 record TTL
+    /// (`sweep_stale_pledges_and_backups`), persisted across restarts
+    /// (boot-grace floored at load). Never the peer `updated_at`.
     /// Eviction ordering is `seq`, not this (ZEB-863).
     pub received_at_ms: u64,
     /// Local monotonic insert sequence (ZEB-863) — the SOLE eviction
@@ -109,9 +126,9 @@ pub struct PledgeListRecord {
 pub struct BackupSetRecord {
     pub entries: Vec<BackupEntry>,
     pub updated_at: u64,
-    /// Local receipt clock (ms) — no trust meaning (mirrors
-    /// `HostingReportRecord::received_at_ms` and
-    /// `StorageSignerPin::pinned_at_ms`). Never the peer `updated_at`.
+    /// Local receipt clock (ms) — drives the ZEB-923 record TTL
+    /// (`sweep_stale_pledges_and_backups`), persisted across restarts
+    /// (boot-grace floored at load). Never the peer `updated_at`.
     /// Eviction ordering is `seq`, not this (ZEB-863).
     pub received_at_ms: u64,
     /// Local monotonic insert sequence (ZEB-863) — the SOLE eviction
@@ -140,6 +157,11 @@ struct PledgeListOnDisk {
     owner: String,
     pledges: Vec<PledgeEntry>,
     updated_at: u64,
+    /// ZEB-923: local receipt clock, persisted so the record TTL survives
+    /// restarts. `default` keeps legacy files loadable (missing ⇒ 0 ⇒
+    /// raised to the boot-grace floor at load).
+    #[serde(default)]
+    received_at_ms: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,6 +170,11 @@ struct BackupSetOnDisk {
     owner: String,
     entries: Vec<BackupEntry>,
     updated_at: u64,
+    /// ZEB-923: local receipt clock, persisted so the record TTL survives
+    /// restarts. `default` keeps legacy files loadable (missing ⇒ 0 ⇒
+    /// raised to the boot-grace floor at load).
+    #[serde(default)]
+    received_at_ms: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,22 +277,22 @@ impl StorageRecordStore {
             }
             // Reloaded rows get the lowest `seq` values (before any live
             // ingest), so a post-restart flood is the newest (highest seq) and
-            // self-evicts first. `received_at_ms` is not persisted (reset to 0),
-            // so — unlike the pins below — there is no local clock to order
-            // these by; they are stamped in disk order. That order is
-            // owner-sorted, but a reload-time eviction among them fires ONLY if
-            // the on-disk file is over cap, which an honest save never produces
-            // (every ingest evicts to the cap). It is reachable only via a
-            // tampered/foreign file, where every row is already
-            // attacker-controlled and there is no honest row to protect — so
-            // the owner-derived order is not a peer-steering surface here.
+            // self-evicts first. `seq` is deliberately NOT ordered by the
+            // persisted `received_at_ms` (ZEB-923) — it stays stamped in disk
+            // order. That order is owner-sorted, but a reload-time eviction
+            // among reloaded rows fires ONLY if the on-disk file is over cap,
+            // which an honest save never produces (every ingest evicts to the
+            // cap). It is reachable only via a tampered/foreign file, where
+            // every row is already attacker-controlled and there is no honest
+            // row to protect — so the owner-derived order is not a
+            // peer-steering surface here.
             let seq = store.next_insert_seq();
             store.pledge_lists.insert(
                 row.owner,
                 PledgeListRecord {
                     pledges: row.pledges,
                     updated_at: row.updated_at,
-                    received_at_ms: 0,
+                    received_at_ms: row.received_at_ms,
                     seq,
                 },
             );
@@ -278,16 +305,17 @@ impl StorageRecordStore {
                 tracing::warn!(owner = %row.owner, %reason, "storage_records reload: dropping ineligible backup set");
                 continue;
             }
-            // Lowest `seq` (disk order) — like pledge lists above, no persisted
-            // local clock, so reload-time eviction here is tampered-file-only
-            // and not a peer-steering surface (see pledge reload).
+            // Lowest `seq` (disk order) — like pledge lists above, `seq` does
+            // not key on the persisted receipt clock, so reload-time eviction
+            // here is tampered-file-only and not a peer-steering surface (see
+            // pledge reload).
             let seq = store.next_insert_seq();
             store.backup_sets.insert(
                 row.owner,
                 BackupSetRecord {
                     entries: row.entries,
                     updated_at: row.updated_at,
-                    received_at_ms: 0,
+                    received_at_ms: row.received_at_ms,
                     seq,
                 },
             );
@@ -359,6 +387,7 @@ impl StorageRecordStore {
                 owner: owner.clone(),
                 pledges: r.pledges.clone(),
                 updated_at: r.updated_at,
+                received_at_ms: r.received_at_ms,
             })
             .collect();
         pledge_lists.sort_by(|a, b| a.owner.cmp(&b.owner));
@@ -369,6 +398,7 @@ impl StorageRecordStore {
                 owner: owner.clone(),
                 entries: r.entries.clone(),
                 updated_at: r.updated_at,
+                received_at_ms: r.received_at_ms,
             })
             .collect();
         backup_sets.sort_by(|a, b| a.owner.cmp(&b.owner));
@@ -723,6 +753,40 @@ impl StorageRecordStore {
     pub fn sweep_hosting(&mut self, now_ms: u64) {
         self.hosting_reports
             .retain(|_, r| now_ms.saturating_sub(r.received_at_ms) < HOSTING_REPORT_STALE_MS);
+    }
+
+    /// ZEB-923: drop pledge lists and backup sets not re-affirmed within
+    /// [`STORAGE_RECORD_TTL_MS`] (same strict boundary as `sweep_hosting`;
+    /// `saturating_sub` ⇒ a wall-clock rollback decays nothing). These
+    /// families are persisted, so removal must reach disk or expired
+    /// records resurrect at reload — save-on-change, like `purge_revoked`.
+    pub fn sweep_stale_pledges_and_backups(&mut self, now_ms: u64) -> bool {
+        let before = self.pledge_lists.len() + self.backup_sets.len();
+        let fresh = |stamp: u64| now_ms.saturating_sub(stamp) < STORAGE_RECORD_TTL_MS;
+        self.pledge_lists.retain(|_, r| fresh(r.received_at_ms));
+        self.backup_sets.retain(|_, r| fresh(r.received_at_ms));
+        let changed = self.pledge_lists.len() + self.backup_sets.len() != before;
+        if changed {
+            self.save();
+        }
+        changed
+    }
+
+    /// ZEB-923: one-shot post-load floor, called once at the production
+    /// construction site. Guarantees every reloaded record at least
+    /// [`STORAGE_RECORD_BOOT_GRACE_MS`] before it can decay — a receiver
+    /// offline longer than the TTL must not mass-decay alive buddies at
+    /// boot before their next renewal lands. Raise-only, RAM-only (not
+    /// saved: a reload re-floors, which is consistent); saturates to a
+    /// no-op for small clocks, leaving test fixtures untouched.
+    pub fn apply_boot_grace(&mut self, now_ms: u64) {
+        let floor = now_ms.saturating_sub(STORAGE_RECORD_TTL_MS - STORAGE_RECORD_BOOT_GRACE_MS);
+        for r in self.pledge_lists.values_mut() {
+            r.received_at_ms = r.received_at_ms.max(floor);
+        }
+        for r in self.backup_sets.values_mut() {
+            r.received_at_ms = r.received_at_ms.max(floor);
+        }
     }
 
     /// ZEB-679 R1 (Qodo): revocation is enforced RETROACTIVELY too.
@@ -1563,6 +1627,223 @@ mod tests {
         assert!(
             store.hosting_report(&owner).is_none(),
             "stale report dropped"
+        );
+    }
+
+    #[test]
+    fn record_ttl_sweep_boundary_is_strict_and_leaves_hosting_alone() {
+        let mut store = StorageRecordStore::new(None);
+        let id = test_identity();
+        let owner = addr_of(&id);
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("someone", 5)], 10);
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), 1_000)
+            .changed());
+        let (topic, bytes) = signed_backup_bytes(&id, vec![], 10);
+        assert!(store
+            .on_backup_set_sample(&topic, &bytes, &rvk(), 1_000)
+            .changed());
+        let (topic, bytes) = signed_hosting_bytes(&id, vec![], 10);
+        assert!(store
+            .on_hosting_report_sample(&topic, &bytes, &rvk(), 1_000)
+            .changed());
+
+        assert!(
+            !store.sweep_stale_pledges_and_backups(1_000 + STORAGE_RECORD_TTL_MS - 1),
+            "fresh records: no change"
+        );
+        assert!(store.pledge_list(&owner).is_some(), "TTL-1 pledge kept");
+        assert!(store.backup_set(&owner).is_some(), "TTL-1 backup set kept");
+
+        assert!(store.sweep_stale_pledges_and_backups(1_000 + STORAGE_RECORD_TTL_MS));
+        assert!(
+            store.pledge_list(&owner).is_none(),
+            "exactly-at-TTL pledge dropped"
+        );
+        assert!(
+            store.backup_set(&owner).is_none(),
+            "exactly-at-TTL backup set dropped"
+        );
+        assert!(
+            store.hosting_report(&owner).is_some(),
+            "the record TTL sweep must not touch hosting reports"
+        );
+    }
+
+    #[test]
+    fn record_ttl_renewed_record_survives_the_sweep_that_kills_its_cohort() {
+        let mut store = StorageRecordStore::new(None);
+        let alice = test_identity();
+        let bob = test_identity();
+        let (topic, bytes) = signed_pledge_bytes(&alice, vec![pledge("x", 1)], 10);
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), 1_000)
+            .changed());
+        let (topic, bytes) = signed_pledge_bytes(&bob, vec![pledge("x", 1)], 10);
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), 1_000)
+            .changed());
+        // Alice renews: strictly-newer updated_at ⇒ UpdatedNewer ⇒ fresh stamp.
+        let (topic, bytes) = signed_pledge_bytes(&alice, vec![pledge("x", 1)], 11);
+        assert_eq!(
+            store.on_pledge_list_sample(&topic, &bytes, &rvk(), 2_000),
+            RecordOutcome::UpdatedNewer
+        );
+        assert!(store.sweep_stale_pledges_and_backups(1_000 + STORAGE_RECORD_TTL_MS));
+        assert!(
+            store.pledge_list(&addr_of(&alice)).is_some(),
+            "renewed survives"
+        );
+        assert!(
+            store.pledge_list(&addr_of(&bob)).is_none(),
+            "non-renewed cohort decays"
+        );
+    }
+
+    #[test]
+    fn record_ttl_sweep_persists_so_expired_records_stay_gone_after_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("storage_records.json");
+        let id = test_identity();
+        let owner = addr_of(&id);
+        {
+            let mut store = StorageRecordStore::new(Some(path.clone()));
+            let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("someone", 5)], 10);
+            assert!(store
+                .on_pledge_list_sample(&topic, &bytes, &rvk(), 1_000)
+                .changed());
+            assert!(store.sweep_stale_pledges_and_backups(1_000 + STORAGE_RECORD_TTL_MS));
+        }
+        let reloaded = StorageRecordStore::new(Some(path));
+        assert!(
+            reloaded.pledge_list(&owner).is_none(),
+            "sweep must save() — an expired record must not resurrect at reload"
+        );
+    }
+
+    #[test]
+    fn received_at_ms_round_trips_disk_and_legacy_files_default_to_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("storage_records.json");
+        let id = test_identity();
+        let owner = addr_of(&id);
+        {
+            let mut store = StorageRecordStore::new(Some(path.clone()));
+            let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("someone", 7)], 10);
+            assert!(store
+                .on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000)
+                .changed());
+            let (topic, bytes) = signed_backup_bytes(&id, vec![], 10);
+            assert!(store
+                .on_backup_set_sample(&topic, &bytes, &rvk(), 9_500)
+                .changed());
+        }
+        let reloaded = StorageRecordStore::new(Some(path));
+        assert_eq!(
+            reloaded.pledge_lists.get(&owner).unwrap().received_at_ms,
+            9_000
+        );
+        assert_eq!(
+            reloaded.backup_sets.get(&owner).unwrap().received_at_ms,
+            9_500
+        );
+
+        // Legacy file (no receivedAtMs field) loads with 0 (⇒ boot-grace floor).
+        let legacy = dir.path().join("legacy.json");
+        std::fs::write(
+            &legacy,
+            format!(
+                r#"{{"version":1,"pledgeLists":[{{"owner":"{owner}","pledges":[],"updatedAt":1}}],"backupSets":[],"signerPins":[]}}"#
+            ),
+        )
+        .unwrap();
+        let store = StorageRecordStore::new(Some(legacy));
+        assert_eq!(store.pledge_lists.get(&owner).unwrap().received_at_ms, 0);
+    }
+
+    #[test]
+    fn apply_boot_grace_floors_stale_stamps_and_leaves_fresh_ones() {
+        let mut store = StorageRecordStore::new(None);
+        let old = test_identity();
+        let fresh = test_identity();
+        let now = 10 * STORAGE_RECORD_TTL_MS;
+        let (topic, bytes) = signed_pledge_bytes(&old, vec![pledge("x", 1)], 10);
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), 0)
+            .changed());
+        let (topic, bytes) = signed_pledge_bytes(&fresh, vec![pledge("x", 1)], 10);
+        assert!(store
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), now - 1_000)
+            .changed());
+
+        store.apply_boot_grace(now);
+        let floor = now - (STORAGE_RECORD_TTL_MS - STORAGE_RECORD_BOOT_GRACE_MS);
+        assert_eq!(
+            store
+                .pledge_lists
+                .get(&addr_of(&old))
+                .unwrap()
+                .received_at_ms,
+            floor,
+            "ancient stamp raised to the grace floor"
+        );
+        assert_eq!(
+            store
+                .pledge_lists
+                .get(&addr_of(&fresh))
+                .unwrap()
+                .received_at_ms,
+            now - 1_000,
+            "fresh stamp untouched (raise-only)"
+        );
+
+        // Small test clocks saturate to a no-op floor of 0.
+        let mut small = StorageRecordStore::new(None);
+        let (topic, bytes) = signed_pledge_bytes(&old, vec![pledge("x", 1)], 11);
+        assert!(small
+            .on_pledge_list_sample(&topic, &bytes, &rvk(), 9_000)
+            .changed());
+        small.apply_boot_grace(9_000);
+        assert_eq!(
+            small
+                .pledge_lists
+                .get(&addr_of(&old))
+                .unwrap()
+                .received_at_ms,
+            9_000
+        );
+    }
+
+    #[test]
+    fn record_ttl_expiry_unfreezes_the_owner_cap() {
+        let mut store = StorageRecordStore::new(None);
+        // Fill to cap with direct rows (established working set), all stale.
+        for i in 0..MAX_TRACKED_OWNERS {
+            let seq = store.next_insert_seq();
+            store.pledge_lists.insert(
+                format!("owner-{i:04}"),
+                PledgeListRecord {
+                    pledges: vec![],
+                    updated_at: 1,
+                    received_at_ms: 1_000,
+                    seq,
+                },
+            );
+        }
+        // Frozen: a genuinely new honest owner self-evicts.
+        let id = test_identity();
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("x", 1)], 10);
+        assert_eq!(
+            store.on_pledge_list_sample(&topic, &bytes, &rvk(), 2_000),
+            RecordOutcome::IgnoredAtCap
+        );
+        // TTL expiry frees the slots…
+        assert!(store.sweep_stale_pledges_and_backups(1_000 + STORAGE_RECORD_TTL_MS));
+        // …and the same newcomer is now admitted.
+        let (topic, bytes) = signed_pledge_bytes(&id, vec![pledge("x", 1)], 11);
+        assert_eq!(
+            store.on_pledge_list_sample(&topic, &bytes, &rvk(), 1_000 + STORAGE_RECORD_TTL_MS),
+            RecordOutcome::Inserted
         );
     }
 
