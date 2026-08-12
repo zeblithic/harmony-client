@@ -880,10 +880,12 @@ pub struct NodeState {
     storage_settings_path: Option<std::path::PathBuf>,
     /// ZEB-669 S2: session-monotonic publish clocks, one per storage
     /// record type — same rationale as `follow_list_clock` (two changes
-    /// within one wall second must not be LWW-equal). Atomic only for
-    /// interior mutability; writers hold the NodeState mutex.
-    pledge_clock: std::sync::atomic::AtomicU64,
-    backup_set_clock: std::sync::atomic::AtomicU64,
+    /// within one wall second must not be LWW-equal). `Arc` (ZEB-923):
+    /// the storage-record publisher task holds a clone for its hourly
+    /// renewal re-mints, so the mint itself is race-free (`fetch_update`)
+    /// rather than relying on writers holding the NodeState mutex.
+    pledge_clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    backup_set_clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Monotonic install generation. Bumped at lock-2 install site under
     /// `start_node`. Post-install checks (pairing-handle install, failure
     /// cleanup, stop_inner gating) compare against this to detect whether a
@@ -2099,8 +2101,8 @@ impl Default for NodeState {
                 storage_settings::StorageSettings::default(),
             )),
             storage_settings_path: None,
-            pledge_clock: std::sync::atomic::AtomicU64::new(0),
-            backup_set_clock: std::sync::atomic::AtomicU64::new(0),
+            pledge_clock: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            backup_set_clock: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 0,
             install_seq: 0,
             node_addr: String::new(),
@@ -13670,10 +13672,17 @@ pub async fn start_node_inner(
                         guard.storage_ledger = storage_ledger_arc;
                         guard.storage_settings = storage_settings_arc;
                         guard.storage_settings_path = Some(storage_settings_path);
-                        guard.pledge_clock =
-                            std::sync::atomic::AtomicU64::new(storage_settings_loaded.pledge_floor);
-                        guard.backup_set_clock = std::sync::atomic::AtomicU64::new(
+                        // ZEB-923: raise-only seed on the SHARED cells — a
+                        // publisher-task clone must never be disconnected by a
+                        // field reassignment, and an in-memory clock ahead of a
+                        // stale-saved floor must never regress.
+                        guard.pledge_clock.fetch_max(
+                            storage_settings_loaded.pledge_floor,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        guard.backup_set_clock.fetch_max(
                             storage_settings_loaded.backup_set_floor,
+                            std::sync::atomic::Ordering::Relaxed,
                         );
                         guard.followed_set = Some(followed_set);
                         guard.vine_feed_cache = Some(vine_feed_cache);
@@ -20055,10 +20064,15 @@ fn next_storage_updated_at(clock: &std::sync::atomic::AtomicU64) -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let prev = clock.load(Ordering::Relaxed);
-    let ts = now_secs.max(prev + 1);
-    clock.store(ts, Ordering::Relaxed);
-    ts
+    // ZEB-923: race-free — the sync IPC paths and the publisher task's
+    // renewal re-mints share each clock; a load/store pair could hand two
+    // concurrent minters the same stamp (LWW-equal ⇒ one publish ignored).
+    let prev = clock
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            Some(now_secs.max(prev + 1))
+        })
+        .unwrap_or_else(|prev| prev); // closure always returns Some
+    now_secs.max(prev + 1)
 }
 
 /// Refuse to sign a storage record for an owner address the local
@@ -20181,7 +20195,9 @@ fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), Stri
             .storage_settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        settings.pledge_floor = updated_at;
+        // ZEB-923: grow-only — concurrent minters can persist out of
+        // order; a floor must never move backwards.
+        settings.pledge_floor = settings.pledge_floor.max(updated_at);
         persist_storage_settings(guard, &settings);
         settings
             .my_pledges
@@ -20254,7 +20270,8 @@ fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), Strin
             .storage_settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        settings.backup_set_floor = updated_at;
+        // ZEB-923: grow-only — see the pledge floor above.
+        settings.backup_set_floor = settings.backup_set_floor.max(updated_at);
         persist_storage_settings(guard, &settings);
     }
     // PR #449 review (Qodo): receivers enforce MAX_BACKUP_SET_WIRE_BYTES
@@ -82215,8 +82232,8 @@ mod start_node_race_tests {
                 storage_settings::StorageSettings::default(),
             )),
             storage_settings_path: None,
-            pledge_clock: std::sync::atomic::AtomicU64::new(0),
-            backup_set_clock: std::sync::atomic::AtomicU64::new(0),
+            pledge_clock: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            backup_set_clock: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 0,
             install_seq: 0,
             node_addr: String::new(),
