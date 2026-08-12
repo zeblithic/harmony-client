@@ -27,8 +27,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-/// Number of enumerated rendezvous slots == the relay-advertiser cap.
-pub const RENDEZVOUS_SLOT_COUNT: usize = COMMUNITY_RELAY_ADVERTISERS_MAX;
+/// Number of enumerated rendezvous slots.
+///
+/// ZEB-910: deliberately DECOUPLED from (and larger than)
+/// [`COMMUNITY_RELAY_ADVERTISERS_MAX`]. Slots bound *discovery* — how many
+/// advertisers publish a bridgeable beacon — while the relay cap bounds
+/// *service reads* (`relays_for_community` truncation feeding the pull
+/// drivers). Raising only the slot count shrinks the chance that every beacon
+/// publisher sits in one island after a community split, without doubling
+/// relay-pull fan-out. Compatibility: the slot index is only a key-derivation
+/// input — old resolvers probe slots 0..4 and still find those publishers;
+/// old publishers fill only 0..4, which new resolvers still probe.
+pub const RENDEZVOUS_SLOT_COUNT: usize = 8;
 
 /// ZEB-827: encode a rendezvous slot's routing blob — a superset of
 /// `ReachabilityAnnouncePayload` carrying an optional membership vouch. A `None`
@@ -603,9 +613,15 @@ mod tests {
         }
     }
 
+    /// ZEB-910: slots bound DISCOVERY (who publishes a bridgeable beacon), the
+    /// relay cap bounds SERVICE reads (`relays_for_community` fan-out).
+    /// Decoupled deliberately — advertisers ranked 4..8 publish beacons
+    /// without joining the pull set, so one island can't hold every slot
+    /// as easily while relay-pull load stays unchanged.
     #[test]
-    fn slot_count_tracks_advertiser_cap() {
-        assert_eq!(RENDEZVOUS_SLOT_COUNT, COMMUNITY_RELAY_ADVERTISERS_MAX);
+    fn slot_count_exceeds_relay_read_cap_by_design() {
+        assert_eq!(RENDEZVOUS_SLOT_COUNT, 8);
+        assert!(RENDEZVOUS_SLOT_COUNT >= COMMUNITY_RELAY_ADVERTISERS_MAX);
     }
 
     fn addr(b: u8) -> OwnerAddr {
