@@ -2560,7 +2560,12 @@ pub struct KeylessRefusingDispatcher {
 #[async_trait::async_trait]
 impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for KeylessRefusingDispatcher {
     async fn handle_connection(&self, conn: Connection) {
-        tracing::info!(
+        // debug, not info: this fires per inbound connection BEFORE peer
+        // authentication, so a reconnect-flooding remote could otherwise
+        // pressure the log (the in-flight gate bounds concurrency, not
+        // sequential attempts). The local-only condition itself is already
+        // surfaced once, loudly, by the ZEB-904 boot warn (CodeRabbit #656).
+        tracing::debug!(
             surface = self.surface,
             "refusing inbound handshake: no fleet crypto (local-only mode; \
              restore the recovery phrase to re-enable)"
