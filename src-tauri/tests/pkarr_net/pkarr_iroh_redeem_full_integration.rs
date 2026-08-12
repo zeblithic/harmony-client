@@ -2054,11 +2054,17 @@ async fn invite_not_burned_when_handshake_fails_after_insert() {
         .await
         .expect("connectivity_redeem_invite_iroh_inner must Ok (errors → non-joined status)");
 
-        assert_ne!(
+        // ZEB-899: post-write failure now latches (joined + pending) instead of
+        // reporting unreachable. The ZEB-874 burn assertions below are
+        // unchanged — the latch is joiner-local and must not burn the invite.
+        assert_eq!(
             outcome.status, "joined",
-            "the redeem must NOT report joined when the acceptor CountersignTimeouts \
-             before delivering the countersign; got status={:?}",
+            "ZEB-899: a post-write failure must latch as joined+pending; got status={:?}",
             outcome.status
+        );
+        assert!(
+            outcome.pending,
+            "ZEB-899: the latched join must report pending=true"
         );
 
         // Grace window for the spawned auto-counter-sign task and teardown to
@@ -2260,12 +2266,34 @@ async fn zeb889_first_attempt_caches_minted_redemption() {
         .await
         .expect("connectivity_redeem_invite_iroh_inner must Ok (errors → non-joined status)");
 
-        assert_ne!(
+        // ZEB-899: the request was fully written and Alice's handle_unicast
+        // committed the PendingJoin (poll_deadline=0 only suppresses the
+        // RESPONSE) — a post-write failure now latches the join as pending
+        // instead of falsely reporting the inviter unreachable.
+        assert_eq!(
             outcome.status, "joined",
-            "the first attempt must NOT join when the acceptor CountersignTimeouts; \
-             got status={:?}",
+            "ZEB-899: a post-write failure (no countersign response) must latch, \
+             not report unreachable; got status={:?}",
             outcome.status
         );
+        assert!(
+            outcome.pending,
+            "ZEB-899: the latched join must report pending=true (no countersign \
+             was applied in-band)"
+        );
+        {
+            let g = s.bob_crdt_state.lock().await;
+            let row = g
+                .spaces
+                .get(&s.community_id)
+                .expect("ZEB-899: the latch must commit Bob's owner-state Space row");
+            assert!(
+                row.pending_join_at.is_some(),
+                "ZEB-899: the latched Space row must carry pending_join_at (greyed \
+                 until the JoinCountersign converges); got {:?}",
+                row.pending_join_at
+            );
+        }
 
         // The load-bearing assertion: the production first attempt cached its mint,
         // so a subsequent retry can reuse it (the recovery leg this PR enables).
@@ -2277,12 +2305,130 @@ async fn zeb889_first_attempt_caches_minted_redemption() {
             "ZEB-889: the first attempt must cache its minted redemption for retry reuse"
         );
 
+        // ZEB-899: the latch spawned a real engine on Bob's registry — shut it
+        // down deterministically so its background tasks can't outlive the test
+        // (nextest leak detection). Best-effort: this harness has no live
+        // adapter transport, so the final flush reports TransportClosed even
+        // though the engine tasks are torn down.
+        let _ = s.registry_bob.shutdown_all().await;
         s.publisher_handle.abort();
         s.alice_ep.shutdown().await;
         s.bob_ep.shutdown().await;
     })
     .await
     .expect("zeb889_first_attempt_caches_minted_redemption timed out at 60s");
+}
+
+/// ZEB-899: when the post-write LATCH itself cannot commit (here: the
+/// generation fence rejects — node stopped mid-redeem), nothing landed
+/// locally, so the outcome degrades to the honest legacy classification
+/// (`inviter_unreachable`, which keeps the LAN-fallback affordance) — NOT
+/// `join_failed` (which asserts the inviter was reached and suppresses the
+/// fallback) and NOT `joined`. The mint stays cached for a later retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zeb899_latch_commit_failure_degrades_to_unreachable() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        // poll_deadline = 0 → no response is written → the joiner enters latch
+        // mode after its response read times out.
+        let s = setup_two_party_iroh_handshake_with_config(
+            harmony_app::iroh_invite_acceptor::HandshakeAcceptorConfig {
+                io_deadline: Duration::from_millis(10_000),
+                poll_deadline: Duration::ZERO,
+                poll_interval: Duration::from_millis(20),
+            },
+        )
+        .await;
+
+        let (invite_payload, invite_url, token_sig) = zeb889_build_targeted_invite(&s);
+        let cache_key = invite_payload
+            .redemption_mint_cache_key()
+            .expect("payload cache key");
+        s.invite_pub.register_invite(&invite_payload).await;
+        let _probe = await_pkarr_record_visible(&s.pkarr_resolver, &token_sig).await;
+
+        let outcome = harmony_app::connectivity_redeem_invite_iroh_inner(
+            invite_url,
+            Some(Arc::clone(&s.pkarr_resolver)),
+            Some(s.bob_reachability.clone()),
+            Some(Arc::clone(&s.bob_ep)),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            s.bob_adopt_floor.clone(),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            None,
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            None,
+            None,
+            |_| {},
+            |_p: harmony_app::NavUpdatedPayload| {},
+            harmony_app::HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(10_000),
+                open_bi_timeout: Duration::from_millis(10_000),
+                response_read_timeout: Duration::from_millis(2_000),
+                write_timeout: Duration::from_millis(10_000),
+            },
+            // The generation fence rejects: the ONLY fence evaluation on this
+            // run happens inside the latch-mode inner (the handshake never
+            // reaches the delivered path), so a constant Err drives the
+            // latch-commit-failure arm deterministically.
+            || {
+                Err(harmony_app::community_invite::RedeemInviteError::new(
+                    harmony_app::community_invite::RedeemInviteErrorCode::GenerationChanged,
+                    "forced fence failure (ZEB-899 latch-degrade test)".to_string(),
+                ))
+            },
+        )
+        .await
+        .expect("connectivity_redeem_invite_iroh_inner must Ok (errors → non-joined status)");
+
+        assert_eq!(
+            outcome.status, "inviter_unreachable",
+            "ZEB-899: a failed latch commit must degrade to the legacy unreachable \
+             outcome (fallback affordance intact), not join_failed/joined; got {:?}",
+            outcome.status
+        );
+        assert!(
+            !s.bob_crdt_state
+                .lock()
+                .await
+                .spaces
+                .contains_key(&s.community_id),
+            "ZEB-899: a failed latch must not leave a Space row (rollback)"
+        );
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            s.registry_bob
+                .get_redemption_mint(cache_key, now_ms)
+                .await
+                .is_some(),
+            "ZEB-899: the mint stays cached for a later retry even when the latch fails"
+        );
+
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("zeb899_latch_commit_failure_degrades_to_unreachable timed out at 60s");
 }
 
 /// ZEB-889: a legitimate joiner whose first countersign delivery failed can
@@ -2397,6 +2543,49 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
             g.insert_verified_for_test(cs1);
         }
 
+        // --- ZEB-899: seed Bob's LATCHED-PENDING Space — the state the
+        //     post-write latch now commits on a failed first attempt (drive
+        //     the same inner the latch call uses: pre_minted, no countersign,
+        //     short redeem window). The retry below then runs over an
+        //     EXISTING pending Space + spawned engine, which is the real
+        //     retry-after-latch shape.
+        let latch_dto = harmony_app::redeem_invite_inner_with_overrides(
+            invite_url.clone(),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            s.bob_adopt_floor.clone(),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            None,
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            || Ok(()),
+            None,
+            harmony_app::RedeemInviteOverrides {
+                pre_minted: Some(p1_mint.clone()),
+                redeem_timeout: Some(Duration::from_secs(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ZEB-899: the latch seed must commit a pending Space, not Err");
+        assert!(
+            latch_dto.pending,
+            "ZEB-899 precondition: the seeded latch must be pending; got {latch_dto:?}"
+        );
+        {
+            let g = s.bob_crdt_state.lock().await;
+            let row = g
+                .spaces
+                .get(&s.community_id)
+                .expect("ZEB-899 precondition: latched Space row exists before the retry");
+            assert!(row.pending_join_at.is_some());
+        }
+
         // --- Drive the retry. Bob reuses P1 from cache → sends P1 → Alice
         //     AlreadyKnown → the acceptor's poll finds the seeded CS1 → delivers
         //     → Bob joins, and the acceptor burns the invite. ---
@@ -2440,6 +2629,14 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
             outcome.status
         );
 
+        // ZEB-899: the retry delivered the countersign in-band over the
+        // EXISTING latched Space/engine — the join is fully ratified now.
+        assert!(
+            !outcome.pending,
+            "ZEB-899: the reused-mint retry must complete the latched join \
+             (pending=false); got {outcome:?}"
+        );
+
         // Poll (rather than a fixed sleep) until the acceptor's post-delivery
         // burn unregisters the invite — the burn happens on the acceptor task
         // just after it writes the countersign, so it races the redeem return.
@@ -2473,6 +2670,12 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
             "ZEB-889: the cached mint is evicted once the join commits"
         );
 
+        // ZEB-899: the latch seed + retry spawned real engines on Bob's
+        // registry — shut them down deterministically so their background
+        // tasks can't outlive the test (nextest leak detection). Best-effort:
+        // this harness has no live adapter transport, so the final flush
+        // reports TransportClosed even though the engine tasks are torn down.
+        let _ = s.registry_bob.shutdown_all().await;
         s.publisher_handle.abort();
         s.alice_ep.shutdown().await;
         s.bob_ep.shutdown().await;

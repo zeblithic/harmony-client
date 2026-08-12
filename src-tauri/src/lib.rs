@@ -62173,14 +62173,19 @@ pub struct RedemptionOutcome {
     /// * `"joined"` — full handshake completed; the joiner is now a
     ///   member. `community_id` is `Some(hex)`.
     /// * `"inviter_unreachable"` — pkarr couldn't find / verify the
-    ///   record, OR the iroh dial / open_bi / response read failed
-    ///   before the inviter delivered a JoinCountersign. The inviter
-    ///   was NOT reached. `community_id` is `None`.
+    ///   record, OR the iroh dial / open_bi / request write failed — the
+    ///   join request was never fully written, so the inviter was NOT
+    ///   reached. ZEB-899: post-write failures (response read / decode /
+    ///   countersign mismatch) no longer map here — they latch as
+    ///   `"joined"` + `pending`. One post-write exception: a latch whose
+    ///   local commit itself fails degrades back to this status (nothing
+    ///   landed locally). `community_id` is `None`.
     /// * `"no_member_reachable"` — ZEB-911: the admin dial failed AND the
     ///   witness ladder dialed at least one rendezvous-resolved candidate,
-    ///   all unreachable. Same retry semantics as `"inviter_unreachable"`;
-    ///   distinct so the UI names the community, not the inviter.
-    ///   `community_id` is `None`.
+    ///   all unreachable. Same retry semantics as `"inviter_unreachable"`,
+    ///   and likewise pre-write only since ZEB-899 (same latch-commit-
+    ///   failure exception); distinct so the UI names the community, not
+    ///   the inviter. `community_id` is `None`.
     /// * `"join_failed"` — pkarr resolved AND the iroh handshake
     ///   completed AND a valid JoinCountersign was delivered, but the
     ///   subsequent local `redeem_invite_inner_with_overrides` failed
@@ -62202,7 +62207,9 @@ pub struct RedemptionOutcome {
     pub community_id: Option<String>,
     /// ZEB-902: for a `"joined"` outcome, whether the join landed as a
     /// *pending* member — a deposited PendingJoin still awaiting the admin's
-    /// countersign — rather than a fully-ratified member. Carried straight
+    /// countersign (the ZEB-902 deposit path, or the ZEB-899 post-write
+    /// latch when the handshake response never arrived) — rather than a
+    /// fully-ratified member. Carried straight
     /// from `dto.pending` (the same flag already forwarded to the nav node
     /// and surfaced by the LAN redeem path, ZEB-254). Always `false` for the
     /// non-`"joined"` statuses (no membership landed). Lets
@@ -62212,9 +62219,11 @@ pub struct RedemptionOutcome {
 }
 
 impl RedemptionOutcome {
-    /// The inviter was not reached / could not be verified — no membership
-    /// landed (`community_id` is `None`, `pending` is definitionally
-    /// `false`).
+    /// The inviter was not reached / could not be verified — the join
+    /// request was never fully written (pre-write only since ZEB-899, with
+    /// one exception: a post-write latch whose local commit fails degrades
+    /// back here); no membership landed (`community_id` is `None`,
+    /// `pending` is definitionally `false`).
     fn unreachable() -> Self {
         Self {
             status: "inviter_unreachable".to_string(),
@@ -62226,8 +62235,10 @@ impl RedemptionOutcome {
     /// ZEB-911: the witness ladder was genuinely exercised — either the
     /// admin's Case-A dial failed and at least one rendezvous-resolved
     /// witness candidate was dialed and failed, or a WITNESS connection was
-    /// established and the handshake stream then died (review r2:
-    /// witness-aware post-dial classification). Distinct from
+    /// established and the stream died BEFORE the join request was fully
+    /// written (review r2; ZEB-899: post-write failures latch as
+    /// `"joined"` + `pending` instead — except a latch whose local commit
+    /// fails, which degrades back here). Distinct from
     /// `"inviter_unreachable"` so the frontend can say "no community member
     /// is currently reachable" instead of blaming the inviter, while mapping
     /// to the same retry affordance. No membership landed.
@@ -63590,14 +63601,23 @@ mod zeb908_reuse_live_session_tests {
 ///  11. CBOR-decode the response as a `SignedMembershipEvent`
 ///      (JoinCountersign). Defensively reject if the wrapped event isn't
 ///      a JoinCountersign targeting our just-minted `bootstrap_join.id`.
+///      ZEB-899: steps 10–11 collapse into
+///      `delivered: Option<(chain, countersign)>` — any failure in them is
+///      POST-write (the acceptor may already have committed the join) and
+///      falls through to step 12's latch mode instead of returning
+///      `inviter_unreachable`.
 ///  12. Call `redeem_invite_inner_with_overrides` with `pre_minted=Some(...)`
 ///      (so the inner reuses the same bootstrap_join.id we just sent —
 ///      `mint_redemption` randomizes the event id, so a fresh mint inside
 ///      would target a different event and the JoinCountersign hook
-///      wouldn't fire), `pre_delivered_countersign=Some(...)`, and
-///      `allow_no_reticulum_destinations=true`. The inner's oneshot await
-///      resolves immediately because Step 12's countersign insert fires
-///      the post-Inserted hook on `target_event_id == bootstrap_join.id`.
+///      wouldn't fire) and `pre_delivered_countersign` from `delivered`.
+///      With a delivered countersign the inner's oneshot await resolves
+///      immediately via the post-Inserted hook on
+///      `target_event_id == bootstrap_join.id`. In latch mode (ZEB-899,
+///      `delivered == None`) the same call commits the ZEB-501
+///      latched-pending Space (`"joined"` + `pending=true`) that converges
+///      over CRDT sync; the ZEB-889 mint cache is retained so a retry hits
+///      the host's AlreadyKnown-retransmit path.
 #[allow(clippy::too_many_arguments)]
 pub async fn connectivity_redeem_invite_iroh_inner<F>(
     invite_url: String,
@@ -64565,132 +64585,150 @@ where
     // round-trip — users only saw `sending` for the full network wait.
     emit_stage(RedemptionStage::AwaitingCountersig);
 
-    // 10. Read response, bounded by dial_config.response_read_timeout.
+    // 10.–11. Read + decode + verify the response, collapsed into `delivered`.
+    // ZEB-899: `None` = post-write failure — the request was FULLY written
+    // (both write_alls Ok), so the acceptor may already have committed the
+    // join host-side (it inserts the PendingJoin and countersign BEFORE
+    // writing the response). These branches therefore no longer return
+    // `inviter_unreachable`; they fall through to the latch-mode inner call
+    // below. Each keeps its distinct warn + labelled CONNECTION_CLOSE.
     // ZEB-325 PR #159 F3: distinct tracing for response-read timeout vs
     // dial / open_bi timeouts (above) so diagnostics can attribute
     // failures cleanly.
-    let read_response = async {
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf)
-            .await
-            .map_err(|e| format!("read length-prefix: {e}"))?;
-        let len = crate::iroh_framing::decode_len_prefix(
-            len_buf,
-            crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN,
-            crate::iroh_framing::Endian::Le,
-            false,
-        )
-        .map_err(|e| format!("response length out of bounds: len={} max={}", e.len, e.max))?;
-        let mut body = vec![0u8; len];
-        recv.read_exact(&mut body)
-            .await
-            .map_err(|e| format!("read response body: {e}"))?;
-        Ok::<Vec<u8>, String>(body)
-    };
-    let response_bytes =
-        match tokio::time::timeout(dial_config.response_read_timeout, read_response).await {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    error = %e,
-                    "ZEB-325 Phase 2c option A: handshake response read failed"
-                );
-                // ZEB-325 PR #159 R5: explicit close for symmetry with
-                // the dial / open_bi failure paths above. Without this
-                // the connection stays open until QUIC's idle timeout
-                // fires — the acceptor side sees a stalled stream and
-                // its IO timeout has to fire before resources are
-                // released. CONNECTION_CLOSE lets the peer release
-                // immediately.
-                conn.close(0u32.into(), b"response-read-failed");
-                return Ok(post_dial_failure_outcome());
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    timeout_ms = dial_config.response_read_timeout.as_millis() as u64,
-                    "ZEB-325 Phase 2c option A: handshake response timeout (read)"
-                );
-                conn.close(0u32.into(), b"response-read-timeout");
-                return Ok(post_dial_failure_outcome());
-            }
-        };
-
-    // 11. CBOR-decode the response. A legacy/admin acceptor returns a single
-    // SignedMembershipEvent (CBOR map, major type 5). A ZEB-911 witness
-    // returns an array (major type 4) of [admission chain ..., countersign]
-    // so this joiner can verify a countersign authored by a member its
-    // fresh CRDT has never seen. Dispatch on the first byte's major type —
-    // the two shapes are structurally unambiguous.
-    // Qodo r3: derive the joiner's chain-length bound from the SAME byte cap
-    // the acceptor enforces when deciding whether the chain fits (and that
-    // the frame read above already applied), so the two ends cannot
-    // disagree: any response the read cap admits decodes to fewer events
-    // than this (each event serializes to at least
-    // `MIN_SIGNED_EVENT_ENCODED_LEN` bytes). The count check is therefore
-    // pure defense-in-depth against a decoder bug — not an independent
-    // policy. The previous flat 64 was one: acceptors degrade on BYTES
-    // only, and a long-history community (every DeviceAnnounce rides the
-    // admission timeline, and countersigner timelines recurse in) can
-    // legitimately ship hundreds of events under the byte cap, which this
-    // joiner then rejected as malformed.
-    const ZEB911_MAX_CHAIN_EVENTS: usize = crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN
-        / crate::community_membership::MIN_SIGNED_EVENT_ENCODED_LEN;
-    let (chain, countersign): (
+    let delivered: Option<(
         Vec<crate::community_membership::SignedMembershipEvent>,
         crate::community_membership::SignedMembershipEvent,
-    ) = if response_bytes.first().map(|b| b >> 5) == Some(4) {
-        let mut events: Vec<crate::community_membership::SignedMembershipEvent> =
-            match ciborium::from_reader(response_bytes.as_slice()) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "ZEB-911: chain response CBOR decode failed");
-                    return Ok(post_dial_failure_outcome());
+    )> = 'delivered: {
+        let read_response = async {
+            let mut len_buf = [0u8; 4];
+            recv.read_exact(&mut len_buf)
+                .await
+                .map_err(|e| format!("read length-prefix: {e}"))?;
+            let len = crate::iroh_framing::decode_len_prefix(
+                len_buf,
+                crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN,
+                crate::iroh_framing::Endian::Le,
+                false,
+            )
+            .map_err(|e| format!("response length out of bounds: len={} max={}", e.len, e.max))?;
+            let mut body = vec![0u8; len];
+            recv.read_exact(&mut body)
+                .await
+                .map_err(|e| format!("read response body: {e}"))?;
+            Ok::<Vec<u8>, String>(body)
+        };
+        let response_bytes =
+            match tokio::time::timeout(dial_config.response_read_timeout, read_response).await {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ZEB-325 Phase 2c option A: handshake response read failed"
+                    );
+                    // ZEB-325 PR #159 R5: explicit close for symmetry with
+                    // the dial / open_bi failure paths above. Without this
+                    // the connection stays open until QUIC's idle timeout
+                    // fires — the acceptor side sees a stalled stream and
+                    // its IO timeout has to fire before resources are
+                    // released. CONNECTION_CLOSE lets the peer release
+                    // immediately.
+                    conn.close(0u32.into(), b"response-read-failed");
+                    break 'delivered None;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_ms = dial_config.response_read_timeout.as_millis() as u64,
+                        "ZEB-325 Phase 2c option A: handshake response timeout (read)"
+                    );
+                    conn.close(0u32.into(), b"response-read-timeout");
+                    break 'delivered None;
                 }
             };
-        if events.len() < 2 || events.len() > ZEB911_MAX_CHAIN_EVENTS {
-            tracing::warn!(
-                len = events.len(),
-                "ZEB-911: chain response length out of bounds"
-            );
-            return Ok(post_dial_failure_outcome());
-        }
-        // Defensive: every chain event must belong to the community we are
-        // redeeming into (each is also fully re-verified by the engine's
-        // verify_event at insert — this just fails fast with a clear log).
-        if events.iter().any(|e| e.community_id != minted.community_id) {
-            tracing::warn!("ZEB-911: chain response carries a foreign community_id");
-            return Ok(post_dial_failure_outcome());
-        }
-        let cs = events.pop().expect("len >= 2 checked above");
-        (events, cs)
-    } else {
-        let cs: crate::community_membership::SignedMembershipEvent = match ciborium::from_reader(
-            response_bytes.as_slice(),
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "ZEB-325 Phase 2c option A: response CBOR decode failed");
-                return Ok(post_dial_failure_outcome());
+
+        // 11. CBOR-decode the response. A legacy/admin acceptor returns a single
+        // SignedMembershipEvent (CBOR map, major type 5). A ZEB-911 witness
+        // returns an array (major type 4) of [admission chain ..., countersign]
+        // so this joiner can verify a countersign authored by a member its
+        // fresh CRDT has never seen. Dispatch on the first byte's major type —
+        // the two shapes are structurally unambiguous.
+        // Qodo r3: derive the joiner's chain-length bound from the SAME byte cap
+        // the acceptor enforces when deciding whether the chain fits (and that
+        // the frame read above already applied), so the two ends cannot
+        // disagree: any response the read cap admits decodes to fewer events
+        // than this (each event serializes to at least
+        // `MIN_SIGNED_EVENT_ENCODED_LEN` bytes). The count check is therefore
+        // pure defense-in-depth against a decoder bug — not an independent
+        // policy. The previous flat 64 was one: acceptors degrade on BYTES
+        // only, and a long-history community (every DeviceAnnounce rides the
+        // admission timeline, and countersigner timelines recurse in) can
+        // legitimately ship hundreds of events under the byte cap, which this
+        // joiner then rejected as malformed.
+        const ZEB911_MAX_CHAIN_EVENTS: usize = crate::iroh_invite_acceptor::HANDSHAKE_MAX_PACKET_LEN
+            / crate::community_membership::MIN_SIGNED_EVENT_ENCODED_LEN;
+        let (chain, countersign): (
+            Vec<crate::community_membership::SignedMembershipEvent>,
+            crate::community_membership::SignedMembershipEvent,
+        ) = if response_bytes.first().map(|b| b >> 5) == Some(4) {
+            let mut events: Vec<crate::community_membership::SignedMembershipEvent> =
+                match ciborium::from_reader(response_bytes.as_slice()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ZEB-911: chain response CBOR decode failed");
+                        conn.close(0u32.into(), b"response-decode-failed");
+                        break 'delivered None;
+                    }
+                };
+            if events.len() < 2 || events.len() > ZEB911_MAX_CHAIN_EVENTS {
+                tracing::warn!(
+                    len = events.len(),
+                    "ZEB-911: chain response length out of bounds"
+                );
+                conn.close(0u32.into(), b"response-decode-failed");
+                break 'delivered None;
             }
+            // Defensive: every chain event must belong to the community we are
+            // redeeming into (each is also fully re-verified by the engine's
+            // verify_event at insert — this just fails fast with a clear log).
+            if events.iter().any(|e| e.community_id != minted.community_id) {
+                tracing::warn!("ZEB-911: chain response carries a foreign community_id");
+                conn.close(0u32.into(), b"response-decode-failed");
+                break 'delivered None;
+            }
+            let cs = events.pop().expect("len >= 2 checked above");
+            (events, cs)
+        } else {
+            let cs: crate::community_membership::SignedMembershipEvent = match ciborium::from_reader(
+                response_bytes.as_slice(),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "ZEB-325 Phase 2c option A: response CBOR decode failed");
+                    conn.close(0u32.into(), b"response-decode-failed");
+                    break 'delivered None;
+                }
+            };
+            (Vec::new(), cs)
         };
-        (Vec::new(), cs)
-    };
-    // Defensive: ensure it's a JoinCountersign for our bootstrap_join.
-    let target_ok = matches!(
-        &countersign.kind,
-        crate::community_membership::MembershipEventKind::JoinCountersign { target_event_id }
-        if *target_event_id == minted.bootstrap_join.id
-    );
-    if !target_ok {
-        tracing::warn!(
+        // Defensive: ensure it's a JoinCountersign for our bootstrap_join.
+        let target_ok = matches!(
+            &countersign.kind,
+            crate::community_membership::MembershipEventKind::JoinCountersign { target_event_id }
+            if *target_event_id == minted.bootstrap_join.id
+        );
+        if !target_ok {
+            tracing::warn!(
             "ZEB-325 Phase 2c option A: response is not a JoinCountersign for our bootstrap_join.id"
         );
-        return Ok(post_dial_failure_outcome());
-    }
-    if countersign.community_id != minted.community_id {
-        tracing::warn!("ZEB-325 Phase 2c option A: countersign community_id mismatch");
-        return Ok(post_dial_failure_outcome());
-    }
+            conn.close(0u32.into(), b"countersign-mismatch");
+            break 'delivered None;
+        }
+        if countersign.community_id != minted.community_id {
+            tracing::warn!("ZEB-325 Phase 2c option A: countersign community_id mismatch");
+            conn.close(0u32.into(), b"countersign-mismatch");
+            break 'delivered None;
+        }
+        Some((chain, countersign))
+    };
 
     // Cleanly close the iroh connection. The acceptor's
     // `handle_connection` awaits `conn.closed()` to keep its
@@ -64716,23 +64754,42 @@ where
     // drain. The acceptor's symmetric wait still bounds itself by
     // `io_deadline` (see `iroh_invite_acceptor.rs::handle_connection`
     // R2/R3 timeout work), so no acceptor-side leak risk.
+    // ZEB-899: on a post-write failure the branch already closed the
+    // connection with its own diagnostic label, so the close here is
+    // delivered-path-only.
     drop(send);
     drop(recv);
-    conn.close(0u32.into(), b"handshake-complete");
+    if delivered.is_some() {
+        conn.close(0u32.into(), b"handshake-complete");
+    }
     drop(conn);
 
-    // 12. Drive the inner with overrides: pre_minted (same artifacts
-    // we already wired into the wire packet) and pre_delivered_countersign
-    // (so the oneshot await resolves on the engine's post-Inserted hook
-    // for the JoinCountersign's target_event_id, which equals our
-    // pre_minted.bootstrap_join.id).
+    // 12. ONE call site for both modes (ZEB-899). `delivered == Some`: drive
+    // the inner with pre_minted (same artifacts we already wired into the
+    // wire packet) and pre_delivered_countersign (so the oneshot await
+    // resolves on the engine's post-Inserted hook for the JoinCountersign's
+    // target_event_id, which equals our pre_minted.bootstrap_join.id) —
+    // today's success path, unchanged. `delivered == None` (LATCH MODE):
+    // the request was fully written, so the acceptor may have committed the
+    // join host-side; run the SAME inner without a countersign — it inserts
+    // the local PendingJoin, deposits it via the DM outbox (the host can
+    // recover it even if the handshake request never arrived), awaits the
+    // countersign oneshot for the redeem window (a live Zenoh session can
+    // still complete the join in-band → pending=false), and otherwise
+    // commits the ZEB-501 latched-pending Space (pending=true, greyed in
+    // nav) that converges to full membership over CRDT sync — instead of
+    // falsely reporting `inviter_unreachable` while the community may
+    // already contain us.
+    let latch_mode = delivered.is_none();
     let overrides = RedeemInviteOverrides {
         pre_minted: Some(minted),
-        pre_delivered_countersign: Some(countersign),
-        pre_delivered_chain: chain,
+        pre_delivered_countersign: delivered.as_ref().map(|(_, cs)| cs.clone()),
+        pre_delivered_chain: delivered.map(|(chain, _)| chain).unwrap_or_default(),
         admin_identity_pub: Some(admin_id_pub),
-        // ZEB-501: production uses the env-or-5s default (the pre-delivered
-        // countersign resolves the oneshot well within it).
+        // ZEB-501: production uses the env-or-5s default in both modes (the
+        // pre-delivered countersign resolves the oneshot well within it;
+        // latch mode gives an existing Zenoh session that long to complete
+        // the join in-band).
         redeem_timeout: None,
         // Invite-only path — no open first-contact dial.
         open_join_iroh: None,
@@ -64759,13 +64816,22 @@ where
 
     match result {
         Ok(dto) => {
-            // ZEB-889: the join committed — the acceptor delivered the
-            // countersign (this Ok arm is reached only after the pre-delivered
-            // countersign was applied) and burned the single-use invite. Drop
-            // the cached mint; no further retry is possible or needed. (A
-            // never-completing redemption keeps its entry until the TTL window
-            // elapses — bounded, one per distinct invite redeemed this session.)
-            if let Some(key) = redemption_cache_key {
+            if latch_mode && dto.pending {
+                // ZEB-899: do NOT evict the ZEB-889 mint cache — no countersign
+                // was applied and the invite was not burned (ZEB-874 burns only
+                // after a delivered response). The cached mint is what makes a
+                // later manual retry re-send the SAME bootstrap_join id and hit
+                // the host's AlreadyKnown-retransmit path, instead of minting
+                // fresh and dying on the verify_event P6 already-engaged reject.
+            } else if let Some(key) = redemption_cache_key {
+                // ZEB-889: the join fully committed — either the acceptor
+                // delivered the countersign in-band (and burned the single-use
+                // invite), or (ZEB-899 CodeAnt r1) latch mode still completed
+                // via the Zenoh/oneshot path within the redeem window
+                // (dto.pending == false). Drop the cached mint; no further
+                // retry is possible or needed. (A never-completing redemption
+                // keeps its entry until the TTL window elapses — bounded, one
+                // per distinct invite redeemed this session.)
                 registry_evict.evict_redemption_mint(&key).await;
             }
             // ZEB-427: durable-on-commit fence (ZEB-393 Bug A), mirroring
@@ -64820,6 +64886,19 @@ where
                 pending: Some(dto.pending),
             });
             Ok(RedemptionOutcome::joined(dto.community_id, dto.pending))
+        }
+        Err(e) if latch_mode => {
+            // ZEB-899: the latch could not commit — nothing landed locally, so
+            // degrade to the honest pre-write outcome (which keeps the LAN
+            // fallback affordance). NOT `join_failed`: that status asserts the
+            // inviter was reached and suppresses the fallback, neither of which
+            // is known on this arm.
+            tracing::warn!(
+                error = %e,
+                community_id = %hex::encode(payload.community_id.0),
+                "ZEB-899: post-write latch commit failed; degrading to the unreachable outcome"
+            );
+            Ok(post_dial_failure_outcome())
         }
         Err(e) => {
             // ZEB-325 PR #159 F1: distinguish post-handshake local
