@@ -2425,6 +2425,49 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
             g.insert_verified_for_test(cs1);
         }
 
+        // --- ZEB-899: seed Bob's LATCHED-PENDING Space — the state the
+        //     post-write latch now commits on a failed first attempt (drive
+        //     the same inner the latch call uses: pre_minted, no countersign,
+        //     short redeem window). The retry below then runs over an
+        //     EXISTING pending Space + spawned engine, which is the real
+        //     retry-after-latch shape.
+        let latch_dto = harmony_app::redeem_invite_inner_with_overrides(
+            invite_url.clone(),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            s.bob_adopt_floor.clone(),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            None,
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            || Ok(()),
+            None,
+            harmony_app::RedeemInviteOverrides {
+                pre_minted: Some(p1_mint.clone()),
+                redeem_timeout: Some(Duration::from_secs(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ZEB-899: the latch seed must commit a pending Space, not Err");
+        assert!(
+            latch_dto.pending,
+            "ZEB-899 precondition: the seeded latch must be pending; got {latch_dto:?}"
+        );
+        {
+            let g = s.bob_crdt_state.lock().await;
+            let row = g
+                .spaces
+                .get(&s.community_id)
+                .expect("ZEB-899 precondition: latched Space row exists before the retry");
+            assert!(row.pending_join_at.is_some());
+        }
+
         // --- Drive the retry. Bob reuses P1 from cache → sends P1 → Alice
         //     AlreadyKnown → the acceptor's poll finds the seeded CS1 → delivers
         //     → Bob joins, and the acceptor burns the invite. ---
@@ -2466,6 +2509,14 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
             outcome.status, "joined",
             "ZEB-889: the retry converges by reusing the cached mint; got status={:?}",
             outcome.status
+        );
+
+        // ZEB-899: the retry delivered the countersign in-band over the
+        // EXISTING latched Space/engine — the join is fully ratified now.
+        assert!(
+            !outcome.pending,
+            "ZEB-899: the reused-mint retry must complete the latched join \
+             (pending=false); got {outcome:?}"
         );
 
         // Poll (rather than a fixed sleep) until the acceptor's post-delivery
