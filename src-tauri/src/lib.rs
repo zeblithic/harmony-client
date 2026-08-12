@@ -2377,6 +2377,13 @@ pub struct StartNodeResponse {
     /// and renders a recovery screen ("your other devices are safe") with
     /// restore/reset actions — not the generic startup-error dead-end.
     pub self_enrollment_missing: bool,
+    /// ZEB-904/905: true when the owner loaded but this device holds no master
+    /// seed and no fleet-KeyTree material — the node booted LOCAL-ONLY (owner
+    /// wiring live, fleet engines + friend features + encrypted file grants
+    /// off). Unlike `self_revoked`/`self_enrollment_missing` this is NOT an
+    /// identity-classification input: `has_owner_identity` is true and the
+    /// device operates. Drives the informational FleetSyncDisabledBanner.
+    pub fleet_crypto_missing: bool,
 }
 
 /// Profile published to/received from the network.
@@ -2480,6 +2487,16 @@ pub(crate) const OWNER_STILL_STARTING_MSG: &str =
 // (pre-mint / absent). Non-destructive — never advises recreating identity.
 pub(crate) const OWNER_NO_IDENTITY_MSG: &str =
     "Owner identity not loaded — no identity is set up on this device yet.";
+
+/// ZEB-904/905: the owner IS loaded and operating locally, but this device
+/// holds no fleet key material (master seed wiped + no fleet-KeyTree slot),
+/// so KeyTree-bound features — friends, device sync, encrypted file grants —
+/// cannot run. Distinct from [`OWNER_NO_IDENTITY_MSG`]: saying "no identity"
+/// to a user whose owner renders on screen was the ZEB-904 bug.
+pub(crate) const OWNER_KEYS_MISSING_MSG: &str =
+    "This device's sync keys are missing — friends, device sync, and encrypted \
+     file shares are unavailable. Restore your recovery phrase (Account → \
+     Devices) or re-pair from a device that holds it to re-enable.";
 
 pub fn parse_capacity(key_expr: &str, payload: &[u8]) -> Option<CapacityUpdate> {
     let node_addr = key_expr.strip_prefix(CAPACITY_PREFIX)?;
@@ -5639,6 +5656,9 @@ pub async fn start_node_inner(
             }
             None => None,
         };
+        // ZEB-904: snapshot for StartNodeResponse — owner present, no fleet
+        // crypto ⇒ the node is booting local-only (see the warn! above).
+        let fleet_crypto_missing_at_boot = owner_loaded.is_some() && fleet_crypto.is_none();
 
         let sync_engine_arc: Option<std::sync::Arc<crate::owner_state_sync::SyncEngine>> =
             if let Some(ref loaded) = owner_loaded {
@@ -14398,6 +14418,7 @@ pub async fn start_node_inner(
             has_owner_identity,
             self_revoked_at_boot,
             self_enrollment_missing_at_boot,
+            fleet_crypto_missing_at_boot,
         )
     };
     let (
@@ -14430,6 +14451,7 @@ pub async fn start_node_inner(
         has_owner_identity,
         self_revoked_at_boot,
         self_enrollment_missing_at_boot,
+        fleet_crypto_missing_at_boot,
     ) = our_gen;
 
     // ZEB-221 + thread-spawn-failure cleanup + lock-poison cleanup: all
@@ -15313,6 +15335,7 @@ pub async fn start_node_inner(
                 has_owner_identity,
                 self_revoked: self_revoked_at_boot,
                 self_enrollment_missing: self_enrollment_missing_at_boot,
+                fleet_crypto_missing: fleet_crypto_missing_at_boot,
             })
         }
         Ok(Err(e)) => Err(e),
@@ -23147,7 +23170,9 @@ pub(crate) async fn ingest_content_encrypted_impl(
         let keytree = guard
             .owner_keytree
             .clone()
-            .ok_or_else(|| "no owner loaded".to_string())?;
+            // ZEB-905: distinct from the crdt_state guard above — the owner
+            // can be loaded (local-only mode) with no fleet key material.
+            .ok_or_else(|| OWNER_KEYS_MISSING_MSG.to_string())?;
         (
             ingest_tx,
             guard.content_index.clone(),
@@ -23296,7 +23321,9 @@ pub(crate) async fn grant_read_impl(
         let keytree = guard
             .owner_keytree
             .clone()
-            .ok_or_else(|| "no owner loaded".to_string())?;
+            // ZEB-905: distinct from the crdt_state guard above — the owner
+            // can be loaded (local-only mode) with no fleet key material.
+            .ok_or_else(|| OWNER_KEYS_MISSING_MSG.to_string())?;
         let content_store = guard
             .content_store
             .clone()
@@ -24039,6 +24066,25 @@ mod file_share_ipc_tests {
             .await
             .expect_err("no owner loaded pre-mint");
         assert_eq!(err, "no owner loaded");
+    }
+
+    /// ZEB-905: a local-only boot (owner loaded, no fleet keytree) must report
+    /// the keys-missing copy — not "no owner loaded", which is a lie when the
+    /// owner renders on screen (the original ZEB-904 symptom).
+    #[tokio::test]
+    async fn grant_read_impl_reports_keys_missing_in_local_only_mode_zeb905() {
+        let store = std::sync::Arc::new(RecordingStore::default());
+        let state = grantable_state(store);
+        state.lock().unwrap().owner_keytree = None;
+        let sink = crate::node_event_sink::RecordingSink::new();
+        let err = grant_read_impl(&state, &sink, cid_hex(), grantee_hex())
+            .await
+            .expect_err("keyless grant must fail");
+        assert_eq!(err, OWNER_KEYS_MISSING_MSG);
+        assert!(
+            err.contains("recovery phrase"),
+            "copy must point at the restore path: {err}"
+        );
     }
 
     #[tokio::test]
@@ -67030,7 +67076,6 @@ pub(crate) async fn redeem_friend_token_impl(
         Some(device_id),
         Some(self_owner),
         Some(dm_outbox),
-        Some(owner_keytree),
         Some(revoked),
     ) = (
         crdt_state,
@@ -67038,11 +67083,16 @@ pub(crate) async fn redeem_friend_token_impl(
         device_id,
         self_owner,
         dm_outbox,
-        owner_keytree,
         revoked_device_projection,
     )
     else {
         return Err(not_loaded_msg.into());
+    };
+    // ZEB-905: checked separately from the owner handles above — a local-only
+    // boot has all of those Some but no keytree, and "not loaded" would be a
+    // lie (the friend secret genuinely cannot be sealed without fleet keys).
+    let Some(owner_keytree) = owner_keytree else {
+        return Err(OWNER_KEYS_MISSING_MSG.into());
     };
 
     // The redeemer signs its FriendLinkRequest with its enrolled device-#2 key
@@ -84732,6 +84782,7 @@ mod start_node_response_tests {
             has_owner_identity: false,
             self_revoked: false,
             self_enrollment_missing: false,
+            fleet_crypto_missing: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(
@@ -84754,6 +84805,7 @@ mod start_node_response_tests {
             has_owner_identity: false,
             self_revoked: false,
             self_enrollment_missing: false,
+            fleet_crypto_missing: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"freshlyCreated\":false"));
@@ -84772,6 +84824,7 @@ mod start_node_response_wire_tests {
             has_owner_identity: false,
             self_revoked: false,
             self_enrollment_missing: false,
+            fleet_crypto_missing: false,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["nodeAddr"], "iroh:abc");
@@ -84779,9 +84832,10 @@ mod start_node_response_wire_tests {
         assert_eq!(json["hasOwnerIdentity"], false);
         assert_eq!(json["selfRevoked"], false);
         assert_eq!(json["selfEnrollmentMissing"], false);
-        // Exactly five keys — no snake_case leakage, no extra fields (ZEB-836
-        // added selfEnrollmentMissing).
-        assert_eq!(json.as_object().unwrap().len(), 5);
+        assert_eq!(json["fleetCryptoMissing"], false);
+        // Exactly six keys — no snake_case leakage, no extra fields (ZEB-836
+        // added selfEnrollmentMissing; ZEB-904/905 added fleetCryptoMissing).
+        assert_eq!(json.as_object().unwrap().len(), 6);
     }
 
     #[test]
@@ -84792,6 +84846,7 @@ mod start_node_response_wire_tests {
             has_owner_identity: true,
             self_revoked: false,
             self_enrollment_missing: false,
+            fleet_crypto_missing: false,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["hasOwnerIdentity"], true);
@@ -84809,6 +84864,7 @@ mod start_node_response_wire_tests {
             has_owner_identity: false,
             self_revoked: true,
             self_enrollment_missing: false,
+            fleet_crypto_missing: false,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["selfRevoked"], true);
@@ -84826,11 +84882,33 @@ mod start_node_response_wire_tests {
             has_owner_identity: false,
             self_revoked: false,
             self_enrollment_missing: true,
+            fleet_crypto_missing: false,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["selfEnrollmentMissing"], true);
         assert_eq!(json["selfRevoked"], false);
         assert_eq!(json["hasOwnerIdentity"], false);
+    }
+
+    /// ZEB-904/905: the local-only-mode shape — UNLIKE the two recovery flags
+    /// above, `hasOwnerIdentity` stays TRUE (the owner is loaded and operating);
+    /// `fleetCryptoMissing` only drives the informational banner and must never
+    /// feed the identity classification.
+    #[test]
+    fn start_node_response_fleet_crypto_missing_shape() {
+        let r = StartNodeResponse {
+            node_addr: "iroh:xyz".to_string(),
+            freshly_created: false,
+            has_owner_identity: true,
+            self_revoked: false,
+            self_enrollment_missing: false,
+            fleet_crypto_missing: true,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["fleetCryptoMissing"], true);
+        assert_eq!(json["hasOwnerIdentity"], true);
+        assert_eq!(json["selfRevoked"], false);
+        assert_eq!(json["selfEnrollmentMissing"], false);
     }
 }
 
