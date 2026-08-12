@@ -306,6 +306,15 @@ enum CoverageVerdict {
 ///   proven nor eligible: they can't hold the community Degraded (a
 ///   long-offline member is expected-unreachable), but repair passes still
 ///   attempt discovery for them (run_one_pass action 3).
+///
+/// DELIBERATE (PR #659 review, Qodo): `P == ∅` reads Starved even when the
+/// eligible set is ALSO empty (every row stale). That state is
+/// indistinguishable from the ZEB-824 cold boot — a node offline past the
+/// freshness window whose only path back in IS the beacon repair — so
+/// returning Healthy there would strand exactly the case the driver exists
+/// for. The cost for a genuinely dead community is the pre-existing ZEB-824
+/// posture: one ladder-capped (10 min) repair pass, cooldown-bounded, for
+/// process life.
 fn coverage_verdict(
     members: &[OwnerAddr],
     rows_by_owner: &HashMap<OwnerAddr, Vec<PeerRow>>,
@@ -1385,6 +1394,26 @@ mod tests {
         let rows = HashMap::from([
             (a, vec![row_at([0xA1; 32], V_NOW - 1_000)]),
             (b, vec![row_at([0xB1; 32], V_NOW - 1_000)]),
+        ]);
+        let traffic = static_traffic(&[]);
+        assert!(matches!(
+            coverage_verdict(&[a, b], &rows, &traffic, V_NOW),
+            CoverageVerdict::Starved
+        ));
+    }
+
+    /// PR #659 review (Qodo) — DELIBERATE-semantics pin: all rows stale + no
+    /// traffic is Starved, NOT Healthy. This state is indistinguishable from
+    /// the ZEB-824 cold boot (offline past the freshness window; beacon
+    /// repair is the only path back in); reading it as Healthy would strand
+    /// exactly the case the driver exists for.
+    #[test]
+    fn verdict_all_rows_stale_no_traffic_is_starved_cold_boot_pin() {
+        let (a, b) = (OwnerAddr([1; 16]), OwnerAddr([2; 16]));
+        let stale = V_NOW - GATEWAY_COVERAGE_RECORD_FRESH_MS - 1;
+        let rows = HashMap::from([
+            (a, vec![row_at([0xA1; 32], stale)]),
+            (b, vec![row_at([0xB1; 32], stale)]),
         ]);
         let traffic = static_traffic(&[]);
         assert!(matches!(

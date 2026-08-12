@@ -415,11 +415,12 @@ pub(crate) async fn all_slots_scan<R>(
 where
     R: harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> + Sync,
 {
-    // PR #659 review: bound in-flight probes — a repair pass must never hold
-    // more concurrent pkarr GETs than the resolver's stale-refresh path may
-    // (`PKARR_REFRESH_MAX_CONCURRENT` = 4; kept as a local const to avoid a
-    // cross-module dependency on a pub(crate) tuning knob).
-    const ALL_SLOTS_PROBE_CONCURRENCY: usize = 4;
+    // PR #659 review (Qodo round 2): bound in-flight probes — a repair pass
+    // must never hold more concurrent pkarr GETs than the resolver's
+    // stale-refresh path may, so alias the SAME knob rather than shadowing
+    // its value (a lone re-tune of one site must not silently diverge them).
+    const ALL_SLOTS_PROBE_CONCURRENCY: usize =
+        crate::reachability_resolver::PKARR_REFRESH_MAX_CONCURRENT;
     use futures::StreamExt;
     let current = harmony_pkarr::current_epoch_id(now_ms);
     let mut epochs = vec![current];
