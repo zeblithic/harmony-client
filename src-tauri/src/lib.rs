@@ -12444,6 +12444,12 @@ pub async fn start_node_inner(
                                         let addrbook_dirty_for_relay =
                                             addrbook_dirty_hub.clone();
                                         let addrbook_publish_tx_for_relay = publish_tx.clone();
+                                        // ZEB-918: live owner-state handle so the
+                                        // slot refresh below publishes under the
+                                        // CURRENT membership epoch key, not the
+                                        // engine's spawn-time capture.
+                                        let slot_crdt_state_for_relay =
+                                            std::sync::Arc::clone(&crdt_state);
                                         std::sync::Arc::new(move || {
                                             let registry = std::sync::Arc::clone(&registry);
                                             let signing_key = std::sync::Arc::clone(&signing_key);
@@ -12466,6 +12472,8 @@ pub async fn start_node_inner(
                                                 addrbook_dirty_for_relay.clone();
                                             let addrbook_publish_tx =
                                                 addrbook_publish_tx_for_relay.clone();
+                                            let slot_crdt_state =
+                                                std::sync::Arc::clone(&slot_crdt_state_for_relay);
                                             Box::pin(async move {
                                                 let now_ms = std::time::SystemTime::now()
                                                     .duration_since(std::time::UNIX_EPOCH)
@@ -12634,10 +12642,39 @@ pub async fn start_node_inner(
                                                         .advertiser_addrs_for_community(
                                                             &c, now_ms,
                                                         );
+                                                    // ZEB-918: publish under the
+                                                    // LIVE membership epoch key,
+                                                    // degrading to the spawn-time
+                                                    // key only when the live read
+                                                    // is unavailable — so beacons
+                                                    // re-key on the first refresh
+                                                    // after an epoch rotation (the
+                                                    // membership-change force-wake)
+                                                    // instead of pinning the
+                                                    // spawn-time key for the
+                                                    // engine's lifetime.
+                                                    // Publisher-degrades (ZEB-597
+                                                    // mirror): still publish
+                                                    // SOMETHING on a degraded
+                                                    // read; the resolver's
+                                                    // previous-epoch rung covers
+                                                    // the skew.
+                                                    let fallback =
+                                                        engine.membership_key();
+                                                    let publish_key = match crate::community_state_sync::live_epoch_key(
+                                                        c,
+                                                        Some(&slot_crdt_state),
+                                                        &fallback,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok((k, _epoch)) => k,
+                                                        Err(_) => fallback,
+                                                    };
                                                     rendezvous_publisher
                                                         .refresh_slot(
                                                             c,
-                                                            engine.membership_key(),
+                                                            publish_key,
                                                             advertisers,
                                                             actor,
                                                         )
