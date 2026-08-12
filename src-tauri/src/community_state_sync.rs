@@ -12408,8 +12408,10 @@ mod envelope_tests {
         let cid = SpaceId([0xaa; 16]);
         let fb = EpochKey::new([0x42u8; 32]);
         let mut os = crate::owner_state_crdt::OwnerState::default();
-        os.spaces
-            .insert(cid, build_test_community_space(0, EpochKey::new([0x11; 32])));
+        os.spaces.insert(
+            cid,
+            build_test_community_space(0, EpochKey::new([0x11; 32])),
+        );
         let crdt = Arc::new(Mutex::new(os));
         let got = epoch_key_candidates(cid, Some(&crdt), &fb).await;
         assert_eq!(candidate_bytes(&got), vec![[0x11u8; 32]]);

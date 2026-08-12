@@ -994,10 +994,11 @@ mod tests {
         old_key: BeaconResolution,
     ) -> Harness {
         let h = harness(community, members, None, true, None);
-        h.ctx.keys.lock().unwrap().insert(
-            community,
-            vec![EpochKey::new(K_NEW), EpochKey::new(K_OLD)],
-        );
+        h.ctx
+            .keys
+            .lock()
+            .unwrap()
+            .insert(community, vec![EpochKey::new(K_NEW), EpochKey::new(K_OLD)]);
         h.beacons.set_resolution_for_key(K_NEW, new_key);
         h.beacons.set_resolution_for_key(K_OLD, old_key);
         h
