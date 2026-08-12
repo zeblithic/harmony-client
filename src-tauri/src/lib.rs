@@ -20189,16 +20189,46 @@ fn persist_storage_settings(guard: &NodeState, settings: &storage_settings::Stor
 /// deterministic order), advancing + persisting the pledge floor.
 fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), String> {
     let identity = storage_signer(guard, "pledge list")?;
-    let updated_at = next_storage_updated_at(&guard.pledge_clock);
+    let v2 = storage_v2_material(guard);
+    build_signed_pledge_list_with(
+        identity,
+        &guard.node_addr,
+        &guard.storage_settings,
+        guard.storage_settings_path.as_deref(),
+        &guard.pledge_clock,
+        v2.as_ref(),
+    )
+}
+
+/// ZEB-923: component-taking core of the pledge-list build, callable
+/// from the storage-record publisher task's hourly renewal (owned
+/// handles, no `&NodeState` — same posture as
+/// `build_signed_hosting_report_with`).
+fn build_signed_pledge_list_with(
+    identity: &harmony_identity::PrivateIdentity,
+    node_addr: &str,
+    settings: &std::sync::Arc<Mutex<storage_settings::StorageSettings>>,
+    settings_path: Option<&std::path::Path>,
+    clock: &std::sync::atomic::AtomicU64,
+    v2_material: Option<&storage_signing::StorageSignerMaterial>,
+) -> Result<(String, Vec<u8>), String> {
+    let signer = vine_signing::signer_address(identity);
+    if node_addr != signer {
+        return Err(format!(
+            "refusing to sign: storage record owner {node_addr} does not match signer identity {signer}"
+        ));
+    }
+    let updated_at = next_storage_updated_at(clock);
     let pledges: Vec<storage_signing::PledgeEntry> = {
-        let mut settings = guard
-            .storage_settings
+        let mut settings = settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // ZEB-923: grow-only — concurrent minters can persist out of
         // order; a floor must never move backwards.
         settings.pledge_floor = settings.pledge_floor.max(updated_at);
-        persist_storage_settings(guard, &settings);
+        if let Some(path) = settings_path {
+            storage_settings::save(path, &settings);
+        }
         settings
             .my_pledges
             .iter()
@@ -20210,7 +20240,7 @@ fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), Stri
             .collect()
     };
     let mut payload = storage_signing::PledgeListPayload {
-        owner_address: guard.node_addr.clone(),
+        owner_address: node_addr.to_string(),
         pledges,
         updated_at,
         identity_pub: None,
@@ -20219,10 +20249,9 @@ fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), Stri
     };
     // ZEB-679: dual-sign when the enrolled `#2` material is available and
     // self-verifies; legacy-only otherwise (every receiver accepts it).
-    match storage_v2_material(guard) {
+    match v2_material {
         Some(material) => {
-            if let Err(e) = storage_signing::sign_pledge_list_v2(identity, &material, &mut payload)
-            {
+            if let Err(e) = storage_signing::sign_pledge_list_v2(identity, material, &mut payload) {
                 tracing::warn!("pledge list v2 sign failed, publishing legacy-only: {e}");
                 payload.v2 = Default::default();
             }
@@ -20242,9 +20271,38 @@ fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), Stri
 /// first), truncated to the wire cap.
 fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), String> {
     let identity = storage_signer(guard, "backup set")?;
+    let v2 = storage_v2_material(guard);
+    build_signed_backup_set_with(
+        identity,
+        &guard.node_addr,
+        &guard.content_index,
+        &guard.storage_settings,
+        guard.storage_settings_path.as_deref(),
+        &guard.backup_set_clock,
+        v2.as_ref(),
+    )
+}
+
+/// ZEB-923: component-taking core of the backup-set build (see
+/// `build_signed_pledge_list_with`).
+#[allow(clippy::too_many_arguments)]
+fn build_signed_backup_set_with(
+    identity: &harmony_identity::PrivateIdentity,
+    node_addr: &str,
+    content_index: &std::sync::Arc<Mutex<content_index::ContentIndex>>,
+    settings: &std::sync::Arc<Mutex<storage_settings::StorageSettings>>,
+    settings_path: Option<&std::path::Path>,
+    clock: &std::sync::atomic::AtomicU64,
+    v2_material: Option<&storage_signing::StorageSignerMaterial>,
+) -> Result<(String, Vec<u8>), String> {
+    let signer = vine_signing::signer_address(identity);
+    if node_addr != signer {
+        return Err(format!(
+            "refusing to sign: storage record owner {node_addr} does not match signer identity {signer}"
+        ));
+    }
     let entries: Vec<storage_signing::BackupEntry> = {
-        let idx = guard
-            .content_index
+        let idx = content_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut rows: Vec<(u64, String, u64)> = idx
@@ -20264,15 +20322,16 @@ fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), Strin
             .map(|(_, cid, size)| storage_signing::BackupEntry { cid, size })
             .collect()
     };
-    let updated_at = next_storage_updated_at(&guard.backup_set_clock);
+    let updated_at = next_storage_updated_at(clock);
     {
-        let mut settings = guard
-            .storage_settings
+        let mut settings = settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // ZEB-923: grow-only — see the pledge floor above.
         settings.backup_set_floor = settings.backup_set_floor.max(updated_at);
-        persist_storage_settings(guard, &settings);
+        if let Some(path) = settings_path {
+            storage_settings::save(path, &settings);
+        }
     }
     // PR #449 review (Qodo): receivers enforce MAX_BACKUP_SET_WIRE_BYTES
     // BEFORE parsing, so an oversize publish is deterministically dropped
@@ -20281,19 +20340,18 @@ fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), Strin
     // oldest flagged entries always survive). Each shrink re-signs — the
     // signature covers the final entry list.
     let mut entries = entries;
-    // ZEB-679: fetch the `#2` material ONCE (not per shrink round — the
-    // material is round-invariant; only the entry list changes).
-    let v2_material = storage_v2_material(guard);
+    // ZEB-679: the `#2` material arrives once from the caller (not per
+    // shrink round — it is round-invariant; only the entry list changes).
     let (topic, bytes) = loop {
         let mut payload = storage_signing::BackupSetPayload {
-            owner_address: guard.node_addr.clone(),
+            owner_address: node_addr.to_string(),
             entries: entries.clone(),
             updated_at,
             identity_pub: None,
             sig: None,
             v2: Default::default(),
         };
-        match v2_material.as_ref() {
+        match v2_material {
             Some(material) => {
                 if let Err(e) =
                     storage_signing::sign_backup_set_v2(identity, material, &mut payload)
@@ -21293,6 +21351,63 @@ mod storage_publish_tests {
         state.node_addr = "somebody-else".into();
         let err = build_signed_pledge_list(&state).unwrap_err();
         assert!(err.contains("does not match signer identity"), "{err}");
+    }
+
+    #[test]
+    fn with_builders_mint_monotonic_stamps_and_persist_floors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, addr) = signed_state();
+        let identity = state.owner_private_identity.clone().unwrap();
+        let settings_path = storage_settings::settings_path(dir.path());
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        state
+            .storage_settings
+            .lock()
+            .unwrap()
+            .my_pledges
+            .insert("buddy-a".into(), 500);
+
+        let (_, bytes_a) = build_signed_pledge_list_with(
+            &identity,
+            &addr,
+            &state.storage_settings,
+            Some(&settings_path),
+            &clock,
+            None,
+        )
+        .expect("build a");
+        let (_, bytes_b) = build_signed_pledge_list_with(
+            &identity,
+            &addr,
+            &state.storage_settings,
+            Some(&settings_path),
+            &clock,
+            None,
+        )
+        .expect("build b");
+        let a: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes_a).unwrap();
+        let b: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes_b).unwrap();
+        assert!(
+            b.updated_at > a.updated_at,
+            "re-mint must be strictly newer (LWW renewal)"
+        );
+        storage_signing::verify_pledge_list(&b).expect("renewal is freshly signed");
+        let persisted = storage_settings::load_or_default(&settings_path);
+        assert!(persisted.pledge_floor >= b.updated_at, "floor persisted");
+
+        let (topic, bytes) = build_signed_backup_set_with(
+            &identity,
+            &addr,
+            &state.content_index,
+            &state.storage_settings,
+            Some(&settings_path),
+            &clock,
+            None,
+        )
+        .expect("backup build");
+        assert_eq!(topic, format!("{STORAGE_RECORD_PREFIX}{addr}/backup-set"));
+        let bs: storage_signing::BackupSetPayload = serde_json::from_slice(&bytes).unwrap();
+        storage_signing::verify_backup_set(&bs).expect("backup renewal self-verifies");
     }
 
     #[test]
