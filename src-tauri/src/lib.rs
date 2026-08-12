@@ -5809,7 +5809,10 @@ pub async fn start_node_inner(
                         std::sync::Arc::new(crate::dm_outbox::DepositOnlyDmTransport);
 
                     let engine = std::sync::Arc::new(crate::owner_state_sync::SyncEngine::new(
-                        keys.clone(),
+                        // ZEB-905 T1 interim: still inside the fleet gate, so
+                        // keys are unconditionally present; T2 hoists this
+                        // construction and passes the boot-computed Option.
+                        Some(keys.clone()),
                         device_id.clone(),
                         std::sync::Arc::clone(&crdt_state),
                         std::sync::Arc::clone(&tracker),
@@ -6033,7 +6036,7 @@ pub async fn start_node_inner(
                     let notes_app = app.clone();
                     let notes_sync = std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                         crate::fleet_sync::FleetSyncConfig {
-                            keys: keys.clone(),
+                            keys: Some(keys.clone()),
                             device_id: device_id.clone(),
                             state: std::sync::Arc::clone(&notes_doc),
                             adopt_floor: adopt_floor.clone(),
@@ -6131,7 +6134,7 @@ pub async fn start_node_inner(
                     let dm_inbox_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                keys: keys.clone(),
+                                keys: Some(keys.clone()),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&dm_inbox_doc),
                                 adopt_floor: adopt_floor.clone(),
@@ -6296,7 +6299,7 @@ pub async fn start_node_inner(
                     let community_device_intro_sync = std::sync::Arc::new(
                         crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                keys: keys.clone(),
+                                keys: Some(keys.clone()),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&community_device_intro_doc),
                                 adopt_floor: adopt_floor.clone(),
@@ -6412,7 +6415,7 @@ pub async fn start_node_inner(
                     let relay_hold_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                keys: keys.clone(),
+                                keys: Some(keys.clone()),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&relay_hold_doc),
                                 adopt_floor: adopt_floor.clone(),
@@ -6464,7 +6467,7 @@ pub async fn start_node_inner(
                     let relay_optin_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                keys: keys.clone(),
+                                keys: Some(keys.clone()),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&relay_optin_doc),
                                 adopt_floor: adopt_floor.clone(),
@@ -6556,7 +6559,7 @@ pub async fn start_node_inner(
                     let dm_outhold_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                keys: keys.clone(),
+                                keys: Some(keys.clone()),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&dm_outhold_doc),
                                 adopt_floor: adopt_floor.clone(),
@@ -6668,7 +6671,7 @@ pub async fn start_node_inner(
                     let fleet_net_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                keys: keys.clone(),
+                                keys: Some(keys.clone()),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&fleet_net_doc),
                                 adopt_floor: adopt_floor.clone(),
@@ -6915,7 +6918,7 @@ pub async fn start_node_inner(
                     let owner_trust_sync = std::sync::Arc::new(
                         crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                keys: keys.clone(),
+                                keys: Some(keys.clone()),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&owner_trust_doc),
                                 adopt_floor: adopt_floor.clone(),
@@ -6995,7 +6998,7 @@ pub async fn start_node_inner(
                     let owner_quorum_sync_engine =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                keys: keys.clone(),
+                                keys: Some(keys.clone()),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&owner_quorum_doc),
                                 adopt_floor: adopt_floor.clone(),
@@ -7146,9 +7149,9 @@ pub async fn start_node_inner(
                     let fleet_keys_sync =
                         std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
                             crate::fleet_sync::FleetSyncConfig {
-                                keys: crate::owner_state_crypto::FleetKeySet::new(
+                                keys: Some(crate::owner_state_crypto::FleetKeySet::new(
                                     std::sync::Arc::clone(&kt),
-                                ),
+                                )),
                                 device_id: device_id.clone(),
                                 state: std::sync::Arc::clone(&fleet_keys_doc),
                                 adopt_floor: adopt_floor.clone(),
@@ -47320,7 +47323,7 @@ mod zeb427_leave_left_at_tests {
         }
 
         let engine = crate::owner_state_sync::SyncEngine::new(
-            crate::owner_state_crypto::FleetKeySet::new(kt),
+            Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
             "left-at-test-dev".into(),
             std::sync::Arc::clone(&state),
             std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -62436,7 +62439,7 @@ mod zeb427_fence_tests {
             crate::owner_state_crdt::OwnerState::default(),
         ));
         let engine = crate::owner_state_sync::SyncEngine::new(
-            crate::owner_state_crypto::FleetKeySet::new(kt),
+            Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
             "fence-test-dev".into(),
             std::sync::Arc::clone(&state),
             std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -79941,7 +79944,7 @@ mod zeb703_outbox_runtime_durability_tests {
         // Short debounce keeps the green path fast; the red path is bounded
         // by the poll deadline below, not the debounce.
         let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
-            crate::owner_state_crypto::FleetKeySet::new(kt),
+            Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
             "zeb703-dev".into(),
             Arc::clone(&crdt_state),
             Arc::clone(&tracker),
@@ -80060,7 +80063,7 @@ mod zeb703_outbox_runtime_durability_tests {
             harmony_crdt_sync::ReplayTracker::new("zeb709-dev".into()),
         ));
         let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
-            crate::owner_state_crypto::FleetKeySet::new(kt),
+            Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
             "zeb709-dev".into(),
             Arc::clone(&crdt_state),
             Arc::clone(&tracker),
@@ -80136,7 +80139,7 @@ mod zeb703_outbox_runtime_durability_tests {
             harmony_crdt_sync::ReplayTracker::new("zeb709-dev".into()),
         ));
         let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
-            crate::owner_state_crypto::FleetKeySet::new(kt),
+            Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
             "zeb709-dev".into(),
             Arc::clone(&crdt_state),
             Arc::clone(&tracker),
@@ -80221,7 +80224,7 @@ mod zeb703_outbox_runtime_durability_tests {
                 id
             });
             let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
-                crate::owner_state_crypto::FleetKeySet::new(kt),
+                Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
                 "zeb703-dev".into(),
                 Arc::clone(&crdt_state),
                 Arc::clone(&tracker),
@@ -80382,7 +80385,7 @@ mod zeb703_outbox_runtime_durability_tests {
         };
 
         let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
-            crate::owner_state_crypto::FleetKeySet::new(kt),
+            Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
             "zeb703-dev".into(),
             Arc::clone(&crdt_state),
             Arc::new(tokio::sync::Mutex::new(
@@ -80469,7 +80472,7 @@ mod zeb703_outbox_runtime_durability_tests {
         // debounced flush can't fire within this test — only the handler's
         // explicit pre-ack persist can write the file.
         let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
-            crate::owner_state_crypto::FleetKeySet::new(kt),
+            Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
             "zeb703-dev".into(),
             Arc::clone(&crdt_state),
             Arc::new(tokio::sync::Mutex::new(
@@ -80787,7 +80790,7 @@ mod zeb703_outbox_runtime_durability_tests {
         };
         // 10-min debounce: only the handler's barrier persist can write.
         let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
-            crate::owner_state_crypto::FleetKeySet::new(kt),
+            Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
             "zeb703-dev".into(),
             Arc::clone(&crdt_state),
             Arc::new(tokio::sync::Mutex::new(
@@ -81010,7 +81013,7 @@ mod zeb708_gui_exit_flush_tests {
                 id
             });
             let engine = Arc::new(crate::owner_state_sync::SyncEngine::new(
-                crate::owner_state_crypto::FleetKeySet::new(kt),
+                Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
                 "zeb708-dev".into(),
                 Arc::clone(&crdt_state),
                 Arc::clone(&tracker),

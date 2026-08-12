@@ -110,12 +110,18 @@ impl SyncEngine {
     /// local device's HLC source; `state` and `tracker` are shared with the
     /// rest of the app via the same `Arc<Mutex<_>>`s.
     ///
+    /// ZEB-905: `keys: None` runs the engine in local-only mode — the
+    /// notify_dirty → debounced-persist path and the shutdown flush work
+    /// unchanged (persistence is key-free), while publish/ingest/root-serve
+    /// no-op. This is what keeps a seedless, no-fleet-material device's
+    /// owner-state mutations durable; see the fleet gate in `start_node`.
+    ///
     /// (The ZEB-417 "signature preserved byte-for-byte" note is retired:
     /// ZEB-668 S5 deliberately widened `kt: Arc<KeyTree>` to the swappable
     /// key set.)
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        keys: FleetKeySet,
+        keys: Option<FleetKeySet>,
         device_id: String,
         state: Arc<Mutex<OwnerState>>,
         tracker: Arc<Mutex<ReplayTracker<String, Hlc>>>,
@@ -730,7 +736,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            FleetKeySet::new(make_kt()),
+            Some(FleetKeySet::new(make_kt())),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -762,7 +768,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            FleetKeySet::new(make_kt()),
+            Some(FleetKeySet::new(make_kt())),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -798,7 +804,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            FleetKeySet::new(make_kt()),
+            Some(FleetKeySet::new(make_kt())),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -839,7 +845,7 @@ mod debounce_tests {
         let crdt_path = paths.crdt.clone(); // capture before `paths` is moved into new()
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            FleetKeySet::new(make_kt()),
+            Some(FleetKeySet::new(make_kt())),
             "test-device".into(),
             Arc::clone(&state),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -906,7 +912,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            FleetKeySet::new(make_kt()),
+            Some(FleetKeySet::new(make_kt())),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -940,7 +946,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            FleetKeySet::new(make_kt()),
+            Some(FleetKeySet::new(make_kt())),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -967,7 +973,7 @@ mod debounce_tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let (_dir, paths) = paths();
         let engine = SyncEngine::new(
-            FleetKeySet::new(make_kt()),
+            Some(FleetKeySet::new(make_kt())),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -1006,7 +1012,7 @@ mod skeleton_tests {
             replay: dir.path().join("replay.cbor"),
         };
         let engine = SyncEngine::new(
-            FleetKeySet::new(make_kt()),
+            Some(FleetKeySet::new(make_kt())),
             "test-device".into(),
             Arc::new(Mutex::new(OwnerState::default())),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -1101,7 +1107,7 @@ mod wire_identity_tests {
         }
 
         let engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "owner-dev".into(),
             Arc::new(Mutex::new(state)),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -1242,7 +1248,7 @@ mod subscriber_tests {
         )));
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "self-device".into(),
             Arc::clone(&state),
             Arc::clone(&tracker),
@@ -1292,7 +1298,7 @@ mod subscriber_tests {
         )));
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "self-device".into(),
             Arc::clone(&state),
             Arc::clone(&tracker),
@@ -1369,7 +1375,7 @@ mod subscriber_tests {
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
         let engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "self-device".into(),
             Arc::clone(&state),
             Arc::clone(&tracker),
@@ -1467,7 +1473,7 @@ mod subscriber_tests {
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
         let engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "self-device".into(),
             Arc::clone(&state),
             Arc::clone(&tracker),
@@ -1584,7 +1590,7 @@ mod subscriber_tests {
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let local_state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "self-device".into(),
             Arc::clone(&local_state),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -1634,7 +1640,7 @@ mod subscriber_tests {
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let local_state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "self-device".into(),
             Arc::clone(&local_state),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -1715,7 +1721,7 @@ mod subscriber_tests {
         let store = Arc::new(InMemoryStub::default()) as Arc<dyn ContentStore>;
         let local_state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "self-device".into(),
             Arc::clone(&local_state),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -1810,7 +1816,7 @@ mod subscriber_tests {
             "self-device".into(),
         )));
         let engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "self-device".into(),
             Arc::clone(&local_state),
             Arc::clone(&tracker),
@@ -1878,7 +1884,7 @@ mod subscriber_tests {
             )));
             let state = Arc::new(Mutex::new(OwnerState::default()));
             let engine = SyncEngine::new(
-                FleetKeySet::new(Arc::clone(&kt)),
+                Some(FleetKeySet::new(Arc::clone(&kt))),
                 "self-device".into(),
                 Arc::clone(&state),
                 Arc::clone(&tracker),
@@ -1924,7 +1930,7 @@ mod subscriber_tests {
         )));
         let state2 = Arc::new(Mutex::new(OwnerState::default()));
         let engine2 = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "self-device".into(),
             Arc::clone(&state2),
             Arc::clone(&tracker2),
@@ -1992,7 +1998,7 @@ mod publisher_tests {
         let store = Arc::new(InMemoryStub::default());
         let state = Arc::new(Mutex::new(OwnerState::default()));
         let engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "alice-device".into(),
             Arc::clone(&state),
             Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
@@ -2153,7 +2159,7 @@ mod integration_tests {
         });
 
         let a_engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "device-a".into(),
             Arc::clone(&a_state),
             a_tracker,
@@ -2165,7 +2171,7 @@ mod integration_tests {
             crate::hlc_adopt_floor::HlcAdoptFloor::new(),
         );
         let b_engine = SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "device-b".into(),
             Arc::clone(&b_state),
             b_tracker,
@@ -4347,7 +4353,7 @@ mod cas_op_protocol_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::owner_state_sync::SyncEngine::new(
-            FleetKeySet::new(Arc::clone(&kt)),
+            Some(FleetKeySet::new(Arc::clone(&kt))),
             "device-sub".into(),
             Arc::clone(&state),
             Arc::clone(&tracker),

@@ -1802,7 +1802,7 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
         let drain = tokio::spawn(async move { while engine_pub_rx.recv().await.is_some() {} });
         let (_engine_sub_tx, engine_sub_rx) = mpsc::channel::<Vec<u8>>(16);
         let sync_engine = Arc::new(harmony_app::owner_state_sync::SyncEngine::new(
-            harmony_app::owner_state_crypto::FleetKeySet::new(kt),
+            Some(harmony_app::owner_state_crypto::FleetKeySet::new(kt)),
             "bob-dev".to_string(),
             Arc::clone(&s.bob_crdt_state),
             Arc::clone(&s.bob_hlc_tracker),

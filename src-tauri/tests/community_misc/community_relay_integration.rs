@@ -195,7 +195,7 @@ fn build_relay_engine(device_id: &str, persist: Arc<dyn FleetPersist<RelayHoldDo
     // ProdRelayDepositCtx).
     let adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-        keys: harmony_app::owner_state_crypto::FleetKeySet::new(kt),
+        keys: Some(harmony_app::owner_state_crypto::FleetKeySet::new(kt)),
         device_id: device_id.to_string(),
         state: Arc::clone(&doc),
         merger,
@@ -240,7 +240,7 @@ fn build_relay_engine_from_doc(
     // ProdRelayDepositCtx).
     let adopt_floor = harmony_app::hlc_adopt_floor::HlcAdoptFloor::new();
     let engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-        keys: harmony_app::owner_state_crypto::FleetKeySet::new(kt),
+        keys: Some(harmony_app::owner_state_crypto::FleetKeySet::new(kt)),
         device_id: device_id.to_string(),
         state: Arc::clone(&doc),
         merger,

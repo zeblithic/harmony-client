@@ -3910,7 +3910,7 @@ mod revoke_tests {
         let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
         let carrier_engine = std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
             crate::fleet_sync::FleetSyncConfig {
-                keys: crate::owner_state_crypto::FleetKeySet::new(kt0),
+                keys: Some(crate::owner_state_crypto::FleetKeySet::new(kt0)),
                 device_id: "dev-a".to_string(),
                 state: std::sync::Arc::clone(&carrier_doc),
                 merger: std::sync::Arc::new(
@@ -3950,7 +3950,7 @@ mod revoke_tests {
         let t_drain = tokio::spawn(async move { while t_out_rx.recv().await.is_some() {} });
         let trust_engine = std::sync::Arc::new(crate::fleet_sync::FleetSyncEngine::new(
             crate::fleet_sync::FleetSyncConfig {
-                keys: keys.clone(),
+                keys: Some(keys.clone()),
                 device_id: "dev-a".to_string(),
                 state: std::sync::Arc::clone(&trust_doc_arc),
                 merger: crate::owner_trust_sync::trust_merger(),

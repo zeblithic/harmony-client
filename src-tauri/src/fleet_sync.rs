@@ -125,6 +125,12 @@ pub enum SyncError {
     TransportClosed,
     #[error("persist: {0}")]
     Persist(String),
+    /// ZEB-905: the engine is running in local-only mode (no fleet KeyTree
+    /// installed), so wire frames can neither be produced nor opened. Only
+    /// the root-serve reply path surfaces this; publish arms treat the
+    /// condition as a silent skip.
+    #[error("no fleet keys installed (local-only mode)")]
+    NoFleetKeys,
 }
 
 /// ZEB-877: per-engine sync observability, shared (`Arc`) between the engine's
@@ -338,7 +344,14 @@ pub struct FleetSyncConfig<S> {
     /// window during a fleet key rotation). Engines whose dataset never
     /// rotates (the fleet-keys carrier itself) pass a 1-set that is never
     /// swapped.
-    pub keys: FleetKeySet,
+    ///
+    /// ZEB-905: `None` runs the engine in local-only mode — mutation,
+    /// debounced persist, and shutdown flush all work; publish/ingest and
+    /// the root-serve reply are skipped (no keys to seal/open wire frames).
+    /// Only the owner-state engine ever passes `None` (a seedless device
+    /// with no fleet material); every fleet dataset engine is constructed
+    /// exclusively when fleet crypto exists and passes `Some`.
+    pub keys: Option<FleetKeySet>,
     /// Local device id — the HLC source for our own publishes.
     pub device_id: String,
     /// Shared replicated dataset.
@@ -759,7 +772,7 @@ where
 /// injected `merger`, `persist`, `lookup_key_tag`, `publish_seen`,
 /// `on_applied`, and `sibling_acks` plus the generic dataset `S`.
 struct Ctx<S> {
-    keys: FleetKeySet,
+    keys: Option<FleetKeySet>,
     device_id: String,
     state: Arc<Mutex<S>>,
     merger: Merger<S>,
@@ -1043,7 +1056,14 @@ where
                 // mirrors the publish arms (same brief state lock + put_serveable
                 // cas round-trip); queries arrive post-boot so the cas op is
                 // served promptly and the flush fence is not starved.
-                let wire = encode_root_wire(&ctx).await;
+                let wire = match encode_root_wire(&ctx).await {
+                    Ok(Some(w)) => Ok(w),
+                    // ZEB-905: local-only mode — we cannot seal a serveable
+                    // root. The query-side adapter drops the reply; the
+                    // pulling peer times out exactly as if we were offline.
+                    Ok(None) => Err(SyncError::NoFleetKeys),
+                    Err(e) => Err(e),
+                };
                 let _ = resp_tx.send(wire);
             }
             Some(resp_tx) = ctx.shutdown_rx.recv() => {
@@ -1180,7 +1200,14 @@ async fn publish_root_now<S>(ctx: &Ctx<S>) -> Result<(), SyncError>
 where
     S: CanonicalPayload + Clone + Send + 'static,
 {
-    let wire = encode_root_wire(ctx).await?;
+    // ZEB-905: local-only mode — no keys means no wire frame can ever be
+    // produced. Skip-as-SUCCESS so the dirty-claim settles instead of
+    // spinning the retry machinery on a condition that cannot heal within
+    // this session; the persist that follows every publish arm still runs.
+    let Some(wire) = encode_root_wire(ctx).await? else {
+        tracing::debug!("skipping root publish: no fleet keys (local-only mode)");
+        return Ok(());
+    };
 
     // 7. Send onto the outbound channel.
     ctx.publisher_tx
@@ -1199,10 +1226,17 @@ where
 /// peer that PULLed the root via a zenoh query, so a missed live push is
 /// recoverable). The bytes are identical either way, so a pulled root re-enters
 /// the receiver's normal inbound decrypt/merge path with no special-casing.
-async fn encode_root_wire<S>(ctx: &Ctx<S>) -> Result<Vec<u8>, SyncError>
+async fn encode_root_wire<S>(ctx: &Ctx<S>) -> Result<Option<Vec<u8>>, SyncError>
 where
     S: CanonicalPayload + Clone + Send + 'static,
 {
+    // ZEB-905: local-only mode — nothing to seal the frame with. `Ok(None)`
+    // (not an error) so every publish caller shares one skip semantics; the
+    // root-serve arm maps it to `SyncError::NoFleetKeys` for its reply.
+    let Some(keyset) = ctx.keys.as_ref() else {
+        return Ok(None);
+    };
+
     // Snapshot state under brief lock.
     let snapshot = {
         let state = ctx.state.lock().await;
@@ -1218,7 +1252,7 @@ where
     //    two devices encrypting the same state. Publish always uses the
     //    newest installed epoch (ZEB-668 S5); the whole publish (entry +
     //    root envelope) is single-epoch by construction.
-    let kt = ctx.keys.newest();
+    let kt = keyset.newest();
     let lookup = space_lookup_key(&kt, ctx.lookup_key_tag);
     let blob_ciphertext = encrypt_entry(&kt, &lookup, &blob_cleartext)
         .map_err(|e| SyncError::Crypto(e.to_string()))?;
@@ -1278,7 +1312,7 @@ where
     let wire =
         encrypt_root_publish(&kt, &payload_bytes).map_err(|e| SyncError::Crypto(e.to_string()))?;
 
-    Ok(wire)
+    Ok(Some(wire))
 }
 
 /// Build a strictly-newer HLC than the last one this device published.
@@ -1496,10 +1530,17 @@ where
     //    (ZEB-668 S5 dual-epoch read window). A publish is entirely
     //    single-epoch, so whichever tree opens the root envelope is bound
     //    for the entry decrypt below.
+    // ZEB-905: local-only mode — no installed epoch could open any frame.
+    // Debug, not warn: on a keyless boot every sibling publish on the topic
+    // lands here, and the condition is already surfaced once at boot.
+    let Some(keyset) = ctx.keys.as_ref() else {
+        tracing::debug!("incoming publish dropped: no fleet keys (local-only mode)");
+        return Inbound::Dropped;
+    };
     let (kt, payload_bytes) = {
         let mut opened = None;
         let mut last_err = None;
-        for candidate in ctx.keys.accept_set() {
+        for candidate in keyset.accept_set() {
             match decrypt_root_publish(&candidate, &wire) {
                 Ok(b) => {
                     opened = Some((candidate, b));
@@ -1515,7 +1556,7 @@ where
                 // are expected during a rotation window, not noteworthy.
                 tracing::warn!(
                     error = %last_err.map(|e| e.to_string()).unwrap_or_default(),
-                    epochs = ?ctx.keys.epochs(),
+                    epochs = ?keyset.epochs(),
                     "incoming publish dropped: decrypt_root_publish (no installed epoch opened it)"
                 );
                 return Inbound::Dropped;
@@ -1952,7 +1993,7 @@ mod engine_tests {
             device_id.to_string(),
         )));
         let engine = FleetSyncEngine::new(FleetSyncConfig {
-            keys,
+            keys: Some(keys),
             device_id: device_id.to_string(),
             state: Arc::clone(&state),
             merger: Arc::new(|local: &mut ToyDoc, remote: ToyDoc| toy_merge(local, remote)),
@@ -2044,7 +2085,7 @@ mod engine_tests {
         )));
         let persist = RecordingPersist::default();
         let engine = FleetSyncEngine::new(FleetSyncConfig {
-            keys: FleetKeySet::new(make_kt()),
+            keys: Some(FleetKeySet::new(make_kt())),
             device_id: device_id.to_string(),
             state: Arc::clone(&state),
             merger: Arc::new(|local: &mut ToyDoc, remote: ToyDoc| toy_merge(local, remote)),
@@ -2068,6 +2109,197 @@ mod engine_tests {
             out_tx,
             in_tx,
         }
+    }
+
+    /// ZEB-905: `build_engine_inspectable_debounce` with `keys: None` — the
+    /// local-only mode a seedless, no-fleet-material device boots into.
+    fn build_engine_keyless(
+        device_id: &str,
+        cas: Arc<dyn ContentStore>,
+        debounce_ms: u64,
+    ) -> BuiltInspectable {
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let (in_tx, in_rx) = mpsc::channel(64);
+        let state = Arc::new(Mutex::new(ToyDoc::default()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            device_id.to_string(),
+        )));
+        let persist = RecordingPersist::default();
+        let engine = FleetSyncEngine::new(FleetSyncConfig {
+            keys: None,
+            device_id: device_id.to_string(),
+            state: Arc::clone(&state),
+            merger: Arc::new(|local: &mut ToyDoc, remote: ToyDoc| toy_merge(local, remote)),
+            replay_tracker: Arc::clone(&tracker),
+            content_store: cas,
+            publisher_tx: out_tx.clone(),
+            subscriber_rx: in_rx,
+            persist: Arc::new(persist.clone()),
+            lookup_key_tag: TOY_TAG,
+            debounce_ms,
+            publish_seen: false,
+            on_applied: None,
+            sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+        });
+        BuiltInspectable {
+            engine,
+            state,
+            persist,
+            out_rx,
+            out_tx,
+            in_tx,
+        }
+    }
+
+    /// ZEB-905: a keyless engine's `notify_dirty` → debounced cycle must still
+    /// reach the persist backend (durability is key-free), must emit NO wire
+    /// frame, and the skipped publish must settle the dirty claim as success —
+    /// observable as an un-armed publish-retry through the real telemetry
+    /// assembly path (a spinning retry would report `owed`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keyless_notify_dirty_persists_without_wire_zeb905() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let mut b = build_engine_keyless("dev-keyless", cas, 50);
+        {
+            let mut doc = b.state.lock().await;
+            doc.entries.insert(
+                "k1".to_string(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "local-only".to_string(),
+                },
+            );
+        }
+        b.engine.notify_dirty();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let captured = b
+                .persist
+                .persisted
+                .lock()
+                .expect("persist mutex")
+                .iter()
+                .any(|d| d.entries.contains_key("k1"));
+            if captured {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "debounced persist never captured the keyless mutation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            matches!(b.out_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "keyless engine must never emit a wire frame"
+        );
+        let registry = FleetSyncRegistry::new();
+        registry.register(
+            crate::network_health::FleetDoc::Notes,
+            b.engine.sync_stats(),
+        );
+        let raw = registry.fleet_sync_raw();
+        let (doc, r) = raw[0];
+        let row = crate::network_health::fleet_sync_row(doc, r);
+        assert!(
+            !row.publish_retry.owed,
+            "keyless skip must settle as success, not arm the publish retry"
+        );
+        let _ = b.engine.shutdown().await;
+    }
+
+    /// ZEB-905: explicit `flush_now` and `shutdown` succeed on a keyless
+    /// engine — the publish halves skip, the persist halves run — and no wire
+    /// frame is ever produced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keyless_flush_and_shutdown_succeed_zeb905() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let mut b = build_engine_keyless("dev-keyless", cas, 3_600_000);
+        {
+            let mut doc = b.state.lock().await;
+            doc.entries.insert(
+                "k1".to_string(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "flushed".to_string(),
+                },
+            );
+        }
+        b.engine.notify_dirty();
+        b.engine
+            .flush_now()
+            .await
+            .expect("keyless flush_now must succeed (publish skipped, persist ran)");
+        assert!(
+            b.persist
+                .persisted
+                .lock()
+                .expect("persist mutex")
+                .iter()
+                .any(|d| d.entries.contains_key("k1")),
+            "flush_now must persist the mutation"
+        );
+        b.engine.notify_dirty();
+        b.engine
+            .shutdown()
+            .await
+            .expect("keyless shutdown must succeed (dirty publish skipped, persist ran)");
+        assert!(
+            b.out_rx.try_recv().is_err(),
+            "keyless engine must never emit a wire frame"
+        );
+    }
+
+    /// ZEB-905: an inbound frame — valid ciphertext from a KEYED sibling — is
+    /// dropped by a keyless receiver: no panic, no merge, no state mutation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keyless_inbound_frame_dropped_zeb905() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let mut seeded = build_engine("dev-seeded", Arc::clone(&cas), false);
+        {
+            let mut doc = seeded.state.lock().await;
+            doc.entries.insert(
+                "k1".to_string(),
+                ToyEntry {
+                    ctr: 1,
+                    val: "from-seeded".to_string(),
+                },
+            );
+        }
+        seeded.engine.notify_dirty();
+        seeded.engine.flush_now().await.expect("seeded flush");
+        let frame = seeded.out_rx.recv().await.expect("seeded engine publishes");
+        let _ = seeded.engine.shutdown().await;
+
+        let b = build_engine_keyless("dev-keyless", cas, 3_600_000);
+        b.in_tx.send(frame).await.expect("inbound send");
+        // Negative assertion: give the subscriber arm a bounded window, then
+        // require the state untouched. (A merge would land well inside this
+        // window — the arm runs as soon as the task loop polls it.)
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            b.state.lock().await.entries.is_empty(),
+            "keyless receiver must drop, not merge"
+        );
+        let _ = b.engine.shutdown().await;
+    }
+
+    /// ZEB-905: a root PULL (ZEB-707 root-serve) against a keyless engine
+    /// replies `Err(NoFleetKeys)` — the query-side adapter drops the reply and
+    /// the pulling peer times out exactly as if we were offline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keyless_root_serve_replies_no_fleet_keys_zeb905() {
+        let cas: Arc<dyn ContentStore> = Arc::new(InMemoryStub::default());
+        let b = build_engine_keyless("dev-keyless", cas, 3_600_000);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        b.engine.root_serve_tx().send(tx).await.expect("serve req");
+        let reply = rx.await.expect("task must reply, not drop the oneshot");
+        assert!(
+            matches!(reply, Err(SyncError::NoFleetKeys)),
+            "expected NoFleetKeys, got: {reply:?}"
+        );
+        let _ = b.engine.shutdown().await;
     }
 
     /// `persist_now` must durably write the mutated state to the persist
@@ -2506,7 +2738,7 @@ mod engine_tests {
         let state = Arc::new(Mutex::new(ToyDoc::default()));
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let engine = FleetSyncEngine::new(FleetSyncConfig {
-            keys: FleetKeySet::new(make_kt()),
+            keys: Some(FleetKeySet::new(make_kt())),
             device_id: "dev-persist-cancel".to_string(),
             state: Arc::clone(&state),
             merger: Arc::new(|local: &mut ToyDoc, remote: ToyDoc| toy_merge(local, remote)),

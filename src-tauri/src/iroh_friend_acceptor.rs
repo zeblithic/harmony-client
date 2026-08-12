@@ -4285,9 +4285,9 @@ mod tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(SyncEngine::new(
-            crate::owner_state_crypto::FleetKeySet::new(Arc::new(
+            Some(crate::owner_state_crypto::FleetKeySet::new(Arc::new(
                 KeyTree::derive(&[7u8; 32]).expect("kt"),
-            )),
+            ))),
             "acceptor-test-dev".into(),
             Arc::clone(&shared_state),
             Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(
