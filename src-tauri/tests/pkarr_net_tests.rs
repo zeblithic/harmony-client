@@ -32,6 +32,10 @@ mod pkarr_identity_discovery_integration;
 mod pkarr_invite_redemption_integration;
 #[path = "pkarr_net/pkarr_iroh_redeem_full_integration.rs"]
 mod pkarr_iroh_redeem_full_integration;
+// ZEB-880 round 2: AVALON-shaped record must survive the REAL pkarr packet
+// build (the round-1 CBOR budget was derived against the wrong cap).
+#[path = "pkarr_net/zeb880_record_size.rs"]
+mod zeb880_record_size;
 // ZEB-911 slice 2: the witness discovery ladder. Reuses the two-party harness
 // above (Alice = admin, Bob = joiner, mock pkarr relay) and adds a third
 // party — the witness node — on top of it.

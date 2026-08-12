@@ -161,3 +161,74 @@ entry (seal-target seed) and as many addresses as then fit.
   is now prevented.
 - IPv6 same-prefix coalescing (ticket suggestion #2) — unnecessary once the record
   is bounded; the trim already keeps the most-useful legs.
+
+---
+
+## Round 2 addendum (2026-08-11) — the budget was derived against the wrong cap
+
+**Reopen evidence:** AVALON (same 5-address / 3-IPv6-leg host) still hit
+`RecordTooLarge` on `rendezvous:<cid>:0` on 0.2.5 (`a6fdcea7`), which contains
+the round-1 fix. Koya (3 IPv4, no global IPv6) publishes cleanly — the
+address-size driver was right; the budget it was trimmed to was not.
+
+### Corrected root cause (measured, then pinned by test)
+
+Round 1 derived `MAX_RECORD_CBOR_BYTES = 729` from `SignedPacket::MAX_BYTES =
+1104`. That constant is the **outer relay-payload bound**: it includes the
+104-byte crypto envelope (pubkey 32 + signature 64 + timestamp 8) and pkarr
+checks it only when **deserializing** a packet. The gate that fails a publish
+is the **builder's**: the encoded DNS packet must be ≤ **1000 bytes** (the
+Mainline DHT mutable-value limit), and inside that packet the TXT record's
+name is **origin-normalized** to `_r.<52-char z32 pubkey>.` — 57 bytes of
+name, where round 1's "measured ~110 B framing" reserve assumed a bare `_r`.
+
+True deterministic framing: header 12 + name 57 + type/class/TTL/RDLENGTH 10 +
+4 chunk-length bytes = **83 B** → max base64 917 → max record CBOR **687 B**
+(exact: 687 → 999-byte packet, builds; 688 → 1001, `PacketTooLarge`).
+
+So every record whose final CBOR landed in **688..=729** passed the round-1
+bound and failed the real build. Measured on the AVALON fixture: the bounded
+rendezvous record lands at exactly 687 B with round-1 constants — one byte of
+luck; the field-real trailing-dot iroh `RelayUrl` form
+(`https://usw1-1.relay.n0.iroh.link./`) pushes it to ~690 and it fails
+forever. Round 1's tests asserted `CBOR ≤ budget` without ever building a
+packet, which is why they stayed green while production failed.
+
+### Round-2 changes
+
+1. **Corrected derivation** — `MAX_RECORD_CBOR_BYTES` now derives from
+   `1000 − 83` (same floor-of-base64-blocks arithmetic) = **687 B**.
+2. **`bound_record_payload`** — orchestrates the existing levers with a
+   size-aware butler fallback: if the fixed fields alone (zero addresses)
+   could never fit and the butler set holds > 1 entry, cap it to one seal
+   target *before* the address trim (so dial addresses survive). Defensive:
+   the production iroh-relay butler pair fits 687 (~452 B fixed + 208 B
+   reserve); long self-hosted butler relay URLs are what trigger it —
+   converting a permanent ZEB-891 publish outage into a record with one seal
+   target. A fitting butler pair is kept (identity keeps its redundancy).
+3. **`budget_matches_pkarr_build_gate_exactly`** — replicates
+   `harmony_pkarr::wire::build_relay_payload`'s packet assembly against the
+   real `pkarr` builder (new dev-dep, same version + features the core
+   workspace pins): exactly-687 builds, 688 fails. The constant can no longer
+   drift from the enforced gate without a test failure.
+4. **End-to-end regression** (`tests/pkarr_net/zeb880_record_size.rs`) —
+   AVALON-shaped host (trailing-dot relay URLs) through the real
+   `CommunityRendezvousPublisher` → `PkarrPublisher` → strict
+   `MockPkarrRelay`, resolved back via `PkarrResolver`. RED before round 2,
+   GREEN after.
+
+### Test-plan deltas
+
+- `budget_is_satisfiable_for_worst_butler_record` →
+  `long_relay_butler_record_converges_via_butler_fallback` (the worst case is
+  now the long-relay-URL butler pair; the fallback must converge it).
+- `identity_record_fits_after_bounding_addresses` additionally pins that the
+  fallback does NOT fire for the production-relay butler pair.
+- New: `butler_pair_kept_when_it_fits`, `budget_matches_pkarr_build_gate_exactly`,
+  and the e2e above.
+
+### Unchanged
+
+Payload sharding across `:0/:1/…` and the in-app diagnostics surface remain
+out of scope (unchanged from round 1); ZEB-891's over-budget warn now fires
+only when even a single-entry butler set + relay URL cannot fit.

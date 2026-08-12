@@ -266,7 +266,7 @@ impl CommunityRendezvousPublisher {
                         // peers. Then bound the addresses (reserving envelope +
                         // the "mv" vouch) so the signed record fits.
                         crate::reachability_bound::cap_butler_set(&mut reach, 1);
-                        let bound = crate::reachability_bound::bound_direct_addresses(
+                        let bound = crate::reachability_bound::bound_record_payload(
                             &mut reach,
                             crate::reachability_bound::RECORD_ENVELOPE_BYTES
                                 + crate::reachability_bound::RENDEZVOUS_VOUCH_BYTES,

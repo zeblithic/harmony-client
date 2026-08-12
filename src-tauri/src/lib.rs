@@ -10218,9 +10218,9 @@ pub async fn start_node_inner(
                                     // `fresh_butler_set`.
                                     bs_at: announced_at_ms,
                                 };
-                            // ZEB-880: bound direct_addresses so the published
-                            // record fits pkarr's SignedPacket cap. This shared
-                            // blob feeds the bare-blob record types
+                            // ZEB-880: bound the payload so the published
+                            // record fits pkarr's build-time DNS-packet gate.
+                            // This shared blob feeds the bare-blob record types
                             // (identity/community/invite) and the sealed
                             // friend/case-D record; reserve the record envelope
                             // + the case-D seal so the largest of those fits.
@@ -10229,13 +10229,24 @@ pub async fn start_node_inner(
                             // (silently undiscoverable). Trimming drops the
                             // least-useful (local-scoped, largest) legs first;
                             // the relay + surviving addresses keep the node
-                            // dialable. The rendezvous publisher re-bounds its
-                            // own (butler-stripped) variant separately.
-                            let bound = crate::reachability_bound::bound_direct_addresses(
+                            // dialable. If long butler relay URLs push the
+                            // fixed fields over the budget at any address
+                            // count, bound_record_payload caps the set to one
+                            // seal target (offline-DM deposit stays alive)
+                            // before trimming, so real dial addresses survive.
+                            // The rendezvous publisher re-bounds its own
+                            // (vouch-carrying) variant separately.
+                            let bound = crate::reachability_bound::bound_record_payload(
                                 &mut payload,
                                 crate::reachability_bound::RECORD_ENVELOPE_BYTES
                                     + crate::reachability_bound::CASE_D_SEAL_BYTES,
                             );
+                            if bound.butler_capped {
+                                tracing::debug!(
+                                    "ZEB-880: capped butler set to one seal target — the full \
+                                     set cannot fit the pkarr record size cap at any address count"
+                                );
+                            }
                             if bound.dropped > 0 {
                                 tracing::debug!(
                                     dropped = bound.dropped,
@@ -10244,11 +10255,12 @@ pub async fn start_node_inner(
                                 );
                             }
                             if bound.over_budget {
-                                // ZEB-891: trimming every address still didn't fit —
-                                // the fixed fields (relay URL + butler set) alone
-                                // exceed the cap, so no trim can recover it. This
-                                // record fails `RecordTooLarge` every publish cycle,
-                                // leaving the node silently undiscoverable cross-WAN.
+                                // ZEB-891: capping the butler set and trimming every
+                                // address still didn't fit — the fixed fields (relay
+                                // URL + single-entry butler set) alone exceed the
+                                // cap, so no trim can recover it. This record fails
+                                // `RecordTooLarge` every publish cycle, leaving the
+                                // node silently undiscoverable cross-WAN.
                                 // Edge-triggered (warn once per false→true
                                 // transition) so a persistent misconfig doesn't
                                 // flood the log every cycle × record type.
@@ -10261,11 +10273,11 @@ pub async fn start_node_inner(
                                         max_record_cbor_bytes =
                                             crate::reachability_bound::MAX_RECORD_CBOR_BYTES,
                                         "ZEB-891: reachability record still exceeds the pkarr size \
-                                         cap after trimming ALL direct addresses — its fixed fields \
-                                         (relay URL + butler set) alone are too large. It will fail \
-                                         to publish (RecordTooLarge) every cycle, leaving this node \
-                                         silently undiscoverable cross-WAN. Shorten the configured \
-                                         relay URL or reduce the butler/fleet set."
+                                         cap after capping the butler set and trimming ALL direct \
+                                         addresses — its fixed fields (relay URL + butler entry) \
+                                         alone are too large. It will fail to publish \
+                                         (RecordTooLarge) every cycle, leaving this node silently \
+                                         undiscoverable cross-WAN. Shorten the configured relay URL."
                                     );
                                 }
                             } else {
