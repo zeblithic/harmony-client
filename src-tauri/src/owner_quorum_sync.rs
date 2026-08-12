@@ -2241,7 +2241,7 @@ mod tests {
             std::fs::create_dir_all(dir.path().join(name)).unwrap();
             let trust_doc = Arc::new(tokio::sync::Mutex::new(trust_seed));
             let trust_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-                keys: crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt)),
+                keys: Some(crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt))),
                 device_id: name.to_string(),
                 state: Arc::clone(&trust_doc),
                 merger: crate::owner_trust_sync::trust_merger(),
@@ -2266,7 +2266,7 @@ mod tests {
             }));
             let quorum_doc = Arc::new(tokio::sync::Mutex::new(QuorumReqDoc::default()));
             let quorum_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-                keys: crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt)),
+                keys: Some(crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt))),
                 device_id: name.to_string(),
                 state: Arc::clone(&quorum_doc),
                 merger: quorum_merger(),
@@ -2836,7 +2836,7 @@ mod tests {
         let (_t_in_tx, t_in) = mpsc::channel::<Vec<u8>>(64);
         tokio::spawn(async move { while t_drain.recv().await.is_some() {} });
         let trust_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-            keys: crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt)),
+            keys: Some(crate::owner_state_crypto::FleetKeySet::new(Arc::clone(&kt))),
             device_id: "dev-a".to_string(),
             state: Arc::clone(&trust_doc),
             merger: crate::owner_trust_sync::trust_merger(),
@@ -2864,7 +2864,7 @@ mod tests {
         let (_q_in_tx, q_in) = mpsc::channel::<Vec<u8>>(64);
         tokio::spawn(async move { while q_drain.recv().await.is_some() {} });
         let quorum_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-            keys: crate::owner_state_crypto::FleetKeySet::new(kt),
+            keys: Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
             device_id: "dev-a".to_string(),
             state: Arc::clone(&quorum_doc),
             merger: quorum_merger(),
@@ -2986,7 +2986,7 @@ mod tests {
         let (_c_in_tx, c_in) = mpsc::channel::<Vec<u8>>(64);
         tokio::spawn(async move { while c_drain.recv().await.is_some() {} });
         let carrier_engine = Arc::new(FleetSyncEngine::new(FleetSyncConfig {
-            keys: crate::owner_state_crypto::FleetKeySet::new(kt0),
+            keys: Some(crate::owner_state_crypto::FleetKeySet::new(kt0)),
             device_id: "dev-a".to_string(),
             state: Arc::clone(&carrier_doc),
             merger: Arc::new(|_l: &mut crate::fleet_key_epoch::FleetKeyEpochDoc, _r| {

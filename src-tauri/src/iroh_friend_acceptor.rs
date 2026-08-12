@@ -2546,6 +2546,34 @@ pub struct MultiplexHandshakeDispatcher {
     gate: Arc<InFlightHandshakeGate>,
 }
 
+/// ZEB-905: dispatcher slot filler for a keyless (local-only) boot. The friend
+/// handshake seals a per-friend rendezvous secret under the owner KeyTree —
+/// without fleet key material the accept CANNOT complete, so inbound friend
+/// connections are refused up front instead of failing mid-handshake. The
+/// dialer sees the connection close, indistinguishable from a not-yet-installed
+/// acceptor; the refusal is logged here for the local operator.
+pub struct KeylessRefusingDispatcher {
+    /// Short label for the refused surface (e.g. `"friend"`), for the log line.
+    pub surface: &'static str,
+}
+
+#[async_trait::async_trait]
+impl crate::iroh_invite_acceptor::IrohHandshakeDispatcher for KeylessRefusingDispatcher {
+    async fn handle_connection(&self, conn: Connection) {
+        // debug, not info: this fires per inbound connection BEFORE peer
+        // authentication, so a reconnect-flooding remote could otherwise
+        // pressure the log (the in-flight gate bounds concurrency, not
+        // sequential attempts). The local-only condition itself is already
+        // surfaced once, loudly, by the ZEB-904 boot warn (CodeRabbit #656).
+        tracing::debug!(
+            surface = self.surface,
+            "refusing inbound handshake: no fleet crypto (local-only mode; \
+             restore the recovery phrase to re-enable)"
+        );
+        conn.close(0u32.into(), b"local-only mode");
+    }
+}
+
 impl MultiplexHandshakeDispatcher {
     /// Build a multiplexer over the invite + friend + friend-PEX acceptors,
     /// with the production in-flight gate caps.
@@ -4285,9 +4313,9 @@ mod tests {
         let (_sub_tx, sub_rx) = mpsc::channel(16);
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(SyncEngine::new(
-            crate::owner_state_crypto::FleetKeySet::new(Arc::new(
+            Some(crate::owner_state_crypto::FleetKeySet::new(Arc::new(
                 KeyTree::derive(&[7u8; 32]).expect("kt"),
-            )),
+            ))),
             "acceptor-test-dev".into(),
             Arc::clone(&shared_state),
             Arc::new(TokioMutex::new(harmony_crdt_sync::ReplayTracker::new(

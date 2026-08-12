@@ -456,7 +456,7 @@ mod tests {
         let floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
 
         let engine = FleetSyncEngine::<NotesDoc>::new(FleetSyncConfig {
-            keys: crate::owner_state_crypto::FleetKeySet::new(kt),
+            keys: Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
             device_id: "dev-A".to_string(),
             state: Arc::clone(&doc),
             merger,
@@ -565,7 +565,7 @@ mod tests {
             let merger: Merger<NotesDoc> = Arc::new(|local, remote| local.merge_from(remote));
             let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
             let engine = FleetSyncEngine::<NotesDoc>::new(FleetSyncConfig {
-                keys: crate::owner_state_crypto::FleetKeySet::new(kt),
+                keys: Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
                 device_id: device_id.to_string(),
                 state: Arc::clone(&doc),
                 merger,

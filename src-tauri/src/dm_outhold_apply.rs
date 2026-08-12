@@ -924,7 +924,7 @@ mod tests {
         let (nudge_tx, _nudge_rx) = mpsc::channel::<()>(1);
 
         let engine = FleetSyncEngine::<DmOutholdDoc>::new(FleetSyncConfig {
-            keys: crate::owner_state_crypto::FleetKeySet::new(kt),
+            keys: Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
             device_id: "dev-A".to_string(),
             state: Arc::clone(&doc),
             merger,

@@ -47,6 +47,17 @@ export interface StartNodeResponse {
    * startup-error dead-end. Forward-compat: treat missing/undefined as `false`.
    */
   selfEnrollmentMissing?: boolean;
+  /**
+   * ZEB-904/905: true when an owner identity loaded from disk but this device
+   * holds no master seed and no fleet-KeyTree material — the node booted
+   * LOCAL-ONLY (communities/channels/profile work; device-to-device sync,
+   * friend features, and encrypted file shares are paused). Unlike the two
+   * flags above this is NOT an identity-classification input: the owner is
+   * present and operational, so it drives an informational banner, never the
+   * mint gate or a recovery screen. Forward-compat: treat missing/undefined
+   * as `false`.
+   */
+  fleetCryptoMissing?: boolean;
 }
 
 /** Non-identifying environment info attached to feedback submissions. */
