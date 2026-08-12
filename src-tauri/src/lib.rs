@@ -16021,6 +16021,30 @@ mod pending_owner_card_tests {
             .expect("not-ready drain must leave the latch for the next start");
         assert_eq!(pending.display_name, "Ada");
     }
+
+    /// ZEB-898: mint's Phase 1 calls `stop_inner` before the mint+restart, and
+    /// the fresh-mint headless flow depends on the boot-stashed card SURVIVING
+    /// that stop so the post-mint start's drain can publish it. Pin it: a
+    /// "clear stale state" sweep added to `stop_inner` would silently
+    /// reintroduce the ZEB-898 field failure (peers resolve hex forever).
+    #[tokio::test]
+    async fn stop_inner_preserves_pending_card_latch() {
+        let state = std::sync::Mutex::new(NodeState::default());
+        state.lock().unwrap().pending_card = Some(PendingCard {
+            display_name: "Zeb898".to_string(),
+            status_text: String::new(),
+            avatar_cid: None,
+            profile_page_root: None,
+        });
+        // None = unconditional stop, exactly what mint Phase 1 passes.
+        crate::stop_inner(&state, None);
+        let guard = state.lock().unwrap();
+        let pending = guard
+            .pending_card
+            .as_ref()
+            .expect("stop_inner must leave the pending-card latch for the next start");
+        assert_eq!(pending.display_name, "Zeb898");
+    }
 }
 
 /// Send a channel message to the mesh network via Zenoh pub/sub.
