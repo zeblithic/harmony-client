@@ -185,6 +185,19 @@ pub trait ContentStore: Send + Sync {
         self.put(cid, blob).await
     }
 
+    /// ZEB-922: re-affirm an existing serve-intent lease (or create one)
+    /// WITHOUT re-writing bytes. Producers call this for content that is still
+    /// referenced by authoritative state but whose bytes were stored by an
+    /// earlier publish — e.g. reused community state segments, which a
+    /// republish deliberately does not re-`put` (O(delta)). Default is a
+    /// no-op; only `RuntimeContentStore` registers the CID in its shared
+    /// `CommunityServeAllowlist`. Same safety contract as `put_serveable`:
+    /// callers affirm ONLY content safe to serve to any requester who can
+    /// name the CID.
+    fn affirm_serveable(&self, cid: ContentId) {
+        let _ = cid;
+    }
+
     /// ZEB-539: after a download validates, allowlist the artifact's whole local
     /// CID subtree for member-to-member re-serve. Sends CasOp::AllowServeSubtree
     /// and returns the number of CIDs allowlisted.
@@ -527,6 +540,15 @@ impl ContentStore for RuntimeContentStore {
             allowlist.allow(cid);
         }
         Ok(())
+    }
+
+    fn affirm_serveable(&self, cid: ContentId) {
+        // ZEB-922: lease affirmation is a pure allowlist write — no CAS
+        // round-trip (the bytes are already admitted; only the serving
+        // intent needs re-stamping).
+        if let Some(allowlist) = &self.serve_allowlist {
+            allowlist.allow(cid);
+        }
     }
 
     async fn allow_serve_subtree(&self, root: ContentId) -> Result<usize, ContentStoreError> {
@@ -1003,6 +1025,52 @@ mod tests {
 
         drop(store);
         stub.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn affirm_serveable_default_impl_is_a_noop() {
+        // The default trait impl (InMemoryStub) must compile and do nothing:
+        // no blob appears, nothing panics.
+        let store = InMemoryStub::default();
+        let c = cid(0xb1);
+        store.affirm_serveable(c);
+        assert!(store.get(&c).await.unwrap().is_none(), "no side effects");
+    }
+
+    #[tokio::test]
+    async fn runtime_affirm_serveable_inserts_and_refreshes_lease() {
+        // RuntimeContentStore WITH an allowlist: affirm inserts a missing CID
+        // and refreshes an existing lease — without any CAS traffic.
+        let (cas_op_tx, mut cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let allowlist = CommunityServeAllowlist::new();
+        let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500))
+            .with_serve_allowlist(allowlist.clone());
+
+        let fresh = cid(0xb2);
+        store.affirm_serveable(fresh);
+        assert!(allowlist.contains(&fresh), "affirm inserts a missing CID");
+
+        let old = cid(0xb3);
+        allowlist.allow_at(old, 1);
+        store.affirm_serveable(old);
+        assert!(
+            allowlist.last_affirmed_ms(&old) > Some(1),
+            "affirm refreshes an existing lease"
+        );
+
+        drop(store);
+        assert!(
+            cas_op_rx.try_recv().is_err(),
+            "affirm_serveable must emit no CasOp"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_affirm_serveable_without_allowlist_is_noop() {
+        // RuntimeContentStore with no allowlist set: affirm must not panic.
+        let (cas_op_tx, _cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500));
+        store.affirm_serveable(cid(0xb4));
     }
 
     #[tokio::test]
