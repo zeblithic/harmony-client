@@ -636,6 +636,11 @@ pub struct DialHealthSummary {
     /// pre-field snapshot forward-compatible.
     #[serde(default)]
     pub connected_via_registry: u64,
+    /// ZEB-910: lifetime Dormant-parole revivals — monotone since process
+    /// start. Wire key `paroled`; `#[serde(default)]` keeps a pre-field
+    /// snapshot forward-compatible.
+    #[serde(default)]
+    pub paroled: u64,
     pub recent: Vec<DynamicDialHit>,
 }
 
@@ -900,6 +905,9 @@ pub struct DialTelemetry {
     /// bumped only by
     /// [`record_connected_via_registry`](Self::record_connected_via_registry).
     connected_via_registry: AtomicU64,
+    /// ZEB-910: lifetime Dormant-parole revivals (see
+    /// [`record_paroled`](Self::record_paroled)).
+    paroled: AtomicU64,
     recent: Mutex<VecDeque<DynamicDialHit>>,
 }
 
@@ -940,6 +948,13 @@ impl DialTelemetry {
     pub fn record_dormant(&self, node_id: [u8; 32], owner: [u8; 16]) {
         self.push(node_id, owner, "dormant");
     }
+    /// ZEB-910: record a Dormant peer revived by the parole tick — lifetime
+    /// counter + a `"paroled"` ring marker. The dial the revival produces
+    /// counts through the normal dial-outcome counters when it dispatches.
+    pub fn record_paroled(&self, node_id: [u8; 32], owner: [u8; 16]) {
+        self.paroled.fetch_add(1, Ordering::Relaxed);
+        self.push(node_id, owner, "paroled");
+    }
     /// ZEB-804 (spec §8): record one Connected entry established by a registry
     /// swap (inbound accept / zenoh `new_link`) rather than by a
     /// supervisor-ladder dial. Increments `connected_via_registry` and NOTHING
@@ -975,6 +990,7 @@ impl DialTelemetry {
             dormant: 0,
             connected: 0,
             connected_via_registry: self.connected_via_registry.load(Ordering::Relaxed),
+            paroled: self.paroled.load(Ordering::Relaxed),
             recent: self
                 .recent
                 .lock()
@@ -8125,6 +8141,7 @@ mod tests {
             dormant: 2,
             connected: 5,
             connected_via_registry: 6,
+            paroled: 7,
             recent: vec![],
         };
         let v = serde_json::to_value(&s).expect("serialize");
@@ -8143,6 +8160,8 @@ mod tests {
         // ZEB-804: exact camelCase key for the registry-swap counter, no
         // snake_case leak past the rename.
         assert_eq!(v["connectedViaRegistry"], 6);
+        // ZEB-910: parole revival counter rides the same summary.
+        assert_eq!(v["paroled"], 7);
         assert!(
             obj.get("connected_via_registry").is_none(),
             "snake key connected_via_registry must not leak"
