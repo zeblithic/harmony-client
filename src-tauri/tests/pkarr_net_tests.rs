@@ -36,6 +36,8 @@ mod pkarr_iroh_redeem_full_integration;
 // build (the round-1 CBOR budget was derived against the wrong cap).
 #[path = "pkarr_net/zeb880_record_size.rs"]
 mod zeb880_record_size;
+#[path = "pkarr_net/zeb910_all_slots.rs"]
+mod zeb910_all_slots;
 #[path = "pkarr_net/zeb918_epoch_rotation.rs"]
 mod zeb918_epoch_rotation;
 // ZEB-911 slice 2: the witness discovery ladder. Reuses the two-party harness
