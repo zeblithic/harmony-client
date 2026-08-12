@@ -48,10 +48,17 @@ pub trait GatewayDialCtx: Send + Sync {
     /// Joined members of `community` EXCLUDING self, from the locally
     /// materialized membership (persisted CRDT — survives rebuilds).
     async fn members_of(&self, community: &SpaceId) -> Vec<OwnerAddr>;
-    /// The engine's spawn-time `membership_key()`. MUST match the rendezvous
-    /// publisher's key choice (`lib.rs:11298`) — never the live epoch key
-    /// (spec §5.3). `None` = engine not registered (transient); skip.
-    async fn epoch_key_of(&self, community: &SpaceId) -> Option<EpochKey>;
+    /// ZEB-918: ordered membership-epoch key candidates for beacon
+    /// resolution — the LIVE current key first, then (when one exists) the
+    /// immediately-previous epoch's archived key; never more than one epoch
+    /// back. MUST stay coherent with the rendezvous publisher's key choice
+    /// (the slot-refresh arm in `lib.rs`, which publishes under the live key
+    /// and degrades to the spawn-time key when the live read is unavailable —
+    /// this ctx degrades identically, so pub/resolver match in both modes).
+    /// `None` = engine not registered (transient); skip — load-bearing:
+    /// it is the ONLY signal separating `engineUnregistered` from
+    /// `soloCommunity`. `Some(v)` is non-empty.
+    async fn epoch_key_candidates_of(&self, community: &SpaceId) -> Option<Vec<EpochKey>>;
     /// ZEB-827: union of Joined (non-self) members' effective enrolled device
     /// verify keys — the set a beacon's membership-vouch key must belong to.
     async fn enrolled_device_keys_of(&self, community: &SpaceId) -> HashSet<[u8; 32]>;
@@ -179,6 +186,10 @@ fn enrolled_keys_from_members(
 pub struct ProdGatewayDialCtx {
     pub registry: Arc<crate::community_state_sync::CommunitySyncRegistry>,
     pub self_owner: OwnerAddr,
+    /// ZEB-918: live owner-state handle for epoch-key candidate reads.
+    /// `None` (test/legacy wiring) degrades every read to the engine's
+    /// spawn-time key — matching the publisher's degraded mode.
+    pub crdt_state: Option<Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
 }
 
 #[async_trait::async_trait]
@@ -203,13 +214,27 @@ impl GatewayDialCtx for ProdGatewayDialCtx {
             .collect()
     }
 
-    async fn epoch_key_of(&self, community: &SpaceId) -> Option<EpochKey> {
-        // Spawn-time membership_key(), matching the key the rendezvous
-        // PUBLISHER slots under (start_node's `refresh_slot` loop passes
-        // `engine.membership_key()`) — deliberately NOT live_epoch_key
-        // (spec §5.3/§9). A mismatch derives a different slot keypair and
-        // silently resolves nothing, forever.
-        Some(self.registry.engine_arc(community).await?.membership_key())
+    async fn epoch_key_candidates_of(&self, community: &SpaceId) -> Option<Vec<EpochKey>> {
+        // ZEB-918: live current key first, previous epoch's archived key
+        // second — coherent with the publisher, which now publishes under
+        // the live key (and degrades to the spawn-time key exactly when
+        // this read does, so a mismatched slot keypair can no longer arise
+        // from process lifetime alone; pre-ZEB-918 both sides pinned the
+        // spawn-time key and rotation broke discovery until restart).
+        //
+        // Engine presence stays the None-gate: "no engine registered" must
+        // keep reaching the ladder as EngineUnregistered, distinct from
+        // "no members".
+        let engine = self.registry.engine_arc(community).await?;
+        let fallback = engine.membership_key();
+        Some(
+            crate::community_state_sync::epoch_key_candidates(
+                *community,
+                self.crdt_state.as_ref(),
+                &fallback,
+            )
+            .await,
+        )
     }
 
     async fn enrolled_device_keys_of(&self, community: &SpaceId) -> HashSet<[u8; 32]> {
@@ -374,7 +399,7 @@ impl CommunityGatewayDialDriver {
             // by a full rung on every boot race. Registration gaps also CLEAR
             // any armed backoff, so the first real attempt after
             // re-registration is never delayed by a stale rung.
-            let Some(epoch_key) = self.ctx.epoch_key_of(&community).await else {
+            let Some(epoch_keys) = self.ctx.epoch_key_candidates_of(&community).await else {
                 tracing::debug!(community = ?community, "ZEB-824: no engine registered; skipping this pass");
                 let cleared = self
                     .ladders
@@ -386,6 +411,12 @@ impl CommunityGatewayDialDriver {
                     tracing::debug!(community = ?community, "ZEB-824: engine unregistered — bootstrap ladder cleared");
                 }
                 self.record(&community, GatewayBootstrapOutcome::EngineUnregistered);
+                continue;
+            };
+            // ZEB-918 shim: single-candidate consumption (candidates are
+            // documented non-empty); the ordered-iteration ladder replaces
+            // this in the follow-on commit.
+            let Some(epoch_key) = epoch_keys.first().cloned() else {
                 continue;
             };
             let members = self.ctx.members_of(&community).await;
@@ -618,8 +649,8 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         }
-        async fn epoch_key_of(&self, c: &SpaceId) -> Option<EpochKey> {
-            self.keys.lock().unwrap().get(c).cloned()
+        async fn epoch_key_candidates_of(&self, c: &SpaceId) -> Option<Vec<EpochKey>> {
+            self.keys.lock().unwrap().get(c).cloned().map(|k| vec![k])
         }
         async fn enrolled_device_keys_of(&self, _c: &SpaceId) -> HashSet<[u8; 32]> {
             // Resolution is driven by `StubBeacons` (which ignores the pre-resolve
@@ -1446,8 +1477,8 @@ mod tests {
         // solo community produces. A members-first pass therefore records every
         // registration gap as `soloCommunity` and `engineUnregistered` never
         // fires in production at all. This ctx reproduces the prod shape exactly
-        // (`epoch_key_of` → None AND `members_of` → []), so it can only pass if
-        // the epoch-key probe runs first.
+        // (`epoch_key_candidates_of` → None AND `members_of` → []), so it can
+        // only pass if the epoch-key probe runs first.
         let community = SpaceId([0x1E; 16]);
         let (member_pub, _member_owner) = test_member(16);
         let h = harness(

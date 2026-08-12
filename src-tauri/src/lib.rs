@@ -12311,6 +12311,11 @@ pub async fn start_node_inner(
                                                 crate::community_gateway_dial_driver::ProdGatewayDialCtx {
                                                     registry: std::sync::Arc::clone(&registry),
                                                     self_owner,
+                                                    // ZEB-918: live epoch-key
+                                                    // candidate reads.
+                                                    crdt_state: Some(
+                                                        std::sync::Arc::clone(&crdt_state),
+                                                    ),
                                                 },
                                             ),
                                             std::sync::Arc::new(
