@@ -1986,13 +1986,19 @@ impl ChannelLogEngine {
     /// `None` on cap/decrypt failure so the caller falls back to the legacy
     /// path), computes the reply against the local log, resolves any `Have`
     /// keys to their events for inline transfer (under the same log lock), and
-    /// seals the reply. Returns `(sealed_reply, have_events)`.
+    /// seals the reply. Returns `(sealed_reply, have_events, seal_key)` —
+    /// ZEB-920: the caller MUST encrypt the inline `Have` packets under the
+    /// returned `seal_key`, not a fresh fetch. A rotation landing between two
+    /// fetches would seal reply and packets under different epochs, and a
+    /// requester that opens the reply but drops the packets marks their
+    /// ranges resolved in `process_reply` — a silent event gap until the
+    /// periodic floor (CodeRabbit Major, PR #661 round 2).
     // ZEB-593: called by the `rbsr/**` Zenoh queryable (via the registry's
     // `RbsrAdapterHooks::respond` closure).
     pub(crate) async fn rbsr_respond(
         &self,
         sealed_request: &[u8],
-    ) -> Option<(Vec<u8>, Vec<SignedChannelEvent>)> {
+    ) -> Option<(Vec<u8>, Vec<SignedChannelEvent>, std::sync::Arc<ChannelKey>)> {
         // ZEB-920: open under the live [current, previous] candidates; seal
         // the reply under the live current key. A requester one epoch behind
         // gets a reply it cannot open — acceptable: the RBSR driver falls
@@ -2027,7 +2033,7 @@ impl ChannelLogEngine {
         drop(log);
         let seal_key = self.encrypt_channel_key().await;
         let sealed = crate::community_channel_log::seal_rbsr_message(&seal_key, &reply).ok()?;
-        Some((sealed, have_events))
+        Some((sealed, have_events, seal_key))
     }
 
     /// ZEB-593 (requester half): build + seal this round-0 RBSR request — one
@@ -2727,12 +2733,15 @@ impl ChannelLogRegistry {
                 move |sealed: Vec<u8>| -> crate::event_loop::RbsrRespondFut {
                     let me = Arc::clone(&engine_rbsr_respond);
                     Box::pin(async move {
-                        let (sealed_reply, have_events) = me.rbsr_respond(&sealed).await?;
+                        // ZEB-920: reuse the exact key the reply was sealed
+                        // under — a fresh fetch here could straddle a rotation
+                        // and split reply/packets across epochs (see
+                        // `rbsr_respond`'s doc for the resulting event gap).
+                        let (sealed_reply, have_events, seal_key) =
+                            me.rbsr_respond(&sealed).await?;
                         // Encrypt each Have event into a wire packet; bail to
                         // `None` (→ requester falls back) rather than advertise
-                        // a Have we can't back with a packet. ZEB-920: seal
-                        // under the live key, fetched once per reply.
-                        let seal_key = me.encrypt_channel_key().await;
+                        // a Have we can't back with a packet.
                         let mut packets = Vec::with_capacity(have_events.len());
                         for ev in &have_events {
                             match encrypt_channel_packet(&seal_key, ev) {
@@ -3748,7 +3757,7 @@ mod tests {
         // A request built over the engine's own log must reconcile to all-Skip
         // with nothing to transfer.
         let sealed_req = fix.engine.rbsr_build_initial().await;
-        let (sealed_reply, have) = fix
+        let (sealed_reply, have, _seal_key) = fix
             .engine
             .rbsr_respond(&sealed_req)
             .await
@@ -3806,7 +3815,7 @@ mod tests {
 
         // Requester drives round 0: build initial → responder replies.
         let req = requester.engine.rbsr_build_initial().await;
-        let (sealed_reply, have_events) = responder
+        let (sealed_reply, have_events, _seal_key) = responder
             .engine
             .rbsr_respond(&req)
             .await
@@ -3882,7 +3891,7 @@ mod tests {
             }
         }
         let req = requester.engine.rbsr_build_initial().await;
-        let (sealed_reply, have_events) = responder
+        let (sealed_reply, have_events, _seal_key) = responder
             .engine
             .rbsr_respond(&req)
             .await
@@ -3954,7 +3963,7 @@ mod tests {
                 rounds <= crate::channel_rbsr::MAX_RBSR_ROUNDS,
                 "exceeded round cap"
             );
-            let (sealed_reply, have_events) = responder
+            let (sealed_reply, have_events, _seal_key) = responder
                 .engine
                 .rbsr_respond(&sealed)
                 .await
