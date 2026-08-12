@@ -1120,8 +1120,9 @@ impl ChannelLogEngine {
         let event = sign_channel_event(&payload, &self.signing_key)
             .map_err(ChannelLogEngineError::ChannelEvent)?;
 
-        // Encrypt for broadcast.
-        let packet = encrypt_channel_packet(&self.channel_key, &event)
+        // Encrypt for broadcast. ZEB-920: seal under the live epoch key.
+        let seal_key = self.encrypt_channel_key().await;
+        let packet = encrypt_channel_packet(&seal_key, &event)
             .map_err(ChannelLogEngineError::ChannelEvent)?;
 
         // Order matters here. We must bump the replay tracker BEFORE
@@ -1245,12 +1246,14 @@ impl ChannelLogEngine {
         // vector (degrade to the key-expr scalar `since` + periodic floor).
         let watermark_sealed = if since.is_some() {
             let vector = self.log_watermark_vector().await;
+            // ZEB-920: seal under the live epoch key.
+            let seal_key = self.encrypt_channel_key().await;
             // Bound the lane count BEFORE materializing the CBOR + AEAD —
             // the byte cap only guards the responder's open path.
             if vector.len() > MAX_WATERMARK_VECTOR_ENTRIES {
                 None
             } else {
-                match seal_watermark_vector(self.channel_key_ref(), &vector) {
+                match seal_watermark_vector(&seal_key, &vector) {
                     Ok(bytes) if bytes.len() <= MAX_WATERMARK_VECTOR_BYTES => Some(bytes),
                     _ => None,
                 }
@@ -1323,7 +1326,9 @@ impl ChannelLogEngine {
         };
         let event = crate::community_channel_log::sign_channel_react(&payload, &self.signing_key)
             .map_err(ChannelLogEngineError::ChannelEvent)?;
-        let packet = encrypt_channel_packet(&self.channel_key, &event)
+        // ZEB-920: seal under the live epoch key.
+        let seal_key = self.encrypt_channel_key().await;
+        let packet = encrypt_channel_packet(&seal_key, &event)
             .map_err(ChannelLogEngineError::ChannelEvent)?;
         {
             let mut tracker = self.replay_tracker.lock().await;
@@ -1644,8 +1649,12 @@ impl ChannelLogEngine {
     }
 
     async fn process_inbound_packet(self: &Arc<Self>, packet: Vec<u8>) {
-        // 1. Decrypt.
-        let event = match decrypt_channel_packet(&self.channel_key, &packet) {
+        // 1. Decrypt. ZEB-920: try the [current, previous] live candidates
+        // (degraded [pinned]) so rotation skew heals in both directions.
+        let open_keys = self.decrypt_channel_keys().await;
+        let event = match crate::community_channel_log::decrypt_channel_packet_with_any(
+            &open_keys, &packet,
+        ) {
             Ok(ev) => ev,
             Err(e) => {
                 tracing::warn!(
@@ -1979,8 +1988,16 @@ impl ChannelLogEngine {
         &self,
         sealed_request: &[u8],
     ) -> Option<(Vec<u8>, Vec<SignedChannelEvent>)> {
-        let key = self.channel_key_ref();
-        let request = crate::community_channel_log::open_rbsr_message(key, sealed_request).ok()?;
+        // ZEB-920: open under the live [current, previous] candidates; seal
+        // the reply under the live current key. A requester one epoch behind
+        // gets a reply it cannot open — acceptable: the RBSR driver falls
+        // back to the vector path on open-failure, and that path serves
+        // events as channel packets the requester CAN open via its own
+        // candidate rungs.
+        let open_keys = self.decrypt_channel_keys().await;
+        let request =
+            crate::community_channel_log::open_rbsr_message_with_any(&open_keys, sealed_request)
+                .ok()?;
         let log = self.log.lock().await;
         let reply = crate::channel_rbsr::respond(&request, &*log);
         let have_keys: Vec<crate::channel_rbsr::ReconcileKey> = reply
@@ -2003,7 +2020,8 @@ impl ChannelLogEngine {
             }
         };
         drop(log);
-        let sealed = crate::community_channel_log::seal_rbsr_message(key, &reply).ok()?;
+        let seal_key = self.encrypt_channel_key().await;
+        let sealed = crate::community_channel_log::seal_rbsr_message(&seal_key, &reply).ok()?;
         Some((sealed, have_events))
     }
 
@@ -2017,8 +2035,9 @@ impl ChannelLogEngine {
             let log = self.log.lock().await;
             crate::channel_rbsr::initial_request(&*log)
         };
-        crate::community_channel_log::seal_rbsr_message(self.channel_key_ref(), &req)
-            .unwrap_or_default()
+        // ZEB-920: seal under the live epoch key.
+        let seal_key = self.encrypt_channel_key().await;
+        crate::community_channel_log::seal_rbsr_message(&seal_key, &req).unwrap_or_default()
     }
 
     /// ZEB-688: monotonic count of inbound packets dropped by the replay
@@ -2050,12 +2069,16 @@ impl ChannelLogEngine {
         frames: Vec<Vec<u8>>,
     ) -> crate::event_loop::RbsrStep {
         use crate::event_loop::RbsrStep;
-        let key = self.channel_key_ref();
+        // ZEB-920: classify frames under the live [current, previous]
+        // candidates (all-keys-fail = inline `Have` packet, exactly as a
+        // single-key fail classified before); seal the next round under the
+        // live current key.
+        let open_keys = self.decrypt_channel_keys().await;
         let mut reply: Option<crate::channel_rbsr::RbsrMessage> = None;
         let mut saw_extra_reply = false;
         let mut have_packets: Vec<Vec<u8>> = Vec::new();
         for frame in frames {
-            match crate::community_channel_log::open_rbsr_message(key, &frame) {
+            match crate::community_channel_log::open_rbsr_message_with_any(&open_keys, &frame) {
                 Ok(msg) if reply.is_none() => reply = Some(msg),
                 // A second sealed reply means a second remote holder answered.
                 Ok(_) => saw_extra_reply = true,
@@ -2087,13 +2110,16 @@ impl ChannelLogEngine {
         };
         match next {
             None => RbsrStep::Converged { ingested },
-            Some(msg) => match crate::community_channel_log::seal_rbsr_message(key, &msg) {
-                Ok(sealed) => RbsrStep::Continue {
-                    ingested,
-                    next: sealed,
-                },
-                Err(_) => RbsrStep::Failed,
-            },
+            Some(msg) => {
+                let seal_key = self.encrypt_channel_key().await;
+                match crate::community_channel_log::seal_rbsr_message(&seal_key, &msg) {
+                    Ok(sealed) => RbsrStep::Continue {
+                        ingested,
+                        next: sealed,
+                    },
+                    Err(_) => RbsrStep::Failed,
+                }
+            }
         }
     }
 
@@ -2659,12 +2685,18 @@ impl ChannelLogRegistry {
                 > {
                     let me = Arc::clone(&engine_for_query);
                     Box::pin(async move {
+                        // ZEB-920: one key fetch per request (not per event) —
+                        // open under candidates, seal replies under live.
+                        let open_keys = me.decrypt_channel_keys().await;
+                        let seal_key = me.encrypt_channel_key().await;
                         // ZEB-585: a sealed watermark vector selects the
                         // per-device diff path; absent (or undecryptable)
                         // falls back to the scalar `since` path.
                         let events = match watermark_sealed {
                             Some(bytes) => {
-                                match open_watermark_vector(me.channel_key_ref(), &bytes) {
+                                match crate::community_channel_log::open_watermark_vector_with_any(
+                                    &open_keys, &bytes,
+                                ) {
                                     Ok(vector) => me.list_messages_vector(&vector, limit).await,
                                     Err(_) => me.list_messages(since, limit).await,
                                 }
@@ -2677,7 +2709,7 @@ impl ChannelLogRegistry {
                         };
                         events
                             .iter()
-                            .filter_map(|ev| encrypt_channel_packet(me.channel_key_ref(), ev).ok())
+                            .filter_map(|ev| encrypt_channel_packet(&seal_key, ev).ok())
                             .collect()
                     })
                 },
@@ -2699,10 +2731,12 @@ impl ChannelLogRegistry {
                         let (sealed_reply, have_events) = me.rbsr_respond(&sealed).await?;
                         // Encrypt each Have event into a wire packet; bail to
                         // `None` (→ requester falls back) rather than advertise
-                        // a Have we can't back with a packet.
+                        // a Have we can't back with a packet. ZEB-920: seal
+                        // under the live key, fetched once per reply.
+                        let seal_key = me.encrypt_channel_key().await;
                         let mut packets = Vec::with_capacity(have_events.len());
                         for ev in &have_events {
-                            match encrypt_channel_packet(me.channel_key_ref(), ev) {
+                            match encrypt_channel_packet(&seal_key, ev) {
                                 Ok(p) => packets.push(p),
                                 Err(_) => return None,
                             }
@@ -3474,6 +3508,120 @@ mod tests {
         assert_eq!(
             dec[1].as_bytes(),
             derive_channel_key(&old, &community_id, &channel_id).as_bytes()
+        );
+    }
+
+    /// ZEB-920 §5: publish seals under the LIVE key after rotation while the
+    /// engine's pinned key stays on the spawn epoch. Mirrors ZEB-919's
+    /// `publisher_seals_under_live_key_when_rotated`.
+    #[tokio::test]
+    async fn publish_seals_under_live_key_when_rotated() {
+        let community_id = SpaceId([0xc1; 16]);
+        let channel_id = ChannelId([0x77; 16]);
+        let live = EpochKey::new([0x22; 32]);
+
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        os.spaces.insert(
+            community_id,
+            crate::community_state_sync::test_community_space(community_id, 1, live.clone()),
+        );
+        let mut fix =
+            build_engine_fixture_with_live_source(Arc::new(tokio::sync::Mutex::new(os))).await;
+
+        fix.engine
+            .publish(b"rotated".to_vec(), None, None, None)
+            .await
+            .expect("publish");
+        let packet = fix.publisher_rx.recv().await.expect("packet");
+
+        let live_key = derive_channel_key(&live, &community_id, &channel_id);
+        assert!(
+            decrypt_channel_packet(&live_key, &packet).is_ok(),
+            "post-rotation publish must seal under the live key"
+        );
+        assert!(
+            decrypt_channel_packet(&fix.channel_key, &packet).is_err(),
+            "the spawn-pinned key must NOT open a post-rotation packet"
+        );
+    }
+
+    /// ZEB-920 §5: an OLD-sealed inbound packet is accepted via the previous
+    /// candidate rung after rotation (the healing direction). NOTE: passes
+    /// pre-conversion too (the pinned decrypt also opens it) — this is the
+    /// post-conversion regression pin for the candidate path, where the
+    /// PRIMARY candidate is the new key and only the previous rung opens it.
+    #[tokio::test]
+    async fn inbound_old_sealed_packet_accepted_via_previous_rung() {
+        let community_id = SpaceId([0xc1; 16]);
+        let spawn_mk = EpochKey::new([0x55; 32]); // fixture's spawn membership key
+        let new = EpochKey::new([0x22; 32]);
+
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        let mut space =
+            crate::community_state_sync::test_community_space(community_id, 1, new.clone());
+        // The spawn-epoch key is the archived previous epoch.
+        space.old_epoch_keys.insert(0, spawn_mk.clone());
+        os.spaces.insert(community_id, space);
+        let fix =
+            build_engine_fixture_with_live_source(Arc::new(tokio::sync::Mutex::new(os))).await;
+
+        let hlc = Hlc {
+            wall_ms: 1_000,
+            logical: 0,
+            device_id: "remote-device".to_string(),
+        };
+        let event = make_signed_event(
+            fix.community_id,
+            fix.channel_id,
+            fix.self_owner,
+            hlc,
+            "old-sealed",
+            &fix.signing_key,
+        );
+        // Sealed under the OLD (spawn-epoch) channel key — an un-rotated peer.
+        let packet = encrypt_channel_packet(&fix.channel_key, &event).expect("encrypt");
+        fix.subscriber_tx.send(packet).await.expect("send");
+
+        let listed = wait_for(
+            || async {
+                let v = fix.engine.list_messages(None, 100).await.unwrap();
+                if v.len() == 1 {
+                    Some(v)
+                } else {
+                    None
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("old-sealed packet accepted via previous rung");
+        assert_eq!(extract_id(&listed[0]), extract_id(&event));
+    }
+
+    /// ZEB-920 §3.4: rbsr_build_initial seals under the live key post-rotation.
+    #[tokio::test]
+    async fn rbsr_initial_seals_under_live_key_when_rotated() {
+        let community_id = SpaceId([0xc1; 16]);
+        let channel_id = ChannelId([0x77; 16]);
+        let live = EpochKey::new([0x22; 32]);
+
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        os.spaces.insert(
+            community_id,
+            crate::community_state_sync::test_community_space(community_id, 1, live.clone()),
+        );
+        let fix =
+            build_engine_fixture_with_live_source(Arc::new(tokio::sync::Mutex::new(os))).await;
+
+        let sealed = fix.engine.rbsr_build_initial().await;
+        let live_key = derive_channel_key(&live, &community_id, &channel_id);
+        assert!(
+            crate::community_channel_log::open_rbsr_message(&live_key, &sealed).is_ok(),
+            "initial RBSR request must seal under the live key"
+        );
+        assert!(
+            crate::community_channel_log::open_rbsr_message(&fix.channel_key, &sealed).is_err(),
+            "the spawn-pinned key must NOT open it"
         );
     }
 
