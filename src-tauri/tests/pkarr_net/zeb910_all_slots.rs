@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use harmony_app::community_rendezvous::{rendezvous_config_from_env, resolve_rendezvous_all_slots};
+use harmony_app::community_rendezvous::resolve_rendezvous_all_slots;
 use harmony_app::community_rendezvous_publisher::CommunityRendezvousPublisher;
 use harmony_app::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 use harmony_app::reachability_record::ReachabilityAnnouncePayload;
@@ -94,7 +94,13 @@ async fn all_slots_resolve_returns_every_publishers_beacon() {
 
         let enrolled: Arc<std::collections::HashSet<[u8; 32]>> =
             Arc::new([vk_a, vk_b].into_iter().collect());
-        let cfg = rendezvous_config_from_env();
+        // PR #659 review: fixed test-local config — a repo-wide
+        // HARMONY_OPEN_JOIN_RESOLVE_DEADLINE_MS override must not be able to
+        // time out every probe and fail this test around a correct impl.
+        let cfg = harmony_pkarr::rendezvous::RendezvousResolveConfig {
+            batch_curve: vec![1, 2, 8],
+            per_batch_deadline: Duration::from_millis(2_500),
+        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         // Fresh resolver per attempt to sidestep the 60 s negative cache;
         // self endpoint id matches neither publisher.

@@ -631,6 +631,22 @@ impl ReachabilityResolver {
         self.refresh_if_older_than(owner, node_id, now_ms, STALE_RECORD_REFRESH_MS)
     }
 
+    /// PR #659 review (CodeAnt): the composite-key freshness read for
+    /// [`refresh_if_older_than`](Self::refresh_if_older_than) — the exact
+    /// (owner, node) row the caller names, NEVER the cross-owner freshest row
+    /// for the node. Under the ZEB-704 seed-owner split one node id can
+    /// legitimately live under two owners (beacon-seeded composite owner +
+    /// gossip master owner), and a fleet-sibling row for the same endpoint
+    /// must not veto a community owner's pkarr refresh.
+    fn resolve_entry_for(&self, owner: &OwnerAddr, node_id: &[u8; 32]) -> Option<ResolverEntry> {
+        let map = self.inner.read().expect("resolver read lock");
+        let entry = map
+            .range_owner(owner)
+            .find(|(key, _)| key.1 == *node_id)
+            .and_then(|(_, v)| v.freshest().cloned());
+        entry
+    }
+
     /// ZEB-910: [`maybe_refresh_stale`](Self::maybe_refresh_stale) with the
     /// staleness bar as a parameter. Repair callers (the gateway dial driver's
     /// Degraded/Starved passes) lower ONLY the staleness gate; the fleet-sibling
@@ -653,8 +669,10 @@ impl ReachabilityResolver {
         //     effective time is at most `skew` ahead of `now_ms`, which still
         //     yields `None` from `checked_sub` and so is treated as stale — worth
         //     a re-resolve. For realistic data (`effective <= now_ms`) this is
-        //     exactly `now_ms - effective_announced_at_ms`.
-        let Some((_, entry)) = self.resolve_entry_by_node_id(&node_id) else {
+        //     exactly `now_ms - effective_announced_at_ms`. The read is
+        //     composite-keyed (PR #659 review): the caller's (owner, node)
+        //     row, not the cross-owner freshest row for the node.
+        let Some(entry) = self.resolve_entry_for(&owner, &node_id) else {
             return;
         };
         // ZEB-510: a fleet-sibling entry is a same-owner LAN/fleet-net record,
@@ -871,6 +889,65 @@ impl ReachabilityResolver {
             self.update_with_source(*addr, payload.clone(), hlc, ReachabilitySource::PkarrLive);
         }
         payloads
+    }
+
+    /// ZEB-910 (PR #659 review): bounded cache-miss discovery for a member with
+    /// NO resolver rows — the record-less arm of the gateway repair. Sync +
+    /// fire-and-forget like [`maybe_refresh_stale`](Self::maybe_refresh_stale):
+    /// the cache check and per-owner cooldown run inline; the pkarr fetch runs
+    /// in a spawned task behind the SAME [`PKARR_REFRESH_MAX_CONCURRENT`]
+    /// semaphore, so a mostly-record-less community cannot fan out unbounded
+    /// concurrent fetches ([`resolve_async`](Self::resolve_async) takes no
+    /// permit — it exists for callers that need the payloads inline). The
+    /// cooldown map is shared with the refresh path deliberately: both are
+    /// "one pkarr fetch per owner per window" decisions.
+    pub(crate) fn discover_record_less(&self, owner: OwnerAddr) {
+        {
+            let map = self.inner.read().expect("resolver read lock");
+            if map.range_owner(&owner).next().is_some() {
+                return; // any row at all ⇒ not record-less; the refresh path owns it
+            }
+        }
+        let fb = {
+            let guard = self
+                .fallback_source
+                .read()
+                .expect("fallback_source poisoned");
+            guard.clone()
+        };
+        let Some(fb) = fb else {
+            return; // no fallback ⇒ nothing to discover with; don't burn the cooldown
+        };
+        {
+            let mut cooldowns = self
+                .refresh_cooldowns
+                .lock()
+                .expect("refresh_cooldowns lock");
+            let now = tokio::time::Instant::now();
+            if let Some(&last) = cooldowns.get(&owner) {
+                if now.saturating_duration_since(last) < PKARR_REFRESH_COOLDOWN {
+                    return;
+                }
+            }
+            cooldowns.insert(owner, now);
+        }
+        let resolver = self.clone();
+        let permits = Arc::clone(&self.refresh_permits);
+        tokio::spawn(async move {
+            let _permit = match permits.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let payloads = fb.resolve(&owner).await;
+            for payload in payloads {
+                let hlc = Hlc {
+                    wall_ms: payload.announced_at_ms,
+                    logical: 0,
+                    device_id: String::new(),
+                };
+                resolver.update_with_source(owner, payload, hlc, ReachabilitySource::PkarrLive);
+            }
+        });
     }
 
     /// Like [`resolve`](Self::resolve), but carries each entry's source for the
@@ -2290,6 +2367,103 @@ mod fallback_tests {
         r.refresh_if_older_than(owner, node_id_bytes(7), now, 10 * 60 * 1000);
         yield_a_few().await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// PR #659 review (CodeAnt): the staleness/source gates must read the
+    /// (owner, node) row the caller names. A same-node row under ANOTHER
+    /// owner — here a fresh fleet-sibling row (ZEB-704 seed-owner-split
+    /// shape) — must not veto the named owner's refresh.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_gates_read_named_owner_row_not_cross_owner_freshest() {
+        let r = ReachabilityResolver::new();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![],
+        }));
+        let community_owner = OwnerAddr([1u8; 16]);
+        let fleet_owner = OwnerAddr([2u8; 16]);
+        let now = 100 * 60 * 60 * 1000u64;
+        // Ancient pkarr-live row for the community owner…
+        r.update_with_source(
+            community_owner,
+            make_payload(7, 1_000),
+            make_hlc(1_000, 0, "dev-a"),
+            ReachabilitySource::PkarrLive,
+        );
+        // …and a FRESH fleet-sibling row for the SAME node under another
+        // owner. The cross-owner freshest view picks the fleet row, whose
+        // source-skip would (wrongly) suppress the refresh.
+        r.update_with_source(
+            fleet_owner,
+            make_payload(7, now - 1_000),
+            make_hlc(now - 1_000, 0, "dev-b"),
+            ReachabilitySource::FleetSibling,
+        );
+
+        r.refresh_if_older_than(community_owner, node_id_bytes(7), now, 10 * 60 * 1000);
+        wait_for_count(&counter, 1).await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the named owner's ancient row must drive the refresh — a fresh \
+             cross-owner fleet row must not veto it"
+        );
+    }
+
+    /// ZEB-910 (PR #659 review): `discover_record_less` fires the fallback for
+    /// a truly record-less owner, installs the result, and is cooldown-bounded.
+    #[tokio::test(start_paused = true)]
+    async fn discover_record_less_fires_once_and_respects_cooldown() {
+        let r = ReachabilityResolver::new();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![make_payload(9, 90_000_000_000)],
+        }));
+        let owner = OwnerAddr([3u8; 16]);
+
+        r.discover_record_less(owner);
+        wait_for_count(&counter, 1).await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (_, p) = r
+            .resolve_by_node_id(&node_id_bytes(9))
+            .expect("discovered record must land in the cache");
+        assert_eq!(p.announced_at_ms, 90_000_000_000);
+
+        // Rows now exist ⇒ the record-less gate no-ops (refresh path owns it),
+        // regardless of cooldown.
+        r.discover_record_less(owner);
+        yield_a_few().await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// ZEB-910 (PR #659 review): repeated discovery for an owner pkarr cannot
+    /// find stays inside the shared per-owner cooldown window.
+    #[tokio::test(start_paused = true)]
+    async fn discover_record_less_cooldown_bounds_repeat_misses() {
+        let r = ReachabilityResolver::new();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![], // pkarr has nothing either — stays record-less
+        }));
+        let owner = OwnerAddr([4u8; 16]);
+
+        r.discover_record_less(owner);
+        wait_for_count(&counter, 1).await;
+        r.discover_record_less(owner);
+        yield_a_few().await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second discovery inside PKARR_REFRESH_COOLDOWN must not fire"
+        );
+
+        tokio::time::advance(PKARR_REFRESH_COOLDOWN + std::time::Duration::from_secs(1)).await;
+        r.discover_record_less(owner);
+        wait_for_count(&counter, 2).await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// ZEB-621 (Qodo #1) regression: a far-future pkarr record initially wins the

@@ -603,17 +603,15 @@ impl CommunityGatewayDialDriver {
                     );
                 }
             }
-            // (3) Record-less member discovery: `resolve_async` short-circuits
-            // on ANY cached row, so real network I/O fires only for truly
-            // record-less members — and only while the community is
-            // non-Healthy (this pass is ladder-paced). Spawned: the pass must
-            // never block on pkarr.
+            // (3) Record-less member discovery, bounded inside the resolver
+            // (PR #659 review): per-owner cooldown + the SAME refresh
+            // semaphore the stale-refresh path uses, so a mostly-record-less
+            // community cannot fan out unbounded pkarr fetches. Sync call;
+            // the network fetch runs in the resolver's spawned task — the
+            // pass never blocks on pkarr. Fires only while the community is
+            // non-Healthy (this pass is ladder-paced).
             for owner in members.iter().filter(|m| !rows_by_owner.contains_key(*m)) {
-                let r = Arc::clone(&self.reachability);
-                let o = *owner;
-                tokio::spawn(async move {
-                    let _ = r.resolve_async(&o).await;
-                });
+                self.reachability.discover_record_less(*owner);
             }
             // (4) Revive ONLY Dormant slots of the target set. Retrying peers
             // keep their ladders (re-arming live backoff every repair pass

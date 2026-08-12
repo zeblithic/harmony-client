@@ -176,7 +176,9 @@ pub struct SupervisorConfig {
     /// steady-state instead of edge-triggered (a quiet, stable community
     /// otherwise keeps cross-island pairs Dormant for process life). Default
     /// ≥ the resolver's per-owner refresh cooldown (15 min) so the paired
-    /// refresh is never structurally cooldown-blocked.
+    /// refresh is never structurally cooldown-blocked. `Duration::ZERO`
+    /// DISABLES parole (PR #659 review: a zero interval would otherwise fire
+    /// on every loop pass and busy-spin the select).
     pub parole_interval: Duration,
     /// ZEB-910: max Dormant peers re-armed per parole tick. Batch × interval
     /// caps steady-state parole load regardless of the Dormant population;
@@ -541,23 +543,28 @@ pub async fn run_reconnect_supervisor(
     let mut pending_sweep_at: Option<Instant> = None;
     // ZEB-910: next Dormant-parole tick (paused-clock Instant, so tests drive
     // it through virtual time like every other schedule in this loop).
-    let mut next_parole = Instant::now() + config.parole_interval;
+    // `None` = parole disabled (`parole_interval == ZERO`, PR #659 review —
+    // an always-elapsed deadline would busy-spin the select).
+    let mut next_parole =
+        (config.parole_interval > Duration::ZERO).then(|| Instant::now() + config.parole_interval);
 
     loop {
         let now = Instant::now();
 
         // --- ZEB-910 dormant parole ----------------------------------------
-        if now >= next_parole {
-            run_parole(
-                &inner,
-                &resolver,
-                &telemetry,
-                now,
-                &self_node_id,
-                &config,
-                &mut rng,
-            );
-            next_parole = now + config.parole_interval;
+        if let Some(due) = next_parole {
+            if now >= due {
+                run_parole(
+                    &inner,
+                    &resolver,
+                    &telemetry,
+                    now,
+                    &self_node_id,
+                    &config,
+                    &mut rng,
+                );
+                next_parole = Some(now + config.parole_interval);
+            }
         }
 
         // --- presence-sweep gating -----------------------------------------
@@ -738,7 +745,7 @@ pub async fn run_reconnect_supervisor(
         // including when dial capacity is exhausted (`next_deadline == None`):
         // a parole wake during exhaustion is harmless (dispatch skips
         // in-flight slots) and the held-permit wake guarantee is unaffected.
-        let deadline = min_opt(min_opt(next_deadline, pending_sweep_at), Some(next_parole));
+        let deadline = min_opt(min_opt(next_deadline, pending_sweep_at), next_parole);
 
         tokio::select! {
             biased;
@@ -865,29 +872,53 @@ fn run_parole(
     config: &SupervisorConfig,
     rng: &mut ChaCha8Rng,
 ) {
-    let mut states = inner.states.lock().expect("states lock");
+    // Phase 1 (PR #659 review): snapshot the Dormant set under the states
+    // lock, then RELEASE it before the resolver lookups — `resolve_by_node_id`
+    // is an O(resolver) scan per candidate, and holding `states` across
+    // O(dormant × resolver) work would block trigger application,
+    // `mark_connected`, and dial-result processing.
+    let dormant: Vec<([u8; 32], Instant)> = {
+        let states = inner.states.lock().expect("states lock");
+        states
+            .iter()
+            .filter_map(|(peer, slot)| match slot.state {
+                PeerState::Dormant { .. } if peer != self_node_id => {
+                    Some((*peer, slot.last_fresh_trigger))
+                }
+                _ => None,
+            })
+            .collect()
+    };
     // Longest-dormant first, ordered by `last_fresh_trigger` (paused-clock
     // `Instant`, which orders dormancy onset exactly). The wall-ms `since_ms`
     // in the state is telemetry-only — it free-runs under tokio's paused test
-    // clock, so it must not drive scheduling. `resolve_by_node_id` is an O(N)
-    // scan, but the candidate set is Dormant-only and the batch is tiny.
-    let mut candidates: Vec<([u8; 32], Instant, [u8; 16])> = states
-        .iter()
-        .filter_map(|(peer, slot)| match slot.state {
-            PeerState::Dormant { .. } if peer != self_node_id => resolver
-                .resolve_by_node_id(peer)
-                .map(|(owner, _)| (*peer, slot.last_fresh_trigger, owner.0)),
-            _ => None,
+    // clock, so it must not drive scheduling.
+    let mut candidates: Vec<([u8; 32], Instant, [u8; 16])> = dormant
+        .into_iter()
+        .filter_map(|(peer, t)| {
+            resolver
+                .resolve_by_node_id(&peer)
+                .map(|(owner, _)| (peer, t, owner.0))
         })
         .collect();
     candidates.sort_by_key(|(peer, t, _)| (*t, *peer));
-    for (peer, _, owner) in candidates.into_iter().take(config.parole_batch) {
+    candidates.truncate(config.parole_batch);
+    // Phase 2: reacquire and re-arm, revalidating each slot is STILL Dormant —
+    // a kick, inbound connect, or eviction may have landed between the phases,
+    // and parole must never clobber fresher state.
+    let mut states = inner.states.lock().expect("states lock");
+    for (peer, _, owner) in candidates {
+        let Some(slot) = states.get_mut(&peer) else {
+            continue; // evicted between phases
+        };
+        if !matches!(slot.state, PeerState::Dormant { .. }) {
+            continue; // revived/connected between phases — fresher state wins
+        }
         // Paired stale-refresh, standard 24h/15min gates — parole is
         // background hygiene, not urgent repair. Sync + non-blocking by
-        // contract (checks inline, network in a spawned task), so holding the
-        // states lock across it is safe.
+        // contract (composite-key read + cooldown map inline, network in a
+        // spawned task), so the brief hold here is fine.
         resolver.maybe_refresh_stale(crate::owner_state_types::OwnerAddr(owner), peer, now_ms());
-        let slot = states.get_mut(&peer).expect("slot exists: collected above");
         let role = dial_role(self_node_id, &peer);
         slot.epoch = slot.epoch.wrapping_add(1);
         // Grants exactly one `dormant_after` window of retries from the base
@@ -1605,6 +1636,44 @@ mod tests {
             calls.load(Ordering::SeqCst) > calls_before,
             "parole must pair a stale-refresh with the revival"
         );
+    }
+
+    /// PR #659 review: `Duration::ZERO` disables parole outright — no
+    /// revivals, no busy-spin (an always-elapsed deadline would otherwise
+    /// starve the paused-clock auto-advance and hang this very test).
+    #[tokio::test(start_paused = true)]
+    async fn zero_parole_interval_disables_parole() {
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let handle = SupervisorHandle::new();
+        let config = cfg_with_parole(cfg(1_000, 64_000, 10_000, 30_000, 8, 3_000), 0, 2);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(40_000)).await;
+        let dormant_count = dialer.count_for(p);
+
+        tokio::time::sleep(ms(300_000)).await;
+        assert_eq!(
+            dialer.count_for(p),
+            dormant_count,
+            "no parole revival with a zero interval"
+        );
+        assert_eq!(telemetry.summary().paroled, 0);
+        assert!(handle
+            .states_snapshot()
+            .iter()
+            .any(|(id, st)| id == &p && matches!(st, PeerStateWire::Dormant { .. })));
     }
 
     /// Parole touches ONLY Dormant slots: Connected and mid-ladder Retrying

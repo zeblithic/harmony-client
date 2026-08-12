@@ -415,24 +415,35 @@ pub(crate) async fn all_slots_scan<R>(
 where
     R: harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> + Sync,
 {
+    // PR #659 review: bound in-flight probes — a repair pass must never hold
+    // more concurrent pkarr GETs than the resolver's stale-refresh path may
+    // (`PKARR_REFRESH_MAX_CONCURRENT` = 4; kept as a local const to avoid a
+    // cross-module dependency on a pub(crate) tuning knob).
+    const ALL_SLOTS_PROBE_CONCURRENCY: usize = 4;
+    use futures::StreamExt;
     let current = harmony_pkarr::current_epoch_id(now_ms);
     let mut epochs = vec![current];
     if current > 0 {
         epochs.push(current - 1);
     }
-    // Current-epoch probes FIRST: `join_all` preserves input order, so the
-    // dedup below prefers a node's current-epoch beacon over its previous one.
+    // Current-epoch probes FIRST: `buffered` (the ORDERED variant — never
+    // `buffer_unordered` here) preserves input order, so the dedup below
+    // prefers a node's current-epoch beacon over its previous one.
     let probes: Vec<(u16, u64)> = epochs
         .iter()
         .flat_map(|e| (0..RENDEZVOUS_SLOT_COUNT as u16).map(move |s| (s, *e)))
         .collect();
-    let results = futures::future::join_all(probes.into_iter().map(|(slot, epoch)| async move {
-        match tokio::time::timeout(per_probe_deadline, resolver.resolve_slot(slot, epoch)).await {
-            Ok(hit) => (hit, false),
-            Err(_) => (None, true),
-        }
-    }))
-    .await;
+    let results: Vec<(Option<IdentifiedBeacon>, bool)> =
+        futures::stream::iter(probes.into_iter().map(|(slot, epoch)| async move {
+            match tokio::time::timeout(per_probe_deadline, resolver.resolve_slot(slot, epoch)).await
+            {
+                Ok(hit) => (hit, false),
+                Err(_) => (None, true),
+            }
+        }))
+        .buffered(ALL_SLOTS_PROBE_CONCURRENCY)
+        .collect()
+        .await;
     let mut timeouts = 0usize;
     let mut seen = std::collections::HashSet::new();
     let mut hits = Vec::new();
