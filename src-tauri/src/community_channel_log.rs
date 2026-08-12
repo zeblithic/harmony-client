@@ -796,7 +796,9 @@ pub(crate) fn decrypt_channel_packet_with_any(
     keys: &[std::sync::Arc<ChannelKey>],
     packet: &[u8],
 ) -> Result<SignedChannelEvent, ChannelEventError> {
-    let mut last = Err(ChannelEventError::AeadDecrypt("no candidate keys".to_string()));
+    let mut last = Err(ChannelEventError::AeadDecrypt(
+        "no candidate keys".to_string(),
+    ));
     for key in keys {
         match decrypt_channel_packet(key, packet) {
             Ok(ev) => return Ok(ev),
@@ -921,7 +923,9 @@ pub(crate) fn open_watermark_vector_with_any(
     keys: &[std::sync::Arc<ChannelKey>],
     packet: &[u8],
 ) -> Result<WatermarkVector, ChannelEventError> {
-    let mut last = Err(ChannelEventError::AeadDecrypt("no candidate keys".to_string()));
+    let mut last = Err(ChannelEventError::AeadDecrypt(
+        "no candidate keys".to_string(),
+    ));
     for key in keys {
         match open_watermark_vector(key, packet) {
             Ok(v) => return Ok(v),
@@ -1042,7 +1046,9 @@ pub(crate) fn open_rbsr_message_with_any(
     keys: &[std::sync::Arc<ChannelKey>],
     frame: &[u8],
 ) -> Result<crate::channel_rbsr::RbsrMessage, ChannelEventError> {
-    let mut last = Err(ChannelEventError::AeadDecrypt("no candidate keys".to_string()));
+    let mut last = Err(ChannelEventError::AeadDecrypt(
+        "no candidate keys".to_string(),
+    ));
     for key in keys {
         match open_rbsr_message(key, frame) {
             Ok(m) => return Ok(m),

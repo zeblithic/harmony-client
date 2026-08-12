@@ -19,13 +19,12 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::community_channel_log::{
-    decrypt_channel_packet, derive_channel_key, encrypt_channel_packet, open_watermark_vector,
-    read_segment_at, seal_watermark_vector, sign_channel_event, verify_channel_event,
-    ChannelAttachment, ChannelEventError, ChannelKey, ChannelLog, ChannelLogConfig,
-    ChannelLogPersistError, ChannelLogReplayTracker, ChannelPostPayload, CommunityStateAtHlc,
-    MessageId, SegmentDescriptor, SignedChannelEvent, WatermarkVector, MAX_ATTACHMENTS,
-    MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS, MAX_WATERMARK_VECTOR_BYTES,
-    MAX_WATERMARK_VECTOR_ENTRIES,
+    derive_channel_key, encrypt_channel_packet, read_segment_at, seal_watermark_vector,
+    sign_channel_event, verify_channel_event, ChannelAttachment, ChannelEventError, ChannelKey,
+    ChannelLog, ChannelLogConfig, ChannelLogPersistError, ChannelLogReplayTracker,
+    ChannelPostPayload, CommunityStateAtHlc, MessageId, SegmentDescriptor, SignedChannelEvent,
+    WatermarkVector, MAX_ATTACHMENTS, MAX_ATTACHMENT_FIELD_BYTES, MAX_MENTIONS,
+    MAX_WATERMARK_VECTOR_BYTES, MAX_WATERMARK_VECTOR_ENTRIES,
 };
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
@@ -452,8 +451,7 @@ pub struct ChannelKeyLiveSource {
     /// from; the fallback every live-read degrade lands on.
     pub(crate) membership_key: EpochKey,
     /// Live owner-state (`Space.current_epoch_key` / `old_epoch_keys`).
-    pub(crate) crdt_state:
-        std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    pub(crate) crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
 }
 
 pub struct ChannelLogEngineParams {
@@ -1929,9 +1927,12 @@ impl ChannelLogEngine {
 }
 
 impl ChannelLogEngine {
-    /// Borrow the per-channel encryption key. Used by the registry's
-    /// `read_for_query` callback to encrypt backfill replies in the
-    /// same wire shape as live broadcast packets (spec §17.1).
+    /// Borrow the pinned spawn-time key. ZEB-920: every production consumer
+    /// now selects keys per-op via [`Self::encrypt_channel_key`] /
+    /// [`Self::decrypt_channel_keys`]; this accessor remains only for this
+    /// file's unit tests, which seal/open fixtures in the degraded
+    /// (`live_key_source: None`) mode.
+    #[cfg(test)]
     pub(crate) fn channel_key_ref(&self) -> &ChannelKey {
         self.channel_key.as_ref()
     }
@@ -1949,7 +1950,11 @@ impl ChannelLogEngine {
                     &src.membership_key,
                 )
                 .await;
-                std::sync::Arc::new(derive_channel_key(&mk, &self.community_id, &self.channel_id))
+                std::sync::Arc::new(derive_channel_key(
+                    &mk,
+                    &self.community_id,
+                    &self.channel_id,
+                ))
             }
         }
     }
@@ -2121,12 +2126,6 @@ impl ChannelLogEngine {
                 }
             }
         }
-    }
-
-    /// ZEB-350: clone the `Arc<ChannelKey>` so the voice relay can hold the key
-    /// for the lifetime of a join without borrowing the engine.
-    pub(crate) fn channel_key_arc(&self) -> std::sync::Arc<ChannelKey> {
-        std::sync::Arc::clone(&self.channel_key)
     }
 }
 
@@ -3240,7 +3239,7 @@ impl ChannelLogRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::community_channel_log::derive_channel_key;
+    use crate::community_channel_log::{decrypt_channel_packet, derive_channel_key};
     use crate::community_membership::ChannelInfo;
     use crate::owner_state_types::EpochKey;
     use ed25519_dalek::SigningKey;

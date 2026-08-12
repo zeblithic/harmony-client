@@ -7884,11 +7884,13 @@ pub async fn start_node_inner(
                                     std::sync::Arc::clone(&channel_log_registry_for_consumer);
                                 let community_registry_for_hook = std::sync::Arc::clone(&registry);
                                 let hlc_tracker_for_hook = std::sync::Arc::clone(&tracker);
+                                let crdt_state_for_hook = std::sync::Arc::clone(&crdt_state);
                                 move |payload: ChannelConfigChangedPayload| {
                                     let registry = std::sync::Arc::clone(&registry_for_hook);
                                     let community_registry =
                                         std::sync::Arc::clone(&community_registry_for_hook);
                                     let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_hook);
+                                    let crdt_state = std::sync::Arc::clone(&crdt_state_for_hook);
                                     async move {
                                         let cid_bytes: [u8; 16] = match hex::decode(
                                             &payload.community_id,
@@ -7949,6 +7951,7 @@ pub async fn start_node_inner(
                                                     &community_engine,
                                                     cid,
                                                     chid,
+                                                    Some(crdt_state),
                                                     hlc_tracker,
                                                 )
                                                 .await
@@ -9045,7 +9048,9 @@ pub async fn start_node_inner(
                                         space_id,
                                         &materialized,
                                         &membership_key,
-                                        None, // ZEB-920: live source wired in Task 4
+                                        // ZEB-920: live owner-state handle for
+                                        // per-op epoch-key selection.
+                                        Some(std::sync::Arc::clone(&crdt_state)),
                                         state_at_hlc,
                                         hlc_tracker_for_reconcile,
                                     )
@@ -28514,7 +28519,10 @@ async fn join_voice_channel(
         .engine(&community, &channel)
         .await
         .ok_or_else(|| "voice channel not ready (no channel engine)".to_string())?;
-    let channel_key = engine.channel_key_arc();
+    // ZEB-920: join-time live key — a join after rotation derives from the
+    // live epoch. A call already in progress keeps its key (mid-call re-key
+    // is out of scope; calls are minutes, epochs are long-lived).
+    let channel_key = engine.encrypt_channel_key().await;
     let signing_key = { dm_outbox.lock().await.community_signing_key.clone() };
 
     // ZEB-350 Task 7: stamp the join HLC (own device). Carried as identifying
@@ -32463,6 +32471,9 @@ pub(crate) async fn register_channel_log_engine(
     community_engine: &std::sync::Arc<crate::community_state_sync::CommunitySyncEngine>,
     community_id: crate::owner_state_types::SpaceId,
     channel_id: crate::community_membership::ChannelId,
+    // ZEB-920: live owner-state for per-op epoch-key selection; `None` =
+    // degraded spawn-key mode (today's behavior).
+    crdt_state: Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
@@ -32476,13 +32487,22 @@ pub(crate) async fn register_channel_log_engine(
         &community_id,
         &channel_id,
     );
+    // ZEB-920: the spawn key above stays the degrade fallback; the engine
+    // reads the live epoch key per operation through this source.
+    let live_key_source =
+        crdt_state.map(
+            |cs| crate::community_channel_log_engine::ChannelKeyLiveSource {
+                membership_key: membership_key.clone(),
+                crdt_state: cs,
+            },
+        );
     let state_at_hlc = community_engine.state_at_hlc_resolver();
     channel_log_registry
         .spawn(
             community_id,
             channel_id,
             key,
-            None, // ZEB-920: live source wired in Task 4
+            live_key_source,
             state_at_hlc,
             hlc_tracker,
         )
@@ -32523,6 +32543,9 @@ pub(crate) async fn reconcile_community_channel_logs(
     channel_log_registry: &std::sync::Arc<crate::community_channel_log_engine::ChannelLogRegistry>,
     community_engine: &std::sync::Arc<crate::community_state_sync::CommunitySyncEngine>,
     community_id: crate::owner_state_types::SpaceId,
+    // ZEB-920: live owner-state for per-op epoch-key selection; `None` =
+    // degraded spawn-key mode (today's behavior).
+    crdt_state: Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
     hlc_tracker: std::sync::Arc<
         tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
     >,
@@ -32542,7 +32565,7 @@ pub(crate) async fn reconcile_community_channel_logs(
             community_id,
             &materialized,
             &membership_key,
-            None, // ZEB-920: live source wired in Task 4
+            crdt_state,
             state_at_hlc,
             hlc_tracker,
         )
@@ -32575,6 +32598,8 @@ pub async fn reconcile_community_channel_logs_for_test(
         channel_log_registry,
         community_engine,
         community_id,
+        // ZEB-920: the harness runs in the documented degraded spawn-key mode.
+        None,
         hlc_tracker,
     )
     .await
@@ -32785,11 +32810,15 @@ pub(crate) async fn create_channel_impl(
         // window between this check and `spawn().await` is the same
         // best-effort bound the community insert above already accepts —
         // the std `NodeState` mutex can't be held across the async spawn.)
-        let node_still_live = {
+        let (node_still_live, crdt_state_for_spawn) = {
             let g = state
                 .lock()
                 .map_err(|e| format!("NodeState poisoned: {e}"))?;
-            g.generation == snapshot_generation && g.channel_log_registry.is_some()
+            (
+                g.generation == snapshot_generation && g.channel_log_registry.is_some(),
+                // ZEB-920: live owner-state handle for per-op key selection.
+                g.crdt_state.clone(),
+            )
         };
         if let Some(channel_log_registry) = channel_log_registry.filter(|_| node_still_live) {
             if let Err(e) = register_channel_log_engine(
@@ -32797,6 +32826,7 @@ pub(crate) async fn create_channel_impl(
                 &engine_arc,
                 space_id,
                 channel_id,
+                crdt_state_for_spawn,
                 hlc_tracker,
             )
             .await
@@ -37006,6 +37036,7 @@ mod create_community_inner_tests {
             let registry_for_hook = std::sync::Arc::clone(&channel_log_registry);
             let community_registry_for_hook = std::sync::Arc::clone(&community_registry);
             let hlc_tracker_for_hook = std::sync::Arc::clone(&hlc_tracker);
+            let crdt_state_for_hook = std::sync::Arc::clone(&crdt_state);
             tokio::spawn(run_community_delta_consumer(
                 delta_rx,
                 // membership-changed callback — no-op in test (no Tauri
@@ -37018,6 +37049,7 @@ mod create_community_inner_tests {
                     let registry = std::sync::Arc::clone(&registry_for_hook);
                     let community_registry = std::sync::Arc::clone(&community_registry_for_hook);
                     let hlc_tracker = std::sync::Arc::clone(&hlc_tracker_for_hook);
+                    let crdt_state = std::sync::Arc::clone(&crdt_state_for_hook);
                     async move {
                         if payload.action != ChannelConfigChangeAction::Created {
                             return;
@@ -37050,6 +37082,7 @@ mod create_community_inner_tests {
                             &community_engine,
                             cid,
                             chid,
+                            Some(crdt_state),
                             hlc_tracker,
                         )
                         .await;
@@ -42212,6 +42245,7 @@ where
             &channel_log_registry,
             &engine_arc,
             minted.community_id,
+            Some(std::sync::Arc::clone(&crdt_state)),
             std::sync::Arc::clone(&hlc_tracker),
         )
         .await;
