@@ -261,6 +261,11 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", 
 # Activate test-fixtures feature for harmony-pkarr in dev/test builds only,
 # so MockPkarrRelay (an axum HTTP server) is excluded from release binaries.
 harmony-pkarr = { git = "https://github.com/zeblithic/harmony.git", rev = "88861ae5ae4461000ed041db907c3fa674824e6f", features = ["test-fixtures"] }
+# ZEB-880 round 2: direct dev-dep (same version + features harmony-pkarr pins)
+# so the reachability_bound boundary test can pin MAX_RECORD_CBOR_BYTES to
+# pkarr's REAL build-time gate (the 1000-byte encoded-DNS-packet check) by
+# replicating harmony-pkarr's wire packet assembly against the actual builder.
+pkarr = { version = "3.10.0", default-features = false, features = ["signed_packet"] }
 
 # ZEB-156: harmony-runtime (pinned above) provides the narrow
 # `NodeRuntime::remove_content` + `StorageTier::remove` delegates this
