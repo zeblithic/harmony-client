@@ -6668,14 +6668,26 @@ pub async fn run(
                 }
                 // (2) Hosting-report staleness sweep (wall clock — receipt
                 // stamps are wall ms, see note_storage_record_sample) +
-                // ZEB-679 R1 retroactive revocation purge: records admitted
-                // before the projection learned their signer's revocation
-                // must stop driving the planner.
+                // ZEB-923 record-TTL decay + ZEB-679 R1 retroactive
+                // revocation purge: records admitted before the projection
+                // learned their signer's revocation must stop driving the
+                // planner.
                 {
                     let mut records = storage_records
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     records.sweep_hosting(crate::wall_clock_ms());
+                    // ZEB-923: decay pledge/backup records not renewed
+                    // within the TTL; the planner in step (3) observes the
+                    // decay in this same tick and releases the pins.
+                    if records.sweep_stale_pledges_and_backups(crate::wall_clock_ms()) {
+                        tracing::info!("storage records: stale pledge/backup records decayed");
+                        crate::node_event_sink::emit_ser(
+                            app.as_ref(),
+                            "storage-buddies-updated",
+                            &serde_json::Value::Null,
+                        );
+                    }
                     if records.purge_revoked(&revoked_projection) {
                         tracing::info!("storage records purged for revoked signer(s)");
                     }
