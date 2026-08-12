@@ -5711,14 +5711,24 @@ pub struct CommunitySyncRegistry {
     /// held together with the `engines` lock (every site acquires them
     /// strictly sequentially), and `watch::Sender::send` is sync, so no
     /// `.await` happens with the guard alive.
-    latched_reattempt_shutdowns: tokio::sync::Mutex<
-        std::collections::HashMap<SpaceId, (u64, tokio::sync::watch::Sender<bool>)>,
-    >,
+    latched_reattempt_shutdowns: tokio::sync::Mutex<LatchedReattemptSlots>,
 
     /// ZEB-903: source for `latched_reattempt_shutdowns` registration
     /// generations. Relaxed ordering suffices — the value is only ever
     /// compared for equality under the map's mutex.
     latched_reattempt_next_gen: std::sync::atomic::AtomicU64,
+}
+
+/// ZEB-903: slot map + one-way closed latch for the latched-join
+/// re-attempt drivers. `closed` is set under the same mutex that guards
+/// `slots` during `shutdown_all`, so a registration racing the teardown
+/// (CodeRabbit PR #664 r1) cannot slip an unsignalled watch in after
+/// the drain — `register_latched_reattempt` observes the flag and hands
+/// back an already-flipped receiver instead.
+#[derive(Default)]
+struct LatchedReattemptSlots {
+    closed: bool,
+    slots: std::collections::HashMap<SpaceId, (u64, tokio::sync::watch::Sender<bool>)>,
 }
 
 /// ZEB-889: retry window after which a cached mint is dropped. A redemption that
@@ -5979,7 +5989,7 @@ impl CommunitySyncRegistry {
             nav_emitter,
             root_fetch_shutdowns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             in_flight_redemption_mints: InFlightRedemptionMints::default(),
-            latched_reattempt_shutdowns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            latched_reattempt_shutdowns: tokio::sync::Mutex::new(LatchedReattemptSlots::default()),
             latched_reattempt_next_gen: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -6818,6 +6828,7 @@ impl CommunitySyncRegistry {
             .latched_reattempt_shutdowns
             .lock()
             .await
+            .slots
             .remove(community_id)
         {
             let _ = tx.send(true);
@@ -6833,7 +6844,11 @@ impl CommunitySyncRegistry {
     /// registration generation plus the shutdown receiver the driver
     /// must hold. An existing entry's sender is flipped before being
     /// replaced, so a parked driver holding a stale invite URL exits
-    /// gracefully when a fresh redeem re-arms the slot.
+    /// gracefully when a fresh redeem re-arms the slot. After
+    /// `shutdown_all` the map is CLOSED: the returned receiver arrives
+    /// already flipped (and nothing is inserted), so a registration
+    /// racing the teardown cannot arm a driver that outlives the
+    /// registry (CodeRabbit PR #664 r1).
     pub async fn register_latched_reattempt(
         &self,
         community_id: SpaceId,
@@ -6843,7 +6858,11 @@ impl CommunitySyncRegistry {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut g = self.latched_reattempt_shutdowns.lock().await;
-        if let Some((_, old)) = g.insert(community_id, (registration_gen, tx)) {
+        if g.closed {
+            let _ = tx.send(true);
+            return (registration_gen, rx);
+        }
+        if let Some((_, old)) = g.slots.insert(community_id, (registration_gen, tx)) {
             let _ = old.send(true);
         }
         (registration_gen, rx)
@@ -6858,10 +6877,11 @@ impl CommunitySyncRegistry {
         registration_gen: u64,
     ) {
         let mut g = self.latched_reattempt_shutdowns.lock().await;
-        if g.get(community_id)
+        if g.slots
+            .get(community_id)
             .is_some_and(|(gen, _)| *gen == registration_gen)
         {
-            g.remove(community_id);
+            g.slots.remove(community_id);
         }
     }
 
@@ -6888,10 +6908,14 @@ impl CommunitySyncRegistry {
             let _ = tx.send(true);
         }
         // ZEB-903: collapse every latched-join re-attempt driver. Same
-        // sequential-lock shape as the root-fetch drain above.
+        // sequential-lock shape as the root-fetch drain above. Setting
+        // `closed` under the same lock fences concurrent registrations —
+        // they receive an already-flipped watch instead of arming a
+        // driver that would outlive the registry (CodeRabbit r1).
         let reattempt_shutdowns: Vec<tokio::sync::watch::Sender<bool>> = {
             let mut g = self.latched_reattempt_shutdowns.lock().await;
-            std::mem::take(&mut *g)
+            g.closed = true;
+            std::mem::take(&mut g.slots)
                 .into_values()
                 .map(|(_, tx)| tx)
                 .collect()
@@ -8150,6 +8174,24 @@ mod tests {
         assert!(
             *rx.borrow(),
             "shutdown_all must flip the re-attempt shutdown watch"
+        );
+    }
+
+    /// CodeRabbit PR #664 r1: a registration racing `shutdown_all` must
+    /// not arm a driver that outlives the registry — after the closed
+    /// latch is set, `register_latched_reattempt` hands back an
+    /// already-flipped receiver.
+    #[tokio::test]
+    async fn register_after_shutdown_all_returns_flipped_watch() {
+        let fix = build_test_fixture().await;
+        let _ = fix.registry.shutdown_all().await;
+        let (_, rx) = fix
+            .registry
+            .register_latched_reattempt(SpaceId([0x09; 16]))
+            .await;
+        assert!(
+            *rx.borrow(),
+            "registration after shutdown_all must receive an already-flipped watch"
         );
     }
 

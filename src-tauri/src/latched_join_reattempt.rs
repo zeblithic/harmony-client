@@ -82,11 +82,23 @@ pub struct ReattemptContext {
 pub async fn spawn_reattempt_driver(ctx: ReattemptContext) -> Option<tokio::task::JoinHandle<()>> {
     let payload = crate::community_invite::decode_invite_url(&ctx.invite_url).ok()?;
     let community_id = payload.community_id;
-    let epoch_rx = ctx.transport_epoch_rx.clone()?;
+    let mut epoch_rx = ctx.transport_epoch_rx.clone()?;
+    // CodeAnt PR #664 r1: fix the seen-version HERE, before the task is
+    // spawned — not at task start. A cloned receiver inherits its
+    // source's (possibly ancient) seen version, and marking it at task
+    // start instead would discard any up-edge that lands between this
+    // call and the task's first poll. After this line the invariant is
+    // exact: every bump AFTER spawn triggers, everything before is seen.
+    epoch_rx.borrow_and_update();
     let (registration_gen, shutdown_rx) = ctx
         .community_registry
         .register_latched_reattempt(community_id)
         .await;
+    if *shutdown_rx.borrow() {
+        // Registry already closed (registration raced shutdown_all —
+        // CodeRabbit r1): nothing to arm.
+        return None;
+    }
     tracing::info!(
         community_id = %hex::encode(community_id.0),
         "ZEB-903: latched-join re-attempt driver armed"
@@ -100,19 +112,33 @@ pub async fn spawn_reattempt_driver(ctx: ReattemptContext) -> Option<tokio::task
     )))
 }
 
-/// True while the Space still exists AND still carries
-/// `pending_join_at` — the demand that justifies the driver. Space gone
-/// (user left the community) or pending cleared (gossip convergence or
-/// a manual retry finished the join) ⇒ the demand collapsed and the
-/// driver must exit.
+/// The demand predicate: the Space still exists, still carries
+/// `pending_join_at`, AND has not been left. Space gone or pending
+/// cleared (gossip convergence or a manual retry finished the join) ⇒
+/// the demand collapsed. The `left_at` gate (CodeAnt PR #664 r1) is
+/// load-bearing: leaving a community retains the row as a tombstone
+/// WITHOUT clearing `pending_join_at`, and the redeem commit's ZEB-427
+/// rejoin path deliberately clears `left_at` — so a background driver
+/// that ignored `left_at` would rejoin (and relist) a community the
+/// user explicitly left. A manual re-redeem of the same URL remains an
+/// intentional rejoin; only the background path is gated.
+fn space_demand_exists(
+    state: &crate::owner_state_crdt::OwnerState,
+    community_id: &crate::owner_state_types::SpaceId,
+) -> bool {
+    state
+        .spaces
+        .get(community_id)
+        .is_some_and(|s| s.pending_join_at.is_some() && s.left_at.is_none())
+}
+
+/// Async wrapper over [`space_demand_exists`] for the driver loop.
 async fn space_still_pending(
     crdt_state: &std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
     community_id: &crate::owner_state_types::SpaceId,
 ) -> bool {
     let g = crdt_state.lock().await;
-    g.spaces
-        .get(community_id)
-        .is_some_and(|s| s.pending_join_at.is_some())
+    space_demand_exists(&g, community_id)
 }
 
 /// The driver loop. Reacts to FUTURE transport up-edges only (the latch
@@ -127,7 +153,6 @@ async fn run_reattempt_driver(
     mut epoch_rx: tokio::sync::watch::Receiver<u64>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    epoch_rx.borrow_and_update();
     let mut last_attempt: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
@@ -153,7 +178,7 @@ async fn run_reattempt_driver(
             break;
         }
         last_attempt = Some(tokio::time::Instant::now());
-        match attempt_once(&ctx, &shutdown_rx).await {
+        match attempt_once(&ctx, community_id, &shutdown_rx).await {
             Ok(outcome) if outcome.status == "joined" && !outcome.pending => {
                 tracing::info!(
                     community_id = %hex::encode(community_id.0),
@@ -186,21 +211,47 @@ async fn run_reattempt_driver(
 /// One full handshake attempt. No-op progress sink (a background driver
 /// must never ghost-drive the redeem dialog's stage display); real nav
 /// sink when a `NodeEventSink` is present (the sidebar refreshes when
-/// background convergence lands); fence = this driver's own shutdown
-/// watch — a teardown racing an in-flight attempt suppresses the commit
-/// exactly like a generation trip. The driver deliberately holds no
-/// NodeState reference: its lifecycle is the registry's lifecycle, and
-/// node restart runs `shutdown_all` on the old registry (spec §2.2).
+/// background convergence lands). The fence checks TWO things at the
+/// inner's pre-commit gate: this driver's own shutdown watch (a
+/// teardown racing an in-flight attempt suppresses the commit exactly
+/// like a generation trip), and — CodeAnt PR #664 r1 — that the demand
+/// still exists (a leave landing DURING the attempt must not be
+/// resurrected by the commit, whose ZEB-427 rejoin path clears
+/// `left_at`). The demand re-check uses `try_lock`: the inner does not
+/// hold the owner-state lock at fence time, so contention is rare — and
+/// on contention the attempt aborts conservatively (the next up-edge
+/// retries). A sub-lock-width residual window remains between the
+/// fence and the commit's own lock acquisition; the manual redeem path
+/// has the same (wider) window today, and closing it fully would need a
+/// leave-aware commit inside the shared inner — out of scope here. The
+/// driver deliberately holds no NodeState reference: its lifecycle is
+/// the registry's lifecycle, and node restart runs `shutdown_all` on
+/// the old registry (spec §2.2).
 async fn attempt_once(
     ctx: &ReattemptContext,
+    community_id: crate::owner_state_types::SpaceId,
     shutdown_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<crate::RedemptionOutcome, crate::community_invite::RedeemInviteError> {
     let fence_rx = shutdown_rx.clone();
+    let fence_crdt = std::sync::Arc::clone(&ctx.crdt_state);
     let fence_check = move || -> Result<(), crate::community_invite::RedeemInviteError> {
         if *fence_rx.borrow() {
             return Err(crate::community_invite::RedeemInviteError::new(
                 crate::community_invite::RedeemInviteErrorCode::GenerationChanged,
                 "latched-join re-attempt driver shut down mid-attempt; commit suppressed"
+                    .to_string(),
+            ));
+        }
+        let demand_ok = match fence_crdt.try_lock() {
+            Ok(g) => space_demand_exists(&g, &community_id),
+            // Contention: cannot verify the demand — abort conservatively.
+            Err(_) => false,
+        };
+        if !demand_ok {
+            return Err(crate::community_invite::RedeemInviteError::new(
+                crate::community_invite::RedeemInviteErrorCode::GenerationChanged,
+                "latched-join demand collapsed mid-attempt (converged, left, or \
+                 unverifiable); commit suppressed"
                     .to_string(),
             ));
         }

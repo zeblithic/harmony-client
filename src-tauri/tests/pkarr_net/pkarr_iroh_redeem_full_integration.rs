@@ -2690,9 +2690,9 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
 /// `pending_join_at`, burning the invite, and evicting the mint cache. The
 /// driver task itself must end (demand collapsed on convergence).
 ///
-/// The epoch watch is bumped repeatedly in the poll loop: a single bump can
-/// race the just-spawned driver's initial seen-version mark, and in
-/// production the next real up-edge covers that window.
+/// The seen-version is fixed pre-spawn (CodeAnt r1), so a single post-spawn
+/// bump would suffice; the poll loop still bumps each iteration purely for
+/// robustness against transient first-attempt failures.
 #[tokio::test(flavor = "multi_thread")]
 async fn zeb903_reattempt_driver_converges_latched_join_on_epoch_bump() {
     let _ = tracing_subscriber::fmt()
@@ -3108,4 +3108,160 @@ async fn zeb903_reattempt_driver_collapses_on_registry_shutdown() {
     })
     .await
     .expect("zeb903_reattempt_driver_collapses_on_registry_shutdown timed out at 60s");
+}
+
+/// ZEB-903 (CodeAnt r1): a left community is NOT demand. Leaving retains the
+/// Space row as a tombstone with `pending_join_at` intact, and the redeem
+/// commit's ZEB-427 rejoin path clears `left_at` — so a driver that ignored
+/// `left_at` would background-rejoin a community the user explicitly left.
+/// Pin: with `left_at` set, an epoch bump makes the driver exit without
+/// attempting (control as in T2: `iroh_endpoint: None` would make an attempt
+/// observably loop the driver instead of ending it), and the row keeps BOTH
+/// markers untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn zeb903_reattempt_driver_respects_left_community() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("harmony_app=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    harmony_app::iroh_endpoint::warm_up_iroh_global_init().await;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let s = setup_two_party_iroh_handshake().await;
+        let (invite_payload, invite_url, _token_sig) = zeb889_build_targeted_invite(&s);
+
+        // Minimal latch seed (as T3), then mark the community left the way
+        // `leave_community` records it: `left_at` set, `pending_join_at`
+        // NOT cleared (the tombstone shape `mark_community_space_left`
+        // produces).
+        let join_hlc = Hlc {
+            wall_ms: 100_600,
+            logical: 0,
+            device_id: "bob-dev".into(),
+        };
+        let p1_mint = harmony_app::mint_redemption(
+            &invite_payload,
+            s.bob_addr,
+            s.bob_comm_sk.as_ref(),
+            &s.bob_comm.cert,
+            join_hlc,
+        )
+        .expect("mint P1 for bob");
+        let latch_dto = harmony_app::redeem_invite_inner_with_overrides(
+            invite_url.clone(),
+            Arc::clone(&s.bob_crdt_state),
+            Arc::clone(&s.bob_hlc_tracker),
+            s.bob_adopt_floor.clone(),
+            "bob-dev".to_string(),
+            s.bob_addr,
+            Arc::clone(&s.bob_comm_sk),
+            s.bob_comm.cert.clone(),
+            Arc::clone(&s.registry_bob),
+            s.bob_adapter_tx.clone(),
+            None,
+            Arc::clone(&s.bob_dm_outbox),
+            Arc::clone(&s.bob_channel_log_registry),
+            || Ok(()),
+            None,
+            harmony_app::RedeemInviteOverrides {
+                pre_minted: Some(p1_mint),
+                redeem_timeout: Some(Duration::from_secs(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the latch seed must commit a pending Space, not Err");
+        assert!(
+            latch_dto.pending,
+            "precondition: seeded latch must be pending"
+        );
+        {
+            let mut g = s.bob_crdt_state.lock().await;
+            let row = g
+                .spaces
+                .get_mut(&s.community_id)
+                .expect("latched Space row must exist");
+            row.left_at = Some(Hlc {
+                wall_ms: 100_800,
+                logical: 0,
+                device_id: "bob-dev".into(),
+            });
+            assert!(
+                row.pending_join_at.is_some(),
+                "precondition: the leave tombstone keeps pending_join_at set"
+            );
+        }
+
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let ctx = harmony_app::latched_join_reattempt::ReattemptContext {
+            invite_url,
+            pkarr_resolver: Some(Arc::clone(&s.pkarr_resolver)),
+            reachability_resolver: Some(s.bob_reachability.clone()),
+            iroh_endpoint: None,
+            crdt_state: Arc::clone(&s.bob_crdt_state),
+            hlc_tracker: Arc::clone(&s.bob_hlc_tracker),
+            adopt_floor: s.bob_adopt_floor.clone(),
+            device_id: "bob-dev".to_string(),
+            self_owner: s.bob_addr,
+            community_signing_key: Arc::clone(&s.bob_comm_sk),
+            enrollment_cert: s.bob_comm.cert.clone(),
+            community_registry: Arc::clone(&s.registry_bob),
+            community_adapter_tx: s.bob_adapter_tx.clone(),
+            transport_epoch_rx: Some(epoch_rx),
+            dm_outbox: Arc::clone(&s.bob_dm_outbox),
+            channel_log_registry: Arc::clone(&s.bob_channel_log_registry),
+            sync_engine: None,
+            identity_dir: None,
+            sink: None,
+            dial_config: harmony_app::HandshakeDialConfig {
+                connect_timeout: Duration::from_millis(2_000),
+                open_bi_timeout: Duration::from_millis(2_000),
+                response_read_timeout: Duration::from_millis(2_000),
+                write_timeout: Duration::from_millis(2_000),
+            },
+        };
+        let handle = harmony_app::latched_join_reattempt::spawn_reattempt_driver(ctx)
+            .await
+            .expect("driver must arm");
+
+        let mut ended = false;
+        for _ in 0..100 {
+            epoch_tx.send_modify(|e| *e = e.wrapping_add(1));
+            if handle.is_finished() {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            ended,
+            "ZEB-903: with left_at set the driver must exit on the first bump"
+        );
+        handle.await.expect("driver task must not panic");
+
+        // The tombstone is untouched: still left, still (inertly) pending.
+        {
+            let g = s.bob_crdt_state.lock().await;
+            let row = g
+                .spaces
+                .get(&s.community_id)
+                .expect("left Space row must survive");
+            assert!(
+                row.left_at.is_some(),
+                "ZEB-903: the driver must never clear a leave marker"
+            );
+            assert!(row.pending_join_at.is_some());
+        }
+
+        let _ = s.registry_bob.shutdown_all().await;
+        s.publisher_handle.abort();
+        s.alice_ep.shutdown().await;
+        s.bob_ep.shutdown().await;
+    })
+    .await
+    .expect("zeb903_reattempt_driver_respects_left_community timed out at 60s");
 }
