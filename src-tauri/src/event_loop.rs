@@ -4376,6 +4376,10 @@ pub async fn run(
     if let (Some(addrbook), Some(registry)) = (addrbook_runtime, community_registry.clone()) {
         let session_for_addrbook = Arc::clone(&session_arc);
         let hub_for_addrbook = addrbook_resync_hub.clone();
+        // ZEB-919: owner-state handle so seal/open track the LIVE epoch key
+        // (None only pre-owner-load, which cannot reach a Subscribe —
+        // degraded spawn-key mode is for tests).
+        let crdt_state_for_addrbook = crdt_state.clone();
         let AddressBookRuntime {
             mut request_rx,
             book,
@@ -4458,6 +4462,8 @@ pub async fn run(
                                 Arc::clone(&registry),
                                 std::sync::Arc::clone(&book),
                                 community,
+                                // ZEB-919: live epoch-key seal.
+                                crdt_state_for_addrbook.clone(),
                             )
                             .await;
                         let subscriber_handle = crate::address_book_sync::spawn_addrbook_subscriber(
@@ -4469,6 +4475,8 @@ pub async fn run(
                             community,
                             std::sync::Arc::clone(&dirty),
                             ingest_observer.clone(),
+                            // ZEB-919: live epoch-key open candidates.
+                            crdt_state_for_addrbook.clone(),
                         );
                         let requester_handle =
                             crate::address_book_sync::spawn_addrbook_snapshot_requester(
@@ -4481,6 +4489,8 @@ pub async fn run(
                                 resync,
                                 std::sync::Arc::clone(&dirty),
                                 ingest_observer.clone(),
+                                // ZEB-919: live epoch-key open candidates.
+                                crdt_state_for_addrbook.clone(),
                             );
                         let persist_handle = crate::address_book_sync::spawn_addrbook_persist_task(
                             std::sync::Arc::clone(&book),

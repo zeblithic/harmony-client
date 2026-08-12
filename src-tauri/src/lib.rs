@@ -9792,10 +9792,21 @@ pub async fn start_node_inner(
                                             continue;
                                         }
 
+                                        // ZEB-919: seal under the LIVE epoch
+                                        // key (the engine's membership_key is
+                                        // spawn-pinned and never follows
+                                        // rotation); degrade to it only when
+                                        // the live read is unavailable.
+                                        let mk = crate::community_state_sync::community_publish_epoch_key_typed(
+                                            community_id,
+                                            Some(&crdt_state),
+                                            &engine.membership_key(),
+                                        )
+                                        .await;
                                         addrbook_keys.insert(
                                             community_id,
                                             crate::address_book_sync::derive_addrbook_key(
-                                                &engine.membership_key(),
+                                                &mk,
                                                 &community_id,
                                             ),
                                         );
@@ -12590,10 +12601,22 @@ pub async fn start_node_inner(
                                                         );
                                                         continue;
                                                     };
+                                                    // ZEB-919: seal under the
+                                                    // LIVE epoch key (the
+                                                    // engine's membership_key
+                                                    // is spawn-pinned); degrade
+                                                    // to it only when the live
+                                                    // read is unavailable.
+                                                    let mk = crate::community_state_sync::community_publish_epoch_key_typed(
+                                                        c,
+                                                        Some(&slot_crdt_state),
+                                                        &engine.membership_key(),
+                                                    )
+                                                    .await;
                                                     addrbook_keys.insert(
                                                         c,
                                                         crate::address_book_sync::derive_addrbook_key(
-                                                            &engine.membership_key(),
+                                                            &mk,
                                                             &c,
                                                         ),
                                                     );
