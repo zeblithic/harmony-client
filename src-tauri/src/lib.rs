@@ -219,6 +219,7 @@ pub mod iroh_pex_acceptor;
 pub mod iroh_transport_lifecycle;
 pub mod iroh_tunnel_acceptor;
 pub mod iroh_tunnel_dm_transport;
+pub mod latched_join_reattempt;
 pub mod library_directory;
 pub mod liveness_heartbeat;
 pub mod mail;
