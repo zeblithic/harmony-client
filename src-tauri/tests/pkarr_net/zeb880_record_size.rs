@@ -122,15 +122,21 @@ async fn avalon_shaped_rendezvous_record_publishes_within_pkarr_cap() {
         // Condition-poll until the slot-0 record is resolvable from the relay.
         // A FRESH resolver per attempt sidesteps the resolver's 60 s negative
         // cache (a first-attempt miss would otherwise pin every later poll to
-        // the cached None). The verifying key is re-derived from `now` each
-        // attempt so an epoch boundary mid-test can't wedge the poll on a
-        // stale slot key.
+        // the cached None). Each attempt tries BOTH the current and previous
+        // epoch's slot key: the publisher derives its key at publish time, so
+        // across an epoch boundary (weekly — rare but CI-real) the record may
+        // sit under either epoch's key depending on which side of the boundary
+        // the publish landed, and the republish under the new key can be a
+        // full publish cycle away (CodeRabbit #657).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        let record = loop {
-            let vk = rendezvous_slot_verifying_key(&epoch_key, 0, current_epoch_id(now_ms()));
-            let resolver = PkarrResolver::new(Arc::clone(&client));
-            if let Ok(Some(rec)) = resolver.resolve(&vk).await {
-                break rec;
+        let record = 'found: loop {
+            let epoch_now = current_epoch_id(now_ms());
+            for epoch_id in [epoch_now, epoch_now.saturating_sub(1)] {
+                let vk = rendezvous_slot_verifying_key(&epoch_key, 0, epoch_id);
+                let resolver = PkarrResolver::new(Arc::clone(&client));
+                if let Ok(Some(rec)) = resolver.resolve(&vk).await {
+                    break 'found rec;
+                }
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
