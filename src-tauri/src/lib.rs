@@ -9045,6 +9045,7 @@ pub async fn start_node_inner(
                                         space_id,
                                         &materialized,
                                         &membership_key,
+                                        None, // ZEB-920: live source wired in Task 4
                                         state_at_hlc,
                                         hlc_tracker_for_reconcile,
                                     )
@@ -32477,7 +32478,14 @@ pub(crate) async fn register_channel_log_engine(
     );
     let state_at_hlc = community_engine.state_at_hlc_resolver();
     channel_log_registry
-        .spawn(community_id, channel_id, key, state_at_hlc, hlc_tracker)
+        .spawn(
+            community_id,
+            channel_id,
+            key,
+            None, // ZEB-920: live source wired in Task 4
+            state_at_hlc,
+            hlc_tracker,
+        )
         .await
 }
 
@@ -32534,6 +32542,7 @@ pub(crate) async fn reconcile_community_channel_logs(
             community_id,
             &materialized,
             &membership_key,
+            None, // ZEB-920: live source wired in Task 4
             state_at_hlc,
             hlc_tracker,
         )

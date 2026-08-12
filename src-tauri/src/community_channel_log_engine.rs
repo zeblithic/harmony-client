@@ -111,6 +111,9 @@ pub enum SpawnOutcome {
 struct DeferredSpawn {
     channel_id: ChannelId,
     channel_key: ChannelKey,
+    /// ZEB-920: carried across ZEB-271 transaction deferral like every
+    /// other spawn argument.
+    live_key_source: Option<ChannelKeyLiveSource>,
     state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
     hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
 }
@@ -436,10 +439,30 @@ pub struct BackfillQueryRequest {
 /// HLC reservation tracker. See ZEB-267 for the rationale; existing
 /// callers (`send_dm`, `create_community`, `redeem_invite`, channel-
 /// config IPCs) all use this same per-device tracker.
+/// ZEB-920: live epoch-key source for per-op channel-key selection. Both
+/// fields travel together — a live read always has its degrade fallback.
+/// `None` on the engine is the documented degraded/test mode (pinned
+/// spawn-time key both directions, byte-identical to pre-ZEB-920).
+///
+/// The struct is `pub` only because `Registry::spawn` is `pub` and
+/// integration tests call it (always with `None`); the `pub(crate)` fields
+/// keep construction in-crate.
+pub struct ChannelKeyLiveSource {
+    /// Spawn-time membership key — what the pinned `channel_key` derives
+    /// from; the fallback every live-read degrade lands on.
+    pub(crate) membership_key: EpochKey,
+    /// Live owner-state (`Space.current_epoch_key` / `old_epoch_keys`).
+    pub(crate) crdt_state:
+        std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+}
+
 pub struct ChannelLogEngineParams {
     pub community_id: SpaceId,
     pub channel_id: ChannelId,
     pub channel_key: Arc<ChannelKey>,
+    /// ZEB-920: `Some` in production spawns (live per-op key selection);
+    /// `None` = degraded/test mode pinned to `channel_key`.
+    pub(crate) live_key_source: Option<ChannelKeyLiveSource>,
     pub root_dir: PathBuf,
     pub state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
     pub self_owner: OwnerAddr,
@@ -471,6 +494,8 @@ pub struct ChannelLogEngine {
     community_id: SpaceId,
     channel_id: ChannelId,
     channel_key: Arc<ChannelKey>,
+    /// ZEB-920: see [`ChannelKeyLiveSource`]. `None` pins `channel_key`.
+    live_key_source: Option<ChannelKeyLiveSource>,
     log: Arc<Mutex<ChannelLog>>,
     replay_tracker: Arc<Mutex<ChannelLogReplayTracker>>,
     /// ZEB-688: monotonic count of inbound packets dropped as replays (any of
@@ -568,6 +593,7 @@ impl ChannelLogEngine {
             community_id: params.community_id,
             channel_id: params.channel_id,
             channel_key: params.channel_key,
+            live_key_source: params.live_key_source,
             log: Arc::new(Mutex::new(log)),
             replay_tracker: Arc::new(Mutex::new(tracker)),
             replay_drops: std::sync::atomic::AtomicU64::new(0),
@@ -1901,6 +1927,46 @@ impl ChannelLogEngine {
         self.channel_key.as_ref()
     }
 
+    /// ZEB-920: the key to SEAL under — derived from the live current epoch
+    /// key (publisher-degrades to the pinned spawn key; every degrade lands
+    /// on it, never worse than pre-ZEB-920).
+    pub(crate) async fn encrypt_channel_key(&self) -> std::sync::Arc<ChannelKey> {
+        match &self.live_key_source {
+            None => std::sync::Arc::clone(&self.channel_key),
+            Some(src) => {
+                let mk = crate::community_state_sync::community_publish_epoch_key_typed(
+                    self.community_id,
+                    Some(&src.crdt_state),
+                    &src.membership_key,
+                )
+                .await;
+                std::sync::Arc::new(derive_channel_key(&mk, &self.community_id, &self.channel_id))
+            }
+        }
+    }
+
+    /// ZEB-920: ordered candidate keys to OPEN under — `[current, previous]`
+    /// epochs (ZEB-918: the previous rung heals rotation skew — a rotated
+    /// member keeps reading not-yet-rotated members' traffic so the rotation
+    /// event itself can propagate; never more than one epoch back), degraded
+    /// `[pinned]`.
+    pub(crate) async fn decrypt_channel_keys(&self) -> Vec<std::sync::Arc<ChannelKey>> {
+        match &self.live_key_source {
+            None => vec![std::sync::Arc::clone(&self.channel_key)],
+            Some(src) => crate::community_state_sync::epoch_key_candidates(
+                self.community_id,
+                Some(&src.crdt_state),
+                &src.membership_key,
+            )
+            .await
+            .iter()
+            .map(|mk| {
+                std::sync::Arc::new(derive_channel_key(mk, &self.community_id, &self.channel_id))
+            })
+            .collect(),
+        }
+    }
+
     /// ZEB-592: respond to one RBSR reconciliation round. Opens the sealed
     /// request (cap-before-alloc + AEAD inside `open_rbsr_message`; returns
     /// `None` on cap/decrypt failure so the caller falls back to the legacy
@@ -2461,6 +2527,7 @@ impl ChannelLogRegistry {
         community_id: SpaceId,
         channel_id: ChannelId,
         channel_key: ChannelKey,
+        live_key_source: Option<ChannelKeyLiveSource>,
         state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
         hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     ) -> Result<SpawnOutcome, ChannelLogEngineError> {
@@ -2475,6 +2542,7 @@ impl ChannelLogRegistry {
                 pt.queue.push(DeferredSpawn {
                     channel_id,
                     channel_key,
+                    live_key_source,
                     state_at_hlc,
                     hlc_tracker,
                 });
@@ -2487,6 +2555,7 @@ impl ChannelLogRegistry {
         let ds = DeferredSpawn {
             channel_id,
             channel_key,
+            live_key_source,
             state_at_hlc,
             hlc_tracker,
         };
@@ -2552,6 +2621,7 @@ impl ChannelLogRegistry {
             community_id,
             channel_id: ds.channel_id,
             channel_key: Arc::new(ds.channel_key),
+            live_key_source: ds.live_key_source,
             root_dir,
             state_at_hlc: ds.state_at_hlc,
             self_owner: self.config.self_owner,
@@ -3059,6 +3129,7 @@ impl ChannelLogRegistry {
         community_id: SpaceId,
         materialized: &MaterializedMembership,
         membership_key: &EpochKey,
+        crdt_state: Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
         state_at_hlc: Arc<dyn CommunityStateAtHlc + Send + Sync>,
         hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>>,
     ) -> Result<(), ChannelLogEngineError> {
@@ -3073,11 +3144,18 @@ impl ChannelLogRegistry {
                 continue;
             }
             let channel_key = derive_channel_key(membership_key, &community_id, channel_id);
+            // ZEB-920: every engine spawned here gets the same live source
+            // (per-community membership key + owner-state handle).
+            let live_key_source = crdt_state.as_ref().map(|cs| ChannelKeyLiveSource {
+                membership_key: membership_key.clone(),
+                crdt_state: std::sync::Arc::clone(cs),
+            });
             match self
                 .spawn(
                     community_id,
                     *channel_id,
                     channel_key,
+                    live_key_source,
                     Arc::clone(&state_at_hlc),
                     Arc::clone(&hlc_tracker),
                 )
@@ -3234,6 +3312,24 @@ mod tests {
         flush_debounce_ms: u64,
         max_dirty_ms: u64,
     ) -> EngineFixture {
+        build_engine_fixture_inner(seal_threshold, flush_debounce_ms, max_dirty_ms, None).await
+    }
+
+    /// ZEB-920: fixture with a live key source over `crdt_state`. The spawn
+    /// membership key stays `[0x55; 32]` (what `channel_key` derives from),
+    /// so tests can pit the pinned key against a rotated live state.
+    async fn build_engine_fixture_with_live_source(
+        crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    ) -> EngineFixture {
+        build_engine_fixture_inner(8, 250, 1000, Some(crdt_state)).await
+    }
+
+    async fn build_engine_fixture_inner(
+        seal_threshold: usize,
+        flush_debounce_ms: u64,
+        max_dirty_ms: u64,
+        live_crdt: Option<std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
+    ) -> EngineFixture {
         let tmp = TempDir::new().expect("tempdir");
 
         let (signing_key_raw, self_owner, _identity_pub_64) = fixture_identity(0x42);
@@ -3279,6 +3375,10 @@ mod tests {
             community_id,
             channel_id,
             channel_key: Arc::clone(&channel_key),
+            live_key_source: live_crdt.map(|cs| ChannelKeyLiveSource {
+                membership_key: membership_key.clone(),
+                crdt_state: cs,
+            }),
             root_dir: tmp.path().to_path_buf(),
             state_at_hlc: state,
             self_owner,
@@ -3308,6 +3408,73 @@ mod tests {
             tmp,
             sink: rec_sink,
         }
+    }
+
+    /// ZEB-920 §3.2: with no live source the selection methods return exactly
+    /// the pinned spawn key — the documented degraded/test mode.
+    #[tokio::test]
+    async fn key_selection_degraded_none_is_pinned() {
+        let fix = build_engine_fixture(8, 250, 1000).await;
+        let enc = fix.engine.encrypt_channel_key().await;
+        assert_eq!(enc.as_bytes(), fix.channel_key.as_bytes());
+        let dec = fix.engine.decrypt_channel_keys().await;
+        assert_eq!(dec.len(), 1);
+        assert_eq!(dec[0].as_bytes(), fix.channel_key.as_bytes());
+    }
+
+    /// ZEB-920 §3.2: encrypt key follows the rotated live state while the
+    /// engine's pinned key stays on the spawn epoch.
+    #[tokio::test]
+    async fn encrypt_key_follows_rotated_live_state() {
+        let community_id = SpaceId([0xc1; 16]);
+        let channel_id = ChannelId([0x77; 16]);
+        let live = EpochKey::new([0x22; 32]);
+
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        os.spaces.insert(
+            community_id,
+            crate::community_state_sync::test_community_space(community_id, 1, live.clone()),
+        );
+        let fix =
+            build_engine_fixture_with_live_source(Arc::new(tokio::sync::Mutex::new(os))).await;
+
+        let enc = fix.engine.encrypt_channel_key().await;
+        let expect_live = derive_channel_key(&live, &community_id, &channel_id);
+        assert_eq!(enc.as_bytes(), expect_live.as_bytes());
+        assert_ne!(
+            enc.as_bytes(),
+            fix.channel_key.as_bytes(),
+            "must leave the spawn pin"
+        );
+    }
+
+    /// ZEB-920 §3.2: decrypt candidates are [current, previous] — the previous
+    /// rung heals rotation skew; never more than one epoch back.
+    #[tokio::test]
+    async fn decrypt_keys_include_previous_epoch_rung() {
+        let community_id = SpaceId([0xc1; 16]);
+        let channel_id = ChannelId([0x77; 16]);
+        let old = EpochKey::new([0x11; 32]);
+        let new = EpochKey::new([0x22; 32]);
+
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        let mut space =
+            crate::community_state_sync::test_community_space(community_id, 1, new.clone());
+        space.old_epoch_keys.insert(0, old.clone());
+        os.spaces.insert(community_id, space);
+        let fix =
+            build_engine_fixture_with_live_source(Arc::new(tokio::sync::Mutex::new(os))).await;
+
+        let dec = fix.engine.decrypt_channel_keys().await;
+        assert_eq!(dec.len(), 2);
+        assert_eq!(
+            dec[0].as_bytes(),
+            derive_channel_key(&new, &community_id, &channel_id).as_bytes()
+        );
+        assert_eq!(
+            dec[1].as_bytes(),
+            derive_channel_key(&old, &community_id, &channel_id).as_bytes()
+        );
     }
 
     /// Build a signed Post event with the fixture identity (so the
@@ -5478,6 +5645,7 @@ mod tests {
             community_id,
             channel_id,
             channel_key: Arc::clone(&channel_key),
+            live_key_source: None,
             root_dir: dir,
             state_at_hlc: state,
             self_owner,
@@ -5900,6 +6068,7 @@ mod tests {
                 community_id,
                 channel_id,
                 key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6005,6 +6174,7 @@ mod tests {
                 community_id,
                 channel_id,
                 key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6186,6 +6356,7 @@ mod tests {
                 hook_cid,
                 hook_chid,
                 key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6328,6 +6499,7 @@ mod tests {
                 cid,
                 &materialized,
                 &fix.membership_key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6376,6 +6548,7 @@ mod tests {
                 cid,
                 &materialized,
                 &fix.membership_key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6388,6 +6561,7 @@ mod tests {
                 cid,
                 &materialized,
                 &fix.membership_key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6435,7 +6609,9 @@ mod tests {
             let key_for_spawn = key.clone();
 
             let handle1 = tokio::spawn(async move {
-                let _ = r1.spawn(cid, chid, key_for_spawn, state, tracker).await;
+                let _ = r1
+                    .spawn(cid, chid, key_for_spawn, None, state, tracker)
+                    .await;
             });
             let handle2 = tokio::spawn(async move {
                 let _ = r2.stop(&cid, &chid).await;
@@ -6518,6 +6694,7 @@ mod tests {
                 cid,
                 &materialized,
                 &fix.membership_key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6587,6 +6764,7 @@ mod tests {
                 community_id,
                 channel_id,
                 key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6638,6 +6816,7 @@ mod tests {
                 community_id,
                 channel_id,
                 key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6691,6 +6870,7 @@ mod tests {
                 community_id,
                 channel_id,
                 key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6749,6 +6929,7 @@ mod tests {
                     community_id,
                     channel_id,
                     key,
+                    None,
                     Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                     Arc::clone(&fix.hlc_tracker),
                 )
@@ -6814,6 +6995,7 @@ mod tests {
                 community_id,
                 channel_id,
                 key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6869,6 +7051,7 @@ mod tests {
                 community_id,
                 channel_id,
                 key,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6908,6 +7091,7 @@ mod tests {
                 community_id,
                 channel_a,
                 key_a,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -6924,6 +7108,7 @@ mod tests {
                 community_id,
                 channel_b,
                 key_b,
+                None,
                 Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                 Arc::clone(&fix.hlc_tracker),
             )
@@ -7011,6 +7196,7 @@ mod tests {
                     community_id,
                     *ch,
                     key,
+                    None,
                     Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                     Arc::clone(&fix.hlc_tracker),
                 )
@@ -7064,6 +7250,7 @@ mod tests {
                     community_id,
                     *ch,
                     key,
+                    None,
                     Arc::clone(&fix.state) as Arc<dyn CommunityStateAtHlc + Send + Sync>,
                     Arc::clone(&fix.hlc_tracker),
                 )
@@ -7606,6 +7793,7 @@ mod tests {
             community_id: fix_a.community_id,
             channel_id: fix_a.channel_id,
             channel_key: Arc::clone(&fix_a.channel_key),
+            live_key_source: None,
             root_dir: tmp_b.path().to_path_buf(),
             state_at_hlc: state_b,
             self_owner: fix_a.self_owner,
@@ -7867,6 +8055,7 @@ mod tests {
             community_id: fix_a.community_id,
             channel_id: fix_a.channel_id,
             channel_key: Arc::clone(&fix_a.channel_key),
+            live_key_source: None,
             root_dir: tmp_b.path().to_path_buf(),
             state_at_hlc: state_b,
             self_owner: fix_a.self_owner,
