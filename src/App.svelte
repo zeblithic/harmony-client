@@ -109,6 +109,7 @@
   import WelcomeModal from './lib/components/WelcomeModal.svelte';
   import NamePromptModal from './lib/components/NamePromptModal.svelte';
   import BackupReminderBanner from './lib/components/BackupReminderBanner.svelte';
+  import FleetSyncDisabledBanner from './lib/components/FleetSyncDisabledBanner.svelte';
   import type { MintIpcResult, OwnerStateView } from './lib/owner-service';
   import type { StartNodeResponse } from './lib/types/onboarding';
   import { MemberCardService } from './lib/member-card-service';
@@ -1061,6 +1062,8 @@
   // owner identity" — that mistake trapped returning users in the mint gate.
   // 'unknown' until start_node resolves; 'present' after a successful mint.
   let ownerIdentityState = $state<OwnerIdentityState>('unknown');
+  // ZEB-904/905: owner present but no fleet crypto — node booted local-only.
+  let fleetCryptoMissing = $state(false);
   // ZEB-338 / PR #169: message from a failed start_node, shown in the startup
   // error overlay (the non-mint escape from the 'error' state).
   let startNodeError = $state<string | null>(null);
@@ -2219,6 +2222,10 @@
       // (onboarding shown), never silently skipped. The backend keychain is the
       // authoritative source of "is this a new user".
       ownerIdentityState = classifyOwnerIdentity(startResp, startFailed);
+      // ZEB-904/905: capture the local-only-mode flag alongside (never part
+      // of) the identity classification — the owner is present; this only
+      // drives the informational FleetSyncDisabledBanner.
+      fleetCryptoMissing = startResp?.fleetCryptoMissing === true;
       if (ownerIdentityState === 'present') {
         showWelcomeModal = false;
         // ZEB-341 Task 1: fetch the owner identity hex so we can seed
@@ -4011,6 +4018,7 @@
 
 <div class="app-shell">
 {#if ownerIdentityState === 'present'}
+  <FleetSyncDisabledBanner {fleetCryptoMissing} />
   <BackupReminderBanner ownerId={selfOwnerId} />
 {/if}
 <Layout {collapsed} {showSettings} mode={appMode} mailSelected={selectedMailCid !== null} bind:mediaPanelOpen bind:mediaPanelWidth>
