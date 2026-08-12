@@ -628,6 +628,24 @@ impl ReachabilityResolver {
     /// dial view and auto-fires the `RecordChanged` supervisor kick through Task
     /// 1's gate — this seam adds no kick logic of its own.
     pub fn maybe_refresh_stale(&self, owner: OwnerAddr, node_id: [u8; 32], now_ms: u64) {
+        self.refresh_if_older_than(owner, node_id, now_ms, STALE_RECORD_REFRESH_MS)
+    }
+
+    /// ZEB-910: [`maybe_refresh_stale`](Self::maybe_refresh_stale) with the
+    /// staleness bar as a parameter. Repair callers (the gateway dial driver's
+    /// Degraded/Starved passes) lower ONLY the staleness gate; the fleet-sibling
+    /// skip, no-fallback bail, per-owner [`PKARR_REFRESH_COOLDOWN`], and
+    /// [`PKARR_REFRESH_MAX_CONCURRENT`] semaphore are deliberately kept — a
+    /// "forced" refresh is still rate-bounded, because repair passes repeat on a
+    /// ladder and an ungated refresh would hammer pkarr for members that are
+    /// simply asleep.
+    pub(crate) fn refresh_if_older_than(
+        &self,
+        owner: OwnerAddr,
+        node_id: [u8; 32],
+        now_ms: u64,
+        older_than_ms: u64,
+    ) {
         // (1) Staleness gate against the freshest view's clamped age. No record ⇒
         //     nothing to heal. The comparison uses `effective_announced_at_ms`
         //     (`announced_at_ms` clamped to `now + FUTURE_SKEW_TOLERANCE_MS` at
@@ -648,7 +666,7 @@ impl ReachabilityResolver {
             return;
         }
         match now_ms.checked_sub(entry.effective_announced_at_ms) {
-            Some(age) if age <= STALE_RECORD_REFRESH_MS => return, // fresh
+            Some(age) if age <= older_than_ms => return, // fresh under this caller's bar
             _ => {} // stale (older than the window) or implausibly future-dated
         }
 
@@ -2191,6 +2209,85 @@ mod fallback_tests {
         let owner = OwnerAddr([1u8; 16]);
         r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
         r.maybe_refresh_stale(owner, node_id_bytes(7), 1_000 + STALE_RECORD_REFRESH_MS);
+        yield_a_few().await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// ZEB-910: `refresh_if_older_than` honors a caller-supplied staleness bar —
+    /// an entry fresh under the 24h default bar refreshes under a 10-minute bar.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_if_older_than_honors_custom_threshold() {
+        let r = ReachabilityResolver::new();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![],
+        }));
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+
+        let now = 1_000 + 20 * 60 * 1000; // entry is 20 minutes old
+        r.maybe_refresh_stale(owner, node_id_bytes(7), now);
+        yield_a_few().await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "under the 24h bar a 20-minute entry is fresh"
+        );
+
+        r.refresh_if_older_than(owner, node_id_bytes(7), now, 10 * 60 * 1000);
+        wait_for_count(&counter, 1).await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// ZEB-910: the per-owner cooldown survives the parameterized bar — repair
+    /// callers lower only the staleness gate, never the rate bound.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_if_older_than_keeps_owner_cooldown() {
+        let r = ReachabilityResolver::new();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![],
+        }));
+        let owner = OwnerAddr([1u8; 16]);
+        r.update(owner, make_payload(7, 1_000), make_hlc(1_000, 0, "dev-a"));
+
+        let now = 1_000 + 20 * 60 * 1000;
+        r.refresh_if_older_than(owner, node_id_bytes(7), now, 10 * 60 * 1000);
+        wait_for_count(&counter, 1).await;
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        r.refresh_if_older_than(owner, node_id_bytes(7), now + 1, 10 * 60 * 1000);
+        yield_a_few().await;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second call inside PKARR_REFRESH_COOLDOWN must not fire"
+        );
+    }
+
+    /// ZEB-910: the ZEB-510 fleet-sibling skip survives the parameterized bar —
+    /// a pkarr re-resolve can never heal a fleet-net record (wrong key space).
+    #[tokio::test(start_paused = true)]
+    async fn refresh_if_older_than_still_skips_fleet_sibling() {
+        let r = ReachabilityResolver::new();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        r.set_fallback_source(Arc::new(CountingFallback {
+            calls: Arc::clone(&counter),
+            payloads: vec![],
+        }));
+        let owner = OwnerAddr([1u8; 16]);
+        r.update_with_source(
+            owner,
+            make_payload(7, 1_000),
+            make_hlc(1_000, 0, "dev-a"),
+            ReachabilitySource::FleetSibling,
+        );
+
+        // Ancient under ANY bar — the source skip must fire before staleness.
+        let now = 1_000 + 48 * 60 * 60 * 1000;
+        r.refresh_if_older_than(owner, node_id_bytes(7), now, 10 * 60 * 1000);
         yield_a_few().await;
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
