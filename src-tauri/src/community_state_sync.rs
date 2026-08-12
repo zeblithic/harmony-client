@@ -3355,9 +3355,26 @@ pub(crate) async fn community_publish_epoch_key(
     crdt_state: &Arc<Mutex<crate::owner_state_crdt::OwnerState>>,
     fallback: &EpochKey,
 ) -> [u8; 32] {
-    match live_epoch_key(community_id, Some(crdt_state), fallback).await {
-        Ok((k, _epoch)) => *k.as_bytes(),
-        Err(_) => *fallback.as_bytes(),
+    *community_publish_epoch_key_typed(community_id, Some(crdt_state), fallback)
+        .await
+        .as_bytes()
+}
+
+/// ZEB-919: typed sibling of [`community_publish_epoch_key`] — the LIVE
+/// `Space.current_epoch_key` when available, else the spawn-time `fallback`
+/// (publisher-degrades, ZEB-597 mirror; never worse than the pinned key,
+/// because every degrade lands on it). For seal/verify call sites that need
+/// an `EpochKey` for key derivation rather than raw bytes for pkarr
+/// registration. `crdt_state = None` is the documented test/legacy degraded
+/// mode, matching [`epoch_key_candidates`].
+pub(crate) async fn community_publish_epoch_key_typed(
+    community_id: SpaceId,
+    crdt_state: Option<&Arc<Mutex<crate::owner_state_crdt::OwnerState>>>,
+    fallback: &EpochKey,
+) -> EpochKey {
+    match live_epoch_key(community_id, crdt_state, fallback).await {
+        Ok((k, _epoch)) => k,
+        Err(_) => fallback.clone(),
     }
 }
 
@@ -12383,6 +12400,50 @@ mod envelope_tests {
             key, [0x42u8; 32],
             "missing Space must degrade to the spawn-time fallback key"
         );
+    }
+
+    /// ZEB-919: the typed sibling with no owner-state handle (test/legacy
+    /// wiring) degrades to the spawn-time fallback key.
+    #[tokio::test]
+    async fn typed_key_none_crdt_falls_back_to_spawn() {
+        let fb = EpochKey::new([0x42u8; 32]);
+        let got = community_publish_epoch_key_typed(SpaceId([0xaa; 16]), None, &fb).await;
+        assert_eq!(*got.as_bytes(), [0x42u8; 32]);
+    }
+
+    /// ZEB-919: the typed sibling reads the LIVE `Space.current_epoch_key`,
+    /// not the spawn-time fallback, when the Space row is complete.
+    #[tokio::test]
+    async fn typed_key_reads_live_current() {
+        let cid = SpaceId([0xaa; 16]);
+        let fb = EpochKey::new([0x42u8; 32]);
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        os.spaces.insert(
+            cid,
+            build_test_community_space(3, EpochKey::new([0x77u8; 32])),
+        );
+        let crdt = Arc::new(Mutex::new(os));
+        let got = community_publish_epoch_key_typed(cid, Some(&crdt), &fb).await;
+        assert_eq!(*got.as_bytes(), [0x77u8; 32]);
+    }
+
+    /// ZEB-919: a wired owner state whose Space is absent or epoch-incomplete
+    /// degrades to the spawn key (publisher-degrades, ZEB-597 mirror).
+    #[tokio::test]
+    async fn typed_key_incomplete_space_degrades_to_spawn() {
+        let cid = SpaceId([0xaa; 16]);
+        let fb = EpochKey::new([0x42u8; 32]);
+        let crdt = Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default()));
+        let got = community_publish_epoch_key_typed(cid, Some(&crdt), &fb).await;
+        assert_eq!(*got.as_bytes(), [0x42u8; 32]);
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        let mut space = build_test_community_space(0, EpochKey::new([0x11; 32]));
+        space.current_epoch = None;
+        space.current_epoch_key = None;
+        os.spaces.insert(cid, space);
+        let crdt = Arc::new(Mutex::new(os));
+        let got = community_publish_epoch_key_typed(cid, Some(&crdt), &fb).await;
+        assert_eq!(*got.as_bytes(), [0x42u8; 32]);
     }
 
     /// ZEB-918: candidate-list assertions compare key bytes (EpochKey is
