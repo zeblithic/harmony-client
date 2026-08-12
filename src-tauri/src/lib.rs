@@ -15027,8 +15027,9 @@ pub async fn start_node_inner(
                 if guard.generation == our_gen {
                     publish_follow_list_update(&guard);
                     // ZEB-669 S2: same once-per-boot LWW convergence for
-                    // the storage-buddy records we own. Hosting reports
-                    // are the periodic publisher task's job (below).
+                    // the storage-buddy records we own. Hosting cadence +
+                    // the ZEB-923 hourly pledge/backup renewal are the
+                    // publisher task's job (below).
                     publish_pledge_list_update(&guard);
                     publish_backup_set_update(&guard);
                     if let (Some(identity), Some(tx), Some(path)) = (
@@ -15041,7 +15042,7 @@ pub async fn start_node_inner(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .hosting_floor;
-                        spawn_hosting_report_publisher(
+                        spawn_storage_record_publisher(
                             identity,
                             guard.node_addr.clone(),
                             guard.storage_ledger.clone(),
@@ -15052,6 +15053,9 @@ pub async fn start_node_inner(
                             guard.dm_outbox.clone(),
                             guard.owner_trust_doc.clone(),
                             guard.storage_v2_cache.clone(),
+                            guard.content_index.clone(),
+                            guard.pledge_clock.clone(),
+                            guard.backup_set_clock.clone(),
                         );
                     }
                     // ZEB-671: seed the Discover graph inputs (consumes
@@ -20511,17 +20515,28 @@ pub(crate) fn publish_backup_set_update(guard: &NodeState) {
     }
 }
 
-/// ZEB-669 S2: per-generation hosting-report publisher. Spawned from
-/// start_node (NEVER inline-awaited — the loop isn't draining publish_rx
-/// yet at spawn time; see the start_node inline-await hazard). Policy:
-/// check every 30 s, publish when the ledger aggregate changed or
-/// `HOSTING_REFRESH_INTERVAL_MS` elapsed (receivers prune at 3× the
-/// refresh interval). Exits when the event loop drops `publish_rx`
-/// (node stopped) — no generation plumbing needed.
+/// ZEB-923: a family periodically renews ONLY while non-empty. An empty
+/// family stays silent, so its rows at receivers decay via the record
+/// TTL — retraction convergence is the boot/on-change publish's job.
+fn storage_record_refresh_due(elapsed_ms: u64, non_empty: bool) -> bool {
+    non_empty && elapsed_ms >= storage_records::STORAGE_RECORD_REFRESH_INTERVAL_MS
+}
+
+/// ZEB-669 S2 / ZEB-923: per-generation storage-record publisher.
+/// Spawned from start_node (NEVER inline-awaited — the loop isn't
+/// draining publish_rx yet at spawn time; see the start_node inline-await
+/// hazard). Policy, checked every 30 s: hosting reports publish when the
+/// ledger aggregate changed or `HOSTING_REFRESH_INTERVAL_MS` elapsed
+/// (receivers prune at 3× the refresh interval); the non-empty pledge
+/// list and backup set are re-minted + re-signed + republished every
+/// `STORAGE_RECORD_REFRESH_INTERVAL_MS` (the ZEB-923 renewal signal —
+/// receivers restamp their record TTL only on a strictly-newer LWW win).
+/// Exits when the event loop drops `publish_rx` (node stopped) — no
+/// generation plumbing needed.
 // Owned-handle posture (headless-serve, no `app.state()`): each dependency
 // arrives as its own argument by design.
 #[allow(clippy::too_many_arguments)]
-fn spawn_hosting_report_publisher(
+fn spawn_storage_record_publisher(
     identity: std::sync::Arc<harmony_identity::PrivateIdentity>,
     node_addr: String,
     ledger: std::sync::Arc<Mutex<storage_ledger::StorageLedger>>,
@@ -20538,6 +20553,12 @@ fn spawn_hosting_report_publisher(
     // storage_v2_cache). This task's per-tick refresh warms it with async
     // locks so the SYNC pledge/backup paths have a contention fallback.
     v2_cache: std::sync::Arc<Mutex<Option<storage_signing::StorageSignerMaterial>>>,
+    // ZEB-923: renewal-republish handles — the content index feeds the
+    // backup-set rebuild; the clocks are the SHARED NodeState mint cells
+    // (fetch_update makes co-minting with the sync IPC paths race-free).
+    content_index: std::sync::Arc<Mutex<content_index::ContentIndex>>,
+    pledge_clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    backup_set_clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     tokio::spawn(async move {
         let clock = std::sync::atomic::AtomicU64::new(hosting_floor);
@@ -20546,6 +20567,9 @@ fn spawn_hosting_report_publisher(
         // buddied should not put an empty claim on the wire.
         let mut published: Option<Vec<storage_signing::HostingReportEntry>> = None;
         let mut last_publish = std::time::Instant::now();
+        // ZEB-923: boot publish covers t=0, so the first renewal at
+        // ~one refresh interval is correct.
+        let mut last_record_refresh = std::time::Instant::now();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             if publish_tx.is_closed() {
@@ -20579,6 +20603,88 @@ fn spawn_hosting_report_publisher(
                 }
                 None => None,
             };
+            // ZEB-923: hourly renewal republish of the non-empty own
+            // records — BEFORE the hosting gate below, whose `continue`
+            // ends the tick on quiet hosting state. Re-minting (strictly
+            // increasing updated_at) + a fresh signature is what makes
+            // every receiver's LWW take the UpdatedNewer path and restamp
+            // its record-TTL clock — a byte-identical republish would be
+            // IgnoredOlder and renew nothing.
+            let elapsed = last_record_refresh.elapsed().as_millis() as u64;
+            let has_pledges = !settings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .my_pledges
+                .is_empty();
+            let has_backup = {
+                let idx = content_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let any = idx.entries().any(|e| {
+                    e.backup
+                        && !e.archived
+                        && harmony_content::cid::ContentId::from_bytes(e.cid).content_class()
+                            == harmony_content::cid::ContentClass::PublicDurable
+                });
+                any
+            };
+            let mut renewed = false;
+            if storage_record_refresh_due(elapsed, has_pledges) {
+                match build_signed_pledge_list_with(
+                    &identity,
+                    &node_addr,
+                    &settings,
+                    Some(settings_path.as_path()),
+                    &pledge_clock,
+                    v2_material.as_ref(),
+                ) {
+                    Ok((topic, bytes)) => {
+                        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                        match publish_tx.try_send(event_loop::PublishRequest {
+                            key_expr: topic,
+                            payload: bytes,
+                            reply: reply_tx,
+                        }) {
+                            Ok(()) => renewed = true,
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "pledge renewal deferred (channel full)")
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "pledge renewal skipped"),
+                }
+            }
+            if storage_record_refresh_due(elapsed, has_backup) {
+                match build_signed_backup_set_with(
+                    &identity,
+                    &node_addr,
+                    &content_index,
+                    &settings,
+                    Some(settings_path.as_path()),
+                    &backup_set_clock,
+                    v2_material.as_ref(),
+                ) {
+                    Ok((topic, bytes)) => {
+                        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                        match publish_tx.try_send(event_loop::PublishRequest {
+                            key_expr: topic,
+                            payload: bytes,
+                            reply: reply_tx,
+                        }) {
+                            Ok(()) => renewed = true,
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "backup-set renewal deferred (channel full)")
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "backup-set renewal skipped"),
+                }
+            }
+            if renewed {
+                last_record_refresh = std::time::Instant::now();
+            }
             let lines = hosting_report_lines(&ledger);
             let changed = published.as_deref() != Some(&lines[..]);
             let refresh_due = last_publish.elapsed().as_millis() as u64
@@ -21317,6 +21423,22 @@ mod storage_publish_tests {
         let a = next_storage_updated_at(&state.pledge_clock);
         let b = next_storage_updated_at(&state.pledge_clock);
         assert!(b > a, "same-wall-second publishes must not be LWW-equal");
+    }
+
+    #[test]
+    fn storage_record_refresh_gating_truth_table() {
+        let i = storage_records::STORAGE_RECORD_REFRESH_INTERVAL_MS;
+        assert!(
+            storage_record_refresh_due(i, true),
+            "due + non-empty publishes"
+        );
+        assert!(storage_record_refresh_due(i + 1, true));
+        assert!(!storage_record_refresh_due(i - 1, true), "not yet due");
+        assert!(
+            !storage_record_refresh_due(i, false),
+            "empty family never renews periodically — its receiver rows should decay"
+        );
+        assert!(!storage_record_refresh_due(0, false));
     }
 
     #[test]
