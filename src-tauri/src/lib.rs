@@ -219,6 +219,7 @@ pub mod iroh_pex_acceptor;
 pub mod iroh_transport_lifecycle;
 pub mod iroh_tunnel_acceptor;
 pub mod iroh_tunnel_dm_transport;
+pub mod latched_join_reattempt;
 pub mod library_directory;
 pub mod liveness_heartbeat;
 pub mod mail;
@@ -62572,6 +62573,32 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
         Ok(())
     };
 
+    // ZEB-903: owned-clone bundle for the latched-join re-attempt
+    // driver. Cloned BEFORE the inner call (which consumes its
+    // arguments); only used when the outcome latches (joined + pending).
+    let reattempt_ctx = crate::latched_join_reattempt::ReattemptContext {
+        invite_url: invite_url.clone(),
+        pkarr_resolver: pkarr_resolver.clone(),
+        reachability_resolver: reachability_resolver.clone(),
+        iroh_endpoint: iroh_endpoint.clone(),
+        crdt_state: std::sync::Arc::clone(&crdt_state),
+        hlc_tracker: std::sync::Arc::clone(&hlc_tracker),
+        adopt_floor: adopt_floor.clone(),
+        device_id: device_id.clone(),
+        self_owner,
+        community_signing_key: std::sync::Arc::clone(&community_signing_key),
+        enrollment_cert: enrollment_cert.clone(),
+        community_registry: std::sync::Arc::clone(&community_registry),
+        community_adapter_tx: community_adapter_tx.clone(),
+        transport_epoch_rx: transport_epoch_rx.clone(),
+        dm_outbox: std::sync::Arc::clone(&dm_outbox),
+        channel_log_registry: std::sync::Arc::clone(&channel_log_registry),
+        sync_engine: sync_engine.clone(),
+        identity_dir: crate::owner_commands::resolve_identity_dir().ok(),
+        sink: Some(std::sync::Arc::clone(&sink)),
+        dial_config: HandshakeDialConfig::from_env(),
+    };
+
     let outcome = connectivity_redeem_invite_iroh_inner(
         invite_url,
         pkarr_resolver,
@@ -62622,6 +62649,16 @@ pub(crate) async fn connectivity_redeem_invite_iroh_impl(
             if let Err(e) = subscribe_community_presence_impl(state, community_id).await {
                 tracing::warn!(error = %e, "ZEB-778: post-join presence subscribe failed");
             }
+        }
+
+        // ZEB-903: a latched outcome (joined + pending) arms the
+        // per-community re-attempt driver — the next transport up-edge
+        // re-runs the one-round-trip fast handshake instead of waiting
+        // minutes for gossip convergence. No-op when the node has no
+        // transport-epoch watch (nothing to subscribe to; the passive
+        // paths still converge).
+        if outcome.pending {
+            let _ = crate::latched_join_reattempt::spawn_reattempt_driver(reattempt_ctx).await;
         }
     }
 
