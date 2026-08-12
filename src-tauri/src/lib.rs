@@ -9792,10 +9792,21 @@ pub async fn start_node_inner(
                                             continue;
                                         }
 
+                                        // ZEB-919: seal under the LIVE epoch
+                                        // key (the engine's membership_key is
+                                        // spawn-pinned and never follows
+                                        // rotation); degrade to it only when
+                                        // the live read is unavailable.
+                                        let mk = crate::community_state_sync::community_publish_epoch_key_typed(
+                                            community_id,
+                                            Some(&crdt_state),
+                                            &engine.membership_key(),
+                                        )
+                                        .await;
                                         addrbook_keys.insert(
                                             community_id,
                                             crate::address_book_sync::derive_addrbook_key(
-                                                &engine.membership_key(),
+                                                &mk,
                                                 &community_id,
                                             ),
                                         );
@@ -12590,10 +12601,22 @@ pub async fn start_node_inner(
                                                         );
                                                         continue;
                                                     };
+                                                    // ZEB-919: seal under the
+                                                    // LIVE epoch key (the
+                                                    // engine's membership_key
+                                                    // is spawn-pinned); degrade
+                                                    // to it only when the live
+                                                    // read is unavailable.
+                                                    let mk = crate::community_state_sync::community_publish_epoch_key_typed(
+                                                        c,
+                                                        Some(&slot_crdt_state),
+                                                        &engine.membership_key(),
+                                                    )
+                                                    .await;
                                                     addrbook_keys.insert(
                                                         c,
                                                         crate::address_book_sync::derive_addrbook_key(
-                                                            &engine.membership_key(),
+                                                            &mk,
                                                             &c,
                                                         ),
                                                     );
@@ -36591,6 +36614,9 @@ pub(crate) async fn create_community_impl(
     };
 
     let name_for_emit = name.clone();
+    // ZEB-919: retained for the case-C registration hook below (the inner
+    // call consumes its own Arc clone).
+    let crdt_state_for_hook = std::sync::Arc::clone(&crdt_state);
     let community_id = create_community_inner(
         name,
         is_invite_only,
@@ -36674,10 +36700,17 @@ pub(crate) async fn create_community_impl(
             };
             if let (Some(pub_handle), Some(registry)) = (community_pub, community_registry) {
                 if let Some(engine) = registry.engine_arc(&space_id).await {
-                    let mk = engine.membership_key();
-                    pub_handle
-                        .on_community_joined(space_id, *mk.as_bytes())
-                        .await;
+                    // ZEB-919 hygiene: spawn==live by construction at
+                    // creation, but normalize to the live helper so no
+                    // direct-pin registration site survives a grep.
+                    let fallback = engine.membership_key();
+                    let key = crate::community_state_sync::community_publish_epoch_key(
+                        space_id,
+                        &crdt_state_for_hook,
+                        &fallback,
+                    )
+                    .await;
+                    pub_handle.on_community_joined(space_id, key).await;
                     tracing::debug!(
                         community_id = %community_id,
                         "ZEB-323 Phase 2b: registered case-C pkarr publication for new community"
@@ -42392,6 +42425,9 @@ pub(crate) async fn redeem_invite_impl(
         Ok(())
     };
 
+    // ZEB-919: retained for the case-C registration hook below (the inner
+    // call consumes its own Arc clone).
+    let crdt_state_for_hook = std::sync::Arc::clone(&crdt_state);
     let dto = redeem_invite_inner(
         url,
         crdt_state,
@@ -42471,10 +42507,17 @@ pub(crate) async fn redeem_invite_impl(
             };
             if let (Some(pub_handle), Some(registry)) = (community_pub, registry) {
                 if let Some(engine) = registry.engine_arc(&space_id).await {
-                    let mk = engine.membership_key();
-                    pub_handle
-                        .on_community_joined(space_id, *mk.as_bytes())
-                        .await;
+                    // ZEB-919 hygiene: spawn==live by construction at a
+                    // fresh join, but normalize to the live helper so no
+                    // direct-pin registration site survives a grep.
+                    let fallback = engine.membership_key();
+                    let key = crate::community_state_sync::community_publish_epoch_key(
+                        space_id,
+                        &crdt_state_for_hook,
+                        &fallback,
+                    )
+                    .await;
+                    pub_handle.on_community_joined(space_id, key).await;
                     tracing::debug!(
                         community_id = %dto.community_id,
                         "ZEB-323 Phase 2b: registered case-C pkarr publication after redeem_invite"
@@ -53753,17 +53796,14 @@ pub async fn self_heal_community_observer(
 
         let current_epoch = materialized.current_epoch.unwrap_or(0);
 
-        // TODO(zeb-249-followup): cross-node observer correctness. When a
-        // REMOTE admin's rotation lands on this node, current_epoch_key in
-        // crdt_state is NOT updated (only LOCAL kick/leave handlers update it).
-        // Catchups synthesized by remote admins' observers would use stale
-        // keys. See spec §10.6.
-
         // Read the CURRENT epoch key from the local owner-state CRDT.
         // `Space.current_epoch_key` is updated by `kick_from_community` /
-        // `leave_community` whenever a rotation lands locally, so this is
-        // always the post-rotation key — correct for the §4.6 scenario
-        // (stale invite, kick happened between invite issuance and redemption).
+        // `leave_community` for locally-originated rotations AND by
+        // `apply_remote_epoch_event` when a remote admin's rotation lands
+        // via CRDT sync (a stale ZEB-249 TODO here claimed otherwise;
+        // removed in ZEB-919), so this is always the post-rotation key —
+        // correct for the §4.6 scenario (stale invite, kick happened
+        // between invite issuance and redemption).
         // Fall back to the engine's spawn-time key only if the CRDT has no
         // record for this community (e.g., the observer fires before the
         // owner-state flush completes — in that case the rotation has not

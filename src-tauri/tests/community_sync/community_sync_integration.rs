@@ -3458,6 +3458,8 @@ async fn addrbook_replaces_announce_events_end_to_end() {
             community_id,
             payload,
             ts,
+            // ZEB-919: no owner-state handle — spawn-key degraded mode.
+            None,
         )
         .await;
         assert!(
@@ -3675,8 +3677,17 @@ async fn peer_ingest_stamps_receipt_time_not_wire_value() {
     let rr = ReachabilityResolver::new();
     let crr = CommunityRelayResolver::new();
 
-    let batch1 =
-        ingest_sealed_packet(&registry_b, &book, &rr, &crr, community_id, &packet1, now1).await;
+    let batch1 = ingest_sealed_packet(
+        &registry_b,
+        &book,
+        &rr,
+        &crr,
+        community_id,
+        &packet1,
+        now1,
+        None,
+    )
+    .await;
     assert_eq!(
         batch1.outcomes,
         vec![harmony_app::address_book_sync::IngestOutcome::Applied(
@@ -3731,8 +3742,17 @@ async fn peer_ingest_stamps_receipt_time_not_wire_value() {
     let packet2 = seal_records(&key, &community_id, std::slice::from_ref(&honest_row))
         .expect("seal honest record");
 
-    let batch2 =
-        ingest_sealed_packet(&registry_b, &book, &rr, &crr, community_id, &packet2, now2).await;
+    let batch2 = ingest_sealed_packet(
+        &registry_b,
+        &book,
+        &rr,
+        &crr,
+        community_id,
+        &packet2,
+        now2,
+        None,
+    )
+    .await;
     assert_eq!(
         batch2.outcomes,
         vec![harmony_app::address_book_sync::IngestOutcome::Applied(
@@ -4069,6 +4089,8 @@ async fn addrbook_snapshot_path_ingest_end_to_end() {
         community_id,
         &packet,
         ts,
+        // ZEB-919: no owner-state handle — spawn-key degraded mode.
+        None,
     )
     .await;
     assert!(

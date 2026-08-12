@@ -128,6 +128,25 @@ pub fn seal_presence_beacon(
     .map_err(|_| BeaconError::Encode)
 }
 
+/// ZEB-919: open a sealed beacon under the first membership-epoch key
+/// candidate that succeeds (candidates come from
+/// [`crate::community_state_sync::epoch_key_candidates`]: the live current
+/// key first, then the immediately-previous epoch's archived key, or the
+/// spawn-time key in degraded mode). The previous-key rung heals rotation
+/// skew: an un-rotated member's beacons stay visible to rotated members
+/// exactly while the rotation event is still propagating to it — the same
+/// load-bearing argument as the ZEB-918 rendezvous resolver rung.
+pub(crate) fn open_presence_with_any(
+    mks: &[crate::owner_state_types::EpochKey],
+    community: &SpaceId,
+    packet: &[u8],
+) -> Option<SignedPresenceBeacon> {
+    mks.iter().find_map(|mk| {
+        let key = crate::community_channel_log::derive_presence_key(mk, community);
+        open_presence_beacon(&key, community, packet)
+    })
+}
+
 /// Open + decode a sealed beacon. Returns `None` on any failure (drop).
 pub fn open_presence_beacon(
     key: &ChannelKey,
@@ -424,11 +443,20 @@ impl CommunityPresenceMap {
 // ── pub/sub spawn helpers (ZEB-537 Task 4) ──────────────────────────
 //
 // Mirror `voice_presence::spawn_voice_presence_{publisher,subscriber}` but
-// community-scoped (no channel) and pure-liveness (no mute/kick/left). The
-// presence key is re-derived from the community's CURRENT epoch key on EVERY
-// operation (`registry.engine_arc(community).membership_key()` →
-// `derive_presence_key`), so it follows epoch rotation automatically; a missing
-// engine means we skip the tick (publisher) / drop the packet (subscriber).
+// community-scoped (no channel) and pure-liveness (no mute/kick/left).
+//
+// ZEB-919 key model: the engine's `membership_key()` is bound at spawn and
+// NEVER changes for the engine's lifetime, so re-fetching the engine per
+// tick does not follow epoch rotation (the pre-919 comments claimed it
+// did — that was false). The presence key is now derived from the LIVE
+// `Space.current_epoch_key` per operation: the publisher seals under the
+// live key (degrading to the spawn key only when the live read is
+// unavailable — publisher-degrades, ZEB-597 mirror), and the subscriber
+// opens under `[current, previous]` candidates so rotation skew heals in
+// both directions while the rotation event propagates. `crdt_state = None`
+// (test/legacy wiring) is the documented degraded mode: both sides fall
+// back to the spawn key coherently. A missing engine still means skip the
+// tick (publisher) / drop the packet (subscriber).
 
 /// Spawn a community-presence heartbeat publisher: emit an immediate beacon,
 /// then one every `interval` (10 s in V1). Each tick re-derives the presence key
@@ -453,6 +481,9 @@ pub fn spawn_community_presence_publisher(
     interval: std::time::Duration,
     presence_visible: Arc<AtomicBool>,
     closing: Arc<AtomicBool>,
+    // ZEB-919: owner-state handle for the live epoch-key read; `None` is the
+    // documented spawn-key degraded mode (test/legacy wiring).
+    crdt_state: Option<Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // `interval` fires immediately on the first `tick()`, giving the
@@ -475,12 +506,19 @@ pub fn spawn_community_presence_publisher(
             let Ok(signed) = sign_presence_beacon(beacon, &signing_key) else {
                 continue;
             };
-            // Re-fetch the presence key per tick so it follows epoch rotation;
-            // if the engine is gone we have nothing to seal under → skip.
+            // ZEB-919: seal under the LIVE epoch key per tick (the engine's
+            // membership_key is spawn-pinned and never follows rotation);
+            // degrade to the spawn key only when the live read is unavailable.
+            // If the engine is gone we have nothing to seal under → skip.
             let Some(engine) = registry.engine_arc(&community).await else {
                 continue;
             };
-            let mk = engine.membership_key();
+            let mk = crate::community_state_sync::community_publish_epoch_key_typed(
+                community,
+                crdt_state.as_ref(),
+                &engine.membership_key(),
+            )
+            .await;
             let key = crate::community_channel_log::derive_presence_key(&mk, &community);
             let Ok(sealed) = seal_presence_beacon(&key, &community, &signed) else {
                 continue;
@@ -550,6 +588,9 @@ pub fn spawn_community_presence_subscriber(
     // reliable trigger for a snapshot catch-up (spec §2). `None` when the
     // address-book pool is unwired (test callers that bypass `start_node`).
     addrbook_resync: Option<Arc<tokio::sync::Notify>>,
+    // ZEB-919: owner-state handle for the live epoch-key candidates; `None`
+    // is the documented spawn-key degraded mode (test/legacy wiring).
+    crdt_state: Option<Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let sub = match session.declare_subscriber(&topic).await {
@@ -569,14 +610,24 @@ pub fn spawn_community_presence_subscriber(
                 continue;
             }
             let bytes = sample.payload().to_bytes().to_vec();
-            // Re-derive the presence key per packet so it follows epoch
-            // rotation; if the engine is gone we cannot open → drop.
+            // ZEB-919: open under the live [current, previous] epoch-key
+            // candidates per packet (the engine's membership_key is
+            // spawn-pinned and never follows rotation; the previous-key rung
+            // keeps un-rotated members visible while the rotation event
+            // propagates to them). If the engine is gone we cannot open →
+            // drop. Cost note: the candidates read takes the owner-state
+            // mutex for a ≤2-key clone at presence cadence (~0.1 Hz per
+            // member) — contention noise.
             let Some(engine) = registry.engine_arc(&community).await else {
                 continue;
             };
-            let mk = engine.membership_key();
-            let key = crate::community_channel_log::derive_presence_key(&mk, &community);
-            let Some(signed) = open_presence_beacon(&key, &community, &bytes) else {
+            let mks = crate::community_state_sync::epoch_key_candidates(
+                community,
+                crdt_state.as_ref(),
+                &engine.membership_key(),
+            )
+            .await;
+            let Some(signed) = open_presence_with_any(&mks, &community, &bytes) else {
                 continue; // non-member key / wrong scope / tamper → drop
             };
             if verify_presence_beacon_sig(&signed).is_err() {
@@ -691,6 +742,95 @@ mod tests {
         assert_eq!(open_presence_beacon(&key, &c, &sealed), Some(signed));
         let other = derive_presence_key(&EpochKey::new([0x22; 32]), &c);
         assert_eq!(open_presence_beacon(&other, &c, &sealed), None);
+    }
+
+    /// ZEB-919: a beacon sealed under the PREVIOUS epoch key (an un-rotated
+    /// member) opens via the second candidate; sealed under the CURRENT key
+    /// it opens via the first. This is the presence analogue of the ZEB-918
+    /// rendezvous previous-epoch rung.
+    #[test]
+    fn open_presence_with_any_previous_candidate_opens_old_sealed() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut b = beacon(4);
+        b.device = sk.verifying_key().to_bytes();
+        let signed = sign_presence_beacon(b, &sk).unwrap();
+        let c = SpaceId([0xc0; 16]);
+        let old = EpochKey::new([0x11; 32]);
+        let new = EpochKey::new([0x22; 32]);
+        let candidates = vec![new.clone(), old.clone()];
+
+        let sealed_old = seal_presence_beacon(&derive_presence_key(&old, &c), &c, &signed).unwrap();
+        assert_eq!(
+            open_presence_with_any(&candidates, &c, &sealed_old),
+            Some(signed.clone()),
+            "previous-epoch candidate must open an un-rotated member's beacon"
+        );
+
+        let sealed_new = seal_presence_beacon(&derive_presence_key(&new, &c), &c, &signed).unwrap();
+        assert_eq!(
+            open_presence_with_any(&candidates, &c, &sealed_new),
+            Some(signed),
+            "current-epoch candidate must open a rotated member's beacon"
+        );
+    }
+
+    /// ZEB-919: a beacon sealed under a key NOT in the candidate list (two
+    /// epochs back, or a non-member key) drops — the rung is one epoch deep,
+    /// never a skeleton key.
+    #[test]
+    fn open_presence_with_any_rejects_unrelated_key() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut b = beacon(5);
+        b.device = sk.verifying_key().to_bytes();
+        let signed = sign_presence_beacon(b, &sk).unwrap();
+        let c = SpaceId([0xc0; 16]);
+        let ancient = EpochKey::new([0x0a; 32]);
+        let sealed = seal_presence_beacon(&derive_presence_key(&ancient, &c), &c, &signed).unwrap();
+        let candidates = vec![EpochKey::new([0x22; 32]), EpochKey::new([0x11; 32])];
+        assert_eq!(open_presence_with_any(&candidates, &c, &sealed), None);
+    }
+
+    /// ZEB-919: the publisher's per-tick key selection reads the LIVE
+    /// `Space.current_epoch_key`, not the spawn-pinned fallback — a beacon
+    /// sealed with the selected key opens under the NEW epoch key after a
+    /// rotation lands in owner-state, even though the engine still pins OLD.
+    #[tokio::test]
+    async fn publisher_seals_under_live_key_when_rotated() {
+        use std::sync::Arc;
+        let c = SpaceId([0xc0; 16]);
+        let spawn_pinned = EpochKey::new([0x11; 32]); // engine's stale copy
+        let live = EpochKey::new([0x22; 32]); // post-rotation key
+
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        os.spaces.insert(
+            c,
+            crate::community_state_sync::test_community_space(c, 1, live.clone()),
+        );
+        let crdt = Arc::new(tokio::sync::Mutex::new(os));
+
+        let mk = crate::community_state_sync::community_publish_epoch_key_typed(
+            c,
+            Some(&crdt),
+            &spawn_pinned,
+        )
+        .await;
+
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut b = beacon(6);
+        b.device = sk.verifying_key().to_bytes();
+        let signed = sign_presence_beacon(b, &sk).unwrap();
+        let sealed = seal_presence_beacon(&derive_presence_key(&mk, &c), &c, &signed).unwrap();
+
+        assert_eq!(
+            open_presence_beacon(&derive_presence_key(&live, &c), &c, &sealed),
+            Some(signed),
+            "publisher must seal under the live key after rotation"
+        );
+        assert_eq!(
+            open_presence_beacon(&derive_presence_key(&spawn_pinned, &c), &c, &sealed),
+            None,
+            "the spawn-pinned key must NOT open a post-rotation beacon"
+        );
     }
 
     #[test]

@@ -162,6 +162,25 @@ pub fn open_records(
     ciborium::from_reader(plain.as_slice()).ok()
 }
 
+/// ZEB-919: open a sealed address-book packet under the first
+/// membership-epoch key candidate that succeeds (candidates come from
+/// [`crate::community_state_sync::epoch_key_candidates`]: the live current
+/// key first, then the immediately-previous epoch's archived key, or the
+/// spawn-time key in degraded mode). The previous-key rung keeps an
+/// un-rotated member's rows ingestible by rotated members exactly while
+/// the rotation event is still propagating to it — the same load-bearing
+/// argument as the ZEB-918 rendezvous resolver rung.
+pub(crate) fn open_records_with_any(
+    mks: &[EpochKey],
+    community: &SpaceId,
+    packet: &[u8],
+) -> Option<Vec<AddressBookRow>> {
+    mks.iter().find_map(|mk| {
+        let key = derive_addrbook_key(mk, community);
+        open_records(&key, community, packet)
+    })
+}
+
 /// Result of ingesting one address-book row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IngestOutcome {
@@ -324,14 +343,17 @@ fn notify_reachability(
     }
 }
 
-/// Async wrapper: unseal `packet` under the community's current membership
-/// key, then per-row gate on live membership before dispatching to
-/// [`ingest_verified_row`]. Used by the event-loop wiring (Tasks 5/6).
+/// Async wrapper: unseal `packet` under the community's LIVE membership-epoch
+/// key candidates (ZEB-919: `[current, previous]`, or the spawn key in
+/// degraded mode — the engine's `membership_key()` is spawn-pinned and never
+/// follows rotation), then per-row gate on live membership before dispatching
+/// to [`ingest_verified_row`]. Used by the event-loop wiring (Tasks 5/6).
 ///
 /// A missing engine or an unseal/decode failure yields one `Malformed`
 /// outcome for the whole packet (nothing to iterate); a row whose signer
 /// is not a currently-enrolled, Joined member yields `NotMember` for that
 /// row and is skipped (never reaches signature verification or the store).
+#[allow(clippy::too_many_arguments)]
 pub async fn ingest_sealed_packet(
     registry: &Arc<CommunitySyncRegistry>,
     book: &CommunityAddressBook,
@@ -340,13 +362,18 @@ pub async fn ingest_sealed_packet(
     community: SpaceId,
     packet: &[u8],
     now_ms: u64,
+    crdt_state: Option<&Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
 ) -> IngestBatch {
     let Some(engine) = registry.engine_arc(&community).await else {
         return IngestBatch::malformed();
     };
-    let mk = engine.membership_key();
-    let key = derive_addrbook_key(&mk, &community);
-    let Some(rows) = open_records(&key, &community, packet) else {
+    let mks = crate::community_state_sync::epoch_key_candidates(
+        community,
+        crdt_state,
+        &engine.membership_key(),
+    )
+    .await;
+    let Some(rows) = open_records_with_any(&mks, &community, packet) else {
         return IngestBatch::malformed();
     };
 
@@ -615,9 +642,10 @@ pub async fn publish_own_rows(
 
 /// Live-record subscriber: every sealed packet on
 /// `harmony/addrbook/{hex}/records` goes through [`ingest_sealed_packet`]
-/// (unseal under the community's CURRENT membership key → per-row membership
-/// gate → signature → LWW upsert → resolver fan-out). A batch that materially
-/// changed the book marks it dirty so the sidecar is rewritten.
+/// (unseal under the community's LIVE membership-epoch key candidates,
+/// ZEB-919 → per-row membership gate → signature → LWW upsert → resolver
+/// fan-out). A batch that materially changed the book marks it dirty so the
+/// sidecar is rewritten.
 ///
 /// `session` is an owned, cheaply-cloned `zenoh::Session` (call sites pass
 /// `session.clone()`), matching
@@ -633,6 +661,9 @@ pub fn spawn_addrbook_subscriber(
     community: SpaceId,
     dirty: Arc<Notify>,
     observer: Option<Arc<dyn AddrbookIngestObserver>>,
+    // ZEB-919: owner-state handle for the live epoch-key candidates; `None`
+    // is the documented spawn-key degraded mode (test/legacy wiring).
+    crdt_state: Option<Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let topic = addrbook_records_topic(&community);
@@ -664,6 +695,7 @@ pub fn spawn_addrbook_subscriber(
                 community,
                 &bytes,
                 wall_now_ms(),
+                crdt_state.as_ref(),
             )
             .await;
             if batch.changed_book() {
@@ -749,6 +781,9 @@ pub async fn spawn_addrbook_snapshot_queryable(
     registry: Arc<CommunitySyncRegistry>,
     book: Arc<CommunityAddressBook>,
     community: SpaceId,
+    // ZEB-919: owner-state handle for the live epoch-key read; `None` is the
+    // documented spawn-key degraded mode (test/legacy wiring).
+    crdt_state: Option<Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
 ) -> JoinHandle<()> {
     let topic = addrbook_snapshot_topic(&community);
     let qbl = match session.declare_queryable(&topic).await {
@@ -760,13 +795,22 @@ pub async fn spawn_addrbook_snapshot_queryable(
     };
     tokio::spawn(async move {
         while let Ok(query) = qbl.recv_async().await {
-            // Re-derive per query so the reply follows epoch rotation; a
-            // missing engine means we hold no key for this community and
-            // simply do not answer (the querier logs a no-responder INFO).
+            // ZEB-919: serve sealed under the LIVE epoch key per query (the
+            // engine's membership_key is spawn-pinned and never follows
+            // rotation; degrade to it only when the live read is
+            // unavailable). A missing engine means we hold no key for this
+            // community and simply do not answer (the querier logs a
+            // no-responder INFO).
             let Some(engine) = registry.engine_arc(&community).await else {
                 continue;
             };
-            let key = derive_addrbook_key(&engine.membership_key(), &community);
+            let mk = crate::community_state_sync::community_publish_epoch_key_typed(
+                community,
+                crdt_state.as_ref(),
+                &engine.membership_key(),
+            )
+            .await;
+            let key = derive_addrbook_key(&mk, &community);
             // An EMPTY book still replies: "I am here and hold nothing" is a
             // real answer, and suppressing it would make an all-empty
             // community look like a no-responder failure forever.
@@ -801,6 +845,8 @@ async fn request_snapshot_once(
     community: SpaceId,
     dirty: &Notify,
     observer: Option<&Arc<dyn AddrbookIngestObserver>>,
+    // ZEB-919: threaded into the reply ingest's live epoch-key candidates.
+    crdt_state: Option<&Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
 ) {
     let community_hex = hex::encode(community.0);
     // Mirrors the channel-log/voting backfill requester's get shape:
@@ -855,6 +901,7 @@ async fn request_snapshot_once(
                         community,
                         &bytes,
                         wall_now_ms(),
+                        crdt_state,
                     )
                     .await;
                     changed |= batch.changed_book();
@@ -929,6 +976,9 @@ pub fn spawn_addrbook_snapshot_requester(
     resync: Arc<Notify>,
     dirty: Arc<Notify>,
     observer: Option<Arc<dyn AddrbookIngestObserver>>,
+    // ZEB-919: owner-state handle for the reply ingest's live epoch-key
+    // candidates; `None` is the documented spawn-key degraded mode.
+    crdt_state: Option<Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let topic = addrbook_snapshot_topic(&community);
@@ -949,6 +999,7 @@ pub fn spawn_addrbook_snapshot_requester(
             community,
             &dirty,
             observer.as_ref(),
+            crdt_state.as_ref(),
         )
         .await;
 
@@ -980,6 +1031,7 @@ pub fn spawn_addrbook_snapshot_requester(
                 community,
                 &dirty,
                 observer.as_ref(),
+                crdt_state.as_ref(),
             )
             .await;
         }
@@ -1099,6 +1151,83 @@ mod tests {
         let last = sealed.len() - 1;
         sealed[last] ^= 0x01;
         assert_eq!(open_records(&key, &c, &sealed), None);
+    }
+
+    /// ZEB-919: a packet sealed under the PREVIOUS epoch key (an un-rotated
+    /// member) opens via the second candidate; sealed under the CURRENT key
+    /// it opens via the first — the address-book analogue of the ZEB-918
+    /// previous-epoch rung.
+    #[test]
+    fn open_records_with_any_previous_candidate_opens_old_sealed() {
+        let c = SpaceId([0xc0; 16]);
+        let old = EpochKey::new([0x11; 32]);
+        let new = EpochKey::new([0x22; 32]);
+        let candidates = vec![new.clone(), old.clone()];
+        let rows = vec![row(1, 1_000)];
+
+        let sealed_old = seal_records(&derive_addrbook_key(&old, &c), &c, &rows).unwrap();
+        assert_eq!(
+            open_records_with_any(&candidates, &c, &sealed_old),
+            Some(rows.clone()),
+            "previous-epoch candidate must open an un-rotated member's packet"
+        );
+
+        let sealed_new = seal_records(&derive_addrbook_key(&new, &c), &c, &rows).unwrap();
+        assert_eq!(
+            open_records_with_any(&candidates, &c, &sealed_new),
+            Some(rows),
+            "current-epoch candidate must open a rotated member's packet"
+        );
+    }
+
+    /// ZEB-919: a packet sealed under a key NOT in the candidate list (two
+    /// epochs back, or a non-member key) drops — one epoch deep, never a
+    /// skeleton key.
+    #[test]
+    fn open_records_with_any_rejects_unrelated_key() {
+        let c = SpaceId([0xc0; 16]);
+        let ancient = derive_addrbook_key(&EpochKey::new([0x0a; 32]), &c);
+        let sealed = seal_records(&ancient, &c, &[row(1, 1_000)]).unwrap();
+        let candidates = vec![EpochKey::new([0x22; 32]), EpochKey::new([0x11; 32])];
+        assert_eq!(open_records_with_any(&candidates, &c, &sealed), None);
+    }
+
+    /// ZEB-919: the snapshot queryable's per-query key selection reads the
+    /// LIVE `Space.current_epoch_key` — a reply sealed with the selected key
+    /// opens under the NEW epoch key after a rotation lands in owner-state,
+    /// even though the engine still pins the OLD key.
+    #[tokio::test]
+    async fn snapshot_seal_key_follows_rotated_live_state() {
+        let c = SpaceId([0xc0; 16]);
+        let spawn_pinned = EpochKey::new([0x11; 32]);
+        let live = EpochKey::new([0x22; 32]);
+
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        os.spaces.insert(
+            c,
+            crate::community_state_sync::test_community_space(c, 1, live.clone()),
+        );
+        let crdt = Arc::new(tokio::sync::Mutex::new(os));
+
+        let mk = crate::community_state_sync::community_publish_epoch_key_typed(
+            c,
+            Some(&crdt),
+            &spawn_pinned,
+        )
+        .await;
+        let rows = vec![row(1, 1_000)];
+        let sealed = seal_records(&derive_addrbook_key(&mk, &c), &c, &rows).unwrap();
+
+        assert_eq!(
+            open_records(&derive_addrbook_key(&live, &c), &c, &sealed),
+            Some(rows),
+            "queryable must serve under the live key after rotation"
+        );
+        assert_eq!(
+            open_records(&derive_addrbook_key(&spawn_pinned, &c), &c, &sealed),
+            None,
+            "the spawn-pinned key must NOT open a post-rotation reply"
+        );
     }
 
     #[test]

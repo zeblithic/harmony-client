@@ -256,6 +256,8 @@ async fn invisible_inner() {
         None,
         // ZEB-815: no address-book pool in this link-layer test.
         None,
+        // ZEB-919: no owner-state handle — spawn-key degraded mode.
+        None,
     );
 
     // Match A's session to B's REMOTE subscriber first, so a later "no beacon"
@@ -307,6 +309,8 @@ async fn invisible_inner() {
         Duration::from_millis(200),
         Arc::clone(&a_visible),
         Arc::clone(&closing_a),
+        // ZEB-919: no owner-state handle — spawn-key degraded mode.
+        None,
     );
 
     // Over ~2s (10 beacon intervals) B must NEVER see A.
@@ -418,6 +422,8 @@ async fn run_inner() {
         None,
         // ZEB-815: no address-book pool in this link-layer test.
         None,
+        // ZEB-919: no owner-state handle — spawn-key degraded mode.
+        None,
     );
 
     // Deterministically wait until A's session has discovered B's REMOTE presence
@@ -473,6 +479,8 @@ async fn run_inner() {
         Duration::from_millis(200),
         Arc::new(AtomicBool::new(true)),
         Arc::clone(&closing_a),
+        // ZEB-919: no owner-state handle — spawn-key degraded mode.
+        None,
     );
 
     // ── Assertion 1 (ONLINE): B sees A online ───────────────────────────────
