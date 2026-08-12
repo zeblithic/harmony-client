@@ -11,7 +11,6 @@
 //! parts: the slot info-layout, the `ReachabilityAnnouncePayload` decoder, the
 //! env-knob config builder, and the advertiser-set slot assignment.
 
-use crate::community_relay_announce::COMMUNITY_RELAY_ADVERTISERS_MAX;
 use crate::membership_vouch::MembershipVouch;
 use crate::owner_state_types::EpochKey;
 use crate::owner_state_types::OwnerAddr;
@@ -486,6 +485,7 @@ pub async fn resolve_rendezvous_all_slots(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::community_relay_announce::COMMUNITY_RELAY_ADVERTISERS_MAX;
 
     fn ek() -> EpochKey {
         EpochKey::new([7u8; 32])
@@ -560,8 +560,7 @@ mod tests {
         let (found, _) = all_slots_scan(&r, now, Duration::from_millis(500)).await;
         assert_eq!(found.len(), 1, "same node across epochs must dedup");
         assert_eq!(
-            found[0].membership_device_vk,
-            [0xAA; 32],
+            found[0].membership_device_vk, [0xAA; 32],
             "the current-epoch beacon wins"
         );
     }

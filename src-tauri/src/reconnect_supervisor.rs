@@ -412,6 +412,27 @@ impl SupervisorHandle {
             .copied()
     }
 
+    /// Test-only state fabrication: insert (or overwrite) `peer`'s slot in the
+    /// given state without running the supervisor loop. The gateway dial
+    /// driver's ZEB-910 tests need a `Dormant`/`Retrying` slot to exist so the
+    /// targeted-revival pass has something to observe via `states_snapshot`;
+    /// production states are only ever loop-materialized.
+    #[cfg(test)]
+    pub fn set_peer_state_for_test(&self, peer: [u8; 32], state: PeerState) {
+        let mut states = self.inner.states.lock().expect("states lock");
+        states.insert(
+            peer,
+            PeerSlot {
+                state,
+                last_fresh_trigger: Instant::now(),
+                dial_in_flight: false,
+                epoch: 0,
+                ever_connected: false,
+                pending_reconnected_marker: false,
+            },
+        );
+    }
+
     /// Test-only read accessor for the pending-sweep flag: `true` once
     /// [`Self::kick_sweep`] has been called and before the loop drains it.
     /// Parallels [`Self::pending_trigger`] (which reads `dirty`); this reads

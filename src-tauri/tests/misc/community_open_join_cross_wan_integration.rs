@@ -1583,6 +1583,7 @@ async fn gateway_dial_driver_bootstraps_from_rendezvous_beacon() {
             ),
             Arc::clone(&resolver),
             Arc::new(move || vec![community]),
+            Arc::new(|_: &[u8; 32]| None),
         )
         .with_telemetry(Arc::clone(&telemetry));
 
@@ -1688,6 +1689,7 @@ async fn gateway_dial_rejects_beacon_when_device_not_enrolled() {
             ),
             Arc::clone(&resolver),
             Arc::new(move || vec![community]),
+            Arc::new(|_: &[u8; 32]| None),
         )
         .with_telemetry(Arc::clone(&telemetry));
 
