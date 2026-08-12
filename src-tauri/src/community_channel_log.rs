@@ -787,6 +787,25 @@ pub fn decrypt_channel_packet(
         .map_err(|e| ChannelEventError::CborDecode(e.to_string()))
 }
 
+/// ZEB-920: try [`decrypt_channel_packet`] under each candidate key in order
+/// (live `[current, previous]`, or the degraded `[pinned]`), returning the
+/// first success. All-fail returns the LAST error so the caller's
+/// garbage-drop warn carries a real cause. Mirrors ZEB-919's
+/// `open_presence_with_any` / `open_records_with_any`.
+pub(crate) fn decrypt_channel_packet_with_any(
+    keys: &[std::sync::Arc<ChannelKey>],
+    packet: &[u8],
+) -> Result<SignedChannelEvent, ChannelEventError> {
+    let mut last = Err(ChannelEventError::AeadDecrypt("no candidate keys".to_string()));
+    for key in keys {
+        match decrypt_channel_packet(key, packet) {
+            Ok(ev) => return Ok(ev),
+            Err(e) => last = Err(e),
+        }
+    }
+    last
+}
+
 /// ZEB-585: per-author-lane catch-up watermark. Keyed by the
 /// `(author, device_id)` lane — the SAME lane identity the replay tracker
 /// uses (see `replay_tracker_independent_lanes_per_author`): two authors
@@ -896,6 +915,22 @@ pub fn open_watermark_vector(
         .map_err(|e| ChannelEventError::CborDecode(e.to_string()))
 }
 
+/// ZEB-920: candidate-key variant of [`open_watermark_vector`] — same
+/// first-success / last-error contract as [`decrypt_channel_packet_with_any`].
+pub(crate) fn open_watermark_vector_with_any(
+    keys: &[std::sync::Arc<ChannelKey>],
+    packet: &[u8],
+) -> Result<WatermarkVector, ChannelEventError> {
+    let mut last = Err(ChannelEventError::AeadDecrypt("no candidate keys".to_string()));
+    for key in keys {
+        match open_watermark_vector(key, packet) {
+            Ok(v) => return Ok(v),
+            Err(e) => last = Err(e),
+        }
+    }
+    last
+}
+
 /// Static AAD for sealed RBSR messages (ZEB-592). Domain-separated from
 /// `WATERMARK_VECTOR_AAD` and `CHANNEL_PACKET_AAD` so a message of one kind can
 /// never be opened as another even under the same `ChannelKey`.
@@ -997,6 +1032,24 @@ pub fn open_rbsr_message(
     crate::channel_rbsr::validate_message(&msg)
         .map_err(|_| ChannelEventError::CborDecode("rbsr message: invalid partition".into()))?;
     Ok(msg)
+}
+
+/// ZEB-920: candidate-key variant of [`open_rbsr_message`] — same
+/// first-success / last-error contract as [`decrypt_channel_packet_with_any`].
+/// `rbsr_ingest_and_next`'s frame classification treats all-keys-fail exactly
+/// as it treated a single-key fail: the frame is an inline `Have` packet.
+pub(crate) fn open_rbsr_message_with_any(
+    keys: &[std::sync::Arc<ChannelKey>],
+    frame: &[u8],
+) -> Result<crate::channel_rbsr::RbsrMessage, ChannelEventError> {
+    let mut last = Err(ChannelEventError::AeadDecrypt("no candidate keys".to_string()));
+    for key in keys {
+        match open_rbsr_message(key, frame) {
+            Ok(m) => return Ok(m),
+            Err(e) => last = Err(e),
+        }
+    }
+    last
 }
 
 /// ZEB-585: raise a watermark-vector lane entry to cover `at` (no-op when
@@ -3351,6 +3404,84 @@ mod tests {
             matches!(open_rbsr_message(&key, &big), Err(ChannelEventError::MalformedPacket(n)) if n == MAX_RBSR_MESSAGE_BYTES + 1),
             "oversize rejected before decrypt"
         );
+    }
+
+    /// ZEB-920: the previous-epoch candidate opens an OLD-sealed packet; an
+    /// unrelated key does not. Same shape as the presence/addrbook
+    /// `*_with_any` pins (ZEB-919).
+    #[test]
+    fn with_any_previous_candidate_opens_old_sealed_packet() {
+        use std::sync::Arc;
+        let c = fixture_community(0xc0);
+        let ch = fixture_channel(0x01);
+        let key_old = derive_channel_key(&EpochKey::new([0x11; 32]), &c, &ch);
+        let key_new = derive_channel_key(&EpochKey::new([0x22; 32]), &c, &ch);
+        let key_bad = derive_channel_key(&EpochKey::new([0x33; 32]), &c, &ch);
+
+        let (payload, sk) = fixture_payload("hello");
+        let ev = sign_channel_event(&payload, &sk).expect("sign");
+        let sealed = encrypt_channel_packet(&key_old, &ev).expect("encrypt");
+
+        let candidates = vec![Arc::new(key_new), Arc::new(key_old)];
+        assert_eq!(
+            decrypt_channel_packet_with_any(&candidates, &sealed).expect("previous rung opens"),
+            ev
+        );
+        assert!(
+            decrypt_channel_packet_with_any(&[Arc::new(key_bad)], &sealed).is_err(),
+            "unrelated key must not open"
+        );
+    }
+
+    /// ZEB-920: same contract for sealed watermark vectors.
+    #[test]
+    fn with_any_previous_candidate_opens_old_sealed_watermark() {
+        use std::sync::Arc;
+        let c = fixture_community(0xc0);
+        let ch = fixture_channel(0x01);
+        let key_old = derive_channel_key(&EpochKey::new([0x11; 32]), &c, &ch);
+        let key_new = derive_channel_key(&EpochKey::new([0x22; 32]), &c, &ch);
+        let key_bad = derive_channel_key(&EpochKey::new([0x33; 32]), &c, &ch);
+
+        let wmv = WatermarkVector::new();
+        let sealed = seal_watermark_vector(&key_old, &wmv).expect("seal");
+
+        let candidates = vec![Arc::new(key_new), Arc::new(key_old)];
+        assert_eq!(
+            open_watermark_vector_with_any(&candidates, &sealed).expect("previous rung opens"),
+            wmv
+        );
+        assert!(open_watermark_vector_with_any(&[Arc::new(key_bad)], &sealed).is_err());
+    }
+
+    /// ZEB-920: same contract for sealed RBSR messages.
+    #[test]
+    fn with_any_previous_candidate_opens_old_sealed_rbsr() {
+        use crate::channel_rbsr::{
+            max_key, RbsrMessage, RbsrMode, RbsrRange, RBSR_PROTOCOL_VERSION,
+        };
+        use std::sync::Arc;
+        let c = fixture_community(0xc0);
+        let ch = fixture_channel(0x01);
+        let key_old = derive_channel_key(&EpochKey::new([0x11; 32]), &c, &ch);
+        let key_new = derive_channel_key(&EpochKey::new([0x22; 32]), &c, &ch);
+        let key_bad = derive_channel_key(&EpochKey::new([0x33; 32]), &c, &ch);
+
+        let msg = RbsrMessage {
+            version: RBSR_PROTOCOL_VERSION,
+            ranges: vec![RbsrRange {
+                upper: max_key(),
+                mode: RbsrMode::Fingerprint([3u8; 16]),
+            }],
+        };
+        let sealed = seal_rbsr_message(&key_old, &msg).expect("seal");
+
+        let candidates = vec![Arc::new(key_new), Arc::new(key_old)];
+        assert_eq!(
+            open_rbsr_message_with_any(&candidates, &sealed).expect("previous rung opens"),
+            msg
+        );
+        assert!(open_rbsr_message_with_any(&[Arc::new(key_bad)], &sealed).is_err());
     }
 
     #[test]
