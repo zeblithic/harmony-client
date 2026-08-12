@@ -12305,6 +12305,29 @@ pub async fn start_node_inner(
                                             s.lock().unwrap_or_else(|p| p.into_inner()).clone()
                                         })
                                     };
+                                        // ZEB-910: proven-traffic lookup for the
+                                        // coverage numerator — the same
+                                        // liveness ⊔ served-registry fusion the
+                                        // network-health snapshot performs
+                                        // (`last_traffic_ms` assembly), as
+                                        // targeted per-node reads.
+                                        let gateway_traffic_evidence: crate::community_gateway_dial_driver::TrafficEvidenceFn = {
+                                            let resolver = reachability_resolver.clone();
+                                            let served = std::sync::Arc::clone(&peer_traffic_registry);
+                                            std::sync::Arc::new(move |node: &[u8; 32]| {
+                                                let live = resolver
+                                                    .liveness()
+                                                    .and_then(|h| h.last_traffic_ms(node));
+                                                let srv = served
+                                                    .stamps(node)
+                                                    .map(|s| s.last_any_served_ms);
+                                                match (live, srv) {
+                                                    (Some(a), Some(b)) => Some(a.max(b)),
+                                                    (a, None) => a,
+                                                    (None, b) => b,
+                                                }
+                                            })
+                                        };
                                         let gateway_driver = std::sync::Arc::new(
                                         crate::community_gateway_dial_driver::CommunityGatewayDialDriver::new(
                                             std::sync::Arc::new(
@@ -12335,6 +12358,7 @@ pub async fn start_node_inner(
                                             ),
                                             std::sync::Arc::new(reachability_resolver.clone()),
                                             gateway_joined,
+                                            gateway_traffic_evidence,
                                         )
                                         .with_telemetry(gateway_bootstrap_telemetry),
                                     );

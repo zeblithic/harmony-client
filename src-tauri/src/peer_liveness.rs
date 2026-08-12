@@ -389,6 +389,15 @@ impl LivenessHandle {
             .collect()
     }
 
+    /// ZEB-910: targeted single-peer read of the traffic-evidence stamp. The
+    /// gateway coverage numerator queries per node-id on every driver pass;
+    /// a full [`views_snapshot`](Self::views_snapshot) per lookup would
+    /// allocate the whole view for one entry.
+    pub fn last_traffic_ms(&self, peer: &[u8; 32]) -> Option<u64> {
+        let slots = self.inner.slots.lock().expect("slots lock");
+        slots.get(peer).and_then(|slot| slot.last_traffic_ms)
+    }
+
     /// Telemetry snapshot of every known peer's liveness view: transport state
     /// plus the state-independent traffic-evidence stamp.
     pub fn views_snapshot(&self) -> Vec<([u8; 32], PeerLivenessView)> {

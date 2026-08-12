@@ -465,7 +465,11 @@ pub enum PeerStaleness {
 /// liveness rx stamp is sampled on the ≤30s RTT tick — so `fresh` means
 /// "traffic demonstrably flowed within the last few minutes". Generous by
 /// design: the tier says "no evidence", not "down".
-const STALENESS_QUIET_MS: u64 = 300_000;
+///
+/// `pub(crate)`: ZEB-910's gateway coverage numerator
+/// (`GATEWAY_PROVEN_TRAFFIC_MS`) deliberately shares this bar — "proven
+/// member" and "fresh peer" must mean the same thing.
+pub(crate) const STALENESS_QUIET_MS: u64 = 300_000;
 
 /// ZEB-804 (spec §6): traffic-evidence age beyond which a peer reads `dark`
 /// (30 min). Derived from the community-relay pull cadence
@@ -632,6 +636,11 @@ pub struct DialHealthSummary {
     /// pre-field snapshot forward-compatible.
     #[serde(default)]
     pub connected_via_registry: u64,
+    /// ZEB-910: lifetime Dormant-parole revivals — monotone since process
+    /// start. Wire key `paroled`; `#[serde(default)]` keeps a pre-field
+    /// snapshot forward-compatible.
+    #[serde(default)]
+    pub paroled: u64,
     pub recent: Vec<DynamicDialHit>,
 }
 
@@ -896,6 +905,9 @@ pub struct DialTelemetry {
     /// bumped only by
     /// [`record_connected_via_registry`](Self::record_connected_via_registry).
     connected_via_registry: AtomicU64,
+    /// ZEB-910: lifetime Dormant-parole revivals (see
+    /// [`record_paroled`](Self::record_paroled)).
+    paroled: AtomicU64,
     recent: Mutex<VecDeque<DynamicDialHit>>,
 }
 
@@ -936,6 +948,13 @@ impl DialTelemetry {
     pub fn record_dormant(&self, node_id: [u8; 32], owner: [u8; 16]) {
         self.push(node_id, owner, "dormant");
     }
+    /// ZEB-910: record a Dormant peer revived by the parole tick — lifetime
+    /// counter + a `"paroled"` ring marker. The dial the revival produces
+    /// counts through the normal dial-outcome counters when it dispatches.
+    pub fn record_paroled(&self, node_id: [u8; 32], owner: [u8; 16]) {
+        self.paroled.fetch_add(1, Ordering::Relaxed);
+        self.push(node_id, owner, "paroled");
+    }
     /// ZEB-804 (spec §8): record one Connected entry established by a registry
     /// swap (inbound accept / zenoh `new_link`) rather than by a
     /// supervisor-ladder dial. Increments `connected_via_registry` and NOTHING
@@ -971,6 +990,7 @@ impl DialTelemetry {
             dormant: 0,
             connected: 0,
             connected_via_registry: self.connected_via_registry.load(Ordering::Relaxed),
+            paroled: self.paroled.load(Ordering::Relaxed),
             recent: self
                 .recent
                 .lock()
@@ -1636,6 +1656,9 @@ pub struct GatewayBootstrapTelemetry {
     resolve_error: AtomicU64,
     rejected_non_member: AtomicU64,
     engine_unregistered: AtomicU64,
+    /// ZEB-910: due Degraded passes that seeded ≥1 beacon (split repair, as
+    /// opposed to `beacons_seeded`'s starved-bootstrap seeding).
+    degraded_seeded: AtomicU64,
     /// community bytes → (last outcome, stamped at). Bounded by the node's
     /// joined-community count (1–2 today); no ring needed.
     per_community: Mutex<HashMap<[u8; 16], (GatewayBootstrapOutcome, u64)>>,
@@ -1679,6 +1702,15 @@ pub enum GatewayBootstrapOutcome {
     /// community — which reads as "we never attempted" and sends an operator
     /// hunting in the rendezvous/pkarr layer instead of at engine registration.
     EngineUnregistered,
+    /// ZEB-910: partial coverage — some members proven by recent traffic, but
+    /// at least one fresh-record member is not. The split signature (or a
+    /// member briefly asleep). Row-only like [`Self::StarvedWaiting`]: this is
+    /// the between-repairs steady state, not an event worth totalling.
+    DegradedWaiting,
+    /// ZEB-910: a due Degraded pass that seeded ≥1 beacon. Counted separately
+    /// from [`Self::BeaconSeeded`] (the starved-pass seeding arm) so
+    /// split-repair activity is distinguishable from bootstrap in the summary.
+    DegradedSeeded,
 }
 
 impl GatewayBootstrapOutcome {
@@ -1692,6 +1724,8 @@ impl GatewayBootstrapOutcome {
             Self::RejectedNonMember => "rejectedNonMember",
             Self::SoloCommunity => "soloCommunity",
             Self::EngineUnregistered => "engineUnregistered",
+            Self::DegradedWaiting => "degradedWaiting",
+            Self::DegradedSeeded => "degradedSeeded",
         }
     }
 }
@@ -1725,8 +1759,12 @@ impl GatewayBootstrapTelemetry {
             GatewayBootstrapOutcome::EngineUnregistered => {
                 self.engine_unregistered.fetch_add(1, Ordering::Relaxed);
             }
+            GatewayBootstrapOutcome::DegradedSeeded => {
+                self.degraded_seeded.fetch_add(1, Ordering::Relaxed);
+            }
             GatewayBootstrapOutcome::Healthy
             | GatewayBootstrapOutcome::StarvedWaiting
+            | GatewayBootstrapOutcome::DegradedWaiting
             | GatewayBootstrapOutcome::SoloCommunity => {}
         }
         self.per_community
@@ -1757,6 +1795,7 @@ impl GatewayBootstrapTelemetry {
             resolve_error: self.resolve_error.load(Ordering::Relaxed),
             rejected_non_member: self.rejected_non_member.load(Ordering::Relaxed),
             engine_unregistered: self.engine_unregistered.load(Ordering::Relaxed),
+            degraded_seeded: self.degraded_seeded.load(Ordering::Relaxed),
             per_community: per,
         }
     }
@@ -1776,6 +1815,10 @@ pub struct GatewayBootstrapHealth {
     pub resolve_error: u64,
     pub rejected_non_member: u64,
     pub engine_unregistered: u64,
+    /// ZEB-910: due Degraded passes that seeded ≥1 beacon. Wire key
+    /// `degradedSeeded`; split-repair activity, distinct from the
+    /// starved-bootstrap `beaconsSeeded`.
+    pub degraded_seeded: u64,
     /// One row per community that has reached a verdict — **not a census of
     /// joined communities**. A community absent here has never been evaluated;
     /// a reader must not treat absence as health.
@@ -8098,6 +8141,7 @@ mod tests {
             dormant: 2,
             connected: 5,
             connected_via_registry: 6,
+            paroled: 7,
             recent: vec![],
         };
         let v = serde_json::to_value(&s).expect("serialize");
@@ -8116,6 +8160,8 @@ mod tests {
         // ZEB-804: exact camelCase key for the registry-swap counter, no
         // snake_case leak past the rename.
         assert_eq!(v["connectedViaRegistry"], 6);
+        // ZEB-910: parole revival counter rides the same summary.
+        assert_eq!(v["paroled"], 7);
         assert!(
             obj.get("connected_via_registry").is_none(),
             "snake key connected_via_registry must not leak"

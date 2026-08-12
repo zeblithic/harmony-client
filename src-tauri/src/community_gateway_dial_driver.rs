@@ -64,64 +64,51 @@ pub trait GatewayDialCtx: Send + Sync {
     async fn enrolled_device_keys_of(&self, community: &SpaceId) -> HashSet<[u8; 32]>;
 }
 
-/// Outcome of one beacon resolve attempt. `ResolveError` means no beacon was
-/// found AND at least one slot probe errored at the pkarr/transport layer —
-/// infrastructure trouble, not proof of absence.
-//
-// large_enum_variant: `Found` carries the full ~248-byte `IdentifiedBeacon`
-// while the miss arms are unit. Deliberate: exactly one short-lived value
-// exists per resolve attempt (never collected, never stored), so the size
-// asymmetry costs nothing, while boxing would add an allocation and an
-// indirection at every match site for no benefit.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
-pub enum BeaconResolution {
-    Found(IdentifiedBeacon),
-    NotFound,
-    ResolveError,
-    /// ZEB-827: a beacon verified transport+epoch but carried no valid
-    /// membership vouch (missing, malformed, stale, bad sig, or a device key
-    /// not in any Joined member's enrolled set). Distinct from `NotFound` (no
-    /// beacon at all) and `ResolveError` (pkarr/transport trouble).
-    RejectedNonMember,
+/// ZEB-910: outcome of one all-slots beacon resolve — every verified hit plus
+/// the probe-error / vouch-reject counts the empty-case classification needs.
+/// `hits` is deduped by `iroh_node_id` (the prod resolver does this); a
+/// nonempty `hits` wins outright — an errored probe on some OTHER slot does
+/// not demote found beacons.
+#[derive(Debug, Clone, Default)]
+pub struct BeaconsOutcome {
+    pub hits: Vec<IdentifiedBeacon>,
+    pub resolve_errors: usize,
+    pub membership_rejects: usize,
 }
 
-/// Pure classification of one identified resolve (review r1 finding 2):
-/// `payload` is the winning beacon, if any; `resolve_errors` counts the slot
-/// probes that failed at the pkarr/transport layer. A hit wins outright — an
-/// errored probe on some OTHER slot does not demote a found beacon. A miss
-/// with zero errors is proof-shaped absence (`NotFound`); a miss with any
-/// errored probe carries no information and must not masquerade as one
-/// (`ResolveError`).
-fn classify_resolution(
-    payload: Option<IdentifiedBeacon>,
-    resolve_errors: usize,
-    membership_rejects: usize,
-) -> BeaconResolution {
-    match payload {
-        Some(hit) => BeaconResolution::Found(hit),
-        // A beacon that was present but failed the membership vouch is more
-        // informative than a probe error — surface it first (ZEB-827).
-        None if membership_rejects > 0 => BeaconResolution::RejectedNonMember,
-        None if resolve_errors > 0 => BeaconResolution::ResolveError,
-        None => BeaconResolution::NotFound,
+/// Pure classification of a hit-less resolve (review r1 finding 2, ZEB-827):
+/// a beacon that was present but failed the membership vouch is more
+/// informative than a probe error, so `RejectedNonMember` wins; a miss with
+/// any errored probe carries no information and must not masquerade as
+/// proof-shaped absence (`ResolveError` vs `NoBeacon`).
+fn classify_empty(resolve_errors: usize, membership_rejects: usize) -> GatewayBootstrapOutcome {
+    if membership_rejects > 0 {
+        GatewayBootstrapOutcome::RejectedNonMember
+    } else if resolve_errors > 0 {
+        GatewayBootstrapOutcome::ResolveError
+    } else {
+        GatewayBootstrapOutcome::NoBeacon
     }
 }
 
 /// The pkarr resolve seam. Prod = [`ProdBeaconResolver`]; tests stub it.
 #[async_trait::async_trait]
 pub trait BeaconResolver: Send + Sync {
-    async fn resolve_beacon(
+    /// ZEB-910: resolve EVERY slot for this epoch key and return every
+    /// verified hit — on a community split the first-found beacon is
+    /// coin-flip likely to be an already-reachable member, so repair must
+    /// see the full slot space to bridge.
+    async fn resolve_beacons(
         &self,
         epoch_key: &EpochKey,
         community_id: SpaceId,
         enrolled_keys: Arc<HashSet<[u8; 32]>>,
         now_ms: u64,
-    ) -> BeaconResolution;
+    ) -> BeaconsOutcome;
 }
 
-/// Production [`BeaconResolver`]: Task 1's identified resolve with the
-/// open-join env-knob config.
+/// Production [`BeaconResolver`]: the ZEB-910 all-slots identified resolve
+/// with the open-join env-knob config.
 pub struct ProdBeaconResolver {
     pub pkarr: Arc<harmony_pkarr::PkarrResolver>,
     pub self_endpoint_id: [u8; 32],
@@ -129,14 +116,14 @@ pub struct ProdBeaconResolver {
 
 #[async_trait::async_trait]
 impl BeaconResolver for ProdBeaconResolver {
-    async fn resolve_beacon(
+    async fn resolve_beacons(
         &self,
         epoch_key: &EpochKey,
         community_id: SpaceId,
         enrolled_keys: Arc<HashSet<[u8; 32]>>,
         now_ms: u64,
-    ) -> BeaconResolution {
-        let res = crate::community_rendezvous::resolve_rendezvous_identified(
+    ) -> BeaconsOutcome {
+        let res = crate::community_rendezvous::resolve_rendezvous_all_slots(
             &self.pkarr,
             epoch_key,
             self.self_endpoint_id,
@@ -146,11 +133,11 @@ impl BeaconResolver for ProdBeaconResolver {
             &rendezvous_config_from_env(),
         )
         .await;
-        classify_resolution(
-            res.outcome.payload,
-            res.resolve_errors,
-            res.membership_rejects,
-        )
+        BeaconsOutcome {
+            hits: res.hits,
+            resolve_errors: res.resolve_errors,
+            membership_rejects: res.membership_rejects,
+        }
     }
 }
 
@@ -264,11 +251,113 @@ struct LadderState {
 
 type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 
+/// ZEB-910: proven-traffic lookup — the fused per-node stamp
+/// (`max(peer-liveness rx app-frame stamp, PeerTrafficRegistry
+/// last_any_served_ms)`, the same fusion `network_health` snapshots). `None`
+/// = no evidence exists, which MUST read as unproven — a peer with no
+/// traffic evidence is exactly what the coverage measure exists to catch.
+pub type TrafficEvidenceFn = Arc<dyn Fn(&[u8; 32]) -> Option<u64> + Send + Sync>;
+
+/// ZEB-910: traffic-evidence age within which a member counts as PROVEN (the
+/// coverage numerator). Shares `network_health`'s "fresh" staleness bar:
+/// zenoh keeps per-link keepalives flowing as QUIC stream data, so any live
+/// link shows rx app frames continuously — >5 min of rx silence on a
+/// supposedly-connected link is genuinely anomalous (blackhole, wedge,
+/// split). Deliberately NOT session existence (ZEB-805: count evidence, not
+/// sessions — a blackholed-but-unclosed conn reads Connected forever).
+pub const GATEWAY_PROVEN_TRAFFIC_MS: u64 = crate::network_health::STALENESS_QUIET_MS;
+
+/// ZEB-910: record-freshness bar for the coverage DENOMINATOR — a member
+/// whose freshest dial-view row is older than this is expected-unreachable
+/// (they stopped announcing), not split evidence. Shares the pkarr
+/// stale-refresh window. During a real split the repair's forced refresh
+/// keeps re-pulling the member's still-fresh relay record, so they stay in
+/// the denominator for as long as they keep publishing — the relay is the
+/// arbiter of "should be reachable".
+pub const GATEWAY_COVERAGE_RECORD_FRESH_MS: u64 =
+    crate::reachability_resolver::STALE_RECORD_REFRESH_MS;
+
+/// One dial-view row, reduced to what the coverage measure needs.
+struct PeerRow {
+    node_id: [u8; 32],
+    effective_announced_at_ms: u64,
+}
+
+/// ZEB-910: per-community coverage verdict (spec §3.1).
+#[derive(Debug)]
+enum CoverageVerdict {
+    /// Every fresh-record member is proven by recent traffic.
+    Healthy,
+    /// Some members proven, but ≥1 fresh-record member is not — the split
+    /// signature (or a member briefly asleep). Repair runs on the ladder.
+    Degraded { unproven: Vec<OwnerAddr> },
+    /// NO member is proven by recent traffic — the original ZEB-824 starved
+    /// shape, now measured by evidence instead of session existence.
+    Starved,
+}
+
+/// Pure coverage classification over one community's members (spec §3.1).
+///
+/// - proven (numerator): any dial-view row's node shows traffic within
+///   [`GATEWAY_PROVEN_TRAFFIC_MS`]. Row freshness is irrelevant for
+///   attribution — a member proven via a stale row still counts.
+/// - eligible (denominator): any row fresh under
+///   [`GATEWAY_COVERAGE_RECORD_FRESH_MS`]. Members with NO rows are neither
+///   proven nor eligible: they can't hold the community Degraded (a
+///   long-offline member is expected-unreachable), but repair passes still
+///   attempt discovery for them (run_one_pass action 3).
+///
+/// DELIBERATE (PR #659 review, Qodo): `P == ∅` reads Starved even when the
+/// eligible set is ALSO empty (every row stale). That state is
+/// indistinguishable from the ZEB-824 cold boot — a node offline past the
+/// freshness window whose only path back in IS the beacon repair — so
+/// returning Healthy there would strand exactly the case the driver exists
+/// for. The cost for a genuinely dead community is the pre-existing ZEB-824
+/// posture: one ladder-capped (10 min) repair pass, cooldown-bounded, for
+/// process life.
+fn coverage_verdict(
+    members: &[OwnerAddr],
+    rows_by_owner: &HashMap<OwnerAddr, Vec<PeerRow>>,
+    traffic: &TrafficEvidenceFn,
+    now_ms: u64,
+) -> CoverageVerdict {
+    let mut any_proven = false;
+    let mut unproven: Vec<OwnerAddr> = Vec::new();
+    for m in members {
+        let Some(rows) = rows_by_owner.get(m) else {
+            continue;
+        };
+        let proven = rows.iter().any(|r| {
+            traffic(&r.node_id)
+                .is_some_and(|t| now_ms.saturating_sub(t) <= GATEWAY_PROVEN_TRAFFIC_MS)
+        });
+        if proven {
+            any_proven = true;
+            continue;
+        }
+        let eligible = rows.iter().any(|r| {
+            now_ms.saturating_sub(r.effective_announced_at_ms) <= GATEWAY_COVERAGE_RECORD_FRESH_MS
+        });
+        if eligible {
+            unproven.push(*m);
+        }
+    }
+    if !any_proven {
+        return CoverageVerdict::Starved;
+    }
+    if !unproven.is_empty() {
+        return CoverageVerdict::Degraded { unproven };
+    }
+    CoverageVerdict::Healthy
+}
+
 pub struct CommunityGatewayDialDriver {
     ctx: Arc<dyn GatewayDialCtx>,
     beacons: Arc<dyn BeaconResolver>,
     reachability: Arc<ReachabilityResolver>,
     joined_communities: JoinedCommunitiesFn,
+    /// ZEB-910: proven-traffic lookup for the coverage numerator.
+    traffic_evidence: TrafficEvidenceFn,
     wake: Arc<Notify>,
     interval: Duration,
     telemetry: Option<Arc<GatewayBootstrapTelemetry>>,
@@ -282,12 +371,14 @@ impl CommunityGatewayDialDriver {
         beacons: Arc<dyn BeaconResolver>,
         reachability: Arc<ReachabilityResolver>,
         joined_communities: JoinedCommunitiesFn,
+        traffic_evidence: TrafficEvidenceFn,
     ) -> Self {
         Self {
             ctx,
             beacons,
             reachability,
             joined_communities,
+            traffic_evidence,
             wake: Arc::new(Notify::new()),
             interval: Duration::from_millis(GATEWAY_DIAL_TICK_MS),
             telemetry: None,
@@ -350,31 +441,22 @@ impl CommunityGatewayDialDriver {
             t.record_pass_start();
         }
         let now_ms = (self.now_fn)();
-        // Connected node-ids, once per pass. No supervisor (pre-install race,
-        // spec §6) ⇒ empty set: starved verdicts still stand, kicks skipped.
-        let connected: HashSet<[u8; 32]> = self
-            .reachability
-            .supervisor()
-            .map(|s| {
-                s.states_snapshot()
-                    .into_iter()
-                    .filter(|(_, st)| matches!(st, PeerStateWire::Connected { .. }))
-                    .map(|(id, _)| id)
-                    .collect()
-            })
-            .unwrap_or_default();
-        // Owners holding at least ONE connected device, once per pass. Folding
-        // the dial view down to owner→single-node first would misjudge a
-        // multi-device member: `list_dialable_peers` yields one row per
-        // (owner, node_id), so a same-owner row for an idle device can displace
-        // the connected device's row and read as starvation.
-        let connected_owners: HashSet<OwnerAddr> = self
-            .reachability
-            .list_dialable_peers()
-            .into_iter()
-            .filter(|(_, entry)| connected.contains(&entry.payload.iroh_node_id))
-            .map(|(owner, _)| owner)
-            .collect();
+        // ZEB-910: the dial view, once per pass — owner → rows. Feeds the
+        // coverage denominator (row freshness) and traffic attribution (row
+        // node-ids). One row per (owner, device), so a multi-device member is
+        // judged by their best device (the ZEB-702 lesson: folding to
+        // owner→single-node first lets an idle device's row displace the live
+        // one). The numerator deliberately does NOT read supervisor
+        // `Connected` state: that is registry occupancy, cleared only by
+        // `conn.closed()` — a blackholed conn reads Connected forever
+        // (ZEB-804/805), which is exactly the lie coverage exists to catch.
+        let mut rows_by_owner: HashMap<OwnerAddr, Vec<PeerRow>> = HashMap::new();
+        for (owner, entry) in self.reachability.list_dialable_peers() {
+            rows_by_owner.entry(owner).or_default().push(PeerRow {
+                node_id: entry.payload.iroh_node_id,
+                effective_announced_at_ms: entry.effective_announced_at_ms,
+            });
+        }
 
         let joined = (self.joined_communities)();
         {
@@ -432,26 +514,47 @@ impl CommunityGatewayDialDriver {
                 self.record(&community, GatewayBootstrapOutcome::SoloCommunity);
                 continue;
             }
-            if members.iter().any(|m| connected_owners.contains(m)) {
-                let healed = self
-                    .ladders
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&community)
-                    .is_some();
-                if healed {
-                    tracing::info!(community = ?community, "ZEB-824: community healed — member session live, bootstrap ladder reset");
+            // ZEB-910: three-state coverage verdict replaces the old
+            // any-member-connected predicate (which read Healthy on both
+            // sides of a two-island split — every node has an intra-island
+            // session).
+            let unproven = match coverage_verdict(
+                &members,
+                &rows_by_owner,
+                &self.traffic_evidence,
+                now_ms,
+            ) {
+                CoverageVerdict::Healthy => {
+                    let healed = self
+                        .ladders
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&community)
+                        .is_some();
+                    if healed {
+                        tracing::info!(community = ?community, "ZEB-910: community healed — full member coverage, bootstrap ladder reset");
+                    }
+                    self.record(&community, GatewayBootstrapOutcome::Healthy);
+                    continue;
                 }
-                self.record(&community, GatewayBootstrapOutcome::Healthy);
-                continue;
-            }
-            // Starved. Due per the per-community ladder?
+                CoverageVerdict::Degraded { unproven } => Some(unproven),
+                CoverageVerdict::Starved => None,
+            };
+            let degraded = unproven.is_some();
+            // Non-Healthy. Due per the per-community ladder? (One ladder for
+            // both flavors: a Starved↔Degraded transition mid-episode keeps
+            // its backoff — the episode is "coverage incomplete", not the
+            // specific flavor.)
             let due = {
                 let mut ladders = self.ladders.lock().unwrap_or_else(|p| p.into_inner());
                 match ladders.get_mut(&community) {
                     None => {
-                        // First starved sighting: attempt NOW, arm the base delay.
-                        tracing::info!(community = ?community, "ZEB-824: community starved — no live member session; resolving rendezvous beacon");
+                        // First non-Healthy sighting: attempt NOW, arm the base delay.
+                        if degraded {
+                            tracing::info!(community = ?community, "ZEB-910: community coverage degraded — unproven fresh-record members; running split repair");
+                        } else {
+                            tracing::info!(community = ?community, "ZEB-824: community starved — no proven member; resolving rendezvous beacon");
+                        }
                         ladders.insert(
                             community,
                             LadderState {
@@ -470,8 +573,75 @@ impl CommunityGatewayDialDriver {
                 }
             };
             if !due {
-                self.record(&community, GatewayBootstrapOutcome::StarvedWaiting);
+                self.record(
+                    &community,
+                    if degraded {
+                        GatewayBootstrapOutcome::DegradedWaiting
+                    } else {
+                        GatewayBootstrapOutcome::StarvedWaiting
+                    },
+                );
                 continue;
+            }
+            // ZEB-910 repair actions 2-4 (spec §3.3), BEFORE the beacon
+            // resolve so the record refreshes overlap the resolve's network
+            // time. Targets: the unproven set when Degraded; every member
+            // with rows when Starved.
+            let refresh_targets: Vec<OwnerAddr> = match &unproven {
+                Some(u) => u.clone(),
+                None => members
+                    .iter()
+                    .filter(|m| rows_by_owner.contains_key(*m))
+                    .copied()
+                    .collect(),
+            };
+            // (2) Member-record refresh — the member-keyed pkarr path, the
+            // robust cross-island discovery channel (per-owner keys, no slot
+            // contention) and what keeps a still-publishing split member in
+            // the coverage denominator. Sync + fire-and-forget internally;
+            // `refresh_if_older_than` keeps every abuse guard (per-owner
+            // cooldown, fleet-sibling skip, refresh semaphore) — only the
+            // staleness bar drops to the ladder cap.
+            for owner in &refresh_targets {
+                for row in rows_by_owner.get(owner).into_iter().flatten() {
+                    self.reachability.refresh_if_older_than(
+                        *owner,
+                        row.node_id,
+                        now_ms,
+                        GATEWAY_DIAL_RETRY_CAP_MS,
+                    );
+                }
+            }
+            // (3) Record-less member discovery, bounded inside the resolver
+            // (PR #659 review): per-owner cooldown + the SAME refresh
+            // semaphore the stale-refresh path uses, so a mostly-record-less
+            // community cannot fan out unbounded pkarr fetches. Sync call;
+            // the network fetch runs in the resolver's spawned task — the
+            // pass never blocks on pkarr. Fires only while the community is
+            // non-Healthy (this pass is ladder-paced).
+            for owner in members.iter().filter(|m| !rows_by_owner.contains_key(*m)) {
+                self.reachability.discover_record_less(*owner);
+            }
+            // (4) Revive ONLY Dormant slots of the target set. Retrying peers
+            // keep their ladders (re-arming live backoff every repair pass
+            // would multiply dial pressure for nothing — they are already
+            // trying); absent slots need no kick, because a record write
+            // auto-kicks NewPeer/RecordChanged through the resolver's
+            // supervisor hooks.
+            if let Some(sup) = self.reachability.supervisor() {
+                let dormant: HashSet<[u8; 32]> = sup
+                    .states_snapshot()
+                    .into_iter()
+                    .filter(|(_, st)| matches!(st, PeerStateWire::Dormant { .. }))
+                    .map(|(id, _)| id)
+                    .collect();
+                for owner in &refresh_targets {
+                    for row in rows_by_owner.get(owner).into_iter().flatten() {
+                        if dormant.contains(&row.node_id) {
+                            sup.kick(row.node_id, ReconnectTrigger::RecordChanged);
+                        }
+                    }
+                }
             }
             // Ladder semantics are identical for both miss flavors: the rung
             // was already consumed before the resolve, and an errored attempt
@@ -482,96 +652,117 @@ impl CommunityGatewayDialDriver {
             // widens); if a beacon WAS present but rejected, the resolve returns
             // `RejectedNonMember`.
             let enrolled_keys = Arc::new(self.ctx.enrolled_device_keys_of(&community).await);
-            // ZEB-918: try candidates in order (live current first, previous
-            // epoch second); stop at the first live beacon. When nothing is
-            // found, the CURRENT-key attempt's outcome is recorded — it is
-            // the canonical health signal, and the previous-key attempt
-            // exists only to heal rotation skew (finding not-yet-rotated
-            // members so the rotation event itself can reach them), so it
-            // must not mask current-key telemetry. A candidate attempt that
-            // finds a beacon always wins — including over a current-key
-            // RejectedNonMember, which condemns one publisher's bad vouch,
-            // not the whole previous-epoch audience.
-            let mut resolution = BeaconResolution::NotFound;
+            // ZEB-918 + PR #659 review (CodeAnt/Greptile convergent finding):
+            // scan EVERY candidate key (live current first, previous epoch
+            // second) and MERGE the hits, deduped by node id with the
+            // earlier-candidate beacon winning. A rotation-straddling split
+            // publishes the un-rotated island's beacons ONLY under the
+            // previous key, so stopping at the first candidate with hits
+            // could keep seeding the already-reachable island forever and
+            // never bridge. Cost: one extra all-slots scan per DUE repair
+            // pass while a rotation archive exists — repair passes are
+            // ladder-paced (30s→10min) and only run while non-Healthy, so
+            // this is bounded, not steady-state. Telemetry: when EVERY
+            // candidate is empty, the CURRENT-key attempt's outcome is
+            // recorded — it is the canonical health signal, and the
+            // previous-key attempt exists only to heal rotation skew, so it
+            // must not mask it (a previous-key ResolveError never upgrades a
+            // current-key NotFound; a current-key RejectedNonMember condemns
+            // one publisher's bad vouch, not the previous-epoch audience).
+            let mut outcome_when_empty = GatewayBootstrapOutcome::NoBeacon;
+            let mut hits: Vec<IdentifiedBeacon> = Vec::new();
+            let mut seen_nodes: HashSet<[u8; 32]> = HashSet::new();
             for (i, candidate) in epoch_keys.iter().enumerate() {
                 let attempt = self
                     .beacons
-                    .resolve_beacon(candidate, community, Arc::clone(&enrolled_keys), now_ms)
+                    .resolve_beacons(candidate, community, Arc::clone(&enrolled_keys), now_ms)
                     .await;
-                let found = matches!(attempt, BeaconResolution::Found(_));
-                if i == 0 || found {
-                    resolution = attempt;
+                if i == 0 {
+                    outcome_when_empty =
+                        classify_empty(attempt.resolve_errors, attempt.membership_rejects);
                 }
-                if found {
-                    break;
+                for hit in attempt.hits {
+                    if seen_nodes.insert(hit.payload.iroh_node_id) {
+                        hits.push(hit);
+                    }
                 }
             }
-            let hit = match resolution {
-                BeaconResolution::Found(hit) => hit,
-                BeaconResolution::RejectedNonMember => {
-                    self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
-                    continue;
-                }
-                BeaconResolution::NotFound => {
-                    self.record(&community, GatewayBootstrapOutcome::NoBeacon);
-                    continue;
-                }
-                BeaconResolution::ResolveError => {
-                    self.record(&community, GatewayBootstrapOutcome::ResolveError);
-                    continue;
-                }
-            };
-            // CR-2 (TOCTOU): the vouch was verified against the enrolled snapshot
-            // taken BEFORE the async resolve. Re-validate the beacon's device key
-            // against a FRESH snapshot now — if it was revoked while we resolved,
-            // the stale accept must not reach seed/kick. This narrows the
-            // check→use window to microseconds; revocation propagation itself
-            // remains eventually-consistent, and post-session data is gated by
-            // per-event enrollment checks regardless.
+            if hits.is_empty() {
+                self.record(&community, outcome_when_empty);
+                continue;
+            }
+            // CR-2 (TOCTOU): each vouch was verified against the enrolled
+            // snapshot taken BEFORE the async resolve. Re-validate every hit's
+            // device key against ONE fresh snapshot now — if it was revoked
+            // while we resolved, the stale accept must not reach seed/kick.
+            // This narrows the check→use window to microseconds; revocation
+            // propagation itself remains eventually-consistent, and
+            // post-session data is gated by per-event enrollment checks
+            // regardless.
             let fresh_enrolled = self.ctx.enrolled_device_keys_of(&community).await;
-            if !fresh_enrolled.contains(&hit.membership_device_vk) {
+            // ZEB-910: seed EVERY hit that survives re-validation — under a
+            // split, any one of them may be the only bridge to the other
+            // island, and seeding an already-reachable member is an idempotent
+            // no-op at the resolver.
+            let mut seeded = 0usize;
+            for hit in hits {
+                if !fresh_enrolled.contains(&hit.membership_device_vk) {
+                    tracing::debug!(
+                        community = ?community,
+                        "ZEB-827: beacon device key revoked during resolve — not seeding"
+                    );
+                    continue;
+                }
+                let Ok(identity) =
+                    harmony_identity::Identity::from_public_bytes(&hit.beacon_identity_pub)
+                else {
+                    // Unreachable on the prod path: `PkarrResolver::resolve`
+                    // already parsed this same Ed25519 half to verify the inner
+                    // signature, so a record reaching here unparseable means a
+                    // wire/publisher bug (or a non-prod `BeaconResolver`),
+                    // never an attacker.
+                    tracing::warn!(
+                        community = ?community,
+                        node_id = %hex::encode(&hit.payload.iroh_node_id[..8]),
+                        "ZEB-827: beacon identity failed to decode — record passed inner-sig verification but its identity bytes are unparseable"
+                    );
+                    continue;
+                };
+                // ZEB-827: the beacon carried a membership vouch verified in
+                // `resolve_slot` against this community's enrolled device keys,
+                // so it belongs to a Joined member. Seed as before — under the
+                // composite device-address owner with the `[0u8;16]`
+                // device-hash placeholder (invite-path parity). The seed-owner
+                // "split" that ZEB-704's `freshest_across_owners` view already
+                // tolerates is a low-value, ReachabilityResolver-internal
+                // follow-up (ZEB-824 spec §9), out of scope here too.
+                let beacon_owner = OwnerAddr(identity.address_hash);
+                let node_id = hit.payload.iroh_node_id;
+                self.reachability
+                    .seed_from_pkarr(beacon_owner, DeviceIdentityHash([0u8; 16]), hit.payload)
+                    .await;
+                if let Some(sup) = self.reachability.supervisor() {
+                    // Explicit kick: idempotent with the seed's auto-kick (the
+                    // dirty set coalesces; NewPeer either way).
+                    sup.kick(node_id, ReconnectTrigger::NewPeer);
+                }
+                seeded += 1;
+                tracing::info!(community = ?community, node_id = %hex::encode(&node_id[..8]), "ZEB-827: vouch-verified rendezvous beacon seeded — reconnect supervisor kicked");
+            }
+            if seeded == 0 {
+                // Every hit fell to CR-2 revalidation (or the unreachable
+                // identity-decode arm) — the present-but-not-a-member shape.
                 self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
-                tracing::debug!(
-                    community = ?community,
-                    "ZEB-827: beacon device key revoked during resolve — not seeding"
-                );
                 continue;
             }
-            let Ok(identity) =
-                harmony_identity::Identity::from_public_bytes(&hit.beacon_identity_pub)
-            else {
-                // Unreachable on the prod path: `PkarrResolver::resolve` already
-                // parsed this same Ed25519 half to verify the inner signature,
-                // so a record reaching here unparseable means a wire/publisher
-                // bug (or a non-prod `BeaconResolver`), never an attacker.
-                tracing::warn!(
-                    community = ?community,
-                    node_id = %hex::encode(&hit.payload.iroh_node_id[..8]),
-                    "ZEB-827: beacon identity failed to decode — record passed inner-sig verification but its identity bytes are unparseable"
-                );
-                self.record(&community, GatewayBootstrapOutcome::RejectedNonMember);
-                continue;
-            };
-            // ZEB-827: the beacon carried a membership vouch verified in
-            // `resolve_slot` against this community's enrolled device keys, so
-            // it belongs to a Joined member. Seed as before — under the
-            // composite device-address owner with the `[0u8;16]` device-hash
-            // placeholder (invite-path parity). The seed-owner "split" that
-            // ZEB-704's `freshest_across_owners` view already tolerates is a
-            // low-value, ReachabilityResolver-internal follow-up (spec §9), out
-            // of scope for this binding change.
-            let beacon_owner = OwnerAddr(identity.address_hash);
-            let node_id = hit.payload.iroh_node_id;
-            self.reachability
-                .seed_from_pkarr(beacon_owner, DeviceIdentityHash([0u8; 16]), hit.payload)
-                .await;
-            if let Some(sup) = self.reachability.supervisor() {
-                // Explicit kick: idempotent with the seed's auto-kick (the
-                // dirty set coalesces; NewPeer either way).
-                sup.kick(node_id, ReconnectTrigger::NewPeer);
-            }
-            self.record(&community, GatewayBootstrapOutcome::BeaconSeeded);
-            tracing::info!(community = ?community, "ZEB-827: vouch-verified rendezvous beacon seeded — reconnect supervisor kicked");
+            self.record(
+                &community,
+                if degraded {
+                    GatewayBootstrapOutcome::DegradedSeeded
+                } else {
+                    GatewayBootstrapOutcome::BeaconSeeded
+                },
+            );
         }
     }
 
@@ -677,12 +868,43 @@ mod tests {
         }
     }
 
+    /// ZEB-910: outcome DSL for the stubs — the old single-hit
+    /// `BeaconResolution` arms expressed as `BeaconsOutcome` values, so the
+    /// pre-existing tests read the same.
+    fn found(hit: IdentifiedBeacon) -> BeaconsOutcome {
+        BeaconsOutcome {
+            hits: vec![hit],
+            ..Default::default()
+        }
+    }
+    fn found_all(hits: Vec<IdentifiedBeacon>) -> BeaconsOutcome {
+        BeaconsOutcome {
+            hits,
+            ..Default::default()
+        }
+    }
+    fn not_found() -> BeaconsOutcome {
+        BeaconsOutcome::default()
+    }
+    fn resolve_error() -> BeaconsOutcome {
+        BeaconsOutcome {
+            resolve_errors: 1,
+            ..Default::default()
+        }
+    }
+    fn rejected_non_member() -> BeaconsOutcome {
+        BeaconsOutcome {
+            membership_rejects: 1,
+            ..Default::default()
+        }
+    }
+
     struct StubBeacons {
-        resolution: Mutex<BeaconResolution>,
+        resolution: Mutex<BeaconsOutcome>,
         /// ZEB-918: per-epoch-key overrides (by key bytes). A key with no
         /// entry falls back to the global `resolution`, so pre-ZEB-918
         /// single-key tests are unaffected.
-        by_key: Mutex<HashMap<[u8; 32], BeaconResolution>>,
+        by_key: Mutex<HashMap<[u8; 32], BeaconsOutcome>>,
         calls: AtomicU64,
         /// ZEB-918: epoch keys in probe order, for candidate-order pins.
         key_log: Mutex<Vec<[u8; 32]>>,
@@ -691,8 +913,8 @@ mod tests {
     impl StubBeacons {
         fn new(hit: Option<IdentifiedBeacon>) -> Self {
             let resolution = match hit {
-                Some(h) => BeaconResolution::Found(h),
-                None => BeaconResolution::NotFound,
+                Some(h) => found(h),
+                None => not_found(),
             };
             Self {
                 resolution: Mutex::new(resolution),
@@ -701,12 +923,12 @@ mod tests {
                 key_log: Mutex::new(Vec::new()),
             }
         }
-        /// Swap the stubbed resolution mid-test (e.g. to `ResolveError`).
-        fn set_resolution(&self, r: BeaconResolution) {
+        /// Swap the stubbed resolution mid-test (e.g. to `resolve_error()`).
+        fn set_resolution(&self, r: BeaconsOutcome) {
             *self.resolution.lock().unwrap() = r;
         }
         /// ZEB-918: stub a per-key resolution (keyed by epoch-key bytes).
-        fn set_resolution_for_key(&self, key: [u8; 32], r: BeaconResolution) {
+        fn set_resolution_for_key(&self, key: [u8; 32], r: BeaconsOutcome) {
             self.by_key.lock().unwrap().insert(key, r);
         }
         fn calls(&self) -> u64 {
@@ -720,13 +942,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl BeaconResolver for StubBeacons {
-        async fn resolve_beacon(
+        async fn resolve_beacons(
             &self,
             k: &EpochKey,
             _community: SpaceId,
             _enrolled: Arc<HashSet<[u8; 32]>>,
             _now: u64,
-        ) -> BeaconResolution {
+        ) -> BeaconsOutcome {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.key_log.lock().unwrap().push(*k.as_bytes());
             if let Some(r) = self.by_key.lock().unwrap().get(k.as_bytes()) {
@@ -871,12 +1093,23 @@ mod tests {
 
     /// Everything a pass-level test needs: the driver plus the handles its
     /// assertions read.
+    /// ZEB-910: shared node-id → proven-traffic-stamp map backing the test
+    /// driver's [`TrafficEvidenceFn`].
+    type TrafficMap = Arc<Mutex<HashMap<[u8; 32], u64>>>;
+
+    fn traffic_fn(map: &TrafficMap) -> TrafficEvidenceFn {
+        let map = Arc::clone(map);
+        Arc::new(move |node: &[u8; 32]| map.lock().unwrap().get(node).copied())
+    }
+
     struct Harness {
         driver: CommunityGatewayDialDriver,
         beacons: Arc<StubBeacons>,
         resolver: Arc<ReachabilityResolver>,
         ctx: Arc<StubCtx>,
         telemetry: Arc<GatewayBootstrapTelemetry>,
+        /// ZEB-910: stamp a node here to make its owner PROVEN at `now`.
+        traffic: TrafficMap,
     }
 
     /// Build a driver over one community with `members`, an epoch key (unless
@@ -901,11 +1134,13 @@ mod tests {
         let ctx = Arc::new(StubCtx::new(HashMap::from([(community, members)]), keys));
         let beacons = Arc::new(StubBeacons::new(hit));
         let telemetry = Arc::new(GatewayBootstrapTelemetry::new());
+        let traffic: TrafficMap = Arc::new(Mutex::new(HashMap::new()));
         let driver = CommunityGatewayDialDriver::new(
             Arc::clone(&ctx) as Arc<dyn GatewayDialCtx>,
             Arc::clone(&beacons) as Arc<dyn BeaconResolver>,
             Arc::clone(&resolver),
             Arc::new(move || vec![community]),
+            traffic_fn(&traffic),
         )
         .with_telemetry(Arc::clone(&telemetry));
         Harness {
@@ -914,6 +1149,7 @@ mod tests {
             resolver,
             ctx,
             telemetry,
+            traffic,
         }
     }
 
@@ -974,6 +1210,505 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // ZEB-910: multi-hit seeding — under a split, any one hit may be the only
+    // bridge to the other island, so a due pass seeds EVERY verified hit.
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn due_pass_seeds_every_verified_hit_and_kicks_each() {
+        let community = SpaceId([0x12; 16]);
+        let (member_a_pub, member_a) = test_member(2);
+        let (member_b_pub, member_b) = test_member(3);
+        let node_a = [0x2D; 32];
+        let node_b = [0x2E; 32];
+        let handle = SupervisorHandle::new();
+        let h = harness(
+            community,
+            vec![member_a, member_b],
+            None,
+            true,
+            Some(handle.clone()),
+        );
+        h.beacons.set_resolution(found_all(vec![
+            beacon(member_a_pub, node_a),
+            beacon(member_b_pub, node_b),
+        ]));
+
+        h.driver.run_one_pass().await;
+
+        assert!(
+            h.resolver.resolve_by_node_id(&node_a).is_some(),
+            "hit A seeded"
+        );
+        assert!(
+            h.resolver.resolve_by_node_id(&node_b).is_some(),
+            "hit B seeded"
+        );
+        assert_eq!(
+            handle.pending_trigger(node_a),
+            Some(ReconnectTrigger::NewPeer)
+        );
+        assert_eq!(
+            handle.pending_trigger(node_b),
+            Some(ReconnectTrigger::NewPeer)
+        );
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("beaconSeeded")
+        );
+        assert_eq!(
+            h.telemetry.summary().beacons_seeded,
+            1,
+            "one seeded PASS is one count, not one per hit"
+        );
+    }
+
+    /// ZEB-910 + CR-2: the fresh-enrollment revalidation filters PER HIT — a
+    /// revoked co-resolved beacon must neither seed nor take down its valid
+    /// sibling, and one surviving hit still makes the pass a seeded pass.
+    #[tokio::test]
+    async fn cr2_revalidation_filters_per_hit_not_per_pass() {
+        let community = SpaceId([0x13; 16]);
+        let (member_a_pub, member_a) = test_member(4);
+        let (member_b_pub, member_b) = test_member(5);
+        let node_a = [0x3D; 32];
+        let node_b = [0x3E; 32];
+        let handle = SupervisorHandle::new();
+        let h = harness(
+            community,
+            vec![member_a, member_b],
+            None,
+            true,
+            Some(handle.clone()),
+        );
+        h.beacons.set_resolution(found_all(vec![
+            beacon(member_a_pub, node_a),
+            // Vouched under a key StubCtx does NOT report as enrolled — the
+            // revoked-during-resolve shape.
+            beacon_with_device_vk(member_b_pub, node_b, [0x66; 32]),
+        ]));
+
+        h.driver.run_one_pass().await;
+
+        assert!(
+            h.resolver.resolve_by_node_id(&node_a).is_some(),
+            "the valid hit must seed"
+        );
+        assert!(
+            h.resolver.resolve_by_node_id(&node_b).is_none(),
+            "the revoked hit must not seed"
+        );
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("beaconSeeded"),
+            "≥1 surviving hit makes the pass a seeded pass"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ZEB-910: pure coverage-verdict classification (spec §3.1).
+    // ------------------------------------------------------------------
+
+    fn row_at(node: [u8; 32], announced: u64) -> PeerRow {
+        PeerRow {
+            node_id: node,
+            effective_announced_at_ms: announced,
+        }
+    }
+
+    fn static_traffic(entries: &[([u8; 32], u64)]) -> TrafficEvidenceFn {
+        let map: HashMap<[u8; 32], u64> = entries.iter().copied().collect();
+        Arc::new(move |n: &[u8; 32]| map.get(n).copied())
+    }
+
+    const V_NOW: u64 = 1_700_000_000_000;
+
+    #[test]
+    fn verdict_all_proven_is_healthy() {
+        let (a, b) = (OwnerAddr([1; 16]), OwnerAddr([2; 16]));
+        let rows = HashMap::from([
+            (a, vec![row_at([0xA1; 32], V_NOW - 1_000)]),
+            (b, vec![row_at([0xB1; 32], V_NOW - 1_000)]),
+        ]);
+        let traffic = static_traffic(&[([0xA1; 32], V_NOW - 500), ([0xB1; 32], V_NOW - 500)]);
+        assert!(matches!(
+            coverage_verdict(&[a, b], &rows, &traffic, V_NOW),
+            CoverageVerdict::Healthy
+        ));
+    }
+
+    #[test]
+    fn verdict_fresh_record_unproven_member_is_degraded() {
+        let (a, b) = (OwnerAddr([1; 16]), OwnerAddr([2; 16]));
+        let rows = HashMap::from([
+            (a, vec![row_at([0xA1; 32], V_NOW - 1_000)]),
+            (b, vec![row_at([0xB1; 32], V_NOW - 1_000)]),
+        ]);
+        // B's traffic stamp is just past the proven window.
+        let traffic = static_traffic(&[
+            ([0xA1; 32], V_NOW - 500),
+            ([0xB1; 32], V_NOW - GATEWAY_PROVEN_TRAFFIC_MS - 1),
+        ]);
+        match coverage_verdict(&[a, b], &rows, &traffic, V_NOW) {
+            CoverageVerdict::Degraded { unproven } => assert_eq!(unproven, vec![b]),
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verdict_stale_record_member_is_not_split_evidence() {
+        // B stopped announcing >24h ago: expected-unreachable, not a split.
+        let (a, b) = (OwnerAddr([1; 16]), OwnerAddr([2; 16]));
+        let rows = HashMap::from([
+            (a, vec![row_at([0xA1; 32], V_NOW - 1_000)]),
+            (
+                b,
+                vec![row_at(
+                    [0xB1; 32],
+                    V_NOW - GATEWAY_COVERAGE_RECORD_FRESH_MS - 1,
+                )],
+            ),
+        ]);
+        let traffic = static_traffic(&[([0xA1; 32], V_NOW - 500)]);
+        assert!(matches!(
+            coverage_verdict(&[a, b], &rows, &traffic, V_NOW),
+            CoverageVerdict::Healthy
+        ));
+    }
+
+    #[test]
+    fn verdict_record_less_member_is_not_split_evidence() {
+        let (a, b) = (OwnerAddr([1; 16]), OwnerAddr([2; 16]));
+        let rows = HashMap::from([(a, vec![row_at([0xA1; 32], V_NOW - 1_000)])]);
+        let traffic = static_traffic(&[([0xA1; 32], V_NOW - 500)]);
+        assert!(matches!(
+            coverage_verdict(&[a, b], &rows, &traffic, V_NOW),
+            CoverageVerdict::Healthy
+        ));
+    }
+
+    #[test]
+    fn verdict_zero_proven_is_starved() {
+        // Fresh records all around, but nobody has traffic evidence — the
+        // original starved shape, and the connected-but-dark community too.
+        let (a, b) = (OwnerAddr([1; 16]), OwnerAddr([2; 16]));
+        let rows = HashMap::from([
+            (a, vec![row_at([0xA1; 32], V_NOW - 1_000)]),
+            (b, vec![row_at([0xB1; 32], V_NOW - 1_000)]),
+        ]);
+        let traffic = static_traffic(&[]);
+        assert!(matches!(
+            coverage_verdict(&[a, b], &rows, &traffic, V_NOW),
+            CoverageVerdict::Starved
+        ));
+    }
+
+    /// PR #659 review (Qodo) — DELIBERATE-semantics pin: all rows stale + no
+    /// traffic is Starved, NOT Healthy. This state is indistinguishable from
+    /// the ZEB-824 cold boot (offline past the freshness window; beacon
+    /// repair is the only path back in); reading it as Healthy would strand
+    /// exactly the case the driver exists for.
+    #[test]
+    fn verdict_all_rows_stale_no_traffic_is_starved_cold_boot_pin() {
+        let (a, b) = (OwnerAddr([1; 16]), OwnerAddr([2; 16]));
+        let stale = V_NOW - GATEWAY_COVERAGE_RECORD_FRESH_MS - 1;
+        let rows = HashMap::from([
+            (a, vec![row_at([0xA1; 32], stale)]),
+            (b, vec![row_at([0xB1; 32], stale)]),
+        ]);
+        let traffic = static_traffic(&[]);
+        assert!(matches!(
+            coverage_verdict(&[a, b], &rows, &traffic, V_NOW),
+            CoverageVerdict::Starved
+        ));
+    }
+
+    #[test]
+    fn verdict_traffic_on_stale_row_still_proves() {
+        // Attribution rides ANY row; only the denominator needs freshness. A
+        // member whose record aged out but whose device demonstrably talks to
+        // us is proven, and must keep the community out of Starved.
+        let a = OwnerAddr([1; 16]);
+        let rows = HashMap::from([(
+            a,
+            vec![row_at(
+                [0xA1; 32],
+                V_NOW - GATEWAY_COVERAGE_RECORD_FRESH_MS - 1,
+            )],
+        )]);
+        let traffic = static_traffic(&[([0xA1; 32], V_NOW - 500)]);
+        assert!(matches!(
+            coverage_verdict(&[a], &rows, &traffic, V_NOW),
+            CoverageVerdict::Healthy
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // ZEB-910: pass-level Degraded behavior + repair actions.
+    // ------------------------------------------------------------------
+
+    fn payload_at(node_id: [u8; 32], announced: u64) -> ReachabilityAnnouncePayload {
+        let mut p = test_payload(node_id);
+        p.announced_at_ms = announced;
+        p
+    }
+
+    /// Logs every fallback resolve's owner — observes both the ZEB-910 forced
+    /// refresh (action 2) and the cache-miss discovery (action 3).
+    struct OwnerLogFallback {
+        log: Arc<Mutex<Vec<OwnerAddr>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::reachability_resolver::ReachabilityFallback<OwnerAddr> for OwnerLogFallback {
+        async fn resolve(&self, addr: &OwnerAddr) -> Vec<ReachabilityAnnouncePayload> {
+            self.log.lock().unwrap().push(*addr);
+            Vec::new()
+        }
+    }
+
+    /// Drive the scheduler until `pred` holds (bounded; the caller's assertion
+    /// reports the failure) — the spawned refresh/discovery tasks need polls.
+    async fn wait_until(pred: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if pred() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A proven member A + an unproven fresh-record member B, clock-driven.
+    /// Returns (harness, clock, b_owner, b_node).
+    fn degraded_harness(
+        community: SpaceId,
+        supervisor: Option<SupervisorHandle>,
+    ) -> (Harness, Arc<AtomicU64>, OwnerAddr, [u8; 32]) {
+        let (_a_pub, a_owner) = test_member(31);
+        let (_b_pub, b_owner) = test_member(32);
+        let (a_node, b_node) = ([0xA1; 32], [0xB1; 32]);
+        let h = harness(community, vec![a_owner, b_owner], None, true, supervisor);
+        let t0 = V_NOW;
+        h.resolver
+            .update(a_owner, payload_at(a_node, t0 - 1_000), hlc(t0 - 1_000));
+        h.resolver
+            .update(b_owner, payload_at(b_node, t0 - 1_000), hlc(t0 - 1_000));
+        h.traffic.lock().unwrap().insert(a_node, t0 - 500);
+        let clock = Arc::new(AtomicU64::new(t0));
+        (h, clock, b_owner, b_node)
+    }
+
+    #[tokio::test]
+    async fn degraded_not_due_records_degraded_waiting_without_resolve() {
+        let community = SpaceId([0x31; 16]);
+        let (h, clock, _b_owner, _b_node) = degraded_harness(community, None);
+        let clock_for_fn = Arc::clone(&clock);
+        let driver = h
+            .driver
+            .with_now_fn(Arc::new(move || clock_for_fn.load(Ordering::SeqCst)));
+
+        // First sighting: due immediately (repair runs; stub has no beacon).
+        driver.run_one_pass().await;
+        assert_eq!(h.beacons.calls(), 1);
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("noBeacon"),
+            "resolve-shaped arms stay uniform on a due degraded pass"
+        );
+
+        // Second pass, 1s later: not due — waiting, zero IO, degraded flavor.
+        clock.store(V_NOW + 1_000, Ordering::SeqCst);
+        driver.run_one_pass().await;
+        assert_eq!(h.beacons.calls(), 1, "an undue pass must not resolve");
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("degradedWaiting")
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_due_pass_with_hit_records_degraded_seeded() {
+        let community = SpaceId([0x32; 16]);
+        let (h, clock, _b_owner, _b_node) = degraded_harness(community, None);
+        let clock_for_fn = Arc::clone(&clock);
+        let driver = h
+            .driver
+            .with_now_fn(Arc::new(move || clock_for_fn.load(Ordering::SeqCst)));
+        let (_bridge_identity, bridge_pub) = test_identity(33);
+        h.beacons
+            .set_resolution(found(beacon(bridge_pub, [0xC1; 32])));
+
+        driver.run_one_pass().await;
+
+        assert_eq!(
+            outcome_of(&h.telemetry, &community).as_deref(),
+            Some("degradedSeeded"),
+            "a degraded seeded pass is distinguishable from starved bootstrap"
+        );
+        let s = h.telemetry.summary();
+        assert_eq!(s.degraded_seeded, 1);
+        assert_eq!(
+            s.beacons_seeded, 0,
+            "the starved counter must not absorb it"
+        );
+    }
+
+    /// ZEB-805 pin: a Connected-but-traffic-dark member community must NOT
+    /// read healthy — Connected is registry occupancy, and a blackholed conn
+    /// keeps it forever.
+    #[tokio::test]
+    async fn connected_but_dark_member_still_repairs() {
+        let community = SpaceId([0x33; 16]);
+        let (_m_pub, m_owner) = test_member(34);
+        let m_node = [0xD1; 32];
+        let handle = SupervisorHandle::new();
+        let h = harness(community, vec![m_owner], None, true, Some(handle.clone()));
+        let now = now_ms();
+        h.resolver
+            .update(m_owner, payload_at(m_node, now - 1_000), hlc(now - 1_000));
+        handle.mark_connected(m_node);
+        // NO traffic stamp: the session exists, evidence does not.
+
+        h.driver.run_one_pass().await;
+
+        assert_eq!(
+            h.beacons.calls(),
+            1,
+            "a connected-but-dark community must repair, not read healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_due_pass_refreshes_unproven_rows_only() {
+        let community = SpaceId([0x34; 16]);
+        let (_a_pub, a_owner) = test_member(35);
+        let (_b_pub, b_owner) = test_member(36);
+        let (a_node, b_node) = ([0xA2; 32], [0xB2; 32]);
+        let h = harness(community, vec![a_owner, b_owner], None, true, None);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        h.resolver.set_fallback_source(Arc::new(OwnerLogFallback {
+            log: Arc::clone(&log),
+        }));
+        let now = now_ms();
+        // A: proven, fresh row. B: unproven; row 20 min old — fresh for the
+        // denominator (24h), stale for the repair refresh (10-min ladder cap).
+        h.resolver
+            .update(a_owner, payload_at(a_node, now - 1_000), hlc(now - 1_000));
+        h.resolver.update(
+            b_owner,
+            payload_at(b_node, now - 20 * 60 * 1_000),
+            hlc(now - 20 * 60 * 1_000),
+        );
+        h.traffic.lock().unwrap().insert(a_node, now - 500);
+
+        h.driver.run_one_pass().await;
+
+        wait_until(|| !log.lock().unwrap().is_empty()).await;
+        let owners = log.lock().unwrap().clone();
+        assert!(
+            owners.contains(&b_owner),
+            "the unproven member's record must be force-refreshed"
+        );
+        assert!(
+            !owners.contains(&a_owner),
+            "the proven member must not be refreshed by repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_less_member_gets_cache_miss_discovery() {
+        let community = SpaceId([0x35; 16]);
+        let (_a_pub, a_owner) = test_member(37);
+        let (_b_pub, b_owner) = test_member(38);
+        let (_c_pub, c_owner) = test_member(39);
+        let (a_node, b_node) = ([0xA3; 32], [0xB3; 32]);
+        let h = harness(community, vec![a_owner, b_owner, c_owner], None, true, None);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        h.resolver.set_fallback_source(Arc::new(OwnerLogFallback {
+            log: Arc::clone(&log),
+        }));
+        let now = now_ms();
+        // A proven; B unproven with a FRESH row (1s old — under the repair
+        // refresh bar, so any fallback call for B would be a bug); C has no
+        // rows at all → cache-miss discovery.
+        h.resolver
+            .update(a_owner, payload_at(a_node, now - 1_000), hlc(now - 1_000));
+        h.resolver
+            .update(b_owner, payload_at(b_node, now - 1_000), hlc(now - 1_000));
+        h.traffic.lock().unwrap().insert(a_node, now - 500);
+
+        h.driver.run_one_pass().await;
+
+        wait_until(|| log.lock().unwrap().contains(&c_owner)).await;
+        let owners = log.lock().unwrap().clone();
+        assert!(
+            owners.contains(&c_owner),
+            "a record-less member must get a cache-miss pkarr discovery"
+        );
+        assert!(
+            !owners.contains(&b_owner),
+            "a fresh-rowed member must be neither refreshed nor re-discovered"
+        );
+    }
+
+    #[tokio::test]
+    async fn dormant_device_of_unproven_member_kicked_retrying_untouched() {
+        use crate::reconnect_supervisor::PeerState;
+        let community = SpaceId([0x36; 16]);
+        let (_a_pub, a_owner) = test_member(40);
+        let (_b_pub, b_owner) = test_member(41);
+        let (a_node, b_dormant, b_retrying) = ([0xA4; 32], [0xB4; 32], [0xB5; 32]);
+        let handle = SupervisorHandle::new();
+        // Supervisor is installed AFTER the row seeding below: the resolver's
+        // first-learn auto-kick would otherwise queue NewPeer for B's devices
+        // (equal merge strength — first-in wins) and mask whether the REPAIR
+        // kicked. With late install, any pending trigger is the repair's.
+        let h = harness(community, vec![a_owner, b_owner], None, true, None);
+        let now = now_ms();
+        h.resolver
+            .update(a_owner, payload_at(a_node, now - 1_000), hlc(now - 1_000));
+        // B's two devices: one Dormant (revive), one Retrying (leave alone).
+        let mut d1 = payload_at(b_dormant, now - 1_000);
+        d1.home_relay_url = "https://d1.example/".into();
+        let mut d2 = payload_at(b_retrying, now - 1_000);
+        d2.home_relay_url = "https://d2.example/".into();
+        h.resolver.update(b_owner, d1, hlc(now - 1_000));
+        h.resolver.update(b_owner, d2, hlc(now - 1_000));
+        h.traffic.lock().unwrap().insert(a_node, now - 500);
+        h.resolver.set_supervisor(handle.clone());
+        handle.set_peer_state_for_test(
+            b_dormant,
+            PeerState::Dormant {
+                since_ms: now - 5_000,
+            },
+        );
+        handle.set_peer_state_for_test(
+            b_retrying,
+            PeerState::Retrying {
+                attempt: 3,
+                next_at: tokio::time::Instant::now() + Duration::from_secs(60),
+            },
+        );
+
+        h.driver.run_one_pass().await;
+
+        assert_eq!(
+            handle.pending_trigger(b_dormant),
+            Some(ReconnectTrigger::RecordChanged),
+            "the Dormant device must be revived"
+        );
+        assert_eq!(
+            handle.pending_trigger(b_retrying),
+            None,
+            "a Retrying device keeps its ladder — no re-arm kick"
+        );
+        assert_eq!(
+            handle.pending_trigger(a_node),
+            None,
+            "the proven member's devices are not targets"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // ZEB-918: ordered epoch-key candidate iteration — the rotation-skew
     // healing rung. Rotation propagates THROUGH connectivity, so a rotated
     // resolver must keep finding not-yet-rotated members' beacons (published
@@ -990,8 +1725,8 @@ mod tests {
     fn rotation_harness(
         community: SpaceId,
         members: Vec<OwnerAddr>,
-        new_key: BeaconResolution,
-        old_key: BeaconResolution,
+        new_key: BeaconsOutcome,
+        old_key: BeaconsOutcome,
     ) -> Harness {
         let h = harness(community, members, None, true, None);
         h.ctx
@@ -1015,8 +1750,8 @@ mod tests {
         let h = rotation_harness(
             community,
             vec![member_owner],
-            BeaconResolution::NotFound,
-            BeaconResolution::Found(beacon(member_pub, beacon_node_id)),
+            not_found(),
+            found(beacon(member_pub, beacon_node_id)),
         );
 
         h.driver.run_one_pass().await;
@@ -1047,10 +1782,10 @@ mod tests {
         let h = rotation_harness(
             community,
             vec![member_owner],
-            BeaconResolution::NotFound,
+            not_found(),
             // Previous-key infrastructure trouble must not upgrade/replace
             // the current-key NotFound in telemetry.
-            BeaconResolution::ResolveError,
+            resolve_error(),
         );
 
         h.driver.run_one_pass().await;
@@ -1074,8 +1809,8 @@ mod tests {
         let h = rotation_harness(
             community,
             vec![member_owner],
-            BeaconResolution::RejectedNonMember,
-            BeaconResolution::Found(beacon(member_pub, beacon_node_id)),
+            rejected_non_member(),
+            found(beacon(member_pub, beacon_node_id)),
         );
 
         h.driver.run_one_pass().await;
@@ -1090,24 +1825,41 @@ mod tests {
         );
     }
 
-    /// A found beacon under the FIRST candidate stops the iteration — the
-    /// previous-epoch key is never probed when the current key answers.
+    /// PR #659 review (CodeAnt/Greptile convergent): a current-key hit must
+    /// NOT stop the scan — a rotation-straddling split publishes the
+    /// un-rotated island's beacons only under the previous key, so both
+    /// candidates are scanned and their hits merged (dedup by node id,
+    /// current-epoch beacon winning).
     #[tokio::test]
-    async fn found_under_current_key_skips_previous_probe() {
+    async fn current_key_hit_still_scans_previous_epoch_and_merges_bridges() {
         let community = SpaceId([0x94; 16]);
         let (member_pub, member_owner) = test_member(24);
+        let (old_member_pub, old_member_owner) = test_member(25);
         let beacon_node_id = [0x2C; 32];
+        let old_island_node_id = [0x2D; 32];
         let h = rotation_harness(
             community,
-            vec![member_owner],
-            BeaconResolution::Found(beacon(member_pub, beacon_node_id)),
-            BeaconResolution::NotFound,
+            vec![member_owner, old_member_owner],
+            found(beacon(member_pub, beacon_node_id)),
+            found(beacon(old_member_pub, old_island_node_id)),
         );
 
         h.driver.run_one_pass().await;
 
-        assert_eq!(h.beacons.calls(), 1, "current-key hit must short-circuit");
-        assert_eq!(h.beacons.probed_keys(), vec![K_NEW]);
+        assert_eq!(
+            h.beacons.calls(),
+            2,
+            "both candidates must be scanned even when the current key hits"
+        );
+        assert!(
+            h.resolver.resolve_by_node_id(&old_island_node_id).is_some(),
+            "the previous-epoch island's beacon must seed too — it may be the only bridge"
+        );
+        assert_eq!(
+            h.beacons.probed_keys(),
+            vec![K_NEW, K_OLD],
+            "the LIVE current key is still probed first"
+        );
         assert_eq!(
             outcome_of(&h.telemetry, &community).as_deref(),
             Some("beaconSeeded")
@@ -1184,10 +1936,11 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 2. A Connected member ⇒ healthy ⇒ no resolve call.
+    // 2. A traffic-PROVEN member ⇒ healthy ⇒ no resolve call. (ZEB-910: the
+    //    numerator is proven traffic, not session existence.)
     // ------------------------------------------------------------------
     #[tokio::test]
-    async fn connected_member_means_healthy_no_resolve() {
+    async fn proven_member_means_healthy_no_resolve() {
         let community = SpaceId([0x12; 16]);
         let (member_pub, member_owner) = test_member(2);
         let member_node_id = [0x44; 32];
@@ -1199,13 +1952,15 @@ mod tests {
             true,
             Some(handle.clone()),
         );
-        // The member is already in the address book AND has a live session.
+        // The member is already in the address book, has a live session, and
+        // traffic demonstrably flowed just now.
         h.resolver.update(
             member_owner,
             test_payload(member_node_id),
             hlc(1_700_000_000_000),
         );
         handle.mark_connected(member_node_id);
+        h.traffic.lock().unwrap().insert(member_node_id, now_ms());
 
         h.driver.run_one_pass().await;
 
@@ -1257,6 +2012,7 @@ mod tests {
                 hlc(1_700_000_000_000),
             );
             handle.mark_connected(connected_node);
+            h.traffic.lock().unwrap().insert(connected_node, now_ms());
 
             h.driver.run_one_pass().await;
 
@@ -1290,14 +2046,16 @@ mod tests {
             true,
             Some(handle.clone()),
         );
-        // A live session to somebody who is NOT a member of this community —
-        // zenoh does not route this community's queries through them.
+        // A live, traffic-proven session to somebody who is NOT a member of
+        // this community — zenoh does not route this community's queries
+        // through them.
         h.resolver.update(
             other_owner,
             test_payload(other_node_id),
             hlc(1_700_000_000_000),
         );
         handle.mark_connected(other_node_id);
+        h.traffic.lock().unwrap().insert(other_node_id, now_ms());
 
         h.driver.run_one_pass().await;
 
@@ -1498,10 +2256,15 @@ mod tests {
             "the ladder must saturate at the 600s cap, not run away"
         );
 
-        // Heal: the member's record lands and its session comes up.
+        // Heal: the member's record lands, its session comes up, and traffic
+        // flows (ZEB-910: healing requires proven traffic, not a session).
         h.resolver
             .update(member_owner, test_payload(member_node_id), hlc(t0));
         handle.mark_connected(member_node_id);
+        h.traffic
+            .lock()
+            .unwrap()
+            .insert(member_node_id, clock.load(Ordering::SeqCst));
         let calls_before_heal = h.beacons.calls();
         driver.run_one_pass().await;
         assert_eq!(h.beacons.calls(), calls_before_heal, "healthy ⇒ no IO");
@@ -1514,10 +2277,15 @@ mod tests {
             "healing must drop the ladder entry"
         );
 
-        // Re-starve: the session drops. The very next pass must attempt
-        // immediately — a 600s cap carried across the heal would leave a
-        // recovered-then-lost node dark for ten minutes.
+        // Re-starve: the session drops and traffic ceases (the stamp ages past
+        // the proven window). The very next pass must attempt immediately — a
+        // 600s cap carried across the heal would leave a recovered-then-lost
+        // node dark for ten minutes.
         handle.evict_peer(member_node_id);
+        clock.store(
+            clock.load(Ordering::SeqCst) + GATEWAY_PROVEN_TRAFFIC_MS + 1,
+            Ordering::SeqCst,
+        );
         driver.run_one_pass().await;
         assert_eq!(
             h.beacons.calls(),
@@ -1578,6 +2346,7 @@ mod tests {
             Arc::clone(&beacons) as Arc<dyn BeaconResolver>,
             resolver,
             Arc::new(Vec::new),
+            Arc::new(|_: &[u8; 32]| None),
         )
         .with_telemetry(Arc::clone(&telemetry));
 
@@ -1781,6 +2550,7 @@ mod tests {
             Arc::clone(&beacons) as Arc<dyn BeaconResolver>,
             Arc::clone(&resolver),
             Arc::new(move || joined_for_fn.lock().unwrap().clone()),
+            Arc::new(|_: &[u8; 32]| None),
         )
         .with_telemetry(Arc::clone(&telemetry))
         .with_now_fn(Arc::new(move || clock_for_fn.load(Ordering::SeqCst)));
@@ -1888,37 +2658,23 @@ mod tests {
     //      only signal separating "nobody published" from "pkarr is failing".
     // ------------------------------------------------------------------
     #[test]
-    fn classify_resolution_covers_all_four_arms() {
-        let (_identity, identity_pub) = test_identity(21);
-        let hit = beacon(identity_pub, [0xAD; 32]);
-
-        // A hit wins outright — even alongside errored/rejected probes on other slots.
-        for errors in [0usize, 3] {
-            match classify_resolution(Some(hit.clone()), errors, 2) {
-                BeaconResolution::Found(b) => assert_eq!(b.payload.iroh_node_id, [0xAD; 32]),
-                other => panic!("a payload hit must classify as Found, got {other:?}"),
-            }
-        }
+    fn classify_empty_precedence() {
         // A miss with zero errors and zero rejects is proof-shaped absence.
-        assert!(matches!(
-            classify_resolution(None, 0, 0),
-            BeaconResolution::NotFound
-        ));
+        assert_eq!(classify_empty(0, 0), GatewayBootstrapOutcome::NoBeacon);
         // A miss with any errored probe carries no information.
-        assert!(matches!(
-            classify_resolution(None, 1, 0),
-            BeaconResolution::ResolveError
-        ));
+        assert_eq!(classify_empty(1, 0), GatewayBootstrapOutcome::ResolveError);
         // ZEB-827: a present-but-rejected beacon is more informative than a
         // probe error — it wins the precedence.
-        assert!(matches!(
-            classify_resolution(None, 0, 1),
-            BeaconResolution::RejectedNonMember
-        ));
-        assert!(matches!(
-            classify_resolution(None, 2, 1),
-            BeaconResolution::RejectedNonMember
-        ));
+        assert_eq!(
+            classify_empty(0, 1),
+            GatewayBootstrapOutcome::RejectedNonMember
+        );
+        assert_eq!(
+            classify_empty(2, 1),
+            GatewayBootstrapOutcome::RejectedNonMember
+        );
+        // ("Hits win outright" now lives in the driver loop: a nonempty
+        // `hits` never reaches classify_empty — pinned by the seed-path tests.)
     }
 
     #[tokio::test]
@@ -1932,7 +2688,7 @@ mod tests {
             true,
             Some(SupervisorHandle::new()),
         );
-        h.beacons.set_resolution(BeaconResolution::ResolveError);
+        h.beacons.set_resolution(resolve_error());
 
         h.driver.run_one_pass().await;
 
@@ -1964,8 +2720,7 @@ mod tests {
             true,
             Some(SupervisorHandle::new()),
         );
-        h.beacons
-            .set_resolution(BeaconResolution::RejectedNonMember);
+        h.beacons.set_resolution(rejected_non_member());
 
         h.driver.run_one_pass().await;
 

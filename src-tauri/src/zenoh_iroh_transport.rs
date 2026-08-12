@@ -2203,6 +2203,10 @@ mod tests {
             // retry ever fires. Keep the bound far above worst contention.
             dial_timeout: Duration::from_secs(300),
             higher_id_fallback_delay: Duration::from_millis(400),
+            // ZEB-910: parole disabled for this real-time test (never fires
+            // inside its wall-clock window).
+            parole_interval: Duration::from_secs(3600),
+            parole_batch: 2,
             jitter_seed: Some(0x2E_B6_20),
         };
         let _supervisor = tokio::spawn(run_reconnect_supervisor(
@@ -2508,6 +2512,10 @@ mod tests {
             // retry ever fires. Keep the bound far above worst contention.
             dial_timeout: Duration::from_secs(300),
             higher_id_fallback_delay: Duration::from_millis(400),
+            // ZEB-910: parole disabled for this real-time test (never fires
+            // inside its wall-clock window).
+            parole_interval: Duration::from_secs(3600),
+            parole_batch: 2,
             jitter_seed: Some(0x2E_B6_20),
         };
         let _supervisor = tokio::spawn(run_reconnect_supervisor(

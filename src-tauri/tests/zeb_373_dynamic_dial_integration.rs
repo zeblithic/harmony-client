@@ -196,6 +196,10 @@ async fn inner() {
         // so it never fires here — a slow hermetic dial is not a hung dial.
         dial_timeout: Duration::from_secs(300),
         higher_id_fallback_delay: Duration::from_millis(200),
+        // ZEB-910: parole disabled for this real-time test (never fires inside
+        // its wall-clock window).
+        parole_interval: Duration::from_secs(3600),
+        parole_batch: 2,
         jitter_seed: Some(0xD1A1),
     };
     tokio::spawn(run_reconnect_supervisor(
