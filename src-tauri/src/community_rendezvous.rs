@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn slot_count_exceeds_relay_read_cap_by_design() {
         assert_eq!(RENDEZVOUS_SLOT_COUNT, 8);
-        assert!(RENDEZVOUS_SLOT_COUNT >= COMMUNITY_RELAY_ADVERTISERS_MAX);
+        const _: () = assert!(RENDEZVOUS_SLOT_COUNT >= COMMUNITY_RELAY_ADVERTISERS_MAX);
     }
 
     fn addr(b: u8) -> OwnerAddr {
