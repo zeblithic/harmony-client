@@ -643,18 +643,26 @@ impl CommunityGatewayDialDriver {
             // widens); if a beacon WAS present but rejected, the resolve returns
             // `RejectedNonMember`.
             let enrolled_keys = Arc::new(self.ctx.enrolled_device_keys_of(&community).await);
-            // ZEB-918: try candidates in order (live current first, previous
-            // epoch second); stop at the first candidate with ANY live beacon.
-            // When nothing is found, the CURRENT-key attempt's outcome is
+            // ZEB-918 + PR #659 review (CodeAnt/Greptile convergent finding):
+            // scan EVERY candidate key (live current first, previous epoch
+            // second) and MERGE the hits, deduped by node id with the
+            // earlier-candidate beacon winning. A rotation-straddling split
+            // publishes the un-rotated island's beacons ONLY under the
+            // previous key, so stopping at the first candidate with hits
+            // could keep seeding the already-reachable island forever and
+            // never bridge. Cost: one extra all-slots scan per DUE repair
+            // pass while a rotation archive exists — repair passes are
+            // ladder-paced (30s→10min) and only run while non-Healthy, so
+            // this is bounded, not steady-state. Telemetry: when EVERY
+            // candidate is empty, the CURRENT-key attempt's outcome is
             // recorded — it is the canonical health signal, and the
-            // previous-key attempt exists only to heal rotation skew (finding
-            // not-yet-rotated members so the rotation event itself can reach
-            // them), so it must not mask current-key telemetry. A candidate
-            // attempt that finds beacons always wins — including over a
-            // current-key RejectedNonMember, which condemns one publisher's
-            // bad vouch, not the whole previous-epoch audience.
+            // previous-key attempt exists only to heal rotation skew, so it
+            // must not mask it (a previous-key ResolveError never upgrades a
+            // current-key NotFound; a current-key RejectedNonMember condemns
+            // one publisher's bad vouch, not the previous-epoch audience).
             let mut outcome_when_empty = GatewayBootstrapOutcome::NoBeacon;
             let mut hits: Vec<IdentifiedBeacon> = Vec::new();
+            let mut seen_nodes: HashSet<[u8; 32]> = HashSet::new();
             for (i, candidate) in epoch_keys.iter().enumerate() {
                 let attempt = self
                     .beacons
@@ -664,9 +672,10 @@ impl CommunityGatewayDialDriver {
                     outcome_when_empty =
                         classify_empty(attempt.resolve_errors, attempt.membership_rejects);
                 }
-                if !attempt.hits.is_empty() {
-                    hits = attempt.hits;
-                    break;
+                for hit in attempt.hits {
+                    if seen_nodes.insert(hit.payload.iroh_node_id) {
+                        hits.push(hit);
+                    }
                 }
             }
             if hits.is_empty() {
@@ -1787,24 +1796,41 @@ mod tests {
         );
     }
 
-    /// A found beacon under the FIRST candidate stops the iteration — the
-    /// previous-epoch key is never probed when the current key answers.
+    /// PR #659 review (CodeAnt/Greptile convergent): a current-key hit must
+    /// NOT stop the scan — a rotation-straddling split publishes the
+    /// un-rotated island's beacons only under the previous key, so both
+    /// candidates are scanned and their hits merged (dedup by node id,
+    /// current-epoch beacon winning).
     #[tokio::test]
-    async fn found_under_current_key_skips_previous_probe() {
+    async fn current_key_hit_still_scans_previous_epoch_and_merges_bridges() {
         let community = SpaceId([0x94; 16]);
         let (member_pub, member_owner) = test_member(24);
+        let (old_member_pub, old_member_owner) = test_member(25);
         let beacon_node_id = [0x2C; 32];
+        let old_island_node_id = [0x2D; 32];
         let h = rotation_harness(
             community,
-            vec![member_owner],
+            vec![member_owner, old_member_owner],
             found(beacon(member_pub, beacon_node_id)),
-            not_found(),
+            found(beacon(old_member_pub, old_island_node_id)),
         );
 
         h.driver.run_one_pass().await;
 
-        assert_eq!(h.beacons.calls(), 1, "current-key hit must short-circuit");
-        assert_eq!(h.beacons.probed_keys(), vec![K_NEW]);
+        assert_eq!(
+            h.beacons.calls(),
+            2,
+            "both candidates must be scanned even when the current key hits"
+        );
+        assert!(
+            h.resolver.resolve_by_node_id(&old_island_node_id).is_some(),
+            "the previous-epoch island's beacon must seed too — it may be the only bridge"
+        );
+        assert_eq!(
+            h.beacons.probed_keys(),
+            vec![K_NEW, K_OLD],
+            "the LIVE current key is still probed first"
+        );
         assert_eq!(
             outcome_of(&h.telemetry, &community).as_deref(),
             Some("beaconSeeded")
