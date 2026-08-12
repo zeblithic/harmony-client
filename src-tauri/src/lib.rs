@@ -62177,12 +62177,15 @@ pub struct RedemptionOutcome {
     ///   join request was never fully written, so the inviter was NOT
     ///   reached. ZEB-899: post-write failures (response read / decode /
     ///   countersign mismatch) no longer map here — they latch as
-    ///   `"joined"` + `pending`. `community_id` is `None`.
+    ///   `"joined"` + `pending`. One post-write exception: a latch whose
+    ///   local commit itself fails degrades back to this status (nothing
+    ///   landed locally). `community_id` is `None`.
     /// * `"no_member_reachable"` — ZEB-911: the admin dial failed AND the
     ///   witness ladder dialed at least one rendezvous-resolved candidate,
     ///   all unreachable. Same retry semantics as `"inviter_unreachable"`,
-    ///   and likewise pre-write only since ZEB-899; distinct so the UI
-    ///   names the community, not the inviter. `community_id` is `None`.
+    ///   and likewise pre-write only since ZEB-899 (same latch-commit-
+    ///   failure exception); distinct so the UI names the community, not
+    ///   the inviter. `community_id` is `None`.
     /// * `"join_failed"` — pkarr resolved AND the iroh handshake
     ///   completed AND a valid JoinCountersign was delivered, but the
     ///   subsequent local `redeem_invite_inner_with_overrides` failed
@@ -62217,9 +62220,10 @@ pub struct RedemptionOutcome {
 
 impl RedemptionOutcome {
     /// The inviter was not reached / could not be verified — the join
-    /// request was never fully written (pre-write only since ZEB-899); no
-    /// membership landed (`community_id` is `None`, `pending` is
-    /// definitionally `false`).
+    /// request was never fully written (pre-write only since ZEB-899, with
+    /// one exception: a post-write latch whose local commit fails degrades
+    /// back here); no membership landed (`community_id` is `None`,
+    /// `pending` is definitionally `false`).
     fn unreachable() -> Self {
         Self {
             status: "inviter_unreachable".to_string(),
@@ -62233,7 +62237,8 @@ impl RedemptionOutcome {
     /// witness candidate was dialed and failed, or a WITNESS connection was
     /// established and the stream died BEFORE the join request was fully
     /// written (review r2; ZEB-899: post-write failures latch as
-    /// `"joined"` + `pending` instead). Distinct from
+    /// `"joined"` + `pending` instead — except a latch whose local commit
+    /// fails, which degrades back here). Distinct from
     /// `"inviter_unreachable"` so the frontend can say "no community member
     /// is currently reachable" instead of blaming the inviter, while mapping
     /// to the same retry affordance. No membership landed.
@@ -64811,7 +64816,7 @@ where
 
     match result {
         Ok(dto) => {
-            if latch_mode {
+            if latch_mode && dto.pending {
                 // ZEB-899: do NOT evict the ZEB-889 mint cache — no countersign
                 // was applied and the invite was not burned (ZEB-874 burns only
                 // after a delivered response). The cached mint is what makes a
@@ -64819,12 +64824,14 @@ where
                 // the host's AlreadyKnown-retransmit path, instead of minting
                 // fresh and dying on the verify_event P6 already-engaged reject.
             } else if let Some(key) = redemption_cache_key {
-                // ZEB-889: the join committed — the acceptor delivered the
-                // countersign (this arm is reached only after the pre-delivered
-                // countersign was applied) and burned the single-use invite. Drop
-                // the cached mint; no further retry is possible or needed. (A
-                // never-completing redemption keeps its entry until the TTL window
-                // elapses — bounded, one per distinct invite redeemed this session.)
+                // ZEB-889: the join fully committed — either the acceptor
+                // delivered the countersign in-band (and burned the single-use
+                // invite), or (ZEB-899 CodeAnt r1) latch mode still completed
+                // via the Zenoh/oneshot path within the redeem window
+                // (dto.pending == false). Drop the cached mint; no further
+                // retry is possible or needed. (A never-completing redemption
+                // keeps its entry until the TTL window elapses — bounded, one
+                // per distinct invite redeemed this session.)
                 registry_evict.evict_redemption_mint(&key).await;
             }
             // ZEB-427: durable-on-commit fence (ZEB-393 Bug A), mirroring

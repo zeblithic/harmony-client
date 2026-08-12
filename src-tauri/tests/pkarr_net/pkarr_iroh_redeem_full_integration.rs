@@ -2305,6 +2305,12 @@ async fn zeb889_first_attempt_caches_minted_redemption() {
             "ZEB-889: the first attempt must cache its minted redemption for retry reuse"
         );
 
+        // ZEB-899: the latch spawned a real engine on Bob's registry — shut it
+        // down deterministically so its background tasks can't outlive the test
+        // (nextest leak detection). Best-effort: this harness has no live
+        // adapter transport, so the final flush reports TransportClosed even
+        // though the engine tasks are torn down.
+        let _ = s.registry_bob.shutdown_all().await;
         s.publisher_handle.abort();
         s.alice_ep.shutdown().await;
         s.bob_ep.shutdown().await;
@@ -2664,6 +2670,12 @@ async fn zeb889_retry_reuses_mint_and_redeems_zombie_invite() {
             "ZEB-889: the cached mint is evicted once the join commits"
         );
 
+        // ZEB-899: the latch seed + retry spawned real engines on Bob's
+        // registry — shut them down deterministically so their background
+        // tasks can't outlive the test (nextest leak detection). Best-effort:
+        // this harness has no live adapter transport, so the final flush
+        // reports TransportClosed even though the engine tasks are torn down.
+        let _ = s.registry_bob.shutdown_all().await;
         s.publisher_handle.abort();
         s.alice_ep.shutdown().await;
         s.bob_ep.shutdown().await;
