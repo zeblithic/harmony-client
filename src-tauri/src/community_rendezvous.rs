@@ -375,12 +375,197 @@ pub async fn resolve_rendezvous_identified(
     }
 }
 
+/// ZEB-910: result of [`resolve_rendezvous_all_slots`] — every distinct
+/// verified beacon across the full slot space, plus the same
+/// error/rejection counts [`IdentifiedResolve`] carries.
+pub struct AllSlotsResolve {
+    /// Deduped by `iroh_node_id`; a node republishing across the weekly
+    /// boundary keeps its CURRENT-epoch beacon.
+    pub hits: Vec<IdentifiedBeacon>,
+    pub resolve_errors: usize,
+    pub membership_rejects: usize,
+}
+
+/// ZEB-910: probe every slot (`0..RENDEZVOUS_SLOT_COUNT`) across the
+/// current + previous time epoch concurrently and collect ALL distinct hits.
+/// Returns `(hits, timed_out_probe_count)` — a timed-out probe carries no
+/// information (infrastructure trouble, not proof of absence), so the caller
+/// folds the count into `resolve_errors`.
+///
+/// This deliberately skips the escalating-batch economy of
+/// [`resolve_rendezvous_with`]: repair passes (the gateway dial driver's
+/// Starved/Degraded ladder) are already ladder-paced and need every reachable
+/// island's beacon, not the first one — on a community split the single-hit
+/// resolve is coin-flip likely to return an already-reachable member and
+/// never bridge (spec §3.3.1).
+pub(crate) async fn all_slots_scan<R>(
+    resolver: &R,
+    now_ms: u64,
+    per_probe_deadline: Duration,
+) -> (Vec<IdentifiedBeacon>, usize)
+where
+    R: harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> + Sync,
+{
+    let current = harmony_pkarr::current_epoch_id(now_ms);
+    let mut epochs = vec![current];
+    if current > 0 {
+        epochs.push(current - 1);
+    }
+    // Current-epoch probes FIRST: `join_all` preserves input order, so the
+    // dedup below prefers a node's current-epoch beacon over its previous one.
+    let probes: Vec<(u16, u64)> = epochs
+        .iter()
+        .flat_map(|e| (0..RENDEZVOUS_SLOT_COUNT as u16).map(move |s| (s, *e)))
+        .collect();
+    let results = futures::future::join_all(probes.into_iter().map(|(slot, epoch)| async move {
+        match tokio::time::timeout(per_probe_deadline, resolver.resolve_slot(slot, epoch)).await {
+            Ok(hit) => (hit, false),
+            Err(_) => (None, true),
+        }
+    }))
+    .await;
+    let mut timeouts = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    let mut hits = Vec::new();
+    for (hit, timed_out) in results {
+        if timed_out {
+            timeouts += 1;
+        }
+        if let Some(beacon) = hit {
+            if seen.insert(beacon.payload.iroh_node_id) {
+                hits.push(beacon);
+            }
+        }
+    }
+    (hits, timeouts)
+}
+
+/// ZEB-910 production entry point: like [`resolve_rendezvous_identified`] but
+/// scanning EVERY slot and returning every verified hit (see
+/// [`all_slots_scan`] for why). Per-probe deadline = the config's
+/// `per_batch_deadline`; membership-vouch verification, freshness re-checks,
+/// and the self-endpoint filter are identical (same [`IdentifiedSlotResolver`]).
+pub async fn resolve_rendezvous_all_slots(
+    pkarr: &Arc<PkarrResolver>,
+    epoch_key: &EpochKey,
+    self_endpoint_id: [u8; 32],
+    community_id: crate::owner_state_types::SpaceId,
+    enrolled_keys: Arc<std::collections::HashSet<[u8; 32]>>,
+    now_ms: u64,
+    cfg: &RendezvousResolveConfig,
+) -> AllSlotsResolve {
+    let resolve_errors = Arc::new(AtomicUsize::new(0));
+    let membership_rejects = Arc::new(AtomicUsize::new(0));
+    let resolver = IdentifiedSlotResolver {
+        pkarr: Arc::clone(pkarr),
+        epoch_key_bytes: Zeroizing::new(epoch_key.as_bytes().to_vec()),
+        self_endpoint_id,
+        resolve_errors: Arc::clone(&resolve_errors),
+        community_id,
+        enrolled_keys,
+        membership_rejects: Arc::clone(&membership_rejects),
+    };
+    let (hits, timeouts) = all_slots_scan(&resolver, now_ms, cfg.per_batch_deadline).await;
+    AllSlotsResolve {
+        hits,
+        resolve_errors: resolve_errors.load(Ordering::Relaxed) + timeouts,
+        membership_rejects: membership_rejects.load(Ordering::Relaxed),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ek() -> EpochKey {
         EpochKey::new([7u8; 32])
+    }
+
+    fn test_beacon(node: u8) -> IdentifiedBeacon {
+        IdentifiedBeacon {
+            payload: ReachabilityAnnouncePayload {
+                iroh_node_id: [node; 32],
+                home_relay_url: String::new(),
+                direct_addresses: vec![],
+                announced_at_ms: 0,
+                identity_signature: [0u8; 64],
+                butler_set: vec![],
+                bs_at: 0,
+            },
+            beacon_identity_pub: [0u8; 64],
+            membership_device_vk: [node; 32],
+        }
+    }
+
+    /// Map-backed [`SlotResolver`] for the ZEB-910 all-slots scan tests: a hit
+    /// per explicitly-seeded `(slot, epoch)` coordinate, empty everywhere else.
+    struct MapSlotResolver {
+        hits: std::collections::HashMap<(u16, u64), IdentifiedBeacon>,
+    }
+
+    #[async_trait::async_trait]
+    impl harmony_pkarr::rendezvous::SlotResolver<IdentifiedBeacon> for MapSlotResolver {
+        async fn resolve_slot(&self, slot_index: u16, epoch_id: u64) -> Option<IdentifiedBeacon> {
+            self.hits.get(&(slot_index, epoch_id)).cloned()
+        }
+    }
+
+    /// ZEB-910: the scan visits every slot in BOTH tolerance-window epochs and
+    /// returns each distinct beacon — the property the escalating single-hit
+    /// driver deliberately lacks.
+    #[tokio::test]
+    async fn all_slots_scan_collects_every_distinct_hit() {
+        let now = 1_700_000_000_000u64;
+        let cur = harmony_pkarr::current_epoch_id(now);
+        let prev = cur.saturating_sub(1);
+        let mut hits = std::collections::HashMap::new();
+        hits.insert((0u16, cur), test_beacon(1));
+        hits.insert((3u16, cur), test_beacon(2));
+        hits.insert((1u16, prev), test_beacon(3));
+        let r = MapSlotResolver { hits };
+        let (found, timeouts) = all_slots_scan(&r, now, Duration::from_millis(500)).await;
+        assert_eq!(timeouts, 0);
+        let ids: std::collections::HashSet<[u8; 32]> =
+            found.iter().map(|b| b.payload.iroh_node_id).collect();
+        let want: std::collections::HashSet<[u8; 32]> =
+            [[1u8; 32], [2u8; 32], [3u8; 32]].into_iter().collect();
+        assert_eq!(ids, want);
+    }
+
+    /// ZEB-910: a node republishing across the weekly boundary appears once,
+    /// and the CURRENT epoch's beacon wins the dedup.
+    #[tokio::test]
+    async fn all_slots_scan_dedups_same_node_across_epochs_preferring_current() {
+        let now = 1_700_000_000_000u64;
+        let cur = harmony_pkarr::current_epoch_id(now);
+        let prev = cur.saturating_sub(1);
+        let mut current_beacon = test_beacon(1);
+        current_beacon.membership_device_vk = [0xAA; 32];
+        let mut previous_beacon = test_beacon(1);
+        previous_beacon.membership_device_vk = [0xBB; 32];
+        let mut hits = std::collections::HashMap::new();
+        hits.insert((0u16, cur), current_beacon);
+        hits.insert((0u16, prev), previous_beacon);
+        let r = MapSlotResolver { hits };
+        let (found, _) = all_slots_scan(&r, now, Duration::from_millis(500)).await;
+        assert_eq!(found.len(), 1, "same node across epochs must dedup");
+        assert_eq!(
+            found[0].membership_device_vk,
+            [0xAA; 32],
+            "the current-epoch beacon wins"
+        );
+    }
+
+    /// ZEB-910: an all-empty slot space yields no hits and no phantom timeouts.
+    #[tokio::test]
+    async fn all_slots_scan_empty_when_no_slot_has_a_beacon() {
+        let r = MapSlotResolver {
+            hits: std::collections::HashMap::new(),
+        };
+        let (found, timeouts) =
+            all_slots_scan(&r, 1_700_000_000_000, Duration::from_millis(500)).await;
+        assert!(found.is_empty());
+        assert_eq!(timeouts, 0);
     }
 
     #[test]
