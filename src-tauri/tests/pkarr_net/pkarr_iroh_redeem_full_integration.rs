@@ -2054,11 +2054,17 @@ async fn invite_not_burned_when_handshake_fails_after_insert() {
         .await
         .expect("connectivity_redeem_invite_iroh_inner must Ok (errors → non-joined status)");
 
-        assert_ne!(
+        // ZEB-899: post-write failure now latches (joined + pending) instead of
+        // reporting unreachable. The ZEB-874 burn assertions below are
+        // unchanged — the latch is joiner-local and must not burn the invite.
+        assert_eq!(
             outcome.status, "joined",
-            "the redeem must NOT report joined when the acceptor CountersignTimeouts \
-             before delivering the countersign; got status={:?}",
+            "ZEB-899: a post-write failure must latch as joined+pending; got status={:?}",
             outcome.status
+        );
+        assert!(
+            outcome.pending,
+            "ZEB-899: the latched join must report pending=true"
         );
 
         // Grace window for the spawned auto-counter-sign task and teardown to
@@ -2260,12 +2266,34 @@ async fn zeb889_first_attempt_caches_minted_redemption() {
         .await
         .expect("connectivity_redeem_invite_iroh_inner must Ok (errors → non-joined status)");
 
-        assert_ne!(
+        // ZEB-899: the request was fully written and Alice's handle_unicast
+        // committed the PendingJoin (poll_deadline=0 only suppresses the
+        // RESPONSE) — a post-write failure now latches the join as pending
+        // instead of falsely reporting the inviter unreachable.
+        assert_eq!(
             outcome.status, "joined",
-            "the first attempt must NOT join when the acceptor CountersignTimeouts; \
-             got status={:?}",
+            "ZEB-899: a post-write failure (no countersign response) must latch, \
+             not report unreachable; got status={:?}",
             outcome.status
         );
+        assert!(
+            outcome.pending,
+            "ZEB-899: the latched join must report pending=true (no countersign \
+             was applied in-band)"
+        );
+        {
+            let g = s.bob_crdt_state.lock().await;
+            let row = g
+                .spaces
+                .get(&s.community_id)
+                .expect("ZEB-899: the latch must commit Bob's owner-state Space row");
+            assert!(
+                row.pending_join_at.is_some(),
+                "ZEB-899: the latched Space row must carry pending_join_at (greyed \
+                 until the JoinCountersign converges); got {:?}",
+                row.pending_join_at
+            );
+        }
 
         // The load-bearing assertion: the production first attempt cached its mint,
         // so a subsequent retry can reuse it (the recovery leg this PR enables).
