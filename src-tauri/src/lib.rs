@@ -1463,6 +1463,9 @@ pub struct NodeState {
     /// ZEB-458 P4 Phase B: join handle for the relay-hold GC sweep task
     /// (populated by T11b). Held so stop_inner can abort it.
     pub community_relay_gc_handle: Option<tokio::task::JoinHandle<()>>,
+    /// ZEB-922: join handle for the serve-allowlist lease sweep task. Held so
+    /// stop_inner / clear_driver_handles can abort it.
+    pub serve_allowlist_sweep_handle: Option<tokio::task::JoinHandle<()>>,
     /// ZEB-458 P4 Phase B: join handle for the joined-communities refresher
     /// task (populated by T11b). Held so stop_inner can abort it.
     pub community_relay_refresher_handle: Option<tokio::task::JoinHandle<()>>,
@@ -1992,6 +1995,10 @@ impl NodeState {
         if let Some(h) = self.community_relay_gc_handle.take() {
             h.abort();
         }
+        // ZEB-922: serve-allowlist lease sweep.
+        if let Some(h) = self.serve_allowlist_sweep_handle.take() {
+            h.abort();
+        }
         // ZEB-458 P4B: joined-communities relay refresher.
         if let Some(h) = self.community_relay_refresher_handle.take() {
             h.abort();
@@ -2239,6 +2246,7 @@ impl Default for NodeState {
             community_relay_publisher_handle: None,
             community_relay_pull_driver_handle: None,
             community_relay_gc_handle: None,
+            serve_allowlist_sweep_handle: None,
             community_relay_refresher_handle: None,
             // ZEB-811 Task 8: vine-pull driver handle + wake stay None until
             // start_node wires the driver (mirrors the community-relay
@@ -4755,6 +4763,7 @@ pub async fn start_node_inner(
         let mut community_relay_publisher_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut community_relay_pull_driver_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut community_relay_gc_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
+        let mut serve_allowlist_sweep_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         let mut community_relay_refresher_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
         // ZEB-811 Task 8: carrier for the vine-pull driver's JoinHandle (built
         // alongside the community-relay pull driver, inside the same
@@ -12841,6 +12850,44 @@ pub async fn start_node_inner(
                         }
                     }
 
+                    // ZEB-922: serve-allowlist lease sweep — serving intent
+                    // nothing has re-affirmed or served within
+                    // SERVE_ALLOWLIST_TTL_MS collapses by default. Renewal is
+                    // entirely push-based (producer re-publish,
+                    // affirm_serveable on root encodes, touch on successful
+                    // serves), so this task needs only the allowlist handle.
+                    // Same shape as the relay-hold GC above; unconditional —
+                    // the allowlist exists on every boot, keyless or not.
+                    // stop_inner aborts it via serve_allowlist_sweep_handle.
+                    {
+                        let sweep_allowlist = serve_allowlist.clone();
+                        serve_allowlist_sweep_handle_opt = Some(tokio::spawn(async move {
+                            let mut ticker =
+                                tokio::time::interval(std::time::Duration::from_millis(
+                                    crate::content_store::SERVE_ALLOWLIST_SWEEP_INTERVAL_MS,
+                                ));
+                            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            // Consume the immediate first tick — nothing can
+                            // be expired at boot (the allowlist starts empty).
+                            ticker.tick().await;
+                            loop {
+                                ticker.tick().await;
+                                let removed = sweep_allowlist.sweep_expired(
+                                    crate::wall_clock_ms(),
+                                    crate::content_store::SERVE_ALLOWLIST_TTL_MS,
+                                );
+                                if removed > 0 {
+                                    tracing::debug!(
+                                        removed,
+                                        remaining = sweep_allowlist.len(),
+                                        "ZEB-922: serve-allowlist lease sweep collapsed \
+                                         expired entries"
+                                    );
+                                }
+                            }
+                        }));
+                    }
+
                     // ZEB-418 SP2 P2 Task 6: install the outbound-hold
                     // handles on the DmOutbox so send_dm's hold write
                     // (Task 3) fires. Installed independent of the
@@ -13879,6 +13926,8 @@ pub async fn start_node_inner(
                         guard.community_relay_pull_driver_handle =
                             community_relay_pull_driver_handle_opt.take();
                         guard.community_relay_gc_handle = community_relay_gc_handle_opt.take();
+                        guard.serve_allowlist_sweep_handle =
+                            serve_allowlist_sweep_handle_opt.take();
                         guard.community_relay_refresher_handle =
                             community_relay_refresher_handle_opt.take();
                         // ZEB-811 Task 8: stash the vine-pull driver's wake
@@ -14520,6 +14569,7 @@ pub async fn start_node_inner(
             // same rationale as the handles above.
             gateway_dial_driver_handle_opt,
             community_relay_gc_handle_opt,
+            serve_allowlist_sweep_handle_opt,
             community_relay_refresher_handle_opt,
             node_addr_for_response,
             freshly_created,
@@ -14553,6 +14603,7 @@ pub async fn start_node_inner(
         mut vine_pull_driver_handle_for_cleanup,
         mut gateway_dial_driver_handle_for_cleanup,
         mut community_relay_gc_handle_for_cleanup,
+        mut serve_allowlist_sweep_handle_for_cleanup,
         mut community_relay_refresher_handle_for_cleanup,
         node_addr_for_response,
         freshly_created,
@@ -14748,6 +14799,9 @@ pub async fn start_node_inner(
             h.abort();
         }
         if let Some(h) = community_relay_gc_handle_for_cleanup.take() {
+            h.abort();
+        }
+        if let Some(h) = serve_allowlist_sweep_handle_for_cleanup.take() {
             h.abort();
         }
         if let Some(h) = community_relay_refresher_handle_for_cleanup.take() {
@@ -82268,6 +82322,7 @@ mod start_node_race_tests {
             community_relay_publisher_handle: None,
             community_relay_pull_driver_handle: None,
             community_relay_gc_handle: None,
+            serve_allowlist_sweep_handle: None,
             community_relay_refresher_handle: None,
             // ZEB-811 Task 8: vine-pull driver handle + wake unused in race
             // tests.
@@ -82421,7 +82476,7 @@ mod start_node_race_tests {
     // is the shared helper both `stop_inner` and the rebuild path call; this
     // pins that it aborts every one and clears its slot.
     #[tokio::test]
-    async fn clear_driver_handles_aborts_all_six_driver_tasks() {
+    async fn clear_driver_handles_aborts_all_seven_driver_tasks() {
         use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
         use std::sync::Arc;
 
@@ -82436,12 +82491,12 @@ mod start_node_race_tests {
         }
 
         let started: Vec<Arc<AtomicBool>> =
-            (0..6).map(|_| Arc::new(AtomicBool::new(false))).collect();
+            (0..7).map(|_| Arc::new(AtomicBool::new(false))).collect();
         let dropped: Vec<Arc<AtomicBool>> =
-            (0..6).map(|_| Arc::new(AtomicBool::new(false))).collect();
+            (0..7).map(|_| Arc::new(AtomicBool::new(false))).collect();
 
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        for i in 0..6 {
+        for i in 0..7 {
             let s = started[i].clone();
             let d = dropped[i].clone();
             handles.push(tokio::spawn(async move {
@@ -82457,6 +82512,7 @@ mod start_node_race_tests {
             g.community_relay_publisher_handle = Some(handles.remove(0));
             g.community_relay_pull_driver_handle = Some(handles.remove(0));
             g.community_relay_gc_handle = Some(handles.remove(0));
+            g.serve_allowlist_sweep_handle = Some(handles.remove(0));
             g.community_relay_refresher_handle = Some(handles.remove(0));
             g.vine_pull_driver_handle = Some(handles.remove(0));
             g.gateway_dial_driver_handle = Some(handles.remove(0));
@@ -82479,7 +82535,7 @@ mod start_node_race_tests {
         }
         assert!(
             started.iter().all(|f| f.load(SeqCst)),
-            "all six driver tasks reached their await point"
+            "all seven driver tasks reached their await point"
         );
 
         {
@@ -82488,6 +82544,7 @@ mod start_node_race_tests {
             assert!(g.community_relay_publisher_handle.is_none());
             assert!(g.community_relay_pull_driver_handle.is_none());
             assert!(g.community_relay_gc_handle.is_none());
+            assert!(g.serve_allowlist_sweep_handle.is_none());
             assert!(g.community_relay_refresher_handle.is_none());
             assert!(g.vine_pull_driver_handle.is_none());
             assert!(g.gateway_dial_driver_handle.is_none());
@@ -82522,6 +82579,7 @@ mod start_node_race_tests {
         assert!(g.community_relay_publisher_handle.is_none());
         assert!(g.community_relay_pull_driver_handle.is_none());
         assert!(g.community_relay_gc_handle.is_none());
+        assert!(g.serve_allowlist_sweep_handle.is_none());
         assert!(g.community_relay_refresher_handle.is_none());
         assert!(g.vine_pull_driver_handle.is_none());
         assert!(g.gateway_dial_driver_handle.is_none());

@@ -54,7 +54,10 @@ async fn inner() {
     };
 
     let allowlist = CommunityServeAllowlist::new();
-    allowlist.allow(allowed_cid); // only this encrypted CID is serveable
+    // Only this encrypted CID is serveable. Stamp 0 so ANY lease renewal by
+    // the serve path is visible (ZEB-922).
+    allowlist.allow_at(allowed_cid, 0);
+    let allowlist_probe = allowlist.clone();
 
     let closing = Arc::new(AtomicBool::new(false));
     let _serve = spawn_content_serve_queryable(
@@ -115,6 +118,17 @@ async fn inner() {
         "allowlisted encrypted CID must be served"
     );
 
+    // --- Step 2b (ZEB-922): a successful serve must refresh the lease ---
+    let mut renewed = false;
+    for _ in 0..40 {
+        if allowlist_probe.last_affirmed_ms(&allowed_cid) > Some(0) {
+            renewed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(renewed, "successful serve must touch the lease stamp");
+
     // --- Step 3: the non-allowlisted encrypted CID MUST NOT serve ---
     let denied_key = key_for(&denied_cid);
     let replies = session_b.get(&denied_key).await.expect("get denied enc");
@@ -132,6 +146,11 @@ async fn inner() {
         !served_flag.load(Ordering::SeqCst),
         "non-allowlisted encrypted CID must NOT be served"
     );
+
+    // ZEB-922: refused and never-allowlisted CIDs must not gain lease entries
+    // from mere requests — demand can renew intent but never create it.
+    assert_eq!(allowlist_probe.last_affirmed_ms(&denied_cid), None);
+    assert_eq!(allowlist_probe.last_affirmed_ms(&pub_cid), None);
 
     closing.store(true, Ordering::SeqCst);
 }

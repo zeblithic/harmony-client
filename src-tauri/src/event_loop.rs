@@ -11513,8 +11513,18 @@ where
                         tracing::warn!(%qkey, "content-serve: local bytes failed hash==cid; not serving");
                         continue;
                     }
-                    if let Err(e) = query.reply(query.key_expr(), bytes).await {
-                        tracing::warn!(%qkey, error = %e, "content-serve reply failed");
+                    match query.reply(query.key_expr(), bytes).await {
+                        Ok(()) => {
+                            // ZEB-922: a successful serve is demonstrated
+                            // demand — refresh the lease (no-op for
+                            // unencrypted CIDs, which are never in the map).
+                            // Also the first success-path observability here.
+                            serve_allowlist.touch(&cid);
+                            tracing::debug!(%qkey, "content-serve: served");
+                        }
+                        Err(e) => {
+                            tracing::warn!(%qkey, error = %e, "content-serve reply failed");
+                        }
                     }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {

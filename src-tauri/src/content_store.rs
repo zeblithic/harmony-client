@@ -12,7 +12,7 @@
 
 use crate::owner_state_types::ContentId;
 use async_trait::async_trait;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Set of community state-root CIDs this node is willing to serve over CAS even
@@ -27,28 +27,99 @@ use std::sync::{Arc, Mutex, RwLock};
 /// an `.await`. The handle is `Clone` (Arc bump) and shared between the
 /// production `RuntimeContentStore` (registration) and the content-serve
 /// queryable (lookup).
+/// Lease TTL for allowlist entries (30 days, matching the
+/// `RELAY_HOLD_TTL_MS` precedent): serving intent nothing has re-affirmed or
+/// served within this window collapses by default (ZEB-922 / Freenet R5 lease
+/// discipline). Renewal is push-based — producer re-publish,
+/// [`ContentStore::affirm_serveable`], and successful serves — so expiry of a
+/// still-referenced community segment is self-healing: the next peer root GET
+/// re-affirms every current segment before the peer fetches them.
+pub const SERVE_ALLOWLIST_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+
+/// Sweep cadence for the lease sweep task in `lib.rs`. Precision is
+/// irrelevant against a 30-day TTL; hourly keeps the task negligible.
+pub const SERVE_ALLOWLIST_SWEEP_INTERVAL_MS: u64 = 60 * 60 * 1_000;
+
 #[derive(Clone, Default)]
-pub struct CommunityServeAllowlist(Arc<RwLock<HashSet<ContentId>>>);
+pub struct CommunityServeAllowlist(Arc<RwLock<HashMap<ContentId, u64>>>);
 
 impl CommunityServeAllowlist {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Mark a community-root CID serveable. Idempotent. The write guard is held
-    /// only across a non-panicking `HashSet::insert`, so poisoning cannot occur
-    /// in practice; a poisoned lock is nonetheless handled by skipping the insert
-    /// (best-effort, never a panic) rather than by promising later recovery.
+    /// Mark a community-root CID serveable, stamping its lease with the shared
+    /// wall clock. Idempotent; re-calling refreshes the lease. The write guard
+    /// is held only across a non-panicking `HashMap::insert`, so poisoning
+    /// cannot occur in practice; a poisoned lock is nonetheless handled by
+    /// skipping the insert (best-effort, never a panic) rather than by
+    /// promising later recovery.
     pub fn allow(&self, cid: ContentId) {
+        self.allow_at(cid, crate::wall_clock_ms());
+    }
+
+    /// Insert-or-refresh with a caller-supplied clock (test seam for
+    /// [`Self::allow`]; stamps are process-local and never persisted, so the
+    /// one clock every stamping module shares — `crate::wall_clock_ms` — is
+    /// the production source).
+    pub fn allow_at(&self, cid: ContentId, now_ms: u64) {
         if let Ok(mut g) = self.0.write() {
-            g.insert(cid);
+            g.insert(cid, now_ms);
         }
     }
 
-    /// True if `cid` is an allowlisted community-root CID. A poisoned lock reads
-    /// as "not allowlisted" (fail closed — never serve on a poisoned guard).
+    /// True if `cid` is an allowlisted community-root CID. Read-pure: a lookup
+    /// must never renew a lease (only an authoritative affirm or a successful
+    /// serve may — a requester merely naming a CID is not demand). A poisoned
+    /// lock reads as "not allowlisted" (fail closed — never serve on a
+    /// poisoned guard).
     pub fn contains(&self, cid: &ContentId) -> bool {
-        self.0.read().map(|g| g.contains(cid)).unwrap_or(false)
+        self.0.read().map(|g| g.contains_key(cid)).unwrap_or(false)
+    }
+
+    /// Refresh the lease iff the CID is already allowlisted — a successful
+    /// serve is demonstrated demand, but demand alone must never CREATE
+    /// serving intent, so this never inserts.
+    pub fn touch(&self, cid: &ContentId) {
+        self.touch_at(cid, crate::wall_clock_ms());
+    }
+
+    /// Test-seam core of [`Self::touch`]. Returns whether a lease was
+    /// refreshed.
+    pub fn touch_at(&self, cid: &ContentId, now_ms: u64) -> bool {
+        if let Ok(mut g) = self.0.write() {
+            if let Some(stamp) = g.get_mut(cid) {
+                *stamp = now_ms;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove entries whose lease expired: `last_affirmed + ttl < now`
+    /// (strict — an entry at exactly `now - ttl` survives, mirroring
+    /// `RelayHoldDoc::gc`). Returns the removed count.
+    pub fn sweep_expired(&self, now_ms: u64, ttl_ms: u64) -> usize {
+        if let Ok(mut g) = self.0.write() {
+            let before = g.len();
+            g.retain(|_, stamp| stamp.saturating_add(ttl_ms) >= now_ms);
+            before - g.len()
+        } else {
+            0
+        }
+    }
+
+    /// The lease stamp for `cid`, if allowlisted (observability + tests).
+    pub fn last_affirmed_ms(&self, cid: &ContentId) -> Option<u64> {
+        self.0.read().ok().and_then(|g| g.get(cid).copied())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.read().map(|g| g.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -112,6 +183,19 @@ pub trait ContentStore: Send + Sync {
     /// (community state-root ciphertext) — never for private blobs.
     async fn put_serveable(&self, cid: ContentId, blob: Vec<u8>) -> Result<(), ContentStoreError> {
         self.put(cid, blob).await
+    }
+
+    /// ZEB-922: re-affirm an existing serve-intent lease (or create one)
+    /// WITHOUT re-writing bytes. Producers call this for content that is still
+    /// referenced by authoritative state but whose bytes were stored by an
+    /// earlier publish — e.g. reused community state segments, which a
+    /// republish deliberately does not re-`put` (O(delta)). Default is a
+    /// no-op; only `RuntimeContentStore` registers the CID in its shared
+    /// `CommunityServeAllowlist`. Same safety contract as `put_serveable`:
+    /// callers affirm ONLY content safe to serve to any requester who can
+    /// name the CID.
+    fn affirm_serveable(&self, cid: ContentId) {
+        let _ = cid;
     }
 
     /// ZEB-539: after a download validates, allowlist the artifact's whole local
@@ -458,6 +542,15 @@ impl ContentStore for RuntimeContentStore {
         Ok(())
     }
 
+    fn affirm_serveable(&self, cid: ContentId) {
+        // ZEB-922: lease affirmation is a pure allowlist write — no CAS
+        // round-trip (the bytes are already admitted; only the serving
+        // intent needs re-stamping).
+        if let Some(allowlist) = &self.serve_allowlist {
+            allowlist.allow(cid);
+        }
+    }
+
     async fn allow_serve_subtree(&self, root: ContentId) -> Result<usize, ContentStoreError> {
         // ZEB-539: hand the local DAG walk to the event loop (it owns the
         // StorageTier cache + the serve_allowlist). Mirrors `put` /
@@ -789,6 +882,62 @@ mod tests {
         assert!(b.contains(&c), "clone shares the underlying set");
     }
 
+    #[test]
+    fn lease_allow_at_inserts_and_refreshes() {
+        let a = CommunityServeAllowlist::new();
+        let c = cid(0xa1);
+        assert_eq!(a.last_affirmed_ms(&c), None);
+        a.allow_at(c, 100);
+        assert_eq!(a.last_affirmed_ms(&c), Some(100));
+        a.allow_at(c, 250);
+        assert_eq!(a.last_affirmed_ms(&c), Some(250), "allow_at refreshes");
+    }
+
+    #[test]
+    fn lease_touch_at_refreshes_only_existing_entries() {
+        let a = CommunityServeAllowlist::new();
+        let present = cid(0xa2);
+        let absent = cid(0xa3);
+        a.allow_at(present, 100);
+        assert!(a.touch_at(&present, 500));
+        assert_eq!(a.last_affirmed_ms(&present), Some(500));
+        assert!(!a.touch_at(&absent, 500), "touch never inserts");
+        assert_eq!(a.last_affirmed_ms(&absent), None);
+        assert!(!a.contains(&absent));
+    }
+
+    #[test]
+    fn lease_sweep_expired_boundary_is_strict() {
+        let a = CommunityServeAllowlist::new();
+        let at_boundary = cid(0xa4);
+        let expired = cid(0xa5);
+        let fresh = cid(0xa6);
+        a.allow_at(at_boundary, 1_000);
+        a.allow_at(expired, 999);
+        a.allow_at(fresh, 5_000);
+        // now == stamp + ttl exactly → survives; one ms older → collapses.
+        let removed = a.sweep_expired(11_000, 10_000);
+        assert_eq!(removed, 1);
+        assert!(a.contains(&at_boundary), "stamp+ttl == now must survive");
+        assert!(!a.contains(&expired));
+        assert!(a.contains(&fresh));
+        assert_eq!(a.len(), 2);
+    }
+
+    #[test]
+    fn lease_refreshed_entry_survives_the_sweep_that_kills_its_cohort() {
+        let a = CommunityServeAllowlist::new();
+        let stale = cid(0xa7);
+        let renewed = cid(0xa8);
+        a.allow_at(stale, 100);
+        a.allow_at(renewed, 100);
+        assert!(a.touch_at(&renewed, 9_000));
+        let removed = a.sweep_expired(15_000, 10_000);
+        assert_eq!(removed, 1);
+        assert!(!a.contains(&stale));
+        assert!(a.contains(&renewed));
+    }
+
     #[tokio::test]
     async fn put_serveable_registers_cid_in_allowlist() {
         // RuntimeContentStore.with_serve_allowlist: put_serveable admits AND records
@@ -876,6 +1025,52 @@ mod tests {
 
         drop(store);
         stub.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn affirm_serveable_default_impl_is_a_noop() {
+        // The default trait impl (InMemoryStub) must compile and do nothing:
+        // no blob appears, nothing panics.
+        let store = InMemoryStub::default();
+        let c = cid(0xb1);
+        store.affirm_serveable(c);
+        assert!(store.get(&c).await.unwrap().is_none(), "no side effects");
+    }
+
+    #[tokio::test]
+    async fn runtime_affirm_serveable_inserts_and_refreshes_lease() {
+        // RuntimeContentStore WITH an allowlist: affirm inserts a missing CID
+        // and refreshes an existing lease — without any CAS traffic.
+        let (cas_op_tx, mut cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let allowlist = CommunityServeAllowlist::new();
+        let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500))
+            .with_serve_allowlist(allowlist.clone());
+
+        let fresh = cid(0xb2);
+        store.affirm_serveable(fresh);
+        assert!(allowlist.contains(&fresh), "affirm inserts a missing CID");
+
+        let old = cid(0xb3);
+        allowlist.allow_at(old, 1);
+        store.affirm_serveable(old);
+        assert!(
+            allowlist.last_affirmed_ms(&old) > Some(1),
+            "affirm refreshes an existing lease"
+        );
+
+        drop(store);
+        assert!(
+            cas_op_rx.try_recv().is_err(),
+            "affirm_serveable must emit no CasOp"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_affirm_serveable_without_allowlist_is_noop() {
+        // RuntimeContentStore with no allowlist set: affirm must not panic.
+        let (cas_op_tx, _cas_op_rx) = tokio::sync::mpsc::channel::<CasOp>(8);
+        let store = RuntimeContentStore::new(cas_op_tx, std::time::Duration::from_millis(500));
+        store.affirm_serveable(cid(0xb4));
     }
 
     #[tokio::test]
