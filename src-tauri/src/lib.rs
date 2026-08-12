@@ -85519,6 +85519,172 @@ mod zeb_687_revoked_feed_boot_tests {
     }
 }
 
+/// ZEB-904/905: a seedless, no-fleet-material identity boots LOCAL-ONLY —
+/// owner wiring live, fleet engines skipped, `fleetCryptoMissing` reported —
+/// and purely-local owner ops (create community) work and survive a restart.
+/// This is the end-to-end pin for the exact production failure: Jake's
+/// long-lived identity (seed wiped pre-ZEB-492, no fleet-KeyTree slot) booted
+/// with every owner handle None while the Account panel rendered the owner.
+///
+/// Same boot recipe + gating rationale as `zeb_687_revoked_feed_boot_tests`
+/// above (test-fixtures for the headless mint; no outer whole-test timeout —
+/// two full boots legitimately run minutes under sweep contention).
+#[cfg(all(test, feature = "test-fixtures"))]
+mod zeb904_seedless_local_only_boot_tests {
+    use super::*;
+    use serial_test::serial;
+
+    struct EnvVarGuard {
+        name: &'static str,
+        prev: Option<String>,
+    }
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let prev = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, prev }
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.name, v),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn seedless_no_material_boot_is_local_only_and_community_persists() {
+        // (a) Env scaffolding — identical rationale to the ZEB-687 module.
+        let home = tempfile::tempdir().expect("tempdir for HOME override");
+        let home_str = home
+            .path()
+            .to_str()
+            .expect("tempdir path is valid utf8")
+            .to_string();
+        let _g_home = EnvVarGuard::set("HOME", &home_str);
+        let _g_userprofile = EnvVarGuard::set("USERPROFILE", &home_str);
+        let _g_pass = EnvVarGuard::set("HARMONY_PASSPHRASE", "zeb904-seedless-boot-pp");
+        let _g_xdg = EnvVarGuard::set("XDG_DATA_HOME", &format!("{home_str}/xdg-data"));
+        let _g_appdata = EnvVarGuard::set("APPDATA", &format!("{home_str}/appdata"));
+        let _g_nokeychain = EnvVarGuard::set("HARMONY_DISABLE_KEYCHAIN", "1");
+
+        // (b) Mint a real owner, then manufacture the seedless state: remove
+        //     the persisted master seed and confirm no fleet-KeyTree slot
+        //     exists (a fresh mint distributes no material — this mirrors both
+        //     the legacy pre-ZEB-492 identity and `install_joiner_state`'s
+        //     no-material output). Read-only existence checks precede the
+        //     removal so a layout change fails loudly here, not as a silent
+        //     wrong-fixture pass.
+        let state = std::sync::Arc::new(Mutex::new(NodeState::default()));
+        crate::owner_commands::mint_owner_identity_inner_for_test(&state, || {
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect("mint owner identity writes owner_state.cbor");
+        let identity_dir = home.path().join(".harmony");
+        let seed_file = identity_dir.join("master_seed.enc");
+        assert!(
+            seed_file.exists(),
+            "fixture precondition: mint must persist master_seed.enc at {}",
+            seed_file.display()
+        );
+        std::fs::remove_file(&seed_file).expect("wipe the master seed");
+        assert!(
+            !identity_dir.join("fleet_keytree.enc").exists(),
+            "fixture precondition: a fresh mint must hold no fleet-KeyTree slot"
+        );
+
+        // (c) Boot 1 — the local-only boot under test.
+        crate::iroh_endpoint::warm_up_iroh_global_init().await;
+        let events = crate::api::events::ApiEventSink::new();
+        let sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink> =
+            std::sync::Arc::new(events.clone());
+        let resp = start_node_inner(None, sink.clone(), None, &state, None)
+            .await
+            .expect("seedless no-material boot must SUCCEED (local-only), not brick");
+        assert!(
+            resp.has_owner_identity,
+            "the owner IS loaded — local-only is not an identity-missing state"
+        );
+        assert!(
+            resp.fleet_crypto_missing,
+            "the boot must report local-only mode to the frontend"
+        );
+
+        // (d) The ZEB-904 half-alive bug was every owner handle None while the
+        //     Account panel rendered the owner. Pin the wiring: owner handles
+        //     present, keytree absent (keyless), fleet engines skipped.
+        {
+            let g = state.lock().expect("NodeState lock");
+            assert!(g.crdt_state.is_some(), "crdt_state must wire keyless");
+            assert!(
+                g.community_registry.is_some(),
+                "community registry must wire keyless"
+            );
+            assert!(g.dm_outbox.is_some(), "dm_outbox must wire keyless");
+            assert!(
+                g.sync_engine.is_some(),
+                "owner-state engine must run keyless"
+            );
+            assert!(
+                g.owner_keytree.is_none(),
+                "no fleet crypto — keytree consumers must see None"
+            );
+            assert!(
+                g.fleet_net_doc.is_none(),
+                "fleet dataset engines must NOT wire keyless"
+            );
+        }
+
+        // (e) The exact op that failed in the wild ("Owner identity not
+        //     loaded — no identity is set up on this device yet").
+        let community_id =
+            create_community_impl(&state, sink.clone(), "Seedless Commons".to_string(), true)
+                .await
+                .expect("create_community must work on a local-only boot");
+
+        // (f) Restart: stop, boot again on the SAME identity dir, and require
+        //     the community to have survived via the keyless engine's persist
+        //     path (notify_dirty → owner_state_crdt.cbor, no publish).
+        assert!(stop_inner(&state, None), "stop must succeed");
+        let resp2 = start_node_inner(None, sink.clone(), None, &state, None)
+            .await
+            .expect("second local-only boot must succeed");
+        assert!(resp2.fleet_crypto_missing, "still keyless after restart");
+        let crdt_state = state
+            .lock()
+            .expect("NodeState lock")
+            .crdt_state
+            .clone()
+            .expect("crdt_state wired on reboot");
+        {
+            let st = crdt_state.lock().await;
+            let sid = crate::owner_state_types::SpaceId(
+                <[u8; 16]>::try_from(
+                    hex::decode(&community_id)
+                        .expect("community id is hex")
+                        .as_slice(),
+                )
+                .expect("community id is 16 bytes"),
+            );
+            let space = st
+                .spaces
+                .get(&sid)
+                .expect("community created keyless must persist across restart");
+            assert_eq!(
+                space.name, "Seedless Commons",
+                "persisted community must carry its name"
+            );
+        }
+
+        // (g) Teardown — same rationale as ZEB-687 (j).
+        let _ = stop_inner(&state, None);
+    }
+}
+
 #[cfg(test)]
 mod zeb694_accept_tests {
     use super::*;
