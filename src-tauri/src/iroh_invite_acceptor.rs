@@ -713,7 +713,26 @@ where
             .engine_arc(&community_id)
             .await
             .ok_or(HandshakeAcceptError::CommunityNotFound { community_id })?;
-        let epoch_key = engine.membership_key();
+        // ZEB-919 posture decision: verify the joiner's `epoch_auth`
+        // capability against the LIVE `Space.current_epoch_key`, current-only
+        // — a HARD CUT for pre-rotation open-join links (ZEB-911/918
+        // precedent: the previous epoch key is precisely the artifact
+        // rotation exists to invalidate). The mint side
+        // (`generate_invite_impl`) already embeds the live key, so this
+        // closes the mint/verify incoherence where an un-restarted acceptor
+        // admitted old-key links forever while a restarted one rejected
+        // them. No previous-key rung here: open-join is outsider→member
+        // admission, not a rotation-propagation path — a joiner holding a
+        // fresh link simply retries against a member whose state has
+        // rotated. Degrade-to-spawn on a live-read miss equals today's
+        // behavior (never worse) and keeps open-join alive across a
+        // transiently incomplete Space row.
+        let epoch_key = crate::community_state_sync::community_publish_epoch_key_typed(
+            community_id,
+            Some(&self.crdt_state),
+            &engine.membership_key(),
+        )
+        .await;
         let admin_addr = engine.admin_addr();
 
         // SECURITY: tokenless open-join is only valid for OPEN communities. An
@@ -1002,6 +1021,75 @@ mod tests {
         mint_test_owner, MembershipEventKind, SignedMembershipEvent,
     };
     use crate::owner_state_types::{DeviceIdentityHash, Hlc, OwnerAddr, SpaceId};
+
+    /// ZEB-919: pins `handle_open_join_inbound`'s admission-key choice — the
+    /// live `Space.current_epoch_key` via
+    /// `community_publish_epoch_key_typed`, NOT the engine's spawn-pinned
+    /// key. After a rotation lands in owner-state, an `epoch_auth` minted
+    /// from a pre-rotation link (OLD key) must fail against the selected key
+    /// (hard cut), and one minted from a fresh link (NEW key) must pass —
+    /// with the spawn key still selected on a live-read miss (degraded mode
+    /// equals today's behavior).
+    #[tokio::test]
+    async fn admission_key_is_live_current_not_spawn_pin() {
+        use crate::open_join_auth::{mint_epoch_auth, verify_epoch_auth};
+        use crate::owner_state_types::EpochKey;
+        use std::sync::Arc;
+
+        let c = SpaceId([0xc9; 16]);
+        let spawn_pinned = EpochKey::new([0x11; 32]); // engine's stale copy
+        let live = EpochKey::new([0x22; 32]); // post-rotation key
+
+        let mut os = crate::owner_state_crdt::OwnerState::default();
+        os.spaces.insert(
+            c,
+            crate::community_state_sync::test_community_space(c, 1, live.clone()),
+        );
+        let crdt = Arc::new(tokio::sync::Mutex::new(os));
+
+        // The exact key-selection expression handle_open_join_inbound runs.
+        let selected = crate::community_state_sync::community_publish_epoch_key_typed(
+            c,
+            Some(&crdt),
+            &spawn_pinned,
+        )
+        .await;
+
+        let joiner_pub = [0x77u8; 64];
+        let nonce = [0x0eu8; 16];
+        let ts = 1_700_000_000_000u64;
+        let old_auth = mint_epoch_auth(&spawn_pinned, &c, &joiner_pub, &nonce, ts);
+        let new_auth = mint_epoch_auth(&live, &c, &joiner_pub, &nonce, ts);
+
+        assert!(
+            !verify_epoch_auth(&selected, &c, &joiner_pub, &nonce, ts, &old_auth),
+            "pre-rotation link capability must be hard-cut after rotation"
+        );
+        assert!(
+            verify_epoch_auth(&selected, &c, &joiner_pub, &nonce, ts, &new_auth),
+            "fresh link capability must admit against the live key"
+        );
+
+        // Degraded mode: live read unavailable → spawn key selected, so a
+        // pre-rotation link still admits (identical to today's behavior).
+        let empty = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+        let degraded = crate::community_state_sync::community_publish_epoch_key_typed(
+            c,
+            Some(&empty),
+            &spawn_pinned,
+        )
+        .await;
+        assert!(verify_epoch_auth(
+            &degraded,
+            &c,
+            &joiner_pub,
+            &nonce,
+            ts,
+            &old_auth
+        ));
+    }
 
     fn sample_join_event() -> SignedMembershipEvent {
         SignedMembershipEvent {
