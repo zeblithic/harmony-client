@@ -479,17 +479,34 @@ pub async fn run_dm_inbox_ingest_sweeper(
     persist_now: PersistNowFn,
     debounce: Duration,
 ) {
+    // ZEB-925: sidecar persist-retry latch — armed by a failed sidecar-only
+    // persist_now inside sweep_once, drained by the next successful one.
+    let mut sidecar_persist_pending = false;
     // Startup sweep: ingest entries deposited while this device was
     // offline (they arrive via the engine's initial fan-in BEFORE
     // on_applied wiring can observe them, and via the persisted doc).
-    sweep_once(&doc, ctx.as_ref(), notify_dirty.as_ref(), &persist_now).await;
+    sweep_once(
+        &doc,
+        ctx.as_ref(),
+        notify_dirty.as_ref(),
+        &persist_now,
+        &mut sidecar_persist_pending,
+    )
+    .await;
 
     while nudge_rx.recv().await.is_some() {
         // Debounce: let the rest of a merge burst land, then drain any
         // extra nudges so the burst coalesces into one sweep.
         tokio::time::sleep(debounce).await;
         while nudge_rx.try_recv().is_ok() {}
-        sweep_once(&doc, ctx.as_ref(), notify_dirty.as_ref(), &persist_now).await;
+        sweep_once(
+            &doc,
+            ctx.as_ref(),
+            notify_dirty.as_ref(),
+            &persist_now,
+            &mut sidecar_persist_pending,
+        )
+        .await;
     }
     // recv() == None: every nudge sender dropped (engine shutdown).
 }
@@ -1522,27 +1539,41 @@ async fn sweep_once(
     ctx: &dyn DmInboxIngestCtx,
     notify_dirty: &(dyn Fn() + Send + Sync),
     persist_now: &PersistNowFn,
+    sidecar_persist_pending: &mut bool,
 ) {
-    let (changed, fo_grew) = {
+    let (changed, sidecars_changed) = {
         let mut guard = doc.lock().await;
-        let before = guard.first_observed_ms().len();
+        let fo_before = guard.first_observed_ms().len();
+        let tomb_before = guard.expired_at_ms().len();
         let changed = ingest_pending(&mut guard, ctx).await;
-        // When `changed` is false the side-map cannot shrink (no entry was
-        // removed, so its live-key prune removes nothing), so a length change
-        // means `gc_expired` lazily stamped a newly-seen entry.
-        (changed, guard.first_observed_ms().len() != before)
+        // When `changed` is false the fo side-map cannot shrink (no entry was
+        // removed, so its live-key prune removes nothing) — a length change
+        // means `gc_expired` lazily stamped a newly-seen entry. The tombstone
+        // map CAN shrink on an otherwise no-op sweep (ZEB-925 retention
+        // age-out), so both deltas mark the sidecars dirty.
+        let sidecars_changed = guard.first_observed_ms().len() != fo_before
+            || guard.expired_at_ms().len() != tomb_before;
+        (changed, sidecars_changed)
     };
     if changed {
         // `notify_dirty` schedules a debounced publish + persist, which also
-        // captures any first-observation stamps added during this sweep.
+        // captures sidecar mutations from this sweep (DmInboxPersist writes
+        // every file). Its failure/retry semantics are the engine's dirty
+        // latch — neither set nor cleared here.
         notify_dirty();
-    } else if fo_grew {
-        // ZEB-862: a stamp-only sweep added durable first-observation
-        // timestamps but removed nothing. Persist them LOCALLY (no fleet
-        // republish; the clock is serde-skip so the wire bytes are unchanged)
-        // so the TTL survives restart.
-        if let Err(e) = persist_now().await {
-            tracing::warn!(error = %e, "ZEB-862: dm-inbox first-observed persist_now failed");
+    } else if sidecars_changed || *sidecar_persist_pending {
+        // ZEB-862 stamp-only / ZEB-925 tombstone-delta sweep: persist the
+        // LOCAL sidecars without a fleet republish (both maps are serde-skip,
+        // so the wire bytes are unchanged). On failure, latch so the next
+        // sweep retries even if nothing else changes — the deltas are already
+        // in memory and will never re-fire on their own (ZEB-924 R1 lesson).
+        match persist_now().await {
+            Ok(()) => *sidecar_persist_pending = false,
+            Err(e) => {
+                *sidecar_persist_pending = true;
+                tracing::warn!(error = %e,
+                    "dm-inbox sidecar persist_now failed; will retry next sweep");
+            }
         }
     }
 }
@@ -2212,6 +2243,89 @@ mod tests {
             0,
             "mutating sweeps notify_dirty; the stamp-only persist_now path is not taken here"
         );
+    }
+
+    /// ZEB-925: a sweep whose only effect is a tombstone-map change (retention
+    /// age-out on an otherwise no-op sweep) persists the sidecars via
+    /// persist_now — the delta would otherwise never reach disk (no entry
+    /// change, no fo growth, no fleet republish).
+    #[tokio::test]
+    async fn tombstone_delta_only_sweep_persists_via_persist_now() {
+        // Past the tombstone retention window so the sweep's prune drops the
+        // seeded stamp.
+        let now_ms: u64 = crate::butler_deposit::INBOX_TOMBSTONE_RETENTION_MS + 1_000_000;
+        let ctx = ProbeCtx {
+            now_ms,
+            ..ProbeCtx::new()
+        };
+        let doc = Arc::new(Mutex::new(DmInboxDoc::default()));
+        {
+            // Tombstone from a "previous run" (restored near its stamp so the
+            // restore-time prune keeps it), aged past retention at this
+            // sweep's `now`.
+            let mut guard = doc.lock().await;
+            guard.restore_expired([("old-key".to_string(), 1u64)].into_iter().collect(), 2u64);
+            assert_eq!(guard.expired_at_ms().len(), 1);
+        }
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let persist_now: PersistNowFn = {
+            let calls = Arc::clone(&persist_calls);
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            })
+        };
+        let mut pending = false;
+        sweep_once(&doc, &ctx, &|| {}, &persist_now, &mut pending).await;
+        assert_eq!(doc.lock().await.expired_at_ms().len(), 0, "aged out");
+        assert_eq!(
+            persist_calls.load(Ordering::SeqCst),
+            1,
+            "tombstone-only delta persisted via persist_now"
+        );
+        assert!(!pending, "successful persist leaves the latch clear");
+    }
+
+    /// ZEB-925 (ZEB-924 R1 lesson): a FAILED sidecar persist_now latches and
+    /// retries on the next sweep even when that sweep changes nothing — the
+    /// deltas are already in memory and will never re-fire on their own.
+    #[tokio::test]
+    async fn failed_sidecar_persist_latches_and_retries_next_sweep() {
+        let ctx = ProbeCtx::new();
+        let doc = Arc::new(Mutex::new(DmInboxDoc::default()));
+        {
+            // Already self-acked (ingest skips it → changed stays false) but
+            // NOT covered (sibling missing): the first sweep's only effect is
+            // the lazy first-observation stamp — a sidecar-only delta.
+            let (key, entry) = make_entry([3; 16], [3; 32], 500, &[SELF_ID]);
+            doc.lock().await.entries.insert(key, entry);
+        }
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let fail_first = Arc::new(AtomicUsize::new(1));
+        let persist_now: PersistNowFn = {
+            let calls = Arc::clone(&persist_calls);
+            let fail = Arc::clone(&fail_first);
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let should_fail = fail.swap(0, Ordering::SeqCst) == 1;
+                Box::pin(async move {
+                    if should_fail {
+                        Err(crate::fleet_sync::SyncError::Persist("disk full".into()))
+                    } else {
+                        Ok(())
+                    }
+                })
+            })
+        };
+        let mut pending = false;
+        sweep_once(&doc, &ctx, &|| {}, &persist_now, &mut pending).await;
+        assert_eq!(persist_calls.load(Ordering::SeqCst), 1);
+        assert!(pending, "failed persist arms the latch");
+        // Second sweep: nothing new (entry already stamped, ingest still
+        // skips it) — the latch alone must drive the retry.
+        sweep_once(&doc, &ctx, &|| {}, &persist_now, &mut pending).await;
+        assert_eq!(persist_calls.load(Ordering::SeqCst), 2, "latch retried");
+        assert!(!pending, "successful retry clears the latch");
     }
 
     /// The on_applied adapter nudges the channel; a full buffer (sweep

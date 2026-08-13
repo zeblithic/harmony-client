@@ -6202,6 +6202,17 @@ pub async fn start_node_inner(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_millis() as u64;
+                            // ZEB-925: restore expiry tombstones FIRST — the
+                            // tombstone wins over a stale doc file, and
+                            // restore_first_observed's orphan-prune then drops
+                            // the removed entries' stamps.
+                            doc.restore_expired(
+                                crate::dm_inbox_persist::load_expired_or_recover(
+                                    &dm_inbox_expired_path,
+                                )
+                                .map_err(|e| format!("load dm-inbox expired: {e}"))?,
+                                now_ms,
+                            );
                             doc.restore_first_observed(
                                 crate::dm_inbox_persist::load_first_observed_or_recover(
                                     &dm_inbox_first_observed_path,
