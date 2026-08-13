@@ -880,10 +880,12 @@ pub struct NodeState {
     storage_settings_path: Option<std::path::PathBuf>,
     /// ZEB-669 S2: session-monotonic publish clocks, one per storage
     /// record type — same rationale as `follow_list_clock` (two changes
-    /// within one wall second must not be LWW-equal). Atomic only for
-    /// interior mutability; writers hold the NodeState mutex.
-    pledge_clock: std::sync::atomic::AtomicU64,
-    backup_set_clock: std::sync::atomic::AtomicU64,
+    /// within one wall second must not be LWW-equal). `Arc` (ZEB-923):
+    /// the storage-record publisher task holds a clone for its hourly
+    /// renewal re-mints, so the mint itself is race-free (`fetch_update`)
+    /// rather than relying on writers holding the NodeState mutex.
+    pledge_clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    backup_set_clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Monotonic install generation. Bumped at lock-2 install site under
     /// `start_node`. Post-install checks (pairing-handle install, failure
     /// cleanup, stop_inner gating) compare against this to detect whether a
@@ -2099,8 +2101,8 @@ impl Default for NodeState {
                 storage_settings::StorageSettings::default(),
             )),
             storage_settings_path: None,
-            pledge_clock: std::sync::atomic::AtomicU64::new(0),
-            backup_set_clock: std::sync::atomic::AtomicU64::new(0),
+            pledge_clock: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            backup_set_clock: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 0,
             install_seq: 0,
             node_addr: String::new(),
@@ -4091,9 +4093,14 @@ pub async fn start_node_inner(
     // RAM-only cache); settings carry budget/pledges/floors.
     let storage_settings_path = storage_settings::settings_path(&app_data_dir);
     let storage_settings_loaded = storage_settings::load_or_default(&storage_settings_path);
-    let storage_records_arc = std::sync::Arc::new(std::sync::Mutex::new(
-        storage_records::StorageRecordStore::new(Some(app_data_dir.join("storage_records.json"))),
-    ));
+    let storage_records_arc = std::sync::Arc::new(std::sync::Mutex::new({
+        let mut records = storage_records::StorageRecordStore::new(Some(
+            app_data_dir.join("storage_records.json"),
+        ));
+        // ZEB-923: one-shot post-load grace floor — see apply_boot_grace.
+        records.apply_boot_grace(wall_clock_ms());
+        records
+    }));
     let storage_ledger_arc = std::sync::Arc::new(std::sync::Mutex::new(
         storage_ledger::StorageLedger::new(Some(app_data_dir.join("storage_ledger.json"))),
     ));
@@ -13665,10 +13672,17 @@ pub async fn start_node_inner(
                         guard.storage_ledger = storage_ledger_arc;
                         guard.storage_settings = storage_settings_arc;
                         guard.storage_settings_path = Some(storage_settings_path);
-                        guard.pledge_clock =
-                            std::sync::atomic::AtomicU64::new(storage_settings_loaded.pledge_floor);
-                        guard.backup_set_clock = std::sync::atomic::AtomicU64::new(
+                        // ZEB-923: raise-only seed on the SHARED cells — a
+                        // publisher-task clone must never be disconnected by a
+                        // field reassignment, and an in-memory clock ahead of a
+                        // stale-saved floor must never regress.
+                        guard.pledge_clock.fetch_max(
+                            storage_settings_loaded.pledge_floor,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        guard.backup_set_clock.fetch_max(
                             storage_settings_loaded.backup_set_floor,
+                            std::sync::atomic::Ordering::Relaxed,
                         );
                         guard.followed_set = Some(followed_set);
                         guard.vine_feed_cache = Some(vine_feed_cache);
@@ -15013,8 +15027,9 @@ pub async fn start_node_inner(
                 if guard.generation == our_gen {
                     publish_follow_list_update(&guard);
                     // ZEB-669 S2: same once-per-boot LWW convergence for
-                    // the storage-buddy records we own. Hosting reports
-                    // are the periodic publisher task's job (below).
+                    // the storage-buddy records we own. Hosting cadence +
+                    // the ZEB-923 hourly pledge/backup renewal are the
+                    // publisher task's job (below).
                     publish_pledge_list_update(&guard);
                     publish_backup_set_update(&guard);
                     if let (Some(identity), Some(tx), Some(path)) = (
@@ -15027,7 +15042,7 @@ pub async fn start_node_inner(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .hosting_floor;
-                        spawn_hosting_report_publisher(
+                        spawn_storage_record_publisher(
                             identity,
                             guard.node_addr.clone(),
                             guard.storage_ledger.clone(),
@@ -15038,6 +15053,9 @@ pub async fn start_node_inner(
                             guard.dm_outbox.clone(),
                             guard.owner_trust_doc.clone(),
                             guard.storage_v2_cache.clone(),
+                            guard.content_index.clone(),
+                            guard.pledge_clock.clone(),
+                            guard.backup_set_clock.clone(),
                         );
                     }
                     // ZEB-671: seed the Discover graph inputs (consumes
@@ -20050,10 +20068,15 @@ fn next_storage_updated_at(clock: &std::sync::atomic::AtomicU64) -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let prev = clock.load(Ordering::Relaxed);
-    let ts = now_secs.max(prev + 1);
-    clock.store(ts, Ordering::Relaxed);
-    ts
+    // ZEB-923: race-free — the sync IPC paths and the publisher task's
+    // renewal re-mints share each clock; a load/store pair could hand two
+    // concurrent minters the same stamp (LWW-equal ⇒ one publish ignored).
+    let prev = clock
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            Some(now_secs.max(prev + 1))
+        })
+        .unwrap_or_else(|prev| prev); // closure always returns Some
+    now_secs.max(prev + 1)
 }
 
 /// Refuse to sign a storage record for an owner address the local
@@ -20170,14 +20193,46 @@ fn persist_storage_settings(guard: &NodeState, settings: &storage_settings::Stor
 /// deterministic order), advancing + persisting the pledge floor.
 fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), String> {
     let identity = storage_signer(guard, "pledge list")?;
-    let updated_at = next_storage_updated_at(&guard.pledge_clock);
+    let v2 = storage_v2_material(guard);
+    build_signed_pledge_list_with(
+        identity,
+        &guard.node_addr,
+        &guard.storage_settings,
+        guard.storage_settings_path.as_deref(),
+        &guard.pledge_clock,
+        v2.as_ref(),
+    )
+}
+
+/// ZEB-923: component-taking core of the pledge-list build, callable
+/// from the storage-record publisher task's hourly renewal (owned
+/// handles, no `&NodeState` — same posture as
+/// `build_signed_hosting_report_with`).
+fn build_signed_pledge_list_with(
+    identity: &harmony_identity::PrivateIdentity,
+    node_addr: &str,
+    settings: &std::sync::Arc<Mutex<storage_settings::StorageSettings>>,
+    settings_path: Option<&std::path::Path>,
+    clock: &std::sync::atomic::AtomicU64,
+    v2_material: Option<&storage_signing::StorageSignerMaterial>,
+) -> Result<(String, Vec<u8>), String> {
+    let signer = vine_signing::signer_address(identity);
+    if node_addr != signer {
+        return Err(format!(
+            "refusing to sign: storage record owner {node_addr} does not match signer identity {signer}"
+        ));
+    }
+    let updated_at = next_storage_updated_at(clock);
     let pledges: Vec<storage_signing::PledgeEntry> = {
-        let mut settings = guard
-            .storage_settings
+        let mut settings = settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        settings.pledge_floor = updated_at;
-        persist_storage_settings(guard, &settings);
+        // ZEB-923: grow-only — concurrent minters can persist out of
+        // order; a floor must never move backwards.
+        settings.pledge_floor = settings.pledge_floor.max(updated_at);
+        if let Some(path) = settings_path {
+            storage_settings::save(path, &settings);
+        }
         settings
             .my_pledges
             .iter()
@@ -20189,7 +20244,7 @@ fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), Stri
             .collect()
     };
     let mut payload = storage_signing::PledgeListPayload {
-        owner_address: guard.node_addr.clone(),
+        owner_address: node_addr.to_string(),
         pledges,
         updated_at,
         identity_pub: None,
@@ -20198,10 +20253,9 @@ fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), Stri
     };
     // ZEB-679: dual-sign when the enrolled `#2` material is available and
     // self-verifies; legacy-only otherwise (every receiver accepts it).
-    match storage_v2_material(guard) {
+    match v2_material {
         Some(material) => {
-            if let Err(e) = storage_signing::sign_pledge_list_v2(identity, &material, &mut payload)
-            {
+            if let Err(e) = storage_signing::sign_pledge_list_v2(identity, material, &mut payload) {
                 tracing::warn!("pledge list v2 sign failed, publishing legacy-only: {e}");
                 payload.v2 = Default::default();
             }
@@ -20221,18 +20275,43 @@ fn build_signed_pledge_list(guard: &NodeState) -> Result<(String, Vec<u8>), Stri
 /// first), truncated to the wire cap.
 fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), String> {
     let identity = storage_signer(guard, "backup set")?;
+    let v2 = storage_v2_material(guard);
+    build_signed_backup_set_with(
+        identity,
+        &guard.node_addr,
+        &guard.content_index,
+        &guard.storage_settings,
+        guard.storage_settings_path.as_deref(),
+        &guard.backup_set_clock,
+        v2.as_ref(),
+    )
+}
+
+/// ZEB-923: component-taking core of the backup-set build (see
+/// `build_signed_pledge_list_with`).
+#[allow(clippy::too_many_arguments)]
+fn build_signed_backup_set_with(
+    identity: &harmony_identity::PrivateIdentity,
+    node_addr: &str,
+    content_index: &std::sync::Arc<Mutex<content_index::ContentIndex>>,
+    settings: &std::sync::Arc<Mutex<storage_settings::StorageSettings>>,
+    settings_path: Option<&std::path::Path>,
+    clock: &std::sync::atomic::AtomicU64,
+    v2_material: Option<&storage_signing::StorageSignerMaterial>,
+) -> Result<(String, Vec<u8>), String> {
+    let signer = vine_signing::signer_address(identity);
+    if node_addr != signer {
+        return Err(format!(
+            "refusing to sign: storage record owner {node_addr} does not match signer identity {signer}"
+        ));
+    }
     let entries: Vec<storage_signing::BackupEntry> = {
-        let idx = guard
-            .content_index
+        let idx = content_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut rows: Vec<(u64, String, u64)> = idx
             .entries()
-            .filter(|e| e.backup && !e.archived)
-            .filter(|e| {
-                harmony_content::cid::ContentId::from_bytes(e.cid).content_class()
-                    == harmony_content::cid::ContentClass::PublicDurable
-            })
+            .filter(|e| backup_set_eligible(e))
             .map(|e| (e.stored_at_ms, hex::encode(e.cid), e.size_bytes))
             .collect();
         rows.sort();
@@ -20243,14 +20322,16 @@ fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), Strin
             .map(|(_, cid, size)| storage_signing::BackupEntry { cid, size })
             .collect()
     };
-    let updated_at = next_storage_updated_at(&guard.backup_set_clock);
+    let updated_at = next_storage_updated_at(clock);
     {
-        let mut settings = guard
-            .storage_settings
+        let mut settings = settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        settings.backup_set_floor = updated_at;
-        persist_storage_settings(guard, &settings);
+        // ZEB-923: grow-only — see the pledge floor above.
+        settings.backup_set_floor = settings.backup_set_floor.max(updated_at);
+        if let Some(path) = settings_path {
+            storage_settings::save(path, &settings);
+        }
     }
     // PR #449 review (Qodo): receivers enforce MAX_BACKUP_SET_WIRE_BYTES
     // BEFORE parsing, so an oversize publish is deterministically dropped
@@ -20259,19 +20340,18 @@ fn build_signed_backup_set(guard: &NodeState) -> Result<(String, Vec<u8>), Strin
     // oldest flagged entries always survive). Each shrink re-signs — the
     // signature covers the final entry list.
     let mut entries = entries;
-    // ZEB-679: fetch the `#2` material ONCE (not per shrink round — the
-    // material is round-invariant; only the entry list changes).
-    let v2_material = storage_v2_material(guard);
+    // ZEB-679: the `#2` material arrives once from the caller (not per
+    // shrink round — it is round-invariant; only the entry list changes).
     let (topic, bytes) = loop {
         let mut payload = storage_signing::BackupSetPayload {
-            owner_address: guard.node_addr.clone(),
+            owner_address: node_addr.to_string(),
             entries: entries.clone(),
             updated_at,
             identity_pub: None,
             sig: None,
             v2: Default::default(),
         };
-        match v2_material.as_ref() {
+        match v2_material {
             Some(material) => {
                 if let Err(e) =
                     storage_signing::sign_backup_set_v2(identity, material, &mut payload)
@@ -20431,17 +20511,97 @@ pub(crate) fn publish_backup_set_update(guard: &NodeState) {
     }
 }
 
-/// ZEB-669 S2: per-generation hosting-report publisher. Spawned from
-/// start_node (NEVER inline-awaited — the loop isn't draining publish_rx
-/// yet at spawn time; see the start_node inline-await hazard). Policy:
-/// check every 30 s, publish when the ledger aggregate changed or
-/// `HOSTING_REFRESH_INTERVAL_MS` elapsed (receivers prune at 3× the
-/// refresh interval). Exits when the event loop drops `publish_rx`
-/// (node stopped) — no generation plumbing needed.
+/// ZEB-923: a family periodically renews ONLY while non-empty. An empty
+/// family stays silent, so its rows at receivers decay via the record
+/// TTL — retraction convergence is the boot/on-change publish's job.
+fn storage_record_refresh_due(elapsed_ms: u64, non_empty: bool) -> bool {
+    non_empty && elapsed_ms >= storage_records::STORAGE_RECORD_REFRESH_INTERVAL_MS
+}
+
+/// ZEB-923 (R1, CodeRabbit): the single backup-set membership predicate —
+/// the builder and the renewal gate must never diverge (a divergence
+/// would periodically renew a set the builder publishes empty, or skip
+/// renewing eligible entries).
+fn backup_set_eligible(e: &content_index::ContentIndexEntry) -> bool {
+    e.backup
+        && !e.archived
+        && harmony_content::cid::ContentId::from_bytes(e.cid).content_class()
+            == harmony_content::cid::ContentClass::PublicDurable
+}
+
+/// ZEB-923 (R1, CodeAnt): outcome of a renewal publish attempted through
+/// the event loop.
+enum PublishOutcome {
+    /// The Zenoh put itself reported success — safe to reset the deadline.
+    Confirmed,
+    /// Queue full, put failed, reply lost, or confirmation timed out —
+    /// leave the deadline alone so the family retries next tick.
+    Retry,
+    /// The event loop dropped `publish_rx` — the node stopped.
+    NodeStopped,
+}
+
+/// ZEB-923 (R1, CodeAnt): `try_send` only proves the request entered the
+/// event-loop queue; the Zenoh put can still fail. Renewal deadlines
+/// reset only on a CONFIRMED put, so a failed renewal retries on the
+/// next 30 s tick instead of silently waiting out a full refresh
+/// interval (a re-mint on retry is harmless — strictly-newer LWW).
+async fn publish_confirmed(
+    publish_tx: &tokio::sync::mpsc::Sender<event_loop::PublishRequest>,
+    key_expr: String,
+    payload: Vec<u8>,
+    what: &str,
+) -> PublishOutcome {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    match publish_tx.try_send(event_loop::PublishRequest {
+        key_expr,
+        payload,
+        reply: reply_tx,
+    }) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return PublishOutcome::NodeStopped
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, what, "renewal publish deferred (channel full)");
+            return PublishOutcome::Retry;
+        }
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+        Ok(Ok(Ok(()))) => PublishOutcome::Confirmed,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, what, "renewal publish failed; retrying next tick");
+            PublishOutcome::Retry
+        }
+        Ok(Err(_)) => {
+            tracing::warn!(what, "renewal publish reply dropped; retrying next tick");
+            PublishOutcome::Retry
+        }
+        Err(_) => {
+            tracing::warn!(
+                what,
+                "renewal publish confirmation timed out; retrying next tick"
+            );
+            PublishOutcome::Retry
+        }
+    }
+}
+
+/// ZEB-669 S2 / ZEB-923: per-generation storage-record publisher.
+/// Spawned from start_node (NEVER inline-awaited — the loop isn't
+/// draining publish_rx yet at spawn time; see the start_node inline-await
+/// hazard). Policy, checked every 30 s: hosting reports publish when the
+/// ledger aggregate changed or `HOSTING_REFRESH_INTERVAL_MS` elapsed
+/// (receivers prune at 3× the refresh interval); the non-empty pledge
+/// list and backup set are re-minted + re-signed + republished every
+/// `STORAGE_RECORD_REFRESH_INTERVAL_MS` (the ZEB-923 renewal signal —
+/// receivers restamp their record TTL only on a strictly-newer LWW win).
+/// Exits when the event loop drops `publish_rx` (node stopped) — no
+/// generation plumbing needed.
 // Owned-handle posture (headless-serve, no `app.state()`): each dependency
 // arrives as its own argument by design.
 #[allow(clippy::too_many_arguments)]
-fn spawn_hosting_report_publisher(
+fn spawn_storage_record_publisher(
     identity: std::sync::Arc<harmony_identity::PrivateIdentity>,
     node_addr: String,
     ledger: std::sync::Arc<Mutex<storage_ledger::StorageLedger>>,
@@ -20458,6 +20618,12 @@ fn spawn_hosting_report_publisher(
     // storage_v2_cache). This task's per-tick refresh warms it with async
     // locks so the SYNC pledge/backup paths have a contention fallback.
     v2_cache: std::sync::Arc<Mutex<Option<storage_signing::StorageSignerMaterial>>>,
+    // ZEB-923: renewal-republish handles — the content index feeds the
+    // backup-set rebuild; the clocks are the SHARED NodeState mint cells
+    // (fetch_update makes co-minting with the sync IPC paths race-free).
+    content_index: std::sync::Arc<Mutex<content_index::ContentIndex>>,
+    pledge_clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    backup_set_clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     tokio::spawn(async move {
         let clock = std::sync::atomic::AtomicU64::new(hosting_floor);
@@ -20466,6 +20632,12 @@ fn spawn_hosting_report_publisher(
         // buddied should not put an empty claim on the wire.
         let mut published: Option<Vec<storage_signing::HostingReportEntry>> = None;
         let mut last_publish = std::time::Instant::now();
+        // ZEB-923: boot publish covers t=0, so the first renewal at
+        // ~one refresh interval is correct. Per-family deadlines (R1,
+        // CodeRabbit): a deferred or failed family retries next tick
+        // instead of being masked by the other family's success.
+        let mut last_pledge_refresh = std::time::Instant::now();
+        let mut last_backup_refresh = std::time::Instant::now();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             if publish_tx.is_closed() {
@@ -20499,6 +20671,76 @@ fn spawn_hosting_report_publisher(
                 }
                 None => None,
             };
+            // ZEB-923: hourly renewal republish of the non-empty own
+            // records — BEFORE the hosting gate below, whose `continue`
+            // ends the tick on quiet hosting state. Re-minting (strictly
+            // increasing updated_at) + a fresh signature is what makes
+            // every receiver's LWW take the UpdatedNewer path and restamp
+            // its record-TTL clock — a byte-identical republish would be
+            // IgnoredOlder and renew nothing.
+            let has_pledges = !settings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .my_pledges
+                .is_empty();
+            let has_backup = {
+                let idx = content_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let any = idx.entries().any(backup_set_eligible);
+                any
+            };
+            if storage_record_refresh_due(
+                last_pledge_refresh.elapsed().as_millis() as u64,
+                has_pledges,
+            ) {
+                match build_signed_pledge_list_with(
+                    &identity,
+                    &node_addr,
+                    &settings,
+                    Some(settings_path.as_path()),
+                    &pledge_clock,
+                    v2_material.as_ref(),
+                ) {
+                    Ok((topic, bytes)) => {
+                        match publish_confirmed(&publish_tx, topic, bytes, "pledge renewal").await {
+                            PublishOutcome::Confirmed => {
+                                last_pledge_refresh = std::time::Instant::now()
+                            }
+                            PublishOutcome::Retry => {}
+                            PublishOutcome::NodeStopped => return,
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "pledge renewal skipped"),
+                }
+            }
+            if storage_record_refresh_due(
+                last_backup_refresh.elapsed().as_millis() as u64,
+                has_backup,
+            ) {
+                match build_signed_backup_set_with(
+                    &identity,
+                    &node_addr,
+                    &content_index,
+                    &settings,
+                    Some(settings_path.as_path()),
+                    &backup_set_clock,
+                    v2_material.as_ref(),
+                ) {
+                    Ok((topic, bytes)) => {
+                        match publish_confirmed(&publish_tx, topic, bytes, "backup-set renewal")
+                            .await
+                        {
+                            PublishOutcome::Confirmed => {
+                                last_backup_refresh = std::time::Instant::now()
+                            }
+                            PublishOutcome::Retry => {}
+                            PublishOutcome::NodeStopped => return,
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "backup-set renewal skipped"),
+                }
+            }
             let lines = hosting_report_lines(&ledger);
             let changed = published.as_deref() != Some(&lines[..]);
             let refresh_due = last_publish.elapsed().as_millis() as u64
@@ -21240,6 +21482,22 @@ mod storage_publish_tests {
     }
 
     #[test]
+    fn storage_record_refresh_gating_truth_table() {
+        let i = storage_records::STORAGE_RECORD_REFRESH_INTERVAL_MS;
+        assert!(
+            storage_record_refresh_due(i, true),
+            "due + non-empty publishes"
+        );
+        assert!(storage_record_refresh_due(i + 1, true));
+        assert!(!storage_record_refresh_due(i - 1, true), "not yet due");
+        assert!(
+            !storage_record_refresh_due(i, false),
+            "empty family never renews periodically — its receiver rows should decay"
+        );
+        assert!(!storage_record_refresh_due(0, false));
+    }
+
+    #[test]
     fn pledge_build_advances_and_persists_the_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut state, addr) = signed_state();
@@ -21271,6 +21529,63 @@ mod storage_publish_tests {
         state.node_addr = "somebody-else".into();
         let err = build_signed_pledge_list(&state).unwrap_err();
         assert!(err.contains("does not match signer identity"), "{err}");
+    }
+
+    #[test]
+    fn with_builders_mint_monotonic_stamps_and_persist_floors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, addr) = signed_state();
+        let identity = state.owner_private_identity.clone().unwrap();
+        let settings_path = storage_settings::settings_path(dir.path());
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        state
+            .storage_settings
+            .lock()
+            .unwrap()
+            .my_pledges
+            .insert("buddy-a".into(), 500);
+
+        let (_, bytes_a) = build_signed_pledge_list_with(
+            &identity,
+            &addr,
+            &state.storage_settings,
+            Some(&settings_path),
+            &clock,
+            None,
+        )
+        .expect("build a");
+        let (_, bytes_b) = build_signed_pledge_list_with(
+            &identity,
+            &addr,
+            &state.storage_settings,
+            Some(&settings_path),
+            &clock,
+            None,
+        )
+        .expect("build b");
+        let a: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes_a).unwrap();
+        let b: storage_signing::PledgeListPayload = serde_json::from_slice(&bytes_b).unwrap();
+        assert!(
+            b.updated_at > a.updated_at,
+            "re-mint must be strictly newer (LWW renewal)"
+        );
+        storage_signing::verify_pledge_list(&b).expect("renewal is freshly signed");
+        let persisted = storage_settings::load_or_default(&settings_path);
+        assert!(persisted.pledge_floor >= b.updated_at, "floor persisted");
+
+        let (topic, bytes) = build_signed_backup_set_with(
+            &identity,
+            &addr,
+            &state.content_index,
+            &state.storage_settings,
+            Some(&settings_path),
+            &clock,
+            None,
+        )
+        .expect("backup build");
+        assert_eq!(topic, format!("{STORAGE_RECORD_PREFIX}{addr}/backup-set"));
+        let bs: storage_signing::BackupSetPayload = serde_json::from_slice(&bytes).unwrap();
+        storage_signing::verify_backup_set(&bs).expect("backup renewal self-verifies");
     }
 
     #[test]
@@ -82210,8 +82525,8 @@ mod start_node_race_tests {
                 storage_settings::StorageSettings::default(),
             )),
             storage_settings_path: None,
-            pledge_clock: std::sync::atomic::AtomicU64::new(0),
-            backup_set_clock: std::sync::atomic::AtomicU64::new(0),
+            pledge_clock: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            backup_set_clock: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             generation: 0,
             install_seq: 0,
             node_addr: String::new(),
