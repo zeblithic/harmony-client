@@ -166,3 +166,24 @@ manually invoked (not in CI); the run's result is recorded on ZEB-912.
    fast path keeps production cost ~zero.
 3. Mixed-mode fleets (some nodes flipped) don't broker — spike-proven equal to
    today's behavior, so the knob cannot regress delivery below status quo.
+
+## 6. Addendum — findings from implementation (2026-08-13, PR #671)
+
+1. **Zenoh's LISTEN default is also mode-dependent** (missed in §2a's enumeration):
+   router mode binds the fixed zenohd port `tcp/[::]:7447`, so co-located
+   router-mode nodes collide at boot ("Address already in use", found by s14's
+   second spawn). Fixed in the config build: router mode normalizes the listen
+   default to the ephemeral `tcp/[::]:0` bind peer mode uses (the TCP listener is
+   vestigial for harmony — links ride iroh, scouting off, `connect/endpoints`
+   empty). Peer-mode config stays byte-identical.
+2. **ZEB-927 (filed):** the invite-only join response carries NO membership
+   snapshot (open-join does), so a joiner link-severed from its inviter never
+   learns the other members exist — fully islanded (observed: C's roster stuck at
+   `{A, C}` with B absent for 180s). §2f's topology was therefore revised: the
+   severed pair is **B—C** (both join via founder A); rosters/structure converge
+   over live links and the multi-hop-load-bearing assertions are the B↔C channel
+   messages, which can only transit A. A joiner—inviter sever variant becomes
+   provable once ZEB-927 ships.
+3. **s14 result:** PASS, 149s local (three router-mode nodes; sever engaged —
+   positive in-test assert on C's deny log; B↔C messages delivered both
+   directions via A; WS real-time + read-back).
