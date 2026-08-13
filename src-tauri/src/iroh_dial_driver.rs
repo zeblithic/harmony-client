@@ -62,6 +62,56 @@ pub fn deterministic_zid_hex(node_id: &[u8; 32]) -> String {
     }
 }
 
+/// ZEB-912: test-only link-layer denylist, from `HARMONY_TEST_ZENOH_DENYLIST`
+/// (comma-separated 64-hex iroh node ids). Gates BOTH the outbound dial (below)
+/// and the inbound zenoh-link accept (`zenoh_iroh_transport`), so configuring
+/// it on ONE node fully severs a pair — the e2e sever seam for proving
+/// router-mode multi-hop delivery (see the ZEB-912 step-2 spec). Parsed once;
+/// unset ⇒ empty set ⇒ every check is a cheap `is_empty` fast path, keeping
+/// production behavior untouched.
+fn zenoh_test_denylist() -> &'static std::collections::HashSet<[u8; 32]> {
+    static DENYLIST: std::sync::OnceLock<std::collections::HashSet<[u8; 32]>> =
+        std::sync::OnceLock::new();
+    DENYLIST.get_or_init(|| {
+        let raw = std::env::var("HARMONY_TEST_ZENOH_DENYLIST").unwrap_or_default();
+        let set = parse_zenoh_denylist(&raw);
+        if !set.is_empty() {
+            tracing::info!(
+                entries = set.len(),
+                "ZEB-912 test denylist ACTIVE (HARMONY_TEST_ZENOH_DENYLIST)"
+            );
+        }
+        set
+    })
+}
+
+/// Pure core of [`zenoh_test_denylist`]: comma-separated 64-hex node ids,
+/// case-insensitive, junk entries warned + skipped (a typo must not silently
+/// disable the seam-wide parse).
+fn parse_zenoh_denylist(raw: &str) -> std::collections::HashSet<[u8; 32]> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let mut id = [0u8; 32];
+            match hex::decode_to_slice(s.to_ascii_lowercase(), &mut id) {
+                Ok(()) => Some(id),
+                Err(e) => {
+                    tracing::warn!(entry = %s, "HARMONY_TEST_ZENOH_DENYLIST: skipping unparseable entry: {e}");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// ZEB-912: is this iroh node id on the test denylist? Inert (always false)
+/// unless `HARMONY_TEST_ZENOH_DENYLIST` is set.
+pub(crate) fn is_zenoh_test_denied(node_id: &[u8; 32]) -> bool {
+    let set = zenoh_test_denylist();
+    !set.is_empty() && set.contains(node_id)
+}
+
 /// Production `PeerDialer`: dials through the live zenoh `Runtime`'s
 /// `connect_peer`. ZEB-390: the target zid is DETERMINISTIC — derived from the
 /// peer's iroh node-id via [`deterministic_zid_hex`] — not a random placeholder.
@@ -83,6 +133,17 @@ impl RuntimePeerDialer {
 #[async_trait::async_trait]
 impl PeerDialer for RuntimePeerDialer {
     async fn dial(&self, node_id: [u8; 32], locator: String) -> bool {
+        // ZEB-912: test-only sever seam. Refusing here (the single funnel every
+        // dial path converges on) chokes boot seeding, record kicks, sweeps,
+        // parole, and gateway repair alike; the supervisor ladders/Dormants
+        // normally — that noise IS the simulated unreachable pair.
+        if is_zenoh_test_denied(&node_id) {
+            tracing::info!(
+                peer = %hex::encode(node_id),
+                "ZEB-912 test denylist: refusing dial"
+            );
+            return false;
+        }
         let loc = match locator.parse::<Locator>() {
             Ok(l) => l,
             Err(e) => {
@@ -107,6 +168,50 @@ impl PeerDialer for RuntimePeerDialer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ZEB-912: denylist parsing — valid 64-hex ids (case-insensitive) are
+    /// kept, junk entries are skipped (never a parse failure that disables the
+    /// seam silently), empty input parses to the empty set.
+    #[test]
+    fn zenoh_denylist_parses_valid_and_skips_junk() {
+        let a = [0xAAu8; 32];
+        let b = [0xBBu8; 32];
+        let raw = format!(
+            " {} ,not-a-hex,,{},cafe",
+            hex::encode(a),
+            hex::encode(b).to_uppercase()
+        );
+        let set = parse_zenoh_denylist(&raw);
+        assert_eq!(set.len(), 2, "two valid entries survive: {set:?}");
+        assert!(set.contains(&a), "lowercase entry parsed");
+        assert!(set.contains(&b), "uppercase entry normalized + parsed");
+
+        assert!(
+            parse_zenoh_denylist("").is_empty(),
+            "empty raw -> empty set"
+        );
+        assert!(
+            parse_zenoh_denylist(" , ,").is_empty(),
+            "separators only -> empty set"
+        );
+    }
+
+    /// ZEB-912: the deny check consults the parsed set; with no env
+    /// configuration the seam is inert (denies nothing).
+    #[test]
+    fn zenoh_denylist_check_against_injected_set() {
+        let denied = [0xCCu8; 32];
+        let allowed = [0xDDu8; 32];
+        let set = parse_zenoh_denylist(&hex::encode(denied));
+        assert!(set.contains(&denied));
+        assert!(!set.contains(&allowed));
+        // The production accessor is env-backed; in the test process (env
+        // unset) it must be empty — the production-inert guarantee.
+        assert!(
+            !is_zenoh_test_denied(&denied),
+            "unset HARMONY_TEST_ZENOH_DENYLIST must deny nothing"
+        );
+    }
 
     /// ZEB-390: the derived zid hex is deterministic (stable per node-id),
     /// exactly 16 bytes wide, and distinct for node-ids that differ within their

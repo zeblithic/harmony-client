@@ -1366,6 +1366,48 @@ pub async fn run(
             return;
         }
     }
+    // ZEB-912: session mode (default "peer"; HARMONY_ZENOH_MODE=router opts into
+    // zenoh's router hat, the only one with linkstate multi-hop data routing in
+    // 1.9.0). Set alongside a `timestamping/enabled` pin: the timestamping
+    // default is mode-dependent (router=true, peer=false) and would silently
+    // start HLC-stamping every data message on a router-mode node — pinning
+    // false in BOTH modes keeps the wire identical to today regardless of mode.
+    let zenoh_mode = zenoh_session_mode();
+    // Logged unconditionally so a test (or operator) has POSITIVE evidence of
+    // the mode that actually applied — e2e s14 asserts this exact line per
+    // node, so a knob regression fails as "mode never engaged" instead of
+    // masquerading as a transport timeout (CodeRabbit #671).
+    tracing::info!("ZEB-912: zenoh session mode: {zenoh_mode}");
+    if let Err(e) = config.insert_json5("mode", &format!("\"{zenoh_mode}\"")) {
+        let e = format!("zenoh config error (mode): {e}");
+        let _ = ready_tx.send(Err(e));
+        return;
+    }
+    if let Err(e) = config.insert_json5("timestamping/enabled", "false") {
+        let e = format!("zenoh config error (timestamping/enabled): {e}");
+        let _ = ready_tx.send(Err(e));
+        return;
+    }
+    // ZEB-912: zenoh's default listen endpoint is ALSO mode-dependent — peer
+    // binds ephemeral `tcp/[::]:0`, router binds the FIXED zenohd port
+    // `tcp/[::]:7447`. Co-located router-mode nodes collide on it (e2e s14:
+    // second node's `zenoh::open` died "Address already in use"), and the TCP
+    // listener is vestigial for harmony anyway (links ride iroh; scouting is
+    // off; connect/endpoints is empty — nothing ever dials it). Normalize the
+    // router default to the same ephemeral bind peer mode uses, BEFORE the
+    // listen-endpoint merge below reads the value back. Gated on router mode so
+    // peer-mode config stays byte-identical to today.
+    if zenoh_mode == "router" {
+        if let Err(e) = config.insert_json5(
+            "listen/endpoints",
+            r#"{"router":["tcp/[::]:0"],"peer":["tcp/[::]:0"]}"#,
+        ) {
+            let e = format!("zenoh config error (listen/endpoints router-default): {e}");
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    }
+
     // ZEB-620: the LAN/Reticulum connect endpoint is the ONLY thing seeded into
     // zenoh's static `connect/endpoints`. ZEB-368 also injected every
     // resolver-known iroh peer here (`iroh_connect_locators`); that static seed is
@@ -1406,6 +1448,7 @@ pub async fn run(
         let eps = crate::iroh_zenoh_registration::merge_iroh_listen_endpoints(
             current.as_deref(),
             &self_loc,
+            zenoh_mode,
         );
         if let Err(e) = config.insert_json5("listen/endpoints", &eps) {
             let e = format!("zenoh config error (listen/endpoints): {e}");
@@ -3843,12 +3886,7 @@ pub async fn run(
     // Used to derive hop distance: ZID in this set → hop 1, else → hop 2.
     // Eagerly populated so capacity updates arriving before the first refresh
     // aren't misclassified as hop 2.
-    let mut direct_peer_zids: std::collections::HashSet<String> = session
-        .info()
-        .peers_zid()
-        .await
-        .map(|z| z.to_string())
-        .collect();
+    let mut direct_peer_zids: std::collections::HashSet<String> = direct_link_zids(&session).await;
     // ZEB-622: previous zid-poll snapshot, kept SEPARATE from the overwrite-
     // style `direct_peer_zids` above (whose hop-distance consumers need the
     // current-snapshot semantics). SEEDED from the same boot-time snapshot
@@ -4578,15 +4616,11 @@ pub async fn run(
 
                 // Refresh direct peer set every 20 timer ticks (~5 seconds).
                 // Driven by timer only (not Zenoh events) to avoid excessive
-                // peers_zid() calls under high message traffic.
+                // session-info calls under high message traffic.
                 peer_refresh_counter += 1;
                 if peer_refresh_counter.is_multiple_of(20) {
-                    let refreshed: Vec<String> = session
-                        .info()
-                        .peers_zid()
-                        .await
-                        .map(|z| z.to_string())
-                        .collect();
+                    let refreshed: Vec<String> =
+                        direct_link_zids(&session).await.into_iter().collect();
                     // ZEB-622: any up-edge (a zid absent last poll, present now)
                     // bumps the transport epoch — community root-fetch /
                     // channel-backfill / mail-root latches re-arm (their drivers
@@ -8383,6 +8417,21 @@ where
 /// elsewhere, in which case best-effort skip-the-admit is the right
 /// behavior. See CodeRabbit R2 on PR #125.
 const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// ZEB-912: all directly-linked zids, regardless of the REMOTE session's mode.
+/// zenoh's session info partitions direct links by remote whatami (`peers_zid`
+/// vs `routers_zid` — an all-router mesh under HARMONY_ZENOH_MODE=router
+/// reports every link in `routers_zid`, probe-verified in the R3 spike doc).
+/// Hop-distance classification and ZEB-622 up-edge detection care about
+/// "directly linked", not the remote's mode — reading only `peers_zid` would
+/// silently blind both on router-mode runs.
+async fn direct_link_zids(session: &zenoh::Session) -> std::collections::HashSet<String> {
+    let info = session.info();
+    let mut set: std::collections::HashSet<String> =
+        info.peers_zid().await.map(|z| z.to_string()).collect();
+    set.extend(info.routers_zid().await.map(|z| z.to_string()));
+    set
+}
 
 /// ZEB-622: up-edge detector over zid-poll snapshots. Replaces the accumulating
 /// seen-zid set (which never forgot, so a same-zid reconnect never re-armed the
@@ -13177,6 +13226,66 @@ pub(crate) fn hermetic_zenoh_config() -> zenoh::Config {
     cfg.insert_json5("scouting/gossip/enabled", "false")
         .expect("disable gossip scouting");
     cfg
+}
+
+/// ZEB-912: session mode for the zenoh runtime, from `HARMONY_ZENOH_MODE`.
+/// Default (unset/empty) = "peer", today's production mode. "router" opts a
+/// node into zenoh's router routing hat — the only hat with linkstate
+/// multi-hop data routing in zenoh 1.9.0 (`routing.peer.mode` is a deprecated
+/// no-op; see docs/research/2026-08-12-zeb912-r3-zenoh-multihop-spike.md).
+pub(crate) fn zenoh_session_mode() -> &'static str {
+    let raw = std::env::var("HARMONY_ZENOH_MODE").ok();
+    parse_zenoh_mode(raw.as_deref())
+}
+
+/// Pure core of [`zenoh_session_mode`]. Any value other than exactly "router"
+/// (trimmed) falls back to "peer" — misconfiguration must fail toward current
+/// behavior, not toward a novel topology. Unrecognized non-empty values warn.
+pub(crate) fn parse_zenoh_mode(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        Some("router") => "router",
+        Some("") | None => "peer",
+        Some(other) => {
+            tracing::warn!(
+                value = %other,
+                "HARMONY_ZENOH_MODE: unrecognized value; using \"peer\""
+            );
+            "peer"
+        }
+    }
+}
+
+#[cfg(test)]
+mod zeb912_mode_knob_tests {
+    use super::parse_zenoh_mode;
+
+    /// ZEB-912: misconfiguration must fail toward today's behavior ("peer"),
+    /// never toward a novel topology. Only the exact (trimmed) "router" opts in.
+    #[test]
+    fn parse_zenoh_mode_defaults_and_opt_in() {
+        assert_eq!(parse_zenoh_mode(None), "peer");
+        assert_eq!(parse_zenoh_mode(Some("")), "peer");
+        assert_eq!(parse_zenoh_mode(Some("   ")), "peer");
+        assert_eq!(parse_zenoh_mode(Some("router")), "router");
+        assert_eq!(parse_zenoh_mode(Some(" router ")), "router");
+        assert_eq!(parse_zenoh_mode(Some("Router")), "peer");
+        assert_eq!(parse_zenoh_mode(Some("linkstate")), "peer");
+        assert_eq!(parse_zenoh_mode(Some("peer")), "peer");
+    }
+
+    /// ZEB-912: pin that the `mode` and `timestamping/enabled` key paths remain
+    /// valid in the zenoh version we build against (zeb616 pattern — a schema
+    /// rename in a zenoh upgrade must fail here, not at node boot).
+    #[test]
+    fn mode_and_timestamping_keys_are_valid() {
+        let mut config = zenoh::Config::default();
+        config
+            .insert_json5("mode", "\"router\"")
+            .expect("mode must be a valid zenoh config key");
+        config
+            .insert_json5("timestamping/enabled", "false")
+            .expect("timestamping/enabled must be a valid zenoh config key");
+    }
 }
 
 #[cfg(test)]

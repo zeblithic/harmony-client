@@ -159,12 +159,18 @@ pub fn iroh_listen_locator(self_node_id: &[u8; 32]) -> String {
 ///
 /// `current_json` is that read-back value (`None` if unreadable). `listen/endpoints`
 /// may be the flat array form (`["tcp/[::]:0"]`) or the per-mode object form
-/// (`{"router": [...], "peer": [...]}`); we append to the `peer` list (we always run
-/// in peer mode) for the object form, or to the flat list for the array form, and
-/// dedupe. Falls back to `["tcp/[::]:0", self_loc]` if the value can't be parsed, so
-/// the default LAN listener is preserved even on the error path. (CodeRabbit + Qodo,
-/// PR #188.)
-pub fn merge_iroh_listen_endpoints(current_json: Option<&str>, self_loc: &str) -> String {
+/// (`{"router": [...], "peer": [...]}`); for the object form we append under `mode`
+/// — the session's own mode (ZEB-912: endpoints under a non-matching key are
+/// silently ignored by zenoh's ModeDependentValue resolution, so a router-mode
+/// session with the locator under "peer" would never instantiate the iroh
+/// factory) — or to the flat list for the array form, and dedupe. Falls back to
+/// `["tcp/[::]:0", self_loc]` if the value can't be parsed, so the default LAN
+/// listener is preserved even on the error path. (CodeRabbit + Qodo, PR #188.)
+pub fn merge_iroh_listen_endpoints(
+    current_json: Option<&str>,
+    self_loc: &str,
+    mode: &str,
+) -> String {
     use serde_json::Value;
     let fallback = || format!("[\"tcp/[::]:0\", \"{self_loc}\"]");
     let append_if_missing = |arr: &mut Vec<Value>| {
@@ -181,8 +187,12 @@ pub fn merge_iroh_listen_endpoints(current_json: Option<&str>, self_loc: &str) -
     match &mut v {
         // Flat array form: append to the single shared listener list.
         Value::Array(arr) => append_if_missing(arr),
-        // Per-mode object form: append to `peer` (our mode); create it if absent.
-        Value::Object(map) => match map.entry("peer").or_insert_with(|| Value::Array(vec![])) {
+        // Per-mode object form: append under the session's own mode; create it
+        // if absent.
+        Value::Object(map) => match map
+            .entry(mode.to_string())
+            .or_insert_with(|| Value::Array(vec![]))
+        {
             Value::Array(arr) => append_if_missing(arr),
             _ => return fallback(),
         },
@@ -204,7 +214,7 @@ mod tests {
         let loc = self_loc();
         // Zenoh's Config::default() shape for listen/endpoints.
         let cur = r#"{"router":["tcp/[::]:7447"],"peer":["tcp/[::]:0"]}"#;
-        let merged = merge_iroh_listen_endpoints(Some(cur), &loc);
+        let merged = merge_iroh_listen_endpoints(Some(cur), &loc, "peer");
         let v: serde_json::Value = serde_json::from_str(&merged).expect("valid JSON");
         let peer = v["peer"].as_array().expect("peer array");
         // Default peer TCP listener survives (LAN transport intact)…
@@ -224,7 +234,7 @@ mod tests {
     #[test]
     fn merge_into_flat_array_appends_and_preserves() {
         let loc = self_loc();
-        let merged = merge_iroh_listen_endpoints(Some(r#"["tcp/[::]:0"]"#), &loc);
+        let merged = merge_iroh_listen_endpoints(Some(r#"["tcp/[::]:0"]"#), &loc, "peer");
         let arr: Vec<String> = serde_json::from_str(&merged).expect("valid JSON array");
         assert!(arr.iter().any(|e| e == "tcp/[::]:0"), "keeps tcp: {merged}");
         assert!(arr.iter().any(|e| e == &loc), "adds iroh: {merged}");
@@ -234,7 +244,7 @@ mod tests {
     fn merge_is_idempotent_no_duplicate_iroh() {
         let loc = self_loc();
         let cur = format!(r#"{{"peer":["tcp/[::]:0","{loc}"]}}"#);
-        let merged = merge_iroh_listen_endpoints(Some(&cur), &loc);
+        let merged = merge_iroh_listen_endpoints(Some(&cur), &loc, "peer");
         let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
         let count = v["peer"]
             .as_array()
@@ -245,11 +255,37 @@ mod tests {
         assert_eq!(count, 1, "no duplicate iroh locator: {merged}");
     }
 
+    /// ZEB-912: under a router-mode session (HARMONY_ZENOH_MODE=router), the
+    /// object form must gain the locator under "router" — endpoints appended
+    /// under a key that doesn't match the session's own mode are silently
+    /// ignored by zenoh's ModeDependentValue resolution.
+    #[test]
+    fn merge_object_form_router_mode_appends_router_key() {
+        let loc = self_loc();
+        let cur = r#"{"router":["tcp/[::]:7447"],"peer":["tcp/[::]:0"]}"#;
+        let merged = merge_iroh_listen_endpoints(Some(cur), &loc, "router");
+        let v: serde_json::Value = serde_json::from_str(&merged).expect("valid JSON");
+        let router = v["router"].as_array().expect("router array");
+        assert!(
+            router.iter().any(|e| e == &loc),
+            "router gains iroh: {merged}"
+        );
+        assert!(
+            router.iter().any(|e| e == "tcp/[::]:7447"),
+            "router keeps tcp: {merged}"
+        );
+        let peer = v["peer"].as_array().expect("peer array");
+        assert!(
+            !peer.iter().any(|e| e == &loc),
+            "peer list must NOT gain the locator in router mode: {merged}"
+        );
+    }
+
     #[test]
     fn merge_unreadable_or_garbage_falls_back_to_tcp_plus_iroh() {
         let loc = self_loc();
         for cur in [None, Some("not json"), Some("42")] {
-            let merged = merge_iroh_listen_endpoints(cur, &loc);
+            let merged = merge_iroh_listen_endpoints(cur, &loc, "peer");
             assert!(
                 merged.contains("tcp/[::]:0"),
                 "fallback keeps tcp: {merged}"

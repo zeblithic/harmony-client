@@ -614,6 +614,18 @@ impl IrohZenohLinkManager {
                         // unsupported"). Reordered above `accept_bi()` from the
                         // pre-ZEB-616 code, which read `remote_id()` after it.
                         let peer_id = conn.remote_id();
+                        // ZEB-912: test-only sever seam (see iroh_dial_driver).
+                        // Reject BEFORE the registry swap so a denied peer never
+                        // reaches mark_supervisor_connected — which would cancel
+                        // our own dialing and leave a half-formed link.
+                        if crate::iroh_dial_driver::is_zenoh_test_denied(peer_id.as_bytes()) {
+                            tracing::info!(
+                                peer = %peer_id,
+                                "ZEB-912 test denylist: rejecting inbound"
+                            );
+                            conn.close(0u32.into(), b"zeb912-test-denylist");
+                            return;
+                        }
                         let conn_id = conn.stable_id();
                         if let Some(old) = mgr.swap_zenoh_conn(peer_id, conn.clone()) {
                             tracing::debug!(

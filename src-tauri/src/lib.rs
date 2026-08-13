@@ -1823,6 +1823,20 @@ impl NodeState {
         self.dm_self_owner.map(|o| hex::encode(o.0))
     }
 
+    /// ZEB-912: status surface helper — the running node's iroh node id, hex.
+    /// `iroh_endpoint` is installed at `start_node` and nulled on stop alongside
+    /// the other node handles. `None` therefore means "not running" — OR
+    /// "running degraded with iroh transport down": iroh boot failure is
+    /// non-fatal (the slot stays `None` and the ZEB-450 transport-disabled
+    /// reason is surfaced via `network_health_snapshot`), so a persistent
+    /// `None` on a running node is a transport-init failure, not a transient
+    /// (Greptile PR #671).
+    pub(crate) fn node_id_hex_for_status(&self) -> Option<String> {
+        self.iroh_endpoint
+            .as_ref()
+            .map(|ep| hex::encode(ep.node_id().as_bytes()))
+    }
+
     /// ZEB-703: handles for `/v1/shutdown`'s pre-ack barrier + flush. The
     /// 200 is the signal supervisors act on; the handler fences new DM
     /// mutations (ZEB-234 stopping flag), drains in-flight fenced sends,

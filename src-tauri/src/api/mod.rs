@@ -68,6 +68,13 @@ struct StatusDto {
     running: bool,
     generation: u64,
     owner_id: Option<String>,
+    /// ZEB-912: the running node's iroh node id (64-hex). `null` when the node
+    /// is not running — or when it is running DEGRADED with iroh transport
+    /// down (iroh boot failure is non-fatal; see `network_health_snapshot`'s
+    /// ZEB-450 transport-disabled reason). The link-layer identity — what the
+    /// e2e severed-pair harness feeds `HARMONY_TEST_ZENOH_DENYLIST`, and what
+    /// fleet ops previously had to scrape from logs.
+    node_id: Option<String>,
     uptime_secs: u64,
     port: u16,
     version: &'static str,
@@ -131,11 +138,12 @@ async fn status_handler(
     if !authed(&ctx, &headers) {
         return unauthorized();
     }
-    let (running, generation, owner_id) = match ctx.state.node_state().lock() {
+    let (running, generation, owner_id, node_id) = match ctx.state.node_state().lock() {
         Ok(guard) => (
             guard.node_is_running(),
             guard.generation_for_status(),
             guard.owner_id_hex_for_status(),
+            guard.node_id_hex_for_status(),
         ),
         Err(e) => {
             return (
@@ -148,6 +156,7 @@ async fn status_handler(
         running,
         generation,
         owner_id,
+        node_id,
         uptime_secs: ctx.started.elapsed().as_secs(),
         port: ctx.bound_port,
         version: env!("CARGO_PKG_VERSION"),
@@ -358,6 +367,37 @@ mod tests {
     use super::*;
     use crate::node_event_sink::FanoutSink;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// ZEB-912: `nodeId` rides `/v1/status` — camelCase pin with a non-default
+    /// value, and `None` serializes as `null` (matching `ownerId`'s convention,
+    /// no skip_serializing_if).
+    #[test]
+    fn status_dto_serializes_node_id_camel_case() {
+        let hex64 = "ab".repeat(32);
+        let dto = StatusDto {
+            running: true,
+            generation: 1,
+            owner_id: None,
+            node_id: Some(hex64.clone()),
+            uptime_secs: 0,
+            port: 1,
+            version: "test",
+        };
+        let json = serde_json::to_string(&dto).expect("serializes");
+        assert!(
+            json.contains(&format!("\"nodeId\":\"{hex64}\"")),
+            "camelCase rename with value: {json}"
+        );
+        let dto_none = StatusDto {
+            node_id: None,
+            ..dto
+        };
+        let json = serde_json::to_string(&dto_none).expect("serializes");
+        assert!(
+            json.contains("\"nodeId\":null"),
+            "absent node id is an explicit null, like ownerId: {json}"
+        );
+    }
 
     /// ZEB-719: the `Mutex<NodeState>` impl (serve path) hands back the SAME
     /// allocation as an owned `Arc`, so the headless voting-tick closure dispatches
