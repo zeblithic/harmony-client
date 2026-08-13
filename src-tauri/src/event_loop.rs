@@ -1383,6 +1383,25 @@ pub async fn run(
         let _ = ready_tx.send(Err(e));
         return;
     }
+    // ZEB-912: zenoh's default listen endpoint is ALSO mode-dependent — peer
+    // binds ephemeral `tcp/[::]:0`, router binds the FIXED zenohd port
+    // `tcp/[::]:7447`. Co-located router-mode nodes collide on it (e2e s14:
+    // second node's `zenoh::open` died "Address already in use"), and the TCP
+    // listener is vestigial for harmony anyway (links ride iroh; scouting is
+    // off; connect/endpoints is empty — nothing ever dials it). Normalize the
+    // router default to the same ephemeral bind peer mode uses, BEFORE the
+    // listen-endpoint merge below reads the value back. Gated on router mode so
+    // peer-mode config stays byte-identical to today.
+    if zenoh_mode == "router" {
+        if let Err(e) = config.insert_json5(
+            "listen/endpoints",
+            r#"{"router":["tcp/[::]:0"],"peer":["tcp/[::]:0"]}"#,
+        ) {
+            let e = format!("zenoh config error (listen/endpoints router-default): {e}");
+            let _ = ready_tx.send(Err(e));
+            return;
+        }
+    }
 
     // ZEB-620: the LAN/Reticulum connect endpoint is the ONLY thing seeded into
     // zenoh's static `connect/endpoints`. ZEB-368 also injected every
