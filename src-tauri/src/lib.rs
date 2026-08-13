@@ -156,6 +156,7 @@ pub mod community_state_persist;
 // ZEB-814: segmented community-state root (manifest + immutable CAS segments).
 pub mod community_state_segments;
 pub mod community_state_sync;
+pub mod community_topology;
 pub mod community_voting_approval;
 pub mod community_voting_conviction;
 pub mod community_voting_core;
