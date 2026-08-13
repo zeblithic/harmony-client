@@ -2270,6 +2270,7 @@ mod tests {
                 doc_path: dir.path().join("dm_inbox.cbor"),
                 replay_path: dir.path().join("dm_inbox_replay.cbor"),
                 first_observed_path: dir.path().join("dm_inbox_first_observed.cbor"),
+                expired_path: dir.path().join("dm_inbox_expired.cbor"),
             }),
             lookup_key_tag: b"dm-inbox-v1",
             debounce_ms: DEFAULT_DEBOUNCE_MS,

@@ -6189,6 +6189,8 @@ pub async fn start_node_inner(
                             identity_dir.join(crate::dm_inbox_persist::DM_INBOX_REPLAY_FILENAME);
                         let dm_inbox_first_observed_path = identity_dir
                             .join(crate::dm_inbox_persist::DM_INBOX_FIRST_OBSERVED_FILENAME);
+                        let dm_inbox_expired_path =
+                            identity_dir.join(crate::dm_inbox_persist::DM_INBOX_EXPIRED_FILENAME);
                         // ZEB-862: restore the LOCAL first-observation clock from its
                         // sidecar so TTL GC survives restart (else the first sweep
                         // re-stamps every entry at `now`).
@@ -6252,6 +6254,7 @@ pub async fn start_node_inner(
                                             doc_path: dm_inbox_path,
                                             replay_path: dm_inbox_replay_path,
                                             first_observed_path: dm_inbox_first_observed_path,
+                                            expired_path: dm_inbox_expired_path,
                                         },
                                     ),
                                     lookup_key_tag: b"dm-inbox-v1",
