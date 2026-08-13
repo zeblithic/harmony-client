@@ -1366,6 +1366,24 @@ pub async fn run(
             return;
         }
     }
+    // ZEB-912: session mode (default "peer"; HARMONY_ZENOH_MODE=router opts into
+    // zenoh's router hat, the only one with linkstate multi-hop data routing in
+    // 1.9.0). Set alongside a `timestamping/enabled` pin: the timestamping
+    // default is mode-dependent (router=true, peer=false) and would silently
+    // start HLC-stamping every data message on a router-mode node — pinning
+    // false in BOTH modes keeps the wire identical to today regardless of mode.
+    let zenoh_mode = zenoh_session_mode();
+    if let Err(e) = config.insert_json5("mode", &format!("\"{zenoh_mode}\"")) {
+        let e = format!("zenoh config error (mode): {e}");
+        let _ = ready_tx.send(Err(e));
+        return;
+    }
+    if let Err(e) = config.insert_json5("timestamping/enabled", "false") {
+        let e = format!("zenoh config error (timestamping/enabled): {e}");
+        let _ = ready_tx.send(Err(e));
+        return;
+    }
+
     // ZEB-620: the LAN/Reticulum connect endpoint is the ONLY thing seeded into
     // zenoh's static `connect/endpoints`. ZEB-368 also injected every
     // resolver-known iroh peer here (`iroh_connect_locators`); that static seed is
@@ -1406,6 +1424,7 @@ pub async fn run(
         let eps = crate::iroh_zenoh_registration::merge_iroh_listen_endpoints(
             current.as_deref(),
             &self_loc,
+            zenoh_mode,
         );
         if let Err(e) = config.insert_json5("listen/endpoints", &eps) {
             let e = format!("zenoh config error (listen/endpoints): {e}");
@@ -13177,6 +13196,66 @@ pub(crate) fn hermetic_zenoh_config() -> zenoh::Config {
     cfg.insert_json5("scouting/gossip/enabled", "false")
         .expect("disable gossip scouting");
     cfg
+}
+
+/// ZEB-912: session mode for the zenoh runtime, from `HARMONY_ZENOH_MODE`.
+/// Default (unset/empty) = "peer", today's production mode. "router" opts a
+/// node into zenoh's router routing hat — the only hat with linkstate
+/// multi-hop data routing in zenoh 1.9.0 (`routing.peer.mode` is a deprecated
+/// no-op; see docs/research/2026-08-12-zeb912-r3-zenoh-multihop-spike.md).
+pub(crate) fn zenoh_session_mode() -> &'static str {
+    let raw = std::env::var("HARMONY_ZENOH_MODE").ok();
+    parse_zenoh_mode(raw.as_deref())
+}
+
+/// Pure core of [`zenoh_session_mode`]. Any value other than exactly "router"
+/// (trimmed) falls back to "peer" — misconfiguration must fail toward current
+/// behavior, not toward a novel topology. Unrecognized non-empty values warn.
+pub(crate) fn parse_zenoh_mode(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        Some("router") => "router",
+        Some("") | None => "peer",
+        Some(other) => {
+            tracing::warn!(
+                value = %other,
+                "HARMONY_ZENOH_MODE: unrecognized value; using \"peer\""
+            );
+            "peer"
+        }
+    }
+}
+
+#[cfg(test)]
+mod zeb912_mode_knob_tests {
+    use super::parse_zenoh_mode;
+
+    /// ZEB-912: misconfiguration must fail toward today's behavior ("peer"),
+    /// never toward a novel topology. Only the exact (trimmed) "router" opts in.
+    #[test]
+    fn parse_zenoh_mode_defaults_and_opt_in() {
+        assert_eq!(parse_zenoh_mode(None), "peer");
+        assert_eq!(parse_zenoh_mode(Some("")), "peer");
+        assert_eq!(parse_zenoh_mode(Some("   ")), "peer");
+        assert_eq!(parse_zenoh_mode(Some("router")), "router");
+        assert_eq!(parse_zenoh_mode(Some(" router ")), "router");
+        assert_eq!(parse_zenoh_mode(Some("Router")), "peer");
+        assert_eq!(parse_zenoh_mode(Some("linkstate")), "peer");
+        assert_eq!(parse_zenoh_mode(Some("peer")), "peer");
+    }
+
+    /// ZEB-912: pin that the `mode` and `timestamping/enabled` key paths remain
+    /// valid in the zenoh version we build against (zeb616 pattern — a schema
+    /// rename in a zenoh upgrade must fail here, not at node boot).
+    #[test]
+    fn mode_and_timestamping_keys_are_valid() {
+        let mut config = zenoh::Config::default();
+        config
+            .insert_json5("mode", "\"router\"")
+            .expect("mode must be a valid zenoh config key");
+        config
+            .insert_json5("timestamping/enabled", "false")
+            .expect("timestamping/enabled must be a valid zenoh config key");
+    }
 }
 
 #[cfg(test)]

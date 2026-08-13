@@ -163,7 +163,7 @@ async fn inner() {
     let mut cfg_a = zenoh::Config::default();
     let self_loc = iroh_listen_locator(ep_a.node_id().as_bytes());
     let current = cfg_a.get_json("listen/endpoints").ok();
-    let eps = merge_iroh_listen_endpoints(current.as_deref(), &self_loc);
+    let eps = merge_iroh_listen_endpoints(current.as_deref(), &self_loc, "peer");
     cfg_a
         .insert_json5("listen/endpoints", &eps)
         .expect("insert listen/endpoints");
