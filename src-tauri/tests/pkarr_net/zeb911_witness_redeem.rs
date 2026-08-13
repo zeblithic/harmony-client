@@ -643,11 +643,22 @@ async fn zeb911_witness_redeem_admin_offline() {
             let g = bob_state.lock().await;
             g.events().cloned().collect()
         };
-        // ZEB-911 chain delivery: the joiner's log now (correctly) carries TWO
-        // countersigns — the witness's for the JOINER's PendingJoin, and the
-        // ADMIN's for the WITNESS's own admission (part of the chain the
-        // handshake response delivered so the witness's countersign is
-        // verifiable on a fresh CRDT). Assert each by target, not globally.
+        // ZEB-911 chain delivery: the joiner's log carries the witness's
+        // countersign for the JOINER's PendingJoin and the ADMIN's for the
+        // WITNESS's own admission (both ride the handshake response so the
+        // witness's countersign is verifiable on a fresh CRDT). Assert by target,
+        // not globally.
+        //
+        // ZEB-927: the response now ships the FULL roster, which can give the
+        // fresh joiner enough context to run membership reconciliation and
+        // reflexively countersign its OWN pending. That self-vouch is benign
+        // (verify_event's JoinCountersignActorNotJoined gate means it only ever
+        // lands POST-admission, so it can never bootstrap a join) AND
+        // timing-dependent — it appears under full-suite contention (CI) but not
+        // in a fast isolated run. So filter the joiner's own actor and assert the
+        // EXTERNAL admitter: the property this guards is that the joiner was
+        // admitted by the WITNESS, not the offline admin — which the racy
+        // self-vouch does not touch.
         let bob_pending_id = bob_events
             .iter()
             .find(|e| {
@@ -662,15 +673,16 @@ async fn zeb911_witness_redeem_admin_offline() {
                     &e.kind,
                     MembershipEventKind::JoinCountersign { target_event_id }
                     if *target_event_id == bob_pending_id
-                )
+                ) && e.actor != s.bob_addr
             })
             .map(|e| e.actor)
             .collect();
         assert_eq!(
             joiner_countersigners,
             vec![witness.comm.owner],
-            "the countersign admitting the JOINER must be the WITNESS's (delivered \
-             over the handshake response)"
+            "the EXTERNAL countersign admitting the JOINER must be the WITNESS's, and only the \
+             witness's (the admin was offline — a stray admin countersign here would be the \
+             regression this guards; the joiner's own benign self-vouch is filtered above)"
         );
         let witness_pending_id = bob_events
             .iter()

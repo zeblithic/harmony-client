@@ -438,7 +438,7 @@ fn joiner_identity_pub_from_signing_key(sk: &ed25519_dalek::SigningKey) -> [u8; 
 /// semantic `InsertOutcome::Rejected`, which `apply_admitted_snapshot` may
 /// resolve on a later round.
 #[async_trait::async_trait]
-trait SnapshotEventApplier {
+pub(crate) trait SnapshotEventApplier {
     async fn apply_one(
         &self,
         ev: crate::community_membership::SignedMembershipEvent,
@@ -480,7 +480,16 @@ impl SnapshotEventApplier for CommunitySyncEngine {
 /// the merge path's diagnostics) and dropped. A duplicate (e.g. the joiner's own
 /// Join, already inserted by the open-redeem local arm) is an idempotent
 /// `AlreadyKnown`. Returns the number of events that landed.
-async fn apply_admitted_snapshot<A: SnapshotEventApplier>(
+///
+/// ZEB-927: this is also the invite-only redeem path's snapshot applier. The
+/// invite acceptor now ships the FULL membership roster in its handshake
+/// response (not just the countersigner's narrow admission chain), so a joiner
+/// with no Zenoh path to its inviter still converges the whole roster instead of
+/// islanding. The acceptor's roster arrives in canonical (EventId-hash) order,
+/// so the same order-tolerant fixpoint merge is required — a single naive pass
+/// would drop (or, on the old redeem loop, hard-fail) any event that precedes
+/// its dependency. Same drop-on-unresolvable semantics.
+pub(crate) async fn apply_admitted_snapshot<A: SnapshotEventApplier>(
     applier: &A,
     member_events: Vec<crate::community_membership::SignedMembershipEvent>,
 ) -> usize {

@@ -42208,40 +42208,34 @@ where
                     ),
                 ));
             }
-            // ZEB-911: a WITNESS-authored countersign is unverifiable on a
-            // fresh joiner's CRDT (only the admin is known) unless the
-            // witness's own admission chain lands first — its cert-carrying
-            // PendingJoin makes the signer resolvable, and materializing it
-            // Joined satisfies verify_event's JoinCountersignActorNotJoined
-            // gate. The acceptor delivers the chain dependency-ordered;
-            // AlreadyKnown is fine (retry or raced CRDT sync).
-            for chain_ev in overrides.pre_delivered_chain.clone() {
-                let chain_ev_id = chain_ev.id;
-                match engine_arc.insert_local_event(chain_ev).await {
-                    Ok(crate::community_state_crdt::InsertOutcome::Inserted)
-                    | Ok(crate::community_state_crdt::InsertOutcome::AlreadyKnown) => {}
-                    Ok(crate::community_state_crdt::InsertOutcome::Rejected(verr)) => {
-                        let _ = community_registry
-                            .take_pending_redemption(&minted.bootstrap_join.id)
-                            .await;
-                        return Err(format!(
-                            "engine rejected witness admission-chain event {}: {verr}",
-                            hex::encode(chain_ev_id)
-                        )
-                        .into());
-                    }
-                    Err(e) => {
-                        let _ = community_registry
-                            .take_pending_redemption(&minted.bootstrap_join.id)
-                            .await;
-                        return Err(format!(
-                            "witness admission-chain insert failed for {}: {e}",
-                            hex::encode(chain_ev_id)
-                        )
-                        .into());
-                    }
-                }
-            }
+            // ZEB-927: the acceptor now delivers the FULL membership roster here
+            // (not just the countersigner's narrow admission chain, ZEB-911), so
+            // a joiner severed from its inviter still converges every member
+            // instead of islanding. The roster arrives in canonical
+            // (EventId-hash) order, NOT dependency order — so the old single-pass
+            // loop's hard-fail-on-Rejected would abort the whole redeem the
+            // moment an event preceded its dependency (e.g. a member's
+            // DeviceAnnounce ahead of that member's Join). Apply it with the SAME
+            // order-tolerant fixpoint merge open-join uses
+            // (`apply_admitted_snapshot`: sort by canonical replay key +
+            // retry-until-stable, DEFERRING rejects; unresolvable remainder is
+            // logged and dropped, never fatal). The witness's own
+            // PendingJoin/Join land here, making the countersign below
+            // verifiable; a chain-less witness countersign that still can't
+            // verify falls through to the honest ZEB-254 pending fallback below.
+            // Clone (never take) — the witness-degrade arm below reads
+            // `overrides.pre_delivered_chain.is_empty()`.
+            let applied = crate::open_join_dial::apply_admitted_snapshot(
+                engine_arc.as_ref(),
+                overrides.pre_delivered_chain.clone(),
+            )
+            .await;
+            tracing::debug!(
+                community_id = %hex::encode(minted.community_id.0),
+                applied,
+                delivered = overrides.pre_delivered_chain.len(),
+                "ZEB-927: applied invite-only membership snapshot before countersign"
+            );
             let countersign_actor = cs.actor;
             match engine_arc
                 .insert_local_event_with_pubs(cs, admin_pub, None)

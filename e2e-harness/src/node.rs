@@ -288,6 +288,29 @@ fn stderr_log_filename(profile: &str) -> String {
     format!("{profile}.stderr.log")
 }
 
+/// Strip ANSI SGR escape sequences (`\x1b[ … m`) from a log line so field-scoped
+/// substring matches aren't split by tracing's colour codes. Non-`m` CSI final
+/// bytes are tolerated too; anything after `\x1b[` up to the final byte is
+/// dropped (ZEB-927).
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Consume the CSI sequence up to and including its final byte
+            // (an ASCII letter for SGR/`m`); if there's no `[`, drop the ESC.
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Remove any stale `api/port` + `api/token` discovery files under `home` left
 /// by a previously-killed process, so a relaunch waits for the new process's
 /// fresh files instead of latching onto the dead one's port/token.
@@ -371,6 +394,27 @@ impl NodeHandle {
         // abort a poll_until through `?`), so decode lossily. (CodeRabbit #671.)
         let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         Ok(String::from_utf8_lossy(&bytes).contains(needle))
+    }
+
+    /// ZEB-927: does any single captured stderr LINE contain every needle?
+    /// Stronger than [`Self::stderr_log_contains`] when a field must belong to a
+    /// specific log event — e.g. asserting a denylist message names a specific
+    /// peer id, rather than matching the message and the id on unrelated lines.
+    /// ANSI SGR codes are stripped before matching (tracing's default fmt colours
+    /// field names/values, so `peer=<hex>` and `entries=2` are split by escape
+    /// sequences on the raw line). Lossy-decodes like `stderr_log_contains`.
+    pub fn stderr_log_line_contains_all(&self, needles: &[&str]) -> anyhow::Result<bool> {
+        let dir = self
+            .config
+            .log_dir
+            .as_ref()
+            .context("stderr_log_line_contains_all requires log_dir capture")?;
+        let path = dir.join(stderr_log_filename(&self.config.profile));
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        Ok(String::from_utf8_lossy(&bytes).lines().any(|line| {
+            let clean = strip_ansi(line);
+            needles.iter().all(|n| clean.contains(n))
+        }))
     }
 
     /// Open a fresh event subscription. The caller owns the receiver + task.
