@@ -917,6 +917,15 @@ fn run_parole(
     let mut candidates: Vec<([u8; 32], Instant, [u8; 16])> = dormant
         .into_iter()
         .filter_map(|(peer, t)| {
+            // ZEB-928 (R4): parole re-arms Dormant slots directly, bypassing `kick` and
+            // `do_sweep`, so it must apply the same bounded-degree filter or it would
+            // revive dials to non-neighbors. Filter before `resolve_by_node_id` + the
+            // batch truncation so denied peers don't consume the parole budget.
+            if let Some(o) = inner.admission_oracle.get() {
+                if !o.admit(&peer) {
+                    return None;
+                }
+            }
             resolver
                 .resolve_by_node_id(&peer)
                 .map(|(owner, _)| (peer, t, owner.0))
@@ -2362,6 +2371,54 @@ mod tests {
         assert!(
             matches!(denied_state, Some(PeerStateWire::Dormant { .. })),
             "denied known peer NOT re-armed (bound holds under sweep)"
+        );
+    }
+
+    /// ZEB-928 (R4): parole is the third arming path (Dormant→Retrying, bypassing kick
+    /// and do_sweep) and must honor the same filter, else it revives dials to
+    /// non-neighbors. Admitted record-backed Dormant peer → paroled; denied → left
+    /// Dormant.
+    #[test]
+    fn r4_parole_skips_denied_dormant_peers() {
+        use crate::admission_oracle::AdmissionOracle;
+        let resolver = ReachabilityResolver::new();
+        let telemetry = DialTelemetry::new();
+        let admitted = peer(1);
+        let denied = peer(2);
+        seed(&resolver, admitted);
+        seed(&resolver, denied);
+
+        let oracle = Arc::new(AdmissionOracle::new(true));
+        oracle.publish_admitted(std::collections::BTreeSet::from([[0x81u8; 32]]));
+        oracle.bind(admitted, [0x81u8; 32]);
+        oracle.bind(denied, [0x82u8; 32]);
+        let handle = SupervisorHandle::new();
+        handle.set_admission_oracle(Arc::clone(&oracle));
+        handle.set_peer_state_for_test(admitted, PeerState::Dormant { since_ms: 0 });
+        handle.set_peer_state_for_test(denied, PeerState::Dormant { since_ms: 0 });
+
+        let config = cfg(1_000, 64_000, 10_000, 30_000, 8, 3_000);
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        run_parole(
+            &handle.inner,
+            &resolver,
+            &telemetry,
+            Instant::now(),
+            &peer(0),
+            &config,
+            &mut rng,
+        );
+
+        let snap = handle.states_snapshot();
+        let a = snap.iter().find(|(id, _)| *id == admitted).map(|(_, s)| s);
+        let d = snap.iter().find(|(id, _)| *id == denied).map(|(_, s)| s);
+        assert!(
+            matches!(a, Some(PeerStateWire::Retrying { .. })),
+            "admitted dormant peer paroled"
+        );
+        assert!(
+            matches!(d, Some(PeerStateWire::Dormant { .. })),
+            "denied dormant peer NOT paroled (bound holds under parole)"
         );
     }
 
