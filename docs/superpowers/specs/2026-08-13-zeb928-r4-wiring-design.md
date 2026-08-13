@@ -198,3 +198,27 @@ router default unchanged, per the R3 decision).
 - **Controller poll cadence.** Version polling is O(joined communities) cheap `u64` reads; the
   expensive O(N log N) recompute is delta-gated. If joined-community count grows large, revisit
   with a push signal off `insert_event`.
+
+## As-built (PR #674) — deviations from the sketch above
+
+Two facts surfaced while grounding against the live tree changed the plan; both are reflected in
+the shipped code, not this section's antecedent prose.
+
+- **Three dial-arming paths, not two.** The choke-point framing named `kick` + `do_sweep`. Parole
+  (ZEB-910, `run_parole`) is a *third* path — it revives Dormant slots straight to `Retrying`,
+  bypassing both. All three consult the one oracle; filtering only the first two would pass unit
+  tests yet let parole slowly re-admit non-neighbors, eroding the bound over time.
+- **Controller lives in `event_loop::run` (the supervisor block), not `lib.rs`.** That block is
+  where the `SupervisorHandle`, the resolver, `community_registry` (a `run` param), and the self
+  device key (via `dm_outbox.lock().community_signing_key.verifying_key()`) co-exist. The controller
+  is `event_loop::run_admission_controller`, spawned there when the oracle is enabled (router mode)
+  and an owner is present. It caches per-community rosters so unchanged communities are not
+  re-`materialized()` each tick.
+- **Only the DurableCrdt (address-book) bind seam is wired this pass.** The beacon
+  (`membership_device_vk`) and pkarr seams are deferred: the pkarr path holds only a
+  `DeviceIdentityHash` (not the enrolled verify key), and the beacon kick originates in the gateway
+  driver, not the resolver. The address-book path is the steady-state feed the bound rests on; the
+  others fail open (dialed) until an address-book row binds them.
+- **Boot looseness.** Records ingested before the oracle is installed carry no binding, so
+  boot-seed dials them (fail-open) until a fresh ingest re-binds. Correctness holds (fail-open
+  never starves); realized boot/steady degree is what the deferred N=50/N=200 harness measures.
