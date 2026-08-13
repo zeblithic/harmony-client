@@ -1823,6 +1823,16 @@ impl NodeState {
         self.dm_self_owner.map(|o| hex::encode(o.0))
     }
 
+    /// ZEB-912: status surface helper — the running node's iroh node id, hex.
+    /// `iroh_endpoint` is installed at `start_node` and nulled on stop alongside
+    /// the other node handles, so `None` faithfully means "not running" (same
+    /// contract as the ZEB-445 helpers above).
+    pub(crate) fn node_id_hex_for_status(&self) -> Option<String> {
+        self.iroh_endpoint
+            .as_ref()
+            .map(|ep| hex::encode(ep.node_id().as_bytes()))
+    }
+
     /// ZEB-703: handles for `/v1/shutdown`'s pre-ack barrier + flush. The
     /// 200 is the signal supervisors act on; the handler fences new DM
     /// mutations (ZEB-234 stopping flag), drains in-flight fenced sends,

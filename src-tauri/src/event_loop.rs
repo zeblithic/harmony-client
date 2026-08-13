@@ -3862,12 +3862,7 @@ pub async fn run(
     // Used to derive hop distance: ZID in this set → hop 1, else → hop 2.
     // Eagerly populated so capacity updates arriving before the first refresh
     // aren't misclassified as hop 2.
-    let mut direct_peer_zids: std::collections::HashSet<String> = session
-        .info()
-        .peers_zid()
-        .await
-        .map(|z| z.to_string())
-        .collect();
+    let mut direct_peer_zids: std::collections::HashSet<String> = direct_link_zids(&session).await;
     // ZEB-622: previous zid-poll snapshot, kept SEPARATE from the overwrite-
     // style `direct_peer_zids` above (whose hop-distance consumers need the
     // current-snapshot semantics). SEEDED from the same boot-time snapshot
@@ -4597,15 +4592,11 @@ pub async fn run(
 
                 // Refresh direct peer set every 20 timer ticks (~5 seconds).
                 // Driven by timer only (not Zenoh events) to avoid excessive
-                // peers_zid() calls under high message traffic.
+                // session-info calls under high message traffic.
                 peer_refresh_counter += 1;
                 if peer_refresh_counter.is_multiple_of(20) {
-                    let refreshed: Vec<String> = session
-                        .info()
-                        .peers_zid()
-                        .await
-                        .map(|z| z.to_string())
-                        .collect();
+                    let refreshed: Vec<String> =
+                        direct_link_zids(&session).await.into_iter().collect();
                     // ZEB-622: any up-edge (a zid absent last poll, present now)
                     // bumps the transport epoch — community root-fetch /
                     // channel-backfill / mail-root latches re-arm (their drivers
@@ -8402,6 +8393,21 @@ where
 /// elsewhere, in which case best-effort skip-the-admit is the right
 /// behavior. See CodeRabbit R2 on PR #125.
 const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// ZEB-912: all directly-linked zids, regardless of the REMOTE session's mode.
+/// zenoh's session info partitions direct links by remote whatami (`peers_zid`
+/// vs `routers_zid` — an all-router mesh under HARMONY_ZENOH_MODE=router
+/// reports every link in `routers_zid`, probe-verified in the R3 spike doc).
+/// Hop-distance classification and ZEB-622 up-edge detection care about
+/// "directly linked", not the remote's mode — reading only `peers_zid` would
+/// silently blind both on router-mode runs.
+async fn direct_link_zids(session: &zenoh::Session) -> std::collections::HashSet<String> {
+    let info = session.info();
+    let mut set: std::collections::HashSet<String> =
+        info.peers_zid().await.map(|z| z.to_string()).collect();
+    set.extend(info.routers_zid().await.map(|z| z.to_string()));
+    set
+}
 
 /// ZEB-622: up-edge detector over zid-poll snapshots. Replaces the accumulating
 /// seen-zid set (which never forgot, so a same-zid reconnect never re-armed the
