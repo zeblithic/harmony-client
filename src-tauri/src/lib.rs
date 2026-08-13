@@ -6488,6 +6488,8 @@ pub async fn start_node_inner(
                             .join(crate::relay_hold_persist::RELAY_HOLD_REPLAY_FILENAME);
                         let relay_hold_first_observed_path = identity_dir
                             .join(crate::relay_hold_persist::RELAY_HOLD_FIRST_OBSERVED_FILENAME);
+                        let relay_hold_expired_path = identity_dir
+                            .join(crate::relay_hold_persist::RELAY_HOLD_EXPIRED_FILENAME);
                         // ZEB-862: restore the LOCAL first-observation clock from its
                         // sidecar so TTL GC survives restart (else the first sweep
                         // re-stamps every entry at `now`).
@@ -6499,6 +6501,18 @@ pub async fn start_node_inner(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_millis() as u64;
+                            // ZEB-924: restore expiry tombstones BEFORE the
+                            // first-observed clock — restore_expired removes any
+                            // stale-doc-resurrected entries, and
+                            // restore_first_observed's orphan-pruning then drops
+                            // their stamps.
+                            doc.restore_expired(
+                                crate::relay_hold_persist::load_expired_or_recover(
+                                    &relay_hold_expired_path,
+                                )
+                                .map_err(|e| format!("load relay-hold expired: {e}"))?,
+                                now_ms,
+                            );
                             doc.restore_first_observed(
                                 crate::relay_hold_persist::load_first_observed_or_recover(
                                     &relay_hold_first_observed_path,
@@ -6541,6 +6555,7 @@ pub async fn start_node_inner(
                                             doc_path: relay_hold_path,
                                             replay_path: relay_hold_replay_path,
                                             first_observed_path: relay_hold_first_observed_path,
+                                            expired_path: relay_hold_expired_path,
                                         },
                                     ),
                                     lookup_key_tag: b"relay-hold-v1",
@@ -12821,11 +12836,16 @@ pub async fn start_node_inner(
                                         .unwrap_or_default()
                                         .as_millis()
                                         as u64;
-                                    let (changed, fo_grew) = {
+                                    let (changed, sidecars_changed) = {
                                         let mut d = gc_doc.lock().await;
-                                        let before = d.first_observed_ms().len();
+                                        let fo_before = d.first_observed_ms().len();
+                                        let tomb_before = d.expired_at_ms().len();
                                         let changed = d.gc(now_ms);
-                                        (changed, d.first_observed_ms().len() != before)
+                                        (
+                                            changed,
+                                            d.first_observed_ms().len() != fo_before
+                                                || d.expired_at_ms().len() != tomb_before,
+                                        )
                                     };
                                     if changed {
                                         gc_sync.notify_dirty();
@@ -12835,7 +12855,7 @@ pub async fn start_node_inner(
                                                 "ZEB-458: relay-hold GC flush_now failed"
                                             );
                                         }
-                                    } else if fo_grew {
+                                    } else if sidecars_changed {
                                         // ZEB-862: a stamp-only sweep added durable
                                         // first-observation timestamps but removed
                                         // nothing (`gc` returned false), so the
@@ -12844,7 +12864,12 @@ pub async fn start_node_inner(
                                         // WITHOUT a fleet republish (the clock is
                                         // serde-skip, so the wire bytes are unchanged)
                                         // and cannot be starved by a stalled publish —
-                                        // so the TTL survives restart.
+                                        // so the TTL survives restart. ZEB-924: same
+                                        // for tombstone age-out/eviction shrinkage —
+                                        // tombstone ADDS always ride a `changed = true`
+                                        // sweep (they coincide with entry removal), so
+                                        // the length delta only needs to catch stamp
+                                        // growth and tombstone shrinkage.
                                         if let Err(e) = gc_sync.persist_now().await {
                                             tracing::warn!(
                                                 error = %e,
