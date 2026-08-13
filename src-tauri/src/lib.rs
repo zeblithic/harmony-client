@@ -6488,6 +6488,8 @@ pub async fn start_node_inner(
                             .join(crate::relay_hold_persist::RELAY_HOLD_REPLAY_FILENAME);
                         let relay_hold_first_observed_path = identity_dir
                             .join(crate::relay_hold_persist::RELAY_HOLD_FIRST_OBSERVED_FILENAME);
+                        let relay_hold_expired_path = identity_dir
+                            .join(crate::relay_hold_persist::RELAY_HOLD_EXPIRED_FILENAME);
                         // ZEB-862: restore the LOCAL first-observation clock from its
                         // sidecar so TTL GC survives restart (else the first sweep
                         // re-stamps every entry at `now`).
@@ -6499,6 +6501,18 @@ pub async fn start_node_inner(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_millis() as u64;
+                            // ZEB-924: restore expiry tombstones BEFORE the
+                            // first-observed clock — restore_expired removes any
+                            // stale-doc-resurrected entries, and
+                            // restore_first_observed's orphan-pruning then drops
+                            // their stamps.
+                            doc.restore_expired(
+                                crate::relay_hold_persist::load_expired_or_recover(
+                                    &relay_hold_expired_path,
+                                )
+                                .map_err(|e| format!("load relay-hold expired: {e}"))?,
+                                now_ms,
+                            );
                             doc.restore_first_observed(
                                 crate::relay_hold_persist::load_first_observed_or_recover(
                                     &relay_hold_first_observed_path,
@@ -6541,6 +6555,7 @@ pub async fn start_node_inner(
                                             doc_path: relay_hold_path,
                                             replay_path: relay_hold_replay_path,
                                             first_observed_path: relay_hold_first_observed_path,
+                                            expired_path: relay_hold_expired_path,
                                         },
                                     ),
                                     lookup_key_tag: b"relay-hold-v1",
@@ -12814,6 +12829,15 @@ pub async fn start_node_inner(
                                 // Consume the immediate first tick — nothing to GC
                                 // at boot (the doc was just loaded).
                                 ticker.tick().await;
+                                // PR #667 R1 (CodeRabbit): a failed sidecar
+                                // persist leaves the length deltas below unchanged
+                                // on the NEXT sweep, so without this latch a
+                                // transient write error would strand fresh stamps /
+                                // tombstone prunes in RAM until some later delta.
+                                // The latch keeps retrying via the direct persist
+                                // path (no dirty-marking, no fleet republish) until
+                                // a write lands.
+                                let mut sidecar_persist_pending = false;
                                 loop {
                                     ticker.tick().await;
                                     let now_ms = std::time::SystemTime::now()
@@ -12821,21 +12845,38 @@ pub async fn start_node_inner(
                                         .unwrap_or_default()
                                         .as_millis()
                                         as u64;
-                                    let (changed, fo_grew) = {
+                                    let (changed, sidecars_changed) = {
                                         let mut d = gc_doc.lock().await;
-                                        let before = d.first_observed_ms().len();
+                                        let fo_before = d.first_observed_ms().len();
+                                        let tomb_before = d.expired_at_ms().len();
                                         let changed = d.gc(now_ms);
-                                        (changed, d.first_observed_ms().len() != before)
+                                        (
+                                            changed,
+                                            d.first_observed_ms().len() != fo_before
+                                                || d.expired_at_ms().len() != tomb_before,
+                                        )
                                     };
                                     if changed {
                                         gc_sync.notify_dirty();
-                                        if let Err(e) = gc_sync.flush_now().await {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "ZEB-458: relay-hold GC flush_now failed"
-                                            );
+                                        match gc_sync.flush_now().await {
+                                            // A successful flush persisted every
+                                            // sidecar too — nothing left to retry.
+                                            Ok(()) => sidecar_persist_pending = false,
+                                            Err(e) => {
+                                                // The armed dirty latch retries the
+                                                // publish leg; the pending latch
+                                                // additionally guarantees a DIRECT
+                                                // persist retry next sweep even if
+                                                // the debounced flush stays wedged
+                                                // (publisher backpressure).
+                                                sidecar_persist_pending = true;
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "ZEB-458: relay-hold GC flush_now failed"
+                                                );
+                                            }
                                         }
-                                    } else if fo_grew {
+                                    } else if sidecars_changed || sidecar_persist_pending {
                                         // ZEB-862: a stamp-only sweep added durable
                                         // first-observation timestamps but removed
                                         // nothing (`gc` returned false), so the
@@ -12844,12 +12885,21 @@ pub async fn start_node_inner(
                                         // WITHOUT a fleet republish (the clock is
                                         // serde-skip, so the wire bytes are unchanged)
                                         // and cannot be starved by a stalled publish —
-                                        // so the TTL survives restart.
-                                        if let Err(e) = gc_sync.persist_now().await {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "ZEB-862: relay-hold first-observed persist_now failed"
-                                            );
+                                        // so the TTL survives restart. ZEB-924: same
+                                        // for tombstone age-out/eviction shrinkage —
+                                        // tombstone ADDS always ride a `changed = true`
+                                        // sweep (they coincide with entry removal), so
+                                        // the length delta only needs to catch stamp
+                                        // growth and tombstone shrinkage.
+                                        match gc_sync.persist_now().await {
+                                            Ok(()) => sidecar_persist_pending = false,
+                                            Err(e) => {
+                                                sidecar_persist_pending = true;
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "ZEB-862: relay-hold sidecar persist_now failed; will retry next sweep"
+                                                );
+                                            }
                                         }
                                     }
                                 }

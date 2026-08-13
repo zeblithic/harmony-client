@@ -137,6 +137,21 @@ pub const RELAY_HOLD_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 /// negligible overhead. Wired at start_node (T11b).
 pub const RELAY_HOLD_GC_INTERVAL_MS: u64 = 10 * 60 * 1_000;
 
+/// ZEB-924: how long a LOCAL expiry tombstone suppresses resurrection-by-merge
+/// of a TTL-expired hold. A still-holding peer expires the same entry within
+/// ITS OWN TTL of ITS first observation, so 2× the TTL covers realistic
+/// cross-device observation skew; past it, a pathological late holder re-arms
+/// at most one more TTL window before being re-tombstoned (bounded harm).
+pub const RELAY_HOLD_TOMBSTONE_RETENTION_MS: u64 = 2 * RELAY_HOLD_TTL_MS;
+
+/// ZEB-924: hard cap on the tombstone set so expiry memory cannot itself
+/// become unbounded state. Oldest-first eviction (the entry peers have most
+/// likely already expired themselves); ~100 B per tombstone keeps the worst
+/// case near 400 KB.
+pub const RELAY_HOLD_TOMBSTONE_CAP: usize = 4 * RELAY_HOLD_GLOBAL_CAP;
+
+const _: () = assert!(RELAY_HOLD_TOMBSTONE_CAP >= RELAY_HOLD_GLOBAL_CAP);
+
 // =====================================================================
 // Wire types — Deposit direction (sender → relay)
 // =====================================================================

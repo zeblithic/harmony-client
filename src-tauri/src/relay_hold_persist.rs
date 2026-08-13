@@ -283,6 +283,86 @@ pub fn save_first_observed(path: &Path, map: &BTreeMap<String, u64>) -> Result<(
     atomic_write(path, &bytes)
 }
 
+// ── expiry-tombstone sidecar (ZEB-924) ─────────────────────────────────────────
+
+/// File name for the persisted LOCAL expiry tombstones. Lives alongside
+/// `relay_hold.cbor`. Local-only: never replicated, never on the wire — it
+/// makes the `#[serde(skip)]` `RelayHoldDoc::expired_at_ms` resurrection
+/// suppression survive restart (RAM-only tombstones would re-arm a full TTL
+/// window per restart).
+pub const RELAY_HOLD_EXPIRED_FILENAME: &str = "relay_hold_expired.cbor";
+
+const RELAY_HOLD_EXPIRED_SCHEMA_V1: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct RelayHoldExpiredFileV1(BTreeMap<String, u64>);
+
+/// Load the LOCAL expiry tombstones from `path`. Returns
+/// `Ok(BTreeMap::new())` if the file does not exist yet (→ no suppression;
+/// the next TTL expiry starts recording).
+pub fn load_expired(path: &Path) -> Result<BTreeMap<String, u64>, SyncError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(SyncError::Persist(format!("read {}: {e}", path.display()))),
+    };
+    if bytes.is_empty() {
+        return Err(SyncError::CborDecode(format!(
+            "relay-hold expired file is empty: {}",
+            path.display()
+        )));
+    }
+    let version = bytes[0];
+    let payload = &bytes[1..];
+    match version {
+        RELAY_HOLD_EXPIRED_SCHEMA_V1 => {
+            let mut cursor = Cursor::new(payload);
+            let file: RelayHoldExpiredFileV1 = from_reader(&mut cursor).map_err(|e| {
+                SyncError::CborDecode(format!("load_expired {}: {e}", path.display()))
+            })?;
+            // Reject trailing bytes after the CBOR value (mirrors `load`).
+            let pos = cursor.position() as usize;
+            if pos != payload.len() {
+                return Err(SyncError::CborDecode(format!(
+                    "trailing bytes after relay-hold expired value: consumed {} of {}",
+                    pos,
+                    payload.len()
+                )));
+            }
+            Ok(file.0)
+        }
+        v => Err(SyncError::CborDecode(format!(
+            "unknown relay-hold expired schema version {v:#x} in {}",
+            path.display()
+        ))),
+    }
+}
+
+/// Same recovery contract as [`load_doc_or_recover`]: `CborDecode` corruption
+/// is quarantined (`.corrupt-<ms>`, bytes preserved) and an empty map
+/// returned; a transient `Persist` error is left untouched and propagated
+/// (ZEB-460). A missing/empty tombstone set is safe-but-slower — the next
+/// resurrection re-arms one TTL window, then re-tombstones — so
+/// quarantine-to-empty never loses correctness, only punctuality.
+pub fn load_expired_or_recover(path: &Path) -> Result<BTreeMap<String, u64>, SyncError> {
+    match load_expired(path) {
+        Ok(m) => Ok(m),
+        Err(e @ SyncError::CborDecode(_)) => {
+            quarantine(path, &e);
+            Ok(BTreeMap::new())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Save the LOCAL expiry tombstones to `path` atomically.
+pub fn save_expired(path: &Path, map: &BTreeMap<String, u64>) -> Result<(), SyncError> {
+    let mut bytes = vec![RELAY_HOLD_EXPIRED_SCHEMA_V1];
+    into_writer(&RelayHoldExpiredFileV1(map.clone()), &mut bytes)
+        .map_err(|e| SyncError::CborEncode(format!("encode expired {}: {e}", path.display())))?;
+    atomic_write(path, &bytes)
+}
+
 // ── FleetPersist impl ─────────────────────────────────────────────────────────
 
 /// Durability sink for the relay-hold fleet-sync engine. Holds the absolute
@@ -295,6 +375,9 @@ pub struct RelayHoldPersist {
     /// ZEB-862: local-only first-observation clock sidecar (see
     /// `RELAY_HOLD_FIRST_OBSERVED_FILENAME`).
     pub first_observed_path: std::path::PathBuf,
+    /// ZEB-924: local-only expiry-tombstone sidecar (see
+    /// `RELAY_HOLD_EXPIRED_FILENAME`).
+    pub expired_path: std::path::PathBuf,
 }
 
 impl crate::fleet_sync::FleetPersist<RelayHoldDoc> for RelayHoldPersist {
@@ -303,6 +386,15 @@ impl crate::fleet_sync::FleetPersist<RelayHoldDoc> for RelayHoldPersist {
         state: &RelayHoldDoc,
         tracker: &BTreeMap<String, Hlc>,
     ) -> Result<(), SyncError> {
+        // ZEB-924 (PR #667 R1): tombstones are written BEFORE the doc. Each
+        // write is individually atomic but the sequence is not; a crash after
+        // the doc but before the tombstones would durably drop a TTL-expired
+        // entry while LOSING its fresh tombstone — the one ordering
+        // `restore_expired` cannot heal (a peer merge could then re-arm a
+        // fresh TTL). Tombstone-first inverts the window: a crash leaves the
+        // tombstone durable with a stale doc still holding the entry, which
+        // boot restoration removes (the tombstone wins).
+        save_expired(&self.expired_path, state.expired_at_ms())?;
         save(&self.doc_path, state)?;
         save_replay(&self.replay_path, tracker)?;
         save_first_observed(&self.first_observed_path, state.first_observed_ms())?;
@@ -504,6 +596,7 @@ mod tests {
             doc_path: dir.path().join("relay_hold.cbor"),
             replay_path: dir.path().join("relay_hold_replay.cbor"),
             first_observed_path: dir.path().join("relay_hold_first_observed.cbor"),
+            expired_path: dir.path().join(RELAY_HOLD_EXPIRED_FILENAME),
         };
         use crate::fleet_sync::FleetPersist;
         let mut doc = sample_doc();
@@ -596,5 +689,57 @@ mod tests {
             !doc.entries.contains_key(&key),
             "reloaded old stamp aged the entry out"
         );
+    }
+
+    // ── expiry-tombstone sidecar (ZEB-924) ────────────────────────────────────
+
+    #[test]
+    fn expired_round_trips_and_missing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RELAY_HOLD_EXPIRED_FILENAME);
+        assert!(
+            load_expired(&path).unwrap().is_empty(),
+            "missing file → empty"
+        );
+        let mut m: BTreeMap<String, u64> = BTreeMap::new();
+        m.insert("k1".into(), 42);
+        save_expired(&path, &m).unwrap();
+        assert_eq!(load_expired(&path).unwrap(), m);
+    }
+
+    #[test]
+    fn load_expired_rejects_trailing_bytes_and_recover_quarantines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RELAY_HOLD_EXPIRED_FILENAME);
+        let mut m: BTreeMap<String, u64> = BTreeMap::new();
+        m.insert("k1".into(), 42);
+        save_expired(&path, &m).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0x00);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            load_expired(&path).unwrap_err(),
+            SyncError::CborDecode(_)
+        ));
+        assert!(load_expired_or_recover(&path).unwrap().is_empty());
+        assert!(!path.exists(), "corrupt file quarantined away");
+    }
+
+    #[test]
+    fn persist_writes_expired_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = RelayHoldPersist {
+            doc_path: dir.path().join("relay_hold.cbor"),
+            replay_path: dir.path().join("relay_hold_replay.cbor"),
+            first_observed_path: dir.path().join("relay_hold_first_observed.cbor"),
+            expired_path: dir.path().join(RELAY_HOLD_EXPIRED_FILENAME),
+        };
+        let mut doc = RelayHoldDoc::default();
+        let m: BTreeMap<String, u64> = [("gone-key".to_string(), 7u64)].into_iter().collect();
+        // Boot time near the stamp so restore's retention prune keeps it.
+        doc.restore_expired(m.clone(), 7);
+        use crate::fleet_sync::FleetPersist;
+        p.persist(&doc, &BTreeMap::new()).unwrap();
+        assert_eq!(load_expired(&p.expired_path).unwrap(), m);
     }
 }
