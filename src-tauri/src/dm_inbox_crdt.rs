@@ -238,7 +238,15 @@ impl DmInboxDoc {
     /// Bound the tombstone map: age out stamps older than
     /// `INBOX_TOMBSTONE_RETENTION_MS`, then evict oldest-first down to
     /// `INBOX_TOMBSTONE_CAP`.
-    fn prune_tombstones(&mut self, now_ms: u64) {
+    ///
+    /// `pub(crate)` for the production merger closure (lib.rs), which prunes
+    /// by wall clock BEFORE every inbound merge (PR #668 R1): a suppressed
+    /// re-merge flags no change and schedules no sweep, so on a quiet inbox
+    /// nothing else would ever age out the tombstone and suppression could
+    /// outlive `INBOX_TOMBSTONE_RETENTION_MS`. Pruning at the merge boundary
+    /// keeps the CRDT itself time-free while making the merge that would be
+    /// wrongly suppressed the one that re-admits.
+    pub(crate) fn prune_tombstones(&mut self, now_ms: u64) {
         self.expired_at_ms.retain(|_, t| {
             now_ms.saturating_sub(*t) < crate::butler_deposit::INBOX_TOMBSTONE_RETENTION_MS
         });
@@ -1009,6 +1017,47 @@ mod tests {
             doc.entries.contains_key(&k),
             "entry survives an expired tombstone"
         );
+    }
+
+    /// PR #668 R1 (CodeRabbit): a suppressed re-merge flags no change, so it
+    /// schedules no sweep — on a quiet inbox nothing would ever prune an
+    /// aged-out tombstone and suppression could outlive retention. The
+    /// production merger closure (lib.rs) therefore prunes by wall clock
+    /// BEFORE every inbound merge; this pins that composition: the same
+    /// merge that would be wrongly suppressed is the one that re-admits.
+    #[test]
+    fn merge_path_prune_reopens_after_retention_without_any_sweep() {
+        let mut doc = DmInboxDoc::default();
+        let k = key_n(10, 10);
+        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "b", &[]));
+        let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
+        doc.restore_first_observed([(k.clone(), 1u64)].into_iter().collect(), now);
+        assert!(doc.gc_expired(now, &BTreeSet::new()));
+        assert!(doc.expired_at_ms().contains_key(&k));
+
+        let mut remote = DmInboxDoc::default();
+        remote
+            .entries
+            .insert(k.clone(), entry(hlc(1, "a"), "b", &[]));
+
+        // NO gc sweeps from here on — only the merger-closure composition
+        // (prune_tombstones then merge_from).
+
+        // Before retention: still suppressed.
+        let before = now + crate::butler_deposit::INBOX_TOMBSTONE_RETENTION_MS - 1;
+        doc.prune_tombstones(before);
+        assert!(!doc.merge_from(remote.clone()).changed, "still suppressed");
+        assert!(!doc.entries.contains_key(&k));
+
+        // After retention: the pre-merge prune drops the tombstone and the
+        // SAME merge re-admits the key.
+        let after = now + crate::butler_deposit::INBOX_TOMBSTONE_RETENTION_MS;
+        doc.prune_tombstones(after);
+        assert!(
+            doc.merge_from(remote).changed,
+            "the merge after retention re-admits without any sweep"
+        );
+        assert!(doc.entries.contains_key(&k));
     }
 
     #[test]

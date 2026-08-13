@@ -6237,7 +6237,22 @@ pub async fn start_node_inner(
                             tokio::sync::mpsc::channel::<Vec<u8>>(64);
                         let dm_inbox_merger: crate::fleet_sync::Merger<
                             crate::dm_inbox_crdt::DmInboxDoc,
-                        > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                        > = std::sync::Arc::new(|local, remote| {
+                            // ZEB-925 (PR #668 R1): age out expiry tombstones
+                            // by wall clock BEFORE the merge. A suppressed
+                            // re-merge flags no change and schedules no sweep,
+                            // so on a quiet inbox nothing else would prune an
+                            // aged-out tombstone and suppression could outlive
+                            // retention; pruning here makes the merge that
+                            // would be wrongly suppressed the one that
+                            // re-admits.
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            local.prune_tombstones(now_ms);
+                            local.merge_from(remote)
+                        });
                         // Ingestion-nudge channel (dm_inbox_ingest.rs trigger
                         // model): capacity-1 level trigger. The engine's
                         // `on_applied` closure owns the only STRONG sender, so
