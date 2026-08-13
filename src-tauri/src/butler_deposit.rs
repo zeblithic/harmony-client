@@ -164,6 +164,20 @@ const _: () =
 /// path worth pinning fleet storage for.
 pub const INBOX_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
+/// ZEB-925: local expiry-tombstone retention — how long a TTL-expired key's
+/// tombstone suppresses resurrection-by-merge in `DmInboxDoc::merge_from`
+/// (2×TTL bounds tombstone age; after it, a still-merging sibling can reopen
+/// at most one fresh TTL window per retention period).
+pub const INBOX_TOMBSTONE_RETENTION_MS: u64 = 2 * INBOX_TTL_MS;
+
+/// ZEB-925: hard bound on the tombstone map (4× the live-entry cap gives
+/// headroom for churn; oldest-first eviction beyond it).
+pub const INBOX_TOMBSTONE_CAP: usize = 4 * INBOX_GLOBAL_CAP;
+
+// Eviction must never make the tombstone set smaller than what a full inbox
+// can expire in one sweep.
+const _: () = assert!(INBOX_TOMBSTONE_CAP >= INBOX_GLOBAL_CAP);
+
 /// ZEB-422 (P2): number of full backoff windows a (entry, recipient) pair may
 /// sit sent-but-never-acked before each FURTHER Ok-send window also attempts
 /// the butler-deposit rung. Windows accumulate via the Ok-arm's AttemptState

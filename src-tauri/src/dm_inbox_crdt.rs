@@ -99,6 +99,15 @@ pub struct DmInboxDoc {
     /// excluded from `PartialEq` below.
     #[serde(skip)]
     first_observed_ms: BTreeMap<String, u64>,
+    /// ZEB-925: LOCAL expiry tombstones (ms) keyed by entry key — memory of
+    /// keys this replica removed by TTL expiry, so a still-holding sibling's
+    /// merge cannot resurrect them and re-arm a fresh TTL window. Never
+    /// serialized (canonical wire bytes unchanged) and excluded from
+    /// `PartialEq` below, mirroring `first_observed_ms`. Bounded by
+    /// `INBOX_TOMBSTONE_RETENTION_MS` age-out + `INBOX_TOMBSTONE_CAP`
+    /// oldest-first eviction (`prune_tombstones`).
+    #[serde(skip)]
+    expired_at_ms: BTreeMap<String, u64>,
 }
 
 impl PartialEq for DmInboxDoc {
@@ -140,11 +149,29 @@ impl DmInboxDoc {
         }
         let before = self.entries.len();
         let first_observed = &self.first_observed_ms;
+        // ZEB-925: split the removal reason. A TTL expiry is tombstoned so a
+        // sibling's merge cannot resurrect it (see merge_from); a coverage
+        // removal is NOT — coverage is a fleet-deterministic function of the
+        // grow-only `ingested_by` union, so a resurrected covered entry
+        // converges out again without suppression. Covered wins when both
+        // apply.
+        let mut ttl_removed: Vec<String> = Vec::new();
         self.entries.retain(|key, _e| {
+            if covered.contains(key) {
+                return false;
+            }
             let observed = first_observed.get(key).copied().unwrap_or(now_ms);
             let ttl_expired = observed.saturating_add(crate::butler_deposit::INBOX_TTL_MS) < now_ms;
-            !(ttl_expired || covered.contains(key))
+            if ttl_expired {
+                ttl_removed.push(key.clone());
+                return false;
+            }
+            true
         });
+        for key in ttl_removed {
+            self.expired_at_ms.insert(key, now_ms);
+        }
+        self.prune_tombstones(now_ms);
         // Prune the side-map for removed keys (bounded with `entries`).
         let live: BTreeSet<String> = self.entries.keys().cloned().collect();
         self.first_observed_ms.retain(|k, _| live.contains(k));
@@ -175,6 +202,59 @@ impl DmInboxDoc {
             *v = (*v).min(now_ms);
         }
         self.first_observed_ms = map;
+    }
+
+    /// ZEB-925: read the LOCAL expiry-tombstone map for durable sidecar
+    /// persistence. Never leaves this replica and never enters the wire.
+    pub fn expired_at_ms(&self) -> &BTreeMap<String, u64> {
+        &self.expired_at_ms
+    }
+
+    /// ZEB-925: restore the LOCAL expiry tombstones on boot from the sidecar,
+    /// BEFORE [`Self::restore_first_observed`] (whose orphan-prune then drops
+    /// the stamps of any entry removed here). Future stamps are clamped to
+    /// `now_ms` (mirroring Q-1); aged-out tombstones are pruned BEFORE the
+    /// entries sweep (an expired tombstone must neither suppress nor delete);
+    /// a surviving tombstone wins over a stale doc file: its entry is removed.
+    pub fn restore_expired(&mut self, mut map: BTreeMap<String, u64>, now_ms: u64) {
+        for v in map.values_mut() {
+            *v = (*v).min(now_ms);
+        }
+        self.expired_at_ms = map;
+        self.prune_tombstones(now_ms);
+        let tombstones = &self.expired_at_ms;
+        self.entries.retain(|k, _| !tombstones.contains_key(k));
+    }
+
+    /// ZEB-925 (spec §2f): forget the expiry tombstone for `key`. Called by
+    /// the deposit acceptor when it ACCEPTS a deposit for the key —
+    /// acceptance is a fresh local decision to hold, and a live entry must
+    /// never coexist with its own tombstone ([`Self::restore_expired`] would
+    /// delete the acked entry at the next boot).
+    pub fn clear_tombstone(&mut self, key: &str) {
+        self.expired_at_ms.remove(key);
+    }
+
+    /// Bound the tombstone map: age out stamps older than
+    /// `INBOX_TOMBSTONE_RETENTION_MS`, then evict oldest-first down to
+    /// `INBOX_TOMBSTONE_CAP`.
+    fn prune_tombstones(&mut self, now_ms: u64) {
+        self.expired_at_ms.retain(|_, t| {
+            now_ms.saturating_sub(*t) < crate::butler_deposit::INBOX_TOMBSTONE_RETENTION_MS
+        });
+        while self.expired_at_ms.len() > crate::butler_deposit::INBOX_TOMBSTONE_CAP {
+            let oldest = self
+                .expired_at_ms
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    self.expired_at_ms.remove(&k);
+                }
+                None => break,
+            }
+        }
     }
 }
 
@@ -250,6 +330,13 @@ impl DmInboxDoc {
         for (k, r) in remote.entries {
             match self.entries.get_mut(&k) {
                 None => {
+                    // ZEB-925: a key this replica expired by TTL is suppressed
+                    // — no insert, no `changed` (no ingest wakeup, no flush
+                    // churn) — until the tombstone ages out
+                    // (`prune_tombstones`).
+                    if self.expired_at_ms.contains_key(&k) {
+                        continue;
+                    }
                     changed = true;
                     self.entries.insert(k, r);
                 }
@@ -738,5 +825,217 @@ mod tests {
         assert_ne!(revoke, DmInboxDoc::revoke_key(&owner, &[0x22; 16]));
         // Distinct revoke payloads from the same granter get distinct keys.
         assert_ne!(revoke, DmInboxDoc::grant_revoke_key(&owner, &[0x01, 0x02]));
+    }
+
+    // ----------------------------------------------------------------
+    // ZEB-925: local expiry tombstones stop resurrection-by-merge
+    // ----------------------------------------------------------------
+
+    fn key_n(space_byte: u8, cid_byte: u8) -> String {
+        DmInboxDoc::key(&[space_byte; 16], &[cid_byte; 32])
+    }
+
+    #[test]
+    fn gc_ttl_expiry_tombstones_the_key_but_coverage_removal_does_not() {
+        let mut doc = DmInboxDoc::default();
+        let k_ttl = key_n(1, 1);
+        let k_cov = key_n(2, 2);
+        doc.entries
+            .insert(k_ttl.clone(), entry(hlc(1, "a"), "butler", &[]));
+        doc.entries
+            .insert(k_cov.clone(), entry(hlc(1, "a"), "butler", &[]));
+        // Both stamps ancient → both entries are past TTL at `now`.
+        let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
+        doc.restore_first_observed(
+            [(k_ttl.clone(), 1u64), (k_cov.clone(), 1u64)]
+                .into_iter()
+                .collect(),
+            now,
+        );
+        let covered: BTreeSet<String> = [k_cov.clone()].into();
+        assert!(doc.gc_expired(now, &covered));
+        assert!(doc.entries.is_empty(), "both removed");
+        assert!(
+            doc.expired_at_ms().contains_key(&k_ttl),
+            "TTL-only removal is tombstoned"
+        );
+        assert!(
+            !doc.expired_at_ms().contains_key(&k_cov),
+            "covered removal is NOT tombstoned even when also past TTL \
+             (coverage is fleet-deterministic; suppression is dead state)"
+        );
+    }
+
+    #[test]
+    fn merge_suppresses_resurrection_of_tombstoned_key() {
+        let mut doc = DmInboxDoc::default();
+        let k = key_n(3, 3);
+        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "b", &[]));
+        let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
+        doc.restore_first_observed([(k.clone(), 1u64)].into_iter().collect(), now);
+        assert!(doc.gc_expired(now, &BTreeSet::new()));
+        assert!(doc.entries.is_empty());
+
+        // A still-holding sibling re-merges the expired entry.
+        let mut remote = DmInboxDoc::default();
+        remote
+            .entries
+            .insert(k.clone(), entry(hlc(1, "a"), "b", &[]));
+        let out = doc.merge_from(remote);
+        assert!(!out.changed, "suppressed re-insert must not flag changed");
+        assert!(
+            !doc.entries.contains_key(&k),
+            "tombstoned key never re-enters entries"
+        );
+    }
+
+    #[test]
+    fn resurrection_lifetime_bound_across_merge_traffic() {
+        // A never-covered entry's lifetime on this replica is bounded by
+        // first-observation + TTL + one sweep, regardless of merge traffic.
+        let mut doc = DmInboxDoc::default();
+        let k = key_n(4, 4);
+        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "b", &[]));
+        assert!(!doc.gc_expired(1_000, &BTreeSet::new()), "stamped at 1s");
+        let mut remote = DmInboxDoc::default();
+        remote
+            .entries
+            .insert(k.clone(), entry(hlc(1, "a"), "b", &[]));
+        // Merge traffic every "day" for 90 days: the entry must be gone from
+        // every sweep after expiry (1_000 + TTL).
+        let day = 24 * 60 * 60 * 1_000u64;
+        let expiry = 1_000 + crate::butler_deposit::INBOX_TTL_MS;
+        for d in 1..=90u64 {
+            let now = 1_000 + d * day;
+            doc.merge_from(remote.clone());
+            doc.gc_expired(now, &BTreeSet::new());
+            if now > expiry {
+                assert!(
+                    !doc.entries.contains_key(&k),
+                    "day {d}: entry resurrected past its TTL"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn covered_resurrection_still_converges_without_tombstone() {
+        let mut doc = DmInboxDoc::default();
+        let k = key_n(5, 5);
+        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "b", &[]));
+        let covered: BTreeSet<String> = [k.clone()].into();
+        assert!(doc.gc_expired(1_000, &covered), "covered removal");
+        assert!(doc.expired_at_ms().is_empty(), "no tombstone for coverage");
+
+        // Resurrected by a slower sibling: insert-once ADMITS it (changed),
+        // and the next sweep's deterministic coverage removes it again.
+        let mut remote = DmInboxDoc::default();
+        remote
+            .entries
+            .insert(k.clone(), entry(hlc(1, "a"), "b", &[]));
+        let out = doc.merge_from(remote);
+        assert!(out.changed, "covered key is not suppressed");
+        assert!(doc.gc_expired(2_000, &covered));
+        assert!(doc.entries.is_empty(), "coverage converges by determinism");
+    }
+
+    #[test]
+    fn tombstone_ages_out_after_retention_and_reopens() {
+        let mut doc = DmInboxDoc::default();
+        let k = key_n(6, 6);
+        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "b", &[]));
+        let now = crate::butler_deposit::INBOX_TTL_MS + 10_000;
+        doc.restore_first_observed([(k.clone(), 1u64)].into_iter().collect(), now);
+        assert!(doc.gc_expired(now, &BTreeSet::new()));
+        assert!(doc.expired_at_ms().contains_key(&k));
+
+        let mut remote = DmInboxDoc::default();
+        remote
+            .entries
+            .insert(k.clone(), entry(hlc(1, "a"), "b", &[]));
+
+        // One ms before retention elapses: still suppressed (the aging gc
+        // sweep runs first, then the merge).
+        let just_before = now + crate::butler_deposit::INBOX_TOMBSTONE_RETENTION_MS - 1;
+        doc.gc_expired(just_before, &BTreeSet::new());
+        assert!(!doc.merge_from(remote.clone()).changed);
+
+        // At/after retention: the tombstone ages out; the key may re-enter
+        // (and gets a fresh first-observation window — the accepted
+        // once-per-retention residual).
+        let after = now + crate::butler_deposit::INBOX_TOMBSTONE_RETENTION_MS;
+        doc.gc_expired(after, &BTreeSet::new());
+        assert!(!doc.expired_at_ms().contains_key(&k), "tombstone aged out");
+        assert!(doc.merge_from(remote).changed, "key readmitted");
+    }
+
+    #[test]
+    fn tombstone_cap_evicts_oldest_first() {
+        // Cap enforcement at restore: CAP+2 tombstones with distinct stamps →
+        // the two oldest are evicted, the newest survive.
+        let cap = crate::butler_deposit::INBOX_TOMBSTONE_CAP;
+        let mut m: BTreeMap<String, u64> = BTreeMap::new();
+        for i in 0..(cap + 2) {
+            // Distinct keys; stamp = i+1 so ordering is by insertion index.
+            m.insert(format!("cap-key-{i:05}"), (i + 1) as u64);
+        }
+        let newest = (cap + 2) as u64;
+        let mut doc = DmInboxDoc::default();
+        doc.restore_expired(m, newest);
+        assert_eq!(doc.expired_at_ms().len(), cap, "pruned down to cap");
+        assert!(
+            !doc.expired_at_ms().contains_key("cap-key-00000")
+                && !doc.expired_at_ms().contains_key("cap-key-00001"),
+            "oldest two evicted"
+        );
+        assert!(
+            doc.expired_at_ms()
+                .contains_key(&format!("cap-key-{:05}", cap + 1)),
+            "newest kept"
+        );
+    }
+
+    #[test]
+    fn restore_prunes_aged_out_tombstones_and_lets_their_entries_live() {
+        let mut doc = DmInboxDoc::default();
+        let k = key_n(7, 7);
+        doc.entries.insert(k.clone(), entry(hlc(1, "a"), "b", &[]));
+        // Sidecar stamp older than retention at boot: the tombstone must be
+        // pruned BEFORE the entries sweep, so the (re-deposited) entry lives.
+        let boot = crate::butler_deposit::INBOX_TOMBSTONE_RETENTION_MS + 50_000;
+        doc.restore_expired([(k.clone(), 1u64)].into_iter().collect(), boot);
+        assert!(doc.expired_at_ms().is_empty(), "aged-out tombstone dropped");
+        assert!(
+            doc.entries.contains_key(&k),
+            "entry survives an expired tombstone"
+        );
+    }
+
+    #[test]
+    fn restore_expired_removes_tombstoned_entries_and_clamps_future_stamps() {
+        let mut doc = DmInboxDoc::default();
+        let k_dead = key_n(8, 8);
+        let k_live = key_n(9, 9);
+        doc.entries
+            .insert(k_dead.clone(), entry(hlc(1, "a"), "b", &[]));
+        doc.entries
+            .insert(k_live.clone(), entry(hlc(1, "a"), "b", &[]));
+        let boot = 1_000_000u64;
+        // k_dead: fresh tombstone (wins over the stale doc). Also a FUTURE
+        // stamp — must be clamped to boot so it cannot outlive retention.
+        doc.restore_expired(
+            [(k_dead.clone(), boot + 5_000_000)].into_iter().collect(),
+            boot,
+        );
+        assert!(
+            !doc.entries.contains_key(&k_dead),
+            "tombstone wins over a stale doc"
+        );
+        assert!(doc.entries.contains_key(&k_live), "untombstoned key lives");
+        assert_eq!(
+            doc.expired_at_ms()[&k_dead],
+            boot,
+            "future stamp clamped to boot"
+        );
     }
 }
