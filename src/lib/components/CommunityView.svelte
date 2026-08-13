@@ -575,6 +575,8 @@
     {communityName}
     {communityKind}
     {members}
+    {resolveCard}
+    {resolveNickname}
     myAddress={ownAddress}
     {myPower}
     {isDegraded}

@@ -8,6 +8,8 @@
     type ForkDescendantDto,
   } from '../types';
   import { nonEmpty } from '../display-label';
+  import { resolveMentionLabel } from '../mention-render';
+  import type { ResolvedCard } from '../member-card-service';
   import ConfirmationModal from './ConfirmationModal.svelte';
   import SetPowerDialog from './SetPowerDialog.svelte';
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
@@ -62,6 +64,8 @@
       setPower: POWER_THRESHOLDS.setPower,
     },
     thresholdsLoaded = false,
+    resolveCard,
+    resolveNickname,
   }: {
     communityId: string;
     communityName: string;
@@ -77,6 +81,13 @@
     onSetPower: (targetAddr: string, newPower: number) => void;
     onLeave: () => void;
     onGenerateInvite: () => Promise<string>;
+    /** ZEB-907: optional resolvers (same contracts as CommunityMembersPanel).
+     *  Rows resolve through the shared 4-rung ladder (nickname → live card →
+     *  roster displayName → hex) so the self row — whose roster displayName
+     *  is always null (you never receive your own card) — renders the local
+     *  card name instead of hex. */
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
     /** ZEB-250: current admin quorum threshold for this community.
      *  When not provided, defaults to 1 (no multi-sig required). */
     adminQuorum?: number;
@@ -366,6 +377,13 @@
   }
 
   let search = $state('');
+
+  /** ZEB-907: ONE label per row via the shared ladder, used by the render
+   *  AND the search filter so a rendered name is always findable. */
+  function memberLabel(m: CommunityMember): string {
+    return resolveMentionLabel(m.address, resolveNickname, resolveCard, () => m.displayName);
+  }
+
   let filteredMembers = $derived(
     search.trim() === ''
       ? joinedMembers
@@ -376,6 +394,7 @@
           const q = search.trim().toLowerCase();
           return joinedMembers.filter(
             (m) =>
+              memberLabel(m).toLowerCase().includes(q) ||
               (m.displayName?.toLowerCase().includes(q) ?? false) ||
               m.address.toLowerCase().includes(q)
           );
@@ -556,10 +575,11 @@
       </div>
       <div class="member-list">
         {#each filteredMembers as m (m.address)}
+          {@const label = memberLabel(m)}
           <div class="member-row">
-            <div class="avatar">{(m.displayName ?? m.address).slice(0, 1).toUpperCase()}</div>
+            <div class="avatar">{label.slice(0, 1).toUpperCase()}</div>
             <div class="member-name">
-              <div class="name">{m.displayName ?? m.address.slice(0, 8)}{m.address === myAddress ? ' (you)' : ''}</div>
+              <div class="name">{label}{m.address === myAddress ? ' (you)' : ''}</div>
               <div class="addr">{m.address}</div>
             </div>
             <RoleBadge role={powerToRole(m.power)} />
