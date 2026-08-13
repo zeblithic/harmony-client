@@ -797,3 +797,80 @@ describe('CommunitySettingsPanel', () => {
     expect(getByText('● Healthy')).toBeTruthy();
   });
 });
+
+// ZEB-907: the members list resolves names through the shared 4-rung ladder
+// (nickname → live card → roster displayName → hex) — the self row's roster
+// displayName is always null (you never receive your own card), so it must
+// read the local card instead of falling to hex.
+describe('member display-name resolution (ZEB-907)', () => {
+  const selfMember: CommunityMember = {
+    address: 'ac7f7d42', displayName: undefined, power: 100, status: 'joined',
+  };
+  const rosterOther: CommunityMember = {
+    address: 'b1c4', displayName: 'RosterBob', power: 0, status: 'joined',
+  };
+  const selfCard = (id: string) =>
+    id === selfMember.address ? { displayName: 'Jake (on Koya)', statusText: '' } : undefined;
+
+  it('self row renders the resolved card name instead of hex', () => {
+    const { getByText, queryByText } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        members: [selfMember, rosterOther],
+        myAddress: selfMember.address,
+        resolveCard: selfCard,
+      },
+    });
+    expect(getByText(/Jake \(on Koya\) \(you\)/)).toBeTruthy();
+    expect(queryByText(/ac7f7d42 \(you\)/)).toBeNull();
+  });
+
+  it('nickname rung beats the card rung', () => {
+    const { getByText } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        members: [selfMember],
+        myAddress: selfMember.address,
+        resolveCard: selfCard,
+        resolveNickname: (id: string) =>
+          id === selfMember.address ? 'my-nick' : undefined,
+      },
+    });
+    expect(getByText(/my-nick \(you\)/)).toBeTruthy();
+  });
+
+  it('live card name beats a stale roster displayName', () => {
+    const { getByText, queryByText } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        members: [rosterOther],
+        myAddress: 'ffff',
+        resolveCard: (id: string) =>
+          id === rosterOther.address ? { displayName: 'FreshBob', statusText: '' } : undefined,
+      },
+    });
+    expect(getByText('FreshBob')).toBeTruthy();
+    expect(queryByText('RosterBob')).toBeNull();
+  });
+
+  it('without resolvers the self row keeps the hex fallback (pre-fix pin)', () => {
+    const { getByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, members: [selfMember], myAddress: selfMember.address },
+    });
+    expect(getByText(/ac7f7d42 \(you\)/)).toBeTruthy();
+  });
+
+  it('search matches the resolved name, not just roster/hex', async () => {
+    const { getByLabelText, getByText, queryByText } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        members: [selfMember, rosterOther],
+        myAddress: selfMember.address,
+        resolveCard: selfCard,
+      },
+    });
+    await fireEvent.input(getByLabelText('Search members'), { target: { value: 'koya' } });
+    expect(getByText(/Jake \(on Koya\) \(you\)/)).toBeTruthy();
+    expect(queryByText('RosterBob')).toBeNull();
+  });
+});

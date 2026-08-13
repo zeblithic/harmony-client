@@ -3,6 +3,14 @@ import { invoke } from '@tauri-apps/api/core';
 export interface OwnerStateView {
   ownerId: string;
   ownerDisplayName: string;
+  /**
+   * ZEB-921: display name of the currently-published owner card — what
+   * peers actually resolve (`ownerDisplayName` is the local device label, a
+   * different notion). `null`/absent when nothing is being served this run
+   * (node down, never published, or the pre-boot-publish window). Optional:
+   * a stale backend omits it.
+   */
+  cardDisplayName?: string | null;
   devices: DeviceView[];
   canBackUp: boolean;
   /** ZEB-668 S5: the fleet's current KeyTree epoch (0 = never rotated). */
