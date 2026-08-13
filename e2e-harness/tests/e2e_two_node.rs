@@ -3713,18 +3713,35 @@ async fn s15_severed_joiner_learns_roster_from_snapshot() {
         }
     }
 
-    // --- Sever evidence (positive, not log-absence): C's denylist must have
-    //     ENGAGED — refusing its own dial (C learns B/A records via the snapshot
-    //     + addrbook and tries to dial) or rejecting their inbound. Without this,
-    //     a silently-inert denylist would let an ordinary full-mesh run (C
-    //     converging B over zenoh) masquerade as a snapshot-delivery proof.
+    // --- Sever evidence (positive, not log-absence). Two reliable facts together
+    //     rule out BOTH zenoh paths by which C could have learned B without the
+    //     snapshot, closing the false-green gap a generic "any engagement" check
+    //     leaves open (CodeRabbit #672):
+    //
+    //     (1) C's link to its INVITER A is demonstrably severed — C refuses its
+    //         own dial to A (peer=a_node_id, matched on one line). A holds the
+    //         full roster, so A is the path C would otherwise converge from; its
+    //         severance is what forces the roster to arrive via the handshake.
+    //         C reliably attempts this dial: it has A's reachability from the
+    //         redeem handshake and tries to open the zenoh session.
+    //     (2) BOTH denylist entries parsed (entries=2, from "a_node_id,b_node_id"),
+    //         so C↔B is equally gated at the transport — structurally, regardless
+    //         of whether a C↔B connection is ever attempted. (C, islanded from the
+    //         mesh, never learns B's reachability to attempt a dial that would
+    //         log, so a B-specific dial refusal can't be relied on here.)
     poll_until(Duration::from_secs(30), || async {
-        let engaged = c.stderr_log_contains("ZEB-912 test denylist: rejecting inbound")?
-            || c.stderr_log_contains("ZEB-912 test denylist: refusing dial")?;
-        Ok(engaged.then_some(()))
+        let refused_inviter =
+            c.stderr_log_line_contains_all(&["ZEB-912 test denylist: refusing dial", &a_node_id])?;
+        let both_entries_loaded =
+            c.stderr_log_line_contains_all(&["ZEB-912 test denylist ACTIVE", "entries=2"])?;
+        Ok((refused_inviter && both_entries_loaded).then_some(()))
     })
     .await
-    .expect("c's denylist MUST show engagement (rejecting inbound / refusing dial)");
+    .expect(
+        "c must demonstrably refuse dialing its inviter A (severed from the roster source) AND \
+         have loaded both denylist entries — so neither A nor B could have delivered the roster \
+         over zenoh, leaving the handshake snapshot as the only source",
+    );
 
     run.mark_success();
     drop((a, b, c, a_home, b_home, c_home));

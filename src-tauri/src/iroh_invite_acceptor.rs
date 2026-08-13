@@ -555,13 +555,22 @@ where
         // joiner's engine re-verifies every event at insert). The joiner
         // distinguishes the array (roster) from the legacy single-countersign
         // map by CBOR major type.
-        if roster.is_empty() {
-            // Degenerate: an empty log (the admin bootstrap is always present in
-            // practice) → legacy single-countersign shape.
+        // ZEB-927: `countersign` was polled from the acceptor's own log above, so
+        // `roster` (a snapshot of that same log) already contains it. Drop it
+        // before the final append so the response carries exactly ONE — at the
+        // last position the joiner `pop()`s (CodeRabbit #672). If that leaves the
+        // body empty (the countersign was the only event), fall back to the
+        // legacy single-countersign map: the joiner's array path requires
+        // len >= 2 and would reject a lone-element array.
+        let body: Vec<SignedMembershipEvent> = roster
+            .into_iter()
+            .filter(|e| e.id != countersign.id)
+            .collect();
+        if body.is_empty() {
             self.write_len_prefixed_cbor(&mut send, &countersign)
                 .await?;
         } else {
-            let mut response: Vec<SignedMembershipEvent> = roster;
+            let mut response: Vec<SignedMembershipEvent> = body;
             response.push(countersign);
             // Encode ONCE and measure (the open-join snapshot pattern): a large
             // community's roster can exceed the handshake cap, and
