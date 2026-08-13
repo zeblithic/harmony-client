@@ -240,22 +240,7 @@ impl RelayHoldDoc {
         for key in ttl_removed {
             self.expired_at_ms.insert(key, now_ms);
         }
-        // Age-out + cap so expiry memory cannot itself become unbounded state.
-        self.expired_at_ms
-            .retain(|_, t| now_ms.saturating_sub(*t) < RELAY_HOLD_TOMBSTONE_RETENTION_MS);
-        while self.expired_at_ms.len() > RELAY_HOLD_TOMBSTONE_CAP {
-            let oldest = self
-                .expired_at_ms
-                .iter()
-                .min_by_key(|(_, t)| **t)
-                .map(|(k, _)| k.clone());
-            match oldest {
-                Some(k) => {
-                    self.expired_at_ms.remove(&k);
-                }
-                None => break,
-            }
-        }
+        self.prune_tombstones(now_ms);
         // Prune the side-map for removed keys (bounded with `entries`).
         let live: BTreeSet<String> = self.entries.keys().cloned().collect();
         self.first_observed_ms.retain(|k, _| live.contains(k));
@@ -299,7 +284,12 @@ impl RelayHoldDoc {
     /// - A stamp GREATER than `now_ms` (a backward local clock step across
     ///   restart) is rebased to `now_ms` (mirrors
     ///   [`Self::restore_first_observed`] Q-1).
-    /// - Any restored tombstone key still present in `entries` (a stale doc
+    /// - Retention + cap are enforced HERE too (PR #667 R1, CodeAnt), so an
+    ///   aged-out or over-cap sidecar never suppresses merges differently at
+    ///   boot than in steady state — pruning runs BEFORE tombstones are
+    ///   applied to `entries`, so an expired tombstone neither suppresses nor
+    ///   deletes anything.
+    /// - Any surviving tombstone key still present in `entries` (a stale doc
     ///   file from a crash between atomic writes resurrected an entry this
     ///   replica already expired) is REMOVED from `entries` — expiry is
     ///   monotone; the tombstone wins.
@@ -311,8 +301,31 @@ impl RelayHoldDoc {
         for v in map.values_mut() {
             *v = (*v).min(now_ms);
         }
-        self.entries.retain(|k, _| !map.contains_key(k));
         self.expired_at_ms = map;
+        self.prune_tombstones(now_ms);
+        let tombstones = &self.expired_at_ms;
+        self.entries.retain(|k, _| !tombstones.contains_key(k));
+    }
+
+    /// ZEB-924: age-out + cap so expiry memory cannot itself become unbounded
+    /// state. Shared by [`Self::gc`] and [`Self::restore_expired`] so the
+    /// retention/cap invariants hold unconditionally, not only after a sweep.
+    fn prune_tombstones(&mut self, now_ms: u64) {
+        self.expired_at_ms
+            .retain(|_, t| now_ms.saturating_sub(*t) < RELAY_HOLD_TOMBSTONE_RETENTION_MS);
+        while self.expired_at_ms.len() > RELAY_HOLD_TOMBSTONE_CAP {
+            let oldest = self
+                .expired_at_ms
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    self.expired_at_ms.remove(&k);
+                }
+                None => break,
+            }
+        }
     }
 }
 
@@ -1253,7 +1266,8 @@ mod tests {
     fn tombstone_cap_evicts_oldest_first() {
         use crate::community_relay::RELAY_HOLD_TOMBSTONE_CAP;
         let mut doc = RelayHoldDoc::default();
-        // Overfill via restore (unit seam), then run gc to enforce the cap.
+        // Overfill via restore (unit seam) — the shared prune runs at restore
+        // AND after every gc, so cap enforcement is unconditional.
         let mut m: BTreeMap<String, u64> = BTreeMap::new();
         for i in 0..(RELAY_HOLD_TOMBSTONE_CAP + 2) {
             // Distinct keys; stamps strictly increasing so "oldest" is i=0,1.
@@ -1266,12 +1280,36 @@ mod tests {
             m.insert(RelayHoldDoc::key(&[7; 16], &content), 1_000 + i as u64);
         }
         let newest_stamp = 1_000 + (RELAY_HOLD_TOMBSTONE_CAP + 1) as u64;
-        doc.restore_expired(m, u64::MAX - 1);
-        assert!(!doc.gc(newest_stamp), "cap enforcement removes no entries");
+        doc.restore_expired(m, newest_stamp);
         assert_eq!(doc.expired_at_ms().len(), RELAY_HOLD_TOMBSTONE_CAP);
         assert!(
             !doc.expired_at_ms().values().any(|t| *t < 1_002),
             "the two OLDEST tombstones were evicted"
+        );
+    }
+
+    #[test]
+    fn restore_prunes_aged_out_tombstones_and_lets_their_entries_live() {
+        use crate::community_relay::RELAY_HOLD_TOMBSTONE_RETENTION_MS;
+        // PR #667 R1 (CodeAnt): a sidecar tombstone older than the retention
+        // window must not suppress (or delete) anything at boot — pruning runs
+        // BEFORE tombstones are applied to entries, so boot behavior matches
+        // steady-state GC behavior.
+        let k = key_rr(1, 1);
+        let mut doc = RelayHoldDoc::default();
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        let now = RELAY_HOLD_TOMBSTONE_RETENTION_MS + 10_000;
+        doc.restore_expired([(k.clone(), 5u64)].into_iter().collect(), now);
+        assert!(
+            doc.expired_at_ms().is_empty(),
+            "aged-out tombstone pruned at restore"
+        );
+        assert!(
+            doc.entries.contains_key(&k),
+            "entry survives — expired suppression must not delete it"
         );
     }
 

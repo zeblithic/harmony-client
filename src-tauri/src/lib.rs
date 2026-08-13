@@ -12829,6 +12829,15 @@ pub async fn start_node_inner(
                                 // Consume the immediate first tick — nothing to GC
                                 // at boot (the doc was just loaded).
                                 ticker.tick().await;
+                                // PR #667 R1 (CodeRabbit): a failed sidecar
+                                // persist leaves the length deltas below unchanged
+                                // on the NEXT sweep, so without this latch a
+                                // transient write error would strand fresh stamps /
+                                // tombstone prunes in RAM until some later delta.
+                                // The latch keeps retrying via the direct persist
+                                // path (no dirty-marking, no fleet republish) until
+                                // a write lands.
+                                let mut sidecar_persist_pending = false;
                                 loop {
                                     ticker.tick().await;
                                     let now_ms = std::time::SystemTime::now()
@@ -12849,13 +12858,25 @@ pub async fn start_node_inner(
                                     };
                                     if changed {
                                         gc_sync.notify_dirty();
-                                        if let Err(e) = gc_sync.flush_now().await {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "ZEB-458: relay-hold GC flush_now failed"
-                                            );
+                                        match gc_sync.flush_now().await {
+                                            // A successful flush persisted every
+                                            // sidecar too — nothing left to retry.
+                                            Ok(()) => sidecar_persist_pending = false,
+                                            Err(e) => {
+                                                // The armed dirty latch retries the
+                                                // publish leg; the pending latch
+                                                // additionally guarantees a DIRECT
+                                                // persist retry next sweep even if
+                                                // the debounced flush stays wedged
+                                                // (publisher backpressure).
+                                                sidecar_persist_pending = true;
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "ZEB-458: relay-hold GC flush_now failed"
+                                                );
+                                            }
                                         }
-                                    } else if sidecars_changed {
+                                    } else if sidecars_changed || sidecar_persist_pending {
                                         // ZEB-862: a stamp-only sweep added durable
                                         // first-observation timestamps but removed
                                         // nothing (`gc` returned false), so the
@@ -12870,11 +12891,15 @@ pub async fn start_node_inner(
                                         // sweep (they coincide with entry removal), so
                                         // the length delta only needs to catch stamp
                                         // growth and tombstone shrinkage.
-                                        if let Err(e) = gc_sync.persist_now().await {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "ZEB-862: relay-hold first-observed persist_now failed"
-                                            );
+                                        match gc_sync.persist_now().await {
+                                            Ok(()) => sidecar_persist_pending = false,
+                                            Err(e) => {
+                                                sidecar_persist_pending = true;
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "ZEB-862: relay-hold sidecar persist_now failed; will retry next sweep"
+                                                );
+                                            }
                                         }
                                     }
                                 }

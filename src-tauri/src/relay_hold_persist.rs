@@ -386,10 +386,18 @@ impl crate::fleet_sync::FleetPersist<RelayHoldDoc> for RelayHoldPersist {
         state: &RelayHoldDoc,
         tracker: &BTreeMap<String, Hlc>,
     ) -> Result<(), SyncError> {
+        // ZEB-924 (PR #667 R1): tombstones are written BEFORE the doc. Each
+        // write is individually atomic but the sequence is not; a crash after
+        // the doc but before the tombstones would durably drop a TTL-expired
+        // entry while LOSING its fresh tombstone — the one ordering
+        // `restore_expired` cannot heal (a peer merge could then re-arm a
+        // fresh TTL). Tombstone-first inverts the window: a crash leaves the
+        // tombstone durable with a stale doc still holding the entry, which
+        // boot restoration removes (the tombstone wins).
+        save_expired(&self.expired_path, state.expired_at_ms())?;
         save(&self.doc_path, state)?;
         save_replay(&self.replay_path, tracker)?;
         save_first_observed(&self.first_observed_path, state.first_observed_ms())?;
-        save_expired(&self.expired_path, state.expired_at_ms())?;
         Ok(())
     }
 }
@@ -728,7 +736,8 @@ mod tests {
         };
         let mut doc = RelayHoldDoc::default();
         let m: BTreeMap<String, u64> = [("gone-key".to_string(), 7u64)].into_iter().collect();
-        doc.restore_expired(m.clone(), u64::MAX);
+        // Boot time near the stamp so restore's retention prune keeps it.
+        doc.restore_expired(m.clone(), 7);
         use crate::fleet_sync::FleetPersist;
         p.persist(&doc, &BTreeMap::new()).unwrap();
         assert_eq!(load_expired(&p.expired_path).unwrap(), m);
