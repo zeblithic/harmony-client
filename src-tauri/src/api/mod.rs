@@ -68,10 +68,12 @@ struct StatusDto {
     running: bool,
     generation: u64,
     owner_id: Option<String>,
-    /// ZEB-912: the running node's iroh node id (64-hex; `null` when the node
-    /// is not running). The link-layer identity — what the e2e severed-pair
-    /// harness feeds `HARMONY_TEST_ZENOH_DENYLIST`, and what fleet ops
-    /// previously had to scrape from logs.
+    /// ZEB-912: the running node's iroh node id (64-hex). `null` when the node
+    /// is not running — or when it is running DEGRADED with iroh transport
+    /// down (iroh boot failure is non-fatal; see `network_health_snapshot`'s
+    /// ZEB-450 transport-disabled reason). The link-layer identity — what the
+    /// e2e severed-pair harness feeds `HARMONY_TEST_ZENOH_DENYLIST`, and what
+    /// fleet ops previously had to scrape from logs.
     node_id: Option<String>,
     uptime_secs: u64,
     port: u16,

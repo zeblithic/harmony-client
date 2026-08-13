@@ -335,9 +335,12 @@ async fn wait_for_api_dir(home: &std::path::Path, timeout: Duration) -> anyhow::
 
 impl NodeHandle {
     /// ZEB-912: the node's iroh node id (64-hex) from `/v1/status.nodeId`.
-    /// `Ok(None)` while the node is (re)booting — poll if you need it settled.
-    /// A MISSING field is a loud error (a binary predating the field), never a
-    /// silent `None` — the camelCase-trap discipline (ZEB-462).
+    /// `Ok(None)` while the node is (re)booting — poll if you need it settled —
+    /// but ALSO when the node runs DEGRADED with iroh transport down (iroh boot
+    /// failure is non-fatal server-side), so a poll that never settles means
+    /// transport-init failure, not slowness (Greptile PR #671). A MISSING field
+    /// is a loud error (a binary predating the field), never a silent `None` —
+    /// the camelCase-trap discipline (ZEB-462).
     pub async fn node_id(&self) -> anyhow::Result<Option<String>> {
         let s = self.status().await?;
         match s.get("nodeId") {

@@ -3382,7 +3382,10 @@ async fn s14_router_mode_severed_pair_delivery() {
     // mint restarts the inner node; poll until the restarted node reports its id.
     let b_node_id: String = poll_until(Duration::from_secs(60), || async { b.node_id().await })
         .await
-        .expect("b reports nodeId after mint restart");
+        .expect(
+            "b reports nodeId after mint restart (a persistent null on a running node means \
+             iroh transport failed at boot — degraded mode, not slowness)",
+        );
     assert_eq!(b_node_id.len(), 64, "nodeId is 64-hex: {b_node_id}");
 
     let c = NodeHandle::spawn(mk(
