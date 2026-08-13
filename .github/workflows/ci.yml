@@ -3,6 +3,19 @@ name: CI
 on:
   push:
     branches: [main]
+    # ZEB-897: doc-only pushes to main (specs/plans/runbooks land directly on
+    # main by convention) used to burn the full ~12-min matrix AND — via the
+    # cancel-in-progress concurrency group below — cancel the still-running
+    # post-merge validation of the code merge before them. Skipped pushes
+    # create no run object, so they can neither waste runners nor cancel
+    # anything. The skip applies only if EVERY changed file in the push
+    # matches. Deliberately push-only: pull_request stays unfiltered so no
+    # PR can ever wait on a check that will never report (required-checks
+    # wedge), under any future branch-protection config.
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'LICENSE'
   pull_request:
     branches: [main]
 
