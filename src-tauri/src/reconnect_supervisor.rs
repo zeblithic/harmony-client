@@ -295,14 +295,10 @@ impl SupervisorHandle {
     /// Lossless, non-async: insert `trigger` for `peer` into the dirty set
     /// (strongest wins) and wake the loop. Never blocks, never drops.
     pub fn kick(&self, peer: [u8; 32], trigger: ReconnectTrigger) {
-        // ZEB-928 (R4): bounded-degree filter. Drop dials to non-neighbors before they
-        // enter the dirty set. Disabled oracle / peer mode / unknown node_id all admit
-        // (see `AdmissionOracle::admit`), so pre-R4 behavior is unchanged.
-        if let Some(o) = self.inner.admission_oracle.get() {
-            if !o.admit(&peer) {
-                return;
-            }
-        }
+        // ZEB-928 (R4): the bounded-degree filter lives at the single dial-dispatch point in
+        // the loop, NOT here — a denied peer must still enter `states` so a later admit can
+        // re-arm and dial it (deny→admit recovery), and enforcing at dispatch also catches a
+        // trigger admitted before a membership shrink. `kick` stays lossless.
         {
             let mut dirty = self.inner.dirty.lock().expect("dirty lock");
             dirty
@@ -664,6 +660,19 @@ pub async fn run_reconnect_supervisor(
                 if !due {
                     continue;
                 }
+                // ZEB-928 (R4): the single bounded-degree enforcement point. A denied
+                // (non-neighbor) peer is parked Dormant instead of dialed — this is the one
+                // place the dial is actually initiated, so it catches every arming path (kick,
+                // sweep, parole) AND a trigger admitted before a membership shrink AND an
+                // already-Retrying slot revoked mid-flight. The peer stays in `states`, so a
+                // later admit re-arms (via kick_sweep/do_sweep) and dials it. Disabled oracle /
+                // peer mode / unknown node_id all admit — pre-R4 behavior unchanged.
+                if let Some(o) = inner.admission_oracle.get() {
+                    if !o.admit(peer) {
+                        slot.state = PeerState::Dormant { since_ms: now_ms() };
+                        continue;
+                    }
+                }
                 match resolver.resolve_by_node_id(peer) {
                     Some((owner, _payload)) => {
                         // ZEB-621: if this peer's freshest record is >24h stale,
@@ -917,15 +926,9 @@ fn run_parole(
     let mut candidates: Vec<([u8; 32], Instant, [u8; 16])> = dormant
         .into_iter()
         .filter_map(|(peer, t)| {
-            // ZEB-928 (R4): parole re-arms Dormant slots directly, bypassing `kick` and
-            // `do_sweep`, so it must apply the same bounded-degree filter or it would
-            // revive dials to non-neighbors. Filter before `resolve_by_node_id` + the
-            // batch truncation so denied peers don't consume the parole budget.
-            if let Some(o) = inner.admission_oracle.get() {
-                if !o.admit(&peer) {
-                    return None;
-                }
-            }
+            // ZEB-928 (R4): no admission filter here — parole may re-arm a denied peer, but
+            // the dial-dispatch filter parks it Dormant again without dialing. Filtering here
+            // too would only be an optimization; the dispatch point is the single enforcement.
             resolver
                 .resolve_by_node_id(&peer)
                 .map(|(owner, _)| (peer, t, owner.0))
@@ -978,15 +981,10 @@ fn do_sweep(
         if peer == self_node_id || matches!(slot.state, PeerState::Connected { .. }) {
             continue;
         }
-        // ZEB-928 (R4): a sweep re-arms directly from `states`, bypassing `kick` — so it
-        // must consult the same filter, else `kick_sweep` would re-dial non-neighbors and
-        // blow the degree bound. Also converges the bound downward: a peer that stopped
-        // being a neighbor (membership shrank) is no longer re-armed here.
-        if let Some(o) = inner.admission_oracle.get() {
-            if !o.admit(peer) {
-                continue;
-            }
-        }
+        // ZEB-928 (R4): no admission filter here — a sweep may re-arm a denied peer, but the
+        // dial-dispatch filter parks it Dormant without dialing. Enforcing here too would only
+        // be an optimization; keeping the single enforcement point at dispatch also means a
+        // deny→admit peer is re-armed by the very next sweep and then dialed.
         let role = dial_role(self_node_id, peer);
         slot.epoch = slot.epoch.wrapping_add(1);
         slot.last_fresh_trigger = now;
@@ -2312,113 +2310,61 @@ mod tests {
         assert!(handle.states_snapshot().is_empty());
     }
 
-    /// ZEB-928 (R4): a router-mode oracle drops `kick`s to non-neighbors before they
-    /// enter the dirty set; admitted node_ids still queue.
-    #[test]
-    fn r4_kick_drops_denied_node_ids_router_mode() {
+    /// ZEB-928 (R4): the bounded-degree filter is enforced at the single dial-dispatch point.
+    /// A denied peer is parked Dormant (sweep-visible, never dialed); admitting it and sweeping
+    /// re-arms and dials it — the deny → admit → sweep → dial recovery. This covers the review
+    /// findings on PR #674 (CodeRabbit CR-3, CodeAnt): a revoked or pre-shrink-admitted peer
+    /// cannot slip a dial through, because dispatch — not arming — is where the bound holds.
+    #[tokio::test(start_paused = true)]
+    async fn r4_denied_peer_parked_until_admitted_then_dialed() {
         use crate::admission_oracle::AdmissionOracle;
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let dk = [0x81u8; 32];
+
         let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.publish_admitted(std::collections::BTreeSet::from([[0x81u8; 32]]));
-        oracle.bind([1u8; 32], [0x81u8; 32]); // admitted
-        oracle.bind([2u8; 32], [0x82u8; 32]); // denied
+        oracle.bind([0u8; 16], p, dk);
+        oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied
         let handle = SupervisorHandle::new();
         handle.set_admission_oracle(Arc::clone(&oracle));
 
-        handle.kick([1u8; 32], ReconnectTrigger::NewPeer);
-        handle.kick([2u8; 32], ReconnectTrigger::NewPeer);
+        // Short sweep cooldown so the phase-2 kick_sweep fires promptly; parole disabled.
+        let config = cfg(1_000, 64_000, 10_000, 1_000, 8, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
 
-        assert!(
-            handle.pending_trigger([1u8; 32]).is_some(),
-            "admitted node_id queued"
+        // Phase 1 — denied: parked at dispatch, never dialed, still sweep-visible.
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(20_000)).await;
+        assert_eq!(
+            dialer.count_for(p),
+            0,
+            "denied peer is parked at dispatch, never dialed"
         );
         assert!(
-            handle.pending_trigger([2u8; 32]).is_none(),
-            "denied node_id dropped at kick"
+            handle
+                .states_snapshot()
+                .iter()
+                .any(|(id, st)| *id == p && matches!(st, PeerStateWire::Dormant { .. })),
+            "denied peer sits Dormant (sweep-visible), not evicted"
         );
-    }
 
-    /// ZEB-928 (R4): the internal `do_sweep` re-arm consults the same oracle — else a
-    /// `kick_sweep` would re-dial non-neighbors straight from `states`, bypassing `kick`
-    /// and blowing the bound. Admitted known peer → re-armed (Retrying); denied → left
-    /// Dormant.
-    #[test]
-    fn r4_sweep_rearms_only_admitted_known_peers() {
-        use crate::admission_oracle::AdmissionOracle;
-        let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.publish_admitted(std::collections::BTreeSet::from([[0x81u8; 32]]));
-        let admitted = [1u8; 32];
-        let denied = [2u8; 32];
-        oracle.bind(admitted, [0x81u8; 32]);
-        oracle.bind(denied, [0x82u8; 32]);
-        let handle = SupervisorHandle::new();
-        handle.set_admission_oracle(Arc::clone(&oracle));
-
-        handle.set_peer_state_for_test(admitted, PeerState::Dormant { since_ms: 0 });
-        handle.set_peer_state_for_test(denied, PeerState::Dormant { since_ms: 0 });
-
-        let config = cfg(10, 100, 10_000, 60_000, 8, 50);
-        let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let self_id = [0xFFu8; 32];
-        do_sweep(&handle.inner, Instant::now(), &self_id, &config, &mut rng);
-
-        let snap = handle.states_snapshot();
-        let admitted_state = snap.iter().find(|(id, _)| *id == admitted).map(|(_, s)| s);
-        let denied_state = snap.iter().find(|(id, _)| *id == denied).map(|(_, s)| s);
+        // Phase 2 — admit + sweep: re-armed and dialed (deny → admit recovery).
+        oracle.publish_admitted(std::collections::BTreeSet::from([dk]));
+        handle.kick_sweep();
+        tokio::time::sleep(ms(20_000)).await;
         assert!(
-            matches!(admitted_state, Some(PeerStateWire::Retrying { .. })),
-            "admitted known peer re-armed by sweep"
-        );
-        assert!(
-            matches!(denied_state, Some(PeerStateWire::Dormant { .. })),
-            "denied known peer NOT re-armed (bound holds under sweep)"
-        );
-    }
-
-    /// ZEB-928 (R4): parole is the third arming path (Dormant→Retrying, bypassing kick
-    /// and do_sweep) and must honor the same filter, else it revives dials to
-    /// non-neighbors. Admitted record-backed Dormant peer → paroled; denied → left
-    /// Dormant.
-    #[test]
-    fn r4_parole_skips_denied_dormant_peers() {
-        use crate::admission_oracle::AdmissionOracle;
-        let resolver = ReachabilityResolver::new();
-        let telemetry = DialTelemetry::new();
-        let admitted = peer(1);
-        let denied = peer(2);
-        seed(&resolver, admitted);
-        seed(&resolver, denied);
-
-        let oracle = Arc::new(AdmissionOracle::new(true));
-        oracle.publish_admitted(std::collections::BTreeSet::from([[0x81u8; 32]]));
-        oracle.bind(admitted, [0x81u8; 32]);
-        oracle.bind(denied, [0x82u8; 32]);
-        let handle = SupervisorHandle::new();
-        handle.set_admission_oracle(Arc::clone(&oracle));
-        handle.set_peer_state_for_test(admitted, PeerState::Dormant { since_ms: 0 });
-        handle.set_peer_state_for_test(denied, PeerState::Dormant { since_ms: 0 });
-
-        let config = cfg(1_000, 64_000, 10_000, 30_000, 8, 3_000);
-        let mut rng = ChaCha8Rng::seed_from_u64(0);
-        run_parole(
-            &handle.inner,
-            &resolver,
-            &telemetry,
-            Instant::now(),
-            &peer(0),
-            &config,
-            &mut rng,
-        );
-
-        let snap = handle.states_snapshot();
-        let a = snap.iter().find(|(id, _)| *id == admitted).map(|(_, s)| s);
-        let d = snap.iter().find(|(id, _)| *id == denied).map(|(_, s)| s);
-        assert!(
-            matches!(a, Some(PeerStateWire::Retrying { .. })),
-            "admitted dormant peer paroled"
-        );
-        assert!(
-            matches!(d, Some(PeerStateWire::Dormant { .. })),
-            "denied dormant peer NOT paroled (bound holds under parole)"
+            dialer.count_for(p) > 0,
+            "admitted peer dialed after the sweep re-arms it"
         );
     }
 
