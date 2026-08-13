@@ -282,6 +282,86 @@ pub fn save_first_observed(path: &Path, map: &BTreeMap<String, u64>) -> Result<(
     atomic_write(path, &bytes)
 }
 
+// ── expired-tombstone sidecar (ZEB-925) ───────────────────────────────────────
+
+/// File name for the persisted LOCAL expiry-tombstone map. Lives alongside
+/// `dm_inbox.cbor`. Local-only: never replicated, never on the wire — it makes
+/// the `#[serde(skip)]` `DmInboxDoc::expired_at_ms` suppression survive
+/// restart (a tombstone that forgot across reboot would let a sibling's merge
+/// resurrect the expired entry with a fresh TTL window).
+pub const DM_INBOX_EXPIRED_FILENAME: &str = "dm_inbox_expired.cbor";
+
+const DM_INBOX_EXPIRED_SCHEMA_V1: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct DmInboxExpiredFileV1(BTreeMap<String, u64>);
+
+/// Load the LOCAL expiry-tombstone map from `path`. Returns
+/// `Ok(BTreeMap::new())` if the file does not exist yet (→ no suppression;
+/// worst case one extra TTL window per resurrection — exactly pre-ZEB-925
+/// behavior, so no doc-file migration is needed).
+pub fn load_expired(path: &Path) -> Result<BTreeMap<String, u64>, SyncError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(SyncError::Persist(format!("read {}: {e}", path.display()))),
+    };
+    if bytes.is_empty() {
+        return Err(SyncError::CborDecode(format!(
+            "dm-inbox expired file is empty: {}",
+            path.display()
+        )));
+    }
+    let version = bytes[0];
+    let payload = &bytes[1..];
+    match version {
+        DM_INBOX_EXPIRED_SCHEMA_V1 => {
+            let mut cursor = Cursor::new(payload);
+            let file: DmInboxExpiredFileV1 = from_reader(&mut cursor).map_err(|e| {
+                SyncError::CborDecode(format!("load_expired {}: {e}", path.display()))
+            })?;
+            // Reject trailing bytes after the CBOR value (mirrors `load`).
+            let pos = cursor.position() as usize;
+            if pos != payload.len() {
+                return Err(SyncError::CborDecode(format!(
+                    "trailing bytes after dm-inbox expired value: consumed {} of {}",
+                    pos,
+                    payload.len()
+                )));
+            }
+            Ok(file.0)
+        }
+        v => Err(SyncError::CborDecode(format!(
+            "unknown dm-inbox expired schema version {v:#x} in {}",
+            path.display()
+        ))),
+    }
+}
+
+/// Same recovery contract as [`load_doc_or_recover`]: `CborDecode` corruption
+/// is quarantined (`.corrupt-<ms>`, bytes preserved) and an empty map
+/// returned; a transient `Persist` error is left untouched and propagated
+/// (ZEB-460). A missing/empty map is safe — suppression is lost, retention
+/// falls back to one TTL window per resurrection until re-tombstoned.
+pub fn load_expired_or_recover(path: &Path) -> Result<BTreeMap<String, u64>, SyncError> {
+    match load_expired(path) {
+        Ok(m) => Ok(m),
+        Err(e @ SyncError::CborDecode(_)) => {
+            quarantine(path, &e);
+            Ok(BTreeMap::new())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Save the LOCAL expiry-tombstone map to `path` atomically.
+pub fn save_expired(path: &Path, map: &BTreeMap<String, u64>) -> Result<(), SyncError> {
+    let mut bytes = vec![DM_INBOX_EXPIRED_SCHEMA_V1];
+    into_writer(&DmInboxExpiredFileV1(map.clone()), &mut bytes)
+        .map_err(|e| SyncError::CborEncode(format!("encode expired {}: {e}", path.display())))?;
+    atomic_write(path, &bytes)
+}
+
 // ── FleetPersist impl ─────────────────────────────────────────────────────────
 
 /// Durability sink for the dm-inbox fleet-sync engine. Holds the absolute
@@ -294,6 +374,9 @@ pub struct DmInboxPersist {
     /// ZEB-862: local-only first-observation clock sidecar (see
     /// `DM_INBOX_FIRST_OBSERVED_FILENAME`).
     pub first_observed_path: std::path::PathBuf,
+    /// ZEB-925: local-only expiry-tombstone sidecar (see
+    /// `DM_INBOX_EXPIRED_FILENAME`).
+    pub expired_path: std::path::PathBuf,
 }
 
 impl crate::fleet_sync::FleetPersist<DmInboxDoc> for DmInboxPersist {
@@ -302,6 +385,11 @@ impl crate::fleet_sync::FleetPersist<DmInboxDoc> for DmInboxPersist {
         state: &DmInboxDoc,
         tracker: &BTreeMap<String, Hlc>,
     ) -> Result<(), SyncError> {
+        // ZEB-925: tombstones FIRST. A crash between writes then leaves
+        // tombstone-present + stale-doc — healed by restore_expired at boot —
+        // instead of fresh-doc + missing-tombstone, which resurrects the
+        // expired entry with a fresh TTL window (un-healable).
+        save_expired(&self.expired_path, state.expired_at_ms())?;
         save(&self.doc_path, state)?;
         save_replay(&self.replay_path, tracker)?;
         save_first_observed(&self.first_observed_path, state.first_observed_ms())?;
@@ -514,6 +602,7 @@ mod tests {
             doc_path: dir.path().join("dm_inbox.cbor"),
             replay_path: dir.path().join("dm_inbox_replay.cbor"),
             first_observed_path: dir.path().join("dm_inbox_first_observed.cbor"),
+            expired_path: dir.path().join("dm_inbox_expired.cbor"),
         };
         use crate::fleet_sync::FleetPersist;
         let mut doc = sample_doc();
@@ -581,6 +670,57 @@ mod tests {
             SyncError::Persist(_)
         ));
         assert!(path.is_dir(), "transient error leaves the path untouched");
+    }
+
+    // ── expired-tombstone sidecar (ZEB-925) ──────────────────────────────────
+
+    #[test]
+    fn expired_round_trips_and_missing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dm_inbox_expired.cbor");
+        assert!(load_expired(&path).unwrap().is_empty());
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("k1".to_string(), 111u64);
+        m.insert("k2".to_string(), 222u64);
+        save_expired(&path, &m).unwrap();
+        assert_eq!(load_expired(&path).unwrap(), m);
+    }
+
+    #[test]
+    fn load_expired_rejects_trailing_bytes_and_recover_quarantines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dm_inbox_expired.cbor");
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("k".to_string(), 5u64);
+        save_expired(&path, &m).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0xFF);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            load_expired(&path).unwrap_err(),
+            SyncError::CborDecode(_)
+        ));
+        assert!(load_expired_or_recover(&path).unwrap().is_empty());
+        assert!(!path.exists(), "corrupt sidecar was quarantined");
+    }
+
+    #[test]
+    fn persist_writes_expired_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = DmInboxPersist {
+            doc_path: dir.path().join("dm_inbox.cbor"),
+            replay_path: dir.path().join("dm_inbox_replay.cbor"),
+            first_observed_path: dir.path().join("dm_inbox_first_observed.cbor"),
+            expired_path: dir.path().join("dm_inbox_expired.cbor"),
+        };
+        use crate::fleet_sync::FleetPersist;
+        let mut doc = sample_doc();
+        let m: std::collections::BTreeMap<String, u64> =
+            [("gone-key".to_string(), 7u64)].into_iter().collect();
+        // Boot time near the stamp so the restore-time retention prune keeps it.
+        doc.restore_expired(m.clone(), 7);
+        p.persist(&doc, &std::collections::BTreeMap::new()).unwrap();
+        assert_eq!(load_expired(&p.expired_path).unwrap(), m);
     }
 
     #[test]

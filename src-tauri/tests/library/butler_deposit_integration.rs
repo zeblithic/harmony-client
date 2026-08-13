@@ -361,6 +361,8 @@ impl ButlerDepositCtx for TestButlerCtx {
         let verdict = {
             let mut doc = self.doc.lock().await;
             if doc.entries.contains_key(&key) {
+                // ZEB-925 (spec §2f): defensive tombstone clear, as in prod.
+                doc.clear_tombstone(&key);
                 DepositPersistVerdict::Duplicate
             } else {
                 let sender_pending = doc
@@ -371,6 +373,8 @@ impl ButlerDepositCtx for TestButlerCtx {
                 if sender_pending >= INBOX_PER_SENDER_CAP || doc.entries.len() >= INBOX_GLOBAL_CAP {
                     return Ok(DepositPersistVerdict::CapExceeded);
                 }
+                // ZEB-925 (spec §2f): acceptance clears the expiry tombstone.
+                doc.clear_tombstone(&key);
                 doc.entries.insert(key, entry);
                 DepositPersistVerdict::Inserted
             }
@@ -598,6 +602,7 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
                 doc_path: a_dir.path().join("dm_inbox.cbor"),
                 replay_path: a_dir.path().join("dm_inbox_replay.cbor"),
                 first_observed_path: a_dir.path().join("dm_inbox_first_observed.cbor"),
+                expired_path: a_dir.path().join("dm_inbox_expired.cbor"),
             },
             expected_key: key.clone(),
             chronology: Arc::clone(&chronology),
@@ -611,6 +616,7 @@ async fn butler_deposit_fans_out_ingests_acks_and_gcs() {
             doc_path: b_dir.path().join("dm_inbox.cbor"),
             replay_path: b_dir.path().join("dm_inbox_replay.cbor"),
             first_observed_path: b_dir.path().join("dm_inbox_first_observed.cbor"),
+            expired_path: b_dir.path().join("dm_inbox_expired.cbor"),
         }),
     );
 
@@ -905,6 +911,7 @@ async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
                 doc_path: a_dir.path().join("dm_inbox.cbor"),
                 replay_path: a_dir.path().join("dm_inbox_replay.cbor"),
                 first_observed_path: a_dir.path().join("dm_inbox_first_observed.cbor"),
+                expired_path: a_dir.path().join("dm_inbox_expired.cbor"),
             },
             expected_key: key.clone(),
             chronology: Arc::clone(&chronology),
@@ -918,6 +925,7 @@ async fn group_dm_co_member_non_friend_deposit_is_accepted_and_ingested() {
             doc_path: b_dir.path().join("dm_inbox.cbor"),
             replay_path: b_dir.path().join("dm_inbox_replay.cbor"),
             first_observed_path: b_dir.path().join("dm_inbox_first_observed.cbor"),
+            expired_path: b_dir.path().join("dm_inbox_expired.cbor"),
         }),
     );
 
@@ -1092,6 +1100,7 @@ async fn non_member_non_friend_deposit_is_rejected_and_not_persisted() {
                 doc_path: a_dir.path().join("dm_inbox.cbor"),
                 replay_path: a_dir.path().join("dm_inbox_replay.cbor"),
                 first_observed_path: a_dir.path().join("dm_inbox_first_observed.cbor"),
+                expired_path: a_dir.path().join("dm_inbox_expired.cbor"),
             },
             expected_key: key.clone(),
             chronology: Arc::clone(&chronology),
@@ -1190,6 +1199,7 @@ async fn co_member_deposit_for_unrelated_space_is_rejected_and_not_persisted() {
                 doc_path: a_dir.path().join("dm_inbox.cbor"),
                 replay_path: a_dir.path().join("dm_inbox_replay.cbor"),
                 first_observed_path: a_dir.path().join("dm_inbox_first_observed.cbor"),
+                expired_path: a_dir.path().join("dm_inbox_expired.cbor"),
             },
             expected_key: key.clone(),
             chronology: Arc::clone(&chronology),

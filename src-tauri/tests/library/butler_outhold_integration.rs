@@ -321,6 +321,7 @@ fn build_inbox_engine(
             doc_path: dir.join("dm_inbox.cbor"),
             replay_path: dir.join("dm_inbox_replay.cbor"),
             first_observed_path: dir.join("dm_inbox_first_observed.cbor"),
+            expired_path: dir.join("dm_inbox_expired.cbor"),
         }),
         lookup_key_tag: b"dm-inbox-v1",
         debounce_ms: 50,

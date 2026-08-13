@@ -6189,6 +6189,8 @@ pub async fn start_node_inner(
                             identity_dir.join(crate::dm_inbox_persist::DM_INBOX_REPLAY_FILENAME);
                         let dm_inbox_first_observed_path = identity_dir
                             .join(crate::dm_inbox_persist::DM_INBOX_FIRST_OBSERVED_FILENAME);
+                        let dm_inbox_expired_path =
+                            identity_dir.join(crate::dm_inbox_persist::DM_INBOX_EXPIRED_FILENAME);
                         // ZEB-862: restore the LOCAL first-observation clock from its
                         // sidecar so TTL GC survives restart (else the first sweep
                         // re-stamps every entry at `now`).
@@ -6200,6 +6202,17 @@ pub async fn start_node_inner(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_millis() as u64;
+                            // ZEB-925: restore expiry tombstones FIRST — the
+                            // tombstone wins over a stale doc file, and
+                            // restore_first_observed's orphan-prune then drops
+                            // the removed entries' stamps.
+                            doc.restore_expired(
+                                crate::dm_inbox_persist::load_expired_or_recover(
+                                    &dm_inbox_expired_path,
+                                )
+                                .map_err(|e| format!("load dm-inbox expired: {e}"))?,
+                                now_ms,
+                            );
                             doc.restore_first_observed(
                                 crate::dm_inbox_persist::load_first_observed_or_recover(
                                     &dm_inbox_first_observed_path,
@@ -6224,7 +6237,22 @@ pub async fn start_node_inner(
                             tokio::sync::mpsc::channel::<Vec<u8>>(64);
                         let dm_inbox_merger: crate::fleet_sync::Merger<
                             crate::dm_inbox_crdt::DmInboxDoc,
-                        > = std::sync::Arc::new(|local, remote| local.merge_from(remote));
+                        > = std::sync::Arc::new(|local, remote| {
+                            // ZEB-925 (PR #668 R1): age out expiry tombstones
+                            // by wall clock BEFORE the merge. A suppressed
+                            // re-merge flags no change and schedules no sweep,
+                            // so on a quiet inbox nothing else would prune an
+                            // aged-out tombstone and suppression could outlive
+                            // retention; pruning here makes the merge that
+                            // would be wrongly suppressed the one that
+                            // re-admits.
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            local.prune_tombstones(now_ms);
+                            local.merge_from(remote)
+                        });
                         // Ingestion-nudge channel (dm_inbox_ingest.rs trigger
                         // model): capacity-1 level trigger. The engine's
                         // `on_applied` closure owns the only STRONG sender, so
@@ -6252,6 +6280,7 @@ pub async fn start_node_inner(
                                             doc_path: dm_inbox_path,
                                             replay_path: dm_inbox_replay_path,
                                             first_observed_path: dm_inbox_first_observed_path,
+                                            expired_path: dm_inbox_expired_path,
                                         },
                                     ),
                                     lookup_key_tag: b"dm-inbox-v1",

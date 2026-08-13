@@ -113,6 +113,20 @@ tombstone ages out (§2b retention), giving a hard per-replica lifetime bound:
 first-observation + TTL + one sweep, plus at most one reopened window per
 retention period (§6).
 
+**R1 amendment (PR #668, CodeRabbit).** Because a suppressed re-merge flags no
+change, it schedules no sweep — and unlike the relay twin (whose GC task runs
+on an unconditional 10-minute timer) the DM-inbox sweeper is purely
+event-driven, so on a quiet inbox nothing would ever prune an aged-out
+tombstone and suppression could outlive retention until the next unrelated
+event or boot. The production merger closure (lib.rs) therefore calls
+`prune_tombstones(now)` by wall clock BEFORE every inbound merge: the merge
+that would be wrongly suppressed is itself the pruner, so suppression never
+outlives retention by more than the gap to the next inbound merge — and that
+merge re-admits. The CRDT stays time-free (the clock lives at the adapter
+boundary); a real re-send was never affected either way, since the deposit
+path clears the tombstone on acceptance (§2f). A dedicated timer task was
+declined as strictly heavier for a weaker bound.
+
 ### 2e. Persistence (`dm_inbox_persist.rs` + boot + sweep)
 
 - New sidecar trio mirroring `first_observed`: `DM_INBOX_EXPIRED_FILENAME =
@@ -207,7 +221,9 @@ remembers). One DM-specific decline: **tombstoning covered removals** — see
 - After `INBOX_TOMBSTONE_RETENTION_MS` a still-merging sibling can reopen one
   window per retention period — the lifetime bound is per-replica
   first-observation + TTL + one sweep, with at most one reopened window per
-  60 d, not a fleet-global guarantee (same residual as the relay).
+  60 d, not a fleet-global guarantee (same residual as the relay). Reopen
+  latency is bounded by the next inbound merge after retention (the §2d R1
+  merge-path prune), not by sweep availability.
 - Cap eviction (oldest-first beyond 4096) can early-expire suppression for
   the evicted keys under pathological churn; the const assert keeps the cap
   ≥ a full inbox's worth of expiries.
