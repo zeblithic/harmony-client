@@ -431,6 +431,114 @@ mod tests {
     }
 
     #[test]
+    fn ttl_decayed_records_release_pins_via_the_existing_plan() {
+        use crate::storage_records::STORAGE_RECORD_TTL_MS;
+        // ZEB-923: a permanently-dark buddy's records decay (fixture
+        // ingests at now_ms = 9_000) and the UNCHANGED planner releases
+        // everything — no new pin machinery.
+        let kept = entry(b"kept", 10);
+        let (mut records, owners) = seeded_records(&[("alice", 50, vec![kept.clone()])]);
+        let my_pledges: BTreeMap<String, u64> = [(owners[0].clone(), 100)].into();
+        let mut ledger = StorageLedger::new(None);
+        ledger.record_pin(&owners[0], &kept.cid, 10, 1);
+
+        assert!(records.sweep_stale_pledges_and_backups(9_000 + STORAGE_RECORD_TTL_MS));
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            1_000,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
+        assert_eq!(
+            plan.release_buddies,
+            vec![owners[0].clone()],
+            "decayed pledge list ⇒ pact inactive ⇒ release everything"
+        );
+        assert!(plan.fetch.is_empty(), "no fetching from a decayed pact");
+    }
+
+    #[test]
+    fn ttl_backup_only_decay_releases_every_pinned_cid() {
+        use crate::storage_records::{StorageRecordStore, STORAGE_RECORD_TTL_MS};
+        // ZEB-923: pledge renews but the backup set decays ⇒ the pact
+        // stays active and `desired` collapses to empty ⇒ every pinned
+        // CID for the buddy lands in `release` (the unwrap_or_default
+        // path), not `release_buddies`.
+        let mut records = StorageRecordStore::new(None);
+        let id = harmony_identity::PrivateIdentity::generate(&mut rand::rngs::OsRng);
+        let owner = hex::encode(id.public_identity().address_hash);
+        let rvk = crate::revoked_device_projection::RevokedDeviceProjection::new();
+        let kept = entry(b"kept", 10);
+
+        let mut pl = PledgeListPayload {
+            owner_address: owner.clone(),
+            pledges: vec![PledgeEntry {
+                to: ME.into(),
+                bytes: 50,
+            }],
+            updated_at: 1,
+            identity_pub: None,
+            sig: None,
+            v2: Default::default(),
+        };
+        storage_signing::sign_pledge_list(&id, &mut pl);
+        let topic = format!("harmony/storage/{owner}/pledges");
+        assert!(records
+            .on_pledge_list_sample(&topic, &serde_json::to_vec(&pl).unwrap(), &rvk, 9_000)
+            .changed());
+        let mut bs = BackupSetPayload {
+            owner_address: owner.clone(),
+            entries: vec![kept.clone()],
+            updated_at: 1,
+            identity_pub: None,
+            sig: None,
+            v2: Default::default(),
+        };
+        storage_signing::sign_backup_set(&id, &mut bs);
+        let topic = format!("harmony/storage/{owner}/backup-set");
+        assert!(records
+            .on_backup_set_sample(&topic, &serde_json::to_vec(&bs).unwrap(), &rvk, 9_000)
+            .changed());
+
+        // Only the pledge renews (strictly-newer re-mint, fresh receipt).
+        pl.updated_at = 2;
+        pl.sig = None;
+        pl.identity_pub = None;
+        storage_signing::sign_pledge_list(&id, &mut pl);
+        let topic = format!("harmony/storage/{owner}/pledges");
+        assert!(records
+            .on_pledge_list_sample(
+                &topic,
+                &serde_json::to_vec(&pl).unwrap(),
+                &rvk,
+                9_000 + STORAGE_RECORD_TTL_MS - 1_000,
+            )
+            .changed());
+
+        assert!(records.sweep_stale_pledges_and_backups(9_000 + STORAGE_RECORD_TTL_MS));
+        assert!(records.pledge_list(&owner).is_some(), "renewed pledge kept");
+        assert!(records.backup_set(&owner).is_none(), "backup set decayed");
+
+        let my_pledges: BTreeMap<String, u64> = [(owner.clone(), 100)].into();
+        let mut ledger = StorageLedger::new(None);
+        ledger.record_pin(&owner, &kept.cid, 10, 1);
+        let plan = plan(
+            ME,
+            &my_pledges,
+            &records,
+            &ledger,
+            1_000,
+            &HashMap::new(),
+            NO_BACKOFF,
+        );
+        assert_eq!(plan.release, vec![(owner.clone(), kept.cid.clone())]);
+        assert!(plan.release_buddies.is_empty(), "pact itself stays active");
+    }
+
+    #[test]
     fn budget_shrink_sets_evict_target() {
         let (records, _) = seeded_records(&[]);
         let my_pledges = BTreeMap::new();
