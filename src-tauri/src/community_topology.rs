@@ -4,17 +4,23 @@
 //! See `docs/superpowers/specs/2026-08-13-zeb914-bounded-degree-topology-design.md`.
 //!
 //! The ring places every active device at `H(community_salt ‖ device_key)`;
-//! neighbors are the devices at ring-ranks `self ± offset` for a geometric
-//! offset set that always includes ±1 (the protected lattice, which makes the
-//! graph connected by construction) plus larger fingers (which give O(log N)
-//! diameter). All nodes derive the same offset set from `(N, degree)`, so every
-//! edge is symmetric — a hard degree bound with no pruning or capacity heuristics.
+//! neighbors are the devices at ring-ranks `self ± offset` where the offsets are
+//! the powers of two up to `N/2`. The `±1` offset (protected lattice) makes the
+//! graph connected by construction; the doubling powers give **O(log N) diameter
+//! at O(log N) degree** — Chord's law. The ratio is fixed at 2, so the offset
+//! count (and hence the degree) grows as `⌊log₂(N/2)⌋ + 1`. All nodes derive the
+//! same offset set from `N`, so every edge is symmetric — a hard degree bound
+//! with no pruning.
+//!
+//! Degree is therefore ~2·log₂N: 14 at 200 devices, 16 at 400, 22 at 4000 — small
+//! and bounded, and the honest price of genuine logarithmic diameter. (A fixed
+//! *count* of geometric offsets would keep the degree constant but make the ratio
+//! grow with N, giving polynomial O(N^…) diameter instead — see the R4 review.)
 //!
 //! Cost: selecting one node's neighbors is dominated by the O(N log N) ring sort
 //! ([`ring_order`]), done once per membership change. A caller computing many
 //! nodes' sets (the wiring's harness, a simulation) should call [`ring_order`]
-//! once and [`neighbors_on_ring`] per node — not [`community_neighbors`] N times,
-//! which would re-sort each call.
+//! once and [`neighbors_on_ring`] per node — not [`community_neighbors`] N times.
 //!
 //! UNWIRED: this module has no live call sites. R4's hot-path wiring (kick-inflow
 //! filter, device-key→node_id resolver bridge, router-mode gate) is a follow-up
@@ -22,10 +28,8 @@
 
 use std::collections::BTreeSet;
 
-/// Target neighbor count above the full-mesh threshold. Values below 2 cannot
-/// form a connected symmetric ring (see [`neighbors_on_ring`]).
-pub const TOPOLOGY_DEFAULT_DEGREE: usize = 10;
-/// Below this many active devices, a community stays full mesh.
+/// Below this many active devices, a community stays full mesh (cheap at small N
+/// per the R3 sounding; the bounded ring is only worth its diameter cost above it).
 pub const FULL_MESH_THRESHOLD: usize = 32;
 
 /// Ring coordinate for a device in a given community. Uniform over `u64`.
@@ -48,46 +52,36 @@ pub fn ring_order(devices: &BTreeSet<[u8; 32]>, community_salt: &[u8]) -> Vec<[u
     ordered
 }
 
-/// Geometric offset set for the circulant ring: at most `⌊degree/2⌋` offset
-/// magnitudes (each contributes `±o`, i.e. up to two neighbors), always
-/// including 1 (the protected lattice), spanning `[1, n/2]` so greedy routing
-/// composes them to reach any rank in O(log n) hops.
-///
-/// Offsets above `n/2` are redundant on an `n`-cycle, so `count` is capped at
-/// `n/2` — a large `degree_budget` cannot inflate the work. A budget below 2
-/// cannot support a connected symmetric ring, so it yields no offsets.
-fn ring_offsets(n: usize, degree_budget: usize) -> BTreeSet<usize> {
-    let max_off = (n / 2).max(1);
-    let count = (degree_budget / 2).min(max_off);
+/// Power-of-two offset set `{1, 2, 4, …, 2^k}` with `2^k ≤ n/2`. The ratio is
+/// fixed at 2, so the count grows as `⌊log₂(n/2)⌋ + 1` — this is what makes the
+/// diameter O(log n) (a fixed *count* with a growing ratio would give polynomial
+/// diameter). Offset 1 is the protected lattice; offsets above `n/2` are
+/// redundant on an `n`-cycle. Empty for `n < 2`.
+fn ring_offsets(n: usize) -> BTreeSet<usize> {
+    let max_off = n / 2;
     let mut offs = BTreeSet::new();
-    if count == 0 {
+    if max_off == 0 {
         return offs;
     }
-    offs.insert(1);
-    if count > 1 && max_off > 1 {
-        for i in 1..count {
-            let frac = i as f64 / (count - 1) as f64;
-            let off = (max_off as f64).powf(frac).round() as usize;
-            offs.insert(off.clamp(1, max_off));
+    let mut o = 1usize;
+    loop {
+        offs.insert(o);
+        match o.checked_mul(2) {
+            Some(next) if next <= max_off => o = next,
+            _ => break,
         }
     }
     offs
 }
 
 /// Bounded neighbor set for `self_device` on a pre-sorted `ring` (from
-/// [`ring_order`]). Selects the devices at ring-ranks `self ± offset`; O(degree)
-/// work beyond locating `self`. Does **not** re-sort — pass the same `ring` when
-/// computing many nodes' sets.
+/// [`ring_order`]). Selects the devices at ring-ranks `self ± offset` for the
+/// power-of-two offsets; O(log n) work beyond locating `self`. Does **not**
+/// re-sort — pass the same `ring` when computing many nodes' sets.
 ///
 /// Returns empty if `self_device` is not on `ring`. Below [`FULL_MESH_THRESHOLD`]
-/// devices, returns all-but-self (full mesh). A `degree_budget` below 2 yields no
-/// fingers — above the threshold that isolates the node — so callers should pass
-/// at least 2 (default [`TOPOLOGY_DEFAULT_DEGREE`]).
-pub fn neighbors_on_ring(
-    ring: &[[u8; 32]],
-    self_device: &[u8; 32],
-    degree_budget: usize,
-) -> BTreeSet<[u8; 32]> {
+/// devices, returns all-but-self (full mesh).
+pub fn neighbors_on_ring(ring: &[[u8; 32]], self_device: &[u8; 32]) -> BTreeSet<[u8; 32]> {
     let n = ring.len();
     let self_rank = match ring.iter().position(|d| d == self_device) {
         Some(r) => r,
@@ -96,9 +90,8 @@ pub fn neighbors_on_ring(
     if n < FULL_MESH_THRESHOLD {
         return ring.iter().copied().filter(|d| d != self_device).collect();
     }
-    let offsets = ring_offsets(n, degree_budget);
     let mut neighbors = BTreeSet::new();
-    for o in offsets {
+    for o in ring_offsets(n) {
         // +o and -o (mod n). All nodes share this offset set, so the edge is
         // symmetric: the node at rank+o computes this node at its own rank-o.
         let fwd = ring[(self_rank + o) % n];
@@ -119,12 +112,11 @@ pub fn neighbors_on_ring(
 ///   INCLUDING `self_device`.
 /// - `self_device`: this node's enrolled device key; must be in `devices`.
 /// - `community_salt`: community id bytes — decorrelates ring positions per community.
-/// - `degree_budget`: target max neighbors above the full-mesh threshold (≥ 2).
 ///
 /// Returns the subset of `devices` this node keeps persistent links to (never
-/// includes `self_device`). Sorts the ring once ([`ring_order`]) then delegates
-/// to [`neighbors_on_ring`]; to compute many nodes' sets, sort once yourself and
-/// call [`neighbors_on_ring`] per node rather than this N times.
+/// includes `self_device`); degree ~2·log₂N above the threshold. Sorts the ring
+/// once ([`ring_order`]) then delegates to [`neighbors_on_ring`]; to compute many
+/// nodes' sets, sort once yourself and call [`neighbors_on_ring`] per node.
 ///
 /// Deterministic and symmetric: for any `a`, `b` in `devices`,
 /// `b ∈ community_neighbors(a, …)` ⟺ `a ∈ community_neighbors(b, …)`.
@@ -132,13 +124,12 @@ pub fn community_neighbors(
     devices: &BTreeSet<[u8; 32]>,
     self_device: &[u8; 32],
     community_salt: &[u8],
-    degree_budget: usize,
 ) -> BTreeSet<[u8; 32]> {
     if !devices.contains(self_device) {
         return BTreeSet::new();
     }
     let ring = ring_order(devices, community_salt);
-    neighbors_on_ring(&ring, self_device, degree_budget)
+    neighbors_on_ring(&ring, self_device)
 }
 
 #[cfg(test)]
@@ -184,7 +175,7 @@ mod tests {
     fn full_mesh_below_threshold() {
         let devices = synth_devices(20);
         for a in &devices {
-            let nb = community_neighbors(&devices, a, b"c", TOPOLOGY_DEFAULT_DEGREE);
+            let nb = community_neighbors(&devices, a, b"c");
             assert_eq!(nb.len(), devices.len() - 1);
             assert!(!nb.contains(a));
             assert!(nb.is_subset(&devices));
@@ -196,38 +187,42 @@ mod tests {
         let devices = synth_devices(50);
         let stranger = synth_key(999_999);
         assert!(!devices.contains(&stranger));
-        assert!(community_neighbors(&devices, &stranger, b"c", 10).is_empty());
+        assert!(community_neighbors(&devices, &stranger, b"c").is_empty());
     }
 
-    // ---- offsets ----
+    // ---- offsets: powers of two ----
 
     #[test]
-    fn offsets_include_lattice_and_respect_budget() {
-        for &n in &[32usize, 50, 100, 200, 400] {
-            let offs = ring_offsets(n, 10);
-            assert!(offs.contains(&1));
-            assert!(offs.len() <= 10 / 2);
-            assert!(offs.iter().all(|&o| o >= 1 && o <= n / 2));
+    fn offsets_are_exactly_powers_of_two_up_to_half_ring() {
+        for &n in &[32usize, 64, 200, 400, 1000] {
+            let offs = ring_offsets(n);
+            let expected: BTreeSet<usize> = (0..64)
+                .map(|k| 1usize << k)
+                .take_while(|&o| o <= n / 2)
+                .collect();
+            assert_eq!(offs, expected, "n={n}");
+            assert!(offs.contains(&1), "protected ±1 lattice present");
+            // The largest offset spans a meaningful fraction of the ring, so
+            // greedy routing reaches the antipode in O(log n) hops.
+            assert!(*offs.iter().max().unwrap() > n / 4, "n={n}");
         }
     }
 
     #[test]
-    fn offsets_span_toward_half_ring() {
-        let offs = ring_offsets(400, 10);
-        assert!(*offs.iter().max().unwrap() >= 400 / 4);
-    }
-
-    #[test]
-    fn offsets_reject_sub_two_budgets_and_cap_huge_ones() {
-        // Below 2: no offsets — a connected symmetric ring needs degree ≥ 2.
-        assert!(ring_offsets(200, 0).is_empty());
-        assert!(ring_offsets(200, 1).is_empty());
-        // Exactly 2: just the protected lattice.
-        assert_eq!(ring_offsets(200, 2), BTreeSet::from([1]));
-        // A huge budget cannot iterate beyond the useful offset range [1, n/2].
-        let huge = ring_offsets(200, usize::MAX);
-        assert!(huge.iter().all(|&o| (1..=100).contains(&o)));
-        assert!(huge.len() <= 100);
+    fn degree_grows_logarithmically_not_polynomially() {
+        // The whole point of the powers-of-two fix: 8× the devices adds ~3
+        // doublings (~+6 neighbors), NOT ~8× the degree.
+        let node = synth_key(0); // present in both rosters (indices start at 0)
+        let d64 = community_neighbors(&synth_devices(64), &node, b"c").len();
+        let d512 = community_neighbors(&synth_devices(512), &node, b"c").len();
+        assert!(
+            d64 >= 2 && d512 > d64,
+            "degree grows with N: {d64} -> {d512}"
+        );
+        assert!(
+            d512 <= d64 + 8,
+            "degree grows only logarithmically: {d64} -> {d512}"
+        );
     }
 
     // ---- circulant assembly ----
@@ -235,12 +230,11 @@ mod tests {
     #[test]
     fn symmetry_holds_above_threshold() {
         let devices = synth_devices(200);
-        let salt = b"community-A";
-        let ring = ring_order(&devices, salt);
+        let ring = ring_order(&devices, b"community-A");
         for a in &devices {
-            for b in neighbors_on_ring(&ring, a, 10) {
+            for b in neighbors_on_ring(&ring, a) {
                 assert!(
-                    neighbors_on_ring(&ring, &b, 10).contains(a),
+                    neighbors_on_ring(&ring, &b).contains(a),
                     "edge not mirrored"
                 );
             }
@@ -250,9 +244,10 @@ mod tests {
     #[test]
     fn degree_bounded_above_threshold() {
         let devices = synth_devices(200);
+        let bound = 2 * ring_offsets(devices.len()).len(); // 2 per offset magnitude
         for a in &devices {
-            let nb = community_neighbors(&devices, a, b"c", 10);
-            assert!(nb.len() <= 10);
+            let nb = community_neighbors(&devices, a, b"c");
+            assert!(nb.len() <= bound, "{} > {bound}", nb.len());
             assert!(!nb.contains(a));
             assert!(nb.is_subset(&devices));
         }
@@ -263,8 +258,8 @@ mod tests {
         let devices = synth_devices(200);
         let node = *devices.iter().next().unwrap();
         assert_eq!(
-            community_neighbors(&devices, &node, b"c", 10),
-            community_neighbors(&devices, &node, b"c", 10)
+            community_neighbors(&devices, &node, b"c"),
+            community_neighbors(&devices, &node, b"c")
         );
     }
 
@@ -275,50 +270,48 @@ mod tests {
         let ring = ring_order(&devices, b"c");
         for a in &devices {
             assert_eq!(
-                neighbors_on_ring(&ring, a, 10),
-                community_neighbors(&devices, a, b"c", 10)
+                neighbors_on_ring(&ring, a),
+                community_neighbors(&devices, a, b"c")
             );
         }
     }
 
-    #[test]
-    fn sub_two_budget_policy_above_threshold() {
-        let devices = synth_devices(200);
-        let node = *devices.iter().next().unwrap();
-        // Budgets below 2 cannot form a connected ring → no neighbors (isolated).
-        assert!(community_neighbors(&devices, &node, b"c", 0).is_empty());
-        assert!(community_neighbors(&devices, &node, b"c", 1).is_empty());
-        // Budget 2 → exactly the protected lattice (two ring neighbors).
-        assert_eq!(community_neighbors(&devices, &node, b"c", 2).len(), 2);
-    }
-
     // ---- graph invariants ----
 
-    fn adjacency(
-        devices: &BTreeSet<[u8; 32]>,
-        salt: &[u8],
-        deg: usize,
-    ) -> (Vec<[u8; 32]>, Vec<Vec<usize>>) {
+    fn adjacency(devices: &BTreeSet<[u8; 32]>, salt: &[u8]) -> (Vec<[u8; 32]>, Vec<Vec<usize>>) {
         // Sort the ring ONCE, then select each node's neighbors from it (O(N log N)
-        // + N·O(degree), not O(N² log N)).
+        // + N·O(log N), not O(N² log N)).
         let ring = ring_order(devices, salt);
         let idx: HashMap<[u8; 32], usize> = ring.iter().enumerate().map(|(i, k)| (*k, i)).collect();
         let adj = ring
             .iter()
-            .map(|a| {
-                neighbors_on_ring(&ring, a, deg)
-                    .iter()
-                    .map(|b| idx[b])
-                    .collect()
-            })
+            .map(|a| neighbors_on_ring(&ring, a).iter().map(|b| idx[b]).collect())
             .collect();
         (ring, adj)
+    }
+
+    fn eccentricity(adj: &[Vec<usize>], src: usize) -> usize {
+        let mut dist = vec![usize::MAX; adj.len()];
+        let mut q = VecDeque::new();
+        dist[src] = 0;
+        q.push_back(src);
+        let mut mx = 0;
+        while let Some(u) = q.pop_front() {
+            for &v in &adj[u] {
+                if dist[v] == usize::MAX {
+                    dist[v] = dist[u] + 1;
+                    mx = mx.max(dist[v]);
+                    q.push_back(v);
+                }
+            }
+        }
+        mx
     }
 
     #[test]
     fn graph_is_connected() {
         let devices = synth_devices(200);
-        let (nodes, adj) = adjacency(&devices, b"c", 10);
+        let (nodes, adj) = adjacency(&devices, b"c");
         let mut seen = HashSet::new();
         let mut stack = vec![0usize];
         seen.insert(0usize);
@@ -334,28 +327,20 @@ mod tests {
 
     #[test]
     fn diameter_is_logarithmic() {
-        let devices = synth_devices(200);
-        let (nodes, adj) = adjacency(&devices, b"c", 10);
-        let ecc = |src: usize| -> usize {
-            let mut dist = vec![usize::MAX; nodes.len()];
-            let mut q = VecDeque::new();
-            dist[src] = 0;
-            q.push_back(src);
-            let mut mx = 0;
-            while let Some(u) = q.pop_front() {
-                for &v in &adj[u] {
-                    if dist[v] == usize::MAX {
-                        dist[v] = dist[u] + 1;
-                        mx = mx.max(dist[v]);
-                        q.push_back(v);
-                    }
-                }
-            }
-            mx
-        };
-        for src in [0usize, 50, 100, 199] {
-            let d = ecc(src);
-            assert!(d <= 20, "diameter {d} exceeds log-bound (N=200, deg=10)");
+        // Diameter must stay O(log n) as the ring grows — the property Greptile's
+        // P1 showed the old fixed-offset construction violated.
+        for &n in &[64usize, 128, 256, 512] {
+            let devices = synth_devices(n);
+            let (nodes, adj) = adjacency(&devices, b"c");
+            let diam = (0..nodes.len())
+                .map(|s| eccentricity(&adj, s))
+                .max()
+                .unwrap();
+            let log_bound = 2 * (usize::BITS - n.leading_zeros()) as usize; // ~2·⌈log₂ n⌉
+            assert!(
+                diam <= log_bound,
+                "N={n}: diameter {diam} exceeds log-bound {log_bound}"
+            );
         }
     }
 
@@ -365,22 +350,27 @@ mod tests {
         let mut grown = base.clone();
         grown.insert(synth_key(987_654));
         let node = *base.iter().next().unwrap();
-        let before = community_neighbors(&base, &node, b"c", 10);
-        let after = community_neighbors(&grown, &node, b"c", 10);
+        let before = community_neighbors(&base, &node, b"c");
+        let after = community_neighbors(&grown, &node, b"c");
         // The per-node neighbor-set *delta* is O(degree): both sets are
         // degree-bounded, so a membership change cannot cascade a node's own links
         // network-wide. (The recompute *work* is the O(N log N) ring sort;
         // network-wide rank-churn is higher by design — the spec's tradeoff.)
+        let deg = 2 * ring_offsets(base.len()).len();
         let delta = before.symmetric_difference(&after).count();
-        assert!(delta <= 2 * TOPOLOGY_DEFAULT_DEGREE);
+        assert!(
+            delta <= 2 * deg,
+            "delta {delta} exceeds 2·degree {}",
+            2 * deg
+        );
     }
 
     #[test]
     fn per_community_decorrelation() {
         let devices = synth_devices(200);
         let node = *devices.iter().next().unwrap();
-        let a = community_neighbors(&devices, &node, b"community-A", 10);
-        let b = community_neighbors(&devices, &node, b"community-B", 10);
+        let a = community_neighbors(&devices, &node, b"community-A");
+        let b = community_neighbors(&devices, &node, b"community-B");
         assert!(a.intersection(&b).count() < a.len());
     }
 }
