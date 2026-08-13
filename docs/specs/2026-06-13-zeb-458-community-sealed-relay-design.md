@@ -159,6 +159,14 @@ RelayHoldEntry {
   `RELAY_HOLD_PER_SENDER_CAP * RELAY_MAX_SEALED_BLOB_BYTES` (mirroring
   `DM_OUTHOLD_DATASET_MAX_BYTES`). Implemented in Phase A.
 - **TTL** = 30 days (`RELAY_HOLD_TTL_MS`, reuse `INBOX_TTL_MS`).
+- **ZEB-924 (2026-08-12):** TTL expiry now leaves a bounded LOCAL tombstone
+  (`expired_at_ms`: 2×TTL retention, cap 4×`RELAY_HOLD_GLOBAL_CAP`,
+  `relay_hold_expired.cbor` sidecar) that suppresses resurrection-by-merge
+  from a still-holding peer, so a never-acked hold's lifetime on a replica is
+  bounded by first-observation + TTL + one sweep. Coverage GC is unchanged
+  (fleet-deterministic, needs no tombstones) and deposits are ungated (a fresh
+  send mints a fresh content-id key). See
+  `docs/superpowers/specs/2026-08-12-zeb924-relay-hold-tombstone-retention-design.md`.
 - **GC** (reuse the dm-inbox sweep + one-sweep deferral): each entry is sealed
   to exactly one device, so an entry is **covered** once it has been pulled+acked
   (`pulled_by` non-empty — only the sealed-to device can open + ack it); remove a
