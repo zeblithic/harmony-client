@@ -258,6 +258,11 @@ struct SupervisorInner {
     /// the loop task's first poll goes uncounted — acceptable for a
     /// legibility counter.
     dial_telemetry: OnceLock<Arc<DialTelemetry>>,
+    /// ZEB-928 (R4): optional admission oracle. Installed once at boot via
+    /// [`SupervisorHandle::set_admission_oracle`]. When present, `kick` and `do_sweep`
+    /// drop dials to node_ids the oracle rejects (bounded-degree filter); absent — or the
+    /// oracle disabled (peer mode) — every kick/sweep passes, exactly pre-R4 behavior.
+    admission_oracle: OnceLock<Arc<crate::admission_oracle::AdmissionOracle>>,
 }
 
 /// Producer-facing handle. Cheap to clone (shared `Arc`); every method is
@@ -282,6 +287,7 @@ impl SupervisorHandle {
                 sweep_requested: AtomicBool::new(false),
                 notify: Notify::new(),
                 dial_telemetry: OnceLock::new(),
+                admission_oracle: OnceLock::new(),
             }),
         }
     }
@@ -289,6 +295,10 @@ impl SupervisorHandle {
     /// Lossless, non-async: insert `trigger` for `peer` into the dirty set
     /// (strongest wins) and wake the loop. Never blocks, never drops.
     pub fn kick(&self, peer: [u8; 32], trigger: ReconnectTrigger) {
+        // ZEB-928 (R4): the bounded-degree filter lives at the single dial-dispatch point in
+        // the loop, NOT here — a denied peer must still enter `states` so a later admit can
+        // re-arm and dial it (deny→admit recovery), and enforcing at dispatch also catches a
+        // trigger admitted before a membership shrink. `kick` stays lossless.
         {
             let mut dirty = self.inner.dirty.lock().expect("dirty lock");
             dirty
@@ -310,6 +320,13 @@ impl SupervisorHandle {
     /// equivalent). Called by [`run_reconnect_supervisor`] at startup.
     pub fn set_dial_telemetry(&self, telemetry: Arc<DialTelemetry>) {
         let _ = self.inner.dial_telemetry.set(telemetry);
+    }
+
+    /// ZEB-928 (R4): install the bounded-degree admission oracle. Install-once (first
+    /// wins, like [`set_dial_telemetry`](Self::set_dial_telemetry)); called at boot
+    /// alongside the resolver install. Until installed, `kick`/`do_sweep` filter nothing.
+    pub fn set_admission_oracle(&self, oracle: Arc<crate::admission_oracle::AdmissionOracle>) {
+        let _ = self.inner.admission_oracle.set(oracle);
     }
 
     /// Request a presence sweep (re-arm all known non-connected peers). Subject
@@ -643,6 +660,19 @@ pub async fn run_reconnect_supervisor(
                 if !due {
                     continue;
                 }
+                // ZEB-928 (R4): the single bounded-degree enforcement point. A denied
+                // (non-neighbor) peer is parked Dormant instead of dialed — this is the one
+                // place the dial is actually initiated, so it catches every arming path (kick,
+                // sweep, parole) AND a trigger admitted before a membership shrink AND an
+                // already-Retrying slot revoked mid-flight. The peer stays in `states`, so a
+                // later admit re-arms (via kick_sweep/do_sweep) and dials it. Disabled oracle /
+                // peer mode / unknown node_id all admit — pre-R4 behavior unchanged.
+                if let Some(o) = inner.admission_oracle.get() {
+                    if !o.admit(peer) {
+                        slot.state = PeerState::Dormant { since_ms: now_ms() };
+                        continue;
+                    }
+                }
                 match resolver.resolve_by_node_id(peer) {
                     Some((owner, _payload)) => {
                         // ZEB-621: if this peer's freshest record is >24h stale,
@@ -896,6 +926,9 @@ fn run_parole(
     let mut candidates: Vec<([u8; 32], Instant, [u8; 16])> = dormant
         .into_iter()
         .filter_map(|(peer, t)| {
+            // ZEB-928 (R4): no admission filter here — parole may re-arm a denied peer, but
+            // the dial-dispatch filter parks it Dormant again without dialing. Filtering here
+            // too would only be an optimization; the dispatch point is the single enforcement.
             resolver
                 .resolve_by_node_id(&peer)
                 .map(|(owner, _)| (peer, t, owner.0))
@@ -948,6 +981,10 @@ fn do_sweep(
         if peer == self_node_id || matches!(slot.state, PeerState::Connected { .. }) {
             continue;
         }
+        // ZEB-928 (R4): no admission filter here — a sweep may re-arm a denied peer, but the
+        // dial-dispatch filter parks it Dormant without dialing. Enforcing here too would only
+        // be an optimization; keeping the single enforcement point at dispatch also means a
+        // deny→admit peer is re-armed by the very next sweep and then dialed.
         let role = dial_role(self_node_id, peer);
         slot.epoch = slot.epoch.wrapping_add(1);
         slot.last_fresh_trigger = now;
@@ -2271,6 +2308,64 @@ mod tests {
         let handle = SupervisorHandle::new();
         handle.evict_peer([9u8; 32]);
         assert!(handle.states_snapshot().is_empty());
+    }
+
+    /// ZEB-928 (R4): the bounded-degree filter is enforced at the single dial-dispatch point.
+    /// A denied peer is parked Dormant (sweep-visible, never dialed); admitting it and sweeping
+    /// re-arms and dials it — the deny → admit → sweep → dial recovery. This covers the review
+    /// findings on PR #674 (CodeRabbit CR-3, CodeAnt): a revoked or pre-shrink-admitted peer
+    /// cannot slip a dial through, because dispatch — not arming — is where the bound holds.
+    #[tokio::test(start_paused = true)]
+    async fn r4_denied_peer_parked_until_admitted_then_dialed() {
+        use crate::admission_oracle::AdmissionOracle;
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let dk = [0x81u8; 32];
+
+        let oracle = Arc::new(AdmissionOracle::new(true));
+        oracle.bind([0u8; 16], p, dk);
+        oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied
+        let handle = SupervisorHandle::new();
+        handle.set_admission_oracle(Arc::clone(&oracle));
+
+        // Short sweep cooldown so the phase-2 kick_sweep fires promptly; parole disabled.
+        let config = cfg(1_000, 64_000, 10_000, 1_000, 8, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        // Phase 1 — denied: parked at dispatch, never dialed, still sweep-visible.
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(20_000)).await;
+        assert_eq!(
+            dialer.count_for(p),
+            0,
+            "denied peer is parked at dispatch, never dialed"
+        );
+        assert!(
+            handle
+                .states_snapshot()
+                .iter()
+                .any(|(id, st)| *id == p && matches!(st, PeerStateWire::Dormant { .. })),
+            "denied peer sits Dormant (sweep-visible), not evicted"
+        );
+
+        // Phase 2 — admit + sweep: re-armed and dialed (deny → admit recovery).
+        oracle.publish_admitted(std::collections::BTreeSet::from([dk]));
+        handle.kick_sweep();
+        tokio::time::sleep(ms(20_000)).await;
+        assert!(
+            dialer.count_for(p) > 0,
+            "admitted peer dialed after the sweep re-arms it"
+        );
     }
 
     #[tokio::test(start_paused = true)]

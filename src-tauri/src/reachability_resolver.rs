@@ -281,6 +281,13 @@ pub struct ReachabilityResolver {
     // bump covers both stale directions (evicted/reassigned AND newly added).
     // Shared across clones (`Arc`) like every other field.
     generation: Arc<std::sync::atomic::AtomicU64>,
+    // ZEB-928: optional R4 admission oracle. None until boot installs it via
+    // `set_admission_oracle`. When present, the resolver forwards verified
+    // `node_id -> enrolled_device_key` bindings (`note_enrolled_binding`) into it and
+    // evicts them on `remove_owner`, so the supervisor's kick-time filter can classify
+    // a node_id by its enrolled device key. Mirrors `supervisor` (shared `Arc<RwLock>`,
+    // latest install wins).
+    admission_oracle: Arc<RwLock<Option<Arc<crate::admission_oracle::AdmissionOracle>>>>,
 }
 
 impl std::fmt::Debug for ReachabilityResolver {
@@ -303,6 +310,7 @@ impl Default for ReachabilityResolver {
             clock: Arc::new(RwLock::new(default_clock())),
             refresh_permits: Arc::new(tokio::sync::Semaphore::new(PKARR_REFRESH_MAX_CONCURRENT)),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            admission_oracle: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -321,6 +329,7 @@ impl Clone for ReachabilityResolver {
             clock: Arc::clone(&self.clock),
             refresh_permits: Arc::clone(&self.refresh_permits),
             generation: Arc::clone(&self.generation),
+            admission_oracle: Arc::clone(&self.admission_oracle),
         }
     }
 }
@@ -384,6 +393,35 @@ impl ReachabilityResolver {
     /// cheap `Arc`-backed clone).
     pub fn liveness(&self) -> Option<LivenessHandle> {
         self.liveness.read().expect("liveness lock").clone()
+    }
+
+    /// ZEB-928: install the R4 admission oracle. Called once at boot (event_loop),
+    /// alongside the supervisor install. Mirrors [`set_supervisor`](Self::set_supervisor):
+    /// thread-safe, latest install wins. `None` until then, in which case
+    /// [`note_enrolled_binding`](Self::note_enrolled_binding) and the `remove_owner`
+    /// eviction are no-ops.
+    pub fn set_admission_oracle(&self, oracle: Arc<crate::admission_oracle::AdmissionOracle>) {
+        *self
+            .admission_oracle
+            .write()
+            .expect("admission_oracle lock") = Some(oracle);
+    }
+
+    /// ZEB-928: forward a verified `(owner, node_id) -> enrolled_device_key` binding into the
+    /// admission oracle (no-op if none installed). Call this at each record-ingest seam that
+    /// holds the enrolled key, BEFORE the `update`/`update_with_source` that fires the supervisor
+    /// kick — so the just-resolved peer is classifiable the instant it is kicked (race-free
+    /// admission). The owner scopes eviction so `remove_owner` never drops a co-resident owner's
+    /// binding for a shared node_id.
+    pub fn note_enrolled_binding(&self, owner: [u8; 16], node_id: [u8; 32], enrolled_vk: [u8; 32]) {
+        if let Some(o) = self
+            .admission_oracle
+            .read()
+            .expect("admission_oracle lock")
+            .as_ref()
+        {
+            o.bind(owner, node_id, enrolled_vk);
+        }
     }
 
     /// LWW update — higher HLC wins; ties broken by announced_at_ms then
@@ -783,7 +821,18 @@ impl ReachabilityResolver {
             .lock()
             .expect("refresh_cooldowns lock")
             .remove(actor);
-        to_remove.into_iter().map(|(_, node_id)| node_id).collect()
+        let node_ids: Vec<[u8; 32]> = to_remove.into_iter().map(|(_, node_id)| node_id).collect();
+        // ZEB-928: drop only THIS owner's oracle bindings for the departed node_ids — a
+        // node_id co-asserted under another live owner keeps that owner's binding (CR-2).
+        if let Some(o) = self
+            .admission_oracle
+            .read()
+            .expect("admission_oracle lock")
+            .as_ref()
+        {
+            o.unbind_owner(actor.0, &node_ids);
+        }
+        node_ids
     }
 
     /// Register a pkarr-backed fallback source. Called once at boot by
@@ -1104,6 +1153,47 @@ mod tests {
         // …and observe it via an independently-fetched clone (shared state).
         let snap = r.liveness().expect("still installed").states_snapshot();
         assert!(snap.iter().any(|(p, _)| *p == [7u8; 32]));
+    }
+
+    /// ZEB-928: the resolver forwards a verified enrolled-key binding into the admission
+    /// oracle and evicts it on `remove_owner`. The denied→admitted flip across eviction
+    /// proves the binding was actually dropped, not merely covered by fail-open.
+    #[test]
+    fn admission_oracle_binding_and_eviction() {
+        use crate::admission_oracle::AdmissionOracle;
+        let oracle = std::sync::Arc::new(AdmissionOracle::new(true));
+        let r = ReachabilityResolver::new();
+        r.set_admission_oracle(std::sync::Arc::clone(&oracle));
+
+        let actor = OwnerAddr([0x11; 16]);
+        let node_id = node_id_bytes(0x42);
+        let enrolled_vk = [0xBB; 32];
+
+        // Ingest-seam order: bind first, then the update that would fire the kick.
+        r.note_enrolled_binding(actor.0, node_id, enrolled_vk);
+        r.update(actor, make_payload(0x42, 1_000), make_hlc(1_000, 0, "d"));
+
+        // Bound but nothing admitted → denied.
+        oracle.publish_admitted(std::collections::BTreeSet::new());
+        assert!(
+            !oracle.admit(&node_id),
+            "bound to a non-admitted key -> denied"
+        );
+
+        // Admitting the enrolled key flips it.
+        oracle.publish_admitted(std::collections::BTreeSet::from([enrolled_vk]));
+        assert!(oracle.admit(&node_id), "admitted key -> node_id dialable");
+
+        // Eviction: with nothing admitted the node_id is denied while bound; after
+        // remove_owner it becomes unknown → fail-open → admitted.
+        oracle.publish_admitted(std::collections::BTreeSet::new());
+        assert!(!oracle.admit(&node_id));
+        let removed = r.remove_owner(&actor);
+        assert!(removed.contains(&node_id));
+        assert!(
+            oracle.admit(&node_id),
+            "unbound after remove -> fail-open (unknown)"
+        );
     }
 
     /// Same owner, SAME device (same iroh_node_id) — later HLC wins per LWW.

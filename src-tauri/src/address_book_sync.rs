@@ -227,6 +227,15 @@ pub fn ingest_verified_row(
     if matches!(outcome, UpsertOutcome::Inserted | UpsertOutcome::Replaced) {
         match row.entry {
             AddressBookEntry::Reachability(p) => {
+                // ZEB-928: feed the verified `node_id -> enrolled_device_key` binding into
+                // the admission oracle BEFORE the update fires the supervisor kick, so a
+                // just-resolved peer is classifiable the instant it is kicked. `row.device`
+                // is the enrolled key cryptographically verified against `p` at :215.
+                reachability_resolver.note_enrolled_binding(
+                    row.actor.0,
+                    p.iroh_node_id,
+                    row.device,
+                );
                 // `ReachabilityResolver` clamps forward skew internally
                 // (`FUTURE_SKEW_TOLERANCE_MS`), so the raw payload is safe.
                 reachability_resolver.update(row.actor, p, row.at);
