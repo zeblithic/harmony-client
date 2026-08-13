@@ -53,7 +53,10 @@ impl AdmissionOracle {
         if !self.enabled {
             return true;
         }
-        let map = self.node_to_devices.read().expect("node_to_devices poisoned");
+        let map = self
+            .node_to_devices
+            .read()
+            .expect("node_to_devices poisoned");
         let devices = match map.get(node_id) {
             Some(d) => d,
             None => return true, // fail-open on unknown identity
@@ -79,7 +82,10 @@ impl AdmissionOracle {
 
     /// Resolver `remove_owner`: forget these node_ids' bindings entirely.
     pub fn unbind_node_ids(&self, node_ids: &[[u8; 32]]) {
-        let mut map = self.node_to_devices.write().expect("node_to_devices poisoned");
+        let mut map = self
+            .node_to_devices
+            .write()
+            .expect("node_to_devices poisoned");
         for n in node_ids {
             map.remove(n);
         }
@@ -237,6 +243,9 @@ mod tests {
         let self_vk = [0xAB; 32]; // deliberately absent
         assert!(!devices.contains(&self_vk));
         let out = compute_admitted(&[(devices.clone(), b"salt".to_vec())], &self_vk);
-        assert_eq!(out, devices, "full active set admitted while self un-materialized");
+        assert_eq!(
+            out, devices,
+            "full active set admitted while self un-materialized"
+        );
     }
 }

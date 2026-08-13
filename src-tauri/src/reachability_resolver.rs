@@ -1174,7 +1174,10 @@ mod tests {
 
         // Bound but nothing admitted → denied.
         oracle.publish_admitted(std::collections::BTreeSet::new());
-        assert!(!oracle.admit(&node_id), "bound to a non-admitted key -> denied");
+        assert!(
+            !oracle.admit(&node_id),
+            "bound to a non-admitted key -> denied"
+        );
 
         // Admitting the enrolled key flips it.
         oracle.publish_admitted(std::collections::BTreeSet::from([enrolled_vk]));
@@ -1186,7 +1189,10 @@ mod tests {
         assert!(!oracle.admit(&node_id));
         let removed = r.remove_owner(&actor);
         assert!(removed.contains(&node_id));
-        assert!(oracle.admit(&node_id), "unbound after remove -> fail-open (unknown)");
+        assert!(
+            oracle.admit(&node_id),
+            "unbound after remove -> fail-open (unknown)"
+        );
     }
 
     /// Same owner, SAME device (same iroh_node_id) — later HLC wins per LWW.
