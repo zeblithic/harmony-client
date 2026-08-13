@@ -5,7 +5,9 @@
 //! GC, and TTL eviction. The relay holds `sealed_blob` OPAQUE — it never
 //! opens the blob.
 
-use crate::community_relay::RELAY_HOLD_TTL_MS;
+use crate::community_relay::{
+    RELAY_HOLD_TOMBSTONE_CAP, RELAY_HOLD_TOMBSTONE_RETENTION_MS, RELAY_HOLD_TTL_MS,
+};
 use crate::fleet_sync::MergeOutcome;
 use crate::owner_state_crypto::{sealed::CanonicalPayloadSealed, CanonicalPayload};
 use crate::owner_state_types::{Hlc, SpaceId};
@@ -50,6 +52,17 @@ pub struct RelayHoldDoc {
     /// `PartialEq` below, so it never affects convergence or equality.
     #[serde(skip)]
     first_observed_ms: BTreeMap<String, u64>,
+    /// ZEB-924: LOCAL expiry memory — keys this replica TTL-expired, mapped
+    /// to the local wall-ms of expiry. Suppresses resurrection-by-merge (a
+    /// still-holding peer's anti-entropy re-insert) so a never-acked hold's
+    /// lifetime here is bounded by first-observation + TTL + one sweep.
+    /// Never serialized (canonical wire bytes unchanged), excluded from
+    /// `PartialEq`, restart-durable via a local sidecar
+    /// (`relay_hold_persist::save_expired`). Bounded by
+    /// `RELAY_HOLD_TOMBSTONE_RETENTION_MS` age-out and
+    /// `RELAY_HOLD_TOMBSTONE_CAP` oldest-first eviction in [`Self::gc`].
+    #[serde(skip)]
+    expired_at_ms: BTreeMap<String, u64>,
 }
 
 impl PartialEq for RelayHoldDoc {
@@ -97,6 +110,15 @@ impl RelayHoldDoc {
         for (k, r) in remote.entries {
             match self.entries.get_mut(&k) {
                 None => {
+                    // ZEB-924: a key this replica already TTL-expired must not
+                    // be resurrected by a still-holding peer's merge — suppress
+                    // the insert entirely (no `changed`, no flush churn, and
+                    // `held_for` never sees it). Deposits are unaffected: a
+                    // fresh send mints a fresh content-id key and
+                    // `persist_hold` inserts directly, not through here.
+                    if self.expired_at_ms.contains_key(&k) {
+                        continue;
+                    }
                     changed = true;
                     self.entries.insert(k, r);
                 }
@@ -174,11 +196,11 @@ impl RelayHoldDoc {
     /// boot `now_ms` (a backward local clock step across restart) is rebased to
     /// `now_ms` in [`Self::restore_first_observed`], so a future stamp cannot
     /// delay expiry. Unlike coverage, this is a per-replica SOFT
-    /// deadline, not fleet-wide deterministic: a never-covered entry
-    /// resurrected by a still-holding peer re-stamps `first_observed_ms` and
-    /// gets a fresh TTL window here too, so it may persist beyond a single
-    /// TTL window in a continuously-merging fleet — bounded by the store's
-    /// caps.
+    /// deadline, not fleet-wide deterministic. ZEB-924: expired keys leave a
+    /// bounded LOCAL tombstone (`expired_at_ms`) that [`Self::merge_from`]
+    /// consults, so a resurrection-by-merge from a still-holding peer is
+    /// suppressed and a never-acked hold's lifetime here is bounded by
+    /// first-observation + TTL + one sweep interval.
     ///
     /// Returns `true` iff the doc changed (some entry was removed).
     pub fn gc(&mut self, now_ms: u64) -> bool {
@@ -202,11 +224,38 @@ impl RelayHoldDoc {
 
         let before = self.entries.len();
         let first_observed = &self.first_observed_ms;
+        // ZEB-924: record WHICH keys the TTL rule removes — they become local
+        // tombstones so a peer merge cannot resurrect them. Coverage-only
+        // removals are fleet-deterministic (every replica re-removes a covered
+        // resurrection) and need no tombstone.
+        let mut ttl_removed: Vec<String> = Vec::new();
         self.entries.retain(|key, _e| {
             let observed = first_observed.get(key).copied().unwrap_or(now_ms);
             let ttl_expired = observed.saturating_add(RELAY_HOLD_TTL_MS) < now_ms;
+            if ttl_expired {
+                ttl_removed.push(key.clone());
+            }
             !(ttl_expired || covered_at_start.contains(key))
         });
+        for key in ttl_removed {
+            self.expired_at_ms.insert(key, now_ms);
+        }
+        // Age-out + cap so expiry memory cannot itself become unbounded state.
+        self.expired_at_ms
+            .retain(|_, t| now_ms.saturating_sub(*t) < RELAY_HOLD_TOMBSTONE_RETENTION_MS);
+        while self.expired_at_ms.len() > RELAY_HOLD_TOMBSTONE_CAP {
+            let oldest = self
+                .expired_at_ms
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    self.expired_at_ms.remove(&k);
+                }
+                None => break,
+            }
+        }
         // Prune the side-map for removed keys (bounded with `entries`).
         let live: BTreeSet<String> = self.entries.keys().cloned().collect();
         self.first_observed_ms.retain(|k, _| live.contains(k));
@@ -237,6 +286,33 @@ impl RelayHoldDoc {
             *v = (*v).min(now_ms);
         }
         self.first_observed_ms = map;
+    }
+
+    /// ZEB-924: read the LOCAL expiry tombstones for durable sidecar
+    /// persistence. Never leaves this replica and never enters the wire.
+    pub fn expired_at_ms(&self) -> &BTreeMap<String, u64> {
+        &self.expired_at_ms
+    }
+
+    /// ZEB-924: restore the LOCAL expiry tombstones on boot from the sidecar.
+    ///
+    /// - A stamp GREATER than `now_ms` (a backward local clock step across
+    ///   restart) is rebased to `now_ms` (mirrors
+    ///   [`Self::restore_first_observed`] Q-1).
+    /// - Any restored tombstone key still present in `entries` (a stale doc
+    ///   file from a crash between atomic writes resurrected an entry this
+    ///   replica already expired) is REMOVED from `entries` — expiry is
+    ///   monotone; the tombstone wins.
+    ///
+    /// Callers MUST load `entries` first and MUST call this BEFORE
+    /// [`Self::restore_first_observed`], whose orphan-pruning then drops the
+    /// removed entries' stamps (the boot path does).
+    pub fn restore_expired(&mut self, mut map: BTreeMap<String, u64>, now_ms: u64) {
+        for v in map.values_mut() {
+            *v = (*v).min(now_ms);
+        }
+        self.entries.retain(|k, _| !map.contains_key(k));
+        self.expired_at_ms = map;
     }
 }
 
@@ -1032,5 +1108,198 @@ mod tests {
              the dataset cap would under-count a full doc and the zenoh adapter \
              could DROP the sample"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // ZEB-924: local expiry tombstones vs resurrection-by-merge
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn gc_ttl_expiry_tombstones_the_key_but_coverage_removal_does_not() {
+        let mut doc = RelayHoldDoc::default();
+        let ttl_key = key_rr(1, 1);
+        let cov_key = key_rr(2, 2);
+        doc.entries.insert(
+            ttl_key.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        doc.entries.insert(
+            cov_key.clone(),
+            entry([2; 16], [9; 16], space(3), hlc(1, "a"), "relay", &["dev-1"]),
+        );
+        assert!(doc.gc(1_000), "covered-at-start entry removed immediately");
+        assert!(
+            doc.expired_at_ms().is_empty(),
+            "coverage removal must NOT tombstone (fleet-deterministic already)"
+        );
+        // TTL-expire the survivor: stamped at 1_000, sweep past TTL.
+        let later = 1_000 + RELAY_HOLD_TTL_MS + 1;
+        assert!(doc.gc(later), "TTL removal");
+        assert_eq!(
+            doc.expired_at_ms().get(&ttl_key),
+            Some(&later),
+            "TTL removal records a tombstone at the sweep time"
+        );
+    }
+
+    #[test]
+    fn merge_suppresses_resurrection_of_tombstoned_key() {
+        let mut doc = RelayHoldDoc::default();
+        let k = key_rr(1, 1);
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        doc.gc(1_000); // stamp
+        doc.gc(1_000 + RELAY_HOLD_TTL_MS + 1); // expire + tombstone
+        assert!(doc.entries.is_empty());
+
+        // A still-holding peer's doc re-offers the entry.
+        let mut remote = RelayHoldDoc::default();
+        remote.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        let out = doc.merge_from(remote);
+        assert!(
+            !out.changed,
+            "suppressed resurrection is silent (no flush churn)"
+        );
+        assert!(
+            doc.entries.is_empty(),
+            "tombstoned key never re-enters entries"
+        );
+    }
+
+    #[test]
+    fn resurrection_lifetime_bound_across_merge_traffic() {
+        // Acceptance pin: interleave merges from a still-holding peer with
+        // sweeps — after the first TTL expiry the key never re-enters.
+        let k = key_rr(1, 1);
+        let mut peer = RelayHoldDoc::default();
+        peer.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        let mut doc = RelayHoldDoc::default();
+        doc.merge_from(peer.clone());
+        doc.gc(0); // first observation stamp at 0
+        let expiry_sweep = RELAY_HOLD_TTL_MS + 1;
+        assert!(doc.gc(expiry_sweep), "expires at TTL");
+        for i in 1..=5u64 {
+            let now = expiry_sweep + i * 600_000; // merge every sweep interval
+            let out = doc.merge_from(peer.clone());
+            assert!(!out.changed, "merge round {i} suppressed");
+            assert!(!doc.gc(now), "nothing to remove in round {i}");
+            assert!(doc.entries.is_empty(), "never re-enters (round {i})");
+        }
+    }
+
+    #[test]
+    fn covered_resurrection_still_converges_without_tombstone() {
+        // Existing semantics pinned: a resurrected COVERED entry carries its
+        // pulled_by and is deterministically re-removed on the next sweep.
+        let k = key_rr(1, 1);
+        let mut doc = RelayHoldDoc::default();
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(1, "a"), "relay", &["dev-1"]),
+        );
+        assert!(doc.gc(1_000), "covered-at-start → removed, no tombstone");
+        let mut peer = RelayHoldDoc::default();
+        peer.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(1, "a"), "relay", &["dev-1"]),
+        );
+        let out = doc.merge_from(peer);
+        assert!(out.changed, "covered entry MAY resurrect (no tombstone)");
+        assert!(
+            doc.gc(2_000),
+            "and is deterministically re-removed next sweep"
+        );
+        assert!(doc.entries.is_empty());
+    }
+
+    #[test]
+    fn tombstone_ages_out_after_retention_and_reopens() {
+        use crate::community_relay::RELAY_HOLD_TOMBSTONE_RETENTION_MS;
+        let k = key_rr(1, 1);
+        let mut doc = RelayHoldDoc::default();
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        doc.gc(0);
+        let expiry = RELAY_HOLD_TTL_MS + 1;
+        assert!(doc.gc(expiry));
+        assert!(doc.expired_at_ms().contains_key(&k));
+        // Past retention the tombstone is dropped…
+        assert!(!doc.gc(expiry + RELAY_HOLD_TOMBSTONE_RETENTION_MS + 1));
+        assert!(doc.expired_at_ms().is_empty(), "tombstone aged out");
+        // …and a pathological late holder re-arms ONE more TTL window
+        // (documented bounded harm, spec §6).
+        let mut peer = RelayHoldDoc::default();
+        peer.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        assert!(
+            doc.merge_from(peer).changed,
+            "post-retention resurrection re-inserts"
+        );
+    }
+
+    #[test]
+    fn tombstone_cap_evicts_oldest_first() {
+        use crate::community_relay::RELAY_HOLD_TOMBSTONE_CAP;
+        let mut doc = RelayHoldDoc::default();
+        // Overfill via restore (unit seam), then run gc to enforce the cap.
+        let mut m: BTreeMap<String, u64> = BTreeMap::new();
+        for i in 0..(RELAY_HOLD_TOMBSTONE_CAP + 2) {
+            // Distinct keys; stamps strictly increasing so "oldest" is i=0,1.
+            let content: [u8; 32] = {
+                let mut c = [0u8; 32];
+                c[0] = (i / 256) as u8;
+                c[1] = (i % 256) as u8;
+                c
+            };
+            m.insert(RelayHoldDoc::key(&[7; 16], &content), 1_000 + i as u64);
+        }
+        let newest_stamp = 1_000 + (RELAY_HOLD_TOMBSTONE_CAP + 1) as u64;
+        doc.restore_expired(m, u64::MAX - 1);
+        assert!(!doc.gc(newest_stamp), "cap enforcement removes no entries");
+        assert_eq!(doc.expired_at_ms().len(), RELAY_HOLD_TOMBSTONE_CAP);
+        assert!(
+            !doc.expired_at_ms().values().any(|t| *t < 1_002),
+            "the two OLDEST tombstones were evicted"
+        );
+    }
+
+    #[test]
+    fn restore_expired_removes_tombstoned_entries_and_clamps_future_stamps() {
+        let k = key_rr(1, 1);
+        let live = key_rr(2, 2);
+        let mut doc = RelayHoldDoc::default();
+        // Stale doc file resurrected an entry this replica already expired…
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        doc.entries.insert(
+            live.clone(),
+            entry([2; 16], [9; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        let now = 1_000_000u64;
+        // …and the sidecar carries a FUTURE stamp (backward clock across restart).
+        doc.restore_expired([(k.clone(), now + 5_000_000)].into_iter().collect(), now);
+        assert!(
+            !doc.entries.contains_key(&k),
+            "tombstone wins over the stale doc file"
+        );
+        assert!(
+            doc.entries.contains_key(&live),
+            "non-tombstoned entry untouched"
+        );
+        assert_eq!(doc.expired_at_ms()[&k], now, "future stamp rebased to now");
     }
 }
