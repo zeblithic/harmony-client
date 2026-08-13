@@ -20311,11 +20311,7 @@ fn build_signed_backup_set_with(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut rows: Vec<(u64, String, u64)> = idx
             .entries()
-            .filter(|e| e.backup && !e.archived)
-            .filter(|e| {
-                harmony_content::cid::ContentId::from_bytes(e.cid).content_class()
-                    == harmony_content::cid::ContentClass::PublicDurable
-            })
+            .filter(|e| backup_set_eligible(e))
             .map(|e| (e.stored_at_ms, hex::encode(e.cid), e.size_bytes))
             .collect();
         rows.sort();
@@ -20522,6 +20518,75 @@ fn storage_record_refresh_due(elapsed_ms: u64, non_empty: bool) -> bool {
     non_empty && elapsed_ms >= storage_records::STORAGE_RECORD_REFRESH_INTERVAL_MS
 }
 
+/// ZEB-923 (R1, CodeRabbit): the single backup-set membership predicate —
+/// the builder and the renewal gate must never diverge (a divergence
+/// would periodically renew a set the builder publishes empty, or skip
+/// renewing eligible entries).
+fn backup_set_eligible(e: &content_index::ContentIndexEntry) -> bool {
+    e.backup
+        && !e.archived
+        && harmony_content::cid::ContentId::from_bytes(e.cid).content_class()
+            == harmony_content::cid::ContentClass::PublicDurable
+}
+
+/// ZEB-923 (R1, CodeAnt): outcome of a renewal publish attempted through
+/// the event loop.
+enum PublishOutcome {
+    /// The Zenoh put itself reported success — safe to reset the deadline.
+    Confirmed,
+    /// Queue full, put failed, reply lost, or confirmation timed out —
+    /// leave the deadline alone so the family retries next tick.
+    Retry,
+    /// The event loop dropped `publish_rx` — the node stopped.
+    NodeStopped,
+}
+
+/// ZEB-923 (R1, CodeAnt): `try_send` only proves the request entered the
+/// event-loop queue; the Zenoh put can still fail. Renewal deadlines
+/// reset only on a CONFIRMED put, so a failed renewal retries on the
+/// next 30 s tick instead of silently waiting out a full refresh
+/// interval (a re-mint on retry is harmless — strictly-newer LWW).
+async fn publish_confirmed(
+    publish_tx: &tokio::sync::mpsc::Sender<event_loop::PublishRequest>,
+    key_expr: String,
+    payload: Vec<u8>,
+    what: &str,
+) -> PublishOutcome {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    match publish_tx.try_send(event_loop::PublishRequest {
+        key_expr,
+        payload,
+        reply: reply_tx,
+    }) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return PublishOutcome::NodeStopped
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, what, "renewal publish deferred (channel full)");
+            return PublishOutcome::Retry;
+        }
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx).await {
+        Ok(Ok(Ok(()))) => PublishOutcome::Confirmed,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, what, "renewal publish failed; retrying next tick");
+            PublishOutcome::Retry
+        }
+        Ok(Err(_)) => {
+            tracing::warn!(what, "renewal publish reply dropped; retrying next tick");
+            PublishOutcome::Retry
+        }
+        Err(_) => {
+            tracing::warn!(
+                what,
+                "renewal publish confirmation timed out; retrying next tick"
+            );
+            PublishOutcome::Retry
+        }
+    }
+}
+
 /// ZEB-669 S2 / ZEB-923: per-generation storage-record publisher.
 /// Spawned from start_node (NEVER inline-awaited — the loop isn't
 /// draining publish_rx yet at spawn time; see the start_node inline-await
@@ -20568,8 +20633,11 @@ fn spawn_storage_record_publisher(
         let mut published: Option<Vec<storage_signing::HostingReportEntry>> = None;
         let mut last_publish = std::time::Instant::now();
         // ZEB-923: boot publish covers t=0, so the first renewal at
-        // ~one refresh interval is correct.
-        let mut last_record_refresh = std::time::Instant::now();
+        // ~one refresh interval is correct. Per-family deadlines (R1,
+        // CodeRabbit): a deferred or failed family retries next tick
+        // instead of being masked by the other family's success.
+        let mut last_pledge_refresh = std::time::Instant::now();
+        let mut last_backup_refresh = std::time::Instant::now();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             if publish_tx.is_closed() {
@@ -20610,7 +20678,6 @@ fn spawn_storage_record_publisher(
             // every receiver's LWW take the UpdatedNewer path and restamp
             // its record-TTL clock — a byte-identical republish would be
             // IgnoredOlder and renew nothing.
-            let elapsed = last_record_refresh.elapsed().as_millis() as u64;
             let has_pledges = !settings
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -20620,16 +20687,13 @@ fn spawn_storage_record_publisher(
                 let idx = content_index
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let any = idx.entries().any(|e| {
-                    e.backup
-                        && !e.archived
-                        && harmony_content::cid::ContentId::from_bytes(e.cid).content_class()
-                            == harmony_content::cid::ContentClass::PublicDurable
-                });
+                let any = idx.entries().any(backup_set_eligible);
                 any
             };
-            let mut renewed = false;
-            if storage_record_refresh_due(elapsed, has_pledges) {
+            if storage_record_refresh_due(
+                last_pledge_refresh.elapsed().as_millis() as u64,
+                has_pledges,
+            ) {
                 match build_signed_pledge_list_with(
                     &identity,
                     &node_addr,
@@ -20639,23 +20703,21 @@ fn spawn_storage_record_publisher(
                     v2_material.as_ref(),
                 ) {
                     Ok((topic, bytes)) => {
-                        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-                        match publish_tx.try_send(event_loop::PublishRequest {
-                            key_expr: topic,
-                            payload: bytes,
-                            reply: reply_tx,
-                        }) {
-                            Ok(()) => renewed = true,
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "pledge renewal deferred (channel full)")
+                        match publish_confirmed(&publish_tx, topic, bytes, "pledge renewal").await {
+                            PublishOutcome::Confirmed => {
+                                last_pledge_refresh = std::time::Instant::now()
                             }
+                            PublishOutcome::Retry => {}
+                            PublishOutcome::NodeStopped => return,
                         }
                     }
                     Err(e) => tracing::warn!(error = %e, "pledge renewal skipped"),
                 }
             }
-            if storage_record_refresh_due(elapsed, has_backup) {
+            if storage_record_refresh_due(
+                last_backup_refresh.elapsed().as_millis() as u64,
+                has_backup,
+            ) {
                 match build_signed_backup_set_with(
                     &identity,
                     &node_addr,
@@ -20666,24 +20728,18 @@ fn spawn_storage_record_publisher(
                     v2_material.as_ref(),
                 ) {
                     Ok((topic, bytes)) => {
-                        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-                        match publish_tx.try_send(event_loop::PublishRequest {
-                            key_expr: topic,
-                            payload: bytes,
-                            reply: reply_tx,
-                        }) {
-                            Ok(()) => renewed = true,
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "backup-set renewal deferred (channel full)")
+                        match publish_confirmed(&publish_tx, topic, bytes, "backup-set renewal")
+                            .await
+                        {
+                            PublishOutcome::Confirmed => {
+                                last_backup_refresh = std::time::Instant::now()
                             }
+                            PublishOutcome::Retry => {}
+                            PublishOutcome::NodeStopped => return,
                         }
                     }
                     Err(e) => tracing::warn!(error = %e, "backup-set renewal skipped"),
                 }
-            }
-            if renewed {
-                last_record_refresh = std::time::Instant::now();
             }
             let lines = hosting_report_lines(&ledger);
             let changed = published.as_deref() != Some(&lines[..]);
