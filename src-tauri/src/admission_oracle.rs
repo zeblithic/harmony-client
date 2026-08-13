@@ -22,9 +22,11 @@ use crate::community_topology::community_neighbors;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::RwLock;
 
-/// A single binding's provenance: `(owner, enrolled device verify key)`. The owner scopes
-/// eviction so a departing owner never drops a co-resident owner's binding for a shared node_id.
-type OwnedDevice = ([u8; 16], [u8; 32]);
+/// The *current* enrolled device verify key each owner asserts for a node_id. Keyed by owner so
+/// (a) a departing owner never evicts a co-resident owner's binding for a shared node_id, and
+/// (b) a superseded reachability record REPLACES that owner's prior key rather than accumulating
+/// stale keys that could keep the node admitted after its verified key changed (Greptile P1).
+type OwnerDeviceKeys = HashMap<[u8; 16], [u8; 32]>;
 
 /// Shared admission classifier. Cheap to read; the hot path takes read locks only.
 pub struct AdmissionOracle {
@@ -33,11 +35,10 @@ pub struct AdmissionOracle {
     enabled: bool,
     /// Admitted enrolled device keys (the realized ring-neighbor union). Controller writes.
     admitted: RwLock<BTreeSet<[u8; 32]>>,
-    /// Reverse bridge `iroh_node_id -> {(owner, enrolled device key)}`. A node_id can be asserted
-    /// by more than one enrolled key and under more than one owner, so the value is a set of
-    /// `(owner, device_key)` pairs; admission is "some bound device key is in the admitted set",
-    /// and eviction is scoped to a single owner. Resolver writes.
-    node_to_owned_devices: RwLock<HashMap<[u8; 32], BTreeSet<OwnedDevice>>>,
+    /// Reverse bridge `iroh_node_id -> {owner -> current enrolled device key}`. Admission is
+    /// "some owner's current bound key is in the admitted set"; a rebind replaces that owner's
+    /// prior key (no stale keys), and eviction is scoped to one owner. Resolver writes.
+    node_to_owned_devices: RwLock<HashMap<[u8; 32], OwnerDeviceKeys>>,
 }
 
 impl AdmissionOracle {
@@ -67,12 +68,12 @@ impl AdmissionOracle {
             .node_to_owned_devices
             .read()
             .expect("node_to_owned_devices poisoned");
-        let owned = match map.get(node_id) {
+        let owners = match map.get(node_id) {
             Some(d) => d,
             None => return true, // fail-open on unknown identity
         };
         let admitted = self.admitted.read().expect("admitted poisoned");
-        owned.iter().any(|(_owner, dk)| admitted.contains(dk))
+        owners.values().any(|dk| admitted.contains(dk))
     }
 
     /// Controller: replace the admitted device-key set (called on a membership delta).
@@ -80,27 +81,29 @@ impl AdmissionOracle {
         *self.admitted.write().expect("admitted poisoned") = keys;
     }
 
-    /// Resolver: record that `node_id` is asserted by (verified) `device_key`, under `owner`.
+    /// Resolver: record that `node_id`'s *current* verified key under `owner` is `device_key`.
+    /// Replaces any prior key this owner asserted for the node_id, so a superseded record can't
+    /// leave a stale key admitted (Greptile P1, PR #674).
     pub fn bind(&self, owner: [u8; 16], node_id: [u8; 32], device_key: [u8; 32]) {
         self.node_to_owned_devices
             .write()
             .expect("node_to_owned_devices poisoned")
             .entry(node_id)
             .or_default()
-            .insert((owner, device_key));
+            .insert(owner, device_key);
     }
 
-    /// Resolver `remove_owner`: forget only `owner`'s bindings for these node_ids. A node_id
-    /// still bound under another owner survives; a node_id whose set becomes empty is dropped.
+    /// Resolver `remove_owner`: forget only `owner`'s binding for these node_ids. A node_id still
+    /// bound under another owner survives; a node_id whose owner-map becomes empty is dropped.
     pub fn unbind_owner(&self, owner: [u8; 16], node_ids: &[[u8; 32]]) {
         let mut map = self
             .node_to_owned_devices
             .write()
             .expect("node_to_owned_devices poisoned");
         for n in node_ids {
-            if let Some(set) = map.get_mut(n) {
-                set.retain(|(o, _)| *o != owner);
-                if set.is_empty() {
+            if let Some(owners) = map.get_mut(n) {
+                owners.remove(&owner);
+                if owners.is_empty() {
                     map.remove(n);
                 }
             }
@@ -180,12 +183,19 @@ mod tests {
     }
 
     #[test]
-    fn multi_device_node_id_admits_on_intersection() {
+    fn rebind_supersedes_prior_key_for_owner() {
+        // A new record for the same (owner, node_id) with a different enrolled key must REPLACE
+        // the prior key — the superseded key can't keep the node admitted (Greptile P1, #674).
         let o = AdmissionOracle::new(true);
+        o.bind(own(1), nid(1), dk(4)); // old key, once a neighbor
+        o.bind(own(1), nid(1), dk(5)); // rotation: dk(5) is now the current key
+        o.publish_admitted(BTreeSet::from([dk(4)]));
+        assert!(
+            !o.admit(&nid(1)),
+            "superseded key dk(4) must NOT keep the node admitted"
+        );
         o.publish_admitted(BTreeSet::from([dk(5)]));
-        o.bind(own(1), nid(1), dk(4));
-        o.bind(own(1), nid(1), dk(5)); // same node_id, second device key
-        assert!(o.admit(&nid(1)), "one bound key is admitted");
+        assert!(o.admit(&nid(1)), "current key dk(5) admits");
     }
 
     #[test]
