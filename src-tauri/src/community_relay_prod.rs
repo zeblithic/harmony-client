@@ -214,7 +214,11 @@ impl RelayDepositCtx for ProdRelayDepositCtx {
                 // Occupied key: insert-once leaves it untouched and the caps
                 // are BYPASSED — the entry is already stored, so a redelivery
                 // after a lost ack re-acks idempotently even at a full hold.
-                // Falls through to the flush below (D7).
+                // Falls through to the flush below (D7). Clearing the
+                // tombstone here is defensive only (a live entry beside a
+                // stale tombstone can exist on disk from a pre-ZEB-924-R2
+                // binary; this self-heals it before the flush).
+                doc.clear_tombstone(&key);
                 RelayPersistVerdict::Duplicate
             } else {
                 // Community-scoped per-sender cap (matches count_for_sender's
@@ -223,9 +227,16 @@ impl RelayDepositCtx for ProdRelayDepositCtx {
                 let total = doc.live_count();
                 if sender_pending >= RELAY_HOLD_PER_SENDER_CAP || total >= RELAY_HOLD_GLOBAL_CAP {
                     // Nothing inserted → nothing to flush; the doc is exactly
-                    // as it was.
+                    // as it was. (No tombstone clear either — a REJECTED
+                    // deposit must not weaken merge suppression.)
                     return Ok(RelayPersistVerdict::CapExceeded);
                 }
+                // ZEB-924 (PR #667 R2, Greptile): acceptance is a fresh local
+                // decision to hold this key again — clear its expiry
+                // tombstone, else the persisted (live entry + stale
+                // tombstone) pair would let restore_expired delete the acked
+                // hold at the next boot. The flush below persists both files.
+                doc.clear_tombstone(&key);
                 doc.entries.insert(key, entry);
                 RelayPersistVerdict::Inserted
             }
@@ -1390,6 +1401,47 @@ mod tests {
     // serves_community: true iff opted-in AND self is_joined
     // Tests call the REAL ProdRelayDepositCtx / ProdRelayPullCtx methods.
     // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn redeposit_of_expired_key_clears_tombstone() {
+        // PR #667 R2 (Greptile): deposits are deliberately ungated, so a
+        // byte-identical redelivery re-inserts a key this replica once
+        // TTL-expired. persist_hold must clear the expiry tombstone on
+        // acceptance — otherwise the persisted (live entry + stale tombstone)
+        // pair lets restore_expired delete the acked hold at the next boot.
+        let c = space(0xCC);
+        let self_owner = [0x11; 16];
+        let recipient = [0xA0; 16];
+        let content = [0xB0; 32];
+        let key = RelayHoldDoc::key(&recipient, &content);
+        let doc = Arc::new(tokio::sync::Mutex::new(RelayHoldDoc::default()));
+        {
+            let mut d = doc.lock().await;
+            d.entries
+                .insert(key.clone(), hold_entry(recipient, [0x22; 16], c, vec![1]));
+            d.gc(0);
+            d.gc(crate::community_relay::RELAY_HOLD_TTL_MS + 1);
+            assert!(d.entries.is_empty(), "seeded entry TTL-expired");
+            assert!(d.expired_at_ms().contains_key(&key), "tombstone recorded");
+        }
+        let ctx = deposit_ctx(
+            self_owner,
+            Arc::clone(&doc),
+            optin_doc(c, true),
+            fake(&[(c, self_owner)]),
+        );
+        let v = ctx
+            .persist_hold(key.clone(), hold_entry(recipient, [0x22; 16], c, vec![1]))
+            .await
+            .unwrap();
+        assert!(matches!(v, RelayPersistVerdict::Inserted));
+        let d = doc.lock().await;
+        assert!(d.entries.contains_key(&key), "redelivery accepted");
+        assert!(
+            !d.expired_at_ms().contains_key(&key),
+            "re-acceptance cleared the tombstone"
+        );
+    }
 
     #[tokio::test]
     async fn deposit_ctx_serves_community_true_when_opted_in_and_self_joined() {

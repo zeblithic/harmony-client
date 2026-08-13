@@ -125,14 +125,23 @@ side-map changed length": tombstone ADDS always coincide with entry removal
 age-out/eviction shrinkage. A balanced add+remove in one sweep is masked by
 the delta but always accompanied by `changed = true` — documented at the site.
 
-### 2f. Deposit path deliberately ungated
+### 2f. Deposit path deliberately ungated — but acceptance clears the tombstone
 
-`persist_hold` does NOT consult tombstones. A fresh re-send mints a new key
+`persist_hold` does NOT gate on tombstones. A fresh re-send mints a new key
 (premise 7), so gating deposits would only affect byte-identical replays —
 and would permanently black-hole a legitimate re-delivery attempt of the same
 sealed bytes (e.g. sender retries a month-old undelivered message from its
 outbox). An ungated byte-replay re-arms at most one TTL window on this
 replica, bounded by the per-sender and global caps, and is then re-tombstoned.
+
+**Amendment (PR #667 R2, Greptile):** acceptance must also CLEAR the key's
+tombstone (`clear_tombstone`), on both the Inserted and Duplicate arms (the
+latter defensively, healing pre-fix disk state). Without it, the persisted
+pair (live entry + stale tombstone) lets `restore_expired` delete the
+accepted — and already-acked — hold at the next boot. A rejected
+(`CapExceeded`) deposit does NOT clear: a refusal must not weaken merge
+suppression. This preserves the invariant `merge_from` relies on: a
+tombstoned key is never live in `entries`.
 
 ### 2g. Constants (`community_relay.rs`)
 

@@ -307,6 +307,19 @@ impl RelayHoldDoc {
         self.entries.retain(|k, _| !tombstones.contains_key(k));
     }
 
+    /// ZEB-924 (PR #667 R2, Greptile): forget the expiry tombstone for `key`.
+    ///
+    /// Called by the DEPOSIT path (`persist_hold`) when it accepts a key —
+    /// deposits are deliberately ungated, so a byte-identical redelivery can
+    /// re-insert a key this replica once TTL-expired. Acceptance is a fresh
+    /// local decision to hold, so expiry memory must not outlive it: leaving
+    /// the stale tombstone beside the live entry would let
+    /// [`Self::restore_expired`] delete the accepted (and already-acked) hold
+    /// at the next boot.
+    pub fn clear_tombstone(&mut self, key: &str) {
+        self.expired_at_ms.remove(key);
+    }
+
     /// ZEB-924: age-out + cap so expiry memory cannot itself become unbounded
     /// state. Shared by [`Self::gc`] and [`Self::restore_expired`] so the
     /// retention/cap invariants hold unconditionally, not only after a sweep.
@@ -1285,6 +1298,42 @@ mod tests {
         assert!(
             !doc.expired_at_ms().values().any(|t| *t < 1_002),
             "the two OLDEST tombstones were evicted"
+        );
+    }
+
+    #[test]
+    fn redeposit_after_expiry_clears_tombstone_so_restart_keeps_the_hold() {
+        // PR #667 R2 (Greptile): an ungated re-deposit of the same sealed
+        // bytes re-inserts a tombstoned key; acceptance must also CLEAR the
+        // tombstone, else the persisted pair (live entry + stale tombstone)
+        // lets restore_expired delete the acked hold at the next boot.
+        let k = key_rr(1, 1);
+        let mut doc = RelayHoldDoc::default();
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(1, "a"), "relay", &[]),
+        );
+        doc.gc(0);
+        doc.gc(RELAY_HOLD_TTL_MS + 1);
+        assert!(doc.expired_at_ms().contains_key(&k));
+        // The deposit path re-accepts the same sealed bytes (same key).
+        doc.clear_tombstone(&k);
+        doc.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(2, "a"), "relay", &[]),
+        );
+        assert!(!doc.expired_at_ms().contains_key(&k), "tombstone cleared");
+        // Simulated restart: what persist saves is what restore receives.
+        let saved = doc.expired_at_ms().clone();
+        let mut rebooted = RelayHoldDoc::default();
+        rebooted.entries.insert(
+            k.clone(),
+            entry([1; 16], [9; 16], space(3), hlc(2, "a"), "relay", &[]),
+        );
+        rebooted.restore_expired(saved, RELAY_HOLD_TTL_MS + 2);
+        assert!(
+            rebooted.entries.contains_key(&k),
+            "accepted redelivery survives restart"
         );
     }
 
