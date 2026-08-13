@@ -1349,6 +1349,9 @@ pub async fn run(
     // shutdown drain can abort it (otherwise it would keep dialing peers after
     // `run()` returns — CodeRabbit, PR #392).
     let mut reconnect_supervisor_task: Option<tokio::task::JoinHandle<()>> = None;
+    // ZEB-928: the R4 admission controller loops forever like the supervisor; capture its
+    // handle so the shutdown drain aborts it too (CodeRabbit, PR #674).
+    let mut admission_controller_task: Option<tokio::task::JoinHandle<()>> = None;
 
     let mut config = zenoh::Config::default();
     // ZEB-809: LAN scouting (multicast AND gossip) is OFF by default.
@@ -1655,12 +1658,12 @@ pub async fn run(
                         let g = dm_outbox.lock().await;
                         g.community_signing_key.verifying_key().to_bytes()
                     };
-                    tokio::spawn(run_admission_controller(
+                    admission_controller_task = Some(tokio::spawn(run_admission_controller(
                         registry,
                         self_vk,
                         std::sync::Arc::clone(&admission_oracle),
                         handle.clone(),
-                    ));
+                    )));
                 }
             }
 
@@ -7421,6 +7424,10 @@ pub async fn run(
     // own, and left running it would keep dialing peers (and holding the zenoh
     // runtime) after the event loop returns.
     if let Some(handle) = reconnect_supervisor_task {
+        handle.abort();
+    }
+    // ZEB-928: stop the R4 admission controller's infinite poll loop too (CodeRabbit, PR #674).
+    if let Some(handle) = admission_controller_task {
         handle.abort();
     }
     let _ = session.close().await;
