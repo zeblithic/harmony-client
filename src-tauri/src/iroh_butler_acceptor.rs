@@ -396,6 +396,11 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
                         }
                     }
                 }
+                // ZEB-925 (spec §2f): defensively clear any expiry tombstone
+                // — a live entry must never coexist with its own tombstone
+                // (restore_expired would delete the acked entry at the next
+                // boot). Heals pre-ZEB-925 inconsistent disk state.
+                doc.clear_tombstone(&key);
                 DepositPersistVerdict::Duplicate
             } else {
                 // Caps INSIDE the doc-lock critical section: counting and
@@ -415,9 +420,15 @@ impl ButlerDepositCtx for ProdButlerDepositCtx {
                 let total = doc.entries.len();
                 if sender_pending >= INBOX_PER_SENDER_CAP || total >= INBOX_GLOBAL_CAP {
                     // Nothing inserted → nothing to flush; the doc is
-                    // exactly as it was.
+                    // exactly as it was — including any expiry tombstone for
+                    // this key (ZEB-925: a rejected deposit must not weaken
+                    // suppression).
                     return Ok(DepositPersistVerdict::CapExceeded);
                 }
+                // ZEB-925 (spec §2f): acceptance is a fresh local decision to
+                // hold — forget the key's expiry memory so restore_expired
+                // cannot delete the acked entry at the next boot.
+                doc.clear_tombstone(&key);
                 doc.entries.insert(key, entry);
                 DepositPersistVerdict::Inserted
             }
@@ -2338,6 +2349,142 @@ mod tests {
             ctx.store.lock().unwrap()[&key].invite_packet.as_deref(),
             Some(&[0x11, 0x22][..]),
             "existing invite never overwritten"
+        );
+    }
+
+    /// ZEB-925 (spec §2f): accepting a deposit clears the key's expiry
+    /// tombstone — on `Inserted` (acceptance is a fresh local decision to
+    /// hold) and `Duplicate` (defensive heal of a pre-fix inconsistent pair)
+    /// — while `CapExceeded` leaves suppression intact. Without the clear,
+    /// the persisted (live entry + stale tombstone) pair is deleted by
+    /// `restore_expired` at the next boot AFTER the butler acked the deposit
+    /// to the sender. Runs against the PRODUCTION `ProdButlerDepositCtx`
+    /// impl (the engine wiring cribbed from `dm_inbox_ingest`'s
+    /// engine-construction test).
+    #[tokio::test]
+    async fn deposit_acceptance_clears_expiry_tombstone() {
+        use crate::butler_deposit::INBOX_GLOBAL_CAP;
+        use crate::dm_inbox_persist::DmInboxPersist;
+        use crate::fleet_sync::{FleetSyncConfig, FleetSyncEngine, Merger, DEFAULT_DEBOUNCE_MS};
+        use crate::owner_state_crypto::KeyTree;
+        use tokio::sync::{mpsc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let kt = Arc::new(KeyTree::derive(&[0x55u8; 32]).expect("derive kt"));
+        let doc = Arc::new(Mutex::new(DmInboxDoc::default()));
+        let tracker = Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+            "dev-A".to_string(),
+        )));
+        let (out_tx, _out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let merger: Merger<DmInboxDoc> = Arc::new(|local, remote| local.merge_from(remote));
+        let (nudge_tx, _nudge_rx) = mpsc::channel::<()>(1);
+        let engine = Arc::new(FleetSyncEngine::<DmInboxDoc>::new(FleetSyncConfig {
+            keys: Some(crate::owner_state_crypto::FleetKeySet::new(kt)),
+            device_id: "dev-A".to_string(),
+            state: Arc::clone(&doc),
+            merger,
+            replay_tracker: Arc::clone(&tracker),
+            content_store: Arc::new(crate::content_store::InMemoryStub::default()),
+            publisher_tx: out_tx,
+            subscriber_rx: in_rx,
+            persist: Arc::new(DmInboxPersist {
+                doc_path: dir.path().join("dm_inbox.cbor"),
+                replay_path: dir.path().join("dm_inbox_replay.cbor"),
+                first_observed_path: dir.path().join("dm_inbox_first_observed.cbor"),
+                expired_path: dir.path().join("dm_inbox_expired.cbor"),
+            }),
+            lookup_key_tag: b"dm-inbox-v1",
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            publish_seen: true,
+            on_applied: None,
+            sibling_acks: Arc::new(Mutex::new(harmony_crdt_sync::MonotoneMap::new())),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+        }));
+        let ctx = ProdButlerDepositCtx {
+            self_owner: [0x01; 16],
+            device_id: "dev-A".to_string(),
+            crdt_state: Arc::new(Mutex::new(crate::owner_state_crdt::OwnerState::default())),
+            device_x25519_priv: zeroize::Zeroizing::new([0u8; 32]),
+            dm_inbox_doc: Arc::clone(&doc),
+            dm_inbox_tracker: Arc::clone(&tracker),
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            dm_inbox_engine: Arc::clone(&engine),
+            ingest_nudge: nudge_tx.downgrade(),
+        };
+
+        let key = DmInboxDoc::key(&[0xAB; 16], &[0xCD; 32]);
+        let e = filler_entry([0x22; 16]);
+
+        // (1) Inserted arm: tombstoned key redeposited → accepted, tombstone
+        //     cleared.
+        doc.lock()
+            .await
+            .restore_expired([(key.clone(), 5u64)].into_iter().collect(), 10);
+        assert_eq!(
+            ctx.persist_entry(key.clone(), e.clone()).await.unwrap(),
+            DepositPersistVerdict::Inserted
+        );
+        {
+            let guard = doc.lock().await;
+            assert!(guard.entries.contains_key(&key), "entry accepted");
+            assert!(
+                !guard.expired_at_ms().contains_key(&key),
+                "Inserted clears the tombstone"
+            );
+        }
+
+        // (2) Duplicate arm: emulate the pre-fix inconsistent
+        //     (live entry + stale tombstone) disk pair, then redeliver — the
+        //     Duplicate arm must heal it.
+        {
+            let mut guard = doc.lock().await;
+            guard.restore_expired([(key.clone(), 5u64)].into_iter().collect(), 10);
+            assert!(
+                !guard.entries.contains_key(&key),
+                "restore_expired removed the tombstoned entry"
+            );
+            guard.entries.insert(key.clone(), e.clone());
+            assert!(
+                guard.expired_at_ms().contains_key(&key),
+                "stale pair seeded"
+            );
+        }
+        assert_eq!(
+            ctx.persist_entry(key.clone(), e.clone()).await.unwrap(),
+            DepositPersistVerdict::Duplicate
+        );
+        assert!(
+            !doc.lock().await.expired_at_ms().contains_key(&key),
+            "Duplicate heals the stale tombstone"
+        );
+
+        // (3) CapExceeded arm: a DIFFERENT tombstoned key rejected at a full
+        //     inbox keeps its tombstone — rejection must not weaken
+        //     suppression. Fill with UNIQUE senders so only the global cap
+        //     trips (per-sender stays at 1 each).
+        let key_full = DmInboxDoc::key(&[0xEE; 16], &[0xEF; 32]);
+        {
+            let mut guard = doc.lock().await;
+            // Seed the tombstone while its key has no entry (no-op removal).
+            let mut with_existing = guard.expired_at_ms().clone();
+            with_existing.insert(key_full.clone(), 5u64);
+            guard.restore_expired(with_existing, 10);
+            for i in 0..INBOX_GLOBAL_CAP {
+                let mut filler = filler_entry([(i % 251) as u8 + 1; 16]);
+                filler.sender_owner[15] = (i / 251) as u8;
+                guard.entries.insert(format!("fill:{i:05}"), filler);
+            }
+        }
+        assert_eq!(
+            ctx.persist_entry(key_full.clone(), filler_entry([0x33; 16]))
+                .await
+                .unwrap(),
+            DepositPersistVerdict::CapExceeded
+        );
+        assert!(
+            doc.lock().await.expired_at_ms().contains_key(&key_full),
+            "CapExceeded must NOT weaken suppression"
         );
     }
 

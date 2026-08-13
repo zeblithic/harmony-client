@@ -361,6 +361,8 @@ impl ButlerDepositCtx for TestButlerCtx {
         let verdict = {
             let mut doc = self.doc.lock().await;
             if doc.entries.contains_key(&key) {
+                // ZEB-925 (spec §2f): defensive tombstone clear, as in prod.
+                doc.clear_tombstone(&key);
                 DepositPersistVerdict::Duplicate
             } else {
                 let sender_pending = doc
@@ -371,6 +373,8 @@ impl ButlerDepositCtx for TestButlerCtx {
                 if sender_pending >= INBOX_PER_SENDER_CAP || doc.entries.len() >= INBOX_GLOBAL_CAP {
                     return Ok(DepositPersistVerdict::CapExceeded);
                 }
+                // ZEB-925 (spec §2f): acceptance clears the expiry tombstone.
+                doc.clear_tombstone(&key);
                 doc.entries.insert(key, entry);
                 DepositPersistVerdict::Inserted
             }
