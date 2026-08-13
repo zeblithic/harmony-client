@@ -68,8 +68,7 @@ impl NodeHandle {
                     .with_context(|| format!("creating log dir {}", dir.display()))?;
                 let out =
                     std::fs::File::create(dir.join(format!("{}.stdout.log", config.profile)))?;
-                let err =
-                    std::fs::File::create(dir.join(format!("{}.stderr.log", config.profile)))?;
+                let err = std::fs::File::create(dir.join(stderr_log_filename(&config.profile)))?;
                 (Stdio::from(out), Stdio::from(err))
             }
             None => (Stdio::null(), Stdio::null()),
@@ -282,6 +281,13 @@ impl Drop for NodeHandle {
     }
 }
 
+/// Single source of the per-profile stderr capture filename — used by BOTH the
+/// spawn-side writer and `stderr_log_contains`, so the two can't drift
+/// (CodeRabbit #671).
+fn stderr_log_filename(profile: &str) -> String {
+    format!("{profile}.stderr.log")
+}
+
 /// Remove any stale `api/port` + `api/token` discovery files under `home` left
 /// by a previously-killed process, so a relaunch waits for the new process's
 /// fresh files instead of latching onto the dead one's port/token.
@@ -356,10 +362,12 @@ impl NodeHandle {
             .log_dir
             .as_ref()
             .context("stderr_log_contains requires log_dir capture")?;
-        let path = dir.join(format!("{}.stderr.log", self.config.profile));
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        Ok(text.contains(needle))
+        let path = dir.join(stderr_log_filename(&self.config.profile));
+        // The file is being written live: a tail cut mid-UTF-8 must not turn a
+        // poll tick into a hard error (read_to_string -> InvalidData would
+        // abort a poll_until through `?`), so decode lossily. (CodeRabbit #671.)
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        Ok(String::from_utf8_lossy(&bytes).contains(needle))
     }
 
     /// Open a fresh event subscription. The caller owns the receiver + task.

@@ -1373,6 +1373,11 @@ pub async fn run(
     // start HLC-stamping every data message on a router-mode node — pinning
     // false in BOTH modes keeps the wire identical to today regardless of mode.
     let zenoh_mode = zenoh_session_mode();
+    // Logged unconditionally so a test (or operator) has POSITIVE evidence of
+    // the mode that actually applied — e2e s14 asserts this exact line per
+    // node, so a knob regression fails as "mode never engaged" instead of
+    // masquerading as a transport timeout (CodeRabbit #671).
+    tracing::info!("ZEB-912: zenoh session mode: {zenoh_mode}");
     if let Err(e) = config.insert_json5("mode", &format!("\"{zenoh_mode}\"")) {
         let e = format!("zenoh config error (mode): {e}");
         let _ = ready_tx.send(Err(e));

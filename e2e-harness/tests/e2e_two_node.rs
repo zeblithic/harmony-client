@@ -3399,6 +3399,20 @@ async fn s14_router_mode_severed_pair_delivery() {
         .await
         .expect("c mint");
 
+    // --- Positive evidence router mode ENGAGED on every node (same discipline
+    //     as the sever-evidence assert below): a knob regression must fail
+    //     here as "mode never engaged", not as a delivery timeout downstream
+    //     (CodeRabbit #671).
+    for (node, who) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+        poll_until(Duration::from_secs(30), || async {
+            Ok(node
+                .stderr_log_contains("ZEB-912: zenoh session mode: router")?
+                .then_some(()))
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{who} MUST report a router-mode zenoh session: {e}"));
+    }
+
     let a_owner = owner_id(&a).await;
     let b_owner = owner_id(&b).await;
     let c_owner = owner_id(&c).await;
