@@ -10,6 +10,18 @@
 
 **Design doc:** `docs/superpowers/specs/2026-08-13-zeb914-bounded-degree-topology-design.md`.
 
+> **Post-review addendum (PR #673).** The shipped implementation evolved from the
+> TDD snippets below in two review-driven ways; where they differ, the code + the
+> updated design doc are authoritative:
+> 1. **Batched API** (CodeAnt/CodeRabbit): `ring_order` (sort once) and
+>    `neighbors_on_ring` (select from a pre-sorted ring) are public; `community_neighbors`
+>    wraps them so callers computing many nodes' sets don't re-sort per call.
+> 2. **Powers-of-two offsets, no `degree_budget`** (Greptile P1): the offset set is
+>    `{1,2,4,…,≤N/2}` (fixed ratio 2) for genuine O(log N) diameter; degree is
+>    therefore `~2·log₂N`, a function of N, so the `degree_budget` parameter and
+>    `TOPOLOGY_DEFAULT_DEGREE` const in the snippets below were removed. A fixed
+>    offset *count* (as originally drafted) gives polynomial O(N^¼) diameter.
+
 ## Global Constraints
 
 - **Unwired.** The module must have **no call sites** in this plan. It is registered in `lib.rs` so it compiles and tests, but nothing calls `community_neighbors`. Wiring is a follow-up ticket.

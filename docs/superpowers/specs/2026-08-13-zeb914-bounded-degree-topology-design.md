@@ -27,10 +27,13 @@ hot-path wiring is specified here but built in a follow-up ticket.
   linear (~0.6 KB/node) and idle CPU at zero to N=200. Its *only* cost was
   **diameter-proportional convergence latency**: ~4.6 s reconvergence at N=200,
   because a ring's diameter is ~N/2 ≈ 100 hops.
-- **R4's target** (recorded on ZEB-914): a small constant degree ~6–10, tuned to
-  **shrink the diameter** that drives the ring's multi-second reconvergence — the
-  tuning metric is membership-change reconvergence latency at N≈200, *not* flood
-  (bounded degree solves flood at any small constant).
+- **R4's target** (recorded on ZEB-914 as "degree ~6–10"): **shrink the diameter**
+  that drives the ring's multi-second reconvergence, without giving up bounded
+  degree. The R4 review corrected the naïve reading of this: genuine O(log N)
+  diameter is not achievable at a fixed constant degree with a circulant — it
+  costs `~2·log₂N` degree (≈14 at N=200). That is still small and bounded (flood
+  is linear in degree, so 14 is as cheap as 10 for the flood problem), so we take
+  the log diameter. See "Degree and diameter" below.
 
 ## The corrected architecture (why the naive framing is wrong)
 
@@ -116,8 +119,10 @@ in an offset set `O`:
 - **Protected lattice:** `o = 1` is always present. The union of all ±1 edges is a
   Hamiltonian cycle → the graph is **connected by construction**, always. This is
   Freenet's protected successor/predecessor lattice, made exact.
-- **Fingers:** the larger offsets (geometrically spaced powers across
-  `[1, ⌊N/2⌋]`) are the long links that give **O(log N) diameter**.
+- **Fingers:** the larger offsets are the powers of two up to `⌊N/2⌋`
+  (`{2, 4, 8, …}`) — the long links that give **O(log N) diameter** at O(log N)
+  degree (see "Degree and diameter" below for why a fixed *count* of offsets
+  would instead give polynomial diameter).
 
 Why circulant-in-rank rather than hash-space Chord fingers:
 
@@ -131,36 +136,50 @@ Why circulant-in-rank rather than hash-space Chord fingers:
 - The one cost — a roster change shifts ranks and perturbs many neighbor sets
   network-wide (vs hash-space Chord's O(log N) per join) — is **neutralized by
   the identity-fixed model**: roster changes are rare, and each node just
-  recomputes its own ~10 neighbors locally from the CRDT it already holds, with
-  no coordination. (Hash-space Chord remains the fallback if churn ever proves
-  frequent; noted, not built.)
+  recomputes its own ~2·log₂N neighbors locally from the CRDT it already holds,
+  with no coordination. (Hash-space Chord remains the fallback if churn ever
+  proves frequent; noted, not built.)
 
-### Degree ↔ diameter tuning
+### Degree and diameter (there is no free tuning knob)
 
-The offset set `O` is the knob. Given a `degree_budget` D, pick `⌊D/2⌋` offsets,
-always including 1, geometrically spaced across `[1, ⌊N/2⌋]` so greedy routing
-composes them to cover the ring. Trading D against diameter:
+The offset set is `O = {1, 2, 4, …, 2^k}`, the powers of two with `2^k ≤ N/2`.
+This is **Chord's law**, and it corrects an error in an earlier draft of this
+spec (surfaced by the R4 review, Greptile P1): the ratio between offsets is fixed
+at 2, so the *count* — and hence the degree — grows as `⌊log₂(N/2)⌋ + 1`, and the
+diameter is genuinely **O(log N)**.
 
-- Full power set `O = {1,2,4,…,2^k}` with `2^k ≈ N/2`: degree `2⌈log₂N⌉` (≈14 at
-  N=200 devices), diameter ≈ `⌈log₂N⌉` (~7 hops).
-- Subsampled, D=10 (5 offsets spanning to N/2): diameter ~5–10 hops.
+The tempting alternative — fix the degree at a small constant D (say 10 → 5
+offsets) and geometrically space them to span the ring — does **not** work: with
+a fixed offset *count*, the ratio grows as `N^(1/(D/2−1))`, and bridging each
+ratio-gap costs that many hops, so the diameter becomes **polynomial**
+(`O(N^(1/(D/2−1))) = O(N^¼)` at D=10), not logarithmic. For a structured,
+greedy-routable graph you cannot have both a fixed small degree and log diameter;
+log diameter costs `~2·log₂N` degree. We take the log diameter (decided with
+Jake), because it is the property that actually scales and the degree cost is
+negligible:
 
-**Payoff:** at N=200, diameter drops from the ring's ~100 hops to ~5–12, so
+| N (devices) | offsets | degree (`2·log₂N`) | diameter |
+|---|---|---|---|
+| 200 | 7 | 14 | ≤ 7 |
+| 400 | 8 | 16 | ≤ 8 |
+| 4000 | 11 | 22 | ≤ 11 |
+
+Degree ~14–16 at the product ceiling is small and bounded (Freenet runs 25–200;
+the R3 sounding showed flood is linear in degree, so 14–16 is as cheap as 10 for
+the flood problem R4 exists to solve).
+
+**Payoff:** at N=200, diameter drops from the ring's ~100 hops to ≤ 7, so
 reconvergence drops from ~4.6 s to an estimated **sub-second** — the quantified
-R4 win. The engine's output feeds directly back into the R3 probe to verify this
-numerically (plan task).
+R4 win. The engine's output feeds back into the R3 probe to verify this
+numerically (harness task, ZEB-928).
 
-**A note on N (device-count, not member-count).** The topology math above uses
-`N` = active *device* count, which is what the ring is built over. The R3
-sounding's `N=200` was likewise device/session count. The **product ceiling of
-200 is members**, so a full 200-member community with multi-device users may
-reach `N ≈ 300–400` devices — beyond the sounding's measured range. This barely
-moves the circulant: `⌈log₂400⌉ = 9` vs `⌈log₂200⌉ = 8`, one extra hop. Log
-scaling is exactly why bounded degree is the right structure — it absorbs the
-device multiplier the ring's linear diameter could not.
-
-**Default:** `degree_budget = 10` (top of the R3-recorded ~6–10 target; the
-full power set that minimises diameter would be ~14).
+**A note on N (device-count, not member-count).** `N` above is the active
+*device* count — what the ring is built over. The R3 sounding's `N=200` was
+likewise device/session count. The **product ceiling of 200 is members**, so a
+full 200-member community with multi-device users may reach `N ≈ 300–400`
+devices. Because degree and diameter are both logarithmic, that device multiplier
+costs almost nothing: `⌈log₂400⌉ = 9` vs `⌈log₂200⌉ = 8`, one extra hop and two
+extra links.
 
 ### Cross-community composition
 
@@ -188,18 +207,17 @@ keys and decoupled from the roster type.
 ### Interface
 
 ```rust
-/// Target neighbor count above the full-mesh threshold.
-pub const TOPOLOGY_DEFAULT_DEGREE: usize = 10;
 /// Below this many active devices, a community stays full mesh.
 pub const FULL_MESH_THRESHOLD: usize = 32;
 
 /// Deterministic bounded-degree neighbor selection for one community's device ring.
+/// Degree is ~2·log₂N above the threshold (powers-of-two offsets — see above); it
+/// is a function of N, so there is no degree parameter.
 ///
 /// - `devices`: all active (Joined, post-revocation) enrolled device keys in the
 ///   community, INCLUDING `self_device`.
 /// - `self_device`: this node's enrolled device key; must be in `devices`.
 /// - `community_salt`: community id bytes — decorrelates ring positions per community.
-/// - `degree_budget`: target max neighbors above the full-mesh threshold.
 ///
 /// Returns the subset of `devices` this node should keep persistent links to
 /// (never includes `self_device`). Below `FULL_MESH_THRESHOLD` devices, returns
@@ -209,12 +227,16 @@ pub fn community_neighbors(
     devices: &BTreeSet<[u8; 32]>,
     self_device: &[u8; 32],
     community_salt: &[u8],
-    degree_budget: usize,
 ) -> BTreeSet<[u8; 32]>;
+
+/// For callers computing many nodes' sets: sort the ring once, then select per
+/// node — avoids the O(N log N) re-sort `community_neighbors` pays per call.
+pub fn ring_order(devices: &BTreeSet<[u8; 32]>, community_salt: &[u8]) -> Vec<[u8; 32]>;
+pub fn neighbors_on_ring(ring: &[[u8; 32]], self_device: &[u8; 32]) -> BTreeSet<[u8; 32]>;
 ```
 
-Position hashing uses the crate's existing `harmony_crypto::hash` (BLAKE3/SHA-256
-truncated to a u64 for the ring coordinate); ties broken by `device_key` bytes.
+Position hashing uses the crate's existing `harmony_crypto::hash::blake3_hash`,
+first 8 bytes as a `u64` ring coordinate; ties broken by `device_key` bytes.
 
 ### Properties (the test suite — this is a TDD deliverable)
 
@@ -222,11 +244,13 @@ truncated to a u64 for the ring coordinate); ties broken by `device_key` bytes.
 2. **Membership:** `result ⊆ devices`.
 3. **Symmetry:** ∀ a,b ∈ devices: `b ∈ neighbors(a) ⟺ a ∈ neighbors(b)`. *(Core
    correctness invariant.)*
-4. **Degree bound:** above threshold, `|result| ≤ degree_budget`; below, `= |devices|−1`.
+4. **Degree bound:** above threshold, `|result| ≤ 2·|offsets| = 2·(⌊log₂(N/2)⌋+1)`;
+   below, `= |devices|−1`. Plus: degree grows *logarithmically* with N (64→512
+   devices adds ~6 neighbors, not ~8×) — the direct proof of the powers-of-two fix.
 5. **Connectivity:** the graph over all devices is connected (BFS reaches all) —
-   guaranteed by the ±1 lattice; tested across N and degree budgets.
-6. **Diameter:** measured graph diameter ≤ the expected O(log N) bound for the
-   chosen degree (regression-style assertion at representative N).
+   guaranteed by the ±1 lattice; tested across N.
+6. **Diameter:** measured graph diameter ≤ an `O(log N)` bound, asserted across
+   N=64…512 so the *scaling* (not just a single point) is pinned logarithmic.
 7. **Determinism:** identical inputs → identical output; independent of insertion
    order.
 8. **Per-community decorrelation:** different `community_salt` yields a
