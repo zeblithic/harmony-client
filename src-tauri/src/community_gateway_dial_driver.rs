@@ -159,7 +159,7 @@ impl BeaconResolver for ProdBeaconResolver {
 /// empty-address-book node whose sole reachable beacon is its own other device.
 /// `enrolled_device_keys` is already post-revocation in materialized state, so a
 /// revoked sibling key is absent and still rejected.
-fn enrolled_keys_from_members(
+pub(crate) fn enrolled_keys_from_members(
     members: &BTreeMap<OwnerAddr, crate::community_membership::MemberState>,
 ) -> HashSet<[u8; 32]> {
     members

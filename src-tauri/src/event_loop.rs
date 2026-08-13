@@ -980,6 +980,75 @@ mod zid_node_cache_tests {
     }
 }
 
+/// ZEB-928 (R4): membership-delta controller for the bounded-degree admission oracle.
+///
+/// Polls each joined community's O(1) [`materialized_version`] and, only when one
+/// advances (or a community is left), recomputes the union of chosen ring neighbors
+/// (`community_topology`) into the admitted device-key set and publishes it, then sweeps
+/// so the filtered re-arm dials exactly the admitted, already-resolved neighbors. Rosters
+/// for unchanged communities stay cached, so the O(N log N) recompute is delta-gated, not
+/// per-tick. Spawned once at session open in router mode with an owner identity present.
+///
+/// [`materialized_version`]: crate::community_state_crdt::CommunityState::materialized_version
+async fn run_admission_controller(
+    registry: std::sync::Arc<crate::community_state_sync::CommunitySyncRegistry>,
+    self_vk: [u8; 32],
+    oracle: std::sync::Arc<crate::admission_oracle::AdmissionOracle>,
+    supervisor: crate::reconnect_supervisor::SupervisorHandle,
+) {
+    use std::collections::{BTreeMap, BTreeSet};
+    // Per-community (last-seen materialized version, active enrolled device keys). The
+    // admitted set is the union over ALL joined communities, so unchanged communities
+    // stay cached and only version-advanced ones re-read `materialized()`.
+    let mut cache: BTreeMap<crate::owner_state_types::SpaceId, (u64, BTreeSet<[u8; 32]>)> =
+        BTreeMap::new();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let ids = registry.spawned_community_ids().await;
+        let id_set: BTreeSet<crate::owner_state_types::SpaceId> = ids.iter().copied().collect();
+        let mut changed = false;
+        let before = cache.len();
+        cache.retain(|k, _| id_set.contains(k));
+        if cache.len() != before {
+            changed = true; // left one or more communities → the union shrank
+        }
+        for id in &ids {
+            let Some(engine) = registry.engine_arc(id).await else {
+                continue;
+            };
+            let state = engine.state();
+            let g = state.lock().await;
+            let ver = g.materialized_version();
+            if cache.get(id).map(|(v, _)| *v) == Some(ver) {
+                continue; // unchanged since the last recompute
+            }
+            let mat = g.materialized(engine.admin_addr());
+            drop(g);
+            let devices: BTreeSet<[u8; 32]> =
+                crate::community_gateway_dial_driver::enrolled_keys_from_members(&mat.members)
+                    .into_iter()
+                    .collect();
+            cache.insert(*id, (ver, devices));
+            changed = true;
+        }
+        if changed {
+            let communities: Vec<(BTreeSet<[u8; 32]>, Vec<u8>)> = cache
+                .iter()
+                .map(|(id, (_, devs))| (devs.clone(), id.0.to_vec()))
+                .collect();
+            oracle.publish_admitted(crate::admission_oracle::compute_admitted(
+                &communities,
+                &self_vk,
+            ));
+            // Re-arm: the oracle-filtered sweep dials exactly the admitted, already-
+            // resolved neighbors and drops the rest.
+            supervisor.kick_sweep();
+        }
+    }
+}
+
 /// Run the NodeRuntime event loop as a background task.
 ///
 /// Sends `Ok(())` on `ready_tx` once UDP + Zenoh + startup actions are
@@ -1566,6 +1635,34 @@ pub async fn run(
             );
         } else {
             resolver.set_supervisor(handle.clone());
+
+            // ZEB-928 (R4): install the bounded-degree admission oracle on both the
+            // supervisor (reads it at kick / do_sweep / parole) and the resolver (feeds
+            // it verified node_id→enrolled_key bindings). Router mode enables filtering;
+            // peer mode installs a disabled oracle that admits everything, so behavior is
+            // unchanged. Spawn the membership-delta controller only when filtering is on
+            // AND an owner identity is present (→ a self device key + a registry).
+            let admission_oracle = std::sync::Arc::new(
+                crate::admission_oracle::AdmissionOracle::new(zenoh_session_mode() == "router"),
+            );
+            handle.set_admission_oracle(std::sync::Arc::clone(&admission_oracle));
+            resolver.set_admission_oracle(std::sync::Arc::clone(&admission_oracle));
+            if admission_oracle.enabled() {
+                if let (Some(registry), Some(dm_outbox)) =
+                    (community_registry.clone(), dm_outbox.as_ref())
+                {
+                    let self_vk = {
+                        let g = dm_outbox.lock().await;
+                        g.community_signing_key.verifying_key().to_bytes()
+                    };
+                    tokio::spawn(run_admission_controller(
+                        registry,
+                        self_vk,
+                        std::sync::Arc::clone(&admission_oracle),
+                        handle.clone(),
+                    ));
+                }
+            }
 
             // ZEB-621: install the supervisor sweep hook onto the address-change
             // fan-out — the `SupervisorHandle` exists only inside this block. A
