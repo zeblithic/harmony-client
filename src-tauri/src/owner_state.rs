@@ -16,6 +16,14 @@ use serde::{Deserialize, Serialize};
 pub struct OwnerStateView {
     pub owner_id: String,
     pub owner_display_name: String,
+    /// ZEB-921: display name of the currently-cached published owner card —
+    /// what peers can actually query from this node right now (the same
+    /// publisher cache backs the periodic refresh and the ZEB-884
+    /// queryable). `None` when nothing is served this run (node down, never
+    /// published, or the pre-boot-publish window). Distinct from
+    /// `owner_display_name`, which is the local DEVICE label.
+    #[serde(default)]
+    pub card_display_name: Option<String>,
     pub devices: Vec<DeviceView>,
     pub can_back_up: bool,
     /// ZEB-668 S5: the fleet's current KeyTree epoch (0 = never bumped).
@@ -2485,6 +2493,8 @@ mod tests {
         let view = OwnerStateView {
             owner_id: "owner-hex".into(),
             owner_display_name: "zeblith".into(),
+            // ZEB-921: non-default value so the rename is pinned.
+            card_display_name: Some("Zeb921Card".into()),
             devices: vec![DeviceView {
                 device_id: "device-hex".into(),
                 display_name: "KRILE".into(),
@@ -2540,6 +2550,11 @@ mod tests {
         assert!(
             json.contains("\"selfClockRegressedSkewSecs\":7200"),
             "expected selfClockRegressedSkewSecs:7200, got {json}"
+        );
+        // ZEB-921: non-default value above pins the rename.
+        assert!(
+            json.contains("\"cardDisplayName\":\"Zeb921Card\""),
+            "expected cardDisplayName:Zeb921Card, got {json}"
         );
         assert!(
             json.contains("\"canBackUp\""),

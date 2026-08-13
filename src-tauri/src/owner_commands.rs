@@ -399,6 +399,7 @@ pub(crate) struct QuorumJoin {
 fn build_owner_state_view(
     loaded: &LoadedOwnerState,
     this_device_name: String,
+    card_display_name: Option<String>,
     fleet: FleetJoin,
     quorum: QuorumJoin,
 ) -> OwnerStateView {
@@ -590,6 +591,7 @@ fn build_owner_state_view(
     OwnerStateView {
         owner_id: hex::encode(loaded.state.owner_id),
         owner_display_name: this_device_name,
+        card_display_name,
         devices,
         can_back_up: loaded.master_seed.is_some(),
         fleet_epoch: fleet.carrier_epoch,
@@ -712,7 +714,7 @@ pub(crate) async fn get_owner_state_inner(
     // runs with an owner loaded). When resident, the view renders from the
     // replicated trust doc and a liveness refresh reaches siblings through
     // the trust engine instead of only a silent local file write.
-    let (trust_resident, quorum_doc_arc) = {
+    let (trust_resident, quorum_doc_arc, card_publisher) = {
         let g = state
             .lock()
             .map_err(|e| format!("NodeState poisoned: {e}"))?;
@@ -720,7 +722,11 @@ pub(crate) async fn get_owner_state_inner(
             (Some(doc), Some(engine)) => Some((doc, engine)),
             _ => None,
         };
-        (trust, g.owner_quorum_doc.clone())
+        (
+            trust,
+            g.owner_quorum_doc.clone(),
+            g.profile_card_publisher.clone(),
+        )
     };
     // ZEB-677 S3: quorum-request snapshot for the co-sign surfaces. Empty
     // join when the node is down — no resident doc, no ceremony surface.
@@ -733,6 +739,21 @@ pub(crate) async fn get_owner_state_inner(
                 .unwrap_or(0),
         },
         None => QuorumJoin::default(),
+    };
+    // ZEB-921: snapshot the cached published-card name (async context — the
+    // cache is a tokio Mutex). The same handle backs the periodic refresh
+    // and the ZEB-884 queryable, so this reports exactly what a peer could
+    // query from us right now; `None` = nothing served this run.
+    let card_display_name = match card_publisher {
+        Some(p) => p
+            .latest_handle()
+            .lock()
+            .await
+            .clone()
+            .and_then(|(_topic, bytes)| {
+                crate::profile_card_broadcast::decode_card_display_name(&bytes)
+            }),
+        None => None,
     };
     let identity_dir = resolve_identity_dir()?;
     let display_name = "this device".to_string();
@@ -777,6 +798,7 @@ pub(crate) async fn get_owner_state_inner(
         return Ok(Some(build_owner_state_view(
             &loaded,
             display_name,
+            card_display_name,
             fleet,
             quorum,
         )));
@@ -825,6 +847,7 @@ pub(crate) async fn get_owner_state_inner(
         Ok(Some(build_owner_state_view(
             &loaded,
             display_name,
+            card_display_name,
             fleet,
             quorum,
         )))
@@ -1629,6 +1652,7 @@ where
             state: build_owner_state_view(
                 &loaded,
                 display_name,
+                None,
                 FleetJoin::default(),
                 QuorumJoin::default(),
             ),
@@ -2947,6 +2971,7 @@ mod tests {
         let view = build_owner_state_view(
             &loaded,
             "this device".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -2992,6 +3017,7 @@ mod tests {
         let view2 = build_owner_state_view(
             &loaded,
             "this device".into(),
+            None,
             FleetJoin {
                 pinned,
                 ..Default::default()
@@ -3044,8 +3070,13 @@ mod tests {
         fleet.rows.insert(dev_vk_hex.clone(), (123_456, ep));
         fleet.connected_eps.insert(ep);
 
-        let view =
-            build_owner_state_view(&loaded, "this device".into(), fleet, QuorumJoin::default());
+        let view = build_owner_state_view(
+            &loaded,
+            "this device".into(),
+            None,
+            fleet,
+            QuorumJoin::default(),
+        );
         let d = view
             .devices
             .iter()
@@ -3062,6 +3093,7 @@ mod tests {
         let view = build_owner_state_view(
             &loaded,
             "this device".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -3069,6 +3101,30 @@ mod tests {
         assert_eq!(d.pet_name, None);
         assert_eq!(d.last_seen_ms, None);
         assert!(!d.connected_now);
+    }
+
+    /// ZEB-921: the published-card-name snapshot is threaded verbatim into
+    /// the view; None stays None (nothing served this run).
+    #[test]
+    fn view_threads_card_display_name() {
+        let loaded = minted_loaded_state();
+        let view = build_owner_state_view(
+            &loaded,
+            "this device".into(),
+            Some("Zeb921Probe".into()),
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        assert_eq!(view.card_display_name.as_deref(), Some("Zeb921Probe"));
+
+        let view_none = build_owner_state_view(
+            &loaded,
+            "this device".into(),
+            None,
+            FleetJoin::default(),
+            QuorumJoin::default(),
+        );
+        assert_eq!(view_none.card_display_name, None);
     }
 
     #[test]
@@ -3081,8 +3137,13 @@ mod tests {
         let dev_vk_hex = fixture_vk_hex(&loaded);
         let mut fleet = FleetJoin::default();
         fleet.petnames.insert(dev_vk_hex.clone(), String::new());
-        let view =
-            build_owner_state_view(&loaded, "this device".into(), fleet, QuorumJoin::default());
+        let view = build_owner_state_view(
+            &loaded,
+            "this device".into(),
+            None,
+            fleet,
+            QuorumJoin::default(),
+        );
         let d = view
             .devices
             .iter()
@@ -3101,8 +3162,13 @@ mod tests {
 
         let mut fleet = FleetJoin::default();
         fleet.petnames.insert(dev_vk_hex.clone(), "   ".into());
-        let view =
-            build_owner_state_view(&loaded, "this device".into(), fleet, QuorumJoin::default());
+        let view = build_owner_state_view(
+            &loaded,
+            "this device".into(),
+            None,
+            fleet,
+            QuorumJoin::default(),
+        );
         let d = view
             .devices
             .iter()
@@ -3118,8 +3184,13 @@ mod tests {
         fleet
             .petnames
             .insert(dev_vk_hex.clone(), "  KRILE  ".into());
-        let view =
-            build_owner_state_view(&loaded, "this device".into(), fleet, QuorumJoin::default());
+        let view = build_owner_state_view(
+            &loaded,
+            "this device".into(),
+            None,
+            fleet,
+            QuorumJoin::default(),
+        );
         let d = view
             .devices
             .iter()
@@ -4258,6 +4329,7 @@ mod revoke_tests {
         let view = build_owner_state_view(
             &with_seed,
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4265,6 +4337,7 @@ mod revoke_tests {
         let view2 = build_owner_state_view(
             &masterless_loaded(&state, &a_sk),
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4280,6 +4353,7 @@ mod revoke_tests {
         let view = build_owner_state_view(
             &masterless_loaded(&state, &a_sk),
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4298,6 +4372,7 @@ mod revoke_tests {
         let view_seed = build_owner_state_view(
             &with_seed,
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4314,6 +4389,7 @@ mod revoke_tests {
         let view_lonely = build_owner_state_view(
             &masterless_loaded(&lonely, &a_sk),
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4334,6 +4410,7 @@ mod revoke_tests {
         let view = build_owner_state_view(
             &masterless_loaded(&state, &a_sk),
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4361,6 +4438,7 @@ mod revoke_tests {
         let view_seed = build_owner_state_view(
             &with_seed,
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4374,6 +4452,7 @@ mod revoke_tests {
         let view_stale = build_owner_state_view(
             &masterless_loaded(&stale_c, &a_sk),
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4490,6 +4569,7 @@ mod revoke_tests {
         let view = build_owner_state_view(
             &masterless_loaded(&state, &a_sk),
             "d".into(),
+            None,
             FleetJoin::default(),
             quorum,
         );
@@ -4535,6 +4615,7 @@ mod revoke_tests {
         let view2 = build_owner_state_view(
             &masterless_loaded(&state, &a_sk),
             "d".into(),
+            None,
             FleetJoin::default(),
             expired_arm,
         );
@@ -4557,6 +4638,7 @@ mod revoke_tests {
         let healthy = build_owner_state_view(
             &masterless_loaded(&state, &a_sk),
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4572,6 +4654,7 @@ mod revoke_tests {
         let regressed = build_owner_state_view(
             &masterless_loaded(&state, &a_sk),
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4600,6 +4683,7 @@ mod revoke_tests {
         let view = build_owner_state_view(
             &loaded,
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4627,6 +4711,7 @@ mod revoke_tests {
         let view = build_owner_state_view(
             &loaded,
             "d".into(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );
@@ -4638,7 +4723,8 @@ mod revoke_tests {
             carrier_bump_wall_ms: (now - 10) * 1000,
             ..Default::default()
         };
-        let view = build_owner_state_view(&loaded, "d".into(), stale_join, QuorumJoin::default());
+        let view =
+            build_owner_state_view(&loaded, "d".into(), None, stale_join, QuorumJoin::default());
         assert!(view.fleet_epoch_stale, "revocation postdates the bump");
         assert_eq!(view.fleet_epoch, 1);
 
@@ -4648,7 +4734,8 @@ mod revoke_tests {
             carrier_bump_wall_ms: (now + 10) * 1000,
             ..Default::default()
         };
-        let view = build_owner_state_view(&loaded, "d".into(), fresh_join, QuorumJoin::default());
+        let view =
+            build_owner_state_view(&loaded, "d".into(), None, fresh_join, QuorumJoin::default());
         assert!(!view.fleet_epoch_stale, "bump postdates every revocation");
         assert_eq!(view.fleet_epoch, 2);
     }
@@ -4675,6 +4762,7 @@ mod revoke_tests {
         let view = build_owner_state_view(
             &loaded,
             "Test Device".to_string(),
+            None,
             FleetJoin::default(),
             QuorumJoin::default(),
         );

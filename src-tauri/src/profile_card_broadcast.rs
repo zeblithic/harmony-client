@@ -258,6 +258,17 @@ pub fn verify_card(
     Ok(card.owner_id)
 }
 
+/// ZEB-921: display name from cached self-card wire bytes (`CardWire.1`).
+/// Decode-only — the publisher cache is written exclusively by our own
+/// publish path with bytes we just signed (`publish_now`), so signature /
+/// cert verification would add plumbing without a new guarantee. `None`
+/// on decode failure (defensive; self-produced bytes always decode).
+pub fn decode_card_display_name(bytes: &[u8]) -> Option<String> {
+    ciborium::de::from_reader::<ProfileCardBroadcast, _>(bytes)
+        .ok()
+        .map(|c| c.display_name)
+}
+
 /// Snapshot of the latest verified profile card broadcast for a subscription.
 /// Wire keys are camelCase to match the frontend DTO convention.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1887,5 +1898,38 @@ mod tests {
             verify_card(&far_future, 0).expect("apply-all"),
             owner.owner.0
         );
+    }
+
+    /// ZEB-921: the owner-state observable decodes the display name from the
+    /// exact bytes the publisher caches (and the ZEB-884 queryable serves).
+    #[test]
+    fn decode_card_display_name_roundtrips_signed_bytes() {
+        let owner = crate::community_membership::mint_test_owner(0x74);
+        let card = sign_card(
+            &owner.device_key,
+            owner.owner.0,
+            "Zeb921Probe".into(),
+            "".into(),
+            None,
+            None,
+            owner.cert.clone(),
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: "d".into(),
+            },
+        )
+        .unwrap();
+        let bytes = canonical_cbor_encode(&card).unwrap();
+        assert_eq!(
+            decode_card_display_name(&bytes).as_deref(),
+            Some("Zeb921Probe")
+        );
+    }
+
+    #[test]
+    fn decode_card_display_name_garbage_is_none() {
+        assert_eq!(decode_card_display_name(b"not cbor at all"), None);
+        assert_eq!(decode_card_display_name(&[]), None);
     }
 }
