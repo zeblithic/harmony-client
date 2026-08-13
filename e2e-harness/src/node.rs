@@ -328,6 +328,40 @@ async fn wait_for_api_dir(home: &std::path::Path, timeout: Duration) -> anyhow::
 }
 
 impl NodeHandle {
+    /// ZEB-912: the node's iroh node id (64-hex) from `/v1/status.nodeId`.
+    /// `Ok(None)` while the node is (re)booting — poll if you need it settled.
+    /// A MISSING field is a loud error (a binary predating the field), never a
+    /// silent `None` — the camelCase-trap discipline (ZEB-462).
+    pub async fn node_id(&self) -> anyhow::Result<Option<String>> {
+        let s = self.status().await?;
+        match s.get("nodeId") {
+            None => {
+                anyhow::bail!("/v1/status has no nodeId field (stale harmony-app binary?): {s}")
+            }
+            Some(Value::Null) => Ok(None),
+            Some(v) => Ok(Some(
+                v.as_str()
+                    .with_context(|| format!("nodeId is not a string: {s}"))?
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// ZEB-912: does this node's captured stderr contain `needle`? Requires the
+    /// node to have been spawned with `log_dir` set (the run-dir capture).
+    /// Reads the live file — poll it; a needle mid-write can miss one tick.
+    pub fn stderr_log_contains(&self, needle: &str) -> anyhow::Result<bool> {
+        let dir = self
+            .config
+            .log_dir
+            .as_ref()
+            .context("stderr_log_contains requires log_dir capture")?;
+        let path = dir.join(format!("{}.stderr.log", self.config.profile));
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Ok(text.contains(needle))
+    }
+
     /// Open a fresh event subscription. The caller owns the receiver + task.
     pub async fn events(
         &self,

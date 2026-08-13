@@ -3326,3 +3326,211 @@ async fn s13_tier2_conviction_setpower() {
     run.mark_success();
     drop((alice, bob, alice_home, bob_home));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S14 (hard-assert — ZEB-912 step 2): router-mode multi-hop delivery across a
+// SEVERED pair. All three nodes run HARMONY_ZENOH_MODE=router. B and C each
+// join founder A's community (v1 restricts invite generation to the admin);
+// C's spawn env denylists B at the zenoh link layer
+// (HARMONY_TEST_ZENOH_DENYLIST=<B's nodeId>), so the B—C link can never form
+// from either side (the seam gates dial AND accept). Rosters and channel
+// structure converge over the two live direct links (B—A, C—A) — the
+// load-bearing multi-hop assertions are the CHANNEL MESSAGES between B and C,
+// which can only travel B—A—C: zenoh router-mode linkstate forwarding through
+// A. In peer mode those asserts CANNOT pass — the R3 spike measured that a
+// peer does not transit data between two other peers
+// (docs/research/2026-08-12-zeb912-r3-zenoh-multihop-spike.md).
+//
+// Why the severed pair is B—C and not joiner—inviter: the invite-only join
+// response carries NO membership snapshot (unlike open-join), so a joiner
+// severed from its inviter can never learn the other members exist and is
+// fully islanded — a real production gap this scenario surfaced, filed as
+// ZEB-927. Once that ships, a joiner—inviter sever variant becomes provable.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn s14_router_mode_severed_pair_delivery() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let mut run = RunDir::new("s14").expect("run dir");
+    let a_home = fresh_home("s14-a");
+    let b_home = fresh_home("s14-b");
+    let c_home = fresh_home("s14-c");
+    let router_env = || ("HARMONY_ZENOH_MODE".to_string(), "router".to_string());
+    let mk = |home: &tempfile::TempDir, profile: &str, extra: Vec<(String, String)>| {
+        let mut cfg = NodeConfig::new(PathBuf::from(home.path()), profile);
+        cfg.log_dir = Some(run.log_dir());
+        cfg.extra_env = extra;
+        cfg
+    };
+
+    let a = NodeHandle::spawn(mk(&a_home, "alice", vec![router_env()]))
+        .await
+        .expect("spawn a");
+    a.rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("a mint");
+
+    // B boots BEFORE C: its nodeId seeds C's denylist, so the sever is in
+    // force from C's very first boot (no window where a B—C link could form).
+    let b = NodeHandle::spawn(mk(&b_home, "bob", vec![router_env()]))
+        .await
+        .expect("spawn b");
+    b.rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("b mint");
+    // mint restarts the inner node; poll until the restarted node reports its id.
+    let b_node_id: String = poll_until(Duration::from_secs(60), || async { b.node_id().await })
+        .await
+        .expect("b reports nodeId after mint restart");
+    assert_eq!(b_node_id.len(), 64, "nodeId is 64-hex: {b_node_id}");
+
+    let c = NodeHandle::spawn(mk(
+        &c_home,
+        "carol",
+        vec![
+            router_env(),
+            ("HARMONY_TEST_ZENOH_DENYLIST".to_string(), b_node_id.clone()),
+        ],
+    ))
+    .await
+    .expect("spawn c");
+    c.rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("c mint");
+
+    let a_owner = owner_id(&a).await;
+    let b_owner = owner_id(&b).await;
+    let c_owner = owner_id(&c).await;
+
+    // --- A founds; B and C each redeem a fresh invite from A via iroh
+    //     first-contact (both handshakes touch only the live A links).
+    let community = create_community(&a, "s14-community", true)
+        .await
+        .expect("create community");
+    let invite_b = generate_invite(&a, &community).await.expect("invite for b");
+    poll_join_iroh(&b, &invite_b, Duration::from_secs(240))
+        .await
+        .expect("b joins via iroh first-contact");
+    let invite_c = generate_invite(&a, &community).await.expect("invite for c");
+    poll_join_iroh(&c, &invite_c, Duration::from_secs(240))
+        .await
+        .expect("c joins via iroh first-contact");
+
+    // --- Rosters converge on all three nodes (member sync rides the two live
+    //     direct links; NOT multi-hop-dependent — the diagnostic dump guards
+    //     against regressions in the join path itself).
+    for (node, who) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+        if let Err(e) = poll_until(Duration::from_secs(120), || async {
+            let has_a = roster_has_joined(node, &community, &a_owner).await?;
+            let has_b = roster_has_joined(node, &community, &b_owner).await?;
+            let has_c = roster_has_joined(node, &community, &c_owner).await?;
+            Ok((has_a && has_b && has_c).then_some(()))
+        })
+        .await
+        {
+            let rows = list_community_members(node, &community)
+                .await
+                .map(|ms| {
+                    ms.iter()
+                        .map(|m| {
+                            format!(
+                                "{}:{}",
+                                m.get("addr")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("?"),
+                                m.get("status")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("?"),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|e| vec![format!("(roster fetch failed: {e})")]);
+            panic!(
+                "{who}'s roster MUST converge: {e}\n  {who}'s roster rows: {rows:?}\n                   owners: a={a_owner} b={b_owner} c={c_owner}"
+            );
+        }
+    }
+
+    // --- Channel created by A converges on both joiners (direct links).
+    let channel = create_channel(&a, &community, "s14-shared", 0)
+        .await
+        .expect("a creates shared channel");
+    for (node, who) in [(&b, "b"), (&c, "c")] {
+        poll_until(Duration::from_secs(120), || async {
+            Ok(channels_contains(node, &community, &channel)
+                .await?
+                .then_some(()))
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{who} MUST converge the shared channel: {e}"));
+    }
+
+    // Subscribe AFTER convergence, BEFORE posts (s9 discipline: don't buffer
+    // the join window in the unbounded WS channel).
+    let (mut c_events, _c_ev) = c.events().await.expect("subscribe c events");
+
+    // --- THE MULTI-HOP PROOF: the severed pair posts in both directions.
+    //     B—C have no link; each message can only arrive through A.
+    let b_body: &[u8] = b"s14-from-bob-via-a";
+    let c_body: &[u8] = b"s14-from-carol-via-a";
+    post_channel_message(&b, &community, &channel, b_body)
+        .await
+        .expect("b posts");
+    post_channel_message(&c, &community, &channel, c_body)
+        .await
+        .expect("c posts");
+
+    // --- HARD ASSERT (real-time): C receives B's message over the WS stream —
+    //     it can only have transited A (router-mode linkstate forwarding).
+    e2e_harness::await_event(&mut c_events, Duration::from_secs(60), |f| {
+        f.event == "channel-message-received"
+            && f.payload.get("channelId").and_then(|x| x.as_str()) == Some(channel.as_str())
+            && f.payload
+                .get("message")
+                .map(|m| {
+                    m.get("author").and_then(|x| x.as_str()) == Some(b_owner.as_str())
+                        && channel_msg_body_bytes(m).as_deref() == Some(b_body)
+                })
+                .unwrap_or(false)
+    })
+    .await
+    .expect("c MUST receive b's message in real-time across the sever (via a)");
+
+    // --- HARD ASSERT (read-back, both directions across the sever).
+    poll_until(Duration::from_secs(60), || async {
+        Ok(
+            channel_has_message_from(&c, &community, &channel, &b_owner, b_body)
+                .await?
+                .then_some(()),
+        )
+    })
+    .await
+    .expect("c's read-back MUST contain b's message (via a)");
+    poll_until(Duration::from_secs(60), || async {
+        Ok(
+            channel_has_message_from(&b, &community, &channel, &c_owner, c_body)
+                .await?
+                .then_some(()),
+        )
+    })
+    .await
+    .expect("b's read-back MUST contain c's message (via a)");
+
+    // --- Sever evidence (positive, not log-absence): C's denylist must have
+    //     ENGAGED — refusing its own dial to B (C learns B's record via A's
+    //     addrbook forwarding) or rejecting B's inbound. Both hit-paths log on
+    //     C. Without this, a silently-inert seam would let an ordinary
+    //     full-mesh run masquerade as a multi-hop proof.
+    poll_until(Duration::from_secs(30), || async {
+        let engaged = c.stderr_log_contains("ZEB-912 test denylist: rejecting inbound")?
+            || c.stderr_log_contains("ZEB-912 test denylist: refusing dial")?;
+        Ok(engaged.then_some(()))
+    })
+    .await
+    .expect("c's denylist MUST show engagement (rejecting inbound / refusing dial)");
+
+    run.mark_success();
+    drop((a, b, c, a_home, b_home, c_home));
+}
