@@ -3551,3 +3551,181 @@ async fn s14_router_mode_severed_pair_delivery() {
     run.mark_success();
     drop((a, b, c, a_home, b_home, c_home));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// s15 — ZEB-927: an invite-only joiner severed from the ENTIRE existing mesh
+// still converges the full roster, purely from the handshake membership
+// snapshot the acceptor now ships.
+//
+// This is the joiner↔inviter sever variant s14's header promised once ZEB-927
+// landed. Topology: A (admin/inviter) founds an invite-only community; B joins
+// normally and becomes a member BEFORE C exists. C is then spawned with BOTH A's
+// and B's nodeIds on its zenoh denylist — C has zero zenoh path to any existing
+// member. C redeems A's invite over the `HARMONY_HANDSHAKE_V1` iroh handshake
+// (a separate ALPN the denylist does NOT gate), so the redeem itself completes.
+//
+// Pre-ZEB-927 the response carried only C's own countersign (+ narrow admission
+// chain), so C materialized {A, C} and — with no zenoh path to learn anyone
+// else — islanded permanently: C's roster never contained B. The fix ships the
+// full roster in that response, so C learns B from the snapshot ALONE. Severing
+// C from BOTH A and B (not just its inviter) is deliberate: if B could still
+// dial C, B would converge the roster into C over zenoh and the test would pass
+// without the fix. The sever-evidence assert proves the islanding is real, so
+// C's knowledge of B can only have come from the snapshot.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn s15_severed_joiner_learns_roster_from_snapshot() {
+    use e2e_harness::driver::*;
+    use std::time::Duration;
+
+    let mut run = RunDir::new("s15").expect("run dir");
+    let a_home = fresh_home("s15-a");
+    let b_home = fresh_home("s15-b");
+    let c_home = fresh_home("s15-c");
+    let router_env = || ("HARMONY_ZENOH_MODE".to_string(), "router".to_string());
+    let mk = |home: &tempfile::TempDir, profile: &str, extra: Vec<(String, String)>| {
+        let mut cfg = NodeConfig::new(PathBuf::from(home.path()), profile);
+        cfg.log_dir = Some(run.log_dir());
+        cfg.extra_env = extra;
+        cfg
+    };
+
+    // A (admin/inviter) and B (existing member) both boot BEFORE C so their
+    // nodeIds are known in time to seed C's denylist from C's very first boot —
+    // no window where a C link to either could form.
+    let a = NodeHandle::spawn(mk(&a_home, "alice", vec![router_env()]))
+        .await
+        .expect("spawn a");
+    a.rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("a mint");
+    let a_node_id: String = poll_until(Duration::from_secs(60), || async { a.node_id().await })
+        .await
+        .expect(
+            "a reports nodeId after mint restart (a persistent null on a running node means \
+             iroh transport failed at boot — degraded mode, not slowness)",
+        );
+    assert_eq!(a_node_id.len(), 64, "nodeId is 64-hex: {a_node_id}");
+
+    let b = NodeHandle::spawn(mk(&b_home, "bob", vec![router_env()]))
+        .await
+        .expect("spawn b");
+    b.rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("b mint");
+    let b_node_id: String = poll_until(Duration::from_secs(60), || async { b.node_id().await })
+        .await
+        .expect(
+            "b reports nodeId after mint restart (a persistent null on a running node means \
+             iroh transport failed at boot — degraded mode, not slowness)",
+        );
+    assert_eq!(b_node_id.len(), 64, "nodeId is 64-hex: {b_node_id}");
+
+    // A founds an invite-only community; B joins and becomes a full member
+    // BEFORE C exists, so B's Join is in A's log by the time C redeems.
+    let community = create_community(&a, "s15-community", true)
+        .await
+        .expect("create community");
+    let invite_b = generate_invite(&a, &community).await.expect("invite for b");
+    poll_join_iroh(&b, &invite_b, Duration::from_secs(240))
+        .await
+        .expect("b joins via iroh first-contact (unsevered)");
+
+    // C is islanded from the ENTIRE existing mesh: both A and B on its zenoh
+    // denylist (comma-separated). C has no zenoh path to learn any member.
+    let c = NodeHandle::spawn(mk(
+        &c_home,
+        "carol",
+        vec![
+            router_env(),
+            (
+                "HARMONY_TEST_ZENOH_DENYLIST".to_string(),
+                format!("{a_node_id},{b_node_id}"),
+            ),
+        ],
+    ))
+    .await
+    .expect("spawn c");
+    c.rpc("mint_owner_identity", json!({}))
+        .await
+        .expect("c mint");
+
+    // Positive evidence router mode ENGAGED on every node (a knob regression must
+    // fail here as "mode never engaged", not as a convergence timeout below).
+    for (node, who) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+        poll_until(Duration::from_secs(30), || async {
+            Ok(node
+                .stderr_log_contains("ZEB-912: zenoh session mode: router")?
+                .then_some(()))
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{who} MUST report a router-mode zenoh session: {e}"));
+    }
+
+    let a_owner = owner_id(&a).await;
+    let b_owner = owner_id(&b).await;
+    let c_owner = owner_id(&c).await;
+
+    // C redeems A's invite over the iroh handshake (HARMONY_HANDSHAKE_V1 — NOT
+    // gated by the zenoh denylist), so the redeem completes even though every
+    // zenoh path from C is severed.
+    let invite_c = generate_invite(&a, &community).await.expect("invite for c");
+    poll_join_iroh(&c, &invite_c, Duration::from_secs(240))
+        .await
+        .expect("c joins via iroh first-contact (severed from the mesh)");
+
+    // --- THE ZEB-927 PROOF: C's roster converges to ALL members despite zero
+    //     zenoh path to any of them — B can ONLY have arrived in the handshake
+    //     membership snapshot. (Pre-fix this hangs at {A, C}: no B, ever.)
+    //     A and B converge normally over their live A↔B link; asserting all
+    //     three guards the join path itself, but C is the load-bearing case.
+    for (node, who) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+        if let Err(e) = poll_until(Duration::from_secs(120), || async {
+            let has_a = roster_has_joined(node, &community, &a_owner).await?;
+            let has_b = roster_has_joined(node, &community, &b_owner).await?;
+            let has_c = roster_has_joined(node, &community, &c_owner).await?;
+            Ok((has_a && has_b && has_c).then_some(()))
+        })
+        .await
+        {
+            let rows = list_community_members(node, &community)
+                .await
+                .map(|ms| {
+                    ms.iter()
+                        .map(|m| {
+                            format!(
+                                "{}:{}",
+                                m.get("addr")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("?"),
+                                m.get("status")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("?"),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|e| vec![format!("(roster fetch failed: {e})")]);
+            panic!(
+                "{who}'s roster MUST converge to all members (ZEB-927: C learns B from the \
+                 handshake snapshot, not over zenoh): {e}\n  {who}'s roster rows: {rows:?}\n                   owners: a={a_owner} b={b_owner} c={c_owner}"
+            );
+        }
+    }
+
+    // --- Sever evidence (positive, not log-absence): C's denylist must have
+    //     ENGAGED — refusing its own dial (C learns B/A records via the snapshot
+    //     + addrbook and tries to dial) or rejecting their inbound. Without this,
+    //     a silently-inert denylist would let an ordinary full-mesh run (C
+    //     converging B over zenoh) masquerade as a snapshot-delivery proof.
+    poll_until(Duration::from_secs(30), || async {
+        let engaged = c.stderr_log_contains("ZEB-912 test denylist: rejecting inbound")?
+            || c.stderr_log_contains("ZEB-912 test denylist: refusing dial")?;
+        Ok(engaged.then_some(()))
+    })
+    .await
+    .expect("c's denylist MUST show engagement (rejecting inbound / refusing dial)");
+
+    run.mark_success();
+    drop((a, b, c, a_home, b_home, c_home));
+}
