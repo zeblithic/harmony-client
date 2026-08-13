@@ -407,19 +407,20 @@ impl ReachabilityResolver {
             .expect("admission_oracle lock") = Some(oracle);
     }
 
-    /// ZEB-928: forward a verified `node_id -> enrolled_device_key` binding into the
-    /// admission oracle (no-op if none installed). Call this at each record-ingest seam
-    /// that holds the enrolled key, BEFORE the `update`/`update_with_source` that fires
-    /// the supervisor kick — so the just-resolved peer is classifiable the instant it is
-    /// kicked (race-free admission).
-    pub fn note_enrolled_binding(&self, node_id: [u8; 32], enrolled_vk: [u8; 32]) {
+    /// ZEB-928: forward a verified `(owner, node_id) -> enrolled_device_key` binding into the
+    /// admission oracle (no-op if none installed). Call this at each record-ingest seam that
+    /// holds the enrolled key, BEFORE the `update`/`update_with_source` that fires the supervisor
+    /// kick — so the just-resolved peer is classifiable the instant it is kicked (race-free
+    /// admission). The owner scopes eviction so `remove_owner` never drops a co-resident owner's
+    /// binding for a shared node_id.
+    pub fn note_enrolled_binding(&self, owner: [u8; 16], node_id: [u8; 32], enrolled_vk: [u8; 32]) {
         if let Some(o) = self
             .admission_oracle
             .read()
             .expect("admission_oracle lock")
             .as_ref()
         {
-            o.bind(node_id, enrolled_vk);
+            o.bind(owner, node_id, enrolled_vk);
         }
     }
 
@@ -821,15 +822,15 @@ impl ReachabilityResolver {
             .expect("refresh_cooldowns lock")
             .remove(actor);
         let node_ids: Vec<[u8; 32]> = to_remove.into_iter().map(|(_, node_id)| node_id).collect();
-        // ZEB-928: drop the oracle's reverse bindings for the departed devices so the
-        // node_id→device_key map doesn't grow monotonically over process lifetime.
+        // ZEB-928: drop only THIS owner's oracle bindings for the departed node_ids — a
+        // node_id co-asserted under another live owner keeps that owner's binding (CR-2).
         if let Some(o) = self
             .admission_oracle
             .read()
             .expect("admission_oracle lock")
             .as_ref()
         {
-            o.unbind_node_ids(&node_ids);
+            o.unbind_owner(actor.0, &node_ids);
         }
         node_ids
     }
@@ -1169,7 +1170,7 @@ mod tests {
         let enrolled_vk = [0xBB; 32];
 
         // Ingest-seam order: bind first, then the update that would fire the kick.
-        r.note_enrolled_binding(node_id, enrolled_vk);
+        r.note_enrolled_binding(actor.0, node_id, enrolled_vk);
         r.update(actor, make_payload(0x42, 1_000), make_hlc(1_000, 0, "d"));
 
         // Bound but nothing admitted → denied.

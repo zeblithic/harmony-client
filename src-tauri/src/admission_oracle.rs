@@ -1,22 +1,30 @@
 //! Node-id admission classifier for R4 bounded-degree dialing (ZEB-928).
 //!
-//! Read on the hot path at the supervisor's two dial-arming sites (`kick` and the internal
-//! `do_sweep` re-arm). Peer mode — or an unwired oracle — admits everything, so behavior is
-//! byte-for-byte identical to pre-R4. Router mode admits a node_id iff a device key bound to
-//! it is in the admitted set; an unknown node_id fails open.
+//! Read on the hot path at the supervisor's dial-dispatch point. Peer mode — or an
+//! unwired oracle — admits everything, so behavior is byte-for-byte identical to pre-R4.
+//! Router mode admits a node_id iff a device key bound to it is in the admitted set; an
+//! unknown node_id fails open.
 //!
 //! Three writers, one reader:
 //! - the event-loop **controller** replaces the admitted *device-key* set on membership deltas
 //!   ([`AdmissionOracle::publish_admitted`], fed by [`compute_admitted`]);
-//! - the **resolver** binds `node_id -> device_key` as records are verified/ingested
-//!   ([`AdmissionOracle::bind`] / [`AdmissionOracle::unbind_node_ids`]);
-//! - the **supervisor** reads [`AdmissionOracle::admit`] at each dial-arming site.
+//! - the **resolver** binds `(owner, node_id) -> device_key` as records are verified/ingested
+//!   ([`AdmissionOracle::bind`] / [`AdmissionOracle::unbind_owner`]);
+//! - the **supervisor** reads [`AdmissionOracle::admit`] at the dial-dispatch point.
+//!
+//! Bindings are keyed by owner as well as node_id: a node_id can be asserted under more than
+//! one owner (delegate/butler devices, a node hosting multiple identities), and a departing
+//! owner must not evict a co-resident owner's still-live binding for a shared node_id.
 //!
 //! See `docs/superpowers/specs/2026-08-13-zeb928-r4-wiring-design.md`.
 
 use crate::community_topology::community_neighbors;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::RwLock;
+
+/// A single binding's provenance: `(owner, enrolled device verify key)`. The owner scopes
+/// eviction so a departing owner never drops a co-resident owner's binding for a shared node_id.
+type OwnedDevice = ([u8; 16], [u8; 32]);
 
 /// Shared admission classifier. Cheap to read; the hot path takes read locks only.
 pub struct AdmissionOracle {
@@ -25,10 +33,11 @@ pub struct AdmissionOracle {
     enabled: bool,
     /// Admitted enrolled device keys (the realized ring-neighbor union). Controller writes.
     admitted: RwLock<BTreeSet<[u8; 32]>>,
-    /// Reverse bridge `iroh_node_id -> enrolled device key(s)`. A node_id can be asserted by more
-    /// than one enrolled key (delegate/butler devices, multi-owner), so the value is a set and
-    /// admission is set-intersection. Resolver writes.
-    node_to_devices: RwLock<HashMap<[u8; 32], BTreeSet<[u8; 32]>>>,
+    /// Reverse bridge `iroh_node_id -> {(owner, enrolled device key)}`. A node_id can be asserted
+    /// by more than one enrolled key and under more than one owner, so the value is a set of
+    /// `(owner, device_key)` pairs; admission is "some bound device key is in the admitted set",
+    /// and eviction is scoped to a single owner. Resolver writes.
+    node_to_owned_devices: RwLock<HashMap<[u8; 32], BTreeSet<OwnedDevice>>>,
 }
 
 impl AdmissionOracle {
@@ -37,7 +46,7 @@ impl AdmissionOracle {
         Self {
             enabled,
             admitted: RwLock::new(BTreeSet::new()),
-            node_to_devices: RwLock::new(HashMap::new()),
+            node_to_owned_devices: RwLock::new(HashMap::new()),
         }
     }
 
@@ -47,22 +56,23 @@ impl AdmissionOracle {
     }
 
     /// Hot path. `true` = allow/keep this dial target. Peer mode → always true. Router mode →
-    /// admit iff a device key bound to `node_id` is in the admitted set; **fail-open** on an
-    /// unknown node_id (no binding: infrastructure or non-community peers stay dialable).
+    /// admit iff a device key bound to `node_id` (under any owner) is in the admitted set;
+    /// **fail-open** on an unknown node_id (no binding: infrastructure or non-community peers
+    /// stay dialable).
     pub fn admit(&self, node_id: &[u8; 32]) -> bool {
         if !self.enabled {
             return true;
         }
         let map = self
-            .node_to_devices
+            .node_to_owned_devices
             .read()
-            .expect("node_to_devices poisoned");
-        let devices = match map.get(node_id) {
+            .expect("node_to_owned_devices poisoned");
+        let owned = match map.get(node_id) {
             Some(d) => d,
             None => return true, // fail-open on unknown identity
         };
         let admitted = self.admitted.read().expect("admitted poisoned");
-        devices.iter().any(|d| admitted.contains(d))
+        owned.iter().any(|(_owner, dk)| admitted.contains(dk))
     }
 
     /// Controller: replace the admitted device-key set (called on a membership delta).
@@ -70,24 +80,30 @@ impl AdmissionOracle {
         *self.admitted.write().expect("admitted poisoned") = keys;
     }
 
-    /// Resolver: record that `node_id` is asserted by (verified) `device_key`.
-    pub fn bind(&self, node_id: [u8; 32], device_key: [u8; 32]) {
-        self.node_to_devices
+    /// Resolver: record that `node_id` is asserted by (verified) `device_key`, under `owner`.
+    pub fn bind(&self, owner: [u8; 16], node_id: [u8; 32], device_key: [u8; 32]) {
+        self.node_to_owned_devices
             .write()
-            .expect("node_to_devices poisoned")
+            .expect("node_to_owned_devices poisoned")
             .entry(node_id)
             .or_default()
-            .insert(device_key);
+            .insert((owner, device_key));
     }
 
-    /// Resolver `remove_owner`: forget these node_ids' bindings entirely.
-    pub fn unbind_node_ids(&self, node_ids: &[[u8; 32]]) {
+    /// Resolver `remove_owner`: forget only `owner`'s bindings for these node_ids. A node_id
+    /// still bound under another owner survives; a node_id whose set becomes empty is dropped.
+    pub fn unbind_owner(&self, owner: [u8; 16], node_ids: &[[u8; 32]]) {
         let mut map = self
-            .node_to_devices
+            .node_to_owned_devices
             .write()
-            .expect("node_to_devices poisoned");
+            .expect("node_to_owned_devices poisoned");
         for n in node_ids {
-            map.remove(n);
+            if let Some(set) = map.get_mut(n) {
+                set.retain(|(o, _)| *o != owner);
+                if set.is_empty() {
+                    map.remove(n);
+                }
+            }
         }
     }
 }
@@ -127,6 +143,9 @@ mod tests {
     fn dk(b: u8) -> [u8; 32] {
         [0x80 | b; 32]
     }
+    fn own(b: u8) -> [u8; 16] {
+        [b; 16]
+    }
     fn synth(n: usize) -> BTreeSet<[u8; 32]> {
         (0..n)
             .map(|i| harmony_crypto::hash::blake3_hash(&(i as u64).to_be_bytes()))
@@ -154,8 +173,8 @@ mod tests {
     fn router_mode_admits_bound_admitted_denies_bound_unadmitted() {
         let o = AdmissionOracle::new(true);
         o.publish_admitted(BTreeSet::from([dk(1)]));
-        o.bind(nid(1), dk(1));
-        o.bind(nid(2), dk(2));
+        o.bind(own(1), nid(1), dk(1));
+        o.bind(own(2), nid(2), dk(2));
         assert!(o.admit(&nid(1)), "bound to admitted device key");
         assert!(!o.admit(&nid(2)), "bound to non-admitted device key");
     }
@@ -164,28 +183,47 @@ mod tests {
     fn multi_device_node_id_admits_on_intersection() {
         let o = AdmissionOracle::new(true);
         o.publish_admitted(BTreeSet::from([dk(5)]));
-        o.bind(nid(1), dk(4));
-        o.bind(nid(1), dk(5)); // same node_id, second device key
+        o.bind(own(1), nid(1), dk(4));
+        o.bind(own(1), nid(1), dk(5)); // same node_id, second device key
         assert!(o.admit(&nid(1)), "one bound key is admitted");
     }
 
     #[test]
     fn publish_admitted_transitions_membership() {
         let o = AdmissionOracle::new(true);
-        o.bind(nid(2), dk(2));
+        o.bind(own(2), nid(2), dk(2));
         assert!(!o.admit(&nid(2)));
         o.publish_admitted(BTreeSet::from([dk(2)]));
         assert!(o.admit(&nid(2)), "admitted after republish");
     }
 
     #[test]
-    fn unbind_node_ids_drops_bindings() {
+    fn unbind_owner_drops_only_that_owners_binding() {
         let o = AdmissionOracle::new(true);
         o.publish_admitted(BTreeSet::from([dk(2)]));
-        o.bind(nid(2), dk(2));
+        o.bind(own(2), nid(2), dk(2));
         assert!(o.admit(&nid(2)));
-        o.unbind_node_ids(&[nid(2)]);
+        o.unbind_owner(own(2), &[nid(2)]);
         assert!(o.admit(&nid(2)), "binding gone -> unknown -> fail open");
+    }
+
+    #[test]
+    fn unbind_owner_preserves_co_resident_owner_on_shared_node_id() {
+        // The SAME node_id is asserted under two owners; owner A's departure must not
+        // evict owner B's live, admitted binding (CR-2 / CodeRabbit PR #674).
+        let o = AdmissionOracle::new(true);
+        let shared = nid(7);
+        o.bind(own(0xA), shared, dk(1)); // owner A, NOT admitted
+        o.bind(own(0xB), shared, dk(2)); // owner B, admitted
+        o.publish_admitted(BTreeSet::from([dk(2)]));
+        assert!(o.admit(&shared), "admitted via owner B");
+        o.unbind_owner(own(0xA), &[shared]);
+        assert!(
+            o.admit(&shared),
+            "owner B's admitted binding survives owner A's departure"
+        );
+        o.unbind_owner(own(0xB), &[shared]);
+        assert!(o.admit(&shared), "now fully unbound -> fail open (unknown)");
     }
 
     // ---- controller pure compute ----
