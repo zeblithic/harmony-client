@@ -84,10 +84,11 @@ impl SimNet {
     /// record, and tell each node to connect to all its peers.
     pub(crate) fn build(n: u8, config: SupervisorConfig) -> Self {
         let clock = SimClock::new();
+        let now_fn = clock.as_now_fn();
         let partition = Partition::fully_connected();
         let fabric: HandleRegistry = Arc::new(Mutex::new(HashMap::new()));
         let nodes: Vec<SimNode> = (1..=n)
-            .map(|s| SimNode::spawn(s, &partition, &fabric, config.clone()))
+            .map(|s| SimNode::spawn(s, &partition, &fabric, &now_fn, config.clone()))
             .collect();
 
         let now = clock.now_ms();

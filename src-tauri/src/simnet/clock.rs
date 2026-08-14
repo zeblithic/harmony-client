@@ -3,6 +3,9 @@
 
 use std::sync::Arc;
 
+/// An injectable `now_ms` closure — matches `ReachabilityResolver::set_clock`.
+pub(crate) type NowFn = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 /// A virtual wall clock that reads tokio's (paused) clock. Under
 /// `#[tokio::test(start_paused = true)]` a `tokio::time::advance(d)` moves both
 /// the scheduler and this clock by `d`, so seeded record timestamps (and, in
@@ -26,8 +29,10 @@ impl SimClock {
         self.base_ms + self.origin.elapsed().as_millis() as u64
     }
 
-    #[allow(dead_code)] // used by PR2 (HLC seam); kept here as the substrate API.
-    pub(crate) fn as_now_fn(&self) -> Arc<dyn Fn() -> u64 + Send + Sync> {
+    /// A `now_ms` closure sharing this clock's virtual time — injected into each
+    /// node's `ReachabilityResolver` so record freshness / stale-refresh /
+    /// future-skew all evaluate in sim-time, not host time.
+    pub(crate) fn as_now_fn(&self) -> NowFn {
         let base = self.base_ms;
         let origin = self.origin;
         Arc::new(move || base + origin.elapsed().as_millis() as u64)

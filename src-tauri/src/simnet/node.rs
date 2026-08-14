@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use super::{
+    clock::NowFn,
     dialer::{HandleRegistry, SimDialer},
     node_identity,
     partition::Partition,
@@ -22,7 +23,7 @@ pub(crate) struct SimNode {
     pub(crate) owner: OwnerAddr,
     pub(crate) handle: SupervisorHandle,
     pub(crate) resolver: Arc<ReachabilityResolver>,
-    _task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl SimNode {
@@ -30,10 +31,14 @@ impl SimNode {
         seed: u8,
         partition: &Partition,
         fabric: &HandleRegistry,
+        now_fn: &NowFn,
         config: SupervisorConfig,
     ) -> Self {
         let (node_id, owner) = node_identity(seed);
         let resolver = Arc::new(ReachabilityResolver::new());
+        // Freshness / stale-refresh / future-skew evaluate in sim-time, coherent
+        // with the seeded record timestamps (which also come from this clock).
+        resolver.set_clock(Arc::clone(now_fn));
         let handle = SupervisorHandle::new();
         resolver.set_supervisor(handle.clone());
         fabric
@@ -56,7 +61,7 @@ impl SimNode {
             owner,
             handle,
             resolver,
-            _task: task,
+            task,
         }
     }
 
@@ -70,6 +75,16 @@ impl SimNode {
 
     pub(crate) fn kick(&self, peer: [u8; 32], trigger: ReconnectTrigger) {
         self.handle.kick(peer, trigger);
+    }
+}
+
+impl Drop for SimNode {
+    /// Abort the spawned supervisor so it cannot outlive the node and keep
+    /// running during a later SimNet's virtual-time advances. `run_reconnect_supervisor`
+    /// loops forever with no cancellation input, so dropping the handle alone
+    /// would merely detach (not stop) the task.
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -91,8 +106,9 @@ mod node_tests {
             ..Default::default()
         };
 
-        let a = SimNode::spawn(1, &partition, &fabric, cfg.clone());
-        let b = SimNode::spawn(2, &partition, &fabric, cfg);
+        let now_fn = clock.as_now_fn();
+        let a = SimNode::spawn(1, &partition, &fabric, &now_fn, cfg.clone());
+        let b = SimNode::spawn(2, &partition, &fabric, &now_fn, cfg);
 
         // Both nodes learn each other's record and are told to connect (the
         // realistic bidirectional pattern SimNet uses): the lower-id node dials
