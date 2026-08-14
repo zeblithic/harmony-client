@@ -377,7 +377,7 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
     // finalize-then-dispatch still holds.
     //
     // Idempotency has two layers. (1) Per-target (ZEB-936): the collection
-    // below dedups to the single canonical (newest-finalized) SetPower poll
+    // below dedups to the single canonical (newest-created) SetPower poll
     // per target, so conflicting finalized polls for the same member never
     // re-dispatch against each other. (2) Per-poll: once the canonical poll's
     // effect lands in materialized state the helper returns `AlreadyApplied`
@@ -398,13 +398,19 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
     //
     // Auto-exec runs AFTER releasing the voting_logs lock so the auto-exec
     // helper (which itself takes NodeState locks) cannot deadlock against
-    // the tick's outer lock.
+    // the tick's outer lock. Canonical selection is therefore a snapshot taken
+    // under that lock: if a newer same-target poll finalizes in the window
+    // between the snapshot and dispatch, the just-superseded poll can mint once
+    // and briefly win by LWW, but the next tick re-selects the now-canonical
+    // poll and converges — a bounded one-tick transient, not a persistent
+    // divergence (and strictly rarer than the pre-ZEB-936 behavior, where every
+    // conflicting finalized poll dispatched on every tick).
     {
         let mut to_dispatch: Vec<(SpaceId, PollId, OwnerAddr, u32)> = Vec::new();
         {
             let logs = ctx.voting_logs.lock().await;
             // ZEB-936: dedup finalized SetPower polls to the CANONICAL
-            // (newest-finalized, tiebroken by poll_id) poll per
+            // (newest-created, tiebroken by poll_id) poll per
             // (community, target). Without this, Pass 3b re-dispatches EVERY
             // finalized SetPower poll every tick, so two finalized polls that
             // disagree on a member's level overwrite each other every tick
@@ -412,7 +418,7 @@ pub async fn run_voting_tick(ctx: &VotingTickContext, now_ms: i128) -> Result<Ti
             // in `apply_auto_exec_set_power` cannot stop a per-TARGET conflict),
             // minting a fresh CRDT SetPower event per poll per tick — the
             // ~49k-event / ~12 MB state-root storm the fleet measured (ZEB-933).
-            // Keeping only the newest-finalized poll matches materialize's LWW
+            // Keeping only the newest-created poll matches materialize's LWW
             // semantics and still re-dispatches that one canonical poll every
             // tick, preserving the quorum>1 countersign accumulation the
             // per-tick re-dispatch exists for.
@@ -1166,7 +1172,7 @@ mod tests {
     }
 
     /// ZEB-936 regression: Pass 3b must dedup conflicting finalized SetPower
-    /// polls for the same target down to the canonical (newest-finalized) one.
+    /// polls for the same target down to the canonical (newest-created) one.
     ///
     /// Before the fix, `to_dispatch` collected EVERY finalized SetPower poll and
     /// re-dispatched each every tick. In a small community every setPower targets
@@ -1253,13 +1259,85 @@ mod tests {
         assert_eq!(
             mint_count, 1,
             "conflicting same-target finalized SetPower polls must converge to \
-             ONE applied mint (canonical newest-finalized wins), not re-mint every \
+             ONE applied mint (canonical newest-created wins), not re-mint every \
              tick; got {mint_count}"
         );
         assert_eq!(
             power_probe.lock().unwrap().get(&target).copied(),
             Some(52),
-            "the surviving power must be the canonical (newest-finalized) poll's level"
+            "the surviving power must be the canonical (newest-created) poll's level"
+        );
+    }
+
+    /// ZEB-936 tie-break: when two same-target finalized SetPower polls share a
+    /// created_at hlc, the poll_id tie-break must pick the SAME poll on every
+    /// replica (the larger poll_id) so selection stays deterministic. Sibling of
+    /// `tier2_setpower_redispatch_dedups_conflicting_same_target_polls` (which
+    /// covers the primary created_at ordering); without the poll_id tie-break
+    /// this case would resolve by arbitrary HashMap order and diverge.
+    #[tokio::test]
+    async fn tier2_setpower_redispatch_tiebreaks_equal_created_at_by_poll_id() {
+        use std::collections::HashMap as StdHashMap;
+        use std::sync::Mutex as StdMutex;
+
+        let cid = SpaceId([0x77; 16]);
+        let target = OwnerAddr([0xcc; 16]);
+
+        // Equal created_at → the poll_id tie-break decides; the larger poll_id
+        // (pid_hi, level 52) is canonical, so its level must survive.
+        let mk = |pid: PollId, level: u32| {
+            let cfg = make_tier2_config(AutoExecAction::SetPower {
+                target_pubkey: target,
+                new_power: level,
+            });
+            let t2 = Tier2ProposalState::new(cfg, 1);
+            let mut poll = make_tier2_poll(cid, pid, Lifecycle::Finalized, t2);
+            poll.meta.created_at = make_hlc(1_000);
+            poll.meta.finalized_at_ms = Some(1_500);
+            poll
+        };
+        let pid_lo = PollId([0x01; 32]);
+        let pid_hi = PollId([0x02; 32]);
+        let mut log = VotingLog::new();
+        log.polls.insert(pid_lo, mk(pid_lo, 51));
+        log.polls.insert(pid_hi, mk(pid_hi, 52));
+
+        let mut logs = HashMap::new();
+        logs.insert(cid, Arc::new(Mutex::new(log)));
+        let now_ms = 3_000i128;
+        let (mut ctx, _events, _ae) = make_ctx_with_logs(logs, now_ms);
+
+        let power: Arc<StdMutex<StdHashMap<OwnerAddr, u32>>> =
+            Arc::new(StdMutex::new(StdHashMap::new()));
+        let mints: Arc<StdMutex<usize>> = Arc::new(StdMutex::new(0));
+        let power_probe = Arc::clone(&power);
+        let mints_probe = Arc::clone(&mints);
+        ctx.auto_exec_set_power = Arc::new(move |_cid, tgt, pw| {
+            let power = Arc::clone(&power);
+            let mints = Arc::clone(&mints);
+            Box::pin(async move {
+                if power.lock().unwrap().get(&tgt).copied() == Some(pw) {
+                    return Ok(crate::community_membership::AutoExecOutcome::AlreadyApplied);
+                }
+                power.lock().unwrap().insert(tgt, pw);
+                *mints.lock().unwrap() += 1;
+                Ok(crate::community_membership::AutoExecOutcome::Applied)
+            })
+        });
+
+        for _ in 0..30 {
+            run_voting_tick(&ctx, now_ms).await.unwrap();
+        }
+
+        assert_eq!(
+            *mints_probe.lock().unwrap(),
+            1,
+            "equal-created_at conflicting polls must still converge to ONE mint via the poll_id tie-break"
+        );
+        assert_eq!(
+            power_probe.lock().unwrap().get(&target).copied(),
+            Some(52),
+            "the larger poll_id must win the tie-break"
         );
     }
 
