@@ -135,7 +135,7 @@ pub fn community_neighbors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
     /// Deterministic distinct synthetic device keys for property tests.
     fn synth_devices(n: usize) -> BTreeSet<[u8; 32]> {
@@ -372,5 +372,103 @@ mod tests {
         let a = community_neighbors(&devices, &node, b"community-A");
         let b = community_neighbors(&devices, &node, b"community-B");
         assert!(a.intersection(&b).count() < a.len());
+    }
+
+    // ---- ZEB-930 O1: membership-change churn (regression guard) ----
+
+    type Adj = BTreeMap<[u8; 32], BTreeSet<[u8; 32]>>;
+
+    /// R4 production adjacency: every node's bounded neighbor set.
+    fn adj_r4(devices: &BTreeSet<[u8; 32]>, salt: &[u8]) -> Adj {
+        let ring = ring_order(devices, salt);
+        ring.iter()
+            .map(|d| (*d, neighbors_on_ring(&ring, d)))
+            .collect()
+    }
+
+    /// R3 ring baseline adjacency: neighbors are the two ring-adjacent devices.
+    fn adj_ring(devices: &BTreeSet<[u8; 32]>, salt: &[u8]) -> Adj {
+        let ring = ring_order(devices, salt);
+        let n = ring.len();
+        ring.iter()
+            .enumerate()
+            .map(|(r, d)| {
+                let mut s = BTreeSet::new();
+                if n >= 2 {
+                    s.insert(ring[(r + 1) % n]);
+                    s.insert(ring[(r + n - 1) % n]);
+                }
+                s.remove(d);
+                (*d, s)
+            })
+            .collect()
+    }
+
+    /// Undirected edge set (each edge once, canonical (min, max)).
+    fn edges(adj: &Adj) -> BTreeSet<([u8; 32], [u8; 32])> {
+        let mut e = BTreeSet::new();
+        for (u, nbrs) in adj {
+            for v in nbrs {
+                e.insert(if u < v { (*u, *v) } else { (*v, *u) });
+            }
+        }
+        e
+    }
+
+    /// Community-wide edge churn: edges added + torn down (symmetric difference).
+    fn edge_churn(before: &Adj, after: &Adj) -> usize {
+        edges(after).symmetric_difference(&edges(before)).count()
+    }
+
+    /// Existing nodes (present before AND after) whose neighbor set changed.
+    fn nodes_affected(before: &Adj, after: &Adj) -> usize {
+        before
+            .keys()
+            .filter(|k| after.contains_key(*k))
+            .filter(|k| before.get(*k) != after.get(*k))
+            .count()
+    }
+
+    #[test]
+    fn zeb930_ring_baseline_join_churn_is_o1_at_scale() {
+        // A join into the degree-2 ring splits exactly one edge: O(1) churn,
+        // independent of N. Guards the claim-B baseline.
+        let salt = b"zeb930";
+        for &n in &[50usize, 200] {
+            let before = synth_devices(n);
+            let mut after = before.clone();
+            after.insert(synth_key(1_000_000));
+            let churn = edge_churn(&adj_ring(&before, salt), &adj_ring(&after, salt));
+            assert!(
+                churn <= 8,
+                "ring join churn at N={n} was {churn}, expected O(1) (<=8)"
+            );
+        }
+    }
+
+    #[test]
+    fn zeb930_r4_join_is_a_redial_storm_at_n200() {
+        // ZEB-930 O1 headline: the rank-based circulant turns one join into a
+        // community-wide re-dial storm — roughly half the nodes change neighbors
+        // and >100 edges churn — because the hash-ranked insert shifts every rank
+        // past the insertion point. Locks the storm as a KNOWN property: a future
+        // key-distance fix (O2) must visibly move these floors.
+        let salt = b"zeb930";
+        let n = 200usize;
+        let before = synth_devices(n);
+        let mut after = before.clone();
+        after.insert(synth_key(1_000_000));
+        let b = adj_r4(&before, salt);
+        let a = adj_r4(&after, salt);
+        let churn = edge_churn(&b, &a);
+        let affected = nodes_affected(&b, &a);
+        assert!(
+            churn >= 100,
+            "R4 join edge-churn at N={n} was {churn}, expected a storm (>=100)"
+        );
+        assert!(
+            affected >= 80,
+            "R4 join nodes-affected at N={n} was {affected}/{n}, expected >=80"
+        );
     }
 }
