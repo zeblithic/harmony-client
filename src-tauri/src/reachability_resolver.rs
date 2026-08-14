@@ -861,7 +861,12 @@ impl ReachabilityResolver {
     ///
     /// The `device_hash` parameter records the inviter's bound-device
     /// identity for API parity with the caller in
-    /// `connectivity_redeem_invite_iroh` (Task 3). The resolver's
+    /// `connectivity_redeem_invite_iroh` (Task 3). The `enrolled_vk` parameter
+    /// (ZEB-930 Part 2) is the enrolled Ed25519 signing key to bind
+    /// `node_id → enrolled_vk` into the admission oracle before the auto-kick —
+    /// a DIFFERENT notion from `device_hash` (device address). `Some` only from a
+    /// caller holding a membership-verified key (the beacon path); `None`
+    /// otherwise (invite-redeem), preserving fail-open. The resolver's
     /// composite key uses `payload.iroh_node_id` (matching `update()`),
     /// because the Phase 1 transport reaches peers exclusively via
     /// `EndpointId` — see spec §7.3 and the docstring on
@@ -886,8 +891,19 @@ impl ReachabilityResolver {
         &self,
         owner_addr: OwnerAddr,
         _device_hash: DeviceIdentityHash,
+        enrolled_vk: Option<[u8; 32]>,
         payload: ReachabilityAnnouncePayload,
     ) {
+        // ZEB-930 Part 2: forward the vouch-verified enrolled key into the
+        // admission oracle BEFORE the update fires the supervisor auto-kick, so
+        // the seeded peer is bounded-degree-classifiable the instant it is kicked
+        // (race-free admission). Only callers holding a membership-verified key
+        // pass `Some`; the invite-redeem callers pass `None` and stay fail-open.
+        // `_device_hash` is the device-ADDRESS notion (`DeviceIdentityHash`) —
+        // NOT this enrolled Ed25519 vk; the two must never converge.
+        if let Some(vk) = enrolled_vk {
+            self.note_enrolled_binding(owner_addr.0, payload.iroh_node_id, vk);
+        }
         let hlc = Hlc {
             wall_ms: payload.announced_at_ms,
             logical: 0,
@@ -1193,6 +1209,41 @@ mod tests {
         assert!(
             oracle.admit(&node_id),
             "unbound after remove -> fail-open (unknown)"
+        );
+    }
+
+    /// ZEB-930 Part 2: `seed_from_pkarr` binds the enrolled key BEFORE its
+    /// internal update fires the kick when given `Some(vk)`, so the seeded node
+    /// is classifiable the instant it is kicked. `None` leaves it fail-open
+    /// (the invite-redeem callers' unchanged posture).
+    #[tokio::test]
+    async fn seed_from_pkarr_some_binds_none_fails_open() {
+        use crate::admission_oracle::AdmissionOracle;
+        let oracle = std::sync::Arc::new(AdmissionOracle::new(true));
+        let r = ReachabilityResolver::new();
+        r.set_admission_oracle(std::sync::Arc::clone(&oracle));
+        oracle.publish_admitted(std::collections::BTreeSet::new()); // nothing admitted
+
+        let owner = OwnerAddr([0x11; 16]);
+        let dh = crate::owner_state_types::DeviceIdentityHash([0u8; 16]);
+        let vk = [0xBB; 32];
+
+        // Some(vk): binds -> node_id classifiable -> denied (bound to a non-admitted key).
+        let node_some = node_id_bytes(0x42);
+        r.seed_from_pkarr(owner, dh, Some(vk), make_payload(0x42, 1_000))
+            .await;
+        assert!(
+            !oracle.admit(&node_some),
+            "Some(vk) binds -> non-admitted key denied"
+        );
+
+        // None: no bind -> node_id unknown -> fail-open.
+        let node_none = node_id_bytes(0x43);
+        r.seed_from_pkarr(owner, dh, None, make_payload(0x43, 1_000))
+            .await;
+        assert!(
+            oracle.admit(&node_none),
+            "None leaves node_id unbound -> fail-open"
         );
     }
 
@@ -2138,7 +2189,7 @@ mod fallback_tests {
 
         // Seed from pkarr (Phase 2c entry point).
         resolver
-            .seed_from_pkarr(owner_addr, device_hash, payload.clone())
+            .seed_from_pkarr(owner_addr, device_hash, None, payload.clone())
             .await;
 
         // After seeding: `resolve()` returns the record and
@@ -2171,7 +2222,7 @@ mod fallback_tests {
         let device_hash = DeviceIdentityHash([0x77; 16]);
         let payload = make_payload(0xBE, 4200);
         resolver
-            .seed_from_pkarr(owner_addr, device_hash, payload)
+            .seed_from_pkarr(owner_addr, device_hash, None, payload)
             .await;
         let tagged = resolver.resolve_with_source(&owner_addr);
         assert_eq!(tagged.len(), 1);

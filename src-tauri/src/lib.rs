@@ -64412,8 +64412,10 @@ where
         // sync once Phase 1's iroh→zenoh ingestion is wired, and is
         // harmless on the option-A path.
         let inviter_device_hash = crate::owner_state_types::DeviceIdentityHash([0u8; 16]);
+        // ZEB-930 Part 2: a joiner holds no membership-verified enrolled key for
+        // the inviter, so pass None — this node_id stays fail-open (unchanged).
         reachability_resolver
-            .seed_from_pkarr(inviter_addr, inviter_device_hash, routing.clone())
+            .seed_from_pkarr(inviter_addr, inviter_device_hash, None, routing.clone())
             .await;
 
         tracing::info!(
@@ -64570,10 +64572,13 @@ where
                                     // resolver to synthesize an EndpointAddr) targets
                                     // the same endpoint we're about to dial — not the
                                     // stale pre-retry one.
+                                    // ZEB-930 Part 2: joiner has no membership-verified
+                                    // key for the inviter → None (fail-open, unchanged).
                                     reachability_resolver
                                         .seed_from_pkarr(
                                             inviter_addr,
                                             crate::owner_state_types::DeviceIdentityHash([0u8; 16]),
+                                            None,
                                             routing2.clone(),
                                         )
                                         .await;
@@ -64746,10 +64751,13 @@ where
                         // Zenoh link (`IrohZenohLinkManager::new_link` reads this
                         // seed) pointed at the peer we actually reached — the
                         // witness-rung analogue of the rung-0 seed above.
+                        // ZEB-930 Part 2: joiner has no membership-verified key for
+                        // the witness → None (fail-open, unchanged).
                         reachability_resolver
                             .seed_from_pkarr(
                                 cand.owner,
                                 crate::owner_state_types::DeviceIdentityHash([0u8; 16]),
+                                None,
                                 cand.routing.clone(),
                             )
                             .await;

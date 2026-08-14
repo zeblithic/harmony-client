@@ -738,8 +738,19 @@ impl CommunityGatewayDialDriver {
                 // follow-up (ZEB-824 spec §9), out of scope here too.
                 let beacon_owner = OwnerAddr(identity.address_hash);
                 let node_id = hit.payload.iroh_node_id;
+                // ZEB-930 Part 2: the vouch was re-validated against this
+                // community's enrolled set at the CR-2 check above, so
+                // `membership_device_vk` is the peer's enrolled Ed25519 key. Bind
+                // it into the admission oracle (inside `seed_from_pkarr`, before
+                // its auto-kick) so the beacon peer is bounded-degree-classifiable
+                // rather than fail-open. NOT the device-address hash placeholder.
                 self.reachability
-                    .seed_from_pkarr(beacon_owner, DeviceIdentityHash([0u8; 16]), hit.payload)
+                    .seed_from_pkarr(
+                        beacon_owner,
+                        DeviceIdentityHash([0u8; 16]),
+                        Some(hit.membership_device_vk),
+                        hit.payload,
+                    )
                     .await;
                 if let Some(sup) = self.reachability.supervisor() {
                     // Explicit kick: idempotent with the seed's auto-kick (the
@@ -1207,6 +1218,46 @@ mod tests {
         // ZEB-918: the healthy single-candidate path costs exactly one probe —
         // the previous-epoch rung must add no cost when there is no rotation.
         assert_eq!(h.beacons.calls(), 1);
+    }
+
+    /// ZEB-930 Part 2: a vouch-verified beacon seed forwards
+    /// `node_id → membership_device_vk` into the admission oracle, so the beacon
+    /// peer is bounded-degree-classifiable (not fail-open) the instant its
+    /// seed-kick fires. The denied→admitted flip across `publish_admitted` proves
+    /// the binding actually landed, rather than being covered by fail-open.
+    #[tokio::test]
+    async fn beacon_seed_binds_enrolled_key_in_admission_oracle() {
+        use crate::admission_oracle::AdmissionOracle;
+        let community = SpaceId([0x12; 16]);
+        let (member_pub, member_owner) = test_member(2);
+        let node_id = [0x2D; 32];
+        let handle = SupervisorHandle::new();
+        let h = harness(
+            community,
+            vec![member_owner],
+            Some(beacon(member_pub, node_id)),
+            true,
+            Some(handle.clone()),
+        );
+        let oracle = std::sync::Arc::new(AdmissionOracle::new(true));
+        h.resolver
+            .set_admission_oracle(std::sync::Arc::clone(&oracle));
+
+        h.driver.run_one_pass().await;
+
+        // With FIXTURE_DEVICE_VK NOT admitted, a correctly-bound node is denied;
+        // an unbound (fail-open) node would be admitted here. The flip on
+        // admitting the key confirms the binding is real.
+        oracle.publish_admitted(std::collections::BTreeSet::new());
+        assert!(
+            !oracle.admit(&node_id),
+            "beacon seed must bind node_id -> enrolled key (not fail-open)"
+        );
+        oracle.publish_admitted(std::collections::BTreeSet::from([FIXTURE_DEVICE_VK]));
+        assert!(
+            oracle.admit(&node_id),
+            "admitting the bound enrolled key makes the beacon node dialable"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1912,6 +1963,7 @@ mod tests {
             .seed_from_pkarr(
                 member_owner,
                 DeviceIdentityHash([0u8; 16]),
+                None,
                 test_payload(beacon_node_id),
             )
             .await;
