@@ -4,7 +4,7 @@
 //! ring vs pre-R4 full-mesh, plus a diameter + dial-concurrency cost model that
 //! bounds reconvergence time. Deterministic (no wall-clock, no RNG). Run:
 //!
-//!     cd src-tauri && cargo run --example topology_churn
+//!     cd src-tauri && cargo run --locked --example topology_churn
 //!
 //! Regenerate the findings-doc tables from this output.
 
@@ -85,6 +85,14 @@ fn churn(before: &Adj, after: &Adj) -> Churn {
                 affected += 1;
             }
             max_adds = max_adds.max(a.difference(b).count());
+        }
+    }
+    // Include the joiner: a node in `after` but not `before` establishes its
+    // ENTIRE neighbor set from scratch (its full degree) — usually the worst
+    // dial workload. Excluding it understates the reconvergence storm.
+    for (k, a) in after {
+        if !before.contains_key(k) {
+            max_adds = max_adds.max(a.len());
         }
     }
     Churn {
