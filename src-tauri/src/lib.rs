@@ -14122,6 +14122,88 @@ pub async fn start_node_inner(
                         // (a device paired this session is absent from the
                         // boot-time fleet_net_enrolled snapshot above).
                         guard.identity_dir = Some(identity_dir.clone());
+                        // ── ZEB-934: eager voting-engine spawn ──────────────
+                        // The sibling per-community engines (community-state
+                        // sync, channel-log) come up eagerly at boot; the
+                        // voting engine did NOT — it spawned only on the first
+                        // *mutating* Tier-2/3 voting IPC. So a receive-only
+                        // member who never voted never started its live
+                        // subscriber / backfill requester and stayed dark to
+                        // governance. Spawn the voting engine for every joined
+                        // community here, where the handles are in scope and
+                        // `event_loop::run` (spawned above) is already draining
+                        // the adapter channel. `tokio::spawn` is a synchronous
+                        // handle return, so it is safe from within this std
+                        // `MutexGuard` scope (mirrors the liveness-heartbeat
+                        // spawn above); the async work runs after `guard` drops,
+                        // capturing individual Arcs — never `NodeState` (the
+                        // start_node inline-await / no-NodeState-in-tasks
+                        // hazard). Idempotent with the lazy mutation path and
+                        // with the ZEB-787 read reconcile above.
+                        if let (
+                            Some(vd_adapter_tx),
+                            Some(vd_hlc_tracker),
+                            Some(vd_device_id),
+                            Some(vd_self_owner),
+                            Some(vd_identity_pub_64),
+                            Some(vd_community_registry),
+                            Some(vd_dm_outbox),
+                            Some(vd_crdt_state),
+                        ) = (
+                            guard.voting_log_adapter_request_tx.clone(),
+                            guard.hlc_tracker.clone(),
+                            guard.dm_device_id.clone(),
+                            guard.dm_self_owner,
+                            guard.dm_identity_pub_64,
+                            guard.community_registry.clone(),
+                            guard.dm_outbox.clone(),
+                            guard.crdt_state.clone(),
+                        ) {
+                            let vd_voting_logs = std::sync::Arc::clone(&guard.voting_logs);
+                            let vd_voting_log_engines =
+                                std::sync::Arc::clone(&guard.voting_log_engines);
+                            let vd_adopt_floor = guard.hlc_adopt_floor.clone();
+                            let vd_app_handle = guard.app_handle_wry.clone();
+                            let vd_dfrost = guard.dfrost_log_registry.clone();
+                            let vd_beacon = guard.beacon_requester.clone();
+                            let vd_identity_dir = guard.identity_dir.clone();
+                            tokio::spawn(async move {
+                                let community_ids =
+                                    vd_community_registry.spawned_community_ids().await;
+                                if community_ids.is_empty() {
+                                    return;
+                                }
+                                let local_signing_key = {
+                                    let o = vd_dm_outbox.lock().await;
+                                    std::sync::Arc::clone(&o.signing_key)
+                                };
+                                let membership_resolver: std::sync::Arc<
+                                    dyn crate::community_voting_log::MembershipSnapshotResolver,
+                                > = std::sync::Arc::new(NodeStateMembershipResolver {
+                                    community_registry: vd_community_registry,
+                                    crdt_state: vd_crdt_state.clone(),
+                                });
+                                ensure_voting_engines_for_all_joined(
+                                    vd_voting_logs,
+                                    vd_voting_log_engines,
+                                    community_ids,
+                                    vd_adapter_tx,
+                                    vd_hlc_tracker,
+                                    vd_adopt_floor,
+                                    vd_device_id,
+                                    local_signing_key,
+                                    vd_self_owner,
+                                    membership_resolver,
+                                    vd_crdt_state,
+                                    vd_identity_pub_64,
+                                    vd_app_handle,
+                                    vd_dfrost,
+                                    vd_beacon,
+                                    vd_identity_dir,
+                                )
+                                .await;
+                            });
+                        }
                         // ZEB-418 P2 (PR #222 round 1): store the routing-
                         // republish trigger so `set_butler_pin` can fire an
                         // immediate pkarr republish on a local pin write —
@@ -37190,6 +37272,11 @@ pub(crate) async fn create_community_impl(
         .await;
     }
 
+    // ZEB-934: eager voting-engine spawn — bring the new community's voting
+    // engine (live subscriber + backfill requester) up now, so a co-admin's
+    // proposals reach this member without it having to vote first.
+    ensure_eager_voting_engine_for_join(state, &community_id).await;
+
     // ZEB-265: surface the new community to the nav listener. emit
     // failure is non-fatal — the create already committed, and the
     // frontend's synthesis fallback (App.svelte) keeps the node visible
@@ -42991,6 +43078,11 @@ pub(crate) async fn redeem_invite_impl(
         )
         .await;
     }
+
+    // ZEB-934: eager voting-engine spawn — a joiner who never votes must still
+    // receive the community's governance (live subscriber + backfill), rather
+    // than staying dark until its first voting mutation.
+    ensure_eager_voting_engine_for_join(state, &dto.community_id).await;
 
     // ZEB-265: surface the redeemed community to the nav listener.
     // emit failure is non-fatal — the join already committed, and
@@ -57138,6 +57230,136 @@ async fn reconcile_all_joined_communities_voting(
     }
 }
 
+/// ZEB-934: eager per-community voting-engine spawn for the boot sweep.
+///
+/// The sibling per-community engines (community-state sync, channel-log) spawn
+/// eagerly at boot; the voting engine did not — it came up only on the first
+/// *mutating* Tier-2/Tier-3 voting IPC (via `ensure_voting_engine_for` /
+/// `VotingEngineNodeHandles::ensure_engine`). So a receive-only member who
+/// never cast a voting mutation never started its live subscriber or backfill
+/// requester and stayed dark to governance. This brings voting into line by
+/// spawning the engine (subscriber + backfill) for every joined community at
+/// boot — the counterpart of `reconcile_all_joined_communities_voting`, which
+/// only reloads the log for *read* verbs.
+///
+/// `ensure_voting_engine_for` is idempotent (fast-path return when the engine
+/// already exists) and fire-and-forget on the adapter send, so this composes
+/// harmlessly with the mutation-triggered spawns and cannot deadlock the event
+/// loop. A per-community failure is logged and skipped so one bad community
+/// never blocks the others (mirrors the reconcile sweep's isolation).
+///
+/// Takes owned handles (not borrows) so it can be moved into a `tokio::spawn`
+/// task at boot — capturing the individual Arcs, never `NodeState` (the
+/// start_node inline-await / no-NodeState-in-tasks hazard).
+#[allow(clippy::too_many_arguments)]
+async fn ensure_voting_engines_for_all_joined(
+    voting_logs: VotingLogsMap,
+    voting_log_engines: VotingLogEnginesMap,
+    community_ids: Vec<crate::owner_state_types::SpaceId>,
+    voting_log_adapter_request_tx: tokio::sync::mpsc::Sender<
+        crate::event_loop::VotingLogAdapterRequest,
+    >,
+    hlc_tracker: std::sync::Arc<
+        tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, crate::owner_state_types::Hlc>>,
+    >,
+    adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor,
+    device_id: String,
+    local_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    local_owner: crate::owner_state_types::OwnerAddr,
+    membership_resolver: std::sync::Arc<
+        dyn crate::community_voting_log::MembershipSnapshotResolver,
+    >,
+    crdt_state: std::sync::Arc<tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>>,
+    self_identity_pub_64: [u8; 64],
+    app_handle: Option<tauri::AppHandle<tauri::Wry>>,
+    dfrost_log_registry: Option<
+        std::sync::Arc<crate::community_dfrost_log_engine::DfrostLogRegistry<tauri::Wry>>,
+    >,
+    beacon_requester: Option<crate::community_voting_log_engine::BeaconRequester>,
+    identity_dir: Option<std::path::PathBuf>,
+) {
+    for community_id in community_ids {
+        if let Err(e) = ensure_voting_engine_for(
+            &voting_logs,
+            &voting_log_engines,
+            community_id,
+            voting_log_adapter_request_tx.clone(),
+            hlc_tracker.clone(),
+            adopt_floor.clone(),
+            device_id.clone(),
+            local_signing_key.clone(),
+            local_owner,
+            membership_resolver.clone(),
+            crdt_state.clone(),
+            self_identity_pub_64,
+            app_handle.clone(),
+            dfrost_log_registry.clone(),
+            beacon_requester.clone(),
+            identity_dir.clone(),
+        )
+        .await
+        {
+            tracing::warn!(
+                ?community_id,
+                err = %e,
+                "ZEB-934: boot eager voting-engine spawn failed for community; \
+                 skipping (the lazy path still spawns it on the first mutating \
+                 voting IPC for it)"
+            );
+        }
+    }
+}
+
+/// ZEB-934: eager voting-engine spawn for a single community from a join seam
+/// (`create_community_impl` / `redeem_invite_impl`), so a member who joins but
+/// never casts a voting mutation still gets a live subscriber + backfill
+/// requester and syncs governance. Reuses the exact IPC path
+/// (`VotingEngineNodeHandles::extract` + `ensure_engine`) the mutating voting
+/// verbs use, so it's idempotent with them and with the boot sweep.
+///
+/// Awaited inline (a join is infrequent and the caller already holds no lock),
+/// so the engine is live by the time the join IPC returns. Every failure is
+/// non-fatal and logged — the join already committed, and the lazy mutation
+/// path still spawns the engine later.
+async fn ensure_eager_voting_engine_for_join(
+    state: &std::sync::Mutex<NodeState>,
+    community_id_hex: &str,
+) {
+    let space_id = match hex::decode(community_id_hex)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+    {
+        Some(bytes) => crate::owner_state_types::SpaceId(bytes),
+        None => {
+            tracing::warn!(
+                community_id = %community_id_hex,
+                "ZEB-934: eager voting-engine spawn skipped — community id is not 16-byte hex"
+            );
+            return;
+        }
+    };
+    match VotingEngineNodeHandles::extract(state) {
+        Ok(handles) => {
+            if let Err(e) = handles.ensure_engine(space_id).await {
+                tracing::warn!(
+                    err = %e,
+                    community_id = %community_id_hex,
+                    "ZEB-934: eager voting-engine spawn on join failed; the lazy \
+                     path will spawn it on the first mutating voting IPC"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                community_id = %community_id_hex,
+                "ZEB-934: eager voting-engine spawn on join skipped (handles \
+                 unavailable); the lazy path will spawn it on first mutation"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod zeb718_voting_reconcile_tests {
     use super::*;
@@ -57272,6 +57494,107 @@ mod zeb718_voting_reconcile_tests {
             payload,
             sig: vec![0u8; 64],
         }
+    }
+
+    #[tokio::test]
+    async fn boot_sweep_spawns_engine_and_enqueues_adapter_per_community() {
+        // ZEB-934: a receive-only member (never casts a voting mutation) must
+        // still get a LIVE voting engine — subscriber + backfill requester —
+        // for every joined community at boot. The pre-ZEB-934 boot sweep
+        // (`reconcile_all_joined_communities_voting`) only repopulated the log
+        // for reads; it spawned no engine and no zenoh sync. This pins the
+        // eager spawn: the engine is registered AND a `VotingLogAdapterRequest`
+        // is enqueued per community (the event loop turns each request into the
+        // live subscriber + backfill requester — the actual receive path).
+        let dir = tempfile::tempdir().unwrap();
+        let cid_a = SpaceId([0x91; 16]);
+        let cid_b = SpaceId([0x92; 16]);
+        let actor = OwnerAddr([0xee; 16]);
+
+        let mut members = HashMap::new();
+        members.insert(
+            actor,
+            MemberAttrs {
+                power: 10,
+                vouching_depth: 0,
+            },
+        );
+        let resolver: Arc<dyn MembershipSnapshotResolver> = Arc::new(StubResolver {
+            snapshot: MembershipSnapshot { members },
+        });
+
+        let voting_logs: VotingLogsMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let voting_log_engines: VotingLogEnginesMap =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        // Hold the rx so we can assert the adapter requests were enqueued.
+        let (adapter_tx, mut adapter_rx) =
+            tokio::sync::mpsc::channel::<crate::event_loop::VotingLogAdapterRequest>(64);
+
+        let hlc_tracker: Arc<tokio::sync::Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+            Arc::new(tokio::sync::Mutex::new(
+                harmony_crdt_sync::ReplayTracker::new("zeb934-dev".to_string()),
+            ));
+        let adopt_floor = crate::hlc_adopt_floor::HlcAdoptFloor::new();
+        let signing_key = Arc::new(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        let crdt_state = Arc::new(tokio::sync::Mutex::new(
+            crate::owner_state_crdt::OwnerState::default(),
+        ));
+
+        ensure_voting_engines_for_all_joined(
+            voting_logs.clone(),
+            voting_log_engines.clone(),
+            vec![cid_a, cid_b],
+            adapter_tx,
+            hlc_tracker,
+            adopt_floor,
+            "zeb934-dev".to_string(),
+            signing_key,
+            actor,
+            resolver,
+            crdt_state,
+            [0u8; 64],
+            None, // app_handle — headless
+            None, // dfrost registry
+            None, // beacon requester
+            Some(dir.path().to_path_buf()),
+        )
+        .await;
+
+        // (1) The engine — and thus the live subscriber — is registered for
+        //     BOTH joined communities, with no prior voting mutation.
+        {
+            let g = voting_log_engines.lock().unwrap();
+            assert!(
+                g.contains_key(&cid_a),
+                "ZEB-934: voting engine must spawn eagerly for community A at boot"
+            );
+            assert!(
+                g.contains_key(&cid_b),
+                "ZEB-934: voting engine must spawn eagerly for community B at boot"
+            );
+        }
+
+        // (2) A VotingLogAdapterRequest is enqueued per community — the event
+        //     loop consumes each to spawn the zenoh subscriber + backfill
+        //     requester. Exactly one per community (no duplicate subscribers).
+        let mut seen = std::collections::HashSet::new();
+        while let Ok(req) = adapter_rx.try_recv() {
+            seen.insert(req.community_id);
+        }
+        assert!(
+            seen.contains(&cid_a),
+            "adapter request enqueued for community A"
+        );
+        assert!(
+            seen.contains(&cid_b),
+            "adapter request enqueued for community B"
+        );
+        assert_eq!(
+            seen.len(),
+            2,
+            "exactly one adapter request per joined community (no duplicate subscribers)"
+        );
     }
 
     #[tokio::test]
@@ -86558,6 +86881,29 @@ mod zeb904_seedless_local_only_boot_tests {
             create_community_impl(&state, sink.clone(), "Seedless Commons".to_string(), true)
                 .await
                 .expect("create_community must work on a local-only boot");
+
+        // ZEB-934: create must EAGERLY spawn the community's voting engine
+        // (live subscriber + backfill requester), not defer it until the first
+        // voting mutation. Before ZEB-934 this map was empty here — a member
+        // who joined/created but never voted stayed dark to governance.
+        {
+            let sid = crate::owner_state_types::SpaceId(
+                <[u8; 16]>::try_from(
+                    hex::decode(&community_id)
+                        .expect("community id is hex")
+                        .as_slice(),
+                )
+                .expect("community id is 16 bytes"),
+            );
+            let g = state.lock().expect("NodeState lock");
+            assert!(
+                g.voting_log_engines
+                    .lock()
+                    .expect("voting_log_engines lock")
+                    .contains_key(&sid),
+                "ZEB-934: create_community must eagerly spawn the voting engine"
+            );
+        }
 
         // (f) Restart: stop, boot again on the SAME identity dir, and require
         //     the community to have survived via the keyless engine's persist
