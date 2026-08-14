@@ -25,9 +25,16 @@ enablement.
 
 ## Magnitude and window
 
-- **Magnitude:** a router-mode node boot-dials its full persisted roster (~N)
-  instead of ~degree neighbors (~14 at N=200) — a ~14× fan-out storm, exactly the
-  unbounded fan-out R4 exists to bound. Only bites communities above
+- **Magnitude:** the boot-seed enumerates the resolver's **dialable** view
+  (`list_dialable_peers`, freshest across durable + pkarr + fleet slots —
+  `iroh_zenoh_registration.rs::boot_seed_node_ids_by_recency`), so it kicks every
+  known peer across all three sources. In router mode a node therefore boot-dials
+  its full dialable roster (~N) instead of ~degree neighbors (~14 at N=200) — a
+  ~14× fan-out storm, exactly the unbounded fan-out R4 exists to bound. The
+  **genuine over-dial** is the community address-book members that are not
+  ring-neighbors; fleet-sibling and SAS-paired entries failing open is *correct*
+  (same-owner / first-contact peers are not community ring members subject to the
+  degree bound — see the Disposition note). Only bites communities above
   `FULL_MESH_THRESHOLD` (below that the ring is full-mesh, so all peers are
   neighbors and there is no over-dial).
 - **Window:** not short. `ingest_verified_row` rebinds only on a *fresher*
@@ -56,3 +63,14 @@ The proposed fix (for ZEB-931): before `seed_boot_peers_into_supervisor`, walk
 each joined community's address book (`CommunityAddressBook::rows_for_community`)
 and `note_enrolled_binding(row.actor.0, payload.iroh_node_id, row.device)` for
 every Reachability row, so the boot-seed kicks classify against real bindings.
+
+**Scope — address-book rows only, by design.** The backfill covers the community
+address-book Reachability rows and deliberately does **not** bind the
+fleet-slot-only (`FleetSibling`) or SAS-paired first-contact seeds that
+`list_dialable_peers` also returns. Those must **stay fail-open**: they are
+same-owner butler siblings or pre-membership first contacts, not community ring
+members, so they are not subject to the ring degree bound. Binding one would put
+it under the ring-neighbor filter and **park** it — breaking legitimate
+same-owner butler deposits / first-contact dialing. So fleet/SAS fail-open at
+boot is the intended terminal state, not a residual gap; ZEB-931 should assert
+this with a test rather than extend the backfill to cover them.
