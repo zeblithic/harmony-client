@@ -16,6 +16,7 @@
 //! oracle). See
 //! `docs/superpowers/specs/2026-08-14-zeb917-r6c-deterministic-simulation-harness-design.md`.
 
+mod anomaly;
 mod bus;
 mod clock;
 mod dialer;
