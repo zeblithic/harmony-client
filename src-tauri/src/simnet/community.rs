@@ -86,6 +86,12 @@ fn spawn_shared_cas() -> mpsc::Sender<CasOp> {
 
 /// Order-independent u64 digest of a state's event-id set. Two logs with the
 /// same event set (any insertion order) hash equal; different sets differ.
+///
+/// This is a **screening** digest for the anomaly trajectory only — the exact
+/// convergence oracle is `CommunityState: PartialEq` (see [`SimCommunity::all_states_equal`]).
+/// A 64-bit XOR can in principle collide, so never assert convergence on the
+/// digest alone; it exists to make a divergent trajectory legible, not to prove
+/// equality.
 fn event_set_digest(state: &CommunityState) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut acc: u64 = 0;
@@ -330,6 +336,19 @@ impl SimCommunity {
 
     /// Partition by 1-based seed-number groups.
     pub(crate) fn split(&self, groups: Vec<Vec<usize>>) {
+        // Guard against silent misuse: a partition must place every node
+        // exactly once. An omitted node would isolate silently (`same_side`
+        // returns false for an ungrouped tag); a duplicate would land in its
+        // last group. Test-only, so a debug assertion is enough. (An
+        // out-of-range index already panics via `self.node`.)
+        debug_assert!(
+            {
+                let mut seen: Vec<usize> = groups.iter().flatten().copied().collect();
+                seen.sort_unstable();
+                seen == (1..=self.nodes.len()).collect::<Vec<_>>()
+            },
+            "split groups must partition every node index exactly once, got {groups:?}"
+        );
         let id_groups: Vec<Vec<[u8; 32]>> = groups
             .iter()
             .map(|g| g.iter().map(|i| self.node(*i).tag).collect())
@@ -344,6 +363,12 @@ impl SimCommunity {
     /// Advance virtual time, letting engine debounce timers, bus drainers, and
     /// the CAS servicer run. `sleep` (not `advance`) so `start_paused`
     /// auto-advances through each armed timer.
+    ///
+    /// The 4 trailing yields nudge the publish → bus-drainer → CAS-fetch →
+    /// subscriber-merge hop chain forward, but are best-effort, NOT a quiescence
+    /// barrier: they are not derived from the hop count and would under-wait if
+    /// a hop is added. Callers must poll for the target condition (see
+    /// `poll_counts_eq`) rather than treat a single `advance` as convergence.
     pub(crate) async fn advance(&self, d: Duration) {
         tokio::time::sleep(d).await;
         for _ in 0..4 {

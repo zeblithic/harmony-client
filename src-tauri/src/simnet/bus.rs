@@ -49,7 +49,11 @@ impl SimBus {
                             // Evaluated per-frame so a mid-run split/heal takes
                             // effect immediately.
                             if partition.same_side(src_tag, tags[j]) {
-                                let _ = sink.send(bytes.clone()).await;
+                                // Non-blocking: a saturated sink drops the frame
+                                // (consistent with the bus's transport-loss
+                                // model) rather than parking the whole fan-out
+                                // and starving healthy peers after `j`.
+                                let _ = sink.try_send(bytes.clone());
                             }
                         }
                     }
@@ -107,7 +111,10 @@ mod bus_tests {
         assert_eq!(drained(&mut i1r).await, Some(b"m1".to_vec()));
         assert_eq!(drained(&mut i2r).await, Some(b"m1".to_vec()));
 
-        // Partition {0} | {1,2}: node 0's frame is dropped for 1 and 2.
+        // Partition {0} | {1,2}: node 0's frame is dropped for 1 and 2. The
+        // heal phase below re-delivers on these same channels — that positive
+        // control proves the bus is live, so these `None`s are genuine drops,
+        // not a dead/undelivered fabric.
         partition.set_split(vec![vec![[1u8; 32]], vec![[2u8; 32], [3u8; 32]]]);
         o0.send(b"drop".to_vec()).await.unwrap();
         assert_eq!(

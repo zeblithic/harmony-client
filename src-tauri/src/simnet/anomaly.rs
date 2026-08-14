@@ -46,6 +46,18 @@ pub(crate) enum Anomaly {
 pub(crate) fn analyze(trajectory: &[Vec<Sample>]) -> Vec<Anomaly> {
     let mut out = Vec::new();
 
+    // The documented precondition: every row has the same node count. `zip` and
+    // the index-bounded stale block would otherwise silently truncate a ragged
+    // trajectory into a partial diagnosis. Test-only, so a debug assertion is
+    // enough.
+    if let Some(first) = trajectory.first() {
+        debug_assert!(
+            trajectory.iter().all(|row| row.len() == first.len()),
+            "analyze requires a rectangular trajectory: {:?}",
+            trajectory.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+    }
+
     // Oscillation: a node's count decreased between consecutive rounds.
     for pair in trajectory.windows(2) {
         for (node, (prev, next)) in pair[0].iter().zip(pair[1].iter()).enumerate() {
@@ -59,8 +71,10 @@ pub(crate) fn analyze(trajectory: &[Vec<Sample>]) -> Vec<Anomaly> {
         }
     }
 
-    // Final divergence: leader = node with max count in the final round (first
-    // on ties); any node whose digest differs is divergent.
+    // Final divergence: leader = node with max count in the final round (last
+    // on ties, per `Iterator::max_by_key`); any node whose digest differs is
+    // divergent. The tie-break only picks the reference digest — if any two
+    // nodes disagree, at least one differs from whichever is chosen leader.
     if let Some(final_row) = trajectory.last() {
         if let Some(leader) = final_row.iter().max_by_key(|s| s.count).copied() {
             for (node, s) in final_row.iter().enumerate() {
