@@ -55,7 +55,13 @@ pub enum SnapshotResolverError {
 /// topic `harmony/community/{id}/voting` (Task 12).
 #[derive(Debug, Default, Clone)]
 pub struct VotingLog {
-    /// All accepted events, ordered by (hlc, event_hash) at insert time.
+    /// All accepted events, in arrival (apply) order — `apply_with_snapshot`
+    /// pushes; it does NOT insert-sort. Canonical `(hlc, event_hash)` order is
+    /// (re)established by `rebuild_from_events`
+    /// (`sort_by_cached_key(canonical_key)`), which is what keeps live state
+    /// byte-equal to boot-restore (ZEB-860/867). Wire/replay order is not
+    /// correctness-bearing here: each event is self-contained and re-applied
+    /// through coordinate-dedup.
     pub events: Vec<SignedVotingEvent>,
     /// Materialized per-poll state, keyed by PollId.
     pub polls: HashMap<PollId, PollState>,

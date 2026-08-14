@@ -3436,9 +3436,9 @@ pub(crate) async fn epoch_key_candidates(
 ///
 /// Encryption split is intentional and load-bearing:
 /// - `encrypt_blob` (deterministic nonce) for the on-CAS ciphertext,
-///   so two devices encrypting the same `CommunityState` derive the
-///   same ContentId and the CAS slot is shared (dedup, replica
-///   convergence on `root_cid`).
+///   so a given plaintext always maps to one ContentId and the CAS
+///   slot is shared — this is what makes a single publisher's
+///   unchanged-segment re-`put`s idempotent (dedup).
 /// - `encrypt_root_publish` (random nonce + AAD) for the wire packet,
 ///   so each publish is independently fresh and the AAD prefix binds
 ///   the ciphertext to its wire-context (replay protection lives in
@@ -3447,6 +3447,20 @@ pub(crate) async fn epoch_key_candidates(
 /// Don't swap them — sharing a deterministic-nonce wire-side would
 /// make every retransmit byte-identical and hide replay errors;
 /// sharing a random-nonce CAS-side would defeat ContentId dedup.
+///
+/// NOT a cross-publisher convergence primitive (ZEB-916 determinism
+/// audit). `encrypt_blob`'s determinism only holds *per identical
+/// plaintext* — and since ZEB-814 segmentation the plaintext is not
+/// identical across publishers: `plan_segments` (below) mints a fresh
+/// random `K_s` per newly-sealed segment (`OsRng`) and the manifest
+/// embeds every segment's `K_s`, so two publishers with byte-identical
+/// logical state produce different manifests → different `root_cid`s.
+/// That is harmless today only because `root_cid` is never byte-compared
+/// across peers: staleness is decided by the receiver's HLC watermark
+/// plus an unconditional fetch-and-merge, never by "their root == my
+/// last root". Do NOT add such a comparison — it would fail open in the
+/// worst direction (roots never match → a full-state exchange on every
+/// publish, forever: the Freenet #4857 heal storm).
 async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncError> {
     use crate::owner_state_crypto::canonical_cbor_encode;
     use ed25519_dalek::Signer;
