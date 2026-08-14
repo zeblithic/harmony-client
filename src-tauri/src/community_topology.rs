@@ -22,9 +22,13 @@
 //! nodes' sets (the wiring's harness, a simulation) should call [`ring_order`]
 //! once and [`neighbors_on_ring`] per node — not [`community_neighbors`] N times.
 //!
-//! UNWIRED: this module has no live call sites. R4's hot-path wiring (kick-inflow
-//! filter, device-key→node_id resolver bridge, router-mode gate) is a follow-up
-//! ticket, ZEB-928, under the ZEB-909 epic.
+//! WIRED (ZEB-928; validated at N=100 by ZEB-929). The R4 hot path — kick-inflow
+//! filter, device-key→node_id resolver bridge, router-mode gate — lives in the
+//! admission oracle: [`community_neighbors`] is the pure core of
+//! [`crate::admission_oracle::compute_admitted`], whose realized neighbor union
+//! the live controller→oracle→supervisor pipeline publishes as the admitted
+//! device-key set. Below [`FULL_MESH_THRESHOLD`], `community_neighbors` returns
+//! all-but-self, so small communities stay full mesh.
 
 use std::collections::BTreeSet;
 
