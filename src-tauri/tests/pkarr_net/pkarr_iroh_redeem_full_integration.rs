@@ -670,6 +670,7 @@ pub(crate) async fn setup_two_party_iroh_handshake_with_config(
         .seed_from_pkarr(
             alice_addr,
             DeviceIdentityHash([0u8; 16]),
+            None,
             alice_routing.clone(),
         )
         .await;
