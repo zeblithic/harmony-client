@@ -261,6 +261,25 @@ mod tests {
     }
 
     #[test]
+    fn compute_admitted_at_n200_bounded_degree_is_14() {
+        // The ticket's headline (ZEB-929 claim C): at N=200 the bounded degree is ~2·log₂N = 14
+        // (100 is not a power of two, so no antipode collapse). Pins the number as a regression
+        // guard against a topology-engine drift.
+        let devices = synth(200);
+        let self_vk = *devices.iter().next().unwrap();
+        let salt = b"zeb929".to_vec();
+        let out = compute_admitted(&[(devices.clone(), salt.clone())], &self_vk);
+        // Structural: equals the engine directly (never a naively-applied formula).
+        assert_eq!(out, community_neighbors(&devices, &self_vk, &salt));
+        assert!(!out.contains(&self_vk));
+        assert_eq!(
+            out.len(),
+            14,
+            "bounded degree at N=200 is 2·(⌊log₂100⌋+1) = 14"
+        );
+    }
+
+    #[test]
     fn compute_admitted_unions_across_communities() {
         let a = synth(FULL_MESH_THRESHOLD + 10);
         let b: BTreeSet<[u8; 32]> = synth(FULL_MESH_THRESHOLD + 10)

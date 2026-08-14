@@ -1162,6 +1162,29 @@ mod tests {
         );
     }
 
+    /// Seed one dialable peer: a reachability record under a distinct `owner` carrying `node_id`.
+    /// Unlike `seed` (which hardcodes one owner), this parameterizes the owner so many peers can
+    /// be seeded without colliding on the resolver's owner-keyed map.
+    fn seed_peer(resolver: &ReachabilityResolver, owner: [u8; 16], node_id: [u8; 32]) {
+        resolver.update(
+            OwnerAddr(owner),
+            ReachabilityAnnouncePayload {
+                iroh_node_id: node_id,
+                home_relay_url: String::new(),
+                direct_addresses: vec![],
+                announced_at_ms: 1,
+                identity_signature: [0u8; 64],
+                butler_set: vec![],
+                bs_at: 0,
+            },
+            Hlc {
+                wall_ms: 1,
+                logical: 0,
+                device_id: String::new(),
+            },
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn cfg(
         base_ms: u64,
@@ -2365,6 +2388,141 @@ mod tests {
         assert!(
             dialer.count_for(p) > 0,
             "admitted peer dialed after the sweep re-arms it"
+        );
+    }
+
+    /// ZEB-929 (R4 validation): the live controller→oracle→supervisor pipeline, driven over a
+    /// 100-device community, dials EXACTLY the engine's ring-neighbor selection (degree 12) and
+    /// parks every non-neighbor Dormant — the bound "proven in practice, not just unit tests."
+    /// Then: an admission delta recovers a parked peer, and a revoked peer whose conn drops is
+    /// NOT re-dialed (the dispatch-point revocation guard, at scale).
+    #[tokio::test(start_paused = true)]
+    async fn r4_bounded_degree_partition_and_delta_at_scale() {
+        use crate::admission_oracle::{compute_admitted, AdmissionOracle};
+        use crate::community_topology::community_neighbors;
+        use std::collections::BTreeSet;
+
+        const N: usize = 100; // self + 99 peers; degree 12 (50 not a power of two → no antipode)
+        let salt = b"zeb929-scale".to_vec();
+        let device_keys: Vec<[u8; 32]> = (0..N)
+            .map(|i| harmony_crypto::hash::blake3_hash(&(i as u64).to_be_bytes()))
+            .collect();
+        let self_vk = device_keys[0];
+        let devices: BTreeSet<[u8; 32]> = device_keys.iter().copied().collect();
+
+        let dialer = RecordingDialer::succeeding();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let oracle = Arc::new(AdmissionOracle::new(true));
+
+        // 99 peers: peer i → node_id peer(i), owner [i;16], enrolled key device_keys[i].
+        let node_ids: Vec<[u8; 32]> = (1..N)
+            .map(|i| {
+                let node_id = peer(i as u8);
+                let owner = [i as u8; 16];
+                seed_peer(&resolver, owner, node_id);
+                oracle.bind(owner, node_id, device_keys[i]);
+                node_id
+            })
+            .collect();
+
+        // Publish the realized admitted device-key set = the engine's neighbor union.
+        let neighbors = community_neighbors(&devices, &self_vk, &salt);
+        oracle.publish_admitted(compute_admitted(
+            &[(devices.clone(), salt.clone())],
+            &self_vk,
+        ));
+
+        // Expected live dial set: peers whose enrolled key is a chosen neighbor.
+        let expected_connected: BTreeSet<[u8; 32]> = (1..N)
+            .filter(|&i| neighbors.contains(&device_keys[i]))
+            .map(|i| peer(i as u8))
+            .collect();
+
+        let handle = SupervisorHandle::new();
+        handle.set_admission_oracle(Arc::clone(&oracle));
+        let config = cfg(1_000, 64_000, 10_000, 1_000, 16, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        for &n in &node_ids {
+            handle.kick(n, ReconnectTrigger::NewPeer);
+        }
+        tokio::time::sleep(ms(60_000)).await;
+
+        let snap = handle.states_snapshot();
+        let connected: BTreeSet<[u8; 32]> = snap
+            .iter()
+            .filter(|(_, st)| matches!(st, PeerStateWire::Connected { .. }))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(neighbors.len(), 12, "N=100 bounded degree is 12");
+        assert_eq!(
+            connected, expected_connected,
+            "live dial set must equal the engine's ring-neighbor selection"
+        );
+        for &n in &node_ids {
+            if expected_connected.contains(&n) {
+                assert!(dialer.count_for(n) >= 1, "a neighbor must dial");
+            } else {
+                assert_eq!(
+                    dialer.count_for(n),
+                    0,
+                    "a non-neighbor never dials (parked at dispatch)"
+                );
+                assert!(
+                    snap.iter()
+                        .any(|(id, st)| *id == n && matches!(st, PeerStateWire::Dormant { .. })),
+                    "a non-neighbor sits Dormant"
+                );
+            }
+        }
+
+        // Phase 2 — admission delta recovers a parked peer. Pick a Dormant non-neighbor,
+        // admit its key, sweep: it must dial and connect.
+        let recover_i = (1..N)
+            .find(|&i| !expected_connected.contains(&peer(i as u8)))
+            .unwrap();
+        let recover_id = peer(recover_i as u8);
+        let mut admitted2 = compute_admitted(&[(devices.clone(), salt.clone())], &self_vk);
+        admitted2.insert(device_keys[recover_i]);
+        oracle.publish_admitted(admitted2.clone());
+        handle.kick_sweep();
+        tokio::time::sleep(ms(30_000)).await;
+        assert!(
+            handle
+                .states_snapshot()
+                .iter()
+                .any(|(id, st)| *id == recover_id && matches!(st, PeerStateWire::Connected { .. })),
+            "a newly-admitted parked peer recovers to Connected after the sweep"
+        );
+
+        // Phase 3 — revocation guard at scale. Revoke a currently-Connected neighbor, then drop
+        // it: the re-dial must be denied at dispatch (parked), not slipped through arming.
+        let revoke_id = *expected_connected.iter().next().unwrap();
+        let revoke_i = (1..N).find(|&i| peer(i as u8) == revoke_id).unwrap();
+        let calls_before = dialer.count_for(revoke_id);
+        admitted2.remove(&device_keys[revoke_i]);
+        oracle.publish_admitted(admitted2);
+        handle.kick(revoke_id, ReconnectTrigger::Dropped); // simulate its connection dropping
+        tokio::time::sleep(ms(30_000)).await;
+        assert_eq!(
+            dialer.count_for(revoke_id),
+            calls_before,
+            "a revoked peer whose conn drops is NOT re-dialed (denied at dispatch)"
+        );
+        assert!(
+            handle
+                .states_snapshot()
+                .iter()
+                .any(|(id, st)| *id == revoke_id && matches!(st, PeerStateWire::Dormant { .. })),
+            "the revoked, dropped peer is parked Dormant"
         );
     }
 
