@@ -3573,7 +3573,11 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
     //    already present from a prior publish and are NOT re-put — this is
     //    where the O(delta) upload cost falls out. Consume the ciphertexts by
     //    value (up to ~256 KiB each) rather than cloning them (Qodo #4).
+    let mut segments_new = 0usize;
+    let mut segment_bytes = 0usize;
     for (seg_ref, ciphertext) in plan.newly_sealed {
+        segments_new += 1;
+        segment_bytes += ciphertext.len();
         ctx.content_store
             .put_serveable(seg_ref.segment_cid, ciphertext)
             .await?;
@@ -3678,9 +3682,25 @@ async fn encode_root_packet(ctx: &InternalCtx) -> Result<Vec<u8>, CommunitySyncE
     // (ZEB-395) — same allowlist contract as the legacy monolithic blob. Then
     // persist the updated segment index so this publisher's NEXT publish reuses
     // these segment CIDs (per-publisher O(delta)).
+    let manifest_bytes = manifest_ciphertext.len();
     ctx.content_store
         .put_serveable(root_cid, manifest_ciphertext)
         .await?;
+    // ZEB-916 Q1: per-encode state-root size. Fires on BOTH the debounced
+    // publish and the query-serve re-encode (both route through this fn), which
+    // the wire-publish log at the adapter cannot tell apart. `segments_new` /
+    // `segment_bytes` are the O(delta) upload; `manifest_bytes` is the root that
+    // every peer re-fetches every round.
+    tracing::info!(
+        target: "harmony_volume",
+        kind = "state_root_encode",
+        community_id = ?ctx.community_id,
+        segments_total = manifest.segments.len(),
+        segments_new,
+        segment_bytes,
+        manifest_bytes,
+        "state-root encoded"
+    );
     // ZEB-922: re-affirm every reused segment's serve lease. Newly-sealed
     // segments were just put_serveable'd in step 3; REUSED segments were put
     // by an earlier publish — possibly a previous process, whose allowlist

@@ -10139,13 +10139,26 @@ pub fn spawn_community_state_zenoh_adapter(
                     biased;
                     maybe = publisher_rx.recv() => {
                         let Some(bytes) = maybe else { break; };
-                        if let Err(e) = session_pub.put(&key_pub, bytes).await {
-                            if !closing_pub.load(Ordering::SeqCst) {
-                                tracing::warn!(
-                                    topic = %topic_pub,
-                                    error = %e,
-                                    "community state-root publish failed"
-                                );
+                        // ZEB-916 Q1: wire-packet volume + publish frequency
+                        // (both otherwise unlogged). One line per debounced
+                        // state-root publish.
+                        let wire_bytes = bytes.len();
+                        match session_pub.put(&key_pub, bytes).await {
+                            Ok(()) => tracing::info!(
+                                target: "harmony_volume",
+                                kind = "state_root_publish",
+                                topic = %topic_pub,
+                                wire_bytes,
+                                "state-root wire publish"
+                            ),
+                            Err(e) => {
+                                if !closing_pub.load(Ordering::SeqCst) {
+                                    tracing::warn!(
+                                        topic = %topic_pub,
+                                        error = %e,
+                                        "community state-root publish failed"
+                                    );
+                                }
                             }
                         }
                     }
@@ -10654,6 +10667,8 @@ pub fn spawn_voting_log_zenoh_adapter(
                     res = qbl.recv_async() => {
                         let Ok(query) = res else { break; };
                         let frames = (read_for_backfill)().await;
+                        let mut served_frames = 0usize;
+                        let mut served_bytes = 0usize;
                         for frame in frames {
                             // Re-encrypt under the CURRENT epoch at serve time.
                             let Some(wire) = voting_encrypt_current_epoch(
@@ -10662,6 +10677,7 @@ pub fn spawn_voting_log_zenoh_adapter(
                                 // No current epoch state — nothing serveable.
                                 break;
                             };
+                            let wire_len = wire.len();
                             if let Err(e) = query.reply(query.key_expr(), wire).await {
                                 tracing::debug!(
                                     topic = %backfill_topic_qbl,
@@ -10670,7 +10686,21 @@ pub fn spawn_voting_log_zenoh_adapter(
                                 );
                                 break;
                             }
+                            // Count only frames that actually left the node — a None
+                            // encrypt or a failed reply breaks out uncounted — so the
+                            // Q1 numbers reflect bytes truly served, not attempted.
+                            served_frames += 1;
+                            served_bytes += wire_len;
                         }
+                        // ZEB-916 Q1: full-dump volume served to one requester.
+                        tracing::info!(
+                            target: "harmony_volume",
+                            kind = "voting_backfill_serve",
+                            topic = %backfill_topic_qbl,
+                            frames = served_frames,
+                            served_bytes,
+                            "voting backfill dump served"
+                        );
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                         if closing_qbl.load(Ordering::SeqCst) { break; }
@@ -10710,31 +10740,50 @@ pub fn spawn_voting_log_zenoh_adapter(
                     .timeout(std::time::Duration::from_secs(10))
                     .await
                 {
-                    Ok(receiver) => loop {
-                        tokio::select! {
-                            biased;
-                            res = receiver.recv_async() => {
-                                let Ok(reply) = res else { break; };
-                                if let Ok(sample) = reply.into_result() {
-                                    // Cap peer-controlled reply payloads before
-                                    // materializing — parity with the live
-                                    // subscriber's allocation-DoS guard.
-                                    if sample.payload().len() > MAX_VOTING_PAYLOAD_BYTES {
-                                        continue;
-                                    }
-                                    let raw = sample.payload().to_bytes().to_vec();
-                                    if let Some(plaintext) = voting_decrypt_current_epoch_cut(
-                                        &crdt_state_req, community_id, &raw,
-                                    ).await {
-                                        (apply_backfilled)(plaintext).await;
+                    Ok(receiver) => {
+                        let mut recv_frames = 0usize;
+                        let mut recv_bytes = 0usize;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                res = receiver.recv_async() => {
+                                    let Ok(reply) = res else { break; };
+                                    if let Ok(sample) = reply.into_result() {
+                                        // Cap peer-controlled reply payloads before
+                                        // materializing — parity with the live
+                                        // subscriber's allocation-DoS guard.
+                                        let payload_len = sample.payload().len();
+                                        if payload_len > MAX_VOTING_PAYLOAD_BYTES {
+                                            continue;
+                                        }
+                                        recv_frames += 1;
+                                        recv_bytes += payload_len;
+                                        let raw = sample.payload().to_bytes().to_vec();
+                                        if let Some(plaintext) = voting_decrypt_current_epoch_cut(
+                                            &crdt_state_req, community_id, &raw,
+                                        ).await {
+                                            (apply_backfilled)(plaintext).await;
+                                        }
                                     }
                                 }
-                            }
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                                if closing_req.load(Ordering::SeqCst) { return; }
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                                    if closing_req.load(Ordering::SeqCst) { return; }
+                                }
                             }
                         }
-                    },
+                        // ZEB-916 Q1: the multi-responder fan-in
+                        // (ConsolidationMode::None → every remote responder's
+                        // full dump arrives) is the dominant voting-sync term and
+                        // is invisible from the responder side alone.
+                        tracing::info!(
+                            target: "harmony_volume",
+                            kind = "voting_backfill_recv",
+                            topic = %backfill_topic_req,
+                            frames = recv_frames,
+                            recv_bytes,
+                            "voting backfill dump received"
+                        );
+                    }
                     Err(e) => {
                         if !closing_req.load(Ordering::SeqCst) {
                             tracing::debug!(
@@ -11678,6 +11727,7 @@ where
                         tracing::warn!(%qkey, "content-serve: local bytes failed hash==cid; not serving");
                         continue;
                     }
+                    let serve_bytes = bytes.len();
                     match query.reply(query.key_expr(), bytes).await {
                         Ok(()) => {
                             // ZEB-922: a successful serve is demonstrated
@@ -11686,6 +11736,15 @@ where
                             // Also the first success-path observability here.
                             serve_allowlist.touch(&cid);
                             tracing::debug!(%qkey, "content-serve: served");
+                            // ZEB-916 Q1: blob-transfer volume (all content
+                            // types; state-root segments are the bulk).
+                            tracing::info!(
+                                target: "harmony_volume",
+                                kind = "content_serve",
+                                %qkey,
+                                serve_bytes,
+                                "content blob served"
+                            );
                         }
                         Err(e) => {
                             tracing::warn!(%qkey, error = %e, "content-serve reply failed");
