@@ -14203,6 +14203,24 @@ pub async fn start_node_inner(
                                 )
                                 .await;
                             });
+                        } else {
+                            // CodeRabbit: without this, a missing precondition
+                            // makes the sweep a silent no-op — "governance stays
+                            // dark" would be undiagnosable. Log which handle(s)
+                            // were absent.
+                            tracing::warn!(
+                                adapter_tx = guard.voting_log_adapter_request_tx.is_some(),
+                                hlc_tracker = guard.hlc_tracker.is_some(),
+                                device_id = guard.dm_device_id.is_some(),
+                                self_owner = guard.dm_self_owner.is_some(),
+                                identity_pub_64 = guard.dm_identity_pub_64.is_some(),
+                                community_registry = guard.community_registry.is_some(),
+                                dm_outbox = guard.dm_outbox.is_some(),
+                                crdt_state = guard.crdt_state.is_some(),
+                                "ZEB-934: boot eager voting-engine sweep skipped — a \
+                                 required handle is unavailable (governance will sync \
+                                 lazily on the first voting mutation)"
+                            );
                         }
                         // ZEB-418 P2 (PR #222 round 1): store the routing-
                         // republish trigger so `set_butler_pin` can fire an
@@ -37274,8 +37292,9 @@ pub(crate) async fn create_community_impl(
 
     // ZEB-934: eager voting-engine spawn — bring the new community's voting
     // engine (live subscriber + backfill requester) up now, so a co-admin's
-    // proposals reach this member without it having to vote first.
-    ensure_eager_voting_engine_for_join(state, &community_id).await;
+    // proposals reach this member without it having to vote first. Fire-and-
+    // forget (the helper spawns) so it never blocks the create response.
+    ensure_eager_voting_engine_for_join(state, &community_id);
 
     // ZEB-265: surface the new community to the nav listener. emit
     // failure is non-fatal — the create already committed, and the
@@ -43081,8 +43100,16 @@ pub(crate) async fn redeem_invite_impl(
 
     // ZEB-934: eager voting-engine spawn — a joiner who never votes must still
     // receive the community's governance (live subscriber + backfill), rather
-    // than staying dark until its first voting mutation.
-    ensure_eager_voting_engine_for_join(state, &dto.community_id).await;
+    // than staying dark until its first voting mutation. Fire-and-forget.
+    //
+    // CodeAnt: gate on `!dto.pending`. An invite-only redemption can commit a
+    // PendingJoin and return `pending == true` — the member is NOT yet admitted,
+    // so it must not start a voting subscriber / backfill requester for a
+    // community it hasn't joined. Once admitted, the boot sweep (next restart)
+    // and the lazy mutation path bring the engine up.
+    if !dto.pending {
+        ensure_eager_voting_engine_for_join(state, &dto.community_id);
+    }
 
     // ZEB-265: surface the redeemed community to the nav listener.
     // emit failure is non-fatal — the join already committed, and
@@ -57317,11 +57344,18 @@ async fn ensure_voting_engines_for_all_joined(
 /// (`VotingEngineNodeHandles::extract` + `ensure_engine`) the mutating voting
 /// verbs use, so it's idempotent with them and with the boot sweep.
 ///
-/// Awaited inline (a join is infrequent and the caller already holds no lock),
-/// so the engine is live by the time the join IPC returns. Every failure is
-/// non-fatal and logged — the join already committed, and the lazy mutation
-/// path still spawns the engine later.
-async fn ensure_eager_voting_engine_for_join(
+/// Fire-and-forget: the engine spawn runs on a background task, so it never
+/// blocks the join IPC. `ensure_engine` performs a persisted-log replay and
+/// then enqueues onto the bounded event-loop adapter channel; awaiting that
+/// inline could stall the join *after it had already committed* if the event
+/// loop were wedged (CodeAnt). A `tokio::time::timeout` was considered and
+/// rejected: a timeout would drop the in-flight adapter send, potentially
+/// leaving the engine registered in the map with no zenoh wiring and no retry
+/// (the idempotent fast path would then treat it as done). Backgrounding keeps
+/// the send pending, so it completes if the loop recovers, and the spawn is
+/// idempotent with the concurrent lazy/boot paths (insertion-race safe). Every
+/// failure is non-fatal and logged — the join already committed.
+fn ensure_eager_voting_engine_for_join(
     state: &std::sync::Mutex<NodeState>,
     community_id_hex: &str,
 ) {
@@ -57338,17 +57372,8 @@ async fn ensure_eager_voting_engine_for_join(
             return;
         }
     };
-    match VotingEngineNodeHandles::extract(state) {
-        Ok(handles) => {
-            if let Err(e) = handles.ensure_engine(space_id).await {
-                tracing::warn!(
-                    err = %e,
-                    community_id = %community_id_hex,
-                    "ZEB-934: eager voting-engine spawn on join failed; the lazy \
-                     path will spawn it on the first mutating voting IPC"
-                );
-            }
-        }
+    let handles = match VotingEngineNodeHandles::extract(state) {
+        Ok(h) => h,
         Err(e) => {
             tracing::warn!(
                 err = %e,
@@ -57356,8 +57381,20 @@ async fn ensure_eager_voting_engine_for_join(
                 "ZEB-934: eager voting-engine spawn on join skipped (handles \
                  unavailable); the lazy path will spawn it on first mutation"
             );
+            return;
         }
-    }
+    };
+    let community_id_hex = community_id_hex.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = handles.ensure_engine(space_id).await {
+            tracing::warn!(
+                err = %e,
+                community_id = %community_id_hex,
+                "ZEB-934: eager voting-engine spawn on join failed; the lazy \
+                 path will spawn it on the first mutating voting IPC"
+            );
+        }
+    });
 }
 
 #[cfg(test)]
@@ -57577,10 +57614,12 @@ mod zeb718_voting_reconcile_tests {
 
         // (2) A VotingLogAdapterRequest is enqueued per community — the event
         //     loop consumes each to spawn the zenoh subscriber + backfill
-        //     requester. Exactly one per community (no duplicate subscribers).
-        let mut seen = std::collections::HashSet::new();
+        //     requester. Collect into a Vec (not a HashSet): a HashSet keyed by
+        //     community_id would silently collapse a duplicate request, so the
+        //     "no duplicate subscribers" check must count raw occurrences.
+        let mut seen = Vec::new();
         while let Ok(req) = adapter_rx.try_recv() {
-            seen.insert(req.community_id);
+            seen.push(req.community_id);
         }
         assert!(
             seen.contains(&cid_a),
@@ -57593,7 +57632,8 @@ mod zeb718_voting_reconcile_tests {
         assert_eq!(
             seen.len(),
             2,
-            "exactly one adapter request per joined community (no duplicate subscribers)"
+            "exactly one adapter request per joined community — a duplicate \
+             subscriber would push the count to 3"
         );
     }
 
@@ -86885,7 +86925,9 @@ mod zeb904_seedless_local_only_boot_tests {
         // ZEB-934: create must EAGERLY spawn the community's voting engine
         // (live subscriber + backfill requester), not defer it until the first
         // voting mutation. Before ZEB-934 this map was empty here — a member
-        // who joined/created but never voted stayed dark to governance.
+        // who joined/created but never voted stayed dark to governance. The
+        // spawn is fire-and-forget (a background task), so poll briefly for it;
+        // an in-process spawn + engine start completes well under this budget.
         {
             let sid = crate::owner_state_types::SpaceId(
                 <[u8; 16]>::try_from(
@@ -86895,12 +86937,23 @@ mod zeb904_seedless_local_only_boot_tests {
                 )
                 .expect("community id is 16 bytes"),
             );
-            let g = state.lock().expect("NodeState lock");
-            assert!(
-                g.voting_log_engines
+            let mut spawned = false;
+            for _ in 0..100 {
+                if state
+                    .lock()
+                    .expect("NodeState lock")
+                    .voting_log_engines
                     .lock()
                     .expect("voting_log_engines lock")
-                    .contains_key(&sid),
+                    .contains_key(&sid)
+                {
+                    spawned = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                spawned,
                 "ZEB-934: create_community must eagerly spawn the voting engine"
             );
         }
