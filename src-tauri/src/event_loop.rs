@@ -10667,7 +10667,7 @@ pub fn spawn_voting_log_zenoh_adapter(
                     res = qbl.recv_async() => {
                         let Ok(query) = res else { break; };
                         let frames = (read_for_backfill)().await;
-                        let frame_count = frames.len();
+                        let mut served_frames = 0usize;
                         let mut served_bytes = 0usize;
                         for frame in frames {
                             // Re-encrypt under the CURRENT epoch at serve time.
@@ -10677,7 +10677,7 @@ pub fn spawn_voting_log_zenoh_adapter(
                                 // No current epoch state — nothing serveable.
                                 break;
                             };
-                            served_bytes += wire.len();
+                            let wire_len = wire.len();
                             if let Err(e) = query.reply(query.key_expr(), wire).await {
                                 tracing::debug!(
                                     topic = %backfill_topic_qbl,
@@ -10686,13 +10686,18 @@ pub fn spawn_voting_log_zenoh_adapter(
                                 );
                                 break;
                             }
+                            // Count only frames that actually left the node — a None
+                            // encrypt or a failed reply breaks out uncounted — so the
+                            // Q1 numbers reflect bytes truly served, not attempted.
+                            served_frames += 1;
+                            served_bytes += wire_len;
                         }
                         // ZEB-916 Q1: full-dump volume served to one requester.
                         tracing::info!(
                             target: "harmony_volume",
                             kind = "voting_backfill_serve",
                             topic = %backfill_topic_qbl,
-                            frames = frame_count,
+                            frames = served_frames,
                             served_bytes,
                             "voting backfill dump served"
                         );
