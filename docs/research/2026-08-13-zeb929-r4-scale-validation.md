@@ -49,7 +49,19 @@ measured property (degree, diameter, flood) invariant. The degree column (below)
 `community_neighbors` cardinality exactly, confirming graph fidelity. Full source delta in the appendix.
 
 Two independent runs were captured: run 1 at N ∈ {32, 50, 100, 200}, run 2 at a finer, mostly-unsaturated
-grid N ∈ {50, 64, 100, 128}. Raw output: `~/work/zeb912-scale-probe/sweep-r4.md` and `sweep-r4-v2.md`.
+grid N ∈ {50, 64, 100, 128}. The raw sweep output is reproduced verbatim as the tables in §2 (the
+authoritative record); the probe is out-of-tree (scratch, per the R3 precedent — a deliberate project
+convention), and its full source delta is in the appendix, so any reviewer can reconstruct it atop the
+R3 probe and re-run. It was captured locally at `~/work/zeb912-scale-probe/sweep-r4.md` / `sweep-r4-v2.md`.
+
+**Append-only churn (a measured lower bound, not full membership churn).** The join event connects the
+joiner's edges but does **not** re-sort the existing ring — an N→N+1 membership change shifts ranks and,
+for R4, retargets some existing nodes' chords (for the ring, an insert changes only O(1) edges). So
+`join_KB` and `join_reconv_ms` measure *append-only* churn, a **lower bound** on the full-membership-churn
+cost. Crucially this understates R4 more than the ring (R4's re-sort perturbs many chords; the ring's
+perturbs O(1)), so the flood finding (§3.2) is **conservative** — full churn only widens the R4/ring gap.
+It does not rescue the reconvergence question (§3.3), which is inconclusive for a separate reason. The R3
+`ring`/`mesh`/`line` baselines use the identical append-only model, so the comparison stays like-for-like.
 
 ## 2. Data
 
@@ -112,7 +124,8 @@ R4's per-join flood is ~9–13× the ring's at matched N, reproducibly (N=100: 8
 The load-bearing correction: **bounding per-node degree does not bound the linkstate flood.** R4 was
 designed to bound degree; it does. But the flood — the thing that actually collapsed full mesh in R3 — is
 edge-bound, and R4 has O(N log N) edges. R4 is far better than mesh's O(N²), but strictly worse than the
-ring's O(N).
+ring's O(N). These figures are the *append-only* join flood (§1); full-membership churn re-sorts more R4
+chords than ring edges, so the real gap is at least this wide — the finding is a conservative lower bound.
 
 ### 3.3 Reconvergence — inconclusive; the probe is biased against R4 (claim B: unproven)
 
@@ -146,8 +159,11 @@ infeasible on one host.
    (cf. R3's identical caveat for mesh).
 3. **Index-as-rank.** Valid only because the graph is a vertex-transitive circulant — corroborated by the
    exact degree match.
-4. **Static churn model.** The join event adds the joiner's edges but does not re-sort the existing ring
-   (as R3 did); reconv is diameter-driven, so this is second-order.
+4. **Append-only churn model (see §1).** The join event adds the joiner's edges but does not re-sort the
+   existing ring, so the flood/reconv figures are a *lower bound* on full-membership churn. This is
+   directionally **conservative** for the flood finding (full churn perturbs more R4 chords than ring
+   edges, widening the gap), and it does not affect the reconvergence verdict, which is inconclusive for
+   the contention reason in §3.3. The R3 baselines use the identical model, so the comparison is fair.
 5. **Absolute vs ratio.** Absolute latencies are host-relative; the robust results are the *degree* (exact)
    and the *flood ratio* R4/ring (reproducible), both measured on the same host in the same run.
 
