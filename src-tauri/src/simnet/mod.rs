@@ -19,6 +19,7 @@
 mod anomaly;
 mod bus;
 mod clock;
+mod community;
 mod dialer;
 mod node;
 mod partition;
