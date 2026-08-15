@@ -590,6 +590,26 @@ fn push_floor_interval() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// ZEB-937 facet 2: the inbound `apply_ingest` merge releases `ctx.state` after
+/// every this-many events so a concurrent `list_community_members` /
+/// `insert_local_event` isn't starved for the whole merge of a large root (the
+/// observed multi-minute roster-IPC hang). Each event is independently
+/// authorized by `insert_event` against current state, so releasing the lock
+/// between events is safe — CRDT convergence is order-independent within
+/// `event_sort_key`. Overridable via `HARMONY_COMMUNITY_APPLY_LOCK_CHUNK`.
+pub const COMMUNITY_APPLY_LOCK_CHUNK: usize = 256;
+
+/// Resolve the apply lock-yield chunk, honoring the
+/// `HARMONY_COMMUNITY_APPLY_LOCK_CHUNK` override (ignored if unset, unparseable,
+/// or zero). Read once at engine spawn, matching the other cadence env vars.
+fn community_apply_lock_chunk() -> usize {
+    std::env::var("HARMONY_COMMUNITY_APPLY_LOCK_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(COMMUNITY_APPLY_LOCK_CHUNK)
+}
+
 /// ZEB-262 Phase 4: shared per-EventId oneshot map. The
 /// `CommunitySyncRegistry` owns the `Arc` and exposes
 /// `register_pending_redemption` / `take_pending_redemption` /
@@ -1214,6 +1234,11 @@ pub struct CommunitySyncEngine {
     /// Read by `network_health_snapshot` to distinguish a node that is
     /// receiving-and-discarding from one that is merely quiet.
     sync_stats: Arc<CommunitySyncStats>,
+    /// ZEB-937 facet 2: shared with the task's `InternalCtx` so a test can set a
+    /// small per-engine apply lock-yield chunk (see `set_apply_lock_chunk_for_test`)
+    /// instead of a process-global env var. Test-only handle.
+    #[cfg(test)]
+    apply_lock_chunk: Arc<std::sync::atomic::AtomicUsize>,
     notify_dirty: Arc<Notify>,
     /// Set by `notify_dirty()`; cleared by the task after each publish.
     /// Prevents the shutdown path from emitting a spurious publish when
@@ -1385,8 +1410,18 @@ impl CommunitySyncEngine {
         // semaphore cap so a full permit set can never overflow the channel.
         let (fetch_retry_tx, fetch_retry_rx) = mpsc::channel(FETCH_RETRY_MAX_INFLIGHT);
         let fetch_retry_sem = Arc::new(Semaphore::new(FETCH_RETRY_MAX_INFLIGHT));
+        // ZEB-937: resolved-ingest plumbing, sized like the fetch-retry pair so
+        // a full resolve-permit set can never overflow the channel.
+        let (resolved_tx, resolved_rx) = mpsc::channel(FETCH_RETRY_MAX_INFLIGHT);
+        let resolve_sem = Arc::new(Semaphore::new(FETCH_RETRY_MAX_INFLIGHT));
         let sync_stats = Arc::new(CommunitySyncStats::default());
         let sync_stats_for_engine = Arc::clone(&sync_stats);
+        // ZEB-937 facet 2: per-engine apply lock-yield chunk, seeded from the
+        // env-overridable default and shared with the task so a test can retune
+        // it per-engine without a process-global env var.
+        let apply_lock_chunk = Arc::new(std::sync::atomic::AtomicUsize::new(
+            community_apply_lock_chunk(),
+        ));
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
@@ -1422,11 +1457,17 @@ impl CommunitySyncEngine {
             fetch_retry_tx,
             fetch_retry_rx: Some(fetch_retry_rx),
             fetch_retry_sem,
+            resolved_tx,
+            resolved_rx: Some(resolved_rx),
+            resolve_sem,
+            apply_lock_chunk: Arc::clone(&apply_lock_chunk),
             sync_stats,
         }));
 
         Self {
             sync_stats: sync_stats_for_engine,
+            #[cfg(test)]
+            apply_lock_chunk,
             notify_dirty,
             has_pending_dirty,
             closing,
@@ -1485,6 +1526,15 @@ impl CommunitySyncEngine {
     /// state that read as fully healthy for 90 minutes during the incident.
     pub(crate) fn sync_stats(&self) -> Arc<CommunitySyncStats> {
         Arc::clone(&self.sync_stats)
+    }
+
+    /// ZEB-937 facet 2 test seam: retune this engine's apply lock-yield chunk
+    /// (shared with its task) WITHOUT a process-global env var, so a test can
+    /// force chunking on a small root without affecting concurrent tests.
+    #[cfg(test)]
+    pub(crate) fn set_apply_lock_chunk_for_test(&self, n: usize) {
+        self.apply_lock_chunk
+            .store(n.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Returns the admin `OwnerAddr` this engine was configured with.
@@ -2386,6 +2436,21 @@ struct InternalCtx {
     /// delay, so this bounds retained memory under a publish flood, not just
     /// task count. See `FETCH_RETRY_MAX_INFLIGHT`.
     fetch_retry_sem: Arc<Semaphore>,
+    /// ZEB-937 resolved-ingest channel: an off-task `resolve_ingest` sends its
+    /// result here; `internal_task` takes the receiver out of the ctx at start
+    /// and polls it as a `select!` arm (the on-task `apply_ingest`). Mirrors the
+    /// `fetch_retry` channel idiom above so the network-bound fetch never pins
+    /// the single writer.
+    resolved_tx: mpsc::Sender<ResolvedIngest>,
+    resolved_rx: Option<mpsc::Receiver<ResolvedIngest>>,
+    /// Caps concurrent off-task resolves — each retains a wire frame and (on
+    /// success) a resolved batch. Same bound/shield as `fetch_retry_sem`.
+    resolve_sem: Arc<Semaphore>,
+    /// ZEB-937 facet 2: apply-loop lock-yield chunk. Seeded once at spawn from
+    /// `community_apply_lock_chunk()`; an `Arc<AtomicUsize>` (shared with the
+    /// engine handle) so a test can inject a small per-engine chunk via
+    /// `set_apply_lock_chunk_for_test` WITHOUT a process-global env var.
+    apply_lock_chunk: Arc<std::sync::atomic::AtomicUsize>,
     /// ZEB-805 observability, shared with the engine handle.
     sync_stats: Arc<CommunitySyncStats>,
 }
@@ -3044,6 +3109,15 @@ async fn internal_task(mut ctx: InternalCtx) {
         .fetch_retry_rx
         .take()
         .expect("fetch_retry_rx is always Some at internal_task start");
+    // ZEB-937: same take-out-of-ctx idiom for the resolved-ingest arm; the tx
+    // and semaphore are cloned into locals so the `select!` arms don't borrow
+    // `ctx` fields alongside the whole-`ctx` handoff to `dispatch_inbound`.
+    let mut resolved_rx = ctx
+        .resolved_rx
+        .take()
+        .expect("resolved_rx is always Some at internal_task start");
+    let resolved_tx = ctx.resolved_tx.clone();
+    let resolve_sem = Arc::clone(&ctx.resolve_sem);
 
     let notify = Arc::clone(&ctx.notify_dirty);
     let notified = notify.notified();
@@ -3189,13 +3263,36 @@ async fn internal_task(mut ctx: InternalCtx) {
                     continue;
                 };
                 // ZEB-805: a fresh inbound frame carries the full retry budget.
-                process_inbound(&ctx, bytes, FETCH_RETRY_ATTEMPTS, FrameOrigin::Network).await;
+                // ZEB-937: dispatch runs the fast prepare on-task, then the
+                // network-bound resolve OFF-task so this loop keeps serving.
+                dispatch_inbound(
+                    &ctx,
+                    bytes,
+                    FETCH_RETRY_ATTEMPTS,
+                    FrameOrigin::Network,
+                    &resolved_tx,
+                    &resolve_sem,
+                )
+                .await;
             }
             // ZEB-805: a fetch-retry sleeper handing its wire frame back after
             // the delay. Re-enters the FULL inbound pipeline, so the replay
             // check naturally kills a retry that a newer root has superseded.
             Some((wire, attempts_left)) = fetch_retry_rx.recv() => {
-                process_inbound(&ctx, wire, attempts_left, FrameOrigin::Retry).await;
+                dispatch_inbound(
+                    &ctx,
+                    wire,
+                    attempts_left,
+                    FrameOrigin::Retry,
+                    &resolved_tx,
+                    &resolve_sem,
+                )
+                .await;
+            }
+            // ZEB-937: an off-task resolve completed — apply it on-task (the
+            // single-writer mutation) or re-enter the fetch-retry loop on a miss.
+            Some(ri) = resolved_rx.recv() => {
+                apply_resolved_ingest(&ctx, ri).await;
             }
             serve_req = async {
                 match root_serve_rx.as_mut() {
@@ -3940,24 +4037,6 @@ enum IncomingOutcome {
     /// payload decode, blob fetch, blob decrypt, blob decode,
     /// misrouted-blob check). No state change. Don't persist.
     ErrPreMutation(CommunitySyncError),
-    /// ZEB-805: the CAS blob for this publish's `root_cid` was not
-    /// fetchable within the state-root budget. Carries the ORIGINAL wire
-    /// frame so the engine loop can schedule a bounded retry, re-injecting
-    /// it through the full inbound pipeline.
-    ///
-    /// This variant exists because the previous behaviour — a terminal
-    /// `ErrPreMutation(BlobNotFound)` — made the stall permanent: the drop
-    /// was justified by "the next state-root from any peer recovers", but
-    /// the next state root is a LARGER blob under the SAME budget, so every
-    /// failure made the next one likelier. Live-observed as a 90-minute
-    /// silent partition.
-    ///
-    /// Safe to retry because the replay tracker is NOT advanced on this
-    /// path (step 5's `CommitTicket` is dropped by every early return —
-    /// ZEB-750), so re-delivery of the same frame is admitted again. That
-    /// invariant is pinned by
-    /// `tracker_stays_unadvanced_across_miss_and_exhaustion`.
-    FetchMiss(Vec<u8>),
     /// Failure occurred AFTER the tracker advanced. Tracker is in-
     /// memory dirty; persist defensively so a restart doesn't replay
     /// the same publish.
@@ -4008,10 +4087,7 @@ impl IncomingOutcome {
     fn error(&self) -> Option<&CommunitySyncError> {
         match self {
             Self::ErrPreMutation(e) | Self::ErrPostMutation(e) => Some(e),
-            // ZEB-805: a FetchMiss is NOT an error at this point — it is a
-            // scheduled retry. It becomes an error only when the retry budget
-            // is exhausted, and the engine loop reports it then.
-            Self::Duplicate | Self::Mutated | Self::MutatedTrackerOnly | Self::FetchMiss(_) => None,
+            Self::Duplicate | Self::Mutated | Self::MutatedTrackerOnly => None,
         }
     }
 }
@@ -4045,6 +4121,14 @@ pub(crate) struct CommunitySyncStats {
     pub(crate) fetch_retries_dropped: AtomicU64,
     pub(crate) fetch_retries_exhausted: AtomicU64,
     pub(crate) fetch_retry_inflight_peak: AtomicU64,
+    /// ZEB-937 facet 2: count of times the inbound apply released `ctx.state`
+    /// at a chunk boundary during a large-root merge (lock-cooperative apply).
+    /// `0` for every root smaller than `COMMUNITY_APPLY_LOCK_CHUNK`.
+    pub(crate) apply_lock_yields: AtomicU64,
+    /// ZEB-937: fresh inbound frames dropped because the off-task resolve
+    /// in-flight cap (`resolve_sem`) was saturated. Distinct from
+    /// `fetch_retries_dropped` (dropped fetch-RETRY sleepers).
+    pub(crate) ingest_resolve_dropped: AtomicU64,
     // ZEB-762: publish-side `RetryBackoff` observability — the OUTBOUND
     // complement to `last_inbound`/`last_advance`. `last_advance` answers "am I
     // receiving?"; these answer "am I successfully publishing MY state out, or
@@ -4137,7 +4221,19 @@ enum FrameOrigin {
 /// Shared by the subscriber arm (fresh frames, full budget) and the
 /// fetch-retry arm (re-injected frames, decremented budget) so the two can
 /// never drift apart. Mirrors `fleet_sync::process_inbound` (ZEB-705).
-async fn process_inbound(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u8, origin: FrameOrigin) {
+/// ZEB-937: on-task ingest dispatch. Runs the fast, no-network `prepare_ingest`
+/// on `internal_task`, then either finishes a terminal outcome inline or hands
+/// the plan to a bounded spawned `resolve_ingest`, whose result returns via the
+/// `resolved_rx` arm. Keeps the network-bound fetch off the single writer so the
+/// serve arm and roster IPC stay responsive during a large-root ingest.
+async fn dispatch_inbound(
+    ctx: &InternalCtx,
+    wire: Vec<u8>,
+    attempts_left: u8,
+    origin: FrameOrigin,
+    resolved_tx: &mpsc::Sender<ResolvedIngest>,
+    resolve_sem: &Arc<Semaphore>,
+) {
     // Stamp "a publish arrived" BEFORE any outcome branch. This must count
     // frames we go on to discard — its whole purpose is to be comparable
     // against `last_advance_ms`, and the gap between them is the
@@ -4152,9 +4248,87 @@ async fn process_inbound(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u8, or
             .store(crate::network_health::now_ms(), Ordering::Relaxed);
     }
 
-    let outcome = handle_incoming_publish(ctx, wire).await;
+    match prepare_ingest(ctx, &wire).await {
+        // Decode / gate / sig rejection — no fetch, finish inline on-task.
+        PreparedIngest::Terminal(outcome) => finish_incoming_outcome(ctx, outcome).await,
+        PreparedIngest::Fetch(plan) => {
+            // Bound concurrent off-task resolves — each retains a wire frame and
+            // (on success) a resolved batch, so this caps retained memory under a
+            // publish flood, mirroring the fetch-retry-sem shield. On saturation,
+            // drop and count rather than pile up; the peer republishes and the
+            // pull-floor backstops.
+            let Ok(permit) = Arc::clone(resolve_sem).try_acquire_owned() else {
+                ctx.sync_stats
+                    .ingest_resolve_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    community_id = ?ctx.community_id,
+                    "community ingest-resolve in-flight cap saturated — dropping frame"
+                );
+                return;
+            };
+            let fetch_ctx = FetchCtx {
+                content_store: Arc::clone(&ctx.content_store),
+                community_id: ctx.community_id,
+                admin_addr: ctx.admin_addr,
+            };
+            let resolved_tx = resolved_tx.clone();
+            tokio::spawn(async move {
+                // Hold the permit for the resolve's whole lifetime (including the
+                // hand-back send), which is what bounds concurrency.
+                let _permit = permit;
+                let result = resolve_ingest(fetch_ctx, plan, wire).await;
+                // Best-effort: a closed channel means the engine shut down.
+                let _ = resolved_tx
+                    .send(ResolvedIngest {
+                        result,
+                        attempts_left,
+                    })
+                    .await;
+            });
+        }
+    }
+}
 
-    if let IncomingOutcome::FetchMiss(wire) = outcome {
+/// ZEB-937: on-task handler for a resolved ingest arriving on `resolved_rx`. The
+/// MUTATION (`apply_ingest`) and the retry scheduling both run here on
+/// `internal_task`, preserving the single-writer invariant.
+async fn apply_resolved_ingest(ctx: &InternalCtx, ri: ResolvedIngest) {
+    let ResolvedIngest {
+        result,
+        attempts_left,
+    } = ri;
+    match result {
+        ResolveResult::Ready {
+            payload,
+            resolved,
+            deferred_open_bootstrap,
+            deferred_invite_bootstrap,
+        } => {
+            let outcome = apply_ingest(
+                ctx,
+                payload,
+                resolved,
+                deferred_open_bootstrap,
+                deferred_invite_bootstrap,
+            )
+            .await;
+            finish_incoming_outcome(ctx, outcome).await;
+        }
+        // A blob/segment fetch miss re-enters the bounded fetch-retry loop.
+        ResolveResult::Miss(wire) => schedule_fetch_retry(ctx, wire, attempts_left).await,
+        // A pre-mutation rejection (decode/misroute/sig/bootstrap) — report it.
+        ResolveResult::Err(e) => {
+            finish_incoming_outcome(ctx, IncomingOutcome::ErrPreMutation(e)).await
+        }
+    }
+}
+
+/// ZEB-937: schedule a bounded fetch-retry for a `ResolveResult::Miss`. Extracted
+/// verbatim from the former `process_inbound` FetchMiss branch — same exhaustion
+/// budget, same in-flight-cap shield, same re-injection via `fetch_retry_tx`.
+async fn schedule_fetch_retry(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u8) {
+    {
         if attempts_left == 0 {
             // Budget spent. NOW it is a terminal drop, and reports as the
             // BlobNotFound this path used to return on the very first miss.
@@ -4235,9 +4409,13 @@ async fn process_inbound(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u8, or
                 tracing::warn!("community fetch-retry re-injection channel unavailable — dropped");
             }
         });
-        return;
     }
+}
 
+/// ZEB-937: finish an ingest outcome on `internal_task` — degraded-report on
+/// error, then the `last_advance_ms` stamp and persist on the mutate paths.
+/// Extracted verbatim from the former `process_inbound` tail.
+async fn finish_incoming_outcome(ctx: &InternalCtx, outcome: IncomingOutcome) {
     if let Some(err) = outcome.error() {
         tracing::warn!(
             community_id = ?ctx.community_id,
@@ -4411,8 +4589,69 @@ fn verify_publisher_sig(
     })
 }
 
-/// path.
-async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOutcome {
+/// ZEB-937: read-only "prepare" phase of an inbound state-root ingest —
+/// epoch-key snapshot, decrypt, membership-at-HLC gate (+ ZEB-906 re-drive),
+/// and known-publisher sig-verify. Runs ON `internal_task` (fast, no network).
+/// A `Fetch` result carries everything the off-task `resolve_ingest` needs; a
+/// `Terminal` is a decode/gate/sig rejection handled inline by the caller.
+enum PreparedIngest {
+    Fetch(FetchPlan),
+    Terminal(IncomingOutcome),
+}
+
+/// The owned hand-off from `prepare_ingest` to the off-task `resolve_ingest`.
+struct FetchPlan {
+    payload: CommunityRootPublishPayload,
+    root_key_used: EpochKey,
+    deferred_open_bootstrap: bool,
+    deferred_invite_bootstrap: bool,
+}
+
+/// Minimal Arc bundle the off-task `resolve_ingest` needs. Field names match
+/// `InternalCtx` so the aliased body (`let ctx = &fetch_ctx;`) reads unchanged.
+struct FetchCtx {
+    content_store: Arc<dyn ContentStore>,
+    community_id: SpaceId,
+    admin_addr: OwnerAddr,
+}
+
+/// Result of the off-task `resolve_ingest`, routed back to `internal_task` via
+/// the `resolved_rx` arm. `Ready` carries the resolved event batch for the
+/// on-task `apply_ingest`; `Miss` re-enters the bounded fetch-retry loop; `Err`
+/// is a pre-mutation rejection.
+enum ResolveResult {
+    /// Root blob + every segment fetched, decoded, sorted, and (for a deferred
+    /// bootstrap) validated — ready for the on-task `apply_ingest`.
+    Ready {
+        payload: CommunityRootPublishPayload,
+        resolved: Vec<SignedMembershipEvent>,
+        deferred_open_bootstrap: bool,
+        deferred_invite_bootstrap: bool,
+    },
+    /// A blob/segment fetch missed within the state-root budget; carries the
+    /// ORIGINAL wire frame so `schedule_fetch_retry` can re-inject it through
+    /// the full inbound pipeline. Safe to retry because `apply_ingest`'s `admit`
+    /// never ran (it is on-task, strictly after resolve), so the replay tracker
+    /// is un-advanced and re-delivery of the same frame is admitted again — the
+    /// ZEB-805 fix for the 90-minute silent partition, pinned by
+    /// `tracker_stays_unadvanced_across_miss_and_exhaustion`.
+    Miss(Vec<u8>),
+    /// A pre-mutation rejection (decrypt/decode/sig/misroute/bootstrap).
+    Err(CommunitySyncError),
+}
+
+/// Envelope carried on the `resolved` channel: the resolve outcome plus the
+/// retry budget the on-task apply arm needs to finish it. (The `last_inbound_ms`
+/// stamp happened on-task in `dispatch_inbound`, so `origin` isn't carried.)
+struct ResolvedIngest {
+    result: ResolveResult,
+    attempts_left: u8,
+}
+
+/// ZEB-937: on-task prepare phase. See [`PreparedIngest`]. Steps 1-4 of the
+/// former `handle_incoming_publish`; the fetch (steps 6-8) is the off-task
+/// [`resolve_ingest`] and the merge (steps 5, 12, 14) is [`apply_ingest`].
+async fn prepare_ingest(ctx: &InternalCtx, wire: &[u8]) -> PreparedIngest {
     use crate::community_membership::MemberStatus;
 
     // ZEB-249 §10.6 Phase A: snapshot live epoch key state BEFORE any
@@ -4459,12 +4698,12 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     //    or `outer_old_keys_rev`; the borrow checker ensures it stays
     //    valid for the lifetime of both Vec values.
     let (payload_bytes, root_key_used): (Vec<u8>, &EpochKey) = {
-        if let Ok(b) = decrypt_root_publish(&outer_current_key, &wire) {
+        if let Ok(b) = decrypt_root_publish(&outer_current_key, wire) {
             (b, &outer_current_key)
         } else {
             let mut found: Option<(Vec<u8>, &EpochKey)> = None;
             for old_key in &outer_old_keys_rev {
-                if let Ok(b) = decrypt_root_publish(old_key, &wire) {
+                if let Ok(b) = decrypt_root_publish(old_key, wire) {
                     found = Some((b, old_key));
                     break;
                 }
@@ -4472,8 +4711,8 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             match found {
                 Some(v) => v,
                 None => {
-                    return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(
-                        CommunityCryptoError::AeadFailed,
+                    return PreparedIngest::Terminal(IncomingOutcome::ErrPreMutation(
+                        CommunitySyncError::Crypto(CommunityCryptoError::AeadFailed),
                     ))
                 }
             }
@@ -4482,7 +4721,9 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
     let payload: CommunityRootPublishPayload = match canonical_cbor_decode(&payload_bytes) {
         Ok(p) => p,
         Err(e) => {
-            return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(e.to_string()))
+            return PreparedIngest::Terminal(IncomingOutcome::ErrPreMutation(
+                CommunitySyncError::CborDecode(e.to_string()),
+            ))
         }
     };
 
@@ -4693,11 +4934,13 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                     }
                 }
             }
-            return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
-                addr: payload.publisher_addr,
-                status: status_now.unwrap_or(MemberStatus::Left),
-                left_at: member_state.and_then(|s| s.left_at),
-            });
+            return PreparedIngest::Terminal(IncomingOutcome::ErrPreMutation(
+                CommunitySyncError::PublisherNotJoined {
+                    addr: payload.publisher_addr,
+                    status: status_now.unwrap_or(MemberStatus::Left),
+                    left_at: member_state.and_then(|s| s.left_at),
+                },
+            ));
         }
     };
 
@@ -4727,41 +4970,65 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             .as_ref()
             .expect("non-deferred publisher ⇒ Some(member_state)");
         if let Err(e) = verify_publisher_sig(&payload, pms) {
-            return IncomingOutcome::ErrPreMutation(e);
+            return PreparedIngest::Terminal(IncomingOutcome::ErrPreMutation(e));
         }
     }
 
-    // 5. Replay-protect via per-(addr, device) RootHlcTracker.
-    //    Read-only — the `record` step happens at step 14 (after the
-    //    state-merge under the TOCTOU re-check), so dedup and the
-    //    single-mutation-point are now decoupled into separate steps.
-    //    Keyed on the trusted `payload.publisher_addr` (sig-verify
-    //    above proved the addr).
-    //
-    //    Note: a publish that passes here can still be rejected at
-    //    step 12's re-check (concurrent local Leave/Kick) and
-    //    therefore NOT advance the tracker. That's the intended
-    //    semantic — re-receive of the same publish later will hit
-    //    the same step-12 rejection until either the publisher's
-    //    membership re-Joins (out-of-band) or the publisher republishes
-    //    at a strictly newer HLC.
-    //
-    //    ZEB-750: `admit` is read-only by construction — it cannot advance
-    //    a watermark. It hands back a `CommitTicket` that step 14 consumes;
-    //    every early return between here and there drops the ticket, which
-    //    is the correct, retry-safe outcome (the watermark stays put, so
-    //    the peer's next delivery of this frame is admitted again).
-    let replay_ticket = {
+    // Cheap pre-fetch replay filter: peek the replay tracker read-only and drop
+    // an obvious Duplicate/Echo BEFORE spending a CAS fetch on it. `admit` is
+    // read-only by construction (ZEB-750) — the returned `CommitTicket` is
+    // dropped here, leaving the watermark untouched — so this is a pure filter,
+    // NOT the authoritative admit. The committed admit re-runs on-task in
+    // `apply_ingest` (then `commit`), keeping admit→commit atomic on the single
+    // writer. Without this filter a joined member could replay CAS-evicted root
+    // frames to burn the full 4×5 s fetch-retry budget per frame and saturate
+    // the resolve/retry semaphores, dropping legitimate new frames.
+    {
         let tracker = ctx.tracker.lock().await;
-        let source = (payload.publisher_addr, payload.at.device_id.clone());
-        match tracker.admit(&source, &payload.at) {
-            Admission::Accept(ticket) => ticket,
-            // Our own publish, reflected back by the transport. Not a
-            // replay and not an error — there is simply nothing to apply.
-            Admission::Echo => return IncomingOutcome::Duplicate,
-            Admission::Duplicate => return IncomingOutcome::Duplicate,
+        match tracker.admit(
+            &(payload.publisher_addr, payload.at.device_id.clone()),
+            &payload.at,
+        ) {
+            Admission::Echo | Admission::Duplicate => {
+                return PreparedIngest::Terminal(IncomingOutcome::Duplicate);
+            }
+            // Admissible at the peek; the ticket is intentionally dropped and a
+            // fresh committed admit is taken in `apply_ingest`.
+            Admission::Accept(_ticket) => {}
         }
-    };
+    }
+
+    // Prepare complete — hand the (owned) plan to the off-task resolver. The
+    // authoritative replay `admit` runs in `apply_ingest` so admit→commit stays
+    // atomic on the single writer; the peek above already shed obvious replays,
+    // so only a frame that becomes a duplicate BETWEEN the peek and apply (a
+    // concurrent commit for the same source) is fetched then dropped — rare.
+    PreparedIngest::Fetch(FetchPlan {
+        payload,
+        root_key_used: root_key_used.clone(),
+        deferred_open_bootstrap,
+        deferred_invite_bootstrap,
+    })
+}
+
+/// ZEB-937: off-task "resolve" phase — the network-bound fetch of the root
+/// blob and every manifest segment, plus decode/sort/bootstrap-validation.
+/// READ-ONLY: it never mutates community state or the replay tracker, so it is
+/// safe to run in a bounded spawned task off `internal_task` while the engine
+/// keeps serving. The replay `admit`/`commit` live in [`apply_ingest`] so the
+/// tracker's advance-only-on-success invariant stays atomic on the one writer.
+async fn resolve_ingest(fetch_ctx: FetchCtx, plan: FetchPlan, wire: Vec<u8>) -> ResolveResult {
+    use crate::community_membership::MemberStatus;
+    // Alias `ctx` to the bundle so the moved body reads `ctx.community_id` /
+    // `ctx.content_store` / `ctx.admin_addr` verbatim.
+    let ctx = &fetch_ctx;
+    let FetchPlan {
+        payload,
+        root_key_used,
+        deferred_open_bootstrap,
+        deferred_invite_bootstrap,
+    } = plan;
+    let root_key_used = &root_key_used;
 
     // 6. Fetch the encrypted blob from CAS under the state-root budget.
     //    ZEB-805: this is a ~100 KB-and-growing payload fetched cross-WAN, so
@@ -4791,7 +5058,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
                 "community state-root blob fetch miss — will retry if budget remains"
             );
-            return IncomingOutcome::FetchMiss(wire);
+            return ResolveResult::Miss(wire);
         }
         Err(e) => {
             // ZEB-805 (r1): a content-store error is the SAME transient class as
@@ -4812,7 +5079,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 error = %e,
                 "community state-root blob fetch error — will retry if budget remains"
             );
-            return IncomingOutcome::FetchMiss(wire);
+            return ResolveResult::Miss(wire);
         }
     };
 
@@ -4842,7 +5109,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                 // MisroutedBlob, an unsupported cleartext version →
                 // UnsupportedRootFormat, crypto/CBOR faults their own variants
                 // (Qodo #1) — no longer all flattened to CborDecode.
-                Err(e) => return IncomingOutcome::ErrPreMutation(e.into()),
+                Err(e) => return ResolveResult::Err(e.into()),
             };
             // Bound the segment count BEFORE any fetch. A joined publisher could
             // otherwise publish a manifest with an unbounded segment list, each
@@ -4852,7 +5119,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             // community_id, and `seal_manifest` permits manifests far larger
             // than this cap, so the bound must be re-enforced on receive.)
             if manifest.segments.len() > MANIFEST_SEGMENT_CAP {
-                return IncomingOutcome::ErrPreMutation(CommunitySyncError::OversizedManifest {
+                return ResolveResult::Err(CommunitySyncError::OversizedManifest {
                     segments: manifest.segments.len(),
                     cap: MANIFEST_SEGMENT_CAP,
                 });
@@ -4879,7 +5146,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                             cid = ?seg_ref.segment_cid,
                             "community state-root segment fetch miss — will retry if budget remains"
                         );
-                        return IncomingOutcome::FetchMiss(wire);
+                        return ResolveResult::Miss(wire);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -4888,7 +5155,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                             error = %e,
                             "community state-root segment fetch error — will retry if budget remains"
                         );
-                        return IncomingOutcome::FetchMiss(wire);
+                        return ResolveResult::Miss(wire);
                     }
                 };
                 match crate::community_state_segments::open_segment(
@@ -4900,7 +5167,7 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
                     // `From<SegmentError>` preserves the class (Misrouted →
                     // MisroutedBlob, unsupported version → UnsupportedRootFormat,
                     // crypto/CBOR their own) instead of flattening to CborDecode.
-                    Err(e) => return IncomingOutcome::ErrPreMutation(e.into()),
+                    Err(e) => return ResolveResult::Err(e.into()),
                 }
             }
             events.extend(manifest.tail);
@@ -4910,29 +5177,25 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         // of misparsing an unknown layout as V1 (Qodo #2 / CR): the `mf`
         // discriminator is signed, so a downgrade attacker can't strip it.
         Some(other) => {
-            return IncomingOutcome::ErrPreMutation(CommunitySyncError::UnsupportedRootFormat(
-                format!("unknown manifest_format discriminator {other}"),
-            ));
+            return ResolveResult::Err(CommunitySyncError::UnsupportedRootFormat(format!(
+                "unknown manifest_format discriminator {other}"
+            )));
         }
         None => {
             let blob_cleartext = match decrypt_blob(root_key_used, &blob_ciphertext) {
                 Ok(b) => b,
-                Err(e) => return IncomingOutcome::ErrPreMutation(CommunitySyncError::Crypto(e)),
+                Err(e) => return ResolveResult::Err(CommunitySyncError::Crypto(e)),
             };
             let remote: CommunityState = match canonical_cbor_decode(&blob_cleartext) {
                 Ok(s) => s,
-                Err(e) => {
-                    return IncomingOutcome::ErrPreMutation(CommunitySyncError::CborDecode(
-                        e.to_string(),
-                    ))
-                }
+                Err(e) => return ResolveResult::Err(CommunitySyncError::CborDecode(e.to_string())),
             };
             // Reject misrouted blob: its community_id must match ours. A
             // ContentStore collision (vanishingly unlikely with SHA-256) or a
             // buggy callsite could otherwise surface a foreign community's
             // events under our key.
             if remote.community_id != ctx.community_id {
-                return IncomingOutcome::ErrPreMutation(CommunitySyncError::MisroutedBlob {
+                return ResolveResult::Err(CommunitySyncError::MisroutedBlob {
                     expected: ctx.community_id,
                     found: remote.community_id,
                 });
@@ -4974,13 +5237,13 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         ) {
             Some(bootstrap_member_state) => {
                 if let Err(e) = verify_publisher_sig(&payload, &bootstrap_member_state) {
-                    return IncomingOutcome::ErrPreMutation(e);
+                    return ResolveResult::Err(e);
                 }
             }
             None => {
                 // No signature-valid open self-Join for the publisher in this
                 // blob → the publish is unauthorized; reject as before.
-                return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
+                return ResolveResult::Err(CommunitySyncError::PublisherNotJoined {
                     addr: payload.publisher_addr,
                     status: MemberStatus::Left,
                     left_at: None,
@@ -5008,13 +5271,13 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         ) {
             Some(bootstrap_member_state) => {
                 if let Err(e) = verify_publisher_sig(&payload, &bootstrap_member_state) {
-                    return IncomingOutcome::ErrPreMutation(e);
+                    return ResolveResult::Err(e);
                 }
             }
             None => {
                 // No signature-valid self-authorizing PendingJoin for the
                 // publisher in this blob → the publish is unauthorized; reject.
-                return IncomingOutcome::ErrPreMutation(CommunitySyncError::PublisherNotJoined {
+                return ResolveResult::Err(CommunitySyncError::PublisherNotJoined {
                     addr: payload.publisher_addr,
                     status: MemberStatus::Left,
                     left_at: None,
@@ -5022,6 +5285,47 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
             }
         }
     }
+
+    // Resolve complete — hand the sorted, bootstrap-validated event batch to
+    // the on-task apply arm (admit + merge + commit).
+    ResolveResult::Ready {
+        payload,
+        resolved,
+        deferred_open_bootstrap,
+        deferred_invite_bootstrap,
+    }
+}
+
+/// ZEB-937: on-task "apply" phase — the state MUTATION. Runs on `internal_task`
+/// via the `resolved_rx` arm, so the single-writer invariant holds: this is the
+/// only place community state and the replay tracker are advanced for an inbound
+/// publish. Mints the replay `CommitTicket` (formerly step 5, moved here so
+/// admit→commit is atomic) and consumes it at step 14 only after a successful
+/// merge — preserving "the tracker never advances on a rejection".
+async fn apply_ingest(
+    ctx: &InternalCtx,
+    payload: CommunityRootPublishPayload,
+    resolved: Vec<SignedMembershipEvent>,
+    deferred_open_bootstrap: bool,
+    deferred_invite_bootstrap: bool,
+) -> IncomingOutcome {
+    use crate::community_membership::MemberStatus;
+    // 5. Replay-protect via per-(addr, device) RootHlcTracker. `admit` is
+    //    read-only (ZEB-750); the returned `CommitTicket` is consumed at step
+    //    14 after the merge, so any rejection path below drops it and leaves
+    //    the watermark untouched (retry-safe). Moved here from the pre-fetch
+    //    position so admit→commit stays atomic on this single writer.
+    let replay_ticket = {
+        let tracker = ctx.tracker.lock().await;
+        let source = (payload.publisher_addr, payload.at.device_id.clone());
+        match tracker.admit(&source, &payload.at) {
+            Admission::Accept(ticket) => ticket,
+            // Our own publish, reflected back by the transport. Not a
+            // replay and not an error — there is simply nothing to apply.
+            Admission::Echo => return IncomingOutcome::Duplicate,
+            Admission::Duplicate => return IncomingOutcome::Duplicate,
+        }
+    };
 
     // Phase B: lock community state once, run insert_event for each
     // event, collect rejections for out-of-lock reporting.
@@ -5049,9 +5353,15 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         //     landed an event between step 2's snapshot and now,
         //     including a Leave/Kick that would have failed the
         //     gate. Re-evaluate `prior_state_at_hlc(payload.at)` over
-        //     the CURRENT events (held under the state lock so no
-        //     further concurrent inserts can land before we merge).
-        //     A negative outcome here returns ErrPreMutation WITHOUT
+        //     the CURRENT events at THIS (first) lock acquisition. This
+        //     coarse publisher-authorization check is a pre-filter, not
+        //     a per-event guarantee: ZEB-937's lock-chunking releases the
+        //     state lock at 256-event boundaries below, so a concurrent
+        //     insert CAN land mid-merge — but every event is independently
+        //     re-authorized by `insert_event` against its own strictly-prior
+        //     set, and `materialize` re-authorizes over the full log, so a
+        //     mid-merge Leave/Kick is still respected and the final state
+        //     converges. A negative outcome here returns ErrPreMutation WITHOUT
         //     advancing the tracker — the cheapest-first gate at
         //     step 2 was a pre-filter; THIS is the authoritative
         //     security check w.r.t. local state mutations.
@@ -5121,7 +5431,34 @@ async fn handle_incoming_publish(ctx: &InternalCtx, wire: Vec<u8>) -> IncomingOu
         // wall (~1.7e12) reads as beyond `MAX_FORWARD_SKEW_MS` and would freeze
         // governance ingestion.
         let now_ms = crate::clock_trust::receiver_now_ms();
-        for event in resolved {
+        // ZEB-937 facet 2: yield the state lock every `apply_lock_chunk` events.
+        let chunk = ctx
+            .apply_lock_chunk
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1);
+        for (processed, event) in resolved.into_iter().enumerate() {
+            // Release + re-acquire at a chunk boundary (checked BEFORE the
+            // per-event duplicate `continue` so it fires regardless), so a
+            // concurrent roster read / local insert (`list_community_members` /
+            // `insert_local_event`, which lock only state) isn't starved for the
+            // whole merge of a large root. `processed` is the 0-based index, so
+            // this fires before events chunk, 2·chunk, … . NOTE this frees only
+            // the STATE LOCK for cross-task contenders; the engine's own serve
+            // arm is on THIS task and resumes only when `apply_ingest` returns
+            // to the `select!` loop — the merge, unlike the fetch, is not itself
+            // offloaded, so a very large merge still briefly occupies the writer.
+            // Safe to re-materialize under a fresh lock: each event is authorized
+            // independently by `insert_event` against its own strictly-prior set,
+            // and `materialize` re-authorizes over the full log, so the final
+            // converged state is identical regardless of interleaving.
+            if processed != 0 && processed.is_multiple_of(chunk) {
+                drop(state);
+                ctx.sync_stats
+                    .apply_lock_yields
+                    .fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+                state = ctx.state.lock().await;
+            }
             if state.contains_event(&event.id) {
                 // C1 restart-recovery: even though we've already seen this
                 // event, check whether a self-authored JoinCountersign for
@@ -7706,6 +8043,723 @@ mod tests {
             at_wall_ms + 1,
             "accepted publish feeds the floor (+1 rule)"
         );
+    }
+
+    /// ZEB-937 repro support: a content store whose budgeted state-root fetch
+    /// (`get_with_budget` — the root blob at step 6, and each manifest segment)
+    /// parks until this test grants a semaphore permit, signalling on entry via
+    /// `entered_tx`. `get`/`put`/`put_serveable` pass straight through, so ONLY
+    /// the inbound ingest fetch is gated — the serve arm's `encode_root_packet`
+    /// (which only PUTs) is never blocked by it. This lets a test hold an
+    /// inbound ingest provably mid-fetch while it probes the engine's serve arm.
+    struct GatedIngestStore {
+        inner: Arc<dyn ContentStore>,
+        gate: Arc<tokio::sync::Semaphore>,
+        entered_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for GatedIngestStore {
+        async fn put(
+            &self,
+            cid: crate::owner_state_types::ContentId,
+            blob: Vec<u8>,
+        ) -> Result<(), crate::content_store::ContentStoreError> {
+            self.inner.put(cid, blob).await
+        }
+
+        async fn get(
+            &self,
+            cid: &crate::owner_state_types::ContentId,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            // Ungated: only the budgeted state-root fetch path is held.
+            self.inner.get(cid).await
+        }
+
+        async fn get_with_budget(
+            &self,
+            cid: &crate::owner_state_types::ContentId,
+            budget: std::time::Duration,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            // Signal entry, then park until the test grants a permit. This is
+            // exactly the inbound state-root fetch the engine currently awaits
+            // INLINE on its single-writer select! task (step 6 / the segment
+            // loop of `handle_incoming_publish`).
+            let _ = self.entered_tx.send(());
+            let _permit = self
+                .gate
+                .acquire()
+                .await
+                .expect("ingest gate semaphore must not be closed");
+            self.inner.get_with_budget(cid, budget).await
+        }
+
+        async fn put_serveable(
+            &self,
+            cid: crate::owner_state_types::ContentId,
+            blob: Vec<u8>,
+        ) -> Result<(), crate::content_store::ContentStoreError> {
+            self.inner.put_serveable(cid, blob).await
+        }
+    }
+
+    /// ZEB-937: the community-state engine's single-writer `select!` task must
+    /// stay responsive to its own state-root queryable while an INBOUND root
+    /// ingest is in flight. Today the `subscriber_rx` / `fetch_retry_rx` arms
+    /// await the whole `handle_incoming_publish` — including the step-6 root
+    /// blob fetch and the per-segment fetch loop — INLINE, so a slow or stalled
+    /// fetch pins the loop and starves the serve arm. That is the receiver
+    /// wedge seen in the R6b fleet run: the state-root queryable logged "engine
+    /// did not respond within the cap (wedged?)" and the roster IPC hung, while
+    /// a healthy link kept delivering small voting frames.
+    ///
+    /// This parks a single inbound blob fetch (via `GatedIngestStore`) and, with
+    /// the engine provably committed to that fetch, sends a serve request and
+    /// asserts the engine still encodes and replies. RED until the ingest
+    /// fetch+apply is moved off the single select! task; a mere cooperative
+    /// yield cannot satisfy it, because one atomic fetch cannot be interrupted.
+    #[tokio::test]
+    async fn engine_serves_own_root_while_inbound_fetch_is_outstanding_zeb937() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        };
+
+        let alice = mint_test_owner(0x93);
+        let alice_addr = alice.owner;
+        let alice_sk = Arc::new(alice.device_key.clone());
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+
+        // Shared CAS so A's served root blob is fetchable by B.
+        let cas_op_tx = spawn_shared_cas();
+        let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_secs(2),
+        ));
+        // B's store sits behind the ingest gate: its state-root fetch parks
+        // until this test releases it, signalling on entry.
+        let cs_b_inner: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let cs_b: Arc<dyn ContentStore> = Arc::new(GatedIngestStore {
+            inner: cs_b_inner,
+            gate: Arc::clone(&gate),
+            entered_tx,
+        });
+
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+        let community_id = SpaceId([0x93; 16]);
+        let membership_key = EpochKey::new([0x93; 32]);
+
+        // Engine A (admin): serve arm wired so we can mint a genuine, signed
+        // packet on demand. A's publisher traffic is drained.
+        let (serve_tx_a, serve_rx_a) = mpsc::channel::<RootServeRequest>(4);
+        let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_a_sub_tx_held, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
+
+        let _engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice_addr,
+            signing_key: Arc::clone(&alice_sk),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice_addr,
+                "alice-dev".to_string(),
+            )))),
+            content_store: cs_a,
+            publisher_tx: a_pub_tx,
+            subscriber_rx: a_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_a.path().join("crdt.cbor"),
+                replay: dir_a.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: Some(serve_rx_a),
+        });
+
+        // Engine B (receiver under test): its OWN serve arm + the gated store.
+        let bob_addr = OwnerAddr([0xB9; 16]);
+        let (serve_tx_b, serve_rx_b) = mpsc::channel::<RootServeRequest>(4);
+        let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while b_pub_rx.recv().await.is_some() {} });
+
+        let _engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "bob-dev".into(),
+            self_owner: bob_addr,
+            signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0xB9; 32])),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                bob_addr,
+                "bob-dev".to_string(),
+            )))),
+            content_store: cs_b,
+            publisher_tx: b_pub_tx,
+            subscriber_rx: b_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_b.path().join("crdt.cbor"),
+                replay: dir_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: Some(serve_rx_b),
+        });
+
+        // Alice's EnrollmentCert-bearing bootstrap Join → into A locally, then
+        // OOB-seeded into B so both can encode a non-empty root and B's
+        // membership-at-HLC gate admits Alice's publish.
+        let alice_join_at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let alice_join_payload = EventPayload {
+            id: [0x11; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice_addr,
+            at: alice_join_at,
+        };
+        let alice_join = SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign alice join")
+        };
+        _engine_a
+            .insert_local_event(alice_join.clone())
+            .await
+            .expect("alice bootstrap insert");
+        _engine_b
+            .insert_local_event(alice_join)
+            .await
+            .expect("bob OOB-seeds alice bootstrap");
+
+        // Mint a genuine, signed packet from A (A's store is ungated).
+        let (a_reply_tx, a_reply_rx) = tokio::sync::oneshot::channel();
+        serve_tx_a
+            .send(a_reply_tx)
+            .await
+            .expect("send A serve request");
+        let packet = a_reply_rx.await.expect("A replied").expect("A encode ok");
+
+        // Feed the packet into B; B's inbound arm fetches the root blob via the
+        // gated store (step 6) and parks there.
+        b_sub_tx.send(packet).await.expect("inject packet into B");
+
+        // Wait until B is provably parked inside the ingest fetch.
+        entered_rx
+            .recv()
+            .await
+            .expect("B must enter the gated ingest fetch");
+
+        // THE INVARIANT: with B's engine committed to the inbound fetch, its
+        // state-root queryable must still be answered. Today the single select!
+        // task is pinned in the inline fetch, so this serve request is never
+        // polled and the reply times out — the observed "wedged?" symptom.
+        let (b_reply_tx, b_reply_rx) = tokio::sync::oneshot::channel();
+        serve_tx_b
+            .send(b_reply_tx)
+            .await
+            .expect("send B serve request");
+        let served = tokio::time::timeout(std::time::Duration::from_secs(2), b_reply_rx).await;
+
+        // Release the parked fetch so B's ingest can finish and tasks unwind,
+        // regardless of the assertion outcome below.
+        gate.add_permits(64);
+
+        let served = served
+            .expect(
+                "engine must serve its own state-root while an inbound ingest fetch is \
+                 outstanding — a timeout here is the ZEB-937 single-task wedge",
+            )
+            .expect("serve reply channel must not be dropped");
+        assert!(
+            served.is_ok(),
+            "state-root serve encode must succeed while an inbound ingest is in flight"
+        );
+    }
+
+    /// ZEB-937 facet 2: the inbound apply must not hold `ctx.state` across the
+    /// whole merge of a large root — that is the 2-min roster-IPC hang. With the
+    /// lock-yield chunk set to 2, ingesting a root of 3 events (bootstrap Join +
+    /// two channel-creates) must release + re-acquire the state lock at least
+    /// once mid-merge (observed via the `apply_lock_yields` counter) while still
+    /// materializing every event. RED before the chunking (counter stays 0);
+    /// GREEN after.
+    #[tokio::test]
+    async fn apply_yields_state_lock_across_large_merge_zeb937() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
+            SignedMembershipEvent,
+        };
+
+        let alice = mint_test_owner(0x94);
+        let alice_addr = alice.owner;
+        let alice_sk = Arc::new(alice.device_key.clone());
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+
+        let cas_op_tx = spawn_shared_cas();
+        let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_secs(2),
+        ));
+        let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+        let community_id = SpaceId([0x94; 16]);
+        let membership_key = EpochKey::new([0x94; 32]);
+
+        // Engine A (admin): serve arm wired so we can mint a genuine packet.
+        let (serve_tx_a, serve_rx_a) = mpsc::channel::<RootServeRequest>(4);
+        let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_a_sub_tx_held, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
+
+        let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice_addr,
+            signing_key: Arc::clone(&alice_sk),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice_addr,
+                "alice-dev".to_string(),
+            )))),
+            content_store: cs_a,
+            publisher_tx: a_pub_tx,
+            subscriber_rx: a_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_a.path().join("crdt.cbor"),
+                replay: dir_a.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: Some(serve_rx_a),
+        });
+
+        // Engine B (receiver under test): chunk the apply lock every 2 events,
+        // set per-engine below (no process-global env → no cross-test race).
+        let bob_addr = OwnerAddr([0xB4; 16]);
+        let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+        let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while b_pub_rx.recv().await.is_some() {} });
+
+        let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "bob-dev".into(),
+            self_owner: bob_addr,
+            signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0xB4; 32])),
+            state: Arc::clone(&b_state),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                bob_addr,
+                "bob-dev".to_string(),
+            )))),
+            content_store: cs_b,
+            publisher_tx: b_pub_tx,
+            subscriber_rx: b_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_b.path().join("crdt.cbor"),
+                replay: dir_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+        // Force a small chunk on THIS engine only — the merge yields at 2.
+        engine_b.set_apply_lock_chunk_for_test(2);
+
+        // Alice's bootstrap Join → A locally + OOB-seeded into B.
+        let alice_join_at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let alice_join_payload = EventPayload {
+            id: [0x12; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice_addr,
+            at: alice_join_at.clone(),
+        };
+        let alice_join = SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign alice join")
+        };
+        engine_a
+            .insert_local_event(alice_join.clone())
+            .await
+            .expect("alice bootstrap insert");
+        engine_b
+            .insert_local_event(alice_join)
+            .await
+            .expect("bob OOB-seeds alice bootstrap");
+
+        // Two channel-creates so the served root carries 3 events (Join + 2) —
+        // strictly more than the chunk of 2, forcing ≥1 mid-merge lock yield.
+        let ch_ids = [ChannelId([0x51; 16]), ChannelId([0x52; 16])];
+        for (i, ch_id) in ch_ids.iter().enumerate() {
+            let create_payload = EventPayload {
+                id: [0x20 + i as u8; 16],
+                community_id,
+                kind: MembershipEventKind::ChannelCreate {
+                    channel_id: *ch_id,
+                    name: format!("ch{i}"),
+                    write_power: 0,
+                    kind: ChannelKind::Text,
+                },
+                actor: alice_addr,
+                at: Hlc {
+                    wall_ms: alice_join_at.wall_ms,
+                    logical: alice_join_at.logical + 1 + i as u32,
+                    device_id: alice_join_at.device_id.clone(),
+                },
+            };
+            let create = sign_event(&create_payload, alice_sk.as_ref()).expect("sign create");
+            assert_eq!(
+                engine_a
+                    .insert_local_event(create)
+                    .await
+                    .expect("alice channel-create insert"),
+                InsertOutcome::Inserted
+            );
+        }
+
+        // Mint the 3-event root from A and feed it to B.
+        let (a_reply_tx, a_reply_rx) = tokio::sync::oneshot::channel();
+        serve_tx_a
+            .send(a_reply_tx)
+            .await
+            .expect("send A serve request");
+        let packet = a_reply_rx.await.expect("A replied").expect("A encode ok");
+        b_sub_tx.send(packet).await.expect("inject packet into B");
+
+        // Poll until B materializes BOTH channels (the whole merge completed).
+        let mut materialized = false;
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mat = {
+                let g = b_state.lock().await;
+                g.materialize_now(alice_addr)
+            };
+            if ch_ids.iter().all(|id| mat.channels.contains_key(id)) {
+                materialized = true;
+                break;
+            }
+        }
+        assert!(
+            materialized,
+            "B must materialize every channel from the multi-event root merge"
+        );
+
+        // THE INVARIANT: the merge released the state lock at least once mid-batch
+        // (chunk=2 over 3 events), rather than holding it across the whole merge.
+        let yields = engine_b
+            .sync_stats()
+            .apply_lock_yields
+            .load(Ordering::Relaxed);
+        assert!(
+            yields >= 1,
+            "apply must yield the state lock mid-merge for a root larger than the \
+             chunk (got {yields} yields) — otherwise a large merge hangs roster IPC"
+        );
+
+        drop(engine_a);
+        drop(engine_b);
+    }
+
+    /// ZEB-937 (review Finding 1): a replayed/duplicate root frame must be
+    /// dropped by the on-task pre-fetch replay peek in `prepare_ingest` — BEFORE
+    /// the off-task CAS fetch — so a joined member cannot replay old (possibly
+    /// CAS-evicted) frames to burn the fetch-retry budget and saturate the
+    /// resolve/retry semaphores. Verified by the content-store `get` count: a
+    /// replay must add ZERO fetches. Deterministic via FIFO ordering — the
+    /// replay is enqueued before a later distinct frame, so once that frame's
+    /// channel materializes the replay has provably been processed.
+    #[tokio::test]
+    async fn replay_frame_is_dropped_before_fetch_zeb937() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
+            SignedMembershipEvent,
+        };
+
+        let alice = mint_test_owner(0x95);
+        let alice_addr = alice.owner;
+        let alice_sk = Arc::new(alice.device_key.clone());
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+
+        let cas_op_tx = spawn_shared_cas();
+        let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_secs(2),
+        ));
+        // B's store counts every budgeted fetch (misses=0 → pure counter).
+        let cs_b_inner: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+        let (store, get_calls, _last_budget) =
+            MissingUntilStore::new_with_mode(cs_b_inner, 0, false);
+        let cs_b: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
+
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+        let community_id = SpaceId([0x95; 16]);
+        let membership_key = EpochKey::new([0x95; 32]);
+
+        let (serve_tx_a, serve_rx_a) = mpsc::channel::<RootServeRequest>(4);
+        let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_a_sub_tx_held, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
+
+        let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice_addr,
+            signing_key: Arc::clone(&alice_sk),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice_addr,
+                "alice-dev".to_string(),
+            )))),
+            content_store: cs_a,
+            publisher_tx: a_pub_tx,
+            subscriber_rx: a_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_a.path().join("crdt.cbor"),
+                replay: dir_a.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: Some(serve_rx_a),
+        });
+
+        let bob_addr = OwnerAddr([0xB5; 16]);
+        let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+        let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while b_pub_rx.recv().await.is_some() {} });
+
+        let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "bob-dev".into(),
+            self_owner: bob_addr,
+            signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0xB5; 32])),
+            state: Arc::clone(&b_state),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                bob_addr,
+                "bob-dev".to_string(),
+            )))),
+            content_store: cs_b,
+            publisher_tx: b_pub_tx,
+            subscriber_rx: b_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_b.path().join("crdt.cbor"),
+                replay: dir_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+
+        // Alice bootstrap Join → A + OOB-seed B.
+        let alice_join_at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let alice_join = SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(
+                &EventPayload {
+                    id: [0x13; 16],
+                    community_id,
+                    kind: MembershipEventKind::Join,
+                    actor: alice_addr,
+                    at: alice_join_at.clone(),
+                },
+                alice_sk.as_ref(),
+            )
+            .expect("sign join")
+        };
+        engine_a
+            .insert_local_event(alice_join.clone())
+            .await
+            .expect("alice join");
+        engine_b
+            .insert_local_event(alice_join)
+            .await
+            .expect("bob OOB-seed join");
+
+        // Helper: Alice creates a channel and A serves the resulting root.
+        let make_root = |ch_id: ChannelId, ev_id: u8, logical: u32| {
+            let sk = Arc::clone(&alice_sk);
+            let serve_tx = serve_tx_a.clone();
+            let at = alice_join_at.clone();
+            async move {
+                let create = sign_event(
+                    &EventPayload {
+                        id: [ev_id; 16],
+                        community_id,
+                        kind: MembershipEventKind::ChannelCreate {
+                            channel_id: ch_id,
+                            name: "c".into(),
+                            write_power: 0,
+                            kind: ChannelKind::Text,
+                        },
+                        actor: alice_addr,
+                        at: Hlc {
+                            wall_ms: at.wall_ms,
+                            logical,
+                            device_id: at.device_id.clone(),
+                        },
+                    },
+                    sk.as_ref(),
+                )
+                .expect("sign create");
+                (create, serve_tx)
+            }
+        };
+
+        // Frame 1: root with channel #1. Insert on A, serve, feed B.
+        let ch1 = ChannelId([0x61; 16]);
+        let (create1, _) = make_root(ch1, 0x30, 1).await;
+        engine_a.insert_local_event(create1).await.expect("create1");
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        serve_tx_a.send(tx1).await.expect("serve1");
+        let packet1 = rx1.await.expect("reply1").expect("encode1");
+        b_sub_tx.send(packet1.clone()).await.expect("feed1");
+        // Poll until B materializes channel #1.
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if b_state
+                .lock()
+                .await
+                .materialize_now(alice_addr)
+                .channels
+                .contains_key(&ch1)
+            {
+                break;
+            }
+        }
+        let gets_after_first = get_calls.load(Ordering::SeqCst);
+        assert!(
+            gets_after_first >= 1,
+            "first ingest must fetch the root blob at least once"
+        );
+
+        // REPLAY the identical frame, then a later DISTINCT frame (channel #2).
+        b_sub_tx.send(packet1).await.expect("feed replay");
+        let ch2 = ChannelId([0x62; 16]);
+        let (create2, _) = make_root(ch2, 0x31, 2).await;
+        engine_a.insert_local_event(create2).await.expect("create2");
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        serve_tx_a.send(tx2).await.expect("serve2");
+        let packet2 = rx2.await.expect("reply2").expect("encode2");
+        b_sub_tx.send(packet2).await.expect("feed2");
+        // Poll until channel #2 materializes — FIFO guarantees the replay was
+        // processed before this frame.
+        let mut got_ch2 = false;
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if b_state
+                .lock()
+                .await
+                .materialize_now(alice_addr)
+                .channels
+                .contains_key(&ch2)
+            {
+                got_ch2 = true;
+                break;
+            }
+        }
+        assert!(
+            got_ch2,
+            "B must ingest the later distinct frame (channel #2)"
+        );
+
+        // The replay added ZERO fetches: total = first ingest + the distinct
+        // frame 2 only. If the replay had reached the fetch, this would be +1.
+        let gets_final = get_calls.load(Ordering::SeqCst);
+        assert_eq!(
+            gets_final,
+            gets_after_first + 1,
+            "a replayed frame must be dropped BEFORE the CAS fetch (pre-fetch replay \
+             peek); observed an extra fetch, meaning the replay reached resolve"
+        );
+
+        drop(engine_a);
+        drop(engine_b);
     }
 
     /// ZEB-790 Task 5: the mirror-image invariant — a publish that FAILS
