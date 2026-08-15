@@ -16,7 +16,9 @@
 //! the sorted slice (à la [`crate::channel_rbsr::SliceSource`]) is exact and
 //! cheap, and the modular-sum fingerprint is order-independent by construction.
 
-use crate::channel_rbsr::{RangeFingerprint, RangeReconcileSource, ReconcileKey};
+use crate::channel_rbsr::{
+    RangeFingerprint, RangeReconcileSource, RbsrMessage, RbsrMode, ReconcileKey,
+};
 use crate::community_voting_core::SignedVotingEvent;
 use crate::community_voting_tier3::canonical_key;
 
@@ -114,6 +116,21 @@ pub(crate) fn resolve_bodies(
         }
     }
     out
+}
+
+/// Collect the `Have` element keys advertised across an RBSR reply's ranges —
+/// the set of bodies the responder must resolve (via [`resolve_bodies`]) and
+/// serve inline. Ordering follows the reply's ascending range partition.
+pub(crate) fn have_keys_of(reply: &RbsrMessage) -> Vec<ReconcileKey> {
+    reply
+        .ranges
+        .iter()
+        .filter_map(|r| match &r.mode {
+            RbsrMode::Have(keys) => Some(keys.iter().cloned()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
 }
 
 #[cfg(test)]
@@ -245,5 +262,111 @@ mod tests {
             6,
             "duplicate event must collapse to one entry"
         );
+    }
+
+    /// `n` distinct events spread across wall_ms / device / payload.
+    fn many_events(n: usize) -> Vec<SignedVotingEvent> {
+        (0..n)
+            .map(|i| {
+                ev(
+                    100 + (i as u64) * 3,
+                    (i % 5) as u32,
+                    if i % 2 == 0 { "dA" } else { "dB" },
+                    (i % 251) as u8,
+                )
+            })
+            .collect()
+    }
+
+    fn source(events: &[SignedVotingEvent]) -> VotingReconcileSource {
+        VotingReconcileSource::from_events(events)
+    }
+
+    fn has_key(events: &[SignedVotingEvent], k: &ReconcileKey) -> bool {
+        events.iter().any(|e| &voting_reconcile_key(e) == k)
+    }
+
+    /// Drive the pull-only RBSR loop between a behind requester `b` and a holder
+    /// `a`, exactly as the transport will: respond → resolve Have bodies → apply
+    /// the ones `b` lacks → process_reply for the next round. Returns
+    /// `(converged_b, distinct_bodies_transferred, rounds)`.
+    fn drive_pull(
+        a: &[SignedVotingEvent],
+        b0: &[SignedVotingEvent],
+    ) -> (Vec<SignedVotingEvent>, usize, u32) {
+        use crate::channel_rbsr::{initial_request, process_reply, respond, MAX_RBSR_ROUNDS};
+        let mut b = b0.to_vec();
+        let mut transferred = 0usize;
+        let mut req = initial_request(&source(&b));
+        let mut rounds = 0u32;
+        loop {
+            rounds += 1;
+            assert!(
+                rounds <= MAX_RBSR_ROUNDS,
+                "exceeded round cap without converging"
+            );
+            let reply = respond(&req, &source(a));
+            let hk = have_keys_of(&reply);
+            let bodies = resolve_bodies(a, &hk);
+            assert_eq!(
+                bodies.len(),
+                hk.len(),
+                "responder must back every advertised key"
+            );
+            for ev in &bodies {
+                let k = voting_reconcile_key(ev);
+                if !has_key(&b, &k) {
+                    b.push(ev.clone());
+                    transferred += 1;
+                }
+            }
+            let (_missing, next) = process_reply(&reply, &source(&b));
+            match next {
+                Some(n) => req = n,
+                None => break,
+            }
+        }
+        (b, transferred, rounds)
+    }
+
+    #[test]
+    fn pull_converges_with_sublinear_transfer() {
+        let a = many_events(200);
+        // b is missing 5 scattered events (remove high→low so indices don't shift).
+        let mut b = a.clone();
+        for i in [190usize, 131, 130, 61, 7] {
+            b.remove(i);
+        }
+        let (converged, transferred, _rounds) = drive_pull(&a, &b);
+
+        let fp = |e: &[SignedVotingEvent]| {
+            source(e)
+                .range_fingerprint(&min_key(), &max_key())
+                .finalize()
+        };
+        assert_eq!(
+            fp(&converged),
+            fp(&a),
+            "requester must converge to holder's set"
+        );
+        assert!(transferred >= 5, "must transfer at least the 5-event diff");
+        assert!(
+            transferred < a.len(),
+            "transfer must be sublinear in log size (got {transferred} of {})",
+            a.len()
+        );
+    }
+
+    #[test]
+    fn identical_logs_converge_in_one_round_zero_have() {
+        use crate::channel_rbsr::{initial_request, process_reply, respond};
+        let a = many_events(64);
+        let reply = respond(&initial_request(&source(&a)), &source(&a));
+        assert!(
+            have_keys_of(&reply).is_empty(),
+            "matching universe fingerprints must ship no Have keys"
+        );
+        let (_m, next) = process_reply(&reply, &source(&a));
+        assert!(next.is_none(), "identical logs converge immediately");
     }
 }
