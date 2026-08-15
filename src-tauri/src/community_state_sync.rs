@@ -10343,9 +10343,16 @@ mod tests {
             InsertOutcome::Inserted
         );
 
-        // Wire the LIVE push bridge: every A publish → B's inbound. This is the
-        // "already-connected peer" condition — no query-serve anywhere. A's
-        // buffered join publish flows too; B already has it, so it dedups.
+        // Drain A's change-driven bootstrap-Join publish BEFORE wiring the
+        // bridge, so the ONLY frame that crosses to B is the later incremental
+        // channel-create publish — keeping the test strictly about the
+        // incremental `notify_dirty` path, not the pending bootstrap publish. B
+        // is already OOB-seeded with the Join, so dropping it loses nothing.
+        tokio::time::sleep(std::time::Duration::from_millis(DEFAULT_DEBOUNCE_MS * 3)).await;
+        while a_pub_rx.try_recv().is_ok() {}
+
+        // Wire the LIVE push bridge: every SUBSEQUENT A publish → B's inbound.
+        // This is the "already-connected peer" condition — no query-serve.
         tokio::spawn(async move {
             while let Some(wire) = a_pub_rx.recv().await {
                 if b_sub_tx.send(wire).await.is_err() {
