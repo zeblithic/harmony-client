@@ -568,6 +568,28 @@ pub const DEFAULT_DEBOUNCE_MS: u64 = 250;
 /// any human interaction).
 pub const COMMUNITY_BOOT_FLUSH_DELAY_MS: u64 = 500;
 
+/// ZEB-935: cadence of the publisher-side "push floor" — a periodic
+/// self-republish of the community root (see
+/// `CommunitySyncEngine::spawn_push_floor`). It is the PUSH analog of the
+/// ~1h PULL floor (`channel_backfill::PERIODIC_RESYNC_FLOOR_MS`): a connected
+/// peer that silently missed a live change-PUT catches up within this window
+/// instead of waiting for the hourly pull. 5 min balances staleness against
+/// the (dedup-cheap) cost of one extra manifest PUT per interval. Overridable
+/// via `HARMONY_COMMUNITY_PUSH_FLOOR_MS` for fleet/test tuning.
+pub const PUSH_FLOOR_MS: u64 = 300_000;
+
+/// ZEB-935: resolve the push-floor cadence, honoring the
+/// `HARMONY_COMMUNITY_PUSH_FLOOR_MS` override (ignored if unset, unparseable,
+/// or zero). Read once at engine spawn, matching the other cadence env vars.
+fn push_floor_interval() -> std::time::Duration {
+    let ms = std::env::var("HARMONY_COMMUNITY_PUSH_FLOOR_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(PUSH_FLOOR_MS);
+    std::time::Duration::from_millis(ms)
+}
+
 /// ZEB-262 Phase 4: shared per-EventId oneshot map. The
 /// `CommunitySyncRegistry` owns the `Arc` and exposes
 /// `register_pending_redemption` / `take_pending_redemption` /
@@ -2172,6 +2194,55 @@ impl CommunitySyncEngine {
         resp_rx
             .await
             .map_err(|_| CommunitySyncError::TransportClosed)?
+    }
+
+    /// ZEB-935: publisher-side "push floor" — the PUSH analog of the ~1h pull
+    /// floor (`run_root_fetch_driver`). Periodically re-publishes the current
+    /// root via `flush_now` so a connected peer that silently missed a live
+    /// change-PUT (a transient route drop / brief subscriber gap, with no
+    /// presence or transport-epoch change to trigger the pull re-arm) catches
+    /// up within `interval` instead of waiting up to the ~1h pull floor. One
+    /// PUT fans out to every subscriber; a peer that already holds the root
+    /// drops it at the replay guard (cheap), only a peer that missed the change
+    /// re-fetches and heals — so this scales far better than tightening the
+    /// per-peer pull cadence.
+    ///
+    /// The ticker self-terminates when the engine's internal task drops
+    /// `flush_now_rx` (shutdown), so it needs no separate shutdown channel.
+    /// Best-effort: a failed flush is left for the next tick (change-driven
+    /// publishes are owned by the debounce/retry loop; this is only the floor).
+    pub(crate) fn spawn_push_floor(&self, interval: std::time::Duration) {
+        let flush_tx = self.flush_now_tx.clone();
+        let community_id = self.community_id;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // A missed tick (e.g. a slow flush) should not fire a burst of
+            // catch-up publishes — one floor publish per elapsed interval is
+            // enough. `Delay` also keeps the cadence honest under load.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // `interval` fires its first tick immediately; consume it so the
+            // first FLOOR publish lands one interval later. Startup coverage is
+            // already handled by the boot flush (lib.rs), so the floor's job is
+            // strictly the steady-state gap between change-driven publishes.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                if flush_tx.send(resp_tx).await.is_err() {
+                    // Engine's internal task dropped `flush_now_rx` (shutdown) —
+                    // nothing left to flush; stop the floor.
+                    tracing::debug!(
+                        community_id = ?community_id,
+                        "community push floor stopping: engine task gone"
+                    );
+                    break;
+                }
+                // Best-effort: a failed/transient publish is left for the next
+                // tick. The change-driven debounce/retry loop owns real
+                // convergence; this floor only bounds missed-PUT staleness.
+                let _ = resp_rx.await;
+            }
+        });
     }
 
     /// ZEB-462 B: durably persist the community membership CRDT to disk NOW,
@@ -6692,6 +6763,13 @@ impl CommunitySyncRegistry {
             root_serve_rx,
         }));
 
+        // ZEB-935: start the publisher-side push floor before handing the engine
+        // to the map. The PUSH analog of the pull-floor driver spawned below: it
+        // periodically re-publishes the root so a connected peer that missed a
+        // live change-PUT converges within `push_floor_interval()` rather than
+        // the ~1h pull floor. Self-terminates when the engine task shuts down.
+        engine.spawn_push_floor(push_floor_interval());
+
         engines.insert(community_id, engine);
 
         // ZEB-434 D3/D4: spawn the per-community root-fetch driver.
@@ -10109,6 +10187,349 @@ mod tests {
             materialized,
             "channel from the query-serve packet must materialize on engine B"
         );
+    }
+
+    /// ZEB-935 pin (component-boundary probe): does the engine PUSH an
+    /// incremental change (a channel create) to an ALREADY-CONNECTED peer via
+    /// the live `publisher_tx → subscriber_rx` path, with NO query-serve?
+    ///
+    /// Bridges Engine A's `publisher_tx` directly into Engine B's
+    /// `subscriber_rx`, seeds both with the admin's bootstrap Join, then — AFTER
+    /// the bridge is live (the "connected peer" condition) — inserts a
+    /// ChannelCreate on A and asserts B materializes it from A's eager debounced
+    /// publish alone. The fleet (ZEB-933) observed a connected peer receive
+    /// ZERO live state-root while voting flowed over the same link; this
+    /// isolates whether that gap lives in the ENGINE (this test fails) or only
+    /// in the production adapter/subscription wiring (this test passes — the
+    /// engine's eager push works peer-to-peer, so the fault is downstream).
+    #[tokio::test]
+    async fn eager_push_delivers_incremental_channel_to_connected_peer_zeb935() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
+            SignedMembershipEvent,
+        };
+        use crate::community_state_crdt::InsertOutcome;
+
+        let alice = mint_test_owner(0xA9);
+        let bob = mint_test_owner(0xB9);
+        let alice_addr = alice.owner;
+        let bob_addr = bob.owner;
+        let alice_sk = Arc::new(alice.device_key.clone());
+        let bob_sk = Arc::new(bob.device_key.clone());
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+
+        let cas_op_tx = spawn_shared_cas();
+        let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_secs(2),
+        ));
+        let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+
+        let community_id = SpaceId([0x39; 16]);
+        let membership_key = EpochKey::new([0x57; 32]);
+
+        // Engine A (admin): no query-serve wired — delivery to B must ride the
+        // live publisher→subscriber push, nothing else.
+        let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_a_sub_tx_held, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+
+        // Engine B (member): b_sub_tx is fed by the live bridge below.
+        let (b_pub_tx, _b_pub_rx_held) = mpsc::channel::<Vec<u8>>(64);
+        let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+
+        let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice_addr,
+            signing_key: Arc::clone(&alice_sk),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice_addr,
+                "alice-dev".to_string(),
+            )))),
+            content_store: cs_a,
+            publisher_tx: a_pub_tx,
+            subscriber_rx: a_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_a.path().join("crdt.cbor"),
+                replay: dir_a.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+
+        let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key,
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "bob-dev".into(),
+            self_owner: bob_addr,
+            signing_key: Arc::clone(&bob_sk),
+            state: Arc::clone(&b_state),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                bob_addr,
+                "bob-dev".to_string(),
+            )))),
+            content_store: cs_b,
+            publisher_tx: b_pub_tx,
+            subscriber_rx: b_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_b.path().join("crdt.cbor"),
+                replay: dir_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+
+        // Alice's EnrollmentCert-bearing bootstrap Join (admin power 100).
+        let alice_join_at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let alice_join_payload = EventPayload {
+            id: [0x10; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice_addr,
+            at: alice_join_at.clone(),
+        };
+        let alice_join = SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign join")
+        };
+        // Seed BOTH engines with the admin bootstrap so B's membership-at-HLC
+        // gate will admit A's later channel push (mirrors the OOB admin_bootstrap
+        // the production invite carries).
+        assert_eq!(
+            engine_a
+                .insert_local_event(alice_join.clone())
+                .await
+                .expect("alice bootstrap insert"),
+            InsertOutcome::Inserted
+        );
+        assert_eq!(
+            engine_b
+                .insert_local_event(alice_join)
+                .await
+                .expect("bob OOB-seeds Alice's bootstrap Join"),
+            InsertOutcome::Inserted
+        );
+
+        // Drain A's change-driven bootstrap-Join publish BEFORE wiring the
+        // bridge, so the ONLY frame that crosses to B is the later incremental
+        // channel-create publish — keeping the test strictly about the
+        // incremental `notify_dirty` path, not the pending bootstrap publish. B
+        // is already OOB-seeded with the Join, so dropping it loses nothing.
+        tokio::time::sleep(std::time::Duration::from_millis(DEFAULT_DEBOUNCE_MS * 3)).await;
+        while a_pub_rx.try_recv().is_ok() {}
+
+        // Wire the LIVE push bridge: every SUBSEQUENT A publish → B's inbound.
+        // This is the "already-connected peer" condition — no query-serve.
+        tokio::spawn(async move {
+            while let Some(wire) = a_pub_rx.recv().await {
+                if b_sub_tx.send(wire).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Incremental change AFTER "connect": Alice adds a channel. This must
+        // reach B through A's eager debounced publish alone.
+        let ch_id = ChannelId([0x42; 16]);
+        let alice_create_payload = EventPayload {
+            id: [0x11; 16],
+            community_id,
+            kind: MembershipEventKind::ChannelCreate {
+                channel_id: ch_id,
+                name: "ops".into(),
+                write_power: 0,
+                kind: ChannelKind::Text,
+            },
+            actor: alice_addr,
+            at: Hlc {
+                wall_ms: alice_join_at.wall_ms,
+                logical: alice_join_at.logical + 1,
+                device_id: alice_join_at.device_id.clone(),
+            },
+        };
+        let alice_create =
+            sign_event(&alice_create_payload, alice_sk.as_ref()).expect("sign channel create");
+        assert_eq!(
+            engine_a
+                .insert_local_event(alice_create)
+                .await
+                .expect("alice channel-create insert"),
+            InsertOutcome::Inserted
+        );
+
+        // B must materialize the channel from the EAGER live push alone.
+        let mut materialized = false;
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mat = {
+                let g = b_state.lock().await;
+                g.materialize_now(alice_addr)
+            };
+            if let Some(info) = mat.channels.get(&ch_id) {
+                assert_eq!(info.name, "ops");
+                assert_eq!(info.write_power, 0);
+                assert!(info.deleted_at.is_none());
+                materialized = true;
+                break;
+            }
+        }
+        assert!(
+            materialized,
+            "ZEB-935: connected peer B must receive the admin's incremental \
+             channel-create via the eager live push (publisher→subscriber), \
+             with no query-serve"
+        );
+
+        // Keep both engine handles alive to the end so their internal tasks are
+        // not dropped mid-flight.
+        drop(engine_a);
+        drop(engine_b);
+    }
+
+    /// ZEB-935: the publisher-side push floor re-publishes the current root on a
+    /// periodic cadence with NO intervening mutation, so a connected peer that
+    /// missed a live PUT catches up within `interval` instead of the ~1h pull
+    /// floor. Seeds one event, drains the change-driven publish, starts the
+    /// floor at a short test cadence, and asserts a fresh publish arrives from
+    /// the floor alone (no further inserts).
+    #[tokio::test]
+    async fn push_floor_republishes_root_without_mutation_zeb935() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, EventPayload, MembershipEventKind, SignedMembershipEvent,
+        };
+        use crate::community_state_crdt::InsertOutcome;
+
+        let alice = mint_test_owner(0xC7);
+        let alice_addr = alice.owner;
+        let alice_sk = Arc::new(alice.device_key.clone());
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+
+        let cas_op_tx = spawn_shared_cas();
+        let cs: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+        let dir = tempfile::tempdir().expect("dir");
+        let community_id = SpaceId([0x3C; 16]);
+
+        // Observe the publisher output directly (NOT drained).
+        let (pub_tx, mut pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_sub_tx_held, sub_rx) = mpsc::channel::<Vec<u8>>(64);
+
+        let engine = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: EpochKey::new([0x58; 32]),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice_addr,
+            signing_key: Arc::clone(&alice_sk),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice_addr,
+                "alice-dev".to_string(),
+            )))),
+            content_store: cs,
+            publisher_tx: pub_tx,
+            subscriber_rx: sub_rx,
+            paths: PersistPaths {
+                crdt: dir.path().join("crdt.cbor"),
+                replay: dir.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+
+        // Seed one event so there is a real root to (re)publish.
+        let alice_join_at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let alice_join_payload = EventPayload {
+            id: [0x10; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice_addr,
+            at: alice_join_at,
+        };
+        let alice_join = SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign join")
+        };
+        assert_eq!(
+            engine
+                .insert_local_event(alice_join)
+                .await
+                .expect("join insert"),
+            InsertOutcome::Inserted
+        );
+
+        // Drain the change-driven publish(es) from the join so anything arriving
+        // afterward is attributable to the floor alone. Wait past one debounce.
+        tokio::time::sleep(std::time::Duration::from_millis(DEFAULT_DEBOUNCE_MS * 3)).await;
+        let mut drained = 0;
+        while pub_rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert!(
+            drained >= 1,
+            "the join insert must have produced a change-driven publish before the floor test"
+        );
+
+        // Start the push floor at a short test cadence. No further inserts.
+        engine.spawn_push_floor(std::time::Duration::from_millis(120));
+
+        // A fresh publish must arrive from the floor alone, with no mutation.
+        let floored = tokio::time::timeout(std::time::Duration::from_secs(2), pub_rx.recv()).await;
+        assert!(
+            matches!(floored, Ok(Some(_))),
+            "ZEB-935: the push floor must re-publish the root on its cadence with \
+             no intervening mutation (got {floored:?})"
+        );
+
+        drop(engine);
     }
 
     /// PR #230 review (Qodo + CodeRabbit): replay-tracker persistence
