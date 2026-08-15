@@ -262,6 +262,7 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
         bf_read_a,
         bf_apply_a,
         Duration::from_secs(86_400),
+        None,
         Arc::clone(&closing_a),
     );
 
@@ -280,6 +281,7 @@ async fn tier2_signal_via_zenoh_fires_delegate_on_behalf_on_peer_engine() {
         bf_read_b,
         bf_apply_b,
         Duration::from_secs(86_400),
+        None,
         Arc::clone(&closing_b),
     );
 

@@ -551,6 +551,63 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
             .collect()
     }
 
+    /// ZEB-932: RBSR round 0 — a whole-universe fingerprint over the live
+    /// (non-archived) event set. The requester seals + sends this to open a
+    /// reconcile; the transport supplies the crypto.
+    pub(crate) async fn rbsr_initial(&self) -> crate::channel_rbsr::RbsrMessage {
+        let log = self.voting_log.lock().await;
+        crate::channel_rbsr::initial_request(
+            &crate::voting_rbsr::VotingReconcileSource::from_events(&log.events),
+        )
+    }
+
+    /// ZEB-932: RBSR responder half. Answers a request over our live event set,
+    /// returning the reply plus the **plaintext** CBOR bodies for every `Have`
+    /// key it advertises. Returns `None` — so the requester falls back to the
+    /// full-dump — if we cannot back an advertised key with a body (never
+    /// advertise a key whose body is missing: the requester treats `Have` as
+    /// resolved and would silently lose those events).
+    pub(crate) async fn rbsr_respond(
+        &self,
+        request: &crate::channel_rbsr::RbsrMessage,
+    ) -> Option<(crate::channel_rbsr::RbsrMessage, Vec<Vec<u8>>)> {
+        let log = self.voting_log.lock().await;
+        let src = crate::voting_rbsr::VotingReconcileSource::from_events(&log.events);
+        let reply = crate::channel_rbsr::respond(request, &src);
+        let have_keys = crate::voting_rbsr::have_keys_of(&reply);
+        let bodies_ev = crate::voting_rbsr::resolve_bodies(&log.events, &have_keys);
+        if bodies_ev.len() != have_keys.len() {
+            return None;
+        }
+        let mut bodies = Vec::with_capacity(bodies_ev.len());
+        for ev in &bodies_ev {
+            let mut b = Vec::new();
+            if ciborium::into_writer(ev, &mut b).is_err() {
+                return None;
+            }
+            bodies.push(b);
+        }
+        Some((reply, bodies))
+    }
+
+    /// ZEB-932: RBSR requester half. Given a responder's reply — whose `Have`
+    /// bodies the transport has already applied via `apply_backfilled_event` —
+    /// compute the next request over our (post-apply) event set, or `None` once
+    /// nothing mismatches (converged). Returns `(still_missing, next)`:
+    /// `still_missing` is the count of advertised `Have` keys NOT present in our
+    /// post-apply set — non-zero means a body the responder advertised never
+    /// landed (rejected on apply, dropped in transit, or failed the current-epoch
+    /// cut), so the caller must NOT trust the optimistic Have→Skip convergence.
+    pub(crate) async fn rbsr_process_reply(
+        &self,
+        reply: &crate::channel_rbsr::RbsrMessage,
+    ) -> (usize, Option<crate::channel_rbsr::RbsrMessage>) {
+        let log = self.voting_log.lock().await;
+        let src = crate::voting_rbsr::VotingReconcileSource::from_events(&log.events);
+        let (missing, next) = crate::channel_rbsr::process_reply(reply, &src);
+        (missing.len(), next)
+    }
+
     /// Construct an engine, spawn its inbound receive loop, and return
     /// an `Arc<Self>` suitable for registry storage.
     pub async fn start(params: VotingLogEngineParams<R>) -> Arc<Self> {
@@ -4154,6 +4211,82 @@ mod tests {
             1,
             "no double-apply on re-backfill"
         );
+    }
+
+    #[tokio::test]
+    async fn rbsr_engine_pull_converges_to_holder() {
+        use crate::channel_rbsr::MAX_RBSR_ROUNDS;
+        use std::collections::HashSet;
+
+        let cid = SpaceId([0x93; 16]);
+        let (key, owner, pub64) = fixture_identity_engine(0x93);
+
+        let log_a = Arc::new(Mutex::new(VotingLog::new()));
+        let engine_a = start_backfill_test_engine(
+            cid,
+            owner,
+            pub64,
+            Arc::clone(&log_a),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+        )
+        .await;
+        let log_b = Arc::new(Mutex::new(VotingLog::new()));
+        let engine_b = start_backfill_test_engine(
+            cid,
+            owner,
+            pub64,
+            Arc::clone(&log_b),
+            crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+        )
+        .await;
+
+        // Holder A gets 20 distinct polls; requester B is missing 4 (i = 0,5,10,15).
+        let events: Vec<SignedVotingEvent> = (0..20u64)
+            .map(|i| signed_poll_create(&key, owner, "dev", 1_000 + i * 10))
+            .collect();
+        for e in &events {
+            engine_a
+                .apply_backfilled_event(&encode_event(e))
+                .await
+                .unwrap();
+        }
+        for (i, e) in events.iter().enumerate() {
+            if i % 5 != 0 {
+                engine_b
+                    .apply_backfilled_event(&encode_event(e))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(log_a.lock().await.polls.len(), 20);
+        assert_eq!(log_b.lock().await.polls.len(), 16);
+
+        // Drive the pull-only RBSR loop: requester B pulls from holder A, exactly
+        // as the transport will (respond → apply Have bodies → process_reply).
+        let mut req = engine_b.rbsr_initial().await;
+        let mut rounds = 0u32;
+        loop {
+            rounds += 1;
+            assert!(
+                rounds <= MAX_RBSR_ROUNDS,
+                "exceeded round cap without converging"
+            );
+            let (reply, bodies) = engine_a.rbsr_respond(&req).await.expect("holder answers");
+            for body in &bodies {
+                let _ = engine_b.apply_backfilled_event(body).await;
+            }
+            let (missing, next) = engine_b.rbsr_process_reply(&reply).await;
+            assert_eq!(missing, 0, "every advertised Have body applied in-process");
+            match next {
+                Some(n) => req = n,
+                None => break,
+            }
+        }
+
+        let a_ids: HashSet<_> = log_a.lock().await.polls.keys().cloned().collect();
+        let b_ids: HashSet<_> = log_b.lock().await.polls.keys().cloned().collect();
+        assert_eq!(a_ids, b_ids, "requester converged to holder's poll set");
+        assert_eq!(b_ids.len(), 20);
     }
 
     #[tokio::test]
