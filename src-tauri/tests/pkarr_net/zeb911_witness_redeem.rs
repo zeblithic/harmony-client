@@ -428,7 +428,7 @@ async fn publish_rendezvous_slot(
         .refresh_slot(
             s.community_id,
             epoch_key.clone(),
-            vec![witness_owner],
+            vec![(witness_owner, String::new())],
             witness_owner,
         )
         .await;

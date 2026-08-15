@@ -97,27 +97,34 @@ impl CommunityRelayResolver {
         fresh.into_iter().map(|(_, e)| e).collect()
     }
 
-    /// The owner addresses of the FRESH relay advertisers for a community, the
-    /// input `slot_for_advertiser` ranks into rendezvous slots. Mirrors the
-    /// freshness filtering of [`Self::relays_for_community`] but returns the
-    /// advertiser identities (the `BTreeMap` key's `OwnerAddr`), which
-    /// `relays_for_community`'s `CommunityRelayEntry` does not expose.
+    /// ZEB-940: the FRESH relay advertisers for a community as `(owner address,
+    /// diversity bucket)` pairs — the input
+    /// [`crate::community_rendezvous::slot_for_advertiser_diverse`] ranks into
+    /// rendezvous slots. The bucket is derived from each advertiser's
+    /// self-declared `home_relay`
+    /// ([`crate::community_rendezvous::relay_diversity_bucket`]), a
+    /// CRDT-authoritative network-locality proxy, so slot assignment can spread
+    /// beacons across regions instead of clustering by address.
     ///
-    /// NOTE: unlike `relays_for_community` this does NOT apply the
-    /// `COMMUNITY_RELAY_ADVERTISERS_MAX` read cap — the rendezvous slot
-    /// assignment (`slot_for_advertiser`) ranks the full fresh advertiser set
-    /// and bounds itself by `RENDEZVOUS_SLOT_COUNT`, so capping here would drop
-    /// advertisers that legitimately claim a slot.
-    pub fn advertiser_addrs_for_community(
+    /// Like [`Self::advertiser_addrs_for_community`] this filters by freshness but
+    /// does NOT apply the `COMMUNITY_RELAY_ADVERTISERS_MAX` read cap — the
+    /// diversity slot assignment ranks the full fresh advertiser set and bounds
+    /// itself by `RENDEZVOUS_SLOT_COUNT`.
+    pub fn advertiser_buckets_for_community(
         &self,
         community_id: &SpaceId,
         now_ms: u64,
-    ) -> Vec<OwnerAddr> {
+    ) -> Vec<(OwnerAddr, String)> {
         let g = self.inner.lock().unwrap();
         g.iter()
             .filter(|((c, _), _)| c == community_id)
             .filter(|(_, p)| fresh_relay_entry(p, now_ms).is_some())
-            .map(|((_, a), _)| *a)
+            .map(|((_, a), p)| {
+                (
+                    *a,
+                    crate::community_rendezvous::relay_diversity_bucket(&p.relay.home_relay),
+                )
+            })
             .collect()
     }
 
@@ -212,35 +219,6 @@ mod tests {
     }
 
     #[test]
-    fn advertiser_addrs_for_community_returns_only_fresh_and_scopes_to_community() {
-        let r = CommunityRelayResolver::new();
-        let c = SpaceId([0xCC; 16]);
-        let other = SpaceId([0xDD; 16]);
-        let now = 1_700_000_000_000;
-        let fresh_addr = OwnerAddr([0x01; 16]);
-        let stale_addr = OwnerAddr([0x02; 16]);
-        let other_addr = OwnerAddr([0x03; 16]);
-        // Fresh advertiser in `c`.
-        r.update(c, fresh_addr, payload(0x01, now), hlc(now));
-        // Stale advertiser in `c` (ad_at older than the freshness window).
-        let stale_at = now - crate::community_relay_announce::COMMUNITY_RELAY_AD_FRESHNESS_MS - 1;
-        r.update(c, stale_addr, payload(0x02, stale_at), hlc(stale_at));
-        // Fresh advertiser, but in a DIFFERENT community.
-        r.update(other, other_addr, payload(0x03, now), hlc(now));
-
-        let got = r.advertiser_addrs_for_community(&c, now);
-        assert_eq!(got, vec![fresh_addr], "only the fresh advertiser of `c`");
-        assert!(
-            !got.contains(&stale_addr),
-            "stale advertiser must be filtered out"
-        );
-        assert!(
-            !got.contains(&other_addr),
-            "another community's advertiser must be excluded"
-        );
-    }
-
-    #[test]
     fn relay_slots_not_censored_by_future_advertisers() {
         // ZEB-852 D4: four advertisers stamped at the clamp ceiling try to fill
         // every rendezvous slot and censor an honest advertiser refreshed at
@@ -285,6 +263,55 @@ mod tests {
             "fresher honest advertiser ranks ahead of the staler one",
         );
         assert_eq!(got2[1].relay_device_id, [0xA1; 16]);
+    }
+
+    #[test]
+    fn advertiser_buckets_map_home_relay_to_diversity_bucket() {
+        let r = CommunityRelayResolver::new();
+        let c = SpaceId([0xCC; 16]);
+        let now = 1_700_000_000_000;
+        let a1 = OwnerAddr([0x01; 16]);
+        let a2 = OwnerAddr([0x02; 16]);
+        // Two fresh advertisers on different relay hosts → distinct buckets
+        // (host only: scheme/port/path stripped).
+        let mut p1 = payload(0x01, now);
+        p1.relay.home_relay = "https://usw1-1.relay.n0.iroh.link/".into();
+        let mut p2 = payload(0x02, now);
+        p2.relay.home_relay = "https://euw1-1.relay.n0.iroh.link:443/derp".into();
+        r.update(c, a1, p1, hlc(now));
+        r.update(c, a2, p2, hlc(now));
+
+        let mut got = r.advertiser_buckets_for_community(&c, now);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (a1, "usw1-1.relay.n0.iroh.link".to_string()),
+                (a2, "euw1-1.relay.n0.iroh.link".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn advertiser_buckets_filter_stale_and_scope_to_community() {
+        let r = CommunityRelayResolver::new();
+        let c = SpaceId([0xCC; 16]);
+        let other = SpaceId([0xDD; 16]);
+        let now = 1_700_000_000_000;
+        let fresh_addr = OwnerAddr([0x01; 16]);
+        let stale_addr = OwnerAddr([0x02; 16]);
+        let other_addr = OwnerAddr([0x03; 16]);
+        r.update(c, fresh_addr, payload(0x01, now), hlc(now));
+        let stale_at = now - crate::community_relay_announce::COMMUNITY_RELAY_AD_FRESHNESS_MS - 1;
+        r.update(c, stale_addr, payload(0x02, stale_at), hlc(stale_at));
+        r.update(other, other_addr, payload(0x03, now), hlc(now));
+
+        let addrs: Vec<OwnerAddr> = r
+            .advertiser_buckets_for_community(&c, now)
+            .into_iter()
+            .map(|(a, _)| a)
+            .collect();
+        assert_eq!(addrs, vec![fresh_addr], "only the fresh advertiser of `c`");
     }
 
     #[test]

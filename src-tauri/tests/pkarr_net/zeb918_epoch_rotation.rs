@@ -101,7 +101,8 @@ async fn rotation_rekeys_beacon_on_next_refresh_and_old_record_stays_until_it_ag
         let me = OwnerAddr([0x01; 16]);
 
         // Pre-rotation publish under K1.
-        rdv.refresh_slot(community, k1.clone(), vec![me], me).await;
+        rdv.refresh_slot(community, k1.clone(), vec![(me, String::new())], me)
+            .await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let rec_k1 = poll_slot0(&client, &k1, deadline)
             .await
@@ -113,7 +114,8 @@ async fn rotation_rekeys_beacon_on_next_refresh_and_old_record_stays_until_it_ag
 
         // Rotation: the caller (the live-key read in the slot-refresh arm)
         // now supplies K2 on the next refresh — same slot, same handle.
-        rdv.refresh_slot(community, k2.clone(), vec![me], me).await;
+        rdv.refresh_slot(community, k2.clone(), vec![(me, String::new())], me)
+            .await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let rec_k2 = poll_slot0(&client, &k2, deadline).await.expect(
             "post-rotation refresh must publish under K2 — a pinned \

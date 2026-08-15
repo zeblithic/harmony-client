@@ -34,7 +34,7 @@ use harmony_pkarr::{
 };
 
 use crate::community_rendezvous::{
-    rendezvous_slot_key, slot_for_advertiser, RENDEZVOUS_SLOT_COUNT,
+    rendezvous_slot_key, slot_for_advertiser_diverse, RENDEZVOUS_SLOT_COUNT,
 };
 use crate::owner_state_types::{EpochKey, OwnerAddr, SpaceId};
 
@@ -160,21 +160,24 @@ impl CommunityRendezvousPublisher {
     /// (Re)compute this node's rendezvous slot for `community_id` from the
     /// current advertiser set and publish accordingly:
     ///
-    /// - `slot_for_advertiser(&advertisers, &me) == Some(slot)` → register a
-    ///   pkarr publication keyed by `rendezvous_slot_key(epoch_key, slot,
-    ///   current_epoch_id(now))` under handle `rendezvous:<cid>:<slot>`. If the
-    ///   node previously held a *different* slot for this community, that stale
-    ///   handle is unregistered first.
-    /// - `None` (not an advertiser, or rank ≥ cap) → unregister any rendezvous
-    ///   handle this node previously registered for the community.
+    /// - `slot_for_advertiser_diverse(&advertisers, &me, N) == Some(slot)` →
+    ///   register a pkarr publication keyed by `rendezvous_slot_key(epoch_key,
+    ///   slot, current_epoch_id(now))` under handle `rendezvous:<cid>:<slot>`. If
+    ///   the node previously held a *different* slot for this community, that
+    ///   stale handle is unregistered first.
+    /// - `None` (not an advertiser, or ranks ≥ cap after diversity interleave) →
+    ///   unregister any rendezvous handle this node previously registered.
     ///
-    /// Re-derives the slot key on every publish (in the `key_builder` closure)
-    /// so it tracks the epoch, mirroring the member-keyed community publisher.
+    /// ZEB-940: `advertisers` carries each advertiser's `(owner address,
+    /// diversity bucket)` so the slot claim spreads beacons across relay regions
+    /// rather than clustering by address. Re-derives the slot key on every
+    /// publish (in the `key_builder` closure) so it tracks the epoch, mirroring
+    /// the member-keyed community publisher.
     pub async fn refresh_slot(
         &self,
         community_id: SpaceId,
         epoch_key: EpochKey,
-        advertisers: Vec<OwnerAddr>,
+        advertisers: Vec<(OwnerAddr, String)>,
         me: OwnerAddr,
     ) {
         // Decision + map mutation happen UNDER the lock (fast, no await);
@@ -187,7 +190,7 @@ impl CommunityRendezvousPublisher {
         {
             let mut registered = self.registered_slots.lock().await;
             let prior_slot = registered.get(&community_id).copied();
-            match slot_for_advertiser(&advertisers, &me) {
+            match slot_for_advertiser_diverse(&advertisers, &me, RENDEZVOUS_SLOT_COUNT) {
                 Some(slot) => {
                     // A rank change must drop the stale slot handle before the
                     // new one is registered (each slot has a single writer).
@@ -613,7 +616,7 @@ mod tests {
         let cid = SpaceId([7u8; 16]);
         let me = OwnerAddr([5u8; 16]);
         publisher
-            .refresh_slot(cid, EpochKey::new([2u8; 32]), vec![me], me)
+            .refresh_slot(cid, EpochKey::new([2u8; 32]), vec![(me, String::new())], me)
             .await;
 
         let reg = spy
@@ -663,7 +666,7 @@ mod tests {
         let me = OwnerAddr([5u8; 16]);
         // `me` is the sole advertiser, so it ranks slot 0 and a record is built.
         publisher
-            .refresh_slot(cid, EpochKey::new([2u8; 32]), vec![me], me)
+            .refresh_slot(cid, EpochKey::new([2u8; 32]), vec![(me, String::new())], me)
             .await;
 
         let reg = spy
@@ -691,7 +694,7 @@ mod tests {
         let cid = SpaceId([1u8; 16]);
         let me = OwnerAddr([1u8; 16]);
         // me is the lowest address → rank 0.
-        let others = vec![OwnerAddr([2u8; 16]), me];
+        let others = vec![(OwnerAddr([2u8; 16]), String::new()), (me, String::new())];
         p.refresh_slot(cid, EpochKey::new([5u8; 32]), others, me)
             .await;
         let regs = spy.registrations().await;
@@ -702,12 +705,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_slot_uses_diversity_bucket_not_address_rank() {
+        // ZEB-940 wiring: `me` (address 3) is behind relay B; two lower-address
+        // advertisers (1, 2) are behind relay A. A plain address rank would place
+        // `me` at slot 2; the diversity round-robin (relay B is the 2nd bucket,
+        // first round) places it at slot 1. Asserting the registered handle ends
+        // `:1` proves refresh_slot consumes the bucket, not just the address.
+        let spy = Arc::new(MockPublisher::default());
+        let p = publisher_for(Arc::clone(&spy));
+        let cid = SpaceId([1u8; 16]);
+        let me = OwnerAddr([3u8; 16]);
+        let advertisers = vec![
+            (OwnerAddr([1u8; 16]), "relayA".to_string()),
+            (OwnerAddr([2u8; 16]), "relayA".to_string()),
+            (me, "relayB".to_string()),
+        ];
+        p.refresh_slot(cid, EpochKey::new([5u8; 32]), advertisers, me)
+            .await;
+        let regs = spy.registrations().await;
+        assert_eq!(regs.len(), 1);
+        assert!(
+            regs[0].handle.ends_with(":1"),
+            "diversity slot 1 (relay-B bucket), not address-rank slot 2; got {}",
+            regs[0].handle
+        );
+    }
+
+    #[tokio::test]
     async fn non_advertiser_unregisters_slot() {
         let spy = Arc::new(MockPublisher::default());
         let p = publisher_for(Arc::clone(&spy));
         let cid = SpaceId([1u8; 16]);
         let me = OwnerAddr([9u8; 16]); // not in the set
-        let others = vec![OwnerAddr([1u8; 16]), OwnerAddr([2u8; 16])];
+        let others = vec![
+            (OwnerAddr([1u8; 16]), String::new()),
+            (OwnerAddr([2u8; 16]), String::new()),
+        ];
         // Pretend we were a beacon before (registered slot 0), then dropped out.
         p.refresh_slot(
             cid,
@@ -779,7 +812,7 @@ mod tests {
         let p = publisher_for(Arc::clone(&spy));
         let cid = SpaceId([1u8; 16]);
         let me = OwnerAddr([1u8; 16]);
-        let others = vec![OwnerAddr([2u8; 16]), me];
+        let others = vec![(OwnerAddr([2u8; 16]), String::new()), (me, String::new())];
         // Before any refresh, the counter is zero.
         assert_eq!(p.observability().slot_fills.load(Ordering::Relaxed), 0);
         // A refresh that registers slot 0 bumps the slot-fill counter to 1.

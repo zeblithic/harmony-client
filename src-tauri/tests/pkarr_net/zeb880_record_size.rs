@@ -116,7 +116,7 @@ async fn avalon_shaped_rendezvous_record_publishes_within_pkarr_cap() {
         let community = SpaceId([0x6f; 16]);
         let epoch_key = EpochKey::new([0x42; 32]);
         let me = OwnerAddr([0x01; 16]);
-        rdv.refresh_slot(community, epoch_key.clone(), vec![me], me)
+        rdv.refresh_slot(community, epoch_key.clone(), vec![(me, String::new())], me)
             .await;
 
         // Condition-poll until the slot-0 record is resolvable from the relay.

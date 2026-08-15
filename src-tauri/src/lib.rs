@@ -12721,7 +12721,7 @@ pub async fn start_node_inner(
                                                 // ZEB-815 Task 6: publish BEFORE
                                                 // the slot refresh below. The
                                                 // refresh ranks this node against
-                                                // `advertiser_addrs_for_community`,
+                                                // `advertiser_buckets_for_community`,
                                                 // which reads the relay resolver —
                                                 // and `publish_own_rows`' local
                                                 // ingest is what puts our OWN ad
@@ -12771,7 +12771,7 @@ pub async fn start_node_inner(
                                                 // change force-wake).
                                                 for (c, engine) in slot_refreshes {
                                                     let advertisers = rendezvous_resolver
-                                                        .advertiser_addrs_for_community(
+                                                        .advertiser_buckets_for_community(
                                                             &c, now_ms,
                                                         );
                                                     // ZEB-918: publish under the
