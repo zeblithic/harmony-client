@@ -106,23 +106,36 @@ impl CommunityRelayResolver {
     /// CRDT-authoritative network-locality proxy, so slot assignment can spread
     /// beacons across regions instead of clustering by address.
     ///
-    /// Like [`Self::advertiser_addrs_for_community`] this filters by freshness but
-    /// does NOT apply the `COMMUNITY_RELAY_ADVERTISERS_MAX` read cap — the
-    /// diversity slot assignment ranks the full fresh advertiser set and bounds
-    /// itself by `RENDEZVOUS_SLOT_COUNT`.
+    /// Unlike [`Self::relays_for_community`] this does NOT apply the
+    /// `COMMUNITY_RELAY_ADVERTISERS_MAX` read cap: the diversity slot assignment
+    /// must see EVERY island's advertiser to interleave across buckets — capping
+    /// the input could drop the very minority-island advertiser it exists to slot
+    /// — so it bounds its OUTPUT by `RENDEZVOUS_SLOT_COUNT` instead.
+    ///
+    /// The `home_relay` URL parsing runs AFTER the resolver lock is released
+    /// (only a cheap `(addr, home_relay)` clone runs under the lock), so a
+    /// large-community scan never extends the critical section that blocks
+    /// concurrent resolver updates.
     pub fn advertiser_buckets_for_community(
         &self,
         community_id: &SpaceId,
         now_ms: u64,
     ) -> Vec<(OwnerAddr, String)> {
-        let g = self.inner.lock().unwrap();
-        g.iter()
-            .filter(|((c, _), _)| c == community_id)
-            .filter(|(_, p)| fresh_relay_entry(p, now_ms).is_some())
-            .map(|((_, a), p)| {
+        // Collect (addr, raw home_relay) under the lock; parse into diversity
+        // buckets outside it (see the note above).
+        let raw: Vec<(OwnerAddr, String)> = {
+            let g = self.inner.lock().unwrap();
+            g.iter()
+                .filter(|((c, _), _)| c == community_id)
+                .filter(|(_, p)| fresh_relay_entry(p, now_ms).is_some())
+                .map(|((_, a), p)| (*a, p.relay.home_relay.clone()))
+                .collect()
+        };
+        raw.into_iter()
+            .map(|(a, home_relay)| {
                 (
-                    *a,
-                    crate::community_rendezvous::relay_diversity_bucket(&p.relay.home_relay),
+                    a,
+                    crate::community_rendezvous::relay_diversity_bucket(&home_relay),
                 )
             })
             .collect()
