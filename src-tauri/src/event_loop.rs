@@ -183,6 +183,49 @@ pub type VotingBackfillApplyFn = std::sync::Arc<
         + Sync,
 >;
 
+/// ZEB-932: the plaintext RBSR protocol halves the voting adapter drives, as
+/// type-erased closures over the (runtime-generic) engine — mirroring the
+/// backfill closures. `initial` builds round 0; `respond` answers a request,
+/// returning the reply plus the plaintext CBOR bodies for its `Have` keys (the
+/// adapter seals the reply under `VOTING_RBSR_AAD` and encrypts the bodies under
+/// `VOTING_TOPIC_AAD`, all under one epoch snapshot); `process_reply` returns the
+/// next request, or `None` once converged (the requester's `Have` bodies having
+/// already been applied via the backfill apply path).
+#[derive(Clone)]
+pub struct VotingRbsrHooks {
+    pub initial: std::sync::Arc<
+        dyn Fn() -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::channel_rbsr::RbsrMessage> + Send>,
+            > + Send
+            + Sync,
+    >,
+    #[allow(clippy::type_complexity)]
+    pub respond: std::sync::Arc<
+        dyn Fn(
+                crate::channel_rbsr::RbsrMessage,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Option<(crate::channel_rbsr::RbsrMessage, Vec<Vec<u8>>)>,
+                        > + Send,
+                >,
+            > + Send
+            + Sync,
+    >,
+    #[allow(clippy::type_complexity)]
+    pub process_reply: std::sync::Arc<
+        dyn Fn(
+                crate::channel_rbsr::RbsrMessage,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Option<crate::channel_rbsr::RbsrMessage>>
+                        + Send,
+                >,
+            > + Send
+            + Sync,
+    >,
+}
+
 /// ZEB-298+ZEB-312 PR 1: per-community voting-log adapter request.
 /// ZEB-718: gains a backfill queryable (responder) + a pull driver
 /// (requester) alongside the pub/sub live path.
@@ -210,6 +253,11 @@ pub struct VotingLogAdapterRequest {
     pub apply_backfilled: VotingBackfillApplyFn,
     /// ZEB-718: periodic anti-entropy floor between backfill pulls.
     pub backfill_interval: std::time::Duration,
+    /// ZEB-932: optional RBSR protocol halves. When `Some`, the adapter also
+    /// spawns a `voting/rbsr` responder and drives RBSR-first catch-up (the
+    /// full dump becomes a fallback + a periodic backstop). `None` → pure
+    /// full-dump (pre-RBSR behavior).
+    pub rbsr_hooks: Option<VotingRbsrHooks>,
 }
 
 /// ZEB-270 Phase 3 Task 4.5: per-channel adapter request handed from
@@ -7334,6 +7382,7 @@ pub async fn run(
                     req.read_for_backfill,
                     req.apply_backfilled,
                     req.backfill_interval,
+                    req.rbsr_hooks,
                     Arc::clone(&closing),
                 );
             }
@@ -10488,6 +10537,237 @@ async fn voting_decrypt_current_epoch_cut(
     .ok()
 }
 
+/// ZEB-932: per-round drain byte cap for a voting RBSR reconcile (mirrors the
+/// channel log's `MAX_RBSR_ROUND_BYTES`) — a runaway responder can't force
+/// unbounded allocation on the requester.
+const MAX_VOTING_RBSR_ROUND_BYTES: usize = 16 * 1024 * 1024;
+
+/// ZEB-932: how many requester ticks between forced full-dump backstops. RBSR
+/// runs every `backfill_interval` tick (cheap); the O(all-events) full dump —
+/// the safety net for archive-window divergence, old peers, and wedged rounds —
+/// runs only every `VOTING_FULL_DUMP_BACKSTOP_TICKS` ticks (or on RBSR failure).
+/// At the 300 s tick this is a ~1 h floor, replacing the pre-RBSR every-300 s
+/// full dump (~12× fewer full dumps).
+const VOTING_FULL_DUMP_BACKSTOP_TICKS: u32 = 12;
+
+/// ZEB-932: seal one voting RBSR message (a request) under the community's
+/// current epoch + `VOTING_RBSR_AAD`. Returns `None` if epoch state is missing.
+async fn voting_rbsr_seal(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    community_id: crate::owner_state_types::SpaceId,
+    msg: &crate::channel_rbsr::RbsrMessage,
+) -> Option<Vec<u8>> {
+    let plaintext = crate::channel_rbsr::encode_message(msg);
+    let st = crdt_state.lock().await;
+    let space = st.spaces.get(&community_id)?;
+    let envelope = crate::community_state_sync::encrypt_for_topic_with_aad(
+        space,
+        &plaintext,
+        crate::community_state_sync::VOTING_RBSR_AAD,
+    )
+    .ok()?;
+    let mut w = Vec::new();
+    ciborium::into_writer(&envelope, &mut w).ok()?;
+    Some(w)
+}
+
+/// ZEB-932: open a sealed voting RBSR message — cap-before-alloc, current-epoch
+/// cut (`envelope.epoch == current_epoch`), `VOTING_RBSR_AAD`, then decode +
+/// `validate_message` at the trust boundary. `None` on any failure, so the
+/// requester's frame classifier falls through to treating the frame as an inline
+/// `Have` event body.
+async fn voting_rbsr_open(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    community_id: crate::owner_state_types::SpaceId,
+    raw: &[u8],
+) -> Option<crate::channel_rbsr::RbsrMessage> {
+    if raw.len() > MAX_VOTING_PAYLOAD_BYTES {
+        return None;
+    }
+    let envelope: crate::community_state_sync::EncryptedEnvelope =
+        ciborium::from_reader(raw).ok()?;
+    let st = crdt_state.lock().await;
+    let space = st.spaces.get(&community_id)?;
+    match space.current_epoch {
+        Some(cur) if cur == envelope.epoch => {}
+        _ => return None,
+    }
+    let plaintext = crate::community_state_sync::decrypt_for_topic_with_aad(
+        space,
+        &envelope,
+        crate::community_state_sync::VOTING_RBSR_AAD,
+    )
+    .ok()?;
+    let msg = crate::channel_rbsr::decode_message(&plaintext).ok()?;
+    crate::channel_rbsr::validate_message(&msg).ok()?;
+    Some(msg)
+}
+
+/// ZEB-932: seal an RBSR reply + its `Have` event bodies under a SINGLE current-
+/// epoch snapshot (one `space` lock). Holding one snapshot for every frame is the
+/// ZEB-920 guarantee for voting: a rotation between frames can't split epochs and
+/// leave a body the reply advertised as resolved under a different epoch (the
+/// requester's cut would then drop it → a silent gap). The reply binds
+/// `VOTING_RBSR_AAD`; each body binds `VOTING_TOPIC_AAD` (wire-identical to a
+/// live/backfill event, so it passes the requester's current-epoch cut and
+/// applies through the same path). Returns `[sealed_reply, body_1, …]`, or `None`
+/// if epoch state is missing / any encode fails (responder then answers nothing →
+/// requester falls back).
+async fn voting_rbsr_seal_reply_and_bodies(
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    community_id: crate::owner_state_types::SpaceId,
+    reply: &crate::channel_rbsr::RbsrMessage,
+    bodies: &[Vec<u8>],
+) -> Option<Vec<Vec<u8>>> {
+    let plaintext_reply = crate::channel_rbsr::encode_message(reply);
+    let st = crdt_state.lock().await;
+    let space = st.spaces.get(&community_id)?;
+    let reply_env = crate::community_state_sync::encrypt_for_topic_with_aad(
+        space,
+        &plaintext_reply,
+        crate::community_state_sync::VOTING_RBSR_AAD,
+    )
+    .ok()?;
+    let mut out = Vec::with_capacity(1 + bodies.len());
+    let mut rw = Vec::new();
+    ciborium::into_writer(&reply_env, &mut rw).ok()?;
+    out.push(rw);
+    for body in bodies {
+        let env = crate::community_state_sync::encrypt_for_topic_with_aad(
+            space,
+            body,
+            crate::community_state_sync::VOTING_TOPIC_AAD,
+        )
+        .ok()?;
+        let mut bw = Vec::new();
+        ciborium::into_writer(&env, &mut bw).ok()?;
+        out.push(bw);
+    }
+    Some(out)
+}
+
+/// Outcome of one RBSR reconcile attempt against remote responders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VotingReconcileOutcome {
+    /// Reconciled to convergence with a responder — no full dump needed.
+    Converged,
+    /// No remote RBSR responder answered round 0 (old peer / nobody online).
+    NoResponder,
+    /// A responder answered but the exchange failed (extra reply, round cap,
+    /// seal/get failure) — fall back to the full dump.
+    Failed,
+}
+
+/// ZEB-932: decide whether to run the full-dump backstop this tick. RBSR is
+/// attempted every tick (cheap); the O(all-events) full dump runs only when RBSR
+/// did not converge (no responder / failure) or the periodic backstop is due —
+/// bounding the expensive dump to a ~`backstop_every`-tick floor while keeping
+/// RBSR anti-entropy frequent. `since_full` = ticks since the last full dump.
+fn need_full_dump(outcome: VotingReconcileOutcome, since_full: u32, backstop_every: u32) -> bool {
+    !matches!(outcome, VotingReconcileOutcome::Converged) || since_full + 1 >= backstop_every
+}
+
+/// ZEB-932: drive one RBSR reconcile session (multiple rounds) as the requester
+/// against remote responders on `rbsr_topic`. Each round seals the request as the
+/// GET payload (`Locality::Remote` excludes our own responder; `Consolidation
+/// ::None` streams every frame), classifies the returned frames — the one that
+/// opens under `VOTING_RBSR_AAD` is the reply; the rest are inline `Have` event
+/// bodies decrypted through the current-epoch cut and applied — then computes the
+/// next request. Returns the outcome so the caller decides on the full-dump
+/// fallback.
+async fn drive_voting_rbsr(
+    session: &zenoh::Session,
+    rbsr_topic: &str,
+    crdt_state: &tokio::sync::Mutex<crate::owner_state_crdt::OwnerState>,
+    community_id: crate::owner_state_types::SpaceId,
+    hooks: &VotingRbsrHooks,
+    apply_backfilled: &VotingBackfillApplyFn,
+    closing: &AtomicBool,
+) -> VotingReconcileOutcome {
+    let mut request = (hooks.initial)().await;
+    let mut round: u32 = 0;
+    loop {
+        if closing.load(Ordering::SeqCst) {
+            return VotingReconcileOutcome::Failed;
+        }
+        round += 1;
+        if round > crate::channel_rbsr::MAX_RBSR_ROUNDS {
+            return VotingReconcileOutcome::Failed;
+        }
+        let Some(sealed) = voting_rbsr_seal(crdt_state, community_id, &request).await else {
+            return VotingReconcileOutcome::Failed;
+        };
+        let receiver = match session
+            .get(rbsr_topic)
+            .payload(sealed)
+            .consolidation(zenoh::query::ConsolidationMode::None)
+            .allowed_destination(zenoh::sample::Locality::Remote)
+            .timeout(std::time::Duration::from_secs(10))
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return VotingReconcileOutcome::Failed,
+        };
+
+        let mut reply: Option<crate::channel_rbsr::RbsrMessage> = None;
+        let mut saw_extra_reply = false;
+        let mut round_bytes = 0usize;
+        loop {
+            tokio::select! {
+                biased;
+                res = receiver.recv_async() => {
+                    let Ok(r) = res else { break; };
+                    let Ok(sample) = r.into_result() else { continue; };
+                    let payload_len = sample.payload().len();
+                    if payload_len > MAX_VOTING_PAYLOAD_BYTES { continue; }
+                    round_bytes = round_bytes.saturating_add(payload_len);
+                    if round_bytes > MAX_VOTING_RBSR_ROUND_BYTES {
+                        return VotingReconcileOutcome::Failed;
+                    }
+                    let raw = sample.payload().to_bytes().to_vec();
+                    // The frame that opens under VOTING_RBSR_AAD is the reply;
+                    // everything else is an inline Have event body.
+                    if let Some(msg) = voting_rbsr_open(crdt_state, community_id, &raw).await {
+                        if reply.is_some() {
+                            saw_extra_reply = true;
+                        } else {
+                            reply = Some(msg);
+                        }
+                        continue;
+                    }
+                    if let Some(plaintext) =
+                        voting_decrypt_current_epoch_cut(crdt_state, community_id, &raw).await
+                    {
+                        (apply_backfilled)(plaintext).await;
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    if closing.load(Ordering::SeqCst) {
+                        return VotingReconcileOutcome::Failed;
+                    }
+                }
+            }
+        }
+
+        if saw_extra_reply {
+            // Multiple holders with divergent logs could falsely converge — fall
+            // back to the dedup-tolerant full dump.
+            return VotingReconcileOutcome::Failed;
+        }
+        let Some(reply_msg) = reply else {
+            return if round == 1 {
+                VotingReconcileOutcome::NoResponder
+            } else {
+                VotingReconcileOutcome::Failed
+            };
+        };
+        match (hooks.process_reply)(reply_msg).await {
+            None => return VotingReconcileOutcome::Converged,
+            Some(next) => request = next,
+        }
+    }
+}
+
 /// ZEB-298+ZEB-312 PR 1: per-community Zenoh adapter for the VotingLog
 /// data plane. Topic: `harmony/community/{id_hex}/voting` (live pub/sub).
 ///
@@ -10517,10 +10797,14 @@ pub fn spawn_voting_log_zenoh_adapter(
     read_for_backfill: VotingBackfillReadFn,
     apply_backfilled: VotingBackfillApplyFn,
     backfill_interval: std::time::Duration,
+    // ZEB-932: optional RBSR halves — Some spawns the rbsr responder + RBSR-first
+    // requester; None keeps the pure full-dump path.
+    rbsr_hooks: Option<VotingRbsrHooks>,
     closing: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     let topic = format!("harmony/community/{}/voting", community_id_hex);
     let backfill_topic = format!("harmony/community/{}/voting/backfill", community_id_hex);
+    let rbsr_topic = format!("harmony/community/{}/voting/rbsr", community_id_hex);
 
     tokio::spawn(async move {
         let key_expr = match zenoh::key_expr::KeyExpr::try_from(topic.clone()) {
@@ -10709,7 +10993,83 @@ pub fn spawn_voting_log_zenoh_adapter(
             }
         });
 
-        // ── ZEB-718 backfill requester (periodic full-dump pull) ────────
+        // ── ZEB-932 RBSR responder (queryable) ──────────────────────────
+        // When RBSR hooks are present, answer voting/rbsr GETs: open the
+        // sealed request (VOTING_RBSR_AAD + current-epoch cut), run the
+        // engine's respond half, and stream back [sealed_reply, body_1, …] —
+        // reply under VOTING_RBSR_AAD, bodies under VOTING_TOPIC_AAD, all
+        // sealed under ONE epoch snapshot (ZEB-920). A payload-less or
+        // unopenable GET, or a respond/seal miss, replies nothing (the
+        // requester reads no-reply as no-responder → full-dump fallback).
+        let rbsr_resp_handle = rbsr_hooks.as_ref().map(|hooks| {
+            let session_rbsr = Arc::clone(&session);
+            let crdt_state_rbsr = Arc::clone(&crdt_state);
+            let closing_rbsr = Arc::clone(&closing);
+            let rbsr_topic_resp = rbsr_topic.clone();
+            let respond = hooks.respond.clone();
+            tokio::spawn(async move {
+                let key = match zenoh::key_expr::KeyExpr::try_from(rbsr_topic_resp.clone()) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            topic = %rbsr_topic_resp,
+                            "voting rbsr key_expr invalid; responder skipped"
+                        );
+                        return;
+                    }
+                };
+                let qbl = match session_rbsr.declare_queryable(&key).await {
+                    Ok(q) => q,
+                    Err(e) => {
+                        if !closing_rbsr.load(Ordering::SeqCst) {
+                            tracing::warn!(
+                                error = %e,
+                                topic = %rbsr_topic_resp,
+                                "failed to declare voting rbsr queryable"
+                            );
+                        }
+                        return;
+                    }
+                };
+                loop {
+                    tokio::select! {
+                        biased;
+                        res = qbl.recv_async() => {
+                            let Ok(query) = res else { break; };
+                            let Some(payload) = query.payload() else { continue; };
+                            if payload.len() > MAX_VOTING_PAYLOAD_BYTES { continue; }
+                            let raw = payload.to_bytes().to_vec();
+                            let Some(request) =
+                                voting_rbsr_open(&crdt_state_rbsr, community_id, &raw).await
+                            else {
+                                continue;
+                            };
+                            let Some((reply_msg, bodies)) = (respond)(request).await else {
+                                continue;
+                            };
+                            let Some(frames) = voting_rbsr_seal_reply_and_bodies(
+                                &crdt_state_rbsr, community_id, &reply_msg, &bodies,
+                            )
+                            .await
+                            else {
+                                continue;
+                            };
+                            for wire in frames {
+                                if query.reply(query.key_expr(), wire).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                            if closing_rbsr.load(Ordering::SeqCst) { break; }
+                        }
+                    }
+                }
+            })
+        });
+
+        // ── ZEB-718 backfill requester (ZEB-932: RBSR-first) ────────────
         // Pulls on spawn (join/reconnect catch-up) and every
         // `backfill_interval` (anti-entropy floor). Each reply is decrypted
         // through the current-epoch cut and applied via the engine's
@@ -10718,81 +11078,113 @@ pub fn spawn_voting_log_zenoh_adapter(
         let crdt_state_req = Arc::clone(&crdt_state);
         let closing_req = Arc::clone(&closing);
         let backfill_topic_req = backfill_topic.clone();
+        let rbsr_topic_req = rbsr_topic.clone();
         let req_handle = tokio::spawn(async move {
+            // ZEB-932: RBSR-first anti-entropy. RBSR runs every tick (cheap); the
+            // O(all-events) full dump runs only when RBSR didn't converge (no
+            // responder / failure) or the periodic backstop is due
+            // (VOTING_FULL_DUMP_BACKSTOP_TICKS × backfill_interval ≈ 1 h).
+            let mut since_full: u32 = VOTING_FULL_DUMP_BACKSTOP_TICKS;
             loop {
-                // One full-dump pull. ConsolidationMode::None streams every
-                // per-event reply; Locality::Remote excludes our own
-                // responder's self-reply.
-                match session_req
-                    .get(backfill_topic_req.as_str())
-                    .consolidation(zenoh::query::ConsolidationMode::None)
-                    .allowed_destination(zenoh::sample::Locality::Remote)
-                    // Bound the query so a hung/never-completing round can't
-                    // stall anti-entropy forever (mirrors the RBSR get path).
-                    // ZEB-812 audit note: this drain awaits `apply_backfilled`
-                    // inline (an app-side await inside the reply arm), which
-                    // is the shape that wedged the channel-log drain — but
-                    // here the 10s query timeout above closes the reply
-                    // stream regardless, so a slow apply bounds one voting
-                    // round at 10s instead of parking zenoh indefinitely.
-                    // Left as-is deliberately; a spill would buy little (the
-                    // payloads are applied, not forwarded to a channel).
-                    .timeout(std::time::Duration::from_secs(10))
+                // 1) RBSR reconcile attempt — converges the common case in a few
+                // small rounds instead of re-shipping the whole log.
+                let outcome = if let Some(hooks) = rbsr_hooks.as_ref() {
+                    drive_voting_rbsr(
+                        &session_req,
+                        &rbsr_topic_req,
+                        &crdt_state_req,
+                        community_id,
+                        hooks,
+                        &apply_backfilled,
+                        &closing_req,
+                    )
                     .await
-                {
-                    Ok(receiver) => {
-                        let mut recv_frames = 0usize;
-                        let mut recv_bytes = 0usize;
-                        loop {
-                            tokio::select! {
-                                biased;
-                                res = receiver.recv_async() => {
-                                    let Ok(reply) = res else { break; };
-                                    if let Ok(sample) = reply.into_result() {
-                                        // Cap peer-controlled reply payloads before
-                                        // materializing — parity with the live
-                                        // subscriber's allocation-DoS guard.
-                                        let payload_len = sample.payload().len();
-                                        if payload_len > MAX_VOTING_PAYLOAD_BYTES {
-                                            continue;
-                                        }
-                                        recv_frames += 1;
-                                        recv_bytes += payload_len;
-                                        let raw = sample.payload().to_bytes().to_vec();
-                                        if let Some(plaintext) = voting_decrypt_current_epoch_cut(
-                                            &crdt_state_req, community_id, &raw,
-                                        ).await {
-                                            (apply_backfilled)(plaintext).await;
+                } else {
+                    VotingReconcileOutcome::NoResponder
+                };
+                if closing_req.load(Ordering::SeqCst) {
+                    return;
+                }
+
+                // 2) Full-dump backstop / fallback.
+                if need_full_dump(outcome, since_full, VOTING_FULL_DUMP_BACKSTOP_TICKS) {
+                    since_full = 0;
+                    // One full-dump pull. ConsolidationMode::None streams every
+                    // per-event reply; Locality::Remote excludes our own
+                    // responder's self-reply.
+                    match session_req
+                        .get(backfill_topic_req.as_str())
+                        .consolidation(zenoh::query::ConsolidationMode::None)
+                        .allowed_destination(zenoh::sample::Locality::Remote)
+                        // Bound the query so a hung/never-completing round can't
+                        // stall anti-entropy forever (mirrors the RBSR get path).
+                        // ZEB-812 audit note: this drain awaits `apply_backfilled`
+                        // inline (an app-side await inside the reply arm), which
+                        // is the shape that wedged the channel-log drain — but
+                        // here the 10s query timeout above closes the reply
+                        // stream regardless, so a slow apply bounds one voting
+                        // round at 10s instead of parking zenoh indefinitely.
+                        // Left as-is deliberately; a spill would buy little (the
+                        // payloads are applied, not forwarded to a channel).
+                        .timeout(std::time::Duration::from_secs(10))
+                        .await
+                    {
+                        Ok(receiver) => {
+                            let mut recv_frames = 0usize;
+                            let mut recv_bytes = 0usize;
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    res = receiver.recv_async() => {
+                                        let Ok(reply) = res else { break; };
+                                        if let Ok(sample) = reply.into_result() {
+                                            // Cap peer-controlled reply payloads before
+                                            // materializing — parity with the live
+                                            // subscriber's allocation-DoS guard.
+                                            let payload_len = sample.payload().len();
+                                            if payload_len > MAX_VOTING_PAYLOAD_BYTES {
+                                                continue;
+                                            }
+                                            recv_frames += 1;
+                                            recv_bytes += payload_len;
+                                            let raw = sample.payload().to_bytes().to_vec();
+                                            if let Some(plaintext) = voting_decrypt_current_epoch_cut(
+                                                &crdt_state_req, community_id, &raw,
+                                            ).await {
+                                                (apply_backfilled)(plaintext).await;
+                                            }
                                         }
                                     }
-                                }
-                                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                                    if closing_req.load(Ordering::SeqCst) { return; }
+                                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                                        if closing_req.load(Ordering::SeqCst) { return; }
+                                    }
                                 }
                             }
-                        }
-                        // ZEB-916 Q1: the multi-responder fan-in
-                        // (ConsolidationMode::None → every remote responder's
-                        // full dump arrives) is the dominant voting-sync term and
-                        // is invisible from the responder side alone.
-                        tracing::info!(
-                            target: "harmony_volume",
-                            kind = "voting_backfill_recv",
-                            topic = %backfill_topic_req,
-                            frames = recv_frames,
-                            recv_bytes,
-                            "voting backfill dump received"
-                        );
-                    }
-                    Err(e) => {
-                        if !closing_req.load(Ordering::SeqCst) {
-                            tracing::debug!(
+                            // ZEB-916 Q1: the multi-responder fan-in
+                            // (ConsolidationMode::None → every remote responder's
+                            // full dump arrives) is the dominant voting-sync term and
+                            // is invisible from the responder side alone.
+                            tracing::info!(
+                                target: "harmony_volume",
+                                kind = "voting_backfill_recv",
                                 topic = %backfill_topic_req,
-                                error = %e,
-                                "voting backfill get failed"
+                                frames = recv_frames,
+                                recv_bytes,
+                                "voting backfill dump received"
                             );
                         }
+                        Err(e) => {
+                            if !closing_req.load(Ordering::SeqCst) {
+                                tracing::debug!(
+                                    topic = %backfill_topic_req,
+                                    error = %e,
+                                    "voting backfill get failed"
+                                );
+                            }
+                        }
                     }
+                } else {
+                    since_full = since_full.saturating_add(1);
                 }
                 // Wait `backfill_interval` before the next pull, waking every
                 // second so a flipped `closing` unblocks teardown promptly.
@@ -10977,6 +11369,9 @@ pub fn spawn_voting_log_zenoh_adapter(
         let _ = sub_handle.await;
         let _ = qbl_handle.await;
         let _ = req_handle.await;
+        if let Some(h) = rbsr_resp_handle {
+            let _ = h.await;
+        }
     })
 }
 
@@ -13978,5 +14373,40 @@ mod note_storage_record_sample_tests {
             &rvk(),
             || 1
         ));
+    }
+}
+
+#[cfg(test)]
+mod zeb932_voting_rbsr_cadence_tests {
+    use super::{need_full_dump, VotingReconcileOutcome};
+
+    #[test]
+    fn converged_skips_full_dump_until_backstop_is_due() {
+        let every = 12u32;
+        // Converged and backstop not yet due → no full dump.
+        assert!(!need_full_dump(VotingReconcileOutcome::Converged, 0, every));
+        assert!(!need_full_dump(
+            VotingReconcileOutcome::Converged,
+            10,
+            every
+        ));
+        // Converged but the periodic floor is due (since_full + 1 >= every).
+        assert!(need_full_dump(VotingReconcileOutcome::Converged, 11, every));
+        assert!(need_full_dump(VotingReconcileOutcome::Converged, 50, every));
+    }
+
+    #[test]
+    fn non_convergence_always_forces_a_full_dump() {
+        let every = 12u32;
+        for since in [0u32, 1, 5, 11] {
+            assert!(
+                need_full_dump(VotingReconcileOutcome::NoResponder, since, every),
+                "no responder must fall back to the full dump"
+            );
+            assert!(
+                need_full_dump(VotingReconcileOutcome::Failed, since, every),
+                "a failed reconcile must fall back to the full dump"
+            );
+        }
     }
 }

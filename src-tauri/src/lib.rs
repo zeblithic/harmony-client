@@ -58461,6 +58461,27 @@ async fn ensure_voting_engine_for(
             })
         });
 
+    // ZEB-932: RBSR protocol closures over the same engine — the adapter's
+    // rbsr responder drives `respond`, the RBSR-first requester drives
+    // `initial`/`process_reply`. Crypto (seal/open) is applied in the adapter.
+    let engine_for_rbsr_initial = std::sync::Arc::clone(&engine);
+    let engine_for_rbsr_respond = std::sync::Arc::clone(&engine);
+    let engine_for_rbsr_process = std::sync::Arc::clone(&engine);
+    let rbsr_hooks = crate::event_loop::VotingRbsrHooks {
+        initial: std::sync::Arc::new(move || {
+            let e = std::sync::Arc::clone(&engine_for_rbsr_initial);
+            Box::pin(async move { e.rbsr_initial().await })
+        }),
+        respond: std::sync::Arc::new(move |request| {
+            let e = std::sync::Arc::clone(&engine_for_rbsr_respond);
+            Box::pin(async move { e.rbsr_respond(&request).await })
+        }),
+        process_reply: std::sync::Arc::new(move |reply| {
+            let e = std::sync::Arc::clone(&engine_for_rbsr_process);
+            Box::pin(async move { e.rbsr_process_reply(&reply).await })
+        }),
+    };
+
     // Build the adapter request now but do NOT send yet — we only send if
     // we win the engine map insertion below. This closes the TOCTOU window
     // where two concurrent first-time callers could each send an adapter
@@ -58476,6 +58497,7 @@ async fn ensure_voting_engine_for(
         read_for_backfill,
         apply_backfilled,
         backfill_interval: VOTING_BACKFILL_INTERVAL,
+        rbsr_hooks: Some(rbsr_hooks),
     };
 
     // Atomic check-and-insert under the std::Mutex. The FIRST caller to

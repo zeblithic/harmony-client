@@ -414,6 +414,14 @@ pub enum EpochError {
 /// downstream deserialize. Versioned (`-v1`) for future rotation.
 pub const VOTING_TOPIC_AAD: &[u8] = b"harmony-voting-v1";
 
+/// ZEB-932: AAD for sealed voting-log RBSR reconcile messages. Domain-separated
+/// from [`VOTING_TOPIC_AAD`] so an RBSR message and a voting *event* packet —
+/// both sealed under the same community epoch key — can never be opened as one
+/// another. This separation is load-bearing for the requester's frame
+/// classifier: it distinguishes a sealed RBSR reply (this AAD) from an inline
+/// `Have` event body (VOTING_TOPIC_AAD) purely by which AAD opens the frame.
+pub const VOTING_RBSR_AAD: &[u8] = b"harmony-voting-rbsr-v1";
+
 /// Encrypt `plaintext` under the community's current epoch key,
 /// wrapping the AEAD output in an `EncryptedEnvelope` that tags the
 /// epoch for receiver-side key selection.
@@ -15117,6 +15125,35 @@ mod envelope_tests {
     /// Uses placeholder values for fields not relevant to epoch crypto.
     fn build_test_community_space(epoch: u64, key: EpochKey) -> Space {
         super::test_community_space(SpaceId([0xaa; 16]), epoch, key)
+    }
+
+    /// ZEB-932: an RBSR message and a voting event packet share the community
+    /// epoch key but bind different AADs, so neither opens as the other — the
+    /// property the requester's frame classifier relies on to tell a sealed
+    /// reply from an inline `Have` event body.
+    #[test]
+    fn voting_rbsr_aad_is_domain_separated() {
+        let space = build_test_community_space(1, EpochKey::new([0x5a; 32]));
+        let plaintext = b"an-rbsr-reconcile-message".to_vec();
+
+        let env =
+            encrypt_for_topic_with_aad(&space, &plaintext, VOTING_RBSR_AAD).expect("seal rbsr");
+        assert_eq!(
+            decrypt_for_topic_with_aad(&space, &env, VOTING_RBSR_AAD).expect("open rbsr"),
+            plaintext,
+            "correct AAD must round-trip"
+        );
+        assert!(
+            decrypt_for_topic_with_aad(&space, &env, VOTING_TOPIC_AAD).is_err(),
+            "an RBSR message must not open under the voting-event AAD"
+        );
+
+        let ev_env =
+            encrypt_for_topic_with_aad(&space, &plaintext, VOTING_TOPIC_AAD).expect("seal event");
+        assert!(
+            decrypt_for_topic_with_aad(&space, &ev_env, VOTING_RBSR_AAD).is_err(),
+            "a voting-event packet must not open under the RBSR AAD"
+        );
     }
 
     /// ZEB-597: the case-C publisher must key on the LIVE current_epoch_key
