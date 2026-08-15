@@ -8712,7 +8712,9 @@ mod tests {
 
         let dir_a = tempfile::tempdir().expect("dir a");
         let dir_b = tempfile::tempdir().expect("dir b");
-        let community_id = SpaceId([0x96; 16]);
+        // A community id unique to this test so the per-community quorum-sync
+        // probe key can never collide with another test's community.
+        let community_id = SpaceId(*b"zeb939_quorum_01");
         let membership_key = EpochKey::new([0x96; 32]);
 
         // Engine A (admin): serve arm wired so we can mint a genuine packet.
@@ -8862,10 +8864,13 @@ mod tests {
             .expect("send A serve request");
         let packet = a_reply_rx.await.expect("A replied").expect("A encode ok");
 
-        // Measure ONLY B's merge: zero the probe immediately before injecting
-        // the packet. All setup inserts (on A and B) already happened; both
-        // engines are otherwise idle, so the counter delta is B's merge alone.
-        crate::community_state_crdt::quorum_sync_probe::reset();
+        // Measure ONLY B's merge: snapshot this community's sync count right
+        // before injecting the packet. All setup inserts (on A and B) already
+        // happened; both engines are otherwise idle, so the delta is B's merge
+        // alone. Keyed by `community_id`, so a concurrent test on a different
+        // community can't perturb it (robust under `cargo test`, not just
+        // nextest's process isolation).
+        let syncs_before = crate::community_state_crdt::quorum_sync_probe::get(community_id);
         b_sub_tx.send(packet).await.expect("inject packet into B");
 
         // Poll until B materializes ALL four channels (the whole merge landed).
@@ -8888,7 +8893,8 @@ mod tests {
 
         // THE INVARIANT: the batch merge synced `admin_quorum` exactly ONCE,
         // not once per inserted event.
-        let syncs = crate::community_state_crdt::quorum_sync_probe::get();
+        let syncs =
+            crate::community_state_crdt::quorum_sync_probe::get(community_id) - syncs_before;
         assert_eq!(
             syncs, 1,
             "a 4-event batch merge must re-materialize admin_quorum ONCE at \

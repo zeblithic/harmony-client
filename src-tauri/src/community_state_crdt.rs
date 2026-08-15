@@ -456,22 +456,36 @@ pub(crate) enum AnnounceKey {
 /// ZEB-939 test probe: counts calls to [`CommunityState::sync_admin_quorum`],
 /// so a batch-merge test can assert the per-insert `admin_quorum` re-materialize
 /// was collapsed to ONE sync per batch. `#[cfg(test)]` — never compiled into
-/// production. Callers reset it before the measured window (the counter is
-/// process-global; nextest runs each test in its own process).
+/// production. Counts are keyed by `community_id`, and a test reads the count
+/// before and after its measured window and asserts on the DELTA. Keying by
+/// community isolates each test's measurement from every other test that
+/// inserts events, so the assertion is reliable even under the standard
+/// in-process parallel test runner — not only under nextest's process-per-test
+/// isolation. (A test's own community id is unique to it.)
 #[cfg(test)]
 pub(crate) mod quorum_sync_probe {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::owner_state_types::SpaceId;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
-    pub(crate) static COUNT: AtomicU64 = AtomicU64::new(0);
+    static COUNTS: Mutex<Option<HashMap<SpaceId, u64>>> = Mutex::new(None);
 
-    /// Zero the counter before a measured window.
-    pub(crate) fn reset() {
-        COUNT.store(0, Ordering::Relaxed);
+    /// Record one `sync_admin_quorum` call for `community_id`.
+    pub(crate) fn record(community_id: SpaceId) {
+        let mut g = COUNTS.lock().expect("quorum-sync probe mutex poisoned");
+        *g.get_or_insert_with(HashMap::new)
+            .entry(community_id)
+            .or_insert(0) += 1;
     }
 
-    /// Reads the number of `sync_admin_quorum` calls since the last `reset`.
-    pub(crate) fn get() -> u64 {
-        COUNT.load(Ordering::Relaxed)
+    /// Syncs recorded for `community_id` so far. Read before and after the
+    /// measured window; assert on the difference.
+    pub(crate) fn get(community_id: SpaceId) -> u64 {
+        let mut g = COUNTS.lock().expect("quorum-sync probe mutex poisoned");
+        g.get_or_insert_with(HashMap::new)
+            .get(&community_id)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -775,7 +789,7 @@ impl CommunityState {
     /// (see [`insert_event_no_quorum_sync`](Self::insert_event_no_quorum_sync)).
     pub(crate) fn sync_admin_quorum(&mut self, admin_addr: OwnerAddr) {
         #[cfg(test)]
-        quorum_sync_probe::COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        quorum_sync_probe::record(self.community_id);
         self.admin_quorum = self.materialize_now(admin_addr).admin_quorum;
     }
 
