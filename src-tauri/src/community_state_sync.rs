@@ -5640,7 +5640,11 @@ async fn apply_ingest(
             // is cheap (a few hundred bytes of signed event) and only
             // paid on the merge path; duplicates short-circuit above.
             let event_clone = event.clone();
-            match state.insert_event(event, &ctx_v) {
+            // ZEB-939: insert WITHOUT the per-insert `admin_quorum` re-materialize
+            // (that O(n) full-log walk is deferred to a single batch-end sync
+            // below). The materialized-view cache version is still bumped per
+            // insert inside here, so reads mid-merge stay correct.
+            match state.insert_event_no_quorum_sync(event, &ctx_v) {
                 InsertOutcome::Inserted => {
                     inserted_any = true;
                     inserted_events.push(event_clone);
@@ -5678,6 +5682,21 @@ async fn apply_ingest(
                     rejection_reports.push(verr);
                 }
             }
+        }
+
+        // ZEB-939: sync `admin_quorum` ONCE for the whole batch, under the
+        // still-held state lock. The per-insert sync (deferred above) only ever
+        // exposes its FINAL value — each insert overwrote it — so one batch-end
+        // re-materialize over the full log yields the byte-identical persisted
+        // value while turning the merge's quorum-sync cost from O(n²) to O(n).
+        // Skipped when nothing was inserted, matching the prior "sync only on
+        // Inserted" behavior (a no-op batch left the field untouched). Every
+        // live reader (`materialized()`, roster IPC, recovery) re-derives from
+        // events, and no persist point observes the field mid-batch — a
+        // concurrent `insert_local_event` landing during a lock-yield syncs the
+        // field itself over the current log — so deferral is invisible.
+        if inserted_any {
+            state.sync_admin_quorum(ctx.admin_addr);
         }
     } // state lock released here
 
@@ -8656,6 +8675,230 @@ mod tests {
             yields >= 1,
             "apply must yield the state lock mid-merge for a root larger than the \
              chunk (got {yields} yields) — otherwise a large merge hangs roster IPC"
+        );
+
+        drop(engine_a);
+        drop(engine_b);
+    }
+
+    /// ZEB-939 (facet 2): a batch state-root merge must re-materialize
+    /// `admin_quorum` exactly ONCE, at batch-end — not once per inserted event.
+    /// The per-insert sync clones the whole log and re-runs the membership state
+    /// machine to read a single integer, so paying it per event makes a large
+    /// merge O(n²) on the single writer; only the final value is observable.
+    /// RED before the batch-end defer (`sync_admin_quorum` fires once per
+    /// inserted event = 4); GREEN after (fires once for the whole batch).
+    #[tokio::test]
+    async fn merge_syncs_admin_quorum_once_per_batch_zeb939() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
+            SignedMembershipEvent,
+        };
+
+        let alice = mint_test_owner(0x96);
+        let alice_addr = alice.owner;
+        let alice_sk = Arc::new(alice.device_key.clone());
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+
+        let cas_op_tx = spawn_shared_cas();
+        let cs_a: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx.clone(),
+            std::time::Duration::from_secs(2),
+        ));
+        let cs_b: Arc<dyn ContentStore> = Arc::new(RuntimeContentStore::new(
+            cas_op_tx,
+            std::time::Duration::from_secs(2),
+        ));
+
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+        // A community id unique to this test so the per-community quorum-sync
+        // probe key can never collide with another test's community.
+        let community_id = SpaceId(*b"zeb939_quorum_01");
+        let membership_key = EpochKey::new([0x96; 32]);
+
+        // Engine A (admin): serve arm wired so we can mint a genuine packet.
+        let (serve_tx_a, serve_rx_a) = mpsc::channel::<RootServeRequest>(4);
+        let (a_pub_tx, mut a_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (_a_sub_tx_held, a_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while a_pub_rx.recv().await.is_some() {} });
+
+        let engine_a = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "alice-dev".into(),
+            self_owner: alice_addr,
+            signing_key: Arc::clone(&alice_sk),
+            state: Arc::new(Mutex::new(CommunityState::new(community_id))),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                alice_addr,
+                "alice-dev".to_string(),
+            )))),
+            content_store: cs_a,
+            publisher_tx: a_pub_tx,
+            subscriber_rx: a_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_a.path().join("crdt.cbor"),
+                replay: dir_a.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(Arc::clone(&resolver)),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: Some(serve_rx_a),
+        });
+
+        let bob_addr = OwnerAddr([0xB6; 16]);
+        let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+        let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while b_pub_rx.recv().await.is_some() {} });
+
+        let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "bob-dev".into(),
+            self_owner: bob_addr,
+            signing_key: Arc::new(ed25519_dalek::SigningKey::from_bytes(&[0xB6; 32])),
+            state: Arc::clone(&b_state),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                bob_addr,
+                "bob-dev".to_string(),
+            )))),
+            content_store: cs_b,
+            publisher_tx: b_pub_tx,
+            subscriber_rx: b_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_b.path().join("crdt.cbor"),
+                replay: dir_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: None,
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+
+        // Alice's bootstrap Join → A locally + OOB-seeded into B (so it is a
+        // duplicate on the merge, and alice is a Joined publisher in B's view).
+        let alice_join_at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let alice_join_payload = EventPayload {
+            id: [0x13; 16],
+            community_id,
+            kind: MembershipEventKind::Join,
+            actor: alice_addr,
+            at: alice_join_at.clone(),
+        };
+        let alice_join = SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(&alice_join_payload, alice_sk.as_ref()).expect("sign alice join")
+        };
+        engine_a
+            .insert_local_event(alice_join.clone())
+            .await
+            .expect("alice bootstrap insert");
+        engine_b
+            .insert_local_event(alice_join)
+            .await
+            .expect("bob OOB-seeds alice bootstrap");
+
+        // Four channel-creates so the served root carries 4 NEW events for B to
+        // insert — enough that a per-insert quorum sync (4) is unmistakably
+        // distinct from a single batch-end sync (1).
+        let ch_ids = [
+            ChannelId([0x61; 16]),
+            ChannelId([0x62; 16]),
+            ChannelId([0x63; 16]),
+            ChannelId([0x64; 16]),
+        ];
+        for (i, ch_id) in ch_ids.iter().enumerate() {
+            let create_payload = EventPayload {
+                id: [0x30 + i as u8; 16],
+                community_id,
+                kind: MembershipEventKind::ChannelCreate {
+                    channel_id: *ch_id,
+                    name: format!("ch{i}"),
+                    write_power: 0,
+                    kind: ChannelKind::Text,
+                },
+                actor: alice_addr,
+                at: Hlc {
+                    wall_ms: alice_join_at.wall_ms,
+                    logical: alice_join_at.logical + 1 + i as u32,
+                    device_id: alice_join_at.device_id.clone(),
+                },
+            };
+            let create = sign_event(&create_payload, alice_sk.as_ref()).expect("sign create");
+            assert_eq!(
+                engine_a
+                    .insert_local_event(create)
+                    .await
+                    .expect("alice channel-create insert"),
+                InsertOutcome::Inserted
+            );
+        }
+
+        // Mint the 5-event root from A.
+        let (a_reply_tx, a_reply_rx) = tokio::sync::oneshot::channel();
+        serve_tx_a
+            .send(a_reply_tx)
+            .await
+            .expect("send A serve request");
+        let packet = a_reply_rx.await.expect("A replied").expect("A encode ok");
+
+        // Measure ONLY B's merge: snapshot this community's sync count right
+        // before injecting the packet. All setup inserts (on A and B) already
+        // happened; both engines are otherwise idle, so the delta is B's merge
+        // alone. Keyed by `community_id`, so a concurrent test on a different
+        // community can't perturb it (robust under `cargo test`, not just
+        // nextest's process isolation).
+        let syncs_before = crate::community_state_crdt::quorum_sync_probe::get(community_id);
+        b_sub_tx.send(packet).await.expect("inject packet into B");
+
+        // Poll until B materializes ALL four channels (the whole merge landed).
+        let mut materialized = false;
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mat = {
+                let g = b_state.lock().await;
+                g.materialize_now(alice_addr)
+            };
+            if ch_ids.iter().all(|id| mat.channels.contains_key(id)) {
+                materialized = true;
+                break;
+            }
+        }
+        assert!(
+            materialized,
+            "B must materialize every channel from the multi-event root merge"
+        );
+
+        // THE INVARIANT: the batch merge synced `admin_quorum` exactly ONCE,
+        // not once per inserted event.
+        let syncs =
+            crate::community_state_crdt::quorum_sync_probe::get(community_id) - syncs_before;
+        assert_eq!(
+            syncs, 1,
+            "a 4-event batch merge must re-materialize admin_quorum ONCE at \
+             batch-end, got {syncs} syncs (per-insert = O(n²) on the writer)"
         );
 
         drop(engine_a);
