@@ -80,8 +80,9 @@ async fn all_slots_resolve_returns_every_publishers_beacon() {
         let epoch_key = EpochKey::new([0x51; 32]);
         let (node_a, node_b) = ([0x0A; 32], [0x0B; 32]);
         // Addresses chosen so A ranks slot 0 and B slot 1 (ascending sort).
+        // Same (empty) diversity bucket → the round-robin reduces to that sort.
         let (owner_a, owner_b) = (OwnerAddr([0x01; 16]), OwnerAddr([0x02; 16]));
-        let advertisers = vec![owner_a, owner_b];
+        let advertisers = vec![(owner_a, String::new()), (owner_b, String::new())];
 
         let (rdv_a, vk_a) = make_publisher(&publisher, 0x55, 0x66, node_a);
         let (rdv_b, vk_b) = make_publisher(&publisher, 0x57, 0x68, node_b);

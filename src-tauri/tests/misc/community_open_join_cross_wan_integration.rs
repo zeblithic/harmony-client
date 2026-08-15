@@ -277,11 +277,18 @@ impl OpenJoinSetup {
         let slot =
             harmony_app::community_rendezvous::slot_for_advertiser(&advertisers, &self.alice_addr)
                 .expect("alice must claim a slot for the chosen advertiser set");
+        // ZEB-940: refresh_slot now takes `(addr, diversity bucket)`. A uniform
+        // (empty) bucket makes the diverse round-robin reduce to the address sort
+        // above, so the published slot matches `slot`.
+        let bucketed: Vec<(OwnerAddr, String)> = advertisers
+            .into_iter()
+            .map(|a| (a, String::new()))
+            .collect();
         self.alice_rendezvous_publisher
             .refresh_slot(
                 self.community_id,
                 self.epoch_key.clone(),
-                advertisers,
+                bucketed,
                 self.alice_addr,
             )
             .await;

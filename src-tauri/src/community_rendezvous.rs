@@ -144,6 +144,110 @@ pub fn slot_for_advertiser(advertisers: &[OwnerAddr], me: &OwnerAddr) -> Option<
     core_slot_for_advertiser(advertisers, me, RENDEZVOUS_SLOT_COUNT)
 }
 
+/// ZEB-940: derive an advertiser's CRDT-authoritative *diversity bucket* from
+/// its self-declared `home_relay` URL — the lowercased host (scheme, port, and
+/// path stripped). Two advertisers behind the same relay host share a bucket;
+/// distinct relay hosts are distinct buckets.
+///
+/// Why the home relay: it is the ONE network-locality signal carried in
+/// replicated community state (`CommunityRelayEntry.home_relay`, signed into the
+/// membership CRDT), so every member derives the identical bucket for a given
+/// advertiser — the determinism [`slot_for_advertiser_diverse`] needs to keep
+/// one writer per slot. A node's *local* reachability view (who it can reach)
+/// would differ per observer and break that invariant.
+///
+/// An unparseable or host-less URL buckets by its trimmed, lowercased raw string
+/// (still deterministic); an empty relay is its own empty bucket. This is a
+/// discovery-plane resilience axis, not a security boundary — a member could
+/// self-declare any `home_relay`, but it is already an enrolled, vouched member
+/// publishing a real beacon, so a "wrong" bucket only reshuffles slots.
+pub fn relay_diversity_bucket(home_relay: &str) -> String {
+    let trimmed = home_relay.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Prefer the URL host (scheme/port/path stripped; the `url` crate already
+    // ASCII-lowercases the host of a special scheme). Fall back to the trimmed,
+    // lowercased raw string for an unparseable or host-less relay so the bucket
+    // key stays deterministic across members.
+    match url::Url::parse(trimmed) {
+        Ok(u) => match u.host_str() {
+            Some(h) => h.to_ascii_lowercase(),
+            None => trimmed.to_ascii_lowercase(),
+        },
+        Err(_) => trimmed.to_ascii_lowercase(),
+    }
+}
+
+/// ZEB-940: diversity-aware deterministic slot claim. Buckets advertisers by a
+/// diversity key (see [`relay_diversity_bucket`]) and assigns rendezvous slots
+/// **round-robin across buckets** (within a bucket, ascending by address), so a
+/// bucket's advertisers land at positions `b, b+k, b+2k, …` for `k` buckets —
+/// one island can never hold two of the first `k` slots. `me`'s slot is its
+/// position in that interleaved order; `None` if `me` is absent or ranks at/
+/// beyond `cap`.
+///
+/// Degenerate case (`k == 1`, i.e. every advertiser shares one bucket — the
+/// common single-region community): reduces byte-for-byte to the plain
+/// address-sorted [`slot_for_advertiser`], so no behavior changes where there is
+/// no diversity to exploit.
+///
+/// Determinism: like the address-only claim, this is a pure function of the
+/// CRDT-replicated advertiser set (address + `home_relay`), so every member
+/// computes the same assignment and each slot has exactly one writer.
+pub fn slot_for_advertiser_diverse<B: Ord>(
+    advertisers: &[(OwnerAddr, B)],
+    me: &OwnerAddr,
+    cap: usize,
+) -> Option<u16> {
+    if cap == 0 {
+        return None;
+    }
+    // 1. Dedup by owner address. Sort by (address, bucket) so a duplicated
+    //    address collapses to a single, deterministically-chosen (min-bucket)
+    //    entry — mirroring the address-only kernel's `dedup` on equal addresses.
+    let mut pairs: Vec<(&OwnerAddr, &B)> = advertisers.iter().map(|(a, b)| (a, b)).collect();
+    pairs.sort_unstable_by(|x, y| x.0.cmp(y.0).then_with(|| x.1.cmp(y.1)));
+    pairs.dedup_by(|a, b| a.0 == b.0);
+
+    // 2. Group into buckets keyed by the diversity axis; each bucket's addresses
+    //    stay address-ascending because `pairs` is address-sorted.
+    let mut buckets: std::collections::BTreeMap<&B, Vec<&OwnerAddr>> =
+        std::collections::BTreeMap::new();
+    for (a, b) in &pairs {
+        buckets.entry(*b).or_default().push(*a);
+    }
+
+    // 3. Order the buckets by their minimum address (address-derived, so no
+    //    systematic bias toward a particular relay-name ordering). Each bucket is
+    //    non-empty and address-sorted, so `[0]` is its minimum.
+    let mut ordered: Vec<Vec<&OwnerAddr>> = buckets.into_values().collect();
+    ordered.sort_by(|x, y| x[0].cmp(y[0]));
+
+    // 4. Round-robin across buckets: round `r` takes each bucket's `r`-th
+    //    advertiser in bucket order. A bucket with `m` advertisers thus lands at
+    //    positions `bucket_index, +k, +2k, …` for `k` buckets, so it can never
+    //    hold two of the first `k` slots.
+    let depth = ordered.iter().map(|b| b.len()).max().unwrap_or(0);
+    let mut assignment: Vec<&OwnerAddr> = Vec::with_capacity(pairs.len());
+    for r in 0..depth {
+        for bucket in &ordered {
+            if let Some(addr) = bucket.get(r) {
+                assignment.push(*addr);
+            }
+        }
+    }
+
+    // 5. `me`'s slot is its position in the interleaved order; reject a rank
+    //    at/beyond the cap or one not representable as a u16 slot index (mirrors
+    //    the address-only kernel's guards).
+    let rank = assignment.iter().position(|a| **a == *me)?;
+    if rank >= cap || rank > usize::from(u16::MAX) {
+        return None;
+    }
+    Some(rank as u16)
+}
+
 /// Build the core rendezvous resolve config from the open-join env knobs.
 /// `HARMONY_OPEN_JOIN_RESOLVE_CURVE` (comma-separated batch widths, each clamped
 /// to `1..=RENDEZVOUS_SLOT_COUNT`) and `HARMONY_OPEN_JOIN_RESOLVE_DEADLINE_MS`
@@ -685,6 +789,171 @@ mod tests {
         assert_eq!(slot_for_advertiser(&set, &addr(1)), Some(0));
         assert_eq!(slot_for_advertiser(&set, &addr(2)), Some(1));
         assert_eq!(slot_for_advertiser(&set, &addr(3)), Some(2));
+    }
+
+    // --- ZEB-940: diversity bucket + diversity-aware slot selection ---
+
+    #[test]
+    fn relay_diversity_bucket_extracts_lowercase_host() {
+        assert_eq!(
+            relay_diversity_bucket("https://usw1-1.relay.n0.iroh.link/"),
+            "usw1-1.relay.n0.iroh.link"
+        );
+        // Case-folded so "USW1" and "usw1" bucket together.
+        assert_eq!(
+            relay_diversity_bucket("https://USW1.Relay.Example/"),
+            "usw1.relay.example"
+        );
+    }
+
+    #[test]
+    fn relay_diversity_bucket_strips_port_and_path() {
+        // Port and path are not part of the locality bucket — the host is.
+        assert_eq!(
+            relay_diversity_bucket("https://relay.example:8443/derp/path"),
+            "relay.example"
+        );
+    }
+
+    #[test]
+    fn relay_diversity_bucket_empty_and_unparseable() {
+        // Empty relay → its own empty bucket.
+        assert_eq!(relay_diversity_bucket(""), "");
+        assert_eq!(relay_diversity_bucket("   "), "");
+        // Unparseable / host-less → deterministic fallback to the trimmed,
+        // lowercased raw string (still a stable bucket key).
+        assert_eq!(relay_diversity_bucket("  Not-A-Url  "), "not-a-url");
+    }
+
+    #[test]
+    fn relay_diversity_bucket_same_host_differs_by_host_only() {
+        let a = relay_diversity_bucket("https://r1.example/");
+        let b = relay_diversity_bucket("https://r1.example/other-path");
+        let c = relay_diversity_bucket("https://r2.example/");
+        assert_eq!(a, b, "same host, different path → same bucket");
+        assert_ne!(a, c, "different host → different bucket");
+    }
+
+    /// Build a same-bucket advertiser set (one relay host) for the equivalence
+    /// property.
+    fn one_bucket(addrs: &[OwnerAddr]) -> Vec<(OwnerAddr, &'static str)> {
+        addrs.iter().map(|a| (*a, "same-relay")).collect()
+    }
+
+    #[test]
+    fn diverse_single_bucket_matches_address_sort() {
+        // The load-bearing back-compat property: when every advertiser shares one
+        // bucket (single-region community), the diversity claim reduces EXACTLY to
+        // the plain address-sorted claim — for every member, at every cap.
+        let addrs = vec![addr(3), addr(1), addr(9), addr(2), addr(7)];
+        let bucketed = one_bucket(&addrs);
+        for who in [addr(1), addr(2), addr(3), addr(7), addr(9), addr(42)] {
+            assert_eq!(
+                slot_for_advertiser_diverse(&bucketed, &who, RENDEZVOUS_SLOT_COUNT),
+                slot_for_advertiser(&addrs, &who),
+                "single-bucket diversity claim diverged from address sort for {who:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diverse_rescues_minority_island_advertiser() {
+        // The fix: 8 advertisers behind relay A (addresses 1..=8) plus ONE behind
+        // relay B (address 9). Under the plain address sort, B's advertiser ranks
+        // 8 >= cap(8) and publishes NO beacon. Under diversity round-robin it
+        // takes an early slot (slot 1: second bucket, first round).
+        let mut set: Vec<(OwnerAddr, &str)> = (1..=8u8).map(|b| (addr(b), "relayA")).collect();
+        set.push((addr(9), "relayB"));
+
+        // Address-only sort would strand relay-B's advertiser.
+        let addrs_only: Vec<OwnerAddr> = set.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            slot_for_advertiser(&addrs_only, &addr(9)),
+            None,
+            "premise: address sort strands the minority-island advertiser"
+        );
+
+        // Diversity round-robin gives it slot 1 (relay B is the 2nd bucket).
+        assert_eq!(
+            slot_for_advertiser_diverse(&set, &addr(9), RENDEZVOUS_SLOT_COUNT),
+            Some(1),
+            "minority-island advertiser must claim an early slot"
+        );
+        // relay A still holds slot 0 (its lowest address).
+        assert_eq!(
+            slot_for_advertiser_diverse(&set, &addr(1), RENDEZVOUS_SLOT_COUNT),
+            Some(0)
+        );
+        // The trade: relay A's 8th advertiser (address 8) is pushed to rank 8 >=
+        // cap and now yields — one island gives up its 8th slot so the other is
+        // represented.
+        assert_eq!(
+            slot_for_advertiser_diverse(&set, &addr(8), RENDEZVOUS_SLOT_COUNT),
+            None,
+            "the displaced 8th same-island advertiser yields the slot"
+        );
+    }
+
+    #[test]
+    fn diverse_round_robin_interleaves_buckets() {
+        // Two buckets of two. Bucket order is by min-address: A(min 1) then B(min 3).
+        // Round-robin → [A0=1, B0=3, A1=2, B1=4] → slots 0,1,2,3.
+        let set = vec![
+            (addr(1), "A"),
+            (addr(2), "A"),
+            (addr(3), "B"),
+            (addr(4), "B"),
+        ];
+        assert_eq!(slot_for_advertiser_diverse(&set, &addr(1), 8), Some(0));
+        assert_eq!(slot_for_advertiser_diverse(&set, &addr(3), 8), Some(1));
+        assert_eq!(slot_for_advertiser_diverse(&set, &addr(2), 8), Some(2));
+        assert_eq!(slot_for_advertiser_diverse(&set, &addr(4), 8), Some(3));
+    }
+
+    #[test]
+    fn diverse_deterministic_across_members() {
+        // Two members compute the SAME assignment from the same (unordered) set.
+        let set_a = vec![(addr(3), "Y"), (addr(1), "X"), (addr(2), "X")];
+        let set_b = vec![(addr(2), "X"), (addr(3), "Y"), (addr(1), "X")];
+        for who in [addr(1), addr(2), addr(3)] {
+            assert_eq!(
+                slot_for_advertiser_diverse(&set_a, &who, 8),
+                slot_for_advertiser_diverse(&set_b, &who, 8),
+                "assignment disagreed for {who:?} under input reordering"
+            );
+        }
+    }
+
+    #[test]
+    fn diverse_not_in_set_returns_none() {
+        let set = vec![(addr(1), "A"), (addr(2), "B")];
+        assert_eq!(slot_for_advertiser_diverse(&set, &addr(9), 8), None);
+    }
+
+    #[test]
+    fn diverse_single_advertiser_is_slot0() {
+        let set = vec![(addr(5), "solo")];
+        assert_eq!(slot_for_advertiser_diverse(&set, &addr(5), 8), Some(0));
+    }
+
+    #[test]
+    fn diverse_dedups_duplicate_pairs() {
+        // A duplicated (addr, bucket) pair must not shift anyone's slot.
+        let set = vec![
+            (addr(1), "A"),
+            (addr(2), "A"),
+            (addr(2), "A"),
+            (addr(3), "A"),
+        ];
+        assert_eq!(slot_for_advertiser_diverse(&set, &addr(1), 8), Some(0));
+        assert_eq!(slot_for_advertiser_diverse(&set, &addr(2), 8), Some(1));
+        assert_eq!(slot_for_advertiser_diverse(&set, &addr(3), 8), Some(2));
+    }
+
+    #[test]
+    fn diverse_zero_cap_is_none() {
+        let set = vec![(addr(1), "A")];
+        assert_eq!(slot_for_advertiser_diverse(&set, &addr(1), 0), None);
     }
 }
 
