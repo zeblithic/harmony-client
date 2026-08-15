@@ -2428,13 +2428,15 @@ struct InternalCtx {
     root_serve_rx: Option<mpsc::Receiver<RootServeRequest>>,
 
     /// ZEB-805 fetch-retry re-injection channel. A `FetchMiss` sleeper sends
-    /// `(wire, attempts_left, max_fetched)` back here after its delay;
+    /// `(wire, attempts_used, max_fetched)` back here after its delay;
     /// `internal_task` takes the receiver out of the ctx at start and polls it as
-    /// a `select!` arm. ZEB-938: `max_fetched` is the best segment-fetch progress
-    /// this frame has reached across prior attempts, carried so `retry_after_miss`
-    /// can tell a resuming round (new high-water mark) from a stalled one.
-    fetch_retry_tx: mpsc::Sender<(Vec<u8>, u8, usize)>,
-    fetch_retry_rx: Option<mpsc::Receiver<(Vec<u8>, u8, usize)>>,
+    /// a `select!` arm. ZEB-938: `attempts_used` is how many attempts this frame
+    /// has made (strictly increasing — the explicit total-budget clock), and
+    /// `max_fetched` is its best segment-fetch progress; together they let
+    /// `retry_after_miss` scale the budget by real progress while still
+    /// terminating.
+    fetch_retry_tx: mpsc::Sender<(Vec<u8>, u32, usize)>,
+    fetch_retry_rx: Option<mpsc::Receiver<(Vec<u8>, u32, usize)>>,
     /// Caps concurrent retry sleepers — each retains a wire frame for the whole
     /// delay, so this bounds retained memory under a publish flood, not just
     /// task count. See `FETCH_RETRY_MAX_INFLIGHT`.
@@ -3271,9 +3273,10 @@ async fn internal_task(mut ctx: InternalCtx) {
                 dispatch_inbound(
                     &ctx,
                     bytes,
-                    FETCH_RETRY_ATTEMPTS,
-                    // A fresh frame has no prior progress — the high-water mark
-                    // starts at zero (ZEB-938).
+                    // A fresh frame has made no attempts and no progress yet
+                    // (ZEB-938: attempts_used and the high-water mark both start
+                    // at zero).
+                    0,
                     0,
                     FrameOrigin::Network,
                     &resolved_tx,
@@ -3284,13 +3287,14 @@ async fn internal_task(mut ctx: InternalCtx) {
             // ZEB-805: a fetch-retry sleeper handing its wire frame back after
             // the delay. Re-enters the FULL inbound pipeline, so the replay
             // check naturally kills a retry that a newer root has superseded.
-            // ZEB-938: `max_fetched` carries the frame's best segment-fetch
-            // progress so the resumable budget survives across rounds.
-            Some((wire, attempts_left, max_fetched)) = fetch_retry_rx.recv() => {
+            // ZEB-938: `attempts_used`/`max_fetched` carry the frame's running
+            // attempt count and best progress so the budget survives across
+            // rounds.
+            Some((wire, attempts_used, max_fetched)) = fetch_retry_rx.recv() => {
                 dispatch_inbound(
                     &ctx,
                     wire,
-                    attempts_left,
+                    attempts_used,
                     max_fetched,
                     FrameOrigin::Retry,
                     &resolved_tx,
@@ -4244,7 +4248,7 @@ enum FrameOrigin {
 async fn dispatch_inbound(
     ctx: &InternalCtx,
     wire: Vec<u8>,
-    attempts_left: u8,
+    attempts_used: u32,
     max_fetched: usize,
     origin: FrameOrigin,
     resolved_tx: &mpsc::Sender<ResolvedIngest>,
@@ -4298,7 +4302,7 @@ async fn dispatch_inbound(
                 let _ = resolved_tx
                     .send(ResolvedIngest {
                         result,
-                        attempts_left,
+                        attempts_used,
                         max_fetched,
                     })
                     .await;
@@ -4313,7 +4317,7 @@ async fn dispatch_inbound(
 async fn apply_resolved_ingest(ctx: &InternalCtx, ri: ResolvedIngest) {
     let ResolvedIngest {
         result,
-        attempts_left,
+        attempts_used,
         max_fetched,
     } = ri;
     match result {
@@ -4334,10 +4338,11 @@ async fn apply_resolved_ingest(ctx: &InternalCtx, ri: ResolvedIngest) {
             finish_incoming_outcome(ctx, outcome).await;
         }
         // A blob/segment fetch miss re-enters the bounded fetch-retry loop.
-        // ZEB-938: pass the retry budget the progress it made (`fetched`) and its
-        // best-so-far (`max_fetched`) so the budget resumes rather than restarts.
+        // ZEB-938: pass the running attempt count, the best-so-far high-water
+        // mark, and this attempt's `fetched` so the progress-scaled budget can
+        // resume rather than restart.
         ResolveResult::Miss { wire, fetched } => {
-            schedule_fetch_retry(ctx, wire, attempts_left, max_fetched, fetched).await
+            schedule_fetch_retry(ctx, wire, attempts_used, max_fetched, fetched).await
         }
         // A pre-mutation rejection (decode/misroute/sig/bootstrap) — report it.
         ResolveResult::Err(e) => {
@@ -4349,54 +4354,67 @@ async fn apply_resolved_ingest(ctx: &InternalCtx, ri: ResolvedIngest) {
 /// ZEB-938: the next step of the progress-based fetch-retry budget after a miss.
 #[derive(Debug, PartialEq, Eq)]
 enum RetryStep {
-    /// The budget is spent after a run of no-progress rounds — drop the frame
-    /// and report degraded. `retry_after_miss` returns this only when the frame
-    /// made no new progress AND `attempts_left` has counted down to zero.
+    /// The total budget is spent — drop the frame and report degraded.
     Exhausted,
-    /// Re-inject the frame for another attempt, carrying the remaining budget
-    /// and the best-progress-so-far high-water mark.
+    /// Re-inject the frame for another attempt, carrying the running attempt
+    /// count and the best-progress-so-far high-water mark. `progressed` is true
+    /// iff this miss set a new high-water mark, so the caller counts the reset
+    /// without recomputing the predicate.
     Retry {
-        attempts_left: u8,
+        attempts_used: u32,
         max_fetched: usize,
+        progressed: bool,
     },
+}
+
+/// ZEB-938: total retry budget a frame earns given its best progress so far.
+/// A frame that has fetched `m` segments is allowed `(m + 1) * (ATTEMPTS + 1)`
+/// total attempts: the pre-938 fixed budget (`ATTEMPTS + 1`) for the first
+/// segment, plus that much again for each further segment it actually landed.
+/// So the budget scales with *real* progress and is hard-capped by the frame's
+/// segment count (itself bounded by `MANIFEST_SEGMENT_CAP`).
+fn fetch_retry_budget(max_fetched: usize) -> u32 {
+    (max_fetched as u32)
+        .saturating_add(1)
+        .saturating_mul(FETCH_RETRY_ATTEMPTS as u32 + 1)
 }
 
 /// ZEB-938: decide the retry step after a state-root fetch miss.
 ///
 /// `this_fetched` is how many segments THIS attempt fetched+opened before it
 /// missed; `prior_max_fetched` is the best any earlier attempt for this frame
-/// reached. A miss that set a NEW high-water mark (`this_fetched >
-/// prior_max_fetched`) is *progress*: reset the no-progress budget to full, so
-/// the frame keeps retrying as long as each round eventually fetches at least
-/// one new segment. Otherwise the budget counts down and terminates at zero.
+/// reached; `attempts_used` is how many attempts this frame has already made.
 ///
-/// This is what turns the former all-or-nothing segmented-root fetch (one
-/// missing segment abandoned the whole root after a fixed `1 +
-/// FETCH_RETRY_ATTEMPTS` attempts) into a resumable one: a large root converges
-/// on a lossy path because the CAS caches every fetched segment, so a retry only
-/// network-fetches the still-missing ones and each round can advance the mark.
-/// Only a *stall* — no new segment for `FETCH_RETRY_ATTEMPTS + 1` consecutive
-/// rounds, i.e. a genuinely-unfetchable segment — abandons the root.
+/// The budget is an EXPLICIT total that scales with progress
+/// ([`fetch_retry_budget`]): reaching a new high-water mark of fetched segments
+/// raises the ceiling, so the frame earns more attempts by making real
+/// progress. Because `attempts_used` strictly increments every round, the chain
+/// terminates in at most `fetch_retry_budget(final max)` attempts REGARDLESS of
+/// how `max_fetched` evolves — the bound does not depend on `max_fetched` being
+/// monotonic, so a future change there can't turn this into an infinite loop.
 ///
-/// The all-or-nothing case (`this_fetched == prior_max_fetched == 0`: a
-/// monolithic root, or a manifest blob that itself never fetches) never makes
-/// progress, so it reduces to exactly the pre-ZEB-938 fixed budget — that
-/// path's behavior is unchanged. Total attempts stay bounded: progress can
-/// occur at most `MANIFEST_SEGMENT_CAP` times (each strictly raises the mark),
-/// with at most `FETCH_RETRY_ATTEMPTS + 1` no-progress rounds between, so the
-/// re-injection chain cannot run forever.
-fn retry_after_miss(attempts_left: u8, prior_max_fetched: usize, this_fetched: usize) -> RetryStep {
-    if this_fetched > prior_max_fetched {
-        RetryStep::Retry {
-            attempts_left: FETCH_RETRY_ATTEMPTS,
-            max_fetched: this_fetched,
-        }
-    } else if attempts_left == 0 {
+/// This turns the former all-or-nothing segmented-root fetch (one missing
+/// segment abandoned the whole root after a fixed `ATTEMPTS + 1` attempts) into
+/// a resumable one: a large root converges on a lossy path because the CAS
+/// caches every fetched segment, so a retry only network-fetches the
+/// still-missing ones and each landed segment extends the budget. The
+/// all-or-nothing case (`max_fetched` stuck at 0: a monolithic root, or a
+/// manifest blob that itself never fetches) earns `fetch_retry_budget(0) ==
+/// ATTEMPTS + 1` — exactly the pre-938 fixed budget, unchanged.
+fn retry_after_miss(
+    attempts_used: u32,
+    prior_max_fetched: usize,
+    this_fetched: usize,
+) -> RetryStep {
+    let max_fetched = prior_max_fetched.max(this_fetched);
+    let next_attempts_used = attempts_used.saturating_add(1);
+    if next_attempts_used >= fetch_retry_budget(max_fetched) {
         RetryStep::Exhausted
     } else {
         RetryStep::Retry {
-            attempts_left: attempts_left - 1,
-            max_fetched: prior_max_fetched,
+            attempts_used: next_attempts_used,
+            max_fetched,
+            progressed: this_fetched > prior_max_fetched,
         }
     }
 }
@@ -4409,28 +4427,26 @@ fn retry_after_miss(attempts_left: u8, prior_max_fetched: usize, this_fetched: u
 async fn schedule_fetch_retry(
     ctx: &InternalCtx,
     wire: Vec<u8>,
-    attempts_left: u8,
+    attempts_used: u32,
     prior_max_fetched: usize,
     this_fetched: usize,
 ) {
-    {
-        let (next_attempts_left, new_max_fetched) = match retry_after_miss(
-            attempts_left,
-            prior_max_fetched,
-            this_fetched,
-        ) {
+    let (next_attempts_used, new_max_fetched, progressed) =
+        match retry_after_miss(attempts_used, prior_max_fetched, this_fetched) {
             RetryStep::Exhausted => {
-                // Budget spent after a run of no-progress rounds. NOW it is a
-                // terminal drop, and reports as the BlobNotFound this path
-                // used to return on the very first miss.
+                // Total budget spent. NOW it is a terminal drop, and reports as
+                // the BlobNotFound this path used to return on the very first
+                // miss.
                 ctx.sync_stats
                     .fetch_retries_exhausted
                     .fetch_add(1, Ordering::Relaxed);
+                let max_fetched = prior_max_fetched.max(this_fetched);
+                let attempts = attempts_used.saturating_add(1);
                 tracing::warn!(
                     community_id = ?ctx.community_id,
                     budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
-                    attempts = FETCH_RETRY_ATTEMPTS + 1,
-                    max_fetched = prior_max_fetched,
+                    attempts,
+                    max_fetched,
                     "community state-root blob fetch retries exhausted — publish dropped; \
                      tracker un-advanced, so a peer's next publish or re-offer is still admissible"
                 );
@@ -4439,87 +4455,87 @@ async fn schedule_fetch_retry(
                     ctx.community_id,
                     "blob_not_found",
                     format!(
-                        "state-root blob not fetchable within {}ms after {} no-progress attempts",
+                        "state-root blob not fetchable within {}ms after {attempts} attempts \
+                         (reached {max_fetched} segments)",
                         crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
-                        FETCH_RETRY_ATTEMPTS + 1
                     ),
                 );
                 return;
             }
             RetryStep::Retry {
-                attempts_left,
+                attempts_used,
                 max_fetched,
-            } => (attempts_left, max_fetched),
+                progressed,
+            } => (attempts_used, max_fetched, progressed),
         };
 
-        // ZEB-938: a round that reached a new high-water mark reset the budget —
-        // a large root is resuming across rounds. Count it as the fleet-
-        // diagnostic complement to `fetch_retries_exhausted`.
-        if this_fetched > prior_max_fetched {
-            ctx.sync_stats
-                .fetch_retries_progress_resets
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        // Acquire the permit BEFORE spawning, so the count of detached
-        // sleepers — each retaining its wire buffer for the whole delay — is
-        // hard-capped rather than merely the re-injection channel. On
-        // saturation, drop and count: piling up retries under a publish flood
-        // is the failure this shield exists to prevent.
-        let Ok(permit) = Arc::clone(&ctx.fetch_retry_sem).try_acquire_owned() else {
-            ctx.sync_stats
-                .fetch_retries_dropped
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                community_id = ?ctx.community_id,
-                "community fetch-retry in-flight cap saturated — dropping retry"
-            );
-            return;
-        };
+    // Acquire the permit BEFORE spawning, so the count of detached sleepers —
+    // each retaining its wire buffer for the whole delay — is hard-capped rather
+    // than merely the re-injection channel. On saturation, drop and count:
+    // piling up retries under a publish flood is the failure this shield exists
+    // to prevent.
+    let Ok(permit) = Arc::clone(&ctx.fetch_retry_sem).try_acquire_owned() else {
         ctx.sync_stats
-            .fetch_retries_scheduled
+            .fetch_retries_dropped
             .fetch_add(1, Ordering::Relaxed);
-        let inflight = (FETCH_RETRY_MAX_INFLIGHT - ctx.fetch_retry_sem.available_permits()) as u64;
-        ctx.sync_stats
-            .fetch_retry_inflight_peak
-            .fetch_max(inflight, Ordering::Relaxed);
-        tracing::info!(
+        tracing::warn!(
             community_id = ?ctx.community_id,
-            attempts_left = next_attempts_left,
-            max_fetched = new_max_fetched,
-            delay_ms = FETCH_RETRY_DELAY_MS,
-            "community state-root blob fetch failed — retry scheduled"
+            "community fetch-retry in-flight cap saturated — dropping retry"
         );
-        let tx = ctx.fetch_retry_tx.clone();
-        let stats = Arc::clone(&ctx.sync_stats);
-        tokio::spawn(async move {
-            // Hold the permit for the sleeper's whole lifetime; released on
-            // task end (after enqueue), which is what bounds concurrency.
-            let _permit = permit;
-            tokio::time::sleep(std::time::Duration::from_millis(FETCH_RETRY_DELAY_MS)).await;
-            // `try_send`, never a blocking `send().await`: a full channel means
-            // the engine is already saturated — drop rather than pile up. A
-            // closed channel means the engine shut down, which is also moot.
-            //
-            // ZEB-805 (r1): count the drop. This path already incremented
-            // `fetch_retries_scheduled`, so leaving it uncounted made a retry
-            // vanish from the counters entirely — neither dropped nor exhausted
-            // — on the very surface this ticket added to diagnose stalls.
-            //
-            // It is reachable, not merely defensive: the permit is released at
-            // task end, right after enqueue, so up to MAX_INFLIGHT fresh
-            // sleepers can spawn while earlier messages sit undrained in the
-            // channel — and the engine can sit for seconds inside a 5 s-budget
-            // CAS fetch.
-            if tx
-                .try_send((wire, next_attempts_left, new_max_fetched))
-                .is_err()
-            {
-                stats.fetch_retries_dropped.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!("community fetch-retry re-injection channel unavailable — dropped");
-            }
-        });
+        return;
+    };
+    ctx.sync_stats
+        .fetch_retries_scheduled
+        .fetch_add(1, Ordering::Relaxed);
+    // ZEB-938: count a progress-driven budget extension only once the retry is
+    // actually committed (permit acquired, alongside `fetch_retries_scheduled`),
+    // so a flood-dropped retry cannot inflate it. Fleet-diagnostic complement to
+    // `fetch_retries_exhausted`: resets climbing with exhausted flat is a large
+    // root converging across rounds.
+    if progressed {
+        ctx.sync_stats
+            .fetch_retries_progress_resets
+            .fetch_add(1, Ordering::Relaxed);
     }
+    let inflight = (FETCH_RETRY_MAX_INFLIGHT - ctx.fetch_retry_sem.available_permits()) as u64;
+    ctx.sync_stats
+        .fetch_retry_inflight_peak
+        .fetch_max(inflight, Ordering::Relaxed);
+    tracing::info!(
+        community_id = ?ctx.community_id,
+        attempts_used = next_attempts_used,
+        max_fetched = new_max_fetched,
+        delay_ms = FETCH_RETRY_DELAY_MS,
+        "community state-root blob fetch failed — retry scheduled"
+    );
+    let tx = ctx.fetch_retry_tx.clone();
+    let stats = Arc::clone(&ctx.sync_stats);
+    tokio::spawn(async move {
+        // Hold the permit for the sleeper's whole lifetime; released on task end
+        // (after enqueue), which is what bounds concurrency.
+        let _permit = permit;
+        tokio::time::sleep(std::time::Duration::from_millis(FETCH_RETRY_DELAY_MS)).await;
+        // `try_send`, never a blocking `send().await`: a full channel means the
+        // engine is already saturated — drop rather than pile up. A closed
+        // channel means the engine shut down, which is also moot.
+        //
+        // ZEB-805 (r1): count the drop. This path already incremented
+        // `fetch_retries_scheduled`, so leaving it uncounted made a retry vanish
+        // from the counters entirely — neither dropped nor exhausted — on the
+        // very surface this ticket added to diagnose stalls.
+        //
+        // It is reachable, not merely defensive: the permit is released at task
+        // end, right after enqueue, so up to MAX_INFLIGHT fresh sleepers can
+        // spawn while earlier messages sit undrained in the channel — and the
+        // engine can sit for seconds inside a 5 s-budget CAS fetch.
+        if tx
+            .try_send((wire, next_attempts_used, new_max_fetched))
+            .is_err()
+        {
+            stats.fetch_retries_dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("community fetch-retry re-injection channel unavailable — dropped");
+        }
+    });
 }
 
 /// ZEB-937: finish an ingest outcome on `internal_task` — degraded-report on
@@ -4761,7 +4777,9 @@ enum ResolveResult {
 /// stamp happened on-task in `dispatch_inbound`, so `origin` isn't carried.)
 struct ResolvedIngest {
     result: ResolveResult,
-    attempts_left: u8,
+    /// ZEB-938: how many attempts this frame has already made — the explicit
+    /// total-budget clock, strictly increasing across re-injections.
+    attempts_used: u32,
     /// ZEB-938: the frame's best segment-fetch progress across prior attempts.
     /// `retry_after_miss` compares this attempt's `fetched` against it to decide
     /// whether a miss resumed (new high-water mark) or stalled.
@@ -12386,74 +12404,82 @@ mod tests {
     }
 
     /// ZEB-938: a fetch miss that reached a NEW high-water mark of fetched
-    /// segments (progress) resets the no-progress budget to full — even at
-    /// `attempts_left == 0`. This is what lets a large segmented root converge
-    /// on a lossy path across arbitrarily many rounds, as long as each round
-    /// eventually fetches at least one new segment (the CAS caches every fetched
-    /// segment, so re-fetches of earlier ones are local cache hits).
+    /// segments (progress) raises the budget ceiling and flags `progressed`, so
+    /// the caller counts one reset. This is what lets a large segmented root
+    /// converge on a lossy path across many rounds — each landed segment extends
+    /// the budget (the CAS caches every fetched segment, so re-fetches of earlier
+    /// ones are local cache hits).
     #[test]
-    fn retry_after_miss_resets_budget_on_progress() {
+    fn retry_after_miss_extends_budget_on_progress() {
         assert_eq!(
-            retry_after_miss(0, 3, 4),
+            retry_after_miss(0, 0, 1),
             RetryStep::Retry {
-                attempts_left: FETCH_RETRY_ATTEMPTS,
-                max_fetched: 4,
-            },
-            "a new high-water mark resets the budget even with no attempts left"
-        );
-        assert_eq!(
-            retry_after_miss(FETCH_RETRY_ATTEMPTS, 0, 1),
-            RetryStep::Retry {
-                attempts_left: FETCH_RETRY_ATTEMPTS,
+                attempts_used: 1,
                 max_fetched: 1,
+                progressed: true,
             },
             "the first segment fetched is progress off the zero baseline"
         );
+        assert_eq!(
+            retry_after_miss(3, 1, 2),
+            RetryStep::Retry {
+                attempts_used: 4,
+                max_fetched: 2,
+                progressed: true,
+            },
+            "a later round reaching a new mark is progress and raises the ceiling"
+        );
     }
 
-    /// ZEB-938: a miss that fetched no NEW segment (`this <= prior`) makes no
-    /// progress — the budget counts down and carries the existing high-water
-    /// mark forward. A regression (`this < prior`, e.g. an earlier segment
-    /// evicted mid-chain) is treated identically: it is not progress.
+    /// ZEB-938: a miss that fetched no NEW segment (`this <= prior`) is not
+    /// progress — `attempts_used` still climbs, the ceiling is unchanged, and
+    /// the high-water mark is carried forward. A regression (`this < prior`, e.g.
+    /// an earlier segment evicted mid-chain) is treated identically.
     #[test]
-    fn retry_after_miss_counts_down_without_progress() {
+    fn retry_after_miss_counts_up_a_stall_within_budget() {
+        // budget(5) = (5 + 1) * (FETCH_RETRY_ATTEMPTS + 1) = 24, so at
+        // attempts_used 4 a same-mark miss just advances the counter.
         assert_eq!(
-            retry_after_miss(3, 5, 5),
+            retry_after_miss(4, 5, 5),
             RetryStep::Retry {
-                attempts_left: 2,
+                attempts_used: 5,
                 max_fetched: 5,
+                progressed: false,
             },
-            "re-reaching the same mark decrements and keeps the mark"
+            "re-reaching the same mark advances the count and keeps the mark"
         );
         assert_eq!(
-            retry_after_miss(1, 5, 5),
+            retry_after_miss(4, 5, 3),
             RetryStep::Retry {
-                attempts_left: 0,
+                attempts_used: 5,
                 max_fetched: 5,
-            },
-        );
-        assert_eq!(
-            retry_after_miss(2, 5, 3),
-            RetryStep::Retry {
-                attempts_left: 1,
-                max_fetched: 5,
+                progressed: false,
             },
             "a regression below the high-water mark is not progress"
         );
     }
 
-    /// ZEB-938: the budget still terminates. `attempts_left == 0` with no new
-    /// progress abandons the root and reports degraded (via the caller). The
-    /// all-or-nothing monolithic case (`this == prior == 0`) reduces to exactly
-    /// the pre-ZEB-938 fixed budget, so that path's behavior is unchanged.
+    /// ZEB-938: the budget is an EXPLICIT total that terminates regardless of how
+    /// progress evolves. The all-or-nothing monolithic case (`max` stuck at 0)
+    /// earns `fetch_retry_budget(0) == FETCH_RETRY_ATTEMPTS + 1` total attempts —
+    /// exactly the pre-938 fixed budget. A frame that fetched more segments earns
+    /// proportionally more, but is still bounded.
     #[test]
-    fn retry_after_miss_exhausts_after_a_run_of_no_progress() {
-        assert_eq!(retry_after_miss(0, 5, 5), RetryStep::Exhausted);
-        assert_eq!(
-            retry_after_miss(0, 0, 0),
-            RetryStep::Exhausted,
-            "monolithic all-or-nothing: no progress signal, unchanged budget"
-        );
+    fn retry_after_miss_enforces_a_progress_scaled_total_budget() {
+        // Monolithic: budget(0) = ATTEMPTS + 1 = 4 → exhausts as attempts_used+1
+        // reaches 4, i.e. after the 1 initial + FETCH_RETRY_ATTEMPTS attempts.
+        assert_eq!(fetch_retry_budget(0), FETCH_RETRY_ATTEMPTS as u32 + 1);
+        assert!(matches!(retry_after_miss(2, 0, 0), RetryStep::Retry { .. }));
+        assert_eq!(retry_after_miss(3, 0, 0), RetryStep::Exhausted);
+        // Having fetched 5 segments earns budget(5) = 24: a stuck 6th segment is
+        // retried far longer than the monolithic 4 before the frame is dropped —
+        // but the total is bounded and reached deterministically.
+        assert_eq!(fetch_retry_budget(5), 24);
+        assert!(matches!(
+            retry_after_miss(22, 5, 5),
+            RetryStep::Retry { .. }
+        ));
+        assert_eq!(retry_after_miss(23, 5, 5), RetryStep::Exhausted);
     }
 
     /// A CAS double for the segmented-root progress tests (ZEB-938). Segments
