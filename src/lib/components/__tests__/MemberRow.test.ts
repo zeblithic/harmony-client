@@ -182,6 +182,88 @@ describe('MemberRow kebab-matrix', () => {
   });
 });
 
+describe('MemberRow per-community thresholds (ZEB-942)', () => {
+  // MemberRow's kebab gates must mirror the backend `verify_event`
+  // (community_membership.rs): Kick needs actor_power >= thresholds.kick AND
+  // strictly-greater than the target; non-admin-affecting SetPower needs
+  // actor_power >= thresholds.setPower; admin-affecting SetPower (grant/remove
+  // the fixed max tier) needs actor_power >= 100 regardless of a lowered
+  // set_power; Unban needs actor_power >= thresholds.setPower.
+
+  it('lowered kick: a sub-50 authorized moderator sees Kick (thresholds.kick=25)', async () => {
+    // A member at power 30 is authorized to kick when kick threshold is 25.
+    // The hard-coded `>= 50` gate would wrongly deny the control.
+    const memberTarget = makeMember(0, 'joined', 'dd'.repeat(16));
+    const { getByRole } = render(MemberRow, {
+      props: {
+        member: memberTarget,
+        viewer: { addr: VIEWER_ADDR, power: 30, isLastAdmin: false },
+        thresholds: { kick: 25, setPower: 100 },
+        onaction: vi.fn(),
+      },
+    });
+
+    await fireEvent.click(getByRole('button', { name: 'Member actions' }));
+    expect(getByRole('menuitem', { name: 'Kick' })).toBeTruthy();
+  });
+
+  it('raised kick: a power-50 member does NOT see Kick (thresholds.kick=75)', () => {
+    // The backend rejects a power-50 actor when kick threshold is 75; the UI
+    // must not dangle a control that would always fail. With no other action
+    // available, the kebab affordance is absent entirely.
+    const memberTarget = makeMember(0, 'joined', 'dd'.repeat(16));
+    const { queryByRole } = render(MemberRow, {
+      props: {
+        member: memberTarget,
+        viewer: { addr: VIEWER_ADDR, power: 50, isLastAdmin: false },
+        thresholds: { kick: 75, setPower: 100 },
+        onaction: vi.fn(),
+      },
+    });
+
+    expect(queryByRole('button', { name: 'Member actions' })).toBeNull();
+  });
+
+  it('lowered setPower: non-admin-affecting promote is enabled, but Promote to Admin stays gated at 100', async () => {
+    // thresholds.setPower=50 authorizes a power-50 actor for non-admin-affecting
+    // SetPower (promote a member to mod). But granting admin (level 100) is
+    // admin-affecting and requires the fixed max tier (100) regardless of the
+    // lowered set_power — so Promote to Admin must remain hidden.
+    const memberTarget = makeMember(0, 'joined', 'dd'.repeat(16));
+    const { getByRole, queryByRole } = render(MemberRow, {
+      props: {
+        member: memberTarget,
+        viewer: { addr: VIEWER_ADDR, power: 50, isLastAdmin: false },
+        thresholds: { kick: 50, setPower: 50 },
+        onaction: vi.fn(),
+      },
+    });
+
+    await fireEvent.click(getByRole('button', { name: 'Member actions' }));
+    expect(getByRole('menuitem', { name: 'Promote to Moderator' })).toBeTruthy();
+    expect(queryByRole('menuitem', { name: 'Promote to Admin' })).toBeNull();
+  });
+
+  it('lowered setPower: demoting a mod to member (non-admin-affecting) is enabled for a power-50 actor', async () => {
+    // Demote-to-Member on a mod (target power 50 → 0) is NOT admin-affecting, so
+    // thresholds.setPower=50 authorizes it. Kick stays hidden (not strictly
+    // greater: 50 is not > 50).
+    const modTarget = makeMember(50, 'joined', 'cc'.repeat(16));
+    const { getByRole, queryByRole } = render(MemberRow, {
+      props: {
+        member: modTarget,
+        viewer: { addr: VIEWER_ADDR, power: 50, isLastAdmin: false },
+        thresholds: { kick: 50, setPower: 50 },
+        onaction: vi.fn(),
+      },
+    });
+
+    await fireEvent.click(getByRole('button', { name: 'Member actions' }));
+    expect(getByRole('menuitem', { name: 'Demote to Member' })).toBeTruthy();
+    expect(queryByRole('menuitem', { name: 'Kick' })).toBeNull();
+  });
+});
+
 describe('MemberRow display-name resolution (ZEB-432)', () => {
   const ADDR = 'cc'.repeat(16);
   const member = makeMember(0, 'joined', ADDR);

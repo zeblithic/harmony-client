@@ -170,6 +170,42 @@ describe('CommunityMembersPanel', () => {
     expect(names.some((n) => n.includes('Bob'))).toBe(false);
   });
 
+  it('threads per-community thresholds into member rows — lowered kick shows Kick to a sub-50 moderator (ZEB-942)', async () => {
+    // Viewer at power 30 with a lowered kick threshold of 25 is authorized to
+    // kick per the backend. The control must appear on the target row. If the
+    // panel failed to forward `thresholds`, MemberRow would fall back to the
+    // default kick=50 and hide the control — so this pins the
+    // CommunityView → panel → MemberRow wiring, not just MemberRow's own logic.
+    const viewer30: CommunityMember = {
+      address: OWN_ADDRESS,
+      displayName: 'Alice',
+      power: 30,
+      status: 'joined',
+      joinedAt: 1700000000000,
+    };
+    const dave: CommunityMember = {
+      address: 'dave'.padEnd(32, '0'),
+      displayName: 'Dave',
+      power: 0,
+      status: 'joined',
+      joinedAt: 1700000001000,
+    };
+    render(CommunityMembersPanel, {
+      props: {
+        ...baseProps(),
+        communityService: makeService([viewer30, dave]),
+        thresholds: { kick: 25, setPower: 100 },
+      },
+    });
+
+    await screen.findByText(/Dave/);
+    // Only Dave's row is actionable (self-row has no actions at power 30), so
+    // there is exactly one kebab. Its presence already proves authorization;
+    // open it to confirm the specific control is Kick.
+    await fireEvent.click(screen.getByRole('button', { name: 'Member actions' }));
+    expect(screen.getByRole('menuitem', { name: 'Kick' })).toBeTruthy();
+  });
+
   it('IPC error surfaces as role="alert" in the panel', async () => {
     const service = makeService([], new Error('network timeout'));
     render(CommunityMembersPanel, {
