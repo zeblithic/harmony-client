@@ -453,6 +453,28 @@ pub(crate) enum AnnounceKey {
     Relay(OwnerAddr, [u8; 16]),
 }
 
+/// ZEB-939 test probe: counts calls to [`CommunityState::sync_admin_quorum`],
+/// so a batch-merge test can assert the per-insert `admin_quorum` re-materialize
+/// was collapsed to ONE sync per batch. `#[cfg(test)]` — never compiled into
+/// production. Callers reset it before the measured window (the counter is
+/// process-global; nextest runs each test in its own process).
+#[cfg(test)]
+pub(crate) mod quorum_sync_probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) static COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Zero the counter before a measured window.
+    pub(crate) fn reset() {
+        COUNT.store(0, Ordering::Relaxed);
+    }
+
+    /// Reads the number of `sync_admin_quorum` calls since the last `reset`.
+    pub(crate) fn get() -> u64 {
+        COUNT.load(Ordering::Relaxed)
+    }
+}
+
 impl CommunityState {
     pub fn new(community_id: SpaceId) -> Self {
         Self {
@@ -671,6 +693,40 @@ impl CommunityState {
         event: SignedMembershipEvent,
         ctx: &VerifyContext,
     ) -> InsertOutcome {
+        // Single-event path (local IPC inserts): sync `admin_quorum` inline, as
+        // before. The batch merge uses `insert_event_no_quorum_sync` instead
+        // (ZEB-939) and syncs once at batch-end.
+        self.insert_event_inner(event, ctx, true)
+    }
+
+    /// ZEB-939: batch-merge insert variant that SKIPS the per-insert
+    /// `admin_quorum` re-materialize. The caller (the Phase-B state-root merge)
+    /// inserts a whole batch through this, then calls
+    /// [`sync_admin_quorum`](Self::sync_admin_quorum) EXACTLY ONCE at batch-end.
+    ///
+    /// Rationale: `sync_admin_quorum` clones the entire event log and re-runs
+    /// the full membership state machine to read a single integer. During a
+    /// batch only the FINAL value is observable (each insert overwrites it), so
+    /// paying that O(n) cost per inserted event makes a large merge O(n²) on the
+    /// single-writer task. `admin_quorum` (the field) is a persistence cache —
+    /// every live reader re-derives via `materialize`; the field itself is read
+    /// only by the persist/DTO snapshot, `Debug`, and `PartialEq`, none of which
+    /// observe it mid-batch. So a single batch-end sync yields the identical
+    /// persisted value.
+    pub(crate) fn insert_event_no_quorum_sync(
+        &mut self,
+        event: SignedMembershipEvent,
+        ctx: &VerifyContext,
+    ) -> InsertOutcome {
+        self.insert_event_inner(event, ctx, false)
+    }
+
+    fn insert_event_inner(
+        &mut self,
+        event: SignedMembershipEvent,
+        ctx: &VerifyContext,
+        sync_quorum: bool,
+    ) -> InsertOutcome {
         use harmony_crdt_sync::verified_log::InsertOutcome as CoreOutcome;
 
         // Build a FRESH per-insert policy context. `now_floor_ms` is the
@@ -695,20 +751,32 @@ impl CommunityState {
             CoreOutcome::Rejected(e) => InsertOutcome::Rejected(e),
             CoreOutcome::Inserted => {
                 // Invalidate cache by bumping version. Lazy re-mat happens on
-                // the next `materialized` call.
+                // the next `materialized` call. ALWAYS done per insert — the
+                // materialized-view cache must observe every event.
                 self.cache.lock().expect("cache mutex poisoned").version += 1;
 
-                // ZEB-250: synchronize CommunityState.admin_quorum with the
-                // freshly-recomputed materialized view. `materialize` is the
-                // source of truth (walks ChangeQuorum proposals in HLC order);
-                // we write the result back to the persistent field so
-                // fast-load doesn't need to re-materialize.
-                let derived = self.materialize_now(ctx.admin_addr).admin_quorum;
-                self.admin_quorum = derived;
+                if sync_quorum {
+                    self.sync_admin_quorum(ctx.admin_addr);
+                }
 
                 InsertOutcome::Inserted
             }
         }
+    }
+
+    /// ZEB-250 / ZEB-939: recompute `admin_quorum` from the current event log
+    /// and write it back to the persisted field. `materialize` is the source of
+    /// truth (walks ChangeQuorum proposals in HLC order); the field is a
+    /// fast-load cache so a reloaded state need not re-materialize before its
+    /// first read.
+    ///
+    /// O(n) in the event log (a full clone + materialize). The single-event
+    /// path runs this per insert; the Phase-B merge runs it ONCE at batch-end
+    /// (see [`insert_event_no_quorum_sync`](Self::insert_event_no_quorum_sync)).
+    pub(crate) fn sync_admin_quorum(&mut self, admin_addr: OwnerAddr) {
+        #[cfg(test)]
+        quorum_sync_probe::COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.admin_quorum = self.materialize_now(admin_addr).admin_quorum;
     }
 
     /// Materialize the current event log without consulting the cache.
@@ -1305,6 +1373,176 @@ mod zeb846_accessor_ceiling {
             state.cache_recompute_after_for_test(),
             None,
             "no future-dated event ⇒ recompute_after stays None"
+        );
+    }
+}
+
+/// ZEB-939: the Phase-B state-root merge defers the per-insert `admin_quorum`
+/// re-materialize to a single batch-end `sync_admin_quorum`. These tests pin
+/// that the deferred path yields the byte-identical persisted field value as
+/// the per-insert path — including when the quorum-changing event is NOT the
+/// last in the batch.
+#[cfg(test)]
+mod zeb939_batch_quorum_sync {
+    use super::*;
+    use crate::community_membership::{
+        mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
+        ProposalKind, TestOwner,
+    };
+    use crate::owner_state_types::Hlc;
+
+    fn hlc(wall_ms: u64) -> Hlc {
+        Hlc {
+            wall_ms,
+            logical: 0,
+            device_id: "dev".into(),
+        }
+    }
+
+    /// Sign with `owner`'s device key; attach the enrollment cert on Joins so
+    /// materialize populates `enrolled_device_keys` and verify can resolve the
+    /// signer (mirrors the adopter tests' `sign_join`).
+    fn sign_as(payload: &EventPayload, owner: &TestOwner) -> SignedMembershipEvent {
+        let ev = sign_event(payload, &owner.device_key).expect("sign");
+        match ev.kind {
+            MembershipEventKind::Join | MembershipEventKind::PendingJoin { .. } => {
+                SignedMembershipEvent {
+                    enrollment: Some(owner.cert.clone()),
+                    ..ev
+                }
+            }
+            _ => ev,
+        }
+    }
+
+    /// A valid two-admin `ChangeQuorum → 2` sequence (mirrors the materialize
+    /// tests' `bootstrap_two_admins_raise_quorum`), followed by a trailing
+    /// channel-create so the quorum-raising event is the 4th of 5 — NOT last.
+    fn changequorum_not_last(
+        alice: &TestOwner,
+        bob: &TestOwner,
+        community_id: SpaceId,
+    ) -> Vec<SignedMembershipEvent> {
+        vec![
+            sign_as(
+                &EventPayload {
+                    id: [0x01; 16],
+                    community_id,
+                    kind: MembershipEventKind::Join,
+                    actor: alice.owner,
+                    at: hlc(1_000),
+                },
+                alice,
+            ),
+            sign_as(
+                &EventPayload {
+                    id: [0x02; 16],
+                    community_id,
+                    kind: MembershipEventKind::Join,
+                    actor: bob.owner,
+                    at: hlc(2_000),
+                },
+                bob,
+            ),
+            // admin1 promotes admin2 to power 100 (self-satisfies at quorum=1).
+            sign_as(
+                &EventPayload {
+                    id: [0x03; 16],
+                    community_id,
+                    kind: MembershipEventKind::SetPower {
+                        target: bob.owner,
+                        level: 100,
+                    },
+                    actor: alice.owner,
+                    at: hlc(3_000),
+                },
+                alice,
+            ),
+            // admin1 raises the quorum to 2 (self-satisfies under prior quorum=1).
+            sign_as(
+                &EventPayload {
+                    id: [0x04; 16],
+                    community_id,
+                    kind: MembershipEventKind::AdminProposal {
+                        proposal_kind: ProposalKind::ChangeQuorum { new_quorum: 2 },
+                    },
+                    actor: alice.owner,
+                    at: hlc(4_000),
+                },
+                alice,
+            ),
+            // Trailing innocuous event so ChangeQuorum is not the last insert.
+            sign_as(
+                &EventPayload {
+                    id: [0x05; 16],
+                    community_id,
+                    kind: MembershipEventKind::ChannelCreate {
+                        channel_id: ChannelId([0x09; 16]),
+                        name: "general".into(),
+                        write_power: 0,
+                        kind: ChannelKind::Text,
+                    },
+                    actor: alice.owner,
+                    at: hlc(5_000),
+                },
+                alice,
+            ),
+        ]
+    }
+
+    #[test]
+    fn batch_end_sync_matches_per_insert_with_changequorum_not_last() {
+        let alice = mint_test_owner(0xA7);
+        let bob = mint_test_owner(0xB7);
+        let community_id = SpaceId([0xA7; 16]);
+        let ctx = VerifyContext {
+            now_ms: None,
+            expected_community_id: community_id,
+            admin_addr: alice.owner,
+            is_invite_only: false,
+        };
+        let events = changequorum_not_last(&alice, &bob, community_id);
+
+        // Reference: the per-insert sync path (single-event IPC behavior).
+        let mut ref_state = CommunityState::new(community_id);
+        for e in &events {
+            assert_eq!(
+                ref_state.insert_event(e.clone(), &ctx),
+                InsertOutcome::Inserted,
+                "every event in the bootstrap sequence must be authorized + inserted"
+            );
+        }
+        assert_eq!(
+            ref_state.admin_quorum, 2,
+            "sanity: the two-admin ChangeQuorum sequence raises the quorum to 2"
+        );
+
+        // Under test: the batch-defer path used by the Phase-B merge.
+        let mut batch_state = CommunityState::new(community_id);
+        for e in &events {
+            assert_eq!(
+                batch_state.insert_event_no_quorum_sync(e.clone(), &ctx),
+                InsertOutcome::Inserted
+            );
+        }
+        // The whole point of the defer: the field stays at its default until the
+        // one batch-end sync, even though a ChangeQuorum already landed.
+        assert_eq!(
+            batch_state.admin_quorum, 1,
+            "deferred path leaves admin_quorum at its default until batch-end sync"
+        );
+
+        batch_state.sync_admin_quorum(ctx.admin_addr);
+
+        assert_eq!(
+            batch_state.admin_quorum, ref_state.admin_quorum,
+            "batch-end sync must produce the same admin_quorum as per-insert, \
+             with the ChangeQuorum not last in the batch"
+        );
+        assert_eq!(
+            batch_state.admin_quorum,
+            batch_state.materialize_now(ctx.admin_addr).admin_quorum,
+            "persisted field must equal the freshly-derived quorum"
         );
     }
 }
