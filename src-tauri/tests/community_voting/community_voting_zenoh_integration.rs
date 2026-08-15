@@ -80,7 +80,7 @@ fn noop_backfill() -> (
 ) {
     (
         Arc::new(|| Box::pin(async { Vec::new() })),
-        Arc::new(|_frame| Box::pin(async { true })),
+        Arc::new(|_frame| Box::pin(async {})),
     )
 }
 

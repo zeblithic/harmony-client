@@ -593,15 +593,19 @@ impl<R: tauri::Runtime> VotingLogEngine<R> {
     /// ZEB-932: RBSR requester half. Given a responder's reply — whose `Have`
     /// bodies the transport has already applied via `apply_backfilled_event` —
     /// compute the next request over our (post-apply) event set, or `None` once
-    /// nothing mismatches (converged).
+    /// nothing mismatches (converged). Returns `(still_missing, next)`:
+    /// `still_missing` is the count of advertised `Have` keys NOT present in our
+    /// post-apply set — non-zero means a body the responder advertised never
+    /// landed (rejected on apply, dropped in transit, or failed the current-epoch
+    /// cut), so the caller must NOT trust the optimistic Have→Skip convergence.
     pub(crate) async fn rbsr_process_reply(
         &self,
         reply: &crate::channel_rbsr::RbsrMessage,
-    ) -> Option<crate::channel_rbsr::RbsrMessage> {
+    ) -> (usize, Option<crate::channel_rbsr::RbsrMessage>) {
         let log = self.voting_log.lock().await;
         let src = crate::voting_rbsr::VotingReconcileSource::from_events(&log.events);
-        let (_missing, next) = crate::channel_rbsr::process_reply(reply, &src);
-        next
+        let (missing, next) = crate::channel_rbsr::process_reply(reply, &src);
+        (missing.len(), next)
     }
 
     /// Construct an engine, spawn its inbound receive loop, and return
@@ -3894,9 +3898,9 @@ pub fn backfill_closures_for_test<R: tauri::Runtime>(
     let e_apply = Arc::clone(engine);
     let apply: crate::event_loop::VotingBackfillApplyFn = Arc::new(move |frame: Vec<u8>| {
         let e = Arc::clone(&e_apply);
-        // ZEB-932: is_ok() — false on a hard reject so the RBSR requester avoids
-        // false convergence; the full-dump path ignores it.
-        Box::pin(async move { e.apply_backfilled_event(&frame).await.is_ok() })
+        Box::pin(async move {
+            let _ = e.apply_backfilled_event(&frame).await;
+        })
     });
     (read, apply)
 }
@@ -4271,8 +4275,10 @@ mod tests {
             for body in &bodies {
                 let _ = engine_b.apply_backfilled_event(body).await;
             }
-            match engine_b.rbsr_process_reply(&reply).await {
-                Some(next) => req = next,
+            let (missing, next) = engine_b.rbsr_process_reply(&reply).await;
+            assert_eq!(missing, 0, "every advertised Have body applied in-process");
+            match next {
+                Some(n) => req = n,
                 None => break,
             }
         }

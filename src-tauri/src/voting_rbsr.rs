@@ -369,4 +369,44 @@ mod tests {
         let (_m, next) = process_reply(&reply, &source(&a));
         assert!(next.is_none(), "identical logs converge immediately");
     }
+
+    /// ZEB-932 (Greptile P1): a Have body that never lands — dropped in transit
+    /// or failing the epoch cut, so `apply_backfilled` is never even called —
+    /// must still be caught. `process_reply`'s post-apply `missing` count is that
+    /// signal: an advertised Have key absent from the requester's set is counted,
+    /// so the transport forces the full-dump fallback instead of falsely
+    /// converging. Small holder (≤ LEAF_THRESHOLD) so the whole universe ships as
+    /// one Have range.
+    #[test]
+    fn unapplied_have_key_is_flagged_missing_for_fallback() {
+        use crate::channel_rbsr::{initial_request, process_reply, respond};
+        let a = many_events(10);
+        let empty: Vec<SignedVotingEvent> = Vec::new();
+
+        let reply = respond(&initial_request(&source(&empty)), &source(&a));
+        let advertised = have_keys_of(&reply);
+        assert_eq!(
+            advertised.len(),
+            10,
+            "small holder ships all keys in one Have"
+        );
+
+        // Requester applied NOTHING (all bodies dropped) → every advertised key
+        // is still missing → the transport would force a fallback.
+        let (missing_dropped, _next) = process_reply(&reply, &source(&empty));
+        assert_eq!(
+            missing_dropped.len(),
+            advertised.len(),
+            "all unapplied advertised keys are flagged missing"
+        );
+
+        // A requester that DID apply them (here: the holder-equivalent set) has
+        // nothing missing → real convergence.
+        let (missing_applied, _n) = process_reply(&reply, &source(&a));
+        assert_eq!(
+            missing_applied.len(),
+            0,
+            "applied bodies leave nothing missing"
+        );
+    }
 }
