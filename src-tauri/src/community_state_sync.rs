@@ -2428,10 +2428,13 @@ struct InternalCtx {
     root_serve_rx: Option<mpsc::Receiver<RootServeRequest>>,
 
     /// ZEB-805 fetch-retry re-injection channel. A `FetchMiss` sleeper sends
-    /// `(wire, attempts_left)` back here after its delay; `internal_task` takes
-    /// the receiver out of the ctx at start and polls it as a `select!` arm.
-    fetch_retry_tx: mpsc::Sender<(Vec<u8>, u8)>,
-    fetch_retry_rx: Option<mpsc::Receiver<(Vec<u8>, u8)>>,
+    /// `(wire, attempts_left, max_fetched)` back here after its delay;
+    /// `internal_task` takes the receiver out of the ctx at start and polls it as
+    /// a `select!` arm. ZEB-938: `max_fetched` is the best segment-fetch progress
+    /// this frame has reached across prior attempts, carried so `retry_after_miss`
+    /// can tell a resuming round (new high-water mark) from a stalled one.
+    fetch_retry_tx: mpsc::Sender<(Vec<u8>, u8, usize)>,
+    fetch_retry_rx: Option<mpsc::Receiver<(Vec<u8>, u8, usize)>>,
     /// Caps concurrent retry sleepers — each retains a wire frame for the whole
     /// delay, so this bounds retained memory under a publish flood, not just
     /// task count. See `FETCH_RETRY_MAX_INFLIGHT`.
@@ -3269,6 +3272,9 @@ async fn internal_task(mut ctx: InternalCtx) {
                     &ctx,
                     bytes,
                     FETCH_RETRY_ATTEMPTS,
+                    // A fresh frame has no prior progress — the high-water mark
+                    // starts at zero (ZEB-938).
+                    0,
                     FrameOrigin::Network,
                     &resolved_tx,
                     &resolve_sem,
@@ -3278,11 +3284,14 @@ async fn internal_task(mut ctx: InternalCtx) {
             // ZEB-805: a fetch-retry sleeper handing its wire frame back after
             // the delay. Re-enters the FULL inbound pipeline, so the replay
             // check naturally kills a retry that a newer root has superseded.
-            Some((wire, attempts_left)) = fetch_retry_rx.recv() => {
+            // ZEB-938: `max_fetched` carries the frame's best segment-fetch
+            // progress so the resumable budget survives across rounds.
+            Some((wire, attempts_left, max_fetched)) = fetch_retry_rx.recv() => {
                 dispatch_inbound(
                     &ctx,
                     wire,
                     attempts_left,
+                    max_fetched,
                     FrameOrigin::Retry,
                     &resolved_tx,
                     &resolve_sem,
@@ -4129,6 +4138,12 @@ pub(crate) struct CommunitySyncStats {
     /// in-flight cap (`resolve_sem`) was saturated. Distinct from
     /// `fetch_retries_dropped` (dropped fetch-RETRY sleepers).
     pub(crate) ingest_resolve_dropped: AtomicU64,
+    /// ZEB-938: count of fetch-retry rounds that reset the no-progress budget
+    /// because the round reached a NEW high-water mark of fetched segments. A
+    /// nonzero value means a large segmented root is resuming across rounds
+    /// (converging on a lossy path) rather than restarting all-or-nothing —
+    /// the fleet-diagnostic complement to `fetch_retries_exhausted`.
+    pub(crate) fetch_retries_progress_resets: AtomicU64,
     // ZEB-762: publish-side `RetryBackoff` observability — the OUTBOUND
     // complement to `last_inbound`/`last_advance`. `last_advance` answers "am I
     // receiving?"; these answer "am I successfully publishing MY state out, or
@@ -4230,6 +4245,7 @@ async fn dispatch_inbound(
     ctx: &InternalCtx,
     wire: Vec<u8>,
     attempts_left: u8,
+    max_fetched: usize,
     origin: FrameOrigin,
     resolved_tx: &mpsc::Sender<ResolvedIngest>,
     resolve_sem: &Arc<Semaphore>,
@@ -4283,6 +4299,7 @@ async fn dispatch_inbound(
                     .send(ResolvedIngest {
                         result,
                         attempts_left,
+                        max_fetched,
                     })
                     .await;
             });
@@ -4297,6 +4314,7 @@ async fn apply_resolved_ingest(ctx: &InternalCtx, ri: ResolvedIngest) {
     let ResolvedIngest {
         result,
         attempts_left,
+        max_fetched,
     } = ri;
     match result {
         ResolveResult::Ready {
@@ -4316,7 +4334,11 @@ async fn apply_resolved_ingest(ctx: &InternalCtx, ri: ResolvedIngest) {
             finish_incoming_outcome(ctx, outcome).await;
         }
         // A blob/segment fetch miss re-enters the bounded fetch-retry loop.
-        ResolveResult::Miss(wire) => schedule_fetch_retry(ctx, wire, attempts_left).await,
+        // ZEB-938: pass the retry budget the progress it made (`fetched`) and its
+        // best-so-far (`max_fetched`) so the budget resumes rather than restarts.
+        ResolveResult::Miss { wire, fetched } => {
+            schedule_fetch_retry(ctx, wire, attempts_left, max_fetched, fetched).await
+        }
         // A pre-mutation rejection (decode/misroute/sig/bootstrap) — report it.
         ResolveResult::Err(e) => {
             finish_incoming_outcome(ctx, IncomingOutcome::ErrPreMutation(e)).await
@@ -4324,35 +4346,119 @@ async fn apply_resolved_ingest(ctx: &InternalCtx, ri: ResolvedIngest) {
     }
 }
 
+/// ZEB-938: the next step of the progress-based fetch-retry budget after a miss.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryStep {
+    /// The budget is spent after a run of no-progress rounds — drop the frame
+    /// and report degraded. `retry_after_miss` returns this only when the frame
+    /// made no new progress AND `attempts_left` has counted down to zero.
+    Exhausted,
+    /// Re-inject the frame for another attempt, carrying the remaining budget
+    /// and the best-progress-so-far high-water mark.
+    Retry {
+        attempts_left: u8,
+        max_fetched: usize,
+    },
+}
+
+/// ZEB-938: decide the retry step after a state-root fetch miss.
+///
+/// `this_fetched` is how many segments THIS attempt fetched+opened before it
+/// missed; `prior_max_fetched` is the best any earlier attempt for this frame
+/// reached. A miss that set a NEW high-water mark (`this_fetched >
+/// prior_max_fetched`) is *progress*: reset the no-progress budget to full, so
+/// the frame keeps retrying as long as each round eventually fetches at least
+/// one new segment. Otherwise the budget counts down and terminates at zero.
+///
+/// This is what turns the former all-or-nothing segmented-root fetch (one
+/// missing segment abandoned the whole root after a fixed `1 +
+/// FETCH_RETRY_ATTEMPTS` attempts) into a resumable one: a large root converges
+/// on a lossy path because the CAS caches every fetched segment, so a retry only
+/// network-fetches the still-missing ones and each round can advance the mark.
+/// Only a *stall* — no new segment for `FETCH_RETRY_ATTEMPTS + 1` consecutive
+/// rounds, i.e. a genuinely-unfetchable segment — abandons the root.
+///
+/// The all-or-nothing case (`this_fetched == prior_max_fetched == 0`: a
+/// monolithic root, or a manifest blob that itself never fetches) never makes
+/// progress, so it reduces to exactly the pre-ZEB-938 fixed budget — that
+/// path's behavior is unchanged. Total attempts stay bounded: progress can
+/// occur at most `MANIFEST_SEGMENT_CAP` times (each strictly raises the mark),
+/// with at most `FETCH_RETRY_ATTEMPTS + 1` no-progress rounds between, so the
+/// re-injection chain cannot run forever.
+fn retry_after_miss(attempts_left: u8, prior_max_fetched: usize, this_fetched: usize) -> RetryStep {
+    if this_fetched > prior_max_fetched {
+        RetryStep::Retry {
+            attempts_left: FETCH_RETRY_ATTEMPTS,
+            max_fetched: this_fetched,
+        }
+    } else if attempts_left == 0 {
+        RetryStep::Exhausted
+    } else {
+        RetryStep::Retry {
+            attempts_left: attempts_left - 1,
+            max_fetched: prior_max_fetched,
+        }
+    }
+}
+
 /// ZEB-937: schedule a bounded fetch-retry for a `ResolveResult::Miss`. Extracted
-/// verbatim from the former `process_inbound` FetchMiss branch — same exhaustion
-/// budget, same in-flight-cap shield, same re-injection via `fetch_retry_tx`.
-async fn schedule_fetch_retry(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u8) {
+/// from the former `process_inbound` FetchMiss branch — same in-flight-cap
+/// shield and re-injection via `fetch_retry_tx`. ZEB-938 replaced the fixed
+/// exhaustion budget with the progress-based [`retry_after_miss`] decision so a
+/// large segmented root resumes across rounds instead of restarting all-or-none.
+async fn schedule_fetch_retry(
+    ctx: &InternalCtx,
+    wire: Vec<u8>,
+    attempts_left: u8,
+    prior_max_fetched: usize,
+    this_fetched: usize,
+) {
     {
-        if attempts_left == 0 {
-            // Budget spent. NOW it is a terminal drop, and reports as the
-            // BlobNotFound this path used to return on the very first miss.
+        let (next_attempts_left, new_max_fetched) = match retry_after_miss(
+            attempts_left,
+            prior_max_fetched,
+            this_fetched,
+        ) {
+            RetryStep::Exhausted => {
+                // Budget spent after a run of no-progress rounds. NOW it is a
+                // terminal drop, and reports as the BlobNotFound this path
+                // used to return on the very first miss.
+                ctx.sync_stats
+                    .fetch_retries_exhausted
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    community_id = ?ctx.community_id,
+                    budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+                    attempts = FETCH_RETRY_ATTEMPTS + 1,
+                    max_fetched = prior_max_fetched,
+                    "community state-root blob fetch retries exhausted — publish dropped; \
+                     tracker un-advanced, so a peer's next publish or re-offer is still admissible"
+                );
+                report_degraded(
+                    ctx.error_tx.as_ref(),
+                    ctx.community_id,
+                    "blob_not_found",
+                    format!(
+                        "state-root blob not fetchable within {}ms after {} no-progress attempts",
+                        crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
+                        FETCH_RETRY_ATTEMPTS + 1
+                    ),
+                );
+                return;
+            }
+            RetryStep::Retry {
+                attempts_left,
+                max_fetched,
+            } => (attempts_left, max_fetched),
+        };
+
+        // ZEB-938: a round that reached a new high-water mark reset the budget —
+        // a large root is resuming across rounds. Count it as the fleet-
+        // diagnostic complement to `fetch_retries_exhausted`.
+        if this_fetched > prior_max_fetched {
             ctx.sync_stats
-                .fetch_retries_exhausted
+                .fetch_retries_progress_resets
                 .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                community_id = ?ctx.community_id,
-                budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
-                attempts = FETCH_RETRY_ATTEMPTS + 1,
-                "community state-root blob fetch retries exhausted — publish dropped; \
-                 tracker un-advanced, so a peer's next publish or re-offer is still admissible"
-            );
-            report_degraded(
-                ctx.error_tx.as_ref(),
-                ctx.community_id,
-                "blob_not_found",
-                format!(
-                    "state-root blob not fetchable within {}ms after {} attempts",
-                    crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
-                    FETCH_RETRY_ATTEMPTS + 1
-                ),
-            );
-            return;
         }
 
         // Acquire the permit BEFORE spawning, so the count of detached
@@ -4379,7 +4485,8 @@ async fn schedule_fetch_retry(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u
             .fetch_max(inflight, Ordering::Relaxed);
         tracing::info!(
             community_id = ?ctx.community_id,
-            attempts_left,
+            attempts_left = next_attempts_left,
+            max_fetched = new_max_fetched,
             delay_ms = FETCH_RETRY_DELAY_MS,
             "community state-root blob fetch failed — retry scheduled"
         );
@@ -4404,7 +4511,10 @@ async fn schedule_fetch_retry(ctx: &InternalCtx, wire: Vec<u8>, attempts_left: u
             // sleepers can spawn while earlier messages sit undrained in the
             // channel — and the engine can sit for seconds inside a 5 s-budget
             // CAS fetch.
-            if tx.try_send((wire, attempts_left - 1)).is_err() {
+            if tx
+                .try_send((wire, next_attempts_left, new_max_fetched))
+                .is_err()
+            {
                 stats.fetch_retries_dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("community fetch-retry re-injection channel unavailable — dropped");
             }
@@ -4635,7 +4745,13 @@ enum ResolveResult {
     /// is un-advanced and re-delivery of the same frame is admitted again — the
     /// ZEB-805 fix for the 90-minute silent partition, pinned by
     /// `tracker_stays_unadvanced_across_miss_and_exhaustion`.
-    Miss(Vec<u8>),
+    ///
+    /// ZEB-938: `fetched` is how many segments were fetched+opened before this
+    /// miss (0 for a root/manifest-blob miss or the legacy monolithic path). It
+    /// is the progress signal `retry_after_miss` uses to reset the retry budget
+    /// when a round advances the high-water mark — so a large segmented root
+    /// resumes across rounds instead of restarting all-or-nothing.
+    Miss { wire: Vec<u8>, fetched: usize },
     /// A pre-mutation rejection (decrypt/decode/sig/misroute/bootstrap).
     Err(CommunitySyncError),
 }
@@ -4646,6 +4762,10 @@ enum ResolveResult {
 struct ResolvedIngest {
     result: ResolveResult,
     attempts_left: u8,
+    /// ZEB-938: the frame's best segment-fetch progress across prior attempts.
+    /// `retry_after_miss` compares this attempt's `fetched` against it to decide
+    /// whether a miss resumed (new high-water mark) or stalled.
+    max_fetched: usize,
 }
 
 /// ZEB-937: on-task prepare phase. See [`PreparedIngest`]. Steps 1-4 of the
@@ -5058,7 +5178,9 @@ async fn resolve_ingest(fetch_ctx: FetchCtx, plan: FetchPlan, wire: Vec<u8>) -> 
                 budget_ms = crate::content_store::STATE_ROOT_FETCH_TIMEOUT_MS,
                 "community state-root blob fetch miss — will retry if budget remains"
             );
-            return ResolveResult::Miss(wire);
+            // fetched: 0 — the manifest blob itself is the all-or-nothing unit;
+            // no segment has been fetched, so this pass made no progress.
+            return ResolveResult::Miss { wire, fetched: 0 };
         }
         Err(e) => {
             // ZEB-805 (r1): a content-store error is the SAME transient class as
@@ -5079,7 +5201,7 @@ async fn resolve_ingest(fetch_ctx: FetchCtx, plan: FetchPlan, wire: Vec<u8>) -> 
                 error = %e,
                 "community state-root blob fetch error — will retry if budget remains"
             );
-            return ResolveResult::Miss(wire);
+            return ResolveResult::Miss { wire, fetched: 0 };
         }
     };
 
@@ -5125,7 +5247,11 @@ async fn resolve_ingest(fetch_ctx: FetchCtx, plan: FetchPlan, wire: Vec<u8>) -> 
                 });
             }
             let mut events: Vec<SignedMembershipEvent> = Vec::new();
-            for seg_ref in &manifest.segments {
+            // ZEB-938: `fetched` (the enumerate index) is the count of segments
+            // already fetched+opened when the loop body runs, so a miss at this
+            // segment hands back exactly how far this pass got — the progress the
+            // resumable retry budget resets on.
+            for (fetched, seg_ref) in manifest.segments.iter().enumerate() {
                 // A segment fetch is pre-mutation exactly like the root fetch
                 // (the replay ticket from step 5 is still un-consumed), so a
                 // miss/error hands the frame back for the same bounded retry.
@@ -5146,7 +5272,7 @@ async fn resolve_ingest(fetch_ctx: FetchCtx, plan: FetchPlan, wire: Vec<u8>) -> 
                             cid = ?seg_ref.segment_cid,
                             "community state-root segment fetch miss — will retry if budget remains"
                         );
-                        return ResolveResult::Miss(wire);
+                        return ResolveResult::Miss { wire, fetched };
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -5155,7 +5281,7 @@ async fn resolve_ingest(fetch_ctx: FetchCtx, plan: FetchPlan, wire: Vec<u8>) -> 
                             error = %e,
                             "community state-root segment fetch error — will retry if budget remains"
                         );
-                        return ResolveResult::Miss(wire);
+                        return ResolveResult::Miss { wire, fetched };
                     }
                 };
                 match crate::community_state_segments::open_segment(
@@ -12258,6 +12384,501 @@ mod tests {
             crate::content_store::fetch_retry::ATTEMPTS
         );
     }
+
+    /// ZEB-938: a fetch miss that reached a NEW high-water mark of fetched
+    /// segments (progress) resets the no-progress budget to full — even at
+    /// `attempts_left == 0`. This is what lets a large segmented root converge
+    /// on a lossy path across arbitrarily many rounds, as long as each round
+    /// eventually fetches at least one new segment (the CAS caches every fetched
+    /// segment, so re-fetches of earlier ones are local cache hits).
+    #[test]
+    fn retry_after_miss_resets_budget_on_progress() {
+        assert_eq!(
+            retry_after_miss(0, 3, 4),
+            RetryStep::Retry {
+                attempts_left: FETCH_RETRY_ATTEMPTS,
+                max_fetched: 4,
+            },
+            "a new high-water mark resets the budget even with no attempts left"
+        );
+        assert_eq!(
+            retry_after_miss(FETCH_RETRY_ATTEMPTS, 0, 1),
+            RetryStep::Retry {
+                attempts_left: FETCH_RETRY_ATTEMPTS,
+                max_fetched: 1,
+            },
+            "the first segment fetched is progress off the zero baseline"
+        );
+    }
+
+    /// ZEB-938: a miss that fetched no NEW segment (`this <= prior`) makes no
+    /// progress — the budget counts down and carries the existing high-water
+    /// mark forward. A regression (`this < prior`, e.g. an earlier segment
+    /// evicted mid-chain) is treated identically: it is not progress.
+    #[test]
+    fn retry_after_miss_counts_down_without_progress() {
+        assert_eq!(
+            retry_after_miss(3, 5, 5),
+            RetryStep::Retry {
+                attempts_left: 2,
+                max_fetched: 5,
+            },
+            "re-reaching the same mark decrements and keeps the mark"
+        );
+        assert_eq!(
+            retry_after_miss(1, 5, 5),
+            RetryStep::Retry {
+                attempts_left: 0,
+                max_fetched: 5,
+            },
+        );
+        assert_eq!(
+            retry_after_miss(2, 5, 3),
+            RetryStep::Retry {
+                attempts_left: 1,
+                max_fetched: 5,
+            },
+            "a regression below the high-water mark is not progress"
+        );
+    }
+
+    /// ZEB-938: the budget still terminates. `attempts_left == 0` with no new
+    /// progress abandons the root and reports degraded (via the caller). The
+    /// all-or-nothing monolithic case (`this == prior == 0`) reduces to exactly
+    /// the pre-ZEB-938 fixed budget, so that path's behavior is unchanged.
+    #[test]
+    fn retry_after_miss_exhausts_after_a_run_of_no_progress() {
+        assert_eq!(retry_after_miss(0, 5, 5), RetryStep::Exhausted);
+        assert_eq!(
+            retry_after_miss(0, 0, 0),
+            RetryStep::Exhausted,
+            "monolithic all-or-nothing: no progress signal, unchanged budget"
+        );
+    }
+
+    /// A CAS double for the segmented-root progress tests (ZEB-938). Segments
+    /// trickle in one per round: segment with threshold `t` returns `Ok(None)`
+    /// (a miss) until the store has seen more than `t` rounds, then serves the
+    /// blob. A "round" is one GET of the manifest (root) CID, which begins every
+    /// `resolve_ingest` pass. The root itself is always available. This models
+    /// the real incident — a large root whose segments become fetchable at
+    /// different times on a lossy path — without a 2048-event real root.
+    struct TrickleStore {
+        blobs: std::sync::Mutex<
+            std::collections::HashMap<crate::owner_state_types::ContentId, Vec<u8>>,
+        >,
+        root_cid: crate::owner_state_types::ContentId,
+        seg_thresholds: std::collections::HashMap<crate::owner_state_types::ContentId, u32>,
+        round: std::sync::atomic::AtomicU32,
+        get_calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for TrickleStore {
+        async fn put(
+            &self,
+            cid: crate::owner_state_types::ContentId,
+            blob: Vec<u8>,
+        ) -> Result<(), crate::content_store::ContentStoreError> {
+            self.blobs.lock().unwrap().insert(cid, blob);
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            cid: &crate::owner_state_types::ContentId,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            self.get_with_budget(cid, std::time::Duration::from_millis(0))
+                .await
+        }
+
+        async fn get_with_budget(
+            &self,
+            cid: &crate::owner_state_types::ContentId,
+            _budget: std::time::Duration,
+        ) -> Result<Option<Vec<u8>>, crate::content_store::ContentStoreError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            if *cid == self.root_cid {
+                // Root GET starts a pass — advance the round clock.
+                self.round.fetch_add(1, Ordering::SeqCst);
+                return Ok(self.blobs.lock().unwrap().get(cid).cloned());
+            }
+            if let Some(&threshold) = self.seg_thresholds.get(cid) {
+                if self.round.load(Ordering::SeqCst) > threshold {
+                    return Ok(self.blobs.lock().unwrap().get(cid).cloned());
+                }
+                // Not yet fetchable this round — a segment miss.
+                return Ok(None);
+            }
+            Ok(self.blobs.lock().unwrap().get(cid).cloned())
+        }
+    }
+
+    /// ZEB-938: `resolve_ingest` must report HOW MANY segments it fetched before
+    /// a miss — the progress signal the resumable retry budget is built on.
+    /// Across a trickle where one more segment becomes fetchable each round, the
+    /// returned `Miss.fetched` must strictly increase, and once every segment is
+    /// available the whole root resolves. Without a truthful `fetched`, the
+    /// progress-based budget in `retry_after_miss` can never see progress and a
+    /// large root on a lossy path would still be abandoned.
+    #[tokio::test]
+    async fn resolve_ingest_reports_progressive_fetched_across_trickle_zeb938() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
+        };
+        use crate::community_state_segments::{
+            seal_manifest, seal_segment, EventBoundary, ManifestCleartext, SegmentRef,
+            MANIFEST_CLEARTEXT_V1, MANIFEST_FORMAT_V1,
+        };
+
+        let community_id = SpaceId([0x3C; 16]);
+        let admin = mint_test_owner(0xAA);
+        let admin_addr = admin.owner;
+        let admin_sk = admin.device_key.clone();
+        let epoch_key = EpochKey::new([0x55; 32]);
+
+        // Five one-event segments, each sealed under its own K_s and made
+        // available only from round > its index (seg0 round 2, seg4 round 5).
+        let mut segments: Vec<SegmentRef> = Vec::new();
+        let mut blobs = std::collections::HashMap::new();
+        let mut seg_thresholds = std::collections::HashMap::new();
+        for i in 0..5u8 {
+            let ev_payload = EventPayload {
+                id: [i; 16],
+                community_id,
+                kind: MembershipEventKind::ChannelCreate {
+                    channel_id: ChannelId([i; 16]),
+                    name: format!("ch{i}"),
+                    write_power: 0,
+                    kind: ChannelKind::Text,
+                },
+                actor: admin_addr,
+                at: Hlc {
+                    wall_ms: 100_000 + i as u64,
+                    logical: 0,
+                    device_id: "admin-dev".into(),
+                },
+            };
+            let ev = sign_event(&ev_payload, &admin_sk).expect("sign segment event");
+            let k_s = [0xE0u8 + i; 32];
+            let (seg_cid, seg_ct) =
+                seal_segment(community_id, std::slice::from_ref(&ev), &k_s).expect("seal segment");
+            blobs.insert(seg_cid, seg_ct);
+            seg_thresholds.insert(seg_cid, i as u32);
+            segments.push(SegmentRef {
+                segment_cid: seg_cid,
+                lo: EventBoundary::of(&ev),
+                hi: EventBoundary::of(&ev),
+                count: 1,
+                k_s,
+            });
+        }
+        let manifest = ManifestCleartext {
+            version: MANIFEST_CLEARTEXT_V1,
+            community_id,
+            segments,
+            tail: vec![],
+        };
+        let (root_cid, manifest_ct) = seal_manifest(&epoch_key, &manifest).expect("seal manifest");
+        blobs.insert(root_cid, manifest_ct);
+
+        let store = Arc::new(TrickleStore {
+            blobs: std::sync::Mutex::new(blobs),
+            root_cid,
+            seg_thresholds,
+            round: std::sync::atomic::AtomicU32::new(0),
+            get_calls: Arc::new(AtomicU64::new(0)),
+        });
+
+        let payload = CommunityRootPublishPayload {
+            root_cid,
+            publisher_addr: admin_addr,
+            at: Hlc {
+                wall_ms: 200_000,
+                logical: 0,
+                device_id: "admin-dev".into(),
+            },
+            publisher_sig: [0u8; 64],
+            epoch: None,
+            manifest_format: Some(MANIFEST_FORMAT_V1),
+        };
+
+        // A fresh (FetchCtx, FetchPlan, wire) per pass — resolve_ingest consumes
+        // them — all sharing the one Arc<TrickleStore> so its round persists.
+        let make = |payload: &CommunityRootPublishPayload| {
+            let fetch_ctx = FetchCtx {
+                content_store: Arc::clone(&store) as Arc<dyn ContentStore>,
+                community_id,
+                admin_addr,
+            };
+            let plan = FetchPlan {
+                payload: payload.clone(),
+                root_key_used: epoch_key.clone(),
+                deferred_open_bootstrap: false,
+                deferred_invite_bootstrap: false,
+            };
+            (fetch_ctx, plan, vec![0xABu8; 8])
+        };
+
+        // Passes 1..=4: one more segment is fetchable each round, so the miss
+        // point — and thus `fetched` — advances by exactly one per pass.
+        for expected in 1..=4usize {
+            let (fc, plan, wire) = make(&payload);
+            match resolve_ingest(fc, plan, wire).await {
+                ResolveResult::Miss { fetched, .. } => assert_eq!(
+                    fetched, expected,
+                    "pass should have fetched {expected} segments before missing"
+                ),
+                ResolveResult::Ready { .. } => panic!("pass {expected}: expected Miss, got Ready"),
+                ResolveResult::Err(e) => panic!("pass {expected}: expected Miss, got Err({e})"),
+            }
+        }
+
+        // Pass 5: every segment is now available → the whole root resolves.
+        let (fc, plan, wire) = make(&payload);
+        match resolve_ingest(fc, plan, wire).await {
+            ResolveResult::Ready { resolved, .. } => assert_eq!(
+                resolved.len(),
+                5,
+                "all five segments' events resolve once every segment is fetchable"
+            ),
+            ResolveResult::Miss { fetched, .. } => {
+                panic!("pass 5: expected Ready, still missing after fetched={fetched}")
+            }
+            ResolveResult::Err(e) => panic!("pass 5: expected Ready, got Err({e})"),
+        }
+    }
+
+    /// ZEB-938 flagship: a large segmented root whose segments become fetchable
+    /// one-per-round on a lossy path must CONVERGE through the full engine loop —
+    /// the whole point of the resumable budget. The trickle needs FIVE rounds to
+    /// land every segment, which is strictly more than the pre-ZEB-938 fixed
+    /// budget of `1 + FETCH_RETRY_ATTEMPTS` (4) attempts allowed; under that old
+    /// budget the frame was abandoned at round 4 and the channels never appeared.
+    /// Now each round advances the fetched high-water mark, resetting the budget,
+    /// so the root resumes across arbitrarily many rounds and materializes.
+    ///
+    /// This exercises the real wiring end-to-end (dispatch → resolve → apply →
+    /// schedule_fetch_retry → re-inject), which the pure `retry_after_miss` and
+    /// isolated `resolve_ingest` tests cannot: `fetched`/`max_fetched` are both
+    /// `usize`, so only a test that composes them across real re-injection rounds
+    /// catches a mis-threaded argument.
+    ///
+    /// `start_paused` so the 2 s retry delays cost no wall-clock.
+    #[tokio::test(start_paused = true)]
+    async fn segmented_root_trickle_converges_beyond_fixed_budget_zeb938() {
+        use crate::community_membership::{
+            mint_test_owner, sign_event, ChannelId, ChannelKind, EventPayload, MembershipEventKind,
+            SignedMembershipEvent,
+        };
+        use crate::community_state_crdt::InsertOutcome;
+        use crate::community_state_segments::{
+            seal_manifest, seal_segment, EventBoundary, ManifestCleartext, SegmentRef,
+            MANIFEST_CLEARTEXT_V1, MANIFEST_FORMAT_V1,
+        };
+        use crate::owner_state_crypto::canonical_cbor_encode;
+        use ed25519_dalek::Signer;
+
+        let community_id = SpaceId([0x3C; 16]);
+        let alice = mint_test_owner(0xAA);
+        let bob = mint_test_owner(0xBB);
+        let alice_addr = alice.owner;
+        let bob_addr = bob.owner;
+        let alice_sk = alice.device_key.clone();
+        let bob_sk = Arc::new(bob.device_key.clone());
+        let membership_key = EpochKey::new([0x55; 32]);
+        let resolver: Arc<dyn IdentityResolver> = Arc::new(NopResolver);
+
+        // Alice's EnrollmentCert-bearing bootstrap Join — seeded into Bob so his
+        // membership-at-HLC gate admits her publish and can verify its sig.
+        let alice_join_at = Hlc {
+            wall_ms: 100_000,
+            logical: 0,
+            device_id: "alice-dev".into(),
+        };
+        let alice_join = SignedMembershipEvent {
+            enrollment: Some(alice.cert.clone()),
+            ..sign_event(
+                &EventPayload {
+                    id: [0x10; 16],
+                    community_id,
+                    kind: MembershipEventKind::Join,
+                    actor: alice_addr,
+                    at: alice_join_at,
+                },
+                &alice_sk,
+            )
+            .expect("sign join")
+        };
+
+        // Five channel-create events, one per segment, each after Alice's join.
+        // Segment i is fetchable only from round > i, so the root needs 5 rounds.
+        const N_SEGMENTS: u8 = 5;
+        let mut ch_ids = Vec::new();
+        let mut segments: Vec<SegmentRef> = Vec::new();
+        let mut blobs = std::collections::HashMap::new();
+        let mut seg_thresholds = std::collections::HashMap::new();
+        for i in 0..N_SEGMENTS {
+            let ch_id = ChannelId([0x40 + i; 16]);
+            ch_ids.push(ch_id);
+            let ev = sign_event(
+                &EventPayload {
+                    id: [0x20 + i; 16],
+                    community_id,
+                    kind: MembershipEventKind::ChannelCreate {
+                        channel_id: ch_id,
+                        name: format!("ch{i}"),
+                        write_power: 0,
+                        kind: ChannelKind::Text,
+                    },
+                    actor: alice_addr,
+                    at: Hlc {
+                        wall_ms: 100_001 + i as u64,
+                        logical: 0,
+                        device_id: "alice-dev".into(),
+                    },
+                },
+                &alice_sk,
+            )
+            .expect("sign channel-create");
+            let k_s = [0xE0u8 + i; 32];
+            let (seg_cid, seg_ct) =
+                seal_segment(community_id, std::slice::from_ref(&ev), &k_s).expect("seal segment");
+            blobs.insert(seg_cid, seg_ct);
+            seg_thresholds.insert(seg_cid, i as u32);
+            segments.push(SegmentRef {
+                segment_cid: seg_cid,
+                lo: EventBoundary::of(&ev),
+                hi: EventBoundary::of(&ev),
+                count: 1,
+                k_s,
+            });
+        }
+        let manifest = ManifestCleartext {
+            version: MANIFEST_CLEARTEXT_V1,
+            community_id,
+            segments,
+            tail: vec![],
+        };
+        let (root_cid, manifest_ct) =
+            seal_manifest(&membership_key, &manifest).expect("seal manifest");
+        blobs.insert(root_cid, manifest_ct);
+
+        let store = Arc::new(TrickleStore {
+            blobs: std::sync::Mutex::new(blobs),
+            root_cid,
+            seg_thresholds,
+            round: std::sync::atomic::AtomicU32::new(0),
+            get_calls: Arc::new(AtomicU64::new(0)),
+        });
+
+        let dir_b = tempfile::tempdir().expect("dir b");
+        let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
+        tokio::spawn(async move { while b_pub_rx.recv().await.is_some() {} });
+        let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (err_tx, _err_rx) = mpsc::channel::<CommunityDegradedReport>(32);
+        let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
+
+        let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            community_id,
+            membership_key: membership_key.clone(),
+            admin_addr: alice_addr,
+            is_invite_only: false,
+            device_id: "bob-dev".into(),
+            self_owner: bob_addr,
+            signing_key: Arc::clone(&bob_sk),
+            state: Arc::clone(&b_state),
+            tracker: Arc::new(Mutex::new(CommunityReplayTracker::new((
+                bob_addr,
+                "bob-dev".to_string(),
+            )))),
+            content_store: Arc::clone(&store) as Arc<dyn ContentStore>,
+            publisher_tx: b_pub_tx,
+            subscriber_rx: b_sub_rx,
+            paths: PersistPaths {
+                crdt: dir_b.path().join("crdt.cbor"),
+                replay: dir_b.path().join("replay.cbor"),
+            },
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+            identity_resolver: Some(resolver),
+            error_tx: Some(err_tx),
+            delta_tx: None,
+            pending_redemptions: None,
+            crdt_state: None,
+            admin_identity_pub: None,
+            nav_emitter: None,
+            root_serve_rx: None,
+        });
+        let stats = engine_b.sync_stats();
+
+        assert_eq!(
+            engine_b
+                .insert_local_event(alice_join)
+                .await
+                .expect("seed alice bootstrap join"),
+            InsertOutcome::Inserted
+        );
+
+        // Craft the segmented-root wire packet, signed by Alice's device key
+        // exactly as `encode_root_packet` would, and AEAD-wrapped under the
+        // membership key (crdt_state: None ⇒ current epoch key IS membership_key).
+        let signed = CommunityRootSignedPayload {
+            root_cid,
+            publisher_addr: alice_addr,
+            at: Hlc {
+                wall_ms: 200_000,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+            manifest_format: Some(MANIFEST_FORMAT_V1),
+        };
+        let signed_bytes = canonical_cbor_encode(&signed).expect("encode signed sub-payload");
+        let publisher_sig = alice_sk.sign(&signed_bytes).to_bytes();
+        let payload = signed.into_wire(publisher_sig, None);
+        let payload_bytes = canonical_cbor_encode(&payload).expect("encode wire payload");
+        let wire = encrypt_root_publish(&membership_key, &payload_bytes).expect("encrypt wire");
+
+        b_sub_tx.send(wire).await.expect("inject segmented root");
+
+        // Under paused time these sleeps auto-advance, driving the whole retry
+        // chain at zero wall-clock. Stop early if the budget is ever exhausted.
+        let mut materialized = false;
+        for _ in 0..400 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            {
+                let g = b_state.lock().await;
+                let mat = g.materialize_now(alice_addr);
+                if ch_ids.iter().all(|c| mat.channels.contains_key(c)) {
+                    materialized = true;
+                    break;
+                }
+            }
+            if stats.fetch_retries_exhausted.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
+
+        assert!(
+            materialized,
+            "a {N_SEGMENTS}-segment root trickling one segment per round must \
+             converge under the progress-based budget (resets={}, exhausted={}, \
+             scheduled={})",
+            stats.fetch_retries_progress_resets.load(Ordering::SeqCst),
+            stats.fetch_retries_exhausted.load(Ordering::SeqCst),
+            stats.fetch_retries_scheduled.load(Ordering::SeqCst),
+        );
+        assert!(
+            stats.fetch_retries_progress_resets.load(Ordering::SeqCst) > 0,
+            "convergence must have gone through at least one progress-driven reset"
+        );
+        assert_eq!(
+            stats.fetch_retries_exhausted.load(Ordering::SeqCst),
+            0,
+            "the budget must never be declared exhausted for a converging root"
+        );
+    }
+
     /// ZEB-434 Task 10: end-to-end repro pin for the live bug — a
     /// channel created while a member was offline stayed invisible to
     /// them indefinitely (the root publish fired into the void; no
