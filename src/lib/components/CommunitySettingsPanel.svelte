@@ -598,7 +598,13 @@
           </div>
         {/each}
       </div>
-      {#if onOpenMembersPanel}
+      {#if onOpenMembersPanel && myPower >= thresholds.kick}
+        <!-- ZEB-926: the manage/moderation overlay is a member-moderation
+             surface, gated on the same power axis as Invites / Join requests
+             (myPower >= thresholds.kick). The in-panel controls are already
+             power-gated per row and the CRDT layer rejects under-powered
+             events on every peer, so this gate is cosmetic — it just stops a
+             plain member from opening a surface they can't act on. -->
         <button class="manage-members-btn" onclick={onOpenMembersPanel}>
           Manage members &amp; moderation history →
         </button>

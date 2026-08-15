@@ -798,6 +798,65 @@ describe('CommunitySettingsPanel', () => {
   });
 });
 
+// ── ZEB-926: Manage-members overlay entry gating ──────────────────────────
+// The "Manage members & moderation history →" button is a member-moderation
+// affordance, so it must be gated on the same power axis as its sibling
+// management sections (Invites / Join requests / Admin governance). The
+// in-panel controls are already power-gated (MemberRow returns no actions for
+// a power-0 viewer) and the CRDT layer rejects any under-powered event on every
+// peer's ingest — this closes the purely-cosmetic gap where the ENTRY button
+// rendered for anyone. Gate: myPower >= thresholds.kick (default 50), so
+// moderators+admins see it and it tracks per-community threshold config.
+describe('CommunitySettingsPanel — manage-members entry gating (ZEB-926)', () => {
+  const withOpen = { ...baseProps, onOpenMembersPanel: vi.fn() };
+
+  it('hides the manage-members entry for a plain member (power 0)', () => {
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...withOpen, myPower: 0, myAddress: plainMember.address },
+    });
+    expect(container.querySelector('.manage-members-btn')).toBeNull();
+  });
+
+  it('shows the manage-members entry for a moderator (power == kick threshold)', () => {
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...withOpen, myPower: 50, myAddress: modMember.address },
+    });
+    expect(container.querySelector('.manage-members-btn')).toBeTruthy();
+  });
+
+  it('shows the manage-members entry for an admin (power 100)', () => {
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...withOpen, myPower: 100, myAddress: adminMember.address },
+    });
+    expect(container.querySelector('.manage-members-btn')).toBeTruthy();
+  });
+
+  it('tracks the per-community kick threshold: a mod below a raised kick bar is gated out', () => {
+    // A community that raises kick to 100 makes moderation admin-only; a
+    // power-50 mod can no longer kick anyone here, so the manage surface must
+    // be hidden for them — mirrors how Invites tracks its own threshold.
+    const { container } = render(CommunitySettingsPanel, {
+      props: {
+        ...withOpen,
+        myPower: 50,
+        myAddress: modMember.address,
+        thresholds: { invite: 0, kick: 100, setPower: 100 },
+        thresholdsLoaded: true,
+      },
+    });
+    expect(container.querySelector('.manage-members-btn')).toBeNull();
+  });
+
+  it('never renders the entry when onOpenMembersPanel is unwired, even for an admin', () => {
+    // The button is opt-in via the callback; the power gate must not resurrect
+    // it when the caller hasn't threaded the overlay opener through.
+    const { container } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, myPower: 100, myAddress: adminMember.address },
+    });
+    expect(container.querySelector('.manage-members-btn')).toBeNull();
+  });
+});
+
 // ZEB-907: the members list resolves names through the shared 4-rung ladder
 // (nickname → live card → roster displayName → hex) — the self row's roster
 // displayName is always null (you never receive your own card), so it must
