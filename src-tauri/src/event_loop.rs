@@ -176,9 +176,14 @@ pub type VotingBackfillReadFn = std::sync::Arc<
 
 /// ZEB-718: closure the backfill requester calls with each decrypted
 /// (current-epoch) plaintext `SignedVotingEvent` CBOR frame, to apply it
-/// through the engine's coordinate-dedup backfill path.
+/// through the engine's coordinate-dedup backfill path. ZEB-932: returns
+/// `false` on a HARD reject (`apply_backfilled_event` errored — decode, skew,
+/// verify, eligibility, or an ordering apply failure), `true` on a successful
+/// apply or a benign no-op (duplicate / resolvers-not-wired). The RBSR requester
+/// uses this to avoid falsely reporting convergence when the responder advertised
+/// a `Have` body the requester couldn't apply; the full-dump path ignores it.
 pub type VotingBackfillApplyFn = std::sync::Arc<
-    dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    dyn Fn(Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         + Send
         + Sync,
 >;
@@ -10667,6 +10672,20 @@ fn need_full_dump(outcome: VotingReconcileOutcome, since_full: u32, backstop_eve
     !matches!(outcome, VotingReconcileOutcome::Converged) || since_full + 1 >= backstop_every
 }
 
+/// ZEB-932: the convergence verdict once RBSR fingerprints agree. Trust
+/// convergence only if every advertised `Have` body applied — `process_reply`
+/// marks a Have range resolved optimistically, so a rejected body leaves a
+/// still-missing event behind a "resolved" range. On any reject, report `Failed`
+/// so the requester runs the full-dump fallback this tick (which replays in the
+/// responder's dependency-safe order) instead of trusting a false convergence.
+fn converge_or_fallback(any_rejected: bool) -> VotingReconcileOutcome {
+    if any_rejected {
+        VotingReconcileOutcome::Failed
+    } else {
+        VotingReconcileOutcome::Converged
+    }
+}
+
 /// ZEB-932: drive one RBSR reconcile session (multiple rounds) as the requester
 /// against remote responders on `rbsr_topic`. Each round seals the request as the
 /// GET payload (`Locality::Remote` excludes our own responder; `Consolidation
@@ -10686,6 +10705,13 @@ async fn drive_voting_rbsr(
 ) -> VotingReconcileOutcome {
     let mut request = (hooks.initial)().await;
     let mut round: u32 = 0;
+    // ZEB-932: if any advertised Have body fails to apply during this reconcile,
+    // do NOT report convergence — process_reply marks a Have range resolved
+    // optimistically, so a rejected body (an ordering apply failure within the
+    // diff, clock skew, or an invalid event) would otherwise leave a silent gap
+    // until the ~1h backstop. On any reject we force the full-dump fallback this
+    // tick instead.
+    let mut any_rejected = false;
     loop {
         if closing.load(Ordering::SeqCst) {
             return VotingReconcileOutcome::Failed;
@@ -10738,7 +10764,9 @@ async fn drive_voting_rbsr(
                     if let Some(plaintext) =
                         voting_decrypt_current_epoch_cut(crdt_state, community_id, &raw).await
                     {
-                        (apply_backfilled)(plaintext).await;
+                        if !(apply_backfilled)(plaintext).await {
+                            any_rejected = true;
+                        }
                     }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
@@ -10762,7 +10790,7 @@ async fn drive_voting_rbsr(
             };
         };
         match (hooks.process_reply)(reply_msg).await {
-            None => return VotingReconcileOutcome::Converged,
+            None => return converge_or_fallback(any_rejected),
             Some(next) => request = next,
         }
     }
@@ -11151,7 +11179,9 @@ pub fn spawn_voting_log_zenoh_adapter(
                                             if let Some(plaintext) = voting_decrypt_current_epoch_cut(
                                                 &crdt_state_req, community_id, &raw,
                                             ).await {
-                                                (apply_backfilled)(plaintext).await;
+                                                // Full dump ignores the applied/rejected
+                                                // signal — it re-runs next tick regardless.
+                                                let _ = (apply_backfilled)(plaintext).await;
                                             }
                                         }
                                     }
@@ -14408,5 +14438,22 @@ mod zeb932_voting_rbsr_cadence_tests {
                 "a failed reconcile must fall back to the full dump"
             );
         }
+    }
+
+    #[test]
+    fn a_rejected_have_body_blocks_false_convergence() {
+        use super::converge_or_fallback;
+        // Fingerprints agreed AND every body applied → real convergence.
+        assert_eq!(
+            converge_or_fallback(false),
+            VotingReconcileOutcome::Converged
+        );
+        // Fingerprints agreed but a Have body was rejected → do NOT converge;
+        // fall back to the full dump this tick so the missing event isn't left
+        // behind an optimistically-resolved range until the backstop.
+        assert_eq!(converge_or_fallback(true), VotingReconcileOutcome::Failed);
+        // And need_full_dump agrees the forced Failed triggers a full dump.
+        assert!(need_full_dump(converge_or_fallback(true), 0, 12));
+        assert!(!need_full_dump(converge_or_fallback(false), 0, 12));
     }
 }

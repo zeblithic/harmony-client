@@ -58456,9 +58456,9 @@ async fn ensure_voting_engine_for(
     let apply_backfilled: crate::event_loop::VotingBackfillApplyFn =
         std::sync::Arc::new(move |frame: Vec<u8>| {
             let e = std::sync::Arc::clone(&engine_for_backfill_apply);
-            Box::pin(async move {
-                let _ = e.apply_backfilled_event(&frame).await;
-            })
+            // is_ok(): true on apply/benign-no-op, false on a hard reject — the
+            // RBSR requester uses this to avoid false convergence (ZEB-932).
+            Box::pin(async move { e.apply_backfilled_event(&frame).await.is_ok() })
         });
 
     // ZEB-932: RBSR protocol closures over the same engine — the adapter's

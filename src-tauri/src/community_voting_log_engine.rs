@@ -3894,9 +3894,9 @@ pub fn backfill_closures_for_test<R: tauri::Runtime>(
     let e_apply = Arc::clone(engine);
     let apply: crate::event_loop::VotingBackfillApplyFn = Arc::new(move |frame: Vec<u8>| {
         let e = Arc::clone(&e_apply);
-        Box::pin(async move {
-            let _ = e.apply_backfilled_event(&frame).await;
-        })
+        // ZEB-932: is_ok() — false on a hard reject so the RBSR requester avoids
+        // false convergence; the full-dump path ignores it.
+        Box::pin(async move { e.apply_backfilled_event(&frame).await.is_ok() })
     });
     (read, apply)
 }
