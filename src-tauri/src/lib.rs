@@ -271,6 +271,7 @@ pub mod relay_acceptor_watchdog;
 pub mod relay_hold_persist;
 pub mod relay_optin_persist;
 pub mod reply_spill;
+pub mod voting_rbsr;
 // ZEB-321 Phase 1 Task 7: debounced background task that re-emits this
 // device's ReachabilityAnnounce on startup / network change / idle tick /
 // manual force-notify. Wired into the event loop by Task 8.
