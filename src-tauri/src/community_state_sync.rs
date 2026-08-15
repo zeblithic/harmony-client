@@ -1234,6 +1234,11 @@ pub struct CommunitySyncEngine {
     /// Read by `network_health_snapshot` to distinguish a node that is
     /// receiving-and-discarding from one that is merely quiet.
     sync_stats: Arc<CommunitySyncStats>,
+    /// ZEB-937 facet 2: shared with the task's `InternalCtx` so a test can set a
+    /// small per-engine apply lock-yield chunk (see `set_apply_lock_chunk_for_test`)
+    /// instead of a process-global env var. Test-only handle.
+    #[cfg(test)]
+    apply_lock_chunk: Arc<std::sync::atomic::AtomicUsize>,
     notify_dirty: Arc<Notify>,
     /// Set by `notify_dirty()`; cleared by the task after each publish.
     /// Prevents the shutdown path from emitting a spurious publish when
@@ -1411,6 +1416,12 @@ impl CommunitySyncEngine {
         let resolve_sem = Arc::new(Semaphore::new(FETCH_RETRY_MAX_INFLIGHT));
         let sync_stats = Arc::new(CommunitySyncStats::default());
         let sync_stats_for_engine = Arc::clone(&sync_stats);
+        // ZEB-937 facet 2: per-engine apply lock-yield chunk, seeded from the
+        // env-overridable default and shared with the task so a test can retune
+        // it per-engine without a process-global env var.
+        let apply_lock_chunk = Arc::new(std::sync::atomic::AtomicUsize::new(
+            community_apply_lock_chunk(),
+        ));
 
         let task = tokio::spawn(internal_task(InternalCtx {
             community_id: cfg.community_id,
@@ -1449,12 +1460,14 @@ impl CommunitySyncEngine {
             resolved_tx,
             resolved_rx: Some(resolved_rx),
             resolve_sem,
-            apply_lock_chunk: community_apply_lock_chunk(),
+            apply_lock_chunk: Arc::clone(&apply_lock_chunk),
             sync_stats,
         }));
 
         Self {
             sync_stats: sync_stats_for_engine,
+            #[cfg(test)]
+            apply_lock_chunk,
             notify_dirty,
             has_pending_dirty,
             closing,
@@ -1513,6 +1526,15 @@ impl CommunitySyncEngine {
     /// state that read as fully healthy for 90 minutes during the incident.
     pub(crate) fn sync_stats(&self) -> Arc<CommunitySyncStats> {
         Arc::clone(&self.sync_stats)
+    }
+
+    /// ZEB-937 facet 2 test seam: retune this engine's apply lock-yield chunk
+    /// (shared with its task) WITHOUT a process-global env var, so a test can
+    /// force chunking on a small root without affecting concurrent tests.
+    #[cfg(test)]
+    pub(crate) fn set_apply_lock_chunk_for_test(&self, n: usize) {
+        self.apply_lock_chunk
+            .store(n.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Returns the admin `OwnerAddr` this engine was configured with.
@@ -2424,9 +2446,11 @@ struct InternalCtx {
     /// Caps concurrent off-task resolves — each retains a wire frame and (on
     /// success) a resolved batch. Same bound/shield as `fetch_retry_sem`.
     resolve_sem: Arc<Semaphore>,
-    /// ZEB-937 facet 2: apply-loop lock-yield chunk, resolved once at spawn from
-    /// `community_apply_lock_chunk()`.
-    apply_lock_chunk: usize,
+    /// ZEB-937 facet 2: apply-loop lock-yield chunk. Seeded once at spawn from
+    /// `community_apply_lock_chunk()`; an `Arc<AtomicUsize>` (shared with the
+    /// engine handle) so a test can inject a small per-engine chunk via
+    /// `set_apply_lock_chunk_for_test` WITHOUT a process-global env var.
+    apply_lock_chunk: Arc<std::sync::atomic::AtomicUsize>,
     /// ZEB-805 observability, shared with the engine handle.
     sync_stats: Arc<CommunitySyncStats>,
 }
@@ -5408,7 +5432,10 @@ async fn apply_ingest(
         // governance ingestion.
         let now_ms = crate::clock_trust::receiver_now_ms();
         // ZEB-937 facet 2: yield the state lock every `apply_lock_chunk` events.
-        let chunk = ctx.apply_lock_chunk;
+        let chunk = ctx
+            .apply_lock_chunk
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1);
         for (processed, event) in resolved.into_iter().enumerate() {
             // Release + re-acquire at a chunk boundary (checked BEFORE the
             // per-event duplicate `continue` so it fires regardless), so a
@@ -8350,15 +8377,14 @@ mod tests {
             root_serve_rx: Some(serve_rx_a),
         });
 
-        // Engine B (receiver under test): chunk the apply lock every 2 events.
-        // The env is read ONCE at `new`, so set it only across construction.
+        // Engine B (receiver under test): chunk the apply lock every 2 events,
+        // set per-engine below (no process-global env → no cross-test race).
         let bob_addr = OwnerAddr([0xB4; 16]);
         let b_state = Arc::new(Mutex::new(CommunityState::new(community_id)));
         let (b_pub_tx, mut b_pub_rx) = mpsc::channel::<Vec<u8>>(64);
         let (b_sub_tx, b_sub_rx) = mpsc::channel::<Vec<u8>>(64);
         tokio::spawn(async move { while b_pub_rx.recv().await.is_some() {} });
 
-        std::env::set_var("HARMONY_COMMUNITY_APPLY_LOCK_CHUNK", "2");
         let engine_b = CommunitySyncEngine::new(CommunitySyncEngineConfig {
             adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
             community_id,
@@ -8390,7 +8416,8 @@ mod tests {
             nav_emitter: None,
             root_serve_rx: None,
         });
-        std::env::remove_var("HARMONY_COMMUNITY_APPLY_LOCK_CHUNK");
+        // Force a small chunk on THIS engine only — the merge yields at 2.
+        engine_b.set_apply_lock_chunk_for_test(2);
 
         // Alice's bootstrap Join → A locally + OOB-seeded into B.
         let alice_join_at = Hlc {
