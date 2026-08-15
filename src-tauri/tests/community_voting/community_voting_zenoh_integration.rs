@@ -152,6 +152,7 @@ async fn voting_event_flows_through_two_zenoh_sessions() {
         bf_read_a,
         bf_apply_a,
         NO_BACKFILL_FLOOR,
+        None,
         Arc::clone(&closing_a),
     );
 
@@ -173,6 +174,7 @@ async fn voting_event_flows_through_two_zenoh_sessions() {
         bf_read_b,
         bf_apply_b,
         NO_BACKFILL_FLOOR,
+        None,
         Arc::clone(&closing_b),
     );
 
@@ -372,6 +374,7 @@ async fn kicked_then_rotated_member_injection_is_dropped() {
         bf_read_b,
         bf_apply_b,
         NO_BACKFILL_FLOOR,
+        None,
         Arc::clone(&closing_b),
     );
 
@@ -570,6 +573,7 @@ async fn spawn_real_voting_node(
         bf_read,
         bf_apply,
         backfill_interval,
+        None,
         closing,
     );
     (engine, log)
