@@ -4,6 +4,8 @@
   import { TrustService } from '../trust-service';
   import { resolveAuthorLabel } from '../mention-render';
   import { sanitizeHref } from '../url-sanitize';
+  import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
+  import { dayClock } from '../day-clock';
   import Avatar from './Avatar.svelte';
 
   let { message, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0, allMessages = [], onScrollToMessage, isSelf = false, onDelete, resolveNickname, resolveCard, seenAt }: {
@@ -64,12 +66,10 @@
     )
   );
 
-  let timeStr = $derived(
-    new Date(message.timestamp).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    })
-  );
+  // ZEB-943: date-aware label formatted against the app-wide day clock, so it
+  // reclassifies at local midnight without a remount (day-clock.ts). Kept off
+  // the delete-state `now` above, which only ticks for still-sending messages.
+  let timeStr = $derived(formatMessageTimestamp(message.timestamp, $dayClock));
 
   // ZEB-214: "Seen HH:MM" clock (only rendered when seenAt is set).
   let seenStr = $derived(
@@ -118,7 +118,7 @@
   <div class="message-content">
     <div class="message-header">
       <span class="sender-name">{authorLabel}</span>
-      <span class="timestamp">{timeStr}</span>
+      <time class="timestamp" datetime={new Date(message.timestamp).toISOString()} title={formatFullTimestamp(message.timestamp)}>{timeStr}</time>
       {#if canDelete}
         <button
           type="button"

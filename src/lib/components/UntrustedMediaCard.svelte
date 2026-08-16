@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import type { Message, MediaAttachment } from '../types';
+  import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
+  import { dayClock } from '../day-clock';
   import Avatar from './Avatar.svelte';
 
   let { message, attachment, onLinkBack, onAvatarClick, onLoad }: {
@@ -11,12 +13,9 @@
     onLoad?: (attachmentId: string) => void;
   } = $props();
 
-  let timeStr = $derived(
-    new Date(message.timestamp).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    })
-  );
+  // ZEB-943: format against the app-wide day clock so the label reclassifies at
+  // local midnight without a remount (day-clock.ts). No per-message timer.
+  let timeStr = $derived(formatMessageTimestamp(message.timestamp, $dayClock));
 
   type LoadState = 'blocked' | 'confirming' | 'cooldown';
   let loadState = $state<LoadState>('blocked');
@@ -68,7 +67,7 @@
       onclick={(e) => { e.stopPropagation(); onAvatarClick?.(message.sender.address, e); }}
     />
     <span class="card-sender">{message.sender.displayName}</span>
-    <span class="card-time">{timeStr}</span>
+    <time class="card-time" datetime={new Date(message.timestamp).toISOString()} title={formatFullTimestamp(message.timestamp)}>{timeStr}</time>
     <span class="link-back-icon" title="Jump to message">&#8599;</span>
   </button>
 
@@ -124,11 +123,19 @@
     font-weight: 600;
     color: var(--text-primary);
     font-size: 13px;
+    /* ZEB-943: date-aware timestamps widen the header — let the sender name
+       truncate so the timestamp and jump control never clip on narrow feeds. */
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .card-time {
     color: var(--text-muted);
     font-size: 11px;
+    flex-shrink: 0;
+    white-space: nowrap;
   }
 
   .link-back-icon {
