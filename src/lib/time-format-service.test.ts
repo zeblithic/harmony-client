@@ -47,29 +47,29 @@ describe('resolveTimeFormatPrefs', () => {
     });
   });
 
-  it('maps the date-order axis to a curated locale', () => {
-    expect(resolveTimeFormatPrefs({ clock: 'system', dateOrder: 'mdy' }).locale).toBe('en-US');
-    expect(resolveTimeFormatPrefs({ clock: 'system', dateOrder: 'dmy' }).locale).toBe('en-GB');
-    expect(resolveTimeFormatPrefs({ clock: 'system', dateOrder: 'ymd' }).locale).toBe('en-CA');
-  });
-
-  it('keeps the two axes independent (24h clock + D/M order)', () => {
-    expect(resolveTimeFormatPrefs({ clock: '24h', dateOrder: 'dmy' })).toEqual({
-      hour12: false,
-      locale: 'en-GB',
+  it('maps the date-order axis to the explicit dateOrder field', () => {
+    expect(resolveTimeFormatPrefs({ clock: 'system', dateOrder: 'mdy' })).toEqual({
+      dateOrder: 'mdy',
+    });
+    expect(resolveTimeFormatPrefs({ clock: 'system', dateOrder: 'dmy' })).toEqual({
+      dateOrder: 'dmy',
+    });
+    expect(resolveTimeFormatPrefs({ clock: 'system', dateOrder: 'ymd' })).toEqual({
+      dateOrder: 'ymd',
     });
   });
 
-  it('pins the clock to the system convention when clock=system but a date locale is chosen', () => {
-    // Decoupling guard: without this, en-GB (24h default) would silently flip
-    // the clock even though the user left it on "system". Inject a deterministic
-    // system convention so the test does not depend on the CI runner's locale.
-    expect(
-      resolveTimeFormatPrefs({ clock: 'system', dateOrder: 'dmy' }, () => true),
-    ).toEqual({ hour12: true, locale: 'en-GB' });
-    expect(
-      resolveTimeFormatPrefs({ clock: 'system', dateOrder: 'dmy' }, () => false),
-    ).toEqual({ hour12: false, locale: 'en-GB' });
+  it('keeps the two axes orthogonal — a date order never sets the clock', () => {
+    // Date order maps to the locale-independent dateOrder field, so it never
+    // touches hour12: clock=system with an explicit date order leaves the clock
+    // following the locale (no hour12 key at all).
+    expect(resolveTimeFormatPrefs({ clock: 'system', dateOrder: 'dmy' })).toEqual({
+      dateOrder: 'dmy',
+    });
+    expect(resolveTimeFormatPrefs({ clock: '24h', dateOrder: 'dmy' })).toEqual({
+      hour12: false,
+      dateOrder: 'dmy',
+    });
   });
 
   it('flows through the time-format seam to force a 24-hour clock', () => {

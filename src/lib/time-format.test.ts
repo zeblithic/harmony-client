@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import {
   formatMessageTimestamp,
   formatFullTimestamp,
+  formatClockTime,
   type TimeFormatPrefs,
 } from './time-format';
 
@@ -67,5 +68,48 @@ describe('formatFullTimestamp', () => {
     const out = formatFullTimestamp(ms, prefs);
     expect(out).toContain('8/14/2026');
     expect(out).toContain(timeOf(ms));
+  });
+
+  it('renders the explicit date order with a 4-digit year (dateOrder set)', () => {
+    const ms = at(2026, 7, 14, 20, 11);
+    expect(formatFullTimestamp(ms, { dateOrder: 'mdy' })).toMatch(/^8\/14\/2026, /);
+    expect(formatFullTimestamp(ms, { dateOrder: 'dmy' })).toMatch(/^14\/8\/2026, /);
+    expect(formatFullTimestamp(ms, { dateOrder: 'ymd' })).toMatch(/^2026-08-14, /);
+  });
+});
+
+// ZEB-944 — explicit date order is assembled from raw local parts, so its
+// output is deterministic across runtimes (no dependency on Intl locale data).
+describe('formatMessageTimestamp — explicit dateOrder', () => {
+  const now = at(2026, 7, 16, 22, 14); // 2026-08-16
+
+  it('orders a same-year date per the dateOrder pref (year dropped)', () => {
+    const ms = at(2026, 7, 14, 8, 11); // 2026-08-14, different day, same year
+    expect(formatMessageTimestamp(ms, now, { dateOrder: 'mdy' })).toMatch(/^8\/14, /);
+    expect(formatMessageTimestamp(ms, now, { dateOrder: 'dmy' })).toMatch(/^14\/8, /);
+    expect(formatMessageTimestamp(ms, now, { dateOrder: 'ymd' })).toMatch(/^08-14, /);
+  });
+
+  it('adds a 2-digit year per the dateOrder pref for a different year', () => {
+    const ms = at(2025, 7, 14, 8, 11); // 2025-08-14, different calendar year
+    expect(formatMessageTimestamp(ms, now, { dateOrder: 'mdy' })).toMatch(/^8\/14\/25, /);
+    expect(formatMessageTimestamp(ms, now, { dateOrder: 'dmy' })).toMatch(/^14\/8\/25, /);
+    expect(formatMessageTimestamp(ms, now, { dateOrder: 'ymd' })).toMatch(/^25-08-14, /);
+  });
+
+  it('still drops the date entirely for a same-day message', () => {
+    const ms = at(2026, 7, 16, 20, 11);
+    const out = formatMessageTimestamp(ms, now, { dateOrder: 'ymd', locale: 'en-US' });
+    expect(out).not.toContain('-');
+    expect(out).toBe(timeOf(ms));
+  });
+});
+
+describe('formatClockTime', () => {
+  it('renders bare time-of-day honoring the clock preference', () => {
+    const ms = at(2026, 7, 16, 20, 11);
+    expect(formatClockTime(ms, { locale: 'en-US', hour12: false })).toContain('20:11');
+    expect(formatClockTime(ms, { locale: 'en-US', hour12: true })).toContain('08:11');
+    expect(formatClockTime(ms, prefs)).not.toContain('/'); // never carries a date
   });
 });

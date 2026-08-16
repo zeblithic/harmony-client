@@ -1,7 +1,7 @@
 // ZEB-944 — owner-scoped time & date format preferences.
 //
 // Follow-up to ZEB-943: `time-format.ts` exposes a swappable `TimeFormatPrefs`
-// seam ({ hour12?, locale? }) at both format functions. This module owns the
+// seam ({ hour12?, locale?, dateOrder? }) at its format functions. This module owns the
 // *user-facing* preference model — two independent axes, a clock (12h/24h) and
 // a date order (M/D · D/M · ISO) — persists it per-owner (the ZEB-586 pattern,
 // mirroring theme-service.ts so switching identity never leaks a preference),
@@ -42,60 +42,19 @@ function isDateOrderPref(v: unknown): v is DateOrderPref {
   return v === 'system' || v === 'mdy' || v === 'dmy' || v === 'ymd';
 }
 
-/** Curated locale whose numeric date rendering yields the requested field
- *  order. `system` → undefined (follow the runtime locale — current behavior). */
-function dateOrderLocale(order: DateOrderPref): string | undefined {
-  switch (order) {
-    case 'mdy':
-      return 'en-US'; // 8/14
-    case 'dmy':
-      return 'en-GB'; // 14/8
-    case 'ymd':
-      return 'en-CA'; // 2026-08-14
-    case 'system':
-      return undefined;
-  }
-}
-
-/** The runtime locale's own 12h/24h convention, resolved explicitly so a chosen
- *  date-order locale can't silently flip the clock (see resolveTimeFormatPrefs). */
-function systemHour12(): boolean {
-  try {
-    return (
-      new Intl.DateTimeFormat(undefined, { hour: 'numeric' }).resolvedOptions().hour12 ?? false
-    );
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Resolve the user-facing two-axis model into the `time-format.ts` seam's
- * `TimeFormatPrefs`.
- *
- * Decoupling guard: the two axes are independent *to the user*, but both the
- * clock convention and the date order flow through Intl locale resolution. If
- * the user leaves the clock on 'system' yet picks a date order whose locale has
- * a different clock default (e.g. en-GB → 24h), that date choice would silently
- * change the clock. So whenever a date-order locale is set AND the clock is
- * 'system', we pin `hour12` to the real system convention. When both axes are
- * 'system' we return {} — byte-identical to today's default behavior.
- *
- * `systemHour12Fn` is injectable for deterministic tests.
+ * `TimeFormatPrefs`. The axes are orthogonal by construction: the clock maps to
+ * `hour12` and the date order maps to the explicit, locale-independent
+ * `dateOrder` field — neither touches `locale`, so choosing a date order can
+ * never affect the clock. Both axes on `system` resolve to `{}` — byte-identical
+ * to the ZEB-943 default (follow the runtime locale for everything).
  */
-export function resolveTimeFormatPrefs(
-  settings: TimeFormatSettings,
-  systemHour12Fn: () => boolean = systemHour12,
-): TimeFormatPrefs {
-  const locale = dateOrderLocale(settings.dateOrder);
-  let hour12: boolean | undefined =
-    settings.clock === '12h' ? true : settings.clock === '24h' ? false : undefined;
-  if (hour12 === undefined && locale !== undefined) {
-    hour12 = systemHour12Fn();
-  }
+export function resolveTimeFormatPrefs(settings: TimeFormatSettings): TimeFormatPrefs {
   const prefs: TimeFormatPrefs = {};
-  if (hour12 !== undefined) prefs.hour12 = hour12;
-  if (locale !== undefined) prefs.locale = locale;
+  if (settings.clock === '12h') prefs.hour12 = true;
+  else if (settings.clock === '24h') prefs.hour12 = false;
+  if (settings.dateOrder !== 'system') prefs.dateOrder = settings.dateOrder;
   return prefs;
 }
 
