@@ -16,6 +16,11 @@
 //!
 //! Run just this group: `cargo nextest run -E 'binary(content_tests)'`.
 
+// ZEB-183: shared harness (spawn_test_runtime, TestHarness, ingest_*, make_leaf,
+// make_entry, insert_top_level, fresh_index) — one copy for the whole binary.
+#[path = "content/harness.rs"]
+mod harness;
+
 #[path = "content/content_index_integration.rs"]
 mod content_index_integration;
 #[path = "content/folder_ingest_walker_integration.rs"]

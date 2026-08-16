@@ -11,9 +11,7 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use harmony_app::content_index::{
-    ContentIndex, ContentIndexEntry, ContentKind, ReplicationTier, Sensitivity, SidecarId,
-};
+use harmony_app::content_index::{ContentIndex, ContentIndexEntry, ContentKind, SidecarId};
 use harmony_app::event_loop::{ContentVerbRequest, IngestRequest};
 use harmony_compute::InstructionBudget;
 use harmony_content::book::MemoryBookStore;
@@ -21,6 +19,8 @@ use harmony_content::cid::{ContentFlags, ContentId};
 use harmony_content::storage_tier::{ContentPolicy, FilterBroadcastConfig, StorageBudget};
 use harmony_runtime::{NodeConfig, NodeRuntime};
 use tokio::sync::{mpsc, oneshot, watch};
+
+use crate::harness::make_entry;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ingest_list_pin_burn_roundtrip() {
@@ -276,19 +276,15 @@ async fn ingest_list_pin_burn_roundtrip() {
         let mut idx = index.lock().unwrap();
         assert!(
             idx.insert(ContentIndexEntry {
-                sidecar_id: sid,
-                cid: expected_cid_bytes,
-                file_name: "hello.txt".into(),
-                size_bytes: bytes.len() as u64,
                 stored_at_ms: 1_700_000_000_000,
-                sensitivity: Sensitivity::Private,
-                replication_tier: ReplicationTier::Default,
-                licensed: false,
-                archived: false,
-                pinned: false,
-                backup: false,
-                origin: None,
-                kind: ContentKind::Leaf,
+                ..make_entry(
+                    sid,
+                    expected_cid_bytes,
+                    "hello.txt",
+                    bytes.len() as u64,
+                    ContentKind::Leaf,
+                    false,
+                )
             }),
             "first insert should return true"
         );
@@ -363,7 +359,7 @@ async fn ingest_list_pin_burn_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
-    use harmony_app::content_index::{self, ContentIndexEntry, ReplicationTier, Sensitivity};
+    use harmony_app::content_index::{self, ContentIndexEntry};
     use harmony_app::event_loop::{ContentVerbRequest, IngestRequest};
     use harmony_app::streaming_ingest;
     use harmony_content::chunker::ChunkerConfig;
@@ -657,19 +653,15 @@ async fn chunked_ingest_pin_cascade_fetch_burn_roundtrip() {
     {
         let mut idx = index.lock().unwrap();
         assert!(idx.insert(ContentIndexEntry {
-            sidecar_id: root_sid,
-            cid: root_cid.to_bytes(),
-            file_name: "chunked.bin".into(),
-            size_bytes: bytes.len() as u64,
             stored_at_ms: 1_700_000_000_000,
-            sensitivity: Sensitivity::Private,
-            replication_tier: ReplicationTier::Default,
-            licensed: false,
-            archived: false,
-            pinned: false,
-            backup: false,
-            origin: None,
-            kind: ContentKind::Leaf,
+            ..make_entry(
+                root_sid,
+                root_cid.to_bytes(),
+                "chunked.bin",
+                bytes.len() as u64,
+                ContentKind::Leaf,
+                false,
+            )
         }));
     }
 
@@ -757,19 +749,8 @@ fn pin_intent_survives_reload() {
     {
         let mut idx = ContentIndex::load(tmp.path());
         idx.insert(ContentIndexEntry {
-            sidecar_id: sid,
-            cid,
-            file_name: "persist-me.bin".into(),
-            size_bytes: 100,
             stored_at_ms: 1_700_000_000_000,
-            sensitivity: Sensitivity::Private,
-            replication_tier: ReplicationTier::Default,
-            licensed: false,
-            archived: false,
-            pinned: false,
-            backup: false,
-            origin: None,
-            kind: ContentKind::Leaf,
+            ..make_entry(sid, cid, "persist-me.bin", 100, ContentKind::Leaf, false)
         });
         assert!(
             idx.set_pinned(&sid, true),
@@ -1353,34 +1334,26 @@ async fn unpin_folder_leaves_independently_pinned_leaf_in_cache() {
     {
         let mut idx = index.lock().unwrap();
         assert!(idx.insert(ContentIndexEntry {
-            sidecar_id: sid_a,
-            cid: cid_a_bytes,
-            file_name: "leaf.txt".into(),
-            size_bytes: leaf_bytes.len() as u64,
             stored_at_ms: 1_700_000_000_000,
-            sensitivity: Sensitivity::Private,
-            replication_tier: ReplicationTier::Default,
-            licensed: false,
-            archived: false,
-            pinned: false,
-            backup: false,
-            origin: None,
-            kind: ContentKind::Leaf,
+            ..make_entry(
+                sid_a,
+                cid_a_bytes,
+                "leaf.txt",
+                leaf_bytes.len() as u64,
+                ContentKind::Leaf,
+                false,
+            )
         }));
         assert!(idx.insert(ContentIndexEntry {
-            sidecar_id: sid_c,
-            cid: cid_c_bytes,
-            file_name: "folder".into(),
-            size_bytes: folder_payload.len() as u64,
             stored_at_ms: 1_700_000_000_000,
-            sensitivity: Sensitivity::Private,
-            replication_tier: ReplicationTier::Default,
-            licensed: false,
-            archived: false,
-            pinned: false,
-            backup: false,
-            origin: None,
-            kind: ContentKind::Folder,
+            ..make_entry(
+                sid_c,
+                cid_c_bytes,
+                "folder",
+                folder_payload.len() as u64,
+                ContentKind::Folder,
+                false,
+            )
         }));
     }
 
@@ -1701,19 +1674,15 @@ async fn rapid_pin_unpin_toggling_keeps_sidecar_and_runtime_consistent() {
     {
         let mut idx = index.lock().unwrap();
         assert!(idx.insert(ContentIndexEntry {
-            sidecar_id: sid,
-            cid: cid_bytes,
-            file_name: "rapid-toggle.txt".into(),
-            size_bytes: bytes.len() as u64,
             stored_at_ms: 1_700_000_000_000,
-            sensitivity: Sensitivity::Private,
-            replication_tier: ReplicationTier::Default,
-            licensed: false,
-            archived: false,
-            pinned: false,
-            backup: false,
-            origin: None,
-            kind: ContentKind::Leaf,
+            ..make_entry(
+                sid,
+                cid_bytes,
+                "rapid-toggle.txt",
+                bytes.len() as u64,
+                ContentKind::Leaf,
+                false,
+            )
         }));
     }
 
