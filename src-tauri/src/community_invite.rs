@@ -904,6 +904,19 @@ pub enum InviteUrlError {
     /// base64 chars decode to exactly 64 KiB raw.
     #[error("invite payload exceeds 85 333 base64-char limit (got {0} chars)")]
     TooLarge(usize),
+    /// ZEB-948: a version-tagged (`0x01`) compressed body failed to inflate —
+    /// truncated / corrupt / not a valid raw-DEFLATE stream.
+    #[error("invite body decompression failed: {0}")]
+    Decompress(String),
+    /// ZEB-948 decoded-body ceiling (`MAX_DECODED_CBOR_BYTES`), enforced at BOTH
+    /// boundaries: at decode it is the decompression-bomb guard (the base64 cap
+    /// only bounds the *compressed* input, and deflate can amplify ~1000×, so the
+    /// decoder is `Take`-bounded and rejects anything past the ceiling before it
+    /// is materialized); at encode it rejects a raw payload whose CBOR exceeds the
+    /// ceiling, so a compressible oversized payload can't slip under the base64
+    /// cap and mint a URL the decoder would then reject as un-redeemable.
+    #[error("invite body exceeds the decoded ceiling (got {0} bytes)")]
+    DecompressedTooLarge(usize),
     /// Caller passed an invite-only payload missing the admin bootstrap
     /// fields (`admin_bootstrap` and/or `admin_identity_pub`). The reader
     /// would reject the resulting URL via `verify_admin_bootstrap`; we
@@ -1010,6 +1023,21 @@ pub enum InviteUrlError {
 /// large snapshots ride out-of-band and this cap can return to a
 /// stricter URL-friendly value.
 pub const MAX_INVITE_BODY_B64_CHARS: usize = 2_800_000; // ≈ 2 MiB decoded (Phase 1)
+
+/// ZEB-948 invite-body framing version. A decoded body that begins with this
+/// byte is `[VERSION] ++ raw_deflate(canonical_cbor)`; any other leading byte is
+/// a legacy (pre-ZEB-948) raw-CBOR body. The payload always serializes as a
+/// top-level CBOR **map** (first byte in `0xA0..=0xBB`), so this tag can never
+/// collide with a legacy body — existing invite URLs keep decoding unchanged.
+const INVITE_BODY_VERSION_DEFLATE: u8 = 0x01;
+
+/// ZEB-948 decompression-bomb ceiling: the maximum DECOMPRESSED CBOR length the
+/// decoder will materialize. `MAX_INVITE_BODY_B64_CHARS` bounds only the
+/// *compressed* input; raw DEFLATE can amplify ~1000×, so `inflate_body` reads
+/// through a `Take` capped just past this value and rejects anything larger.
+/// Sized to the same ~2 MiB decoded budget as the base64 cap
+/// (2_800_000 base64 chars × 3/4 ≈ 2.1 MB).
+const MAX_DECODED_CBOR_BYTES: usize = MAX_INVITE_BODY_B64_CHARS / 4 * 3;
 
 /// Exact byte length of a single X25519-sealed epoch-key envelope
 /// (32 ephemeral x25519 pubkey + 12 nonce + 32 ciphertext + 16 AEAD tag,
@@ -1119,9 +1147,69 @@ fn validate_untargeted_decrypt_key_shape(
     }
 }
 
+/// ZEB-948: raw-DEFLATE-compress a canonical-CBOR body and prepend the version
+/// tag, yielding `[INVITE_BODY_VERSION_DEFLATE] ++ deflate(cbor)`. Uses raw
+/// DEFLATE (no zlib/gzip container) since the version tag is our own framing.
+/// Writing to an in-memory `Vec` is infallible, so this cannot error.
+fn deflate_body(cbor: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::DeflateEncoder::new(
+        Vec::with_capacity(cbor.len() / 2 + 1),
+        flate2::Compression::best(),
+    );
+    enc.write_all(cbor)
+        .expect("DeflateEncoder write to Vec is infallible");
+    let compressed = enc
+        .finish()
+        .expect("DeflateEncoder finish to Vec is infallible");
+    let mut out = Vec::with_capacity(compressed.len() + 1);
+    out.push(INVITE_BODY_VERSION_DEFLATE);
+    out.extend_from_slice(&compressed);
+    out
+}
+
+/// ZEB-948: inverse of [`deflate_body`] — inflate a raw-DEFLATE stream (the body
+/// AFTER the version tag has been stripped) back to canonical CBOR, bounding the
+/// output to [`MAX_DECODED_CBOR_BYTES`] so a decompression bomb can neither OOM
+/// nor hang the decoder. The reader is `Take`-limited to `cap + 1` bytes: if it
+/// yields more than `cap`, the body is over the ceiling and is rejected.
+fn inflate_body(deflate_stream: &[u8]) -> Result<Vec<u8>, InviteUrlError> {
+    use std::io::Read;
+    let mut limited =
+        flate2::read::DeflateDecoder::new(deflate_stream).take(MAX_DECODED_CBOR_BYTES as u64 + 1);
+    let mut out = Vec::new();
+    limited
+        .read_to_end(&mut out)
+        .map_err(|e| InviteUrlError::Decompress(e.to_string()))?;
+    if out.len() > MAX_DECODED_CBOR_BYTES {
+        return Err(InviteUrlError::DecompressedTooLarge(out.len()));
+    }
+    Ok(out)
+}
+
+/// ZEB-948: choose the smaller of the compressed vs raw body. Returns the
+/// version-tagged DEFLATE body when it is *strictly* smaller than the raw CBOR;
+/// otherwise returns the raw CBOR unchanged (legacy form). This keeps the invite
+/// URL never larger than the pre-compression form, so tiny payloads that inflate
+/// under DEFLATE simply stay legacy.
+fn frame_body(cbor: Vec<u8>) -> Vec<u8> {
+    let compressed = deflate_body(&cbor);
+    if compressed.len() < cbor.len() {
+        compressed
+    } else {
+        cbor
+    }
+}
+
 /// Canonical-CBOR-encode the payload, then base64url-no-pad the result,
 /// and prefix `harmony://invite/`. The output is copy-paste-safe across
 /// chat / email / messaging clients that munge `+`, `/`, or `=`.
+///
+/// ZEB-948: the CBOR body is raw-DEFLATE-compressed when that is strictly
+/// smaller than the raw form (a version tag distinguishes the two; see
+/// [`INVITE_BODY_VERSION_DEFLATE`]). Tiny payloads that would inflate under
+/// compression stay in the legacy raw-CBOR form, so we only pay the tag byte
+/// when compression actually wins — and legacy invite URLs still decode.
 pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, InviteUrlError> {
     if payload.is_invite_only && payload.invite_token.is_none() {
         return Err(InviteUrlError::InviteOnlyMissingToken);
@@ -1165,7 +1253,20 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
     // invite-only, forbidden elsewhere). See validate_untargeted_decrypt_key_shape.
     validate_untargeted_decrypt_key_shape(payload)?;
     let cbor = canonical_cbor_encode(payload).map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
+    // ZEB-948: bound the RAW (uncompressed) body at the same ceiling the decoder
+    // enforces on the decompressed body. Without this, a highly-compressible
+    // oversized payload could slip under the base64 cap once compressed and mint
+    // a URL that `decode_invite_url` would then reject as DecompressedTooLarge —
+    // an un-redeemable URL leaving the mint site. Enforce at both boundaries,
+    // matching this module's convention.
+    if cbor.len() > MAX_DECODED_CBOR_BYTES {
+        return Err(InviteUrlError::DecompressedTooLarge(cbor.len()));
+    }
+    // ZEB-948: compress the body only when it strictly helps (see `frame_body`).
+    // The decoder tells compressed vs legacy apart by the leading byte, so legacy
+    // URLs — and any invite already shared — keep decoding unchanged.
+    let body_bytes = frame_body(cbor);
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&body_bytes);
     // Encode-time size check: fail fast rather than producing an invite URL
     // that decode_invite_url would immediately reject with TooLarge.
     if b64.len() > MAX_INVITE_BODY_B64_CHARS {
@@ -1196,7 +1297,15 @@ pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlE
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(body)
         .map_err(|e| InviteUrlError::Base64(e.to_string()))?;
-    let payload = canonical_cbor_decode::<CommunityInvitePayload>(&bytes)
+    // ZEB-948: a leading version tag marks a raw-DEFLATE-compressed body; a legacy
+    // body is raw canonical CBOR whose first byte is a CBOR map header, never the
+    // tag — so this branch is unambiguous and old invite URLs still decode.
+    let cbor = if bytes.first() == Some(&INVITE_BODY_VERSION_DEFLATE) {
+        inflate_body(&bytes[1..])?
+    } else {
+        bytes
+    };
+    let payload = canonical_cbor_decode::<CommunityInvitePayload>(&cbor)
         .map_err(|e| InviteUrlError::Cbor(e.to_string()))?;
     // ZEB-249 PR #106 R5: enforce sealed-epoch-key shape contract AFTER decoding
     // so a tampered or malformed URL is rejected with a clear error rather than
@@ -3103,6 +3212,142 @@ mod tests {
             decode_invite_url(&url),
             Err(InviteUrlError::UntargetedKeyNotAllowed)
         ));
+    }
+
+    // ── ZEB-948: Phase 1 invite-URL compression ─────────────────────────
+
+    /// The LEGACY (pre-ZEB-948) URL form: canonical CBOR → base64url, no
+    /// version tag. Mirrors what already-shared invites in the wild look like.
+    fn legacy_v1_url(p: &CommunityInvitePayload) -> String {
+        let cbor = canonical_cbor_encode(p).expect("cbor encode");
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor);
+        format!("harmony://invite/{b64}")
+    }
+
+    /// The raw body bytes behind an invite URL (post-prefix, base64url-decoded),
+    /// so tests can inspect the framing (version tag vs legacy CBOR map header).
+    fn url_body_bytes(url: &str) -> Vec<u8> {
+        let body = url
+            .trim()
+            .strip_prefix("harmony://invite/")
+            .expect("prefix");
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(body)
+            .expect("b64 decode")
+    }
+
+    /// A large, highly-repetitive open payload: the emitted URL is strictly
+    /// shorter than the legacy raw-CBOR form, leads with the deflate version
+    /// tag, and round-trips losslessly.
+    #[test]
+    fn large_payload_url_is_compressed_and_round_trips() {
+        let mut p = make_open_payload_correct();
+        // A long, repetitive name gives DEFLATE plenty to crush without needing
+        // to hand-build a full member/channel graph — the point is the codec.
+        p.community_name = "harmony community ".repeat(400);
+        let url = encode_invite_url(&p).expect("encodes");
+        let legacy = legacy_v1_url(&p);
+        assert!(
+            url.len() < legacy.len(),
+            "compressed URL ({}) must be shorter than legacy ({})",
+            url.len(),
+            legacy.len()
+        );
+        assert_eq!(
+            url_body_bytes(&url).first(),
+            Some(&INVITE_BODY_VERSION_DEFLATE),
+            "compressed body must lead with the deflate version tag"
+        );
+        assert_eq!(decode_invite_url(&url).expect("decodes"), p);
+    }
+
+    /// Backward-compat: a legacy raw-CBOR URL (no version tag) — the form of
+    /// every invite already shared in the wild — still decodes after ZEB-948.
+    #[test]
+    fn legacy_v1_url_still_decodes() {
+        let p = make_open_payload_correct();
+        let url = legacy_v1_url(&p);
+        let first = url_body_bytes(&url)[0];
+        assert!(
+            (0xA0..=0xBB).contains(&first),
+            "legacy body starts with a CBOR map header, got {first:#x}"
+        );
+        assert_eq!(decode_invite_url(&url).expect("legacy decodes"), p);
+    }
+
+    /// Compression must never make the URL *longer* than the legacy raw-CBOR
+    /// form — whichever branch `frame_body` picks — and the payload round-trips.
+    #[test]
+    fn compression_never_lengthens_the_url() {
+        let p = make_open_payload_correct();
+        let url = encode_invite_url(&p).expect("encodes");
+        assert!(
+            url.len() <= legacy_v1_url(&p).len(),
+            "compression must never lengthen the URL ({} vs legacy {})",
+            url.len(),
+            legacy_v1_url(&p).len()
+        );
+        assert_eq!(decode_invite_url(&url).expect("decodes"), p);
+    }
+
+    /// `frame_body` compresses a repetitive body and tags it.
+    #[test]
+    fn frame_body_compresses_repetitive_input() {
+        let framed = frame_body(vec![0u8; 1000]);
+        assert_eq!(framed.first(), Some(&INVITE_BODY_VERSION_DEFLATE));
+        assert!(framed.len() < 1000, "repetitive input must compress");
+    }
+
+    /// `frame_body` leaves an incompressible body untouched (legacy form): a
+    /// 0..=255 permutation has no repeats and a uniform symbol distribution, so
+    /// DEFLATE cannot beat it — the raw bytes are returned unchanged, never tagged.
+    #[test]
+    fn frame_body_keeps_incompressible_input_legacy() {
+        let incompressible: Vec<u8> = (0u8..=255).collect();
+        assert_eq!(frame_body(incompressible.clone()), incompressible);
+    }
+
+    /// Decompression-bomb guard: a crafted version-tagged body whose DEFLATE
+    /// stream inflates past the decoded ceiling is rejected with
+    /// `DecompressedTooLarge` (and never OOMs — the decoder is `Take`-bounded).
+    #[test]
+    fn decompression_bomb_is_rejected() {
+        // 4 MiB of zeros deflates to a few KB (well under the base64 input cap)
+        // but inflates past MAX_DECODED_CBOR_BYTES (~2.1 MB).
+        let bomb = vec![0u8; 4 * 1024 * 1024];
+        let body = deflate_body(&bomb); // [0x01] ++ deflate(zeros)
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&body);
+        let url = format!("harmony://invite/{b64}");
+        assert!(matches!(
+            decode_invite_url(&url),
+            Err(InviteUrlError::DecompressedTooLarge(_))
+        ));
+    }
+
+    /// Encode-side ceiling: a payload whose RAW CBOR exceeds
+    /// `MAX_DECODED_CBOR_BYTES` is rejected at the mint site (even though it would
+    /// compress well under the base64 cap), so no un-redeemable URL is ever
+    /// produced. Mirrors the decode-side decompression-bomb guard.
+    #[test]
+    fn oversized_raw_payload_rejected_at_encode() {
+        let mut p = make_open_payload_correct();
+        // A repetitive name would compress to nothing, but the raw-size guard
+        // runs before compression, so this is rejected regardless.
+        p.community_name = "x".repeat(MAX_DECODED_CBOR_BYTES + 1024);
+        assert!(matches!(
+            encode_invite_url(&p),
+            Err(InviteUrlError::DecompressedTooLarge(_))
+        ));
+    }
+
+    /// `deflate_body` / `inflate_body` are exact inverses on the CBOR body.
+    #[test]
+    fn deflate_inflate_round_trips() {
+        let cbor = canonical_cbor_encode(&make_open_payload_correct()).expect("cbor");
+        let framed = deflate_body(&cbor);
+        assert_eq!(framed.first(), Some(&INVITE_BODY_VERSION_DEFLATE));
+        let back = inflate_body(&framed[1..]).expect("inflates");
+        assert_eq!(back, cbor);
     }
 
     // ── ZEB-369: targeted invite-only sealed-key shape ───────────────────
