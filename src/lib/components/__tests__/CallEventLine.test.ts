@@ -85,7 +85,10 @@ describe('CallEventLine', () => {
     // past year, so a date component is always rendered.
     const ts = 1_700_000_000_000;
     expect(time.textContent).toBe(formatMessageTimestamp(ts, Date.now()));
-    expect(time.textContent).toMatch(/\//); // date present — not "today"
     expect(time.getAttribute('title')).toBe(formatFullTimestamp(ts));
+    // PR #692 review: semantic <time datetime> for parity/a11y with the other
+    // message surfaces.
+    expect(time.tagName.toLowerCase()).toBe('time');
+    expect(time.getAttribute('datetime')).toBe(new Date(ts).toISOString());
   });
 });

@@ -2,6 +2,7 @@
   import type { Message, MediaAttachment } from '../types';
   import { sanitizeHref } from '../url-sanitize';
   import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
+  import { dayClock } from '../day-clock';
   import Avatar from './Avatar.svelte';
 
   let { message, attachment, onLinkBack, onAvatarClick }: {
@@ -11,9 +12,9 @@
     onAvatarClick?: (address: string, event: MouseEvent) => void;
   } = $props();
 
-  // ZEB-943: mount-time reference instant (no per-message timer — see ZEB-242).
-  const now = Date.now();
-  let timeStr = $derived(formatMessageTimestamp(message.timestamp, now));
+  // ZEB-943: format against the app-wide day clock so the label reclassifies at
+  // local midnight without a remount (day-clock.ts). No per-message timer.
+  let timeStr = $derived(formatMessageTimestamp(message.timestamp, $dayClock));
 </script>
 
 <div class="media-card" id="media-{attachment.id}">
@@ -26,7 +27,7 @@
       onclick={(e) => { e.stopPropagation(); onAvatarClick?.(message.sender.address, e); }}
     />
     <span class="card-sender">{message.sender.displayName}</span>
-    <span class="card-time" title={formatFullTimestamp(message.timestamp)}>{timeStr}</span>
+    <time class="card-time" datetime={new Date(message.timestamp).toISOString()} title={formatFullTimestamp(message.timestamp)}>{timeStr}</time>
     <span class="link-back-icon" title="Jump to message">&#8599;</span>
   </button>
 
@@ -102,11 +103,19 @@
     font-weight: 600;
     color: var(--text-primary);
     font-size: 13px;
+    /* ZEB-943: date-aware timestamps widen the header — let the sender name
+       truncate so the timestamp and jump control never clip on narrow feeds. */
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .card-time {
     color: var(--text-muted);
     font-size: 11px;
+    flex-shrink: 0;
+    white-space: nowrap;
   }
 
   .link-back-icon {

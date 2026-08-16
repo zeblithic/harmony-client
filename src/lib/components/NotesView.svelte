@@ -11,6 +11,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
+  import { dayClock } from '../day-clock';
   import type { NotesService, NoteEntry } from '../notes-service';
 
   let {
@@ -88,9 +89,11 @@
     }
   }
 
-  // ZEB-943: mount-time reference instant (no per-message timer — see ZEB-242).
-  const now = Date.now();
-  function formatTime(ts: number): string {
+  // ZEB-943: format against the app-wide day clock so labels reclassify at
+  // local midnight without a remount (day-clock.ts). No per-message timer.
+  // `now` comes from the template call site (`$dayClock`) so Svelte tracks the
+  // store as a render dependency.
+  function formatTime(ts: number, now: number): string {
     return formatMessageTimestamp(ts, now);
   }
 </script>
@@ -115,7 +118,7 @@
         <header class="note-meta">
           <span class="note-author">{authorLabel}</span>
           <time class="note-ts" datetime={new Date(entry.timestamp).toISOString()} title={formatFullTimestamp(entry.timestamp)}>
-            {formatTime(entry.timestamp)}
+            {formatTime(entry.timestamp, $dayClock)}
           </time>
         </header>
         <p class="note-body">{entry.text}</p>

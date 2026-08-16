@@ -6,6 +6,7 @@
   import type { Message } from '../types';
   import { describeCallEvent, isMissedCallEvent } from '../call-log';
   import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
+  import { dayClock } from '../day-clock';
 
   let { message, isSelf = false }: { message: Message; isSelf?: boolean } = $props();
 
@@ -16,9 +17,9 @@
   let missed = $derived(
     message.callEvent ? isMissedCallEvent(message.callEvent, direction) : false,
   );
-  // ZEB-943: mount-time reference instant (no per-message timer — see ZEB-242).
-  const now = Date.now();
-  let timeStr = $derived(formatMessageTimestamp(message.timestamp, now));
+  // ZEB-943: format against the app-wide day clock so the label reclassifies at
+  // local midnight without a remount (day-clock.ts). No per-message timer.
+  let timeStr = $derived(formatMessageTimestamp(message.timestamp, $dayClock));
 </script>
 
 <div class="call-event-line" class:missed data-testid="call-event-line" role="note">
@@ -30,7 +31,7 @@
          call. Without the marker a failed send is invisible to the caller. -->
     <span class="failed">not delivered</span>
   {/if}
-  <span class="time" title={formatFullTimestamp(message.timestamp)}>{timeStr}</span>
+  <time class="time" datetime={new Date(message.timestamp).toISOString()} title={formatFullTimestamp(message.timestamp)}>{timeStr}</time>
   <span class="rule" aria-hidden="true"></span>
 </div>
 

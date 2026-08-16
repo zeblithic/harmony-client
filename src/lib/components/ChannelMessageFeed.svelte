@@ -17,6 +17,7 @@
   import type { ResolvedCard } from '../member-card-service';
   import { nonEmpty } from '../display-label';
   import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
+  import { dayClock } from '../day-clock';
   import { tokenizeBody, resolveMentionLabel } from '../mention-render';
   import type { MentionCandidate } from '../mention-compose';
   import MentionInput from './MentionInput.svelte';
@@ -460,13 +461,12 @@
     return author === ownAddress;
   }
 
-  // ZEB-943: mount-time reference instant for the "is this message from today?"
-  // decision. Deliberately not a ticking timer — ZEB-242 established that
-  // per-message timers are wasteful, and the hover tooltip always carries the
-  // exact date regardless of a midnight rollover mid-session.
-  const now = Date.now();
-
-  function formatTimestamp(at: HlcDto): string {
+  // ZEB-943: format against the app-wide day clock (day-clock.ts) so labels
+  // reclassify at local midnight WITHOUT a remount — this feed instance persists
+  // across channel switches and long-open sessions. One shared timer for the
+  // whole app, not per-message (ZEB-242). `now` is passed from the template
+  // call site (`$dayClock`) so Svelte tracks the store as a render dependency.
+  function formatTimestamp(at: HlcDto, now: number): string {
     return formatMessageTimestamp(at.wallMs, now);
   }
 
@@ -893,7 +893,7 @@
               {:else}
                 <span class="author">{authorLabel(msg.author)}</span>
               {/if}
-              <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()} title={formatFullTimestamp(msg.at.wallMs)}>{formatTimestamp(msg.at)}</time>
+              <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()} title={formatFullTimestamp(msg.at.wallMs)}>{formatTimestamp(msg.at, $dayClock)}</time>
               {#if row.isPreFork}
                 <span class="pre-fork-badge" aria-label="From original community">from {originalCommunityName}</span>
               {/if}
