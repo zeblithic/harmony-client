@@ -23,6 +23,7 @@
 
   import ProfileEditor from './ProfileEditor.svelte';
   import AppearanceSettings from './AppearanceSettings.svelte';
+  import TimeFormatSettings from './TimeFormatSettings.svelte';
   import IdentityPanel from './IdentityPanel.svelte';
   import DevicesPanel from './DevicesPanel.svelte';
   import NotificationSettingsPanel from './NotificationSettingsPanel.svelte';
@@ -184,6 +185,7 @@
     hidden={activeTab !== 'appearance'}
   >
     <AppearanceSettings />
+    <TimeFormatSettings />
   </div>
   <div
     class="tab-content"

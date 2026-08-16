@@ -16,8 +16,9 @@
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
   import type { ResolvedCard } from '../member-card-service';
   import { nonEmpty } from '../display-label';
-  import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
+  import { formatMessageTimestamp, formatFullTimestamp, formatDateOnly, type TimeFormatPrefs } from '../time-format';
   import { dayClock } from '../day-clock';
+  import { timeFormatPrefs } from '../time-format-service';
   import { tokenizeBody, resolveMentionLabel } from '../mention-render';
   import type { MentionCandidate } from '../mention-compose';
   import MentionInput from './MentionInput.svelte';
@@ -466,8 +467,8 @@
   // across channel switches and long-open sessions. One shared timer for the
   // whole app, not per-message (ZEB-242). `now` is passed from the template
   // call site (`$dayClock`) so Svelte tracks the store as a render dependency.
-  function formatTimestamp(at: HlcDto, now: number): string {
-    return formatMessageTimestamp(at.wallMs, now);
+  function formatTimestamp(at: HlcDto, now: number, prefs: TimeFormatPrefs): string {
+    return formatMessageTimestamp(at.wallMs, now, prefs);
   }
 
   // ZEB-432/ZEB-774 label ladder (mirrors MemberRow / FriendsPanel): local friend
@@ -867,7 +868,7 @@
             {#if row.forkReason}
               <span class="fork-divider-reason">“{row.forkReason}”</span>
             {/if}
-            <span class="fork-divider-meta">{new Date(row.forkedAtMs).toLocaleDateString()} · {snapshotMessages.length} message{snapshotMessages.length === 1 ? '' : 's'} carried</span>
+            <span class="fork-divider-meta">{formatDateOnly(row.forkedAtMs, $timeFormatPrefs)} · {snapshotMessages.length} message{snapshotMessages.length === 1 ? '' : 's'} carried</span>
           </span>
         </div>
       {:else if 'msg' in row}
@@ -893,7 +894,7 @@
               {:else}
                 <span class="author">{authorLabel(msg.author)}</span>
               {/if}
-              <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()} title={formatFullTimestamp(msg.at.wallMs)}>{formatTimestamp(msg.at, $dayClock)}</time>
+              <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()} title={formatFullTimestamp(msg.at.wallMs, $timeFormatPrefs)}>{formatTimestamp(msg.at, $dayClock, $timeFormatPrefs)}</time>
               {#if row.isPreFork}
                 <span class="pre-fork-badge" aria-label="From original community">from {originalCommunityName}</span>
               {/if}
