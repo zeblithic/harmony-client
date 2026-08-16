@@ -647,6 +647,7 @@
         {isOnline}
         {selfInvisible}
         {onOpenCard}
+        {thresholds}
       />
     </div>
   </div>

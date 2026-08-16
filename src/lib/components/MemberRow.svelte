@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { CommunityMember } from '../types';
+  import { POWER_THRESHOLDS } from '../types';
   import type { ResolvedCard } from '../member-card-service';
   import Avatar from './Avatar.svelte';
   import { nonEmpty } from '../display-label';
@@ -34,6 +35,7 @@
     isOnline,
     selfInvisible = false,
     onOpenCard,
+    thresholds = POWER_THRESHOLDS,
   }: {
     member: CommunityMember;
     viewer: { addr: string; power: number; isLastAdmin: boolean };
@@ -53,6 +55,12 @@
     selfInvisible?: boolean;
     /** ZEB-341: open the owner_id card popover for this member. */
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
+    /** ZEB-942: per-community power thresholds (kick / setPower). The kebab
+     *  gates mirror the backend `verify_event`, so a community that customizes
+     *  these away from the defaults gets consistent controls. Optional; defaults
+     *  to the global POWER_THRESHOLDS so callers that don't customize (and every
+     *  existing test) behave exactly as before. */
+    thresholds?: { kick: number; setPower: number };
   } = $props();
 
   let menuOpen = $state(false);
@@ -64,43 +72,68 @@
     return 'Member';
   }
 
+  // ZEB-942: FIXED role-ladder tiers — the same boundaries the tier badge uses
+  // (member < 50 ≤ Moderator, Admin = 100). These are the immovable role tiers,
+  // distinct from the customizable authorization `thresholds` below: only the
+  // auth gates move per community, the role ladder never does.
+  const MOD_TIER = 50;
+  const ADMIN_TIER = POWER_THRESHOLDS.max; // 100 — the immovable `max` the
+  // backend keys admin-affecting SetPower on (community_membership.rs).
+
   function kebabActions(
     viewerPower: number,
     targetPower: number,
     targetStatus: CommunityMember['status'],
     isSelf: boolean,
     _isLastAdmin: boolean,
+    thresholds: { kick: number; setPower: number },
   ): KebabAction[] {
     if (targetStatus === 'banned') {
-      return viewerPower >= 100 ? ['unban'] : [];
+      // Unban: backend requires actor_power >= set_power threshold
+      // (verify_event for MembershipEventKind::Unban).
+      return viewerPower >= thresholds.setPower ? ['unban'] : [];
     }
     if (isSelf) {
-      // Self-demote requires SetPower privilege (backend check:
-      // actor_power >= POWER_THRESHOLDS.set_power == 100). A moderator
-      // cannot self-demote via this UI — the backend would reject the
-      // setPowerLevel call with "insufficient power". Mods who want to
-      // step down should use the community-leave flow instead.
+      // Self-demote is a SetPower on self → authorized at set_power. (An admin
+      // self-demoting is admin-affecting but always holds max, so the set_power
+      // gate alone never surfaces a control the backend rejects.) Only offer a
+      // target level strictly BELOW the viewer's current power — a genuine
+      // demotion. Otherwise the control would be a no-op (level == current) or,
+      // when set_power is customized below the mod tier, a self-PROMOTION behind
+      // a "demote" label (demote-mod raises a power-30 viewer to 50). A member
+      // with nothing to demote should use the community-leave flow instead.
       const actions: KebabAction[] = [];
-      if (viewerPower >= 100) {
-        actions.push('demote-mod');
-        actions.push('demote-member');
+      if (viewerPower >= thresholds.setPower) {
+        if (viewerPower > MOD_TIER) actions.push('demote-mod'); // → 50
+        if (viewerPower > 0) actions.push('demote-member'); // → 0
       }
       return actions;
     }
-    // Acting on another member.
-    //
-    // SetPower (promote/demote) requires only that the actor has admin-tier
-    // (>= 100). The backend does NOT compare actor power to target power
-    // for SetPower — see `verify_event` for `MembershipEventKind::SetPower`
-    // in community_membership.rs. So an admin can demote a peer admin.
-    // Kick, by contrast, requires strictly-greater (`actor_power > target_power`).
+    // Acting on another member — mirror `verify_event` (community_membership.rs):
+    //  - Kick: actor_power >= thresholds.kick AND strictly-greater than target.
+    //  - SetPower: actor_power >= thresholds.setPower, EXCEPT admin-affecting
+    //    SetPower (granting the max tier, or touching a current max-holder)
+    //    requires actor_power >= max (100) regardless of a lowered set_power —
+    //    else a lowered set_power would delegate admin grant/removal to
+    //    non-admins (see the ZEB-734 guard). So promote-to-admin and demoting an
+    //    admin stay gated at ADMIN_TIER; promote-to-mod and demoting a mod use
+    //    set_power.
     const actions: KebabAction[] = [];
-    const canSetPower = viewerPower >= 100;
-    const canKick = viewerPower >= 50 && viewerPower > targetPower;
-    if (canSetPower && targetPower < 50) actions.push('promote-mod');
-    if (canSetPower && targetPower < 100) actions.push('promote-admin');
-    if (canSetPower && targetPower >= 100) actions.push('demote-mod');
-    if (canSetPower && targetPower >= 50) actions.push('demote-member');
+    const canSetPower = viewerPower >= thresholds.setPower; // non-admin-affecting
+    const canAdminAffect = viewerPower >= ADMIN_TIER; // grants/removes max
+    const canKick = viewerPower >= thresholds.kick && viewerPower > targetPower;
+    if (canSetPower && targetPower < MOD_TIER) actions.push('promote-mod');
+    if (canAdminAffect && targetPower < ADMIN_TIER) actions.push('promote-admin');
+    if (canAdminAffect && targetPower >= ADMIN_TIER) actions.push('demote-mod');
+    // Demote-to-Member is admin-affecting only when the target currently holds
+    // the max tier; demoting a mod (50..99) to member is not.
+    if (
+      targetPower >= ADMIN_TIER
+        ? canAdminAffect
+        : canSetPower && targetPower >= MOD_TIER
+    ) {
+      actions.push('demote-member');
+    }
     if (canKick) actions.push('kick');
     return actions;
   }
@@ -116,7 +149,7 @@
 
   let isSelf = $derived(member.address === viewer.addr);
   let actions = $derived(
-    kebabActions(viewer.power, member.power, member.status, isSelf, viewer.isLastAdmin)
+    kebabActions(viewer.power, member.power, member.status, isSelf, viewer.isLastAdmin, thresholds)
   );
   let label = $derived(tierLabel(member.power, member.status));
   // ZEB-432 label ladder (mirrors FriendsPanel): local friend nickname

@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import type { CommunityService } from '../community-service';
   import type { CommunityMember, ModerationEvent } from '../types';
+  import { POWER_THRESHOLDS } from '../types';
   import MemberRow from './MemberRow.svelte';
   import type { KebabAction, OpenCardPayload } from './MemberRow.svelte';
   import type { ResolvedCard } from '../member-card-service';
@@ -19,6 +20,7 @@
     isOnline,
     selfInvisible = false,
     onOpenCard,
+    thresholds = POWER_THRESHOLDS,
   }: {
     communityId: string;
     communityName: string;
@@ -41,6 +43,11 @@
     selfInvisible?: boolean;
     /** ZEB-341: open the owner_id card popover for a clicked member. */
     onOpenCard?: (payload: OpenCardPayload, ev: MouseEvent) => void;
+    /** ZEB-942: per-community power thresholds, forwarded to each MemberRow so
+     *  its kebab gates mirror the backend `verify_event`. Optional; defaults to
+     *  the global POWER_THRESHOLDS. CommunityView supplies the live governance
+     *  snapshot. */
+    thresholds?: { kick: number; setPower: number };
   } = $props();
 
   let members: CommunityMember[] = $state([]);
@@ -328,6 +335,7 @@
           {isOnline}
           {selfInvisible}
           {onOpenCard}
+          {thresholds}
           onaction={(detail) => onMemberAction(detail)}
         />
       {/each}
@@ -349,6 +357,7 @@
               {isOnline}
               {selfInvisible}
               {onOpenCard}
+              {thresholds}
               onaction={(detail) => onMemberAction(detail)}
             />
           {/each}
