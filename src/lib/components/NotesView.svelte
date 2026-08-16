@@ -10,8 +10,9 @@
    */
   import { onMount, onDestroy } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
+  import { formatMessageTimestamp, formatFullTimestamp, type TimeFormatPrefs } from '../time-format';
   import { dayClock } from '../day-clock';
+  import { timeFormatPrefs } from '../time-format-service';
   import type { NotesService, NoteEntry } from '../notes-service';
 
   let {
@@ -93,8 +94,8 @@
   // local midnight without a remount (day-clock.ts). No per-message timer.
   // `now` comes from the template call site (`$dayClock`) so Svelte tracks the
   // store as a render dependency.
-  function formatTime(ts: number, now: number): string {
-    return formatMessageTimestamp(ts, now);
+  function formatTime(ts: number, now: number, prefs: TimeFormatPrefs): string {
+    return formatMessageTimestamp(ts, now, prefs);
   }
 </script>
 
@@ -117,8 +118,8 @@
       <article class="note-entry">
         <header class="note-meta">
           <span class="note-author">{authorLabel}</span>
-          <time class="note-ts" datetime={new Date(entry.timestamp).toISOString()} title={formatFullTimestamp(entry.timestamp)}>
-            {formatTime(entry.timestamp, $dayClock)}
+          <time class="note-ts" datetime={new Date(entry.timestamp).toISOString()} title={formatFullTimestamp(entry.timestamp, $timeFormatPrefs)}>
+            {formatTime(entry.timestamp, $dayClock, $timeFormatPrefs)}
           </time>
         </header>
         <p class="note-body">{entry.text}</p>
