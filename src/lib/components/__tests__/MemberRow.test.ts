@@ -262,6 +262,27 @@ describe('MemberRow per-community thresholds (ZEB-942)', () => {
     expect(getByRole('menuitem', { name: 'Demote to Member' })).toBeTruthy();
     expect(queryByRole('menuitem', { name: 'Kick' })).toBeNull();
   });
+
+  it('self-demote never offers a control that RAISES power (demote-mod hidden below mod tier)', async () => {
+    // Regression (CodeRabbit PR #691): 'Demote to Moderator' maps to
+    // setPowerLevel(self, 50). For a power-30 viewer under a lowered setPower
+    // (25) the self-demote gate passes, but offering demote-mod would let the
+    // viewer promote themselves 30 → 50 via a "demote" label. It must be hidden;
+    // only genuinely-lowering actions (demote-member → 0) may appear.
+    const selfMember = makeMember(30, 'joined', VIEWER_ADDR);
+    const { getByRole, queryByRole } = render(MemberRow, {
+      props: {
+        member: selfMember,
+        viewer: { addr: VIEWER_ADDR, power: 30, isLastAdmin: false },
+        thresholds: { kick: 50, setPower: 25 },
+        onaction: vi.fn(),
+      },
+    });
+
+    await fireEvent.click(getByRole('button', { name: 'Member actions' }));
+    expect(queryByRole('menuitem', { name: 'Demote to Moderator' })).toBeNull();
+    expect(getByRole('menuitem', { name: 'Demote to Member' })).toBeTruthy();
+  });
 });
 
 describe('MemberRow display-name resolution (ZEB-432)', () => {

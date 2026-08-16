@@ -357,6 +357,7 @@
               {isOnline}
               {selfInvisible}
               {onOpenCard}
+              {thresholds}
               onaction={(detail) => onMemberAction(detail)}
             />
           {/each}

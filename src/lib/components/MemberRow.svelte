@@ -94,14 +94,18 @@
       return viewerPower >= thresholds.setPower ? ['unban'] : [];
     }
     if (isSelf) {
-      // Self-demote is a SetPower on self → gated on set_power. (An admin
+      // Self-demote is a SetPower on self → authorized at set_power. (An admin
       // self-demoting is admin-affecting but always holds max, so the set_power
-      // gate alone never surfaces a control the backend rejects.) A member below
-      // set_power cannot self-demote here — they should use community-leave.
+      // gate alone never surfaces a control the backend rejects.) Only offer a
+      // target level strictly BELOW the viewer's current power — a genuine
+      // demotion. Otherwise the control would be a no-op (level == current) or,
+      // when set_power is customized below the mod tier, a self-PROMOTION behind
+      // a "demote" label (demote-mod raises a power-30 viewer to 50). A member
+      // with nothing to demote should use the community-leave flow instead.
       const actions: KebabAction[] = [];
       if (viewerPower >= thresholds.setPower) {
-        actions.push('demote-mod');
-        actions.push('demote-member');
+        if (viewerPower > MOD_TIER) actions.push('demote-mod'); // → 50
+        if (viewerPower > 0) actions.push('demote-member'); // → 0
       }
       return actions;
     }

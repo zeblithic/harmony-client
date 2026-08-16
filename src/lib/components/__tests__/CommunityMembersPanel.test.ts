@@ -206,6 +206,48 @@ describe('CommunityMembersPanel', () => {
     expect(screen.getByRole('menuitem', { name: 'Kick' })).toBeTruthy();
   });
 
+  it('threads thresholds into BANNED rows too — lowered setPower shows Unban to a sub-100 moderator (ZEB-942)', async () => {
+    // Regression (CodeRabbit/CodeAnt PR #691): the banned-row MemberRow must
+    // receive `thresholds` just like active rows. MemberRow gates Unban on
+    // thresholds.setPower; a lowered setPower (50) must let a power-50 viewer see
+    // Unban on a banned member. If the banned row fell back to the default
+    // setPower=100, no kebab would render on the banned row at all.
+    const viewer50: CommunityMember = {
+      address: OWN_ADDRESS,
+      displayName: 'Alice',
+      power: 50,
+      status: 'joined',
+      joinedAt: 1700000000000,
+    };
+    const bannedEve: CommunityMember = {
+      address: 'eve'.padEnd(32, '0'),
+      displayName: 'Eve',
+      power: 0,
+      status: 'banned',
+      joinedAt: 1700000002000,
+    };
+    const { container } = render(CommunityMembersPanel, {
+      props: {
+        ...baseProps(),
+        communityService: makeService([viewer50, bannedEve]),
+        thresholds: { kick: 50, setPower: 50 },
+      },
+    });
+
+    await screen.findByText(/Banned \(1\)/i);
+    const bannedList = container.querySelector('.banned-list');
+    expect(bannedList).not.toBeNull();
+    // Under the bug (banned row missing thresholds → default setPower=100), a
+    // power-50 viewer sees no Unban, so no kebab renders in the banned list.
+    const kebab = bannedList!.querySelector<HTMLButtonElement>('.kebab-btn');
+    expect(kebab).not.toBeNull();
+    await fireEvent.click(kebab!);
+    const items = Array.from(bannedList!.querySelectorAll('.menu-item')).map((el) =>
+      el.textContent?.trim(),
+    );
+    expect(items).toContain('Unban');
+  });
+
   it('IPC error surfaces as role="alert" in the panel', async () => {
     const service = makeService([], new Error('network timeout'));
     render(CommunityMembersPanel, {
