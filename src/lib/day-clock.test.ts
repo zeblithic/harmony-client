@@ -43,6 +43,31 @@ describe('createDayClock', () => {
     unsub();
   });
 
+  it('re-emits a fresh instant on resubscription after a gap (no stale resume)', () => {
+    // The store tears down (clears its timer) when the last subscriber leaves —
+    // e.g. every message surface unmounts while the user is in Settings. If the
+    // gap crosses midnight, a naive readable would hand the next subscriber its
+    // retained pre-midnight value and only refresh at the FOLLOWING midnight.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 16, 23, 0, 0)); // 11pm, day 16
+    const clock = createDayClock();
+
+    const unsub1 = clock.subscribe(() => {});
+    unsub1(); // teardown: timer cleared, value retained at day 16
+
+    // Time advances across midnight while nothing is subscribed.
+    vi.setSystemTime(new Date(2026, 7, 17, 9, 0, 0)); // 9am, day 17
+
+    let firstSeen = 0;
+    const unsub2 = clock.subscribe((v) => {
+      if (firstSeen === 0) firstSeen = v;
+    });
+    // The value the returning subscriber sees first must be "today" (17),
+    // not the stale retained day-16 value.
+    expect(new Date(firstSeen).getDate()).toBe(17);
+    unsub2();
+  });
+
   it('stops its timer once the last subscriber leaves', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 7, 16, 12, 0, 0));

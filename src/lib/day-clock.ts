@@ -47,6 +47,12 @@ export function createDayClock(): Readable<number> {
         scheduleNext();
       }, msUntilNextLocalMidnight(Date.now()));
     };
+    // Refresh immediately on (re)subscription: the store retains its last value
+    // across a 0-subscriber gap and the timer is cleared on teardown, so a gap
+    // that crossed midnight (e.g. the user sat in a non-message view) would
+    // otherwise hand the returning subscriber a stale pre-midnight instant until
+    // the following midnight. Greptile P1, PR #692.
+    set(Date.now());
     scheduleNext();
     return () => clearTimeout(timer);
   });
