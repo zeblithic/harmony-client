@@ -4,6 +4,7 @@ import {
   formatMessageTimestamp,
   formatFullTimestamp,
   formatClockTime,
+  formatDateOnly,
   type TimeFormatPrefs,
 } from './time-format';
 
@@ -102,6 +103,21 @@ describe('formatMessageTimestamp — explicit dateOrder', () => {
     const out = formatMessageTimestamp(ms, now, { dateOrder: 'ymd', locale: 'en-US' });
     expect(out).not.toContain('-');
     expect(out).toBe(timeOf(ms));
+  });
+});
+
+describe('formatDateOnly', () => {
+  it('renders a full numeric date only, honoring the date-order preference', () => {
+    const ms = at(2026, 7, 14, 20, 11);
+    expect(formatDateOnly(ms, { locale: 'en-US' })).toBe('8/14/2026'); // system → locale
+    expect(formatDateOnly(ms, { dateOrder: 'mdy' })).toBe('8/14/2026');
+    expect(formatDateOnly(ms, { dateOrder: 'dmy' })).toBe('14/8/2026');
+    expect(formatDateOnly(ms, { dateOrder: 'ymd' })).toBe('2026-08-14');
+  });
+
+  it('carries no time-of-day', () => {
+    const ms = at(2026, 7, 14, 20, 11);
+    expect(formatDateOnly(ms, { dateOrder: 'ymd' })).not.toContain(':');
   });
 });
 

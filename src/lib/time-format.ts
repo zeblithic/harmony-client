@@ -109,6 +109,27 @@ export function formatClockTime(
 }
 
 /**
+ * Full numeric date only, no time-of-day, honoring the date-order preference.
+ * For standalone date labels that sit alongside message timestamps — e.g. the
+ * fork-divider band — so they don't disagree with the chosen order. `system`
+ * (undefined `dateOrder`) follows the locale, matching a bare
+ * `toLocaleDateString()`.
+ */
+export function formatDateOnly(
+  ms: number,
+  prefs: TimeFormatPrefs = DEFAULT_TIME_FORMAT_PREFS,
+): string {
+  const date = new Date(ms);
+  return prefs.dateOrder === undefined
+    ? date.toLocaleDateString(localeArg(prefs), {
+        year: 'numeric',
+        month: 'numeric',
+        day: 'numeric',
+      })
+    : orderedDate(date, prefs.dateOrder, 'numeric');
+}
+
+/**
  * Inline label for a message timestamp:
  *  - same local day as `now` → bare time (`08:11 AM`)
  *  - other day, same year    → `8/14, 08:11 AM`

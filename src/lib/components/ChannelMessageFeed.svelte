@@ -16,7 +16,7 @@
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
   import type { ResolvedCard } from '../member-card-service';
   import { nonEmpty } from '../display-label';
-  import { formatMessageTimestamp, formatFullTimestamp, type TimeFormatPrefs } from '../time-format';
+  import { formatMessageTimestamp, formatFullTimestamp, formatDateOnly, type TimeFormatPrefs } from '../time-format';
   import { dayClock } from '../day-clock';
   import { timeFormatPrefs } from '../time-format-service';
   import { tokenizeBody, resolveMentionLabel } from '../mention-render';
@@ -868,7 +868,7 @@
             {#if row.forkReason}
               <span class="fork-divider-reason">“{row.forkReason}”</span>
             {/if}
-            <span class="fork-divider-meta">{new Date(row.forkedAtMs).toLocaleDateString()} · {snapshotMessages.length} message{snapshotMessages.length === 1 ? '' : 's'} carried</span>
+            <span class="fork-divider-meta">{formatDateOnly(row.forkedAtMs, $timeFormatPrefs)} · {snapshotMessages.length} message{snapshotMessages.length === 1 ? '' : 's'} carried</span>
           </span>
         </div>
       {:else if 'msg' in row}
