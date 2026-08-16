@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import type { Message, MediaAttachment } from '../types';
+  import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
   import Avatar from './Avatar.svelte';
 
   let { message, attachment, onLinkBack, onAvatarClick, onLoad }: {
@@ -11,12 +12,9 @@
     onLoad?: (attachmentId: string) => void;
   } = $props();
 
-  let timeStr = $derived(
-    new Date(message.timestamp).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    })
-  );
+  // ZEB-943: mount-time reference instant (no per-message timer — see ZEB-242).
+  const now = Date.now();
+  let timeStr = $derived(formatMessageTimestamp(message.timestamp, now));
 
   type LoadState = 'blocked' | 'confirming' | 'cooldown';
   let loadState = $state<LoadState>('blocked');
@@ -68,7 +66,7 @@
       onclick={(e) => { e.stopPropagation(); onAvatarClick?.(message.sender.address, e); }}
     />
     <span class="card-sender">{message.sender.displayName}</span>
-    <span class="card-time">{timeStr}</span>
+    <span class="card-time" title={formatFullTimestamp(message.timestamp)}>{timeStr}</span>
     <span class="link-back-icon" title="Jump to message">&#8599;</span>
   </button>
 

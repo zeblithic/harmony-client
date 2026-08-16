@@ -2,6 +2,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/svelte';
 import CallEventLine from '../CallEventLine.svelte';
+import { formatMessageTimestamp, formatFullTimestamp } from '../../time-format';
 import type { Message } from '../../types';
 
 afterEach(cleanup);
@@ -74,13 +75,17 @@ describe('CallEventLine', () => {
     expect(screen.getByTestId('call-event-line').textContent).not.toContain('not delivered');
   });
 
-  it('shows the call timestamp', () => {
+  it('shows the ZEB-943 date-aware timestamp with a full-datetime tooltip', () => {
     const { message, isSelf } = callMessage('declined');
     render(CallEventLine, { props: { message, isSelf } });
-    const expected = new Date(1_700_000_000_000).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-    expect(screen.getByTestId('call-event-line').textContent).toContain(expected);
+    const time = screen.getByTestId('call-event-line').querySelector('.time') as HTMLElement;
+    // Wiring contract: the visible label is the shared date-aware formatter's
+    // output and the tooltip carries the full datetime (format correctness is
+    // pinned in time-format.test.ts). The fixture timestamp (2023) is always a
+    // past year, so a date component is always rendered.
+    const ts = 1_700_000_000_000;
+    expect(time.textContent).toBe(formatMessageTimestamp(ts, Date.now()));
+    expect(time.textContent).toMatch(/\//); // date present — not "today"
+    expect(time.getAttribute('title')).toBe(formatFullTimestamp(ts));
   });
 });

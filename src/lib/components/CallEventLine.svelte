@@ -5,6 +5,7 @@
   // Message.text so the direction can never go stale against the payload.
   import type { Message } from '../types';
   import { describeCallEvent, isMissedCallEvent } from '../call-log';
+  import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
 
   let { message, isSelf = false }: { message: Message; isSelf?: boolean } = $props();
 
@@ -15,12 +16,9 @@
   let missed = $derived(
     message.callEvent ? isMissedCallEvent(message.callEvent, direction) : false,
   );
-  let timeStr = $derived(
-    new Date(message.timestamp).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    }),
-  );
+  // ZEB-943: mount-time reference instant (no per-message timer — see ZEB-242).
+  const now = Date.now();
+  let timeStr = $derived(formatMessageTimestamp(message.timestamp, now));
 </script>
 
 <div class="call-event-line" class:missed data-testid="call-event-line" role="note">
@@ -32,7 +30,7 @@
          call. Without the marker a failed send is invisible to the caller. -->
     <span class="failed">not delivered</span>
   {/if}
-  <span class="time">{timeStr}</span>
+  <span class="time" title={formatFullTimestamp(message.timestamp)}>{timeStr}</span>
   <span class="rule" aria-hidden="true"></span>
 </div>
 

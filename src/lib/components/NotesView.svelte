@@ -10,6 +10,7 @@
    */
   import { onMount, onDestroy } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
+  import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
   import type { NotesService, NoteEntry } from '../notes-service';
 
   let {
@@ -87,8 +88,10 @@
     }
   }
 
+  // ZEB-943: mount-time reference instant (no per-message timer — see ZEB-242).
+  const now = Date.now();
   function formatTime(ts: number): string {
-    return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return formatMessageTimestamp(ts, now);
   }
 </script>
 
@@ -111,7 +114,7 @@
       <article class="note-entry">
         <header class="note-meta">
           <span class="note-author">{authorLabel}</span>
-          <time class="note-ts" datetime={new Date(entry.timestamp).toISOString()}>
+          <time class="note-ts" datetime={new Date(entry.timestamp).toISOString()} title={formatFullTimestamp(entry.timestamp)}>
             {formatTime(entry.timestamp)}
           </time>
         </header>

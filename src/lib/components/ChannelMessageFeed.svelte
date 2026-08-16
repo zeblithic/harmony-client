@@ -16,6 +16,7 @@
   import { buildUnifiedTimeline, type TimelineRow } from '../fork-timeline';
   import type { ResolvedCard } from '../member-card-service';
   import { nonEmpty } from '../display-label';
+  import { formatMessageTimestamp, formatFullTimestamp } from '../time-format';
   import { tokenizeBody, resolveMentionLabel } from '../mention-render';
   import type { MentionCandidate } from '../mention-compose';
   import MentionInput from './MentionInput.svelte';
@@ -459,8 +460,14 @@
     return author === ownAddress;
   }
 
+  // ZEB-943: mount-time reference instant for the "is this message from today?"
+  // decision. Deliberately not a ticking timer — ZEB-242 established that
+  // per-message timers are wasteful, and the hover tooltip always carries the
+  // exact date regardless of a midnight rollover mid-session.
+  const now = Date.now();
+
   function formatTimestamp(at: HlcDto): string {
-    return new Date(at.wallMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return formatMessageTimestamp(at.wallMs, now);
   }
 
   // ZEB-432/ZEB-774 label ladder (mirrors MemberRow / FriendsPanel): local friend
@@ -886,7 +893,7 @@
               {:else}
                 <span class="author">{authorLabel(msg.author)}</span>
               {/if}
-              <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()}>{formatTimestamp(msg.at)}</time>
+              <time class="ts" datetime={new Date(msg.at.wallMs).toISOString()} title={formatFullTimestamp(msg.at.wallMs)}>{formatTimestamp(msg.at)}</time>
               {#if row.isPreFork}
                 <span class="pre-fork-badge" aria-label="From original community">from {originalCommunityName}</span>
               {/if}
