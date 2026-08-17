@@ -53,12 +53,16 @@ describe('InviteLinkManager', () => {
 
   it('shows kind-specific warning after generation (invite-only)', async () => {
     const onGenerate = vi.fn().mockResolvedValue('harmony://invite/v1?ci=foo');
-    const { getByText } = render(InviteLinkManager, {
+    const { getByText, container } = render(InviteLinkManager, {
       props: { kind: 'invite-only', onGenerate },
     });
     await fireEvent.click(getByText(/Generate invite link/i));
     await new Promise((r) => setTimeout(r, 0));
-    expect(getByText(/admin bootstrap signature/i)).toBeTruthy();
+    // ZEB-953: the warning is crypto-accurate for any inviter (admin OR a
+    // moderator, post-ZEB-950) — it embeds the generator's own invite
+    // signature, not an "admin bootstrap signature".
+    expect(getByText(/invite signature/i)).toBeTruthy();
+    expect(container.textContent).not.toMatch(/admin/i);
   });
 
   it('shows kind-specific warning after generation (open)', async () => {

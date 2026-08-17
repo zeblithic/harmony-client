@@ -160,8 +160,10 @@ pub struct CommunityInvitePayload {
     /// `verify_invite_token_sig_with_enrolled`), not against this field, so a
     /// moderator's token is accepted. (ZEB-951 renamed this field from the former
     /// `admin_identity_pub`; wire key `ap` unchanged, so encoding is byte-identical.
-    /// The redeem error-code vocabulary keeps its stable `missing_admin_identity_pub`
-    /// string — a frontend contract, deliberately not renamed.)
+    /// ZEB-953 renamed the matching redeem error-code from `missing_admin_identity_pub`
+    /// to `missing_inviter_identity_pub` to track this field: that code is a
+    /// redeemer-local Rust↔frontend IPC string (Serialize-only, never on the iroh
+    /// wire between nodes or persisted), so it carries no cross-version contract.)
     ///
     /// ZEB-339: NO LONGER used to verify `admin_bootstrap` (that goes through
     /// the admin's EnrollmentCert carried on the bootstrap event — see
@@ -1673,7 +1675,7 @@ pub enum RedeemInviteErrorCode {
     InviteExpired,
     InviteVerifyFailed,
     InviteTokenMissing,
-    MissingAdminIdentityPub,
+    MissingInviterIdentityPub,
     // ── Reachability / transient — retry. ──
     InviterUnreachable,
     RelaysWarmingUp,
@@ -1704,7 +1706,7 @@ impl RedeemInviteErrorCode {
             Self::InviteExpired => "invite_expired",
             Self::InviteVerifyFailed => "invite_verify_failed",
             Self::InviteTokenMissing => "invite_token_missing",
-            Self::MissingAdminIdentityPub => "missing_admin_identity_pub",
+            Self::MissingInviterIdentityPub => "missing_inviter_identity_pub",
             Self::InviterUnreachable => "inviter_unreachable",
             Self::RelaysWarmingUp => "relays_warming_up",
             Self::NodeNotReady => "node_not_ready",
@@ -1851,7 +1853,7 @@ mod redeem_invite_error_code_tests {
         RedeemInviteErrorCode::InviteExpired,
         RedeemInviteErrorCode::InviteVerifyFailed,
         RedeemInviteErrorCode::InviteTokenMissing,
-        RedeemInviteErrorCode::MissingAdminIdentityPub,
+        RedeemInviteErrorCode::MissingInviterIdentityPub,
         RedeemInviteErrorCode::InviterUnreachable,
         RedeemInviteErrorCode::RelaysWarmingUp,
         RedeemInviteErrorCode::NodeNotReady,
@@ -1987,7 +1989,7 @@ mod redeem_invite_error_code_tests {
         for status in [
             "inviter_unreachable",
             "join_failed",
-            "missing_admin_identity_pub",
+            "missing_inviter_identity_pub",
         ] {
             assert!(
                 ALL_CODES.iter().any(|c| c.as_str() == status),

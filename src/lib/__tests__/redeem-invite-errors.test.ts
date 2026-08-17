@@ -104,3 +104,24 @@ describe('toRedeemInviteError', () => {
     expect(typeof e.message).toBe('string');
   });
 });
+
+// ZEB-953: de-admin the redemption vocabulary. Post-ZEB-950 (moderator invites)
+// and ZEB-911 (witness ladder), the inviter is the actor a redeemer waits on —
+// not necessarily "the admin". The copy and the internal code are aligned to
+// say "inviter".
+describe('redemption vocabulary says "inviter", not "admin" (ZEB-953)', () => {
+  it('inviter_unreachable hint points at the inviter, consistent with its own summary', () => {
+    const copy = redeemInviteCopy('inviter_unreachable');
+    expect(copy.summary).toMatch(/inviter/i);
+    expect(copy.hint).toMatch(/inviter/i);
+    expect(copy.hint).not.toMatch(/admin/i);
+  });
+
+  it('exposes missing_inviter_identity_pub and retires missing_admin_identity_pub', () => {
+    const fallback = redeemInviteCopy('unknown');
+    // The renamed code carries its own (non-fallback) copy...
+    expect(redeemInviteCopy('missing_inviter_identity_pub')).not.toEqual(fallback);
+    // ...and the old spelling is gone from the vocabulary (falls back to unknown).
+    expect(redeemInviteCopy('missing_admin_identity_pub')).toEqual(fallback);
+  });
+});
