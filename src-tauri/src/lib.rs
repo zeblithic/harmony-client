@@ -36187,27 +36187,13 @@ pub(crate) async fn generate_invite_impl(
             Vec::new()
         };
 
-    let state_snapshot = {
-        let materialized = if engine_state.is_some() {
-            // R4-6: pass wall_now_ms so an idle-community PendingJoin
-            // already past 30d is excluded from the bootstrap snapshot
-            // sent to a new invitee.
-            let wall_now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            crate::community_membership::materialize_with_now(&events, admin, Some(wall_now_ms))
-        } else {
-            // No engine yet (e.g., just-created community with no events):
-            // fall back to empty maps — still a valid bootstrap hint.
-            crate::community_membership::MaterializedMembership::default()
-        };
-        crate::community_invite::MaterializedCommunityState {
-            members: materialized.members,
-            channels: materialized.channels,
-            power_levels: materialized.power_levels,
-        }
-    };
+    // ZEB-949 Phase 2: invites no longer inline the roster — members, channels,
+    // and policies sync P2P after redemption (spike verdict: the snapshot is a
+    // UI hint, never consulted by the membership-at-HLC gate). O(members) -> O(1).
+    // This also drops, for free, the zeroed ed25519_pub / PQ placeholder fields
+    // that lived per-member inside the roster. `events` remains in use below
+    // (admin-bootstrap extraction).
+    let state_snapshot = crate::community_invite::MaterializedCommunityState::default();
 
     // ZEB-367 Phase 4: invite-only invites seal the epoch key + carry a signed
     // InviteToken + the admin bootstrap; open invites ship the raw 32-byte key.
