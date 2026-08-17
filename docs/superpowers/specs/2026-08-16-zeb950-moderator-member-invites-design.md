@@ -60,10 +60,9 @@ For a community that *raises* `invite_threshold` (e.g. to 50), the witness model
 - `generate_invite_impl` already sets it from the generator's own identity — correct for a moderator inviter with no change. Verify the receive-side token-verify paths resolve the **inviter's** keys (they already do in `handle_unicast` via membership; confirm the `verify_invite_token_signature`/`PendingJoin` path does not assume admin).
 - This is a **local rename**, not a wire-format change: no new tag, no migration.
 
-### 3. Frontend: gate the affordance by power, not `canAdmin`
+### 3. Frontend: verify the (already-present) threshold gate + reachability
 
-- Add `canInvite = myPower >= thresholds.invite` (mirroring the existing `myPower >= thresholds.kick` gates in `CommunitySettingsPanel.svelte:406`). At threshold 0, every member sees it.
-- Gate the invite affordance (`InviteLinkManager` mount / the "generate invite" control at `CommunitySettingsPanel.svelte:617`, and the `CommunityView.svelte` path) on `canInvite` instead of the admin-tier gate. Keep the settings-panel entry reachable for non-admins when they have invite power (or surface the invite control outside the admin-only settings section — decided in the plan by where the control currently lives).
+- The invite section **already** gates on `{#if myPower >= thresholds.invite}` (`CommunitySettingsPanel.svelte:614`), not on the admin tier — so at threshold 0 every member already sees the invite control. The production change here is small-to-none: verify a non-admin Joined member can actually *reach* the panel/section (no higher-level admin-only gate hides it), and add regression coverage. If a higher-level gate does hide it, relax that entry to `myPower >= thresholds.invite`.
 - `powerToRole` and role labels are unaffected.
 
 ## The one implementation detail pinned by TDD
