@@ -63044,9 +63044,10 @@ pub struct RedemptionOutcome {
     ///   `community_id` is `Some(hex)` so the frontend can surface
     ///   "we found Alice but local insert failed". Added in ZEB-325
     ///   PR #159 F1.
-    /// * `"missing_inviter_identity_pub"` — open invite (no
-    ///   inviter_identity_pub binding); case-A discovery is not
-    ///   applicable. `community_id` is `None`.
+    /// * `"missing_inviter_identity_pub"` — the invite carries a token but
+    ///   no `inviter_identity_pub` binding, so case-A discovery is not
+    ///   applicable (an open invite with no token instead returns
+    ///   `"inviter_unreachable"` at the earlier guard). `community_id` is `None`.
     /// * `"pkarr_resolved_no_handshake"` — legacy Phase 2b stub status;
     ///   no longer returned by Phase 2c+. Kept in the type union for
     ///   frontend defensive parsing.
@@ -63226,8 +63227,8 @@ pub struct PkarrPublicationStatus {
 ///
 /// Returns `"joined"` on successful redemption; `"inviter_unreachable"`
 /// when pkarr cannot find the record or the record fails verification;
-/// `"missing_inviter_identity_pub"` when the invite is open (no inviter
-/// identity binding) and case-A discovery is not applicable.
+/// `"missing_inviter_identity_pub"` when the invite carries a token but has
+/// no inviter identity binding and case-A discovery is not applicable.
 ///
 /// Implementation is split into a `pub` `connectivity_redeem_invite_iroh_inner`
 /// helper so integration tests can drive the orchestration with explicit
