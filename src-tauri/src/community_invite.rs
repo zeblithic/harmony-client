@@ -1184,6 +1184,16 @@ fn inflate_body(deflate_stream: &[u8]) -> Result<Vec<u8>, InviteUrlError> {
     if out.len() > MAX_DECODED_CBOR_BYTES {
         return Err(InviteUrlError::DecompressedTooLarge(out.len()));
     }
+    // ZEB-948 strict framing: the body must be EXACTLY one DEFLATE stream. The
+    // decoder stops at the stream's end and silently ignores anything after it,
+    // so verify it consumed every input byte — reject trailing / appended bytes
+    // after a valid stream, which would otherwise make the invite URL malleable
+    // (multiple accepted encodings of the same payload).
+    if limited.get_ref().total_in() as usize != deflate_stream.len() {
+        return Err(InviteUrlError::Decompress(
+            "trailing bytes after the DEFLATE stream".to_string(),
+        ));
+    }
     Ok(out)
 }
 
@@ -3337,6 +3347,25 @@ mod tests {
         assert!(matches!(
             encode_invite_url(&p),
             Err(InviteUrlError::DecompressedTooLarge(_))
+        ));
+    }
+
+    /// Strict framing (CodeAnt PR #695): trailing bytes appended after a valid
+    /// DEFLATE stream are rejected, not silently ignored — the compressed body
+    /// must be exactly one stream, so an attacker can't pad a URL with extra
+    /// bytes that decode to the same payload.
+    #[test]
+    fn decode_rejects_trailing_bytes_after_compressed_body() {
+        let mut p = make_open_payload_correct();
+        p.community_name = "harmony community ".repeat(400); // ensures the body compresses
+        let cbor = canonical_cbor_encode(&p).expect("cbor");
+        let mut body = deflate_body(&cbor); // [0x01] ++ deflate(cbor)
+        body.extend_from_slice(b"trailing-garbage"); // append junk after the stream
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&body);
+        let url = format!("harmony://invite/{b64}");
+        assert!(matches!(
+            decode_invite_url(&url),
+            Err(InviteUrlError::Decompress(_))
         ));
     }
 
