@@ -147,16 +147,27 @@ pub struct CommunityInvitePayload {
     #[serde(rename = "ab", skip_serializing_if = "Option::is_none", default)]
     pub admin_bootstrap: Option<crate::community_membership::SignedMembershipEvent>,
 
-    /// Admin's 64-byte identity_pub (X25519_pub(32) || Ed25519_pub(32),
+    /// The INVITER's 64-byte identity_pub (X25519_pub(32) || Ed25519_pub(32),
     /// matching `harmony_identity::Identity::to_public_bytes()`). Required
-    /// (present) for invite-only payloads (ZEB-260). ZEB-339: this is the
-    /// admin's RETICULUM transport pub; it is NO LONGER used to verify
-    /// `admin_bootstrap` (that now goes through the admin's EnrollmentCert
-    /// carried on the bootstrap event — see `verify_admin_bootstrap`), and
-    /// the old `address_hash(admin_identity_pub) == admin_addr` binding does
-    /// not hold under the owner/device split (admin_addr is the owner_id /
-    /// master hash). Still threaded into `insert_local_event_with_pubs`,
-    /// which ignores it post-ZEB-339.
+    /// (present) for invite-only payloads (ZEB-260).
+    ///
+    /// ZEB-950: despite the `admin_identity_pub` name, this is the identity of
+    /// whoever GENERATED the invite — the admin in the v1 common case, but any
+    /// member with power ≥ the community's `invite` threshold since moderator
+    /// invites shipped. `generate_invite_impl` sets it from the generator's own
+    /// identity, so a non-admin inviter supplies their own with no change. The
+    /// invite token is verified against the inviter's ENROLLED DEVICE keys
+    /// (resolved from materialized membership — `verify_invite_token_sig_with_enrolled`),
+    /// not against this field, so a moderator's token is accepted. A rename to
+    /// `inviter_identity_pub` (wire key `ap` unchanged) is tracked as a
+    /// dedicated follow-up PR.
+    ///
+    /// ZEB-339: NO LONGER used to verify `admin_bootstrap` (that goes through
+    /// the admin's EnrollmentCert carried on the bootstrap event — see
+    /// `verify_admin_bootstrap`), and the old
+    /// `address_hash(admin_identity_pub) == admin_addr` binding does not hold
+    /// under the owner/device split. Still threaded into
+    /// `insert_local_event_with_pubs`, which ignores it post-ZEB-339.
     #[serde(
         rename = "ap",
         skip_serializing_if = "Option::is_none",
