@@ -1,7 +1,13 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, waitFor, fireEvent } from '@testing-library/svelte';
 import RecoveryBanner from '../RecoveryBanner.svelte';
 import type { RecoveryProposalDto, RecoveryStateDto } from '../../recovery-types';
+// ZEB-946: the veto-deadline timestamp honors the owner's time-format prefs.
+import {
+  setTimeFormatSettings,
+  _resetTimeFormatServiceForTest,
+} from '../../time-format-service';
+import { formatFullTimestamp } from '../../time-format';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/event', () => ({
@@ -242,6 +248,29 @@ describe('RecoveryBanner', () => {
     // Dismissed durably — the nudge button does not come back.
     await waitFor(() => {
       expect(() => getByText('Review recovery settings')).toThrow();
+    });
+  });
+
+  describe('honors the time-format preference (ZEB-946)', () => {
+    afterEach(() => {
+      _resetTimeFormatServiceForTest();
+    });
+
+    it('renders the veto deadline in the chosen clock + order', async () => {
+      setTimeFormatSettings({ clock: '24h', dateOrder: 'ymd' });
+      const deadline = Date.UTC(2026, 7, 1, 15, 30);
+      mockRecoveryState(
+        makeState({
+          proposals: [makeProposal({ phase: 'timeLocked', deadlineMs: deadline, signersSoFar: 2 })],
+        }),
+      );
+      const { container } = renderBanner();
+      await waitFor(() =>
+        expect(container.querySelector('[data-testid="recovery-banner"]')).not.toBeNull(),
+      );
+      expect(container.querySelector('[data-testid="recovery-banner"]')?.textContent).toContain(
+        formatFullTimestamp(deadline, { hour12: false, dateOrder: 'ymd' }),
+      );
     });
   });
 });

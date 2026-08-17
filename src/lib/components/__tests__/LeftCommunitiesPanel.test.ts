@@ -1,7 +1,13 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import LeftCommunitiesPanel from '../LeftCommunitiesPanel.svelte';
 import type { LeftCommunityNavDto } from '../../community-service';
+// ZEB-946: the "Left …" date honors the owner's date-order preference.
+import {
+  setTimeFormatSettings,
+  _resetTimeFormatServiceForTest,
+} from '../../time-format-service';
+import { formatDateOnly } from '../../time-format';
 
 const ROW: LeftCommunityNavDto = {
   spaceId: 'aa'.repeat(16),
@@ -142,5 +148,21 @@ describe('LeftCommunitiesPanel (ZEB-435)', () => {
     await rerender({ active: true });
     await findByText(/No left communities/i);
     expect(service.listLeftCommunities).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('LeftCommunitiesPanel left-at date honors the preference (ZEB-946)', () => {
+  afterEach(() => {
+    _resetTimeFormatServiceForTest();
+  });
+
+  it('renders the left-at date in the chosen order', async () => {
+    setTimeFormatSettings({ clock: 'system', dateOrder: 'ymd' });
+    const service = makeService([[ROW]]);
+    const { container, findByText } = render(LeftCommunitiesPanel, { props: { service } });
+    await findByText('Old Crew');
+    expect(container.querySelector('.left-at')?.textContent).toBe(
+      `Left ${formatDateOnly(ROW.leftAtMs, { dateOrder: 'ymd' })}`,
+    );
   });
 });

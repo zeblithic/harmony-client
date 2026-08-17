@@ -1,7 +1,14 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import DevicesPanel from '../DevicesPanel.svelte';
+// ZEB-946: real time-format modules (not mocked) — assert the standalone date
+// labels honor the owner's chosen date order / clock.
+import {
+  setTimeFormatSettings,
+  _resetTimeFormatServiceForTest,
+} from '../../time-format-service';
+import { formatDateOnly } from '../../time-format';
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
@@ -1323,6 +1330,37 @@ describe('DevicesPanel meta row + backup stamps (ZEB-650 slice 1)', () => {
     render(DevicesPanel);
     const line = await screen.findByTestId('devices-last-backed-up');
     expect(line.textContent).toContain(new Date(stamp).toLocaleDateString());
+  });
+
+  // ZEB-946: the enrolled + last-backed-up dates are standalone numeric labels
+  // and must honor the owner's date-order preference (ymd here), not the raw
+  // locale order. Reset the module-level prefs store after each so the choice
+  // doesn't leak into sibling tests.
+  describe('honors the owner date-order preference (ZEB-946)', () => {
+    afterEach(() => {
+      _resetTimeFormatServiceForTest();
+    });
+
+    it('renders the earliest-enrollment date in the chosen order', async () => {
+      setTimeFormatSettings({ clock: 'system', dateOrder: 'ymd' });
+      const earliestMs = 1_600_000_000 * 1000;
+      mockedInvoke.mockResolvedValueOnce(metaView);
+      render(DevicesPanel);
+      const enrolled = await screen.findByTestId('devices-meta-enrolled');
+      expect(enrolled.textContent).toContain(formatDateOnly(earliestMs, { dateOrder: 'ymd' }));
+      // Guard: the raw locale order (mdy in the test runtime) must NOT leak through.
+      expect(enrolled.textContent).not.toContain(new Date(earliestMs).toLocaleDateString());
+    });
+
+    it('renders the last-backed-up date in the chosen order', async () => {
+      setTimeFormatSettings({ clock: 'system', dateOrder: 'ymd' });
+      const stamp = Date.UTC(2026, 0, 15);
+      localStorage.setItem(backedUpAtKey, String(stamp));
+      mockedInvoke.mockResolvedValueOnce(metaView);
+      render(DevicesPanel);
+      const line = await screen.findByTestId('devices-last-backed-up');
+      expect(line.textContent).toContain(formatDateOnly(stamp, { dateOrder: 'ymd' }));
+    });
   });
 
   it('omits last-backed-up for a legacy owner without a stamp', async () => {

@@ -1,5 +1,9 @@
 <script lang="ts">
   import type { MailMessageDetail } from '../types';
+  // ZEB-946: the header time honors the owner's clock preference; the
+  // word-month date stays locale-default (readable + order-unambiguous).
+  import { formatClockTime, type TimeFormatPrefs } from '../time-format';
+  import { timeFormatPrefs } from '../time-format-service';
 
   let {
     message = null,
@@ -15,14 +19,14 @@
     onBack?: () => void;
   } = $props();
 
-  function formatDate(timestamp: number): string {
-    return new Date(timestamp * 1000).toLocaleString([], {
+  function formatDate(timestamp: number, prefs: TimeFormatPrefs): string {
+    const ms = timestamp * 1000;
+    const date = new Date(ms).toLocaleDateString([], {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
     });
+    return `${date}, ${formatClockTime(ms, prefs)}`;
   }
 
   function shortAddr(addr: string): string {
@@ -74,7 +78,7 @@
       <h2 class="subject">{message.subject || '(no subject)'}</h2>
       <div class="meta">
         <span class="from">From: <code>{shortAddr(message.senderAddress)}</code></span>
-        <span class="date">{formatDate(message.timestamp)}</span>
+        <span class="date">{formatDate(message.timestamp, $timeFormatPrefs)}</span>
       </div>
       {#if message.recipients.length > 0}
         <div class="recipients">

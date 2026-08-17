@@ -1,7 +1,13 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, fireEvent } from '@testing-library/svelte';
 import MemberRow from '../MemberRow.svelte';
 import type { CommunityMember } from '../../types';
+// ZEB-946: the joined-date label honors the owner's date-order preference.
+import {
+  setTimeFormatSettings,
+  _resetTimeFormatServiceForTest,
+} from '../../time-format-service';
+import { formatDateOnly } from '../../time-format';
 
 function makeMember(
   power: number,
@@ -461,5 +467,27 @@ describe('MemberRow self-invisible dot (ZEB-600)', () => {
     const dot = container.querySelector('.presence-dot');
     expect(dot?.classList.contains('self-invisible')).toBe(false);
     expect(dot?.classList.contains('online')).toBe(true);
+  });
+});
+
+describe('MemberRow joined-date honors the time-format preference (ZEB-946)', () => {
+  afterEach(() => {
+    _resetTimeFormatServiceForTest();
+  });
+
+  it('renders the joined date in the chosen order', () => {
+    setTimeFormatSettings({ clock: 'system', dateOrder: 'ymd' });
+    const joinedAt = 1_700_000_000_000; // ms
+    const member = makeMember(0, 'joined', 'cc'.repeat(16));
+    member.joinedAt = joinedAt;
+    const { container } = render(MemberRow, {
+      props: {
+        member,
+        viewer: { addr: VIEWER_ADDR, power: 100, isLastAdmin: false },
+      },
+    });
+    expect(container.querySelector('.joined-date')?.textContent).toBe(
+      formatDateOnly(joinedAt, { dateOrder: 'ymd' }),
+    );
   });
 });
