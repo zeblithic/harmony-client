@@ -823,9 +823,9 @@
 
 {#if kickTarget}
   <ConfirmationModal
-    title={`Kick ${kickTarget.displayName ?? kickTarget.address.slice(0, 8)} from ${communityName}?`}
+    title={`Kick ${memberLabel(kickTarget)} from ${communityName}?`}
     description="They will be banned from rejoining. A future admin can re-invite them, but kick events can't be undone."
-    confirmLabel={`Kick ${kickTarget.displayName ?? kickTarget.address.slice(0, 8)}`}
+    confirmLabel={`Kick ${memberLabel(kickTarget)}`}
     danger={true}
     onConfirm={() => { onKick(kickTarget!.address); kickTarget = null; }}
     onCancel={() => (kickTarget = null)}
@@ -834,7 +834,7 @@
 
 {#if setPowerTarget}
   <SetPowerDialog
-    targetName={setPowerTarget.displayName ?? setPowerTarget.address.slice(0, 8)}
+    targetName={memberLabel(setPowerTarget)}
     targetAddress={setPowerTarget.address}
     currentPower={setPowerTarget.power}
     actorMaxPower={myPower}
@@ -845,7 +845,7 @@
 
 {#if pendingAdminChange}
   {@const promoting = pendingAdminChange.newPower >= ADMIN_TIER}
-  {@const targetName = pendingAdminChange.target.displayName ?? pendingAdminChange.target.address.slice(0, 8)}
+  {@const targetName = memberLabel(pendingAdminChange.target)}
   <ConfirmationModal
     title={promoting
       ? `Promote ${targetName} to admin?`

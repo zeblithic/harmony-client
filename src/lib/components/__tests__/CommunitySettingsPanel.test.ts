@@ -954,3 +954,68 @@ describe('member display-name resolution (ZEB-907)', () => {
     expect(queryByText('RosterBob')).toBeNull();
   });
 });
+
+// ZEB-957: the destructive member-action confirmations (kick, set-power,
+// admin promote/demote) must resolve the target's name through the same
+// display-name ladder the member rows use — NOT the raw roster displayName.
+// Two failure modes they used to have: (1) a member with only a friend
+// nickname showed their hex/roster name in the confirmation; (2) a peer who
+// broadcast a whitespace-only card/roster name rendered a BLANK confirmation
+// ("Kick  from …?"), since a plain `?? addr.slice(0,8)` treats "   " as present.
+describe('member-action confirmation dialogs resolve names through the ladder (ZEB-957)', () => {
+  it('kick dialog shows the friend nickname, not the roster displayName', async () => {
+    const { container, getByRole } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        resolveNickname: (id: string) => (id === plainMember.address ? 'Ziggy' : undefined),
+      },
+    });
+    const rows = container.querySelectorAll('.member-row');
+    const bobRow = Array.from(rows).find((r) => r.textContent?.includes('Ziggy'))!;
+    await fireEvent.click(bobRow.querySelector('button.kick') as HTMLButtonElement);
+    expect(getByRole('button', { name: /Kick Ziggy/i })).toBeTruthy();
+  });
+
+  it('kick dialog falls through a blank published name to hex, never a blank label', async () => {
+    const blankMember: CommunityMember = {
+      address: 'ff00ff00ff00ff00', displayName: '   ', power: 0, status: 'joined',
+    };
+    const { container, getByRole } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, members: [adminMember, blankMember] },
+    });
+    const rows = container.querySelectorAll('.member-row');
+    const blankRow = Array.from(rows).find((r) => r.textContent?.includes('ff00ff00'))!;
+    await fireEvent.click(blankRow.querySelector('button.kick') as HTMLButtonElement);
+    // The confirm button must name the hex short-id, never a blank "Kick ".
+    expect(getByRole('button', { name: /Kick ff00ff00/i })).toBeTruthy();
+  });
+
+  it('set-power dialog shows the resolved nickname in its title', async () => {
+    const { container, getByText } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        resolveNickname: (id: string) => (id === modMember.address ? 'Chaz' : undefined),
+      },
+    });
+    const rows = container.querySelectorAll('.member-row');
+    const charlieRow = Array.from(rows).find((r) => r.textContent?.includes('Chaz'))!;
+    await fireEvent.click(charlieRow.querySelector('button.set-role') as HTMLButtonElement);
+    expect(getByText(/Set Chaz's role/i)).toBeTruthy();
+  });
+
+  it('admin-promote confirmation shows the resolved nickname, not the roster name', async () => {
+    const { container, getByText } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        resolveNickname: (id: string) => (id === modMember.address ? 'Chaz' : undefined),
+      },
+    });
+    const rows = container.querySelectorAll('.member-row');
+    const charlieRow = Array.from(rows).find((r) => r.textContent?.includes('Chaz'))!;
+    await fireEvent.click(charlieRow.querySelector('button.set-role') as HTMLButtonElement);
+    const numberInput = container.querySelector('input[type="number"]') as HTMLInputElement;
+    await fireEvent.input(numberInput, { target: { value: '100' } });
+    await fireEvent.click(container.querySelector('.confirm-btn') as HTMLButtonElement);
+    expect(getByText(/Promote Chaz to admin\?/i)).toBeTruthy();
+  });
+});
