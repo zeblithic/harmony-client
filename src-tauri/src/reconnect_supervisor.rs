@@ -246,8 +246,12 @@ struct PeerSlot {
     /// bridge (R1 coverage repair). While `now - since < repair_exempt_window`,
     /// the dispatch-point admit veto is waived so a DENIED non-neighbor can still
     /// be dialed to heal a split. `None` = no exemption (the default; every peer
-    /// admitted purely on ring membership). Paused-clock `Instant`, like every
-    /// other scheduling field — never the free-running wall clock.
+    /// admitted purely on ring membership). **Consumed (reset to `None`) on the
+    /// →Connected edge** so the exemption authorizes one repair episode, not every
+    /// reconnect in the window: a post-connect drop re-parks a denied non-neighbor
+    /// and only a fresh R1 mark re-arms it (CodeAnt review). Survives *failed*
+    /// dials, so ladder retries within the window still escape the veto. Paused-clock
+    /// `Instant`, like every other scheduling field — never the free-running wall clock.
     repair_exempt_since: Option<Instant>,
 }
 
@@ -407,6 +411,11 @@ impl SupervisorHandle {
             slot.epoch = slot.epoch.wrapping_add(1);
             slot.state = PeerState::Connected { since_ms: now_ms() };
             slot.ever_connected = true;
+            // ZEB-941 (review): consume the reachability-repair exemption on the
+            // →Connected edge — the repair goal (a connection) is met, so a later
+            // drop must not reuse this authorization; only a fresh R1 coverage
+            // mark re-arms the bridge past the R4 admit veto.
+            slot.repair_exempt_since = None;
             // The epoch bump voids any outstanding dial's result, so the flag
             // must not outlive it: left set, it would suppress the first
             // re-dial after a subsequent `Dropped` until that stale dial
@@ -1131,6 +1140,11 @@ fn apply_result(
         // `reconnected` marker for THIS dial was already emitted by the dial task
         // (gated on the ever-connected bit read before the dial).
         slot.ever_connected = true;
+        // ZEB-941 (review): consume the reachability-repair exemption on connect
+        // (the repair goal). A later drop within the window then re-parks a denied
+        // non-neighbor instead of reusing this authorization; only a fresh R1
+        // coverage-repair mark re-arms it.
+        slot.repair_exempt_since = None;
     } else {
         ladder_after_failure(
             slot,
@@ -2579,6 +2593,78 @@ mod tests {
             dialer.count_for(p),
             settled,
             "no further dials once the exemption has lapsed"
+        );
+    }
+
+    /// ZEB-941 (CodeAnt review): the exemption is CONSUMED once the bridge connects
+    /// (the repair goal), so a later drop WITHIN the still-live window does not
+    /// re-authorize a denied non-neighbor dial — only a fresh R1 repair mark can.
+    /// Without the clear-on-connect, a connect→drop inside the 30-min window would
+    /// silently bypass the R4 degree bound (the "reusable-authorization" gap). The
+    /// window stays live throughout (plain `cfg`), so the clear is the SOLE cause of
+    /// the re-park.
+    #[tokio::test(start_paused = true)]
+    async fn r4_repair_exempt_cleared_on_connect_so_later_drop_re_parks() {
+        use crate::admission_oracle::AdmissionOracle;
+        let dialer = RecordingDialer::succeeding();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let dk = [0x81u8; 32];
+
+        let oracle = Arc::new(AdmissionOracle::new(true));
+        oracle.bind([0u8; 16], p, dk);
+        oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied throughout
+        let handle = SupervisorHandle::new();
+        handle.set_admission_oracle(Arc::clone(&oracle));
+
+        // dormant_after huge so the ONLY Dormant transition is the admit re-park.
+        let config = cfg(1_000, 8_000, 3_600_000, 1_000, 8, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        // Bridge marked → dials → CONNECTS (succeeding dialer), which consumes the exemption.
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(3_000)).await;
+        handle.mark_reachability_bridge(p);
+        handle.kick_sweep();
+        tokio::time::sleep(ms(5_000)).await;
+        assert_eq!(
+            dialer.count_for(p),
+            1,
+            "exempt bridge dials once and connects"
+        );
+        assert!(
+            handle
+                .states_snapshot()
+                .iter()
+                .any(|(id, st)| *id == p && matches!(st, PeerStateWire::Connected { .. })),
+            "the bridge is Connected after the successful dial"
+        );
+
+        // Connection drops while the window is still live. Because the exemption was
+        // consumed on connect, the re-armed dial is denied → re-parked Dormant, NOT
+        // re-dialed. (Only a fresh R1 mark would re-authorize it.)
+        handle.kick(p, ReconnectTrigger::Dropped);
+        tokio::time::sleep(ms(20_000)).await;
+        assert_eq!(
+            dialer.count_for(p),
+            1,
+            "post-connect drop does NOT re-dial a denied non-neighbor — exemption consumed on connect"
+        );
+        assert!(
+            handle
+                .states_snapshot()
+                .iter()
+                .any(|(id, st)| *id == p && matches!(st, PeerStateWire::Dormant { .. })),
+            "the dropped bridge re-parks Dormant without a fresh repair mark"
         );
     }
 
