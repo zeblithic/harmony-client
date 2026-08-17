@@ -347,6 +347,9 @@ mod simnet;
 // ZEB-949 Phase 2: slim-bootstrap invite regression + size coverage.
 #[cfg(test)]
 mod community_invite_slim_bootstrap_tests;
+// ZEB-950: moderator/member invites — non-admin inviter verifies, admin absent.
+#[cfg(test)]
+mod moderator_invite_tests;
 // ZEB-622: peer liveness — passive per-peer transport state machine fusing
 // registry connect/drop edges, iroh path events, and zenoh transport events
 // into Connected/Degraded/Disconnected. Pure logic; producers wired in later tasks.
