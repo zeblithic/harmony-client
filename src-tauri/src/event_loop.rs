@@ -1741,6 +1741,36 @@ pub async fn run(
                 SupervisorConfig::default(),
             )));
 
+            // ZEB-931: before the boot-seed, backfill the now-installed oracle with
+            // the address book's reachability bindings. The oracle was installed just
+            // above, but the resolver that feeds it was populated back in `start_node`
+            // (BOOT-PROBE 10, inline-awaited into this same shared `book`), so those
+            // binds hit a `None` oracle and were dropped. Without this backfill a
+            // router-mode node finds its boot-seeded peers unbound → `admit` fails open
+            // → it dials the full persisted roster instead of ~degree ring neighbors
+            // (the R4 fan-out storm). Peer mode skips this entirely (oracle disabled),
+            // keeping boot byte-identical. `addrbook_runtime` is not consumed until far
+            // below, so borrowing it here is free.
+            if admission_oracle.enabled() {
+                if let (Some(ref addrbook), Some(ref registry)) =
+                    (&addrbook_runtime, &community_registry)
+                {
+                    let bound =
+                        crate::iroh_zenoh_registration::backfill_admission_oracle_from_address_book(
+                            &admission_oracle,
+                            &addrbook.book,
+                            registry.known_ids().await,
+                            crate::iroh_friend_acceptor::wall_now_ms(),
+                        );
+                    if bound > 0 {
+                        tracing::info!(
+                            "ZEB-931: backfilled {bound} address-book binding(s) into the \
+                             admission oracle before boot-seed"
+                        );
+                    }
+                }
+            }
+
             // Boot seed: every peer the resolver already knows enters the supervisor
             // as a `NewPeer` kick (recency-ordered), so a peer whose first dial fails
             // or later drops is reconnected indefinitely — not dialed once at boot.
