@@ -19,6 +19,9 @@
   import { bumpFleetEpoch, requestQuorumEpochBump } from '../fleet-epoch-service';
   import { setButlerPin, extractButlerPinError } from '../butler-pin-service';
   import { fetchCommunitiesCount } from '../owner-meta';
+  // ZEB-946: standalone date/time labels honor the owner's time-format prefs.
+  import { formatDateOnly, formatFullTimestamp, type TimeFormatPrefs } from '../time-format';
+  import { timeFormatPrefs } from '../time-format-service';
   import {
     BACKUP_FLAGS_CHANGED_EVENT,
     markRecoveryBackedUp,
@@ -819,21 +822,21 @@
     return name.trim().charAt(0).toUpperCase() || '?';
   }
 
-  function formatEnrolledAt(ts: number): string {
+  function formatEnrolledAt(ts: number, prefs: TimeFormatPrefs): string {
     const ms = ts * 1000;
     const now = Date.now();
     const ageDays = Math.floor((now - ms) / (1000 * 60 * 60 * 24));
     if (ageDays < 1) return 'today';
     if (ageDays < 2) return 'yesterday';
     if (ageDays < 30) return `${ageDays}d ago`;
-    return new Date(ms).toLocaleDateString();
+    return formatDateOnly(ms, prefs);
   }
 
   // ZEB-668 S4: heartbeat-tolerant relative time. The stamp cadence is
   // ~7.5 min (fleet-net re-stamp tick) — hence "just now" out to 10 min and
   // the "~" prefix on minute/hour buckets (honesty ledger: last seen = last
   // fleet heartbeat, not live presence).
-  function formatLastSeen(ms: number): string {
+  function formatLastSeen(ms: number, prefs: TimeFormatPrefs): string {
     const min = Math.floor((Date.now() - ms) / 60000);
     if (min < 10) return 'just now';
     if (min < 60) return `~${min}m ago`;
@@ -841,7 +844,7 @@
     if (h < 24) return `~${h}h ago`;
     const d = Math.floor(h / 24);
     if (d < 30) return `${d}d ago`;
-    return new Date(ms).toLocaleDateString();
+    return formatDateOnly(ms, prefs);
   }
 
   /** ZEB-721: coarse "~Nm / ~Nh / ~Nd" rendering of a clock-regression skew (seconds). */
@@ -907,14 +910,14 @@
             <div class="owner-meta" data-testid="devices-meta">
               <span class="meta-key" data-testid="devices-meta-keytype">ed25519</span>
               {#if firstEnrolledMs !== null}
-                <span data-testid="devices-meta-enrolled">First device enrolled {new Date(firstEnrolledMs).toLocaleDateString()}</span>
+                <span data-testid="devices-meta-enrolled">First device enrolled {formatDateOnly(firstEnrolledMs, $timeFormatPrefs)}</span>
               {/if}
               {#if communitiesCount !== null}
                 <span data-testid="devices-meta-communities">{communitiesCount} {communitiesCount === 1 ? 'community' : 'communities'}</span>
               {/if}
             </div>
             {#if lastBackedUpMs !== null}
-              <div class="owner-meta" data-testid="devices-last-backed-up">Last backed up {new Date(lastBackedUpMs).toLocaleDateString()}</div>
+              <div class="owner-meta" data-testid="devices-last-backed-up">Last backed up {formatDateOnly(lastBackedUpMs, $timeFormatPrefs)}</div>
             {/if}
           </div>
           <button
@@ -1061,7 +1064,7 @@
             {:else}
               Waiting for another device to co-sign the removal of
               <strong>{quorumDeviceName(req.targetDeviceId)}</strong> — expires
-              {new Date(req.expiresAtMs).toLocaleString()}.
+              {formatFullTimestamp(req.expiresAtMs, $timeFormatPrefs)}.
             {/if}
           </p>
         </div>
@@ -1194,7 +1197,7 @@
                   <span class="trust-badge refused">● refused</span>
                 {/if}
                 <span class="separator">·</span>
-                <span>added {formatEnrolledAt(device.enrolledAt)}</span>
+                <span>added {formatEnrolledAt(device.enrolledAt, $timeFormatPrefs)}</span>
                 <span class="separator">·</span>
                 <span class="fingerprint">{device.fingerprint}</span>
                 <!-- ZEB-668 S4: presence line, non-self rows only (self is
@@ -1208,7 +1211,7 @@
                     <!-- typeof guard (PR #454 round 1): an omitted field
                          (pre-S4 shape) must read as absent, same as null. -->
                     <span class="separator">·</span>
-                    <span>last seen {formatLastSeen(device.lastSeenMs)}</span>
+                    <span>last seen {formatLastSeen(device.lastSeenMs, $timeFormatPrefs)}</span>
                   {/if}
                 {/if}
               </div>
@@ -1261,7 +1264,7 @@
                   <span class="removed-reason">{device.revokedReason}</span>
                 {/if}
                 {#if device.revokedAt !== null}
-                  <span class="removed-date">removed {formatEnrolledAt(device.revokedAt)}</span>
+                  <span class="removed-date">removed {formatEnrolledAt(device.revokedAt, $timeFormatPrefs)}</span>
                 {/if}
               </div>
             {/each}

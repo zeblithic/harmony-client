@@ -1,5 +1,9 @@
 <script lang="ts">
   import type { MailMessageDetail } from '../types';
+  // ZEB-946: the header time honors the owner's clock preference; the
+  // word-month date stays locale-default (readable + order-unambiguous).
+  import type { TimeFormatPrefs } from '../time-format';
+  import { timeFormatPrefs } from '../time-format-service';
 
   let {
     message = null,
@@ -15,13 +19,20 @@
     onBack?: () => void;
   } = $props();
 
-  function formatDate(timestamp: number): string {
+  function formatDate(timestamp: number, prefs: TimeFormatPrefs): string {
+    // Keep the single locale-native combined format (its date/time separator is
+    // locale-chosen — a comma in en-US, a space/ideographic mark in ja/ko/zh —
+    // so we must NOT hand-join with a literal ", "). Thread only the clock axis
+    // (hour12) into it, mirroring the seam's `timeOptions`. The word-month date
+    // stays locale-default (readable + order-unambiguous), so the date-order
+    // axis intentionally does not apply here.
     return new Date(timestamp * 1000).toLocaleString([], {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
       hour: '2-digit',
       minute: '2-digit',
+      ...(prefs.hour12 === undefined ? {} : { hour12: prefs.hour12 }),
     });
   }
 
@@ -74,7 +85,7 @@
       <h2 class="subject">{message.subject || '(no subject)'}</h2>
       <div class="meta">
         <span class="from">From: <code>{shortAddr(message.senderAddress)}</code></span>
-        <span class="date">{formatDate(message.timestamp)}</span>
+        <span class="date">{formatDate(message.timestamp, $timeFormatPrefs)}</span>
       </div>
       {#if message.recipients.length > 0}
         <div class="recipients">

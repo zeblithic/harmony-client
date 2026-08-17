@@ -3,6 +3,9 @@
     import { invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
     import CountChip from './governance/CountChip.svelte';
+    // ZEB-946: the "since …" HLC timestamp honors the owner's time-format prefs.
+    import { formatFullTimestamp, type TimeFormatPrefs } from '../time-format';
+    import { timeFormatPrefs } from '../time-format-service';
 
     let { communityId, canModerate }: {
         communityId: string;
@@ -103,8 +106,8 @@
         }
     }
 
-    function formatHlc(hlc: { wallMs: number }): string {
-        return new Date(hlc.wallMs).toLocaleString();
+    function formatHlc(hlc: { wallMs: number }, prefs: TimeFormatPrefs): string {
+        return formatFullTimestamp(hlc.wallMs, prefs);
     }
 
     // Teardown of a Tauri unlisten handle must never throw mid-sequence: if it
@@ -204,7 +207,7 @@
                     {#each pending as p (p.eventId)}
                         <li class="join-row">
                             <span class="joiner">{p.inviteeHint ?? p.joinerAddr.slice(0, 12)}</span>
-                            <span class="time">since {formatHlc(p.pendingAtHlc)}</span>
+                            <span class="time">since {formatHlc(p.pendingAtHlc, $timeFormatPrefs)}</span>
                             <button class="reject-btn" type="button" onclick={() => kickJoiner(p.joinerAddr)}>
                                 Reject (kick)
                             </button>
@@ -227,7 +230,7 @@
                     {#each recent as r (r.joinEventId)}
                         <li class="join-row">
                             <span class="joiner">{r.joinerAddr.slice(0, 12)}</span>
-                            <span class="time">at {formatHlc(r.countersignedAtHlc)}</span>
+                            <span class="time">at {formatHlc(r.countersignedAtHlc, $timeFormatPrefs)}</span>
                         </li>
                     {/each}
                 </ul>

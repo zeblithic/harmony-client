@@ -1,6 +1,12 @@
-import { describe, test, expect, vi, beforeEach } from 'vitest';
+import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, fireEvent, waitFor } from '@testing-library/svelte';
 import PendingJoinsPanel from '../PendingJoinsPanel.svelte';
+// ZEB-946: the "since …" HLC timestamp honors the owner's time-format prefs.
+import {
+    setTimeFormatSettings,
+    _resetTimeFormatServiceForTest,
+} from '../../time-format-service';
+import { formatFullTimestamp } from '../../time-format';
 
 vi.mock('@tauri-apps/api/core', () => ({
     invoke: vi.fn(),
@@ -134,6 +140,39 @@ describe('PendingJoinsPanel', () => {
             const chip = container.querySelector('details:first-of-type .count-chip');
             expect(chip?.classList.contains('neutral')).toBe(true);
             expect(chip?.querySelector('.cc-value')?.textContent).toBe('2');
+        });
+    });
+
+    describe('honors the time-format preference (ZEB-946)', () => {
+        afterEach(() => {
+            _resetTimeFormatServiceForTest();
+        });
+
+        test('renders the "since" HLC timestamp in the chosen clock + order', async () => {
+            setTimeFormatSettings({ clock: '24h', dateOrder: 'ymd' });
+            const wallMs = 1_700_000_000_000;
+            const { invoke } = await import('@tauri-apps/api/core');
+            (invoke as any).mockImplementation((cmd: string) => {
+                if (cmd === 'list_pending_joins') {
+                    return Promise.resolve([
+                        {
+                            eventId: 'aaa',
+                            joinerAddr: '1122334455667788',
+                            pendingAtHlc: { wallMs, logical: 0, deviceId: '00' },
+                            inviteeHint: 'alice',
+                        },
+                    ]);
+                }
+                if (cmd === 'list_recent_counter_signs') return Promise.resolve([]);
+                return Promise.resolve(null);
+            });
+            const { container } = render(PendingJoinsPanel, {
+                props: { communityId: 'abc', canModerate: true },
+            });
+            await waitFor(() => expect(container.querySelector('.time')).not.toBeNull());
+            expect(container.querySelector('.time')?.textContent).toBe(
+                `since ${formatFullTimestamp(wallMs, { hour12: false, dateOrder: 'ymd' })}`,
+            );
         });
     });
 });

@@ -1,6 +1,9 @@
 <script lang="ts">
   import type { ContentDetail } from '../types';
   import { categoryIcon, formatBytes } from '../file-utils';
+  // ZEB-946: the "Stored" date honors the owner's date-order preference.
+  import { formatDateOnly } from '../time-format';
+  import { timeFormatPrefs } from '../time-format-service';
 
   let {
     item,
@@ -10,7 +13,7 @@
 
   let icon = $derived(categoryIcon(item.category));
   let size = $derived(formatBytes(item.sizeBytes));
-  let storedDate = $derived(new Date(item.storedAt).toLocaleDateString());
+  let storedDate = $derived(formatDateOnly(item.storedAt, $timeFormatPrefs));
 </script>
 
 <div class="file-metadata">

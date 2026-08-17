@@ -24,6 +24,9 @@
     isReconfigureNudgeDismissed,
     isResolvedProposalDismissed,
   } from '../recovery-flags';
+  // ZEB-946: recovery deadlines honor the owner's time-format prefs.
+  import { formatFullTimestamp, type TimeFormatPrefs } from '../time-format';
+  import { timeFormatPrefs } from '../time-format-service';
 
   const POLL_MS = 60_000;
 
@@ -153,8 +156,8 @@
     return resolveName(addr);
   }
 
-  function fmtDate(ms: number): string {
-    return new Date(ms).toLocaleString();
+  function fmtDate(ms: number, prefs: TimeFormatPrefs): string {
+    return formatFullTimestamp(ms, prefs);
   }
 
   function collectingLine(p: RecoveryProposalDto): string {
@@ -162,8 +165,8 @@
     return `Recovery of @${name(p.lostAdminAddr)} proposed by @${name(p.proposerAddr)} — ${remaining} more signature${remaining === 1 ? '' : 's'} needed`;
   }
 
-  function timeLockedLine(p: RecoveryProposalDto): string {
-    const when = p.deadlineMs !== null ? fmtDate(p.deadlineMs) : 'the veto window closes';
+  function timeLockedLine(p: RecoveryProposalDto, prefs: TimeFormatPrefs): string {
+    const when = p.deadlineMs !== null ? fmtDate(p.deadlineMs, prefs) : 'the veto window closes';
     return `@${name(p.newAdminAddr)} becomes admin of this community on ${when} unless a current admin vetoes`;
   }
 
@@ -229,7 +232,7 @@
           {#if p.phase === 'collecting'}
             {collectingLine(p)}
           {:else}
-            {timeLockedLine(p)}
+            {timeLockedLine(p, $timeFormatPrefs)}
           {/if}
         </span>
         <span class="row-actions">
@@ -262,7 +265,7 @@
         <span class="text">
           {resolvedLine(p)}
           {#if p.phase === 'executed' && p.rotationEligibleAtMs !== null && nowMs <= p.rotationEligibleAtMs}
-            · membership key rotation pending finality (completes {fmtDate(p.rotationEligibleAtMs)})
+            · membership key rotation pending finality (completes {fmtDate(p.rotationEligibleAtMs, $timeFormatPrefs)})
           {/if}
         </span>
         <span class="row-actions">

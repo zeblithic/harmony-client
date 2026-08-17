@@ -1,5 +1,8 @@
 <script lang="ts">
   import type { MailEntry, MailFolderKind, MailCounts } from '../types';
+  // ZEB-946: the "today" mail time honors the owner's clock preference.
+  import { formatClockTime, type TimeFormatPrefs } from '../time-format';
+  import { timeFormatPrefs } from '../time-format-service';
 
   let {
     entries = [],
@@ -36,11 +39,15 @@
     { kind: 'trash', label: 'Trash' },
   ];
 
-  function formatTime(timestamp: number): string {
+  function formatTime(timestamp: number, prefs: TimeFormatPrefs): string {
     const date = new Date(timestamp * 1000);
     const now = new Date();
     const diffDays = Math.floor((now.getTime() - date.getTime()) / 86400_000);
-    if (diffDays === 0) return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    // Today → a numeric time-of-day, so it honors the 12h/24h clock preference.
+    if (diffDays === 0) return formatClockTime(timestamp * 1000, prefs);
+    // ZEB-946: the weekday-name ("Mon") and short-month/day ("Aug 14") recency
+    // labels are intentionally left locale-default — they are word-y relative
+    // affordances, not the numeric dates the date-order preference reorders.
     if (diffDays < 7) return date.toLocaleDateString([], { weekday: 'short' });
     return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
   }
@@ -117,7 +124,7 @@
         >
           <span class="mail-sender">{shortAddr(entry.senderAddress)}</span>
           <span class="mail-subject">{entry.subjectSnippet || '(no subject)'}</span>
-          <span class="mail-time">{formatTime(entry.timestamp)}</span>
+          <span class="mail-time">{formatTime(entry.timestamp, $timeFormatPrefs)}</span>
           <div class="mail-actions">
             {#if !entry.read}
               <button

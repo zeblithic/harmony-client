@@ -11,6 +11,9 @@
    */
   import type { LeftCommunityNavDto } from '../community-service';
   import TypedConfirmationModal from './TypedConfirmationModal.svelte';
+  // ZEB-946: the "Left …" date honors the owner's date-order preference.
+  import { formatDateOnly } from '../time-format';
+  import { timeFormatPrefs } from '../time-format-service';
 
   /** Narrow structural seam (the real `CommunityService` satisfies it) so the
    *  panel is testable without a Tauri adapter. */
@@ -84,13 +87,6 @@
     }
   }
 
-  function fmtLeftAt(ms: number): string {
-    return new Date(ms).toLocaleDateString(undefined, {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-    });
-  }
 </script>
 
 <div class="left-communities">
@@ -116,7 +112,7 @@
         <li class="row">
           <div class="meta">
             <span class="name">{row.name}</span>
-            <span class="left-at">Left {fmtLeftAt(row.leftAtMs)}</span>
+            <span class="left-at">Left {formatDateOnly(row.leftAtMs, $timeFormatPrefs)}</span>
           </div>
           <button
             class="delete-btn"

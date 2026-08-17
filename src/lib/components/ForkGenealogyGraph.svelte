@@ -73,6 +73,10 @@
   function initial(display: string): string {
     return (display.trim().charAt(0) || '⑂').toUpperCase();
   }
+  // ZEB-946: intentionally left locale-default. This is a word-month + year
+  // fork-age label ("Aug 2026") with no day, so the date-order preference (which
+  // only reorders numeric day/month/year fields) has nothing to reorder, and
+  // there is no clock component for the 12h/24h axis to touch.
   function monthYear(wallMs: number): string {
     return new Date(wallMs).toLocaleDateString(undefined, {
       month: 'short',

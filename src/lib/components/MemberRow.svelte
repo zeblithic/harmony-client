@@ -4,6 +4,9 @@
   import type { ResolvedCard } from '../member-card-service';
   import Avatar from './Avatar.svelte';
   import { nonEmpty } from '../display-label';
+  // ZEB-946: the joined-date label honors the owner's date-order preference.
+  import { formatDateOnly } from '../time-format';
+  import { timeFormatPrefs } from '../time-format-service';
 
   export type KebabAction =
     | 'kick'
@@ -175,7 +178,7 @@
   );
   let joinedDate = $derived(
     member.joinedAt != null
-      ? new Date(member.joinedAt).toLocaleDateString()
+      ? formatDateOnly(member.joinedAt, $timeFormatPrefs)
       : '—'
   );
   // ZEB-537: online status. Read through the resolver inside $derived so a
