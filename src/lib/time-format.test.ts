@@ -5,6 +5,7 @@ import {
   formatFullTimestamp,
   formatClockTime,
   formatDateOnly,
+  formatMailRecency,
   type TimeFormatPrefs,
 } from './time-format';
 
@@ -127,5 +128,59 @@ describe('formatClockTime', () => {
     expect(formatClockTime(ms, { locale: 'en-US', hour12: false })).toContain('20:11');
     expect(formatClockTime(ms, { locale: 'en-US', hour12: true })).toContain('08:11');
     expect(formatClockTime(ms, prefs)).not.toContain('/'); // never carries a date
+  });
+});
+
+// ZEB-952 — the mail recency label buckets by LOCAL CALENDAR DAY, not by elapsed
+// 24h windows. The old `floor((now - ms) / 86400000)` math misfiled anything
+// whose *elapsed* time disagreed with the calendar-day count (late-yesterday
+// viewed early-today; a Sunday-to-Sunday span that stays under 7×24h).
+describe('formatMailRecency', () => {
+  const weekdayOf = (ms: number) => new Date(ms).toLocaleDateString('en-US', { weekday: 'short' });
+  const monthDayOf = (ms: number) =>
+    new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+  it('renders time-of-day for a same-local-day message, whatever the hours elapsed', () => {
+    const now = at(2026, 7, 16, 23, 55);
+    const ms = at(2026, 7, 16, 0, 5); // ~23h50m earlier, but the SAME local day
+    expect(formatMailRecency(ms, now, prefs)).toBe(timeOf(ms));
+  });
+
+  it('honors the clock preference on the same-day branch', () => {
+    const now = at(2026, 7, 16, 22, 14);
+    const ms = at(2026, 7, 16, 20, 11);
+    expect(formatMailRecency(ms, now, { locale: 'en-US', hour12: false })).toContain('20:11');
+  });
+
+  // THE regression: late-yesterday viewed early-today. Only ~11h elapsed, so the
+  // old floor(elapsed/24h) put it in the "today" bucket (a bare clock time that
+  // looks like it arrived today). The calendar-day rule shows the weekday.
+  it('shows the weekday (not a bare time) for late-yesterday viewed early today', () => {
+    const now = at(2026, 7, 16, 10, 0); // today 10:00
+    const ms = at(2026, 7, 15, 23, 0); // yesterday 23:00 — 11h elapsed
+    const out = formatMailRecency(ms, now, prefs);
+    expect(out).toBe(weekdayOf(ms));
+    expect(out).not.toBe(timeOf(ms));
+  });
+
+  it('shows the weekday up to 6 calendar days back', () => {
+    const now = at(2026, 7, 16, 10, 0);
+    const ms = at(2026, 7, 10, 8, 0); // 6 calendar days earlier
+    expect(formatMailRecency(ms, now, prefs)).toBe(weekdayOf(ms));
+  });
+
+  it('falls back to month/day at 7 calendar days and beyond', () => {
+    const now = at(2026, 7, 16, 10, 0);
+    const ms = at(2026, 7, 9, 8, 0); // 7 calendar days earlier
+    expect(formatMailRecency(ms, now, prefs)).toBe(monthDayOf(ms));
+  });
+
+  it('uses month/day when a <7×24h span still crosses into the 7th calendar day', () => {
+    // now Aug 16 09:00, ms Aug 9 23:00 → 6d10h elapsed (old floor=6 → weekday,
+    // and Aug 9 & Aug 16 are the SAME weekday, so the label would collide with
+    // today). Calendar-day count is 7 → month/day.
+    const now = at(2026, 7, 16, 9, 0);
+    const ms = at(2026, 7, 9, 23, 0);
+    expect(formatMailRecency(ms, now, prefs)).toBe(monthDayOf(ms));
   });
 });

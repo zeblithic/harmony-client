@@ -1,7 +1,9 @@
 <script lang="ts">
   import type { MailEntry, MailFolderKind, MailCounts } from '../types';
   // ZEB-946: the "today" mail time honors the owner's clock preference.
-  import { formatClockTime, type TimeFormatPrefs } from '../time-format';
+  // ZEB-952: recency is bucketed by local calendar day (shared seam), not by
+  // elapsed 24h windows.
+  import { formatMailRecency, type TimeFormatPrefs } from '../time-format';
   import { timeFormatPrefs } from '../time-format-service';
 
   let {
@@ -39,17 +41,12 @@
     { kind: 'trash', label: 'Trash' },
   ];
 
+  // `entry.timestamp` is in seconds; the seam works in ms. `Date.now()` is the
+  // reference instant, snapshotted at render (re-evaluates on re-render like the
+  // list itself). Bucketing lives in the shared seam so its boundary behavior is
+  // unit-tested deterministically — see time-format.test.ts (ZEB-952).
   function formatTime(timestamp: number, prefs: TimeFormatPrefs): string {
-    const date = new Date(timestamp * 1000);
-    const now = new Date();
-    const diffDays = Math.floor((now.getTime() - date.getTime()) / 86400_000);
-    // Today → a numeric time-of-day, so it honors the 12h/24h clock preference.
-    if (diffDays === 0) return formatClockTime(timestamp * 1000, prefs);
-    // ZEB-946: the weekday-name ("Mon") and short-month/day ("Aug 14") recency
-    // labels are intentionally left locale-default — they are word-y relative
-    // affordances, not the numeric dates the date-order preference reorders.
-    if (diffDays < 7) return date.toLocaleDateString([], { weekday: 'short' });
-    return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    return formatMailRecency(timestamp * 1000, Date.now(), prefs);
   }
 
   function shortAddr(addr: string): string {
