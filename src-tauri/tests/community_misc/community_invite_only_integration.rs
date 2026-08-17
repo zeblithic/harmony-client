@@ -430,7 +430,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
         expires_at: None,
         invite_token: Some(invite_token),
         admin_bootstrap: Some(alice_minted.bootstrap_join.clone()),
-        admin_identity_pub: Some(alice.identity.to_public_bytes()),
+        inviter_identity_pub: Some(alice.identity.to_public_bytes()),
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
@@ -446,7 +446,7 @@ async fn alice_redeems_invite_only_against_bob_admin() {
 
     // ZEB-260 (Case A FIXED): admin's signed bootstrap is now plumbed
     // through the invite URL (CommunityInvitePayload.admin_bootstrap +
-    // admin_identity_pub). redeem_invite_inner verifies and inserts it
+    // inviter_identity_pub). redeem_invite_inner verifies and inserts it
     // into Bob's engine BEFORE sending the unicast packet, so by the
     // time Alice's publish-back arrives, Bob's CRDT already has Alice
     // as Joined and the membership-at-HLC gate admits.
@@ -679,10 +679,10 @@ async fn community_invite_only_tampered_admin_bootstrap_rejects() {
             sig: [0xEE; 64],
         }),
         admin_bootstrap: Some(alice_bootstrap),
-        // admin_identity_pub is ignored by post-ZEB-339 verify_admin_bootstrap
+        // inviter_identity_pub is ignored by post-ZEB-339 verify_admin_bootstrap
         // (which uses the cert's device key exclusively); only presence matters
         // for the encode gate.
-        admin_identity_pub: Some([0u8; 64]),
+        inviter_identity_pub: Some([0u8; 64]),
         forked_from: None,
         pre_fork_snapshot: None,
         // ZEB-339: encode_invite_url requires invite-only payloads to carry the

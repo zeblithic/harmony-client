@@ -323,7 +323,7 @@ pub(crate) async fn setup_two_party_iroh_handshake_with_config(
     let alice_sk = Arc::new(signing_key_from(&alice_identity));
     let bob_sk = Arc::new(signing_key_from(&bob_identity));
     // Reticulum composite pubs: still needed for pkarr
-    // (PkarrInvitePublisher + admin_identity_pub in payload).
+    // (PkarrInvitePublisher + inviter_identity_pub in payload).
     let (alice_transport_addr, alice_pub) = derive_composite_owner(&alice_sk);
     let (bob_transport_addr, _bob_pub) = derive_composite_owner(&bob_sk);
 
@@ -811,7 +811,7 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
         .expect("seal epoch key to bob");
 
         // ZEB-339: invite payload uses community actor addresses throughout.
-        // admin_identity_pub still carries the Reticulum composite pub (alice_pub)
+        // inviter_identity_pub still carries the Reticulum composite pub (alice_pub)
         // because pkarr step 6 (verify_identity_match) checks it against the
         // pkarr record's harmony_identity_pub, which is signed by alice_sk.
         let invite_payload = CommunityInvitePayload {
@@ -831,9 +831,9 @@ async fn bob_joins_alice_via_iroh_handshake_option_a() {
             expires_at: None,
             invite_token: Some(invite_token),
             admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
-            // admin_identity_pub = Reticulum composite pub; used only for the
+            // inviter_identity_pub = Reticulum composite pub; used only for the
             // pkarr verify_identity_match check (step 6) — not for membership.
-            admin_identity_pub: Some(s.alice_pub),
+            inviter_identity_pub: Some(s.alice_pub),
             forked_from: None,
             pre_fork_snapshot: None,
             // ZEB-339: invite-only payloads REQUIRE an inviter EnrollmentCert.
@@ -1173,7 +1173,7 @@ async fn targeted_invite_only_generate_then_redeem_roundtrip() {
             expires_at: None,
             invite_token: Some(invite_token),
             admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
-            admin_identity_pub: Some(s.alice_pub),
+            inviter_identity_pub: Some(s.alice_pub),
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: Some(s.alice_comm.cert.clone()),
@@ -1341,7 +1341,7 @@ async fn targeted_invite_only_multi_device_redeem_opens_correct_envelope() {
             expires_at: None,
             invite_token: Some(invite_token),
             admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
-            admin_identity_pub: Some(s.alice_pub),
+            inviter_identity_pub: Some(s.alice_pub),
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: Some(s.alice_comm.cert.clone()),
@@ -1515,7 +1515,7 @@ async fn invite_only_untargeted_generate_then_redeem_roundtrip() {
             expires_at: None,
             invite_token: Some(invite_token),
             admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
-            admin_identity_pub: Some(s.alice_pub),
+            inviter_identity_pub: Some(s.alice_pub),
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: Some(s.alice_comm.cert.clone()),
@@ -1772,7 +1772,7 @@ async fn zeb427_iroh_redeem_fences_owner_state_space_to_disk() {
             expires_at: None,
             invite_token: Some(invite_token),
             admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
-            admin_identity_pub: Some(s.alice_pub),
+            inviter_identity_pub: Some(s.alice_pub),
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: Some(s.alice_comm.cert.clone()),
@@ -2001,7 +2001,7 @@ async fn invite_not_burned_when_handshake_fails_after_insert() {
             expires_at: None,
             invite_token: Some(invite_token),
             admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
-            admin_identity_pub: Some(s.alice_pub),
+            inviter_identity_pub: Some(s.alice_pub),
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: Some(s.alice_comm.cert.clone()),
@@ -2170,7 +2170,7 @@ pub(crate) fn zeb889_build_targeted_invite(
         expires_at: None,
         invite_token: Some(invite_token),
         admin_bootstrap: Some(s.alice_minted.bootstrap_join.clone()),
-        admin_identity_pub: Some(s.alice_pub),
+        inviter_identity_pub: Some(s.alice_pub),
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: Some(s.alice_comm.cert.clone()),

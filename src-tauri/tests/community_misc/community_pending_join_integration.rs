@@ -150,7 +150,7 @@ async fn pending_join_accepted_via_engine_insert_without_admin_pub_bind() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -287,7 +287,7 @@ fn build_engine_with_resolver(
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: admin_pub,
+        inviter_identity_pub: admin_pub,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -697,7 +697,7 @@ async fn joiner_engine_clears_pending_join_at_on_countersign() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: Some(Arc::clone(&crdt_state)),
-        admin_identity_pub: Some(admin_pub),
+        inviter_identity_pub: Some(admin_pub),
         nav_emitter: Some(Arc::clone(&nav_cb)),
         root_serve_rx: None,
     });
@@ -1451,7 +1451,7 @@ async fn pending_join_resolves_when_admin_comes_online() {
 
 // ── ZEB-254 R1 (C1): boot-reconcile late-bind regression test ────────────────
 
-/// Regression: an admin engine spawned with `admin_identity_pub: None`
+/// Regression: an admin engine spawned with `inviter_identity_pub: None`
 /// (simulating the boot-reconcile path in `spawn_engine_inner_now`) must
 /// still accept a PendingJoin and auto-counter-sign it.
 ///
@@ -1484,7 +1484,7 @@ async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind(
     let tmp = tempfile::tempdir().expect("tempdir");
 
     // NOTE: admin_pub is intentionally NOT passed — simulates boot-reconcile
-    // spawn where admin_identity_pub defaults to None.
+    // spawn where inviter_identity_pub defaults to None.
     let engine = build_engine_with_resolver(
         community_id,
         admin_addr,
@@ -1495,7 +1495,7 @@ async fn boot_reconcile_engine_accepts_pending_join_via_opportunistic_late_bind(
         cs,
         &tmp,
         Some(resolver),
-        None, // <-- boot-reconcile: no pre-set admin_identity_pub
+        None, // <-- boot-reconcile: no pre-set inviter_identity_pub
     );
 
     // Step 1: insert admin bootstrap Join so the admin is materialized as
@@ -1655,7 +1655,7 @@ async fn boot_reconcile_engine_accepts_pending_join_via_state_root_late_bind() {
         sign_event_with_identity(&pending_payload, &joiner_priv).expect("sign PendingJoin");
     let pending_id = pending_join.id;
 
-    // Admin engine with admin_identity_pub: None (boot-reconcile mode).
+    // Admin engine with inviter_identity_pub: None (boot-reconcile mode).
     // ZEB-339 verifies PendingJoin via the carried EnrollmentCert /
     // materialized membership, so no admin-pub binding is needed.
     let cs_dst = make_cas();
@@ -1675,7 +1675,7 @@ async fn boot_reconcile_engine_accepts_pending_join_via_state_root_late_bind() {
         cs_dst,
         &tmp_d,
         Some(resolver),
-        None, // <-- boot-reconcile: no pre-set admin_identity_pub
+        None, // <-- boot-reconcile: no pre-set inviter_identity_pub
     );
 
     // Step 1: insert admin bootstrap Join so the admin is materialized as

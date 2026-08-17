@@ -104,7 +104,7 @@ async fn engine_constructs_and_shuts_down_cleanly() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -175,7 +175,7 @@ async fn flush_now_publishes_one_root_publish() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -373,7 +373,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -414,7 +414,7 @@ async fn engine_receives_remote_publish_and_merges_event() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -668,7 +668,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -720,7 +720,7 @@ async fn engine_emits_membership_delta_on_remote_insert() {
         delta_tx: Some(delta_tx),
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -829,7 +829,7 @@ async fn engine_insert_local_event_emits_delta_and_notifies_publish() {
         delta_tx: Some(delta_tx),
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -982,7 +982,7 @@ async fn engine_accepts_self_owner_and_signing_key_in_config() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -1062,7 +1062,7 @@ async fn publish_carries_valid_publisher_sig() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -1286,7 +1286,7 @@ async fn spoofed_publisher_addr_rejected_with_publisher_sig_invalid() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -1523,7 +1523,7 @@ async fn kicked_member_publish_rejected_with_publisher_not_joined() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -1738,7 +1738,7 @@ async fn invite_only_cold_cache_publish_rejected_then_succeeds_after_propagation
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -1885,7 +1885,7 @@ async fn a_failed_community_publish_retries_itself_on_a_quiescent_community_zeb7
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -1991,7 +1991,7 @@ async fn a_persistently_failing_community_publish_paces_its_retries_zeb761() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
@@ -2130,7 +2130,7 @@ async fn a_burst_of_mutations_collapses_into_one_publish_zeb750() {
         delta_tx: None,
         pending_redemptions: None,
         crdt_state: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         nav_emitter: None,
         root_serve_rx: None,
     });
