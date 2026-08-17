@@ -1,10 +1,10 @@
 //! ZEB-949 Phase 2 — regression coverage for slim-bootstrap invites.
 //!
-//! Proves the receive-side membership-at-HLC gate needs only `admin_bootstrap`
-//! + the P2P-synced event log — never the inlined roster snapshot. Exercises the
-//! real gate (`CommunityState::insert_event` -> `verify_event` against the
-//! strictly-prior materialized state). Also pins the size property of a slim
-//! invite (the size fixture below).
+//! Proves the receive-side membership-at-HLC gate needs only the `admin_bootstrap`
+//! event and the P2P-synced event log — never the inlined roster snapshot.
+//! Exercises the real gate (`CommunityState::insert_event` -> `verify_event`
+//! against the strictly-prior materialized state). Also pins the size property
+//! of a slim invite (the size fixture below).
 #![cfg(test)]
 
 use std::collections::{BTreeMap, BTreeSet};
