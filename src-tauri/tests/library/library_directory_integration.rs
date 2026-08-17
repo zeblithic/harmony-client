@@ -210,8 +210,10 @@ async fn subscribe_to_library_receives_published_entries() {
     names.sort();
     assert_eq!(names, vec!["c0", "c1", "c2"]);
 
-    // browse_library DTO mapping: community_addr is derived from
-    // inviter_identity_pub; raw signature/identity_pub fields are dropped.
+    // browse_library DTO mapping: community_addr is derived from the entry's
+    // `community_admin_identity_pub` (via address_hash) — NOT the invite's
+    // `inviter_identity_pub` (which is None for these open payloads); raw
+    // signature/identity_pub fields are dropped.
     let dtos: Vec<DirectoryEntryDTO> = snap
         .iter()
         .map(DirectoryEntryDTO::from_aggregated)
@@ -656,13 +658,14 @@ async fn click_to_join_redeem_invite_smoke() {
     // engine; the invite payload is self-describing per spec §5.2 —
     // joiner's `redeem_invite_inner` cold-bootstraps from it.
     //
-    // Importantly: the founder's `inviter_identity_pub` must match the
-    // `community_admin_identity_pub` in the directory entry, because
-    // the joiner's `verify_entry` checks both the entry's signature
-    // (Ed25519 over canonical CBOR) AND that the URL's `admin_addr`
-    // resolves consistently with the entry's identity_pub. The
-    // `mock_directory_entry` fixture's `admin_seed` parameter drives
-    // both — we use the same seed for the URL's admin_addr derivation.
+    // Importantly: this is an OPEN invite (`inviter_identity_pub: None`), so
+    // the binding tested is on `admin_addr`, not the identity_pub field. The
+    // URL's `admin_addr` must resolve to the directory entry's
+    // `community_admin_identity_pub`: the joiner's `verify_entry` checks both
+    // the entry's signature (Ed25519 over canonical CBOR) AND that
+    // `admin_addr == address_hash(entry.community_admin_identity_pub)`. The
+    // `mock_directory_entry` fixture's `admin_seed` parameter drives both — we
+    // use the same seed for the URL's admin_addr derivation.
     let founder_seed = [0x55u8; 32];
     let founder_signing = ed25519_dalek::SigningKey::from_bytes(&founder_seed);
     let founder_ed_pub = founder_signing.verifying_key().to_bytes();
