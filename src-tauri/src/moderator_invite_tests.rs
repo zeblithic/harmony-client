@@ -31,7 +31,11 @@ fn hlc(wall_ms: u64, dev: &str) -> Hlc {
 
 /// An OPEN invite carrying the raw 32-byte membership key (the shape a member
 /// redeems to Join). Mirrors the Phase-2 slim open shape.
-fn open_invite(community_id: SpaceId, admin_addr: OwnerAddr, key_bytes: Vec<u8>) -> CommunityInvitePayload {
+fn open_invite(
+    community_id: SpaceId,
+    admin_addr: OwnerAddr,
+    key_bytes: Vec<u8>,
+) -> CommunityInvitePayload {
     CommunityInvitePayload {
         inviter_signer_certs: Vec::new(),
         community_id,
