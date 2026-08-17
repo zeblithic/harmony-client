@@ -44,6 +44,27 @@ describe('CommunitySettingsPanel', () => {
     expect(getByText(/Danger/)).toBeTruthy();
   });
 
+  // ZEB-950: the invite affordance is gated on power >= the community's invite
+  // threshold (default 0 = any member), not on admin — so members can invite.
+  it('shows the Invites section to a plain member at the default invite threshold (0)', () => {
+    const { getByText } = render(CommunitySettingsPanel, {
+      props: { ...baseProps, myAddress: plainMember.address, myPower: 0 },
+    });
+    expect(getByText('Invites')).toBeTruthy();
+  });
+
+  it('hides the Invites section from an under-powered member when the community raises the invite threshold', () => {
+    const { queryByText } = render(CommunitySettingsPanel, {
+      props: {
+        ...baseProps,
+        myAddress: plainMember.address,
+        myPower: 10,
+        thresholds: { invite: 50, kick: 50, setPower: 100 },
+      },
+    });
+    expect(queryByText('Invites')).toBeNull();
+  });
+
   it('Info section shows community name, kind, member count, your role', () => {
     const { getByText, getAllByText } = render(CommunitySettingsPanel, { props: baseProps });
     // 'IPFS Crew' appears in subtitle + name field; we just need at least one
