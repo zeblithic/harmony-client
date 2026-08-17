@@ -1,10 +1,11 @@
 // ZEB-943 — date-aware message timestamp formatting.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   formatMessageTimestamp,
   formatFullTimestamp,
   formatClockTime,
   formatDateOnly,
+  formatMailRecency,
   type TimeFormatPrefs,
 } from './time-format';
 
@@ -127,5 +128,92 @@ describe('formatClockTime', () => {
     expect(formatClockTime(ms, { locale: 'en-US', hour12: false })).toContain('20:11');
     expect(formatClockTime(ms, { locale: 'en-US', hour12: true })).toContain('08:11');
     expect(formatClockTime(ms, prefs)).not.toContain('/'); // never carries a date
+  });
+});
+
+// ZEB-952 — the mail recency label buckets by LOCAL CALENDAR DAY, not by elapsed
+// 24h windows. The old `floor((now - ms) / 86400000)` math misfiled anything
+// whose *elapsed* time disagreed with the calendar-day count (late-yesterday
+// viewed early-today; a Sunday-to-Sunday span that stays under 7×24h).
+describe('formatMailRecency', () => {
+  const weekdayOf = (ms: number) => new Date(ms).toLocaleDateString('en-US', { weekday: 'short' });
+  const monthDayOf = (ms: number) =>
+    new Date(ms).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+  it('renders time-of-day for a same-local-day message, whatever the hours elapsed', () => {
+    const now = at(2026, 7, 16, 23, 55);
+    const ms = at(2026, 7, 16, 0, 5); // ~23h50m earlier, but the SAME local day
+    expect(formatMailRecency(ms, now, prefs)).toBe(timeOf(ms));
+  });
+
+  it('honors the clock preference on the same-day branch', () => {
+    const now = at(2026, 7, 16, 22, 14);
+    const ms = at(2026, 7, 16, 20, 11);
+    expect(formatMailRecency(ms, now, { locale: 'en-US', hour12: false })).toContain('20:11');
+  });
+
+  // THE regression: late-yesterday viewed early-today. Only ~11h elapsed, so the
+  // old floor(elapsed/24h) put it in the "today" bucket (a bare clock time that
+  // looks like it arrived today). The calendar-day rule shows the weekday.
+  it('shows the weekday (not a bare time) for late-yesterday viewed early today', () => {
+    const now = at(2026, 7, 16, 10, 0); // today 10:00
+    const ms = at(2026, 7, 15, 23, 0); // yesterday 23:00 — 11h elapsed
+    const out = formatMailRecency(ms, now, prefs);
+    expect(out).toBe(weekdayOf(ms));
+    expect(out).not.toBe(timeOf(ms));
+  });
+
+  it('shows the weekday up to 6 calendar days back', () => {
+    const now = at(2026, 7, 16, 10, 0);
+    const ms = at(2026, 7, 10, 8, 0); // 6 calendar days earlier
+    expect(formatMailRecency(ms, now, prefs)).toBe(weekdayOf(ms));
+  });
+
+  it('falls back to month/day at 7 calendar days and beyond', () => {
+    const now = at(2026, 7, 16, 10, 0);
+    const ms = at(2026, 7, 9, 8, 0); // 7 calendar days earlier
+    expect(formatMailRecency(ms, now, prefs)).toBe(monthDayOf(ms));
+  });
+
+  it('uses month/day when a <7×24h span still crosses into the 7th calendar day', () => {
+    // now Aug 16 09:00, ms Aug 9 23:00 → 6d10h elapsed (old floor=6 → weekday,
+    // and Aug 9 & Aug 16 are the SAME weekday, so the label would collide with
+    // today). Calendar-day count is 7 → month/day.
+    const now = at(2026, 7, 16, 9, 0);
+    const ms = at(2026, 7, 9, 23, 0);
+    expect(formatMailRecency(ms, now, prefs)).toBe(monthDayOf(ms));
+  });
+});
+
+// A DST-observing zone makes a local calendar day 23h (spring-forward) or 25h
+// (fall-back), so the underlying day diff must count LOCAL midnights and ROUND
+// — a `floor` over raw elapsed ms misfiles the 23h day as 0 calendar days and
+// would mislabel a 1-day-old message as month/day. Node re-reads `process.env.TZ`
+// on every Date op, so pinning it here exercises the transition regardless of
+// the CI runner's own zone. US 2026: spring-forward Sun 2026-03-08 (23h day),
+// fall-back Sun 2026-11-01 (25h day).
+describe('formatMailRecency — DST boundaries (round, not floor)', () => {
+  const origTZ = process.env.TZ;
+  beforeAll(() => {
+    process.env.TZ = 'America/New_York';
+  });
+  afterAll(() => {
+    if (origTZ === undefined) delete process.env.TZ;
+    else process.env.TZ = origTZ;
+  });
+
+  const weekdayOf = (ms: number) => new Date(ms).toLocaleDateString('en-US', { weekday: 'short' });
+
+  it('labels a previous-day message as the weekday across spring-forward (23h day)', () => {
+    const ms = at(2026, 2, 8, 9, 0); // Sun 2026-03-08 — the 23h local day
+    const now = at(2026, 2, 9, 10, 0); // Mon 2026-03-09
+    // round(23h/24h) = 1 calendar day → weekday; a floor day-diff → 0 → month/day.
+    expect(formatMailRecency(ms, now, prefs)).toBe(weekdayOf(ms));
+  });
+
+  it('labels a previous-day message as the weekday across fall-back (25h day)', () => {
+    const ms = at(2026, 10, 1, 9, 0); // Sun 2026-11-01 — the 25h local day
+    const now = at(2026, 10, 2, 10, 0); // Mon 2026-11-02
+    expect(formatMailRecency(ms, now, prefs)).toBe(weekdayOf(ms));
   });
 });

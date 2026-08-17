@@ -49,4 +49,21 @@ describe('MailInbox time honors the clock preference (ZEB-946)', () => {
       new Date(nowSec * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     );
   });
+
+  // ZEB-952: an old message routes through the calendar-day seam to the
+  // month/day bucket (deterministic — any real `now` is >7 days after 2020).
+  // Locks that MailInbox exercises the non-today path, not just "today".
+  it('renders an old message as month/day (calendar-day bucketing wired through the seam)', () => {
+    const oldMs = new Date(2020, 0, 15, 9, 0).getTime(); // 2020-01-15 09:00 local
+    const { container } = render(MailInbox, {
+      props: {
+        entries: [makeEntry(Math.floor(oldMs / 1000))],
+        activeFolder: 'inbox',
+        selectedCid: null,
+      },
+    });
+    expect(mailTime(container)).toBe(
+      new Date(oldMs).toLocaleDateString([], { month: 'short', day: 'numeric' }),
+    );
+  });
 });

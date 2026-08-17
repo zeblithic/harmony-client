@@ -59,6 +59,16 @@ function sameLocalDay(a: Date, b: Date): boolean {
   );
 }
 
+/** Whole local calendar days from `earlier` to `later` (0 when same local day,
+ *  negative when `earlier` is after `later`). Diffs LOCAL midnights and rounds,
+ *  so it's DST-robust — a 23h/25h calendar day still counts as exactly one day
+ *  (a `floor` over raw elapsed ms would misfile it). */
+function localCalendarDaysBetween(earlier: Date, later: Date): number {
+  const a = new Date(earlier.getFullYear(), earlier.getMonth(), earlier.getDate());
+  const b = new Date(later.getFullYear(), later.getMonth(), later.getDate());
+  return Math.round((b.getTime() - a.getTime()) / 86_400_000);
+}
+
 function pad2(n: number): string {
   return String(n).padStart(2, '0');
 }
@@ -149,6 +159,32 @@ export function formatMessageTimestamp(
   if (sameLocalDay(date, nowDate)) return time;
   const year: YearMode = date.getFullYear() === nowDate.getFullYear() ? 'none' : '2-digit';
   return `${dateString(date, prefs, year)}, ${time}`;
+}
+
+/**
+ * Compact recency label for a mail-list row, bucketed by LOCAL CALENDAR DAY
+ * (not elapsed 24h windows — see ZEB-952):
+ *  - same local day         → time-of-day (honors the clock preference)
+ *  - 1–6 calendar days back → short weekday name (`Mon`)
+ *  - 7+ calendar days back  → short month + day (`Aug 14`)
+ *
+ * The weekday window stops at 6 days so the name never collides with today's
+ * weekday. `now` is injected (not read from the clock) so callers own the
+ * reference instant and unit tests stay deterministic, mirroring
+ * `formatMessageTimestamp`.
+ */
+export function formatMailRecency(
+  ms: number,
+  now: number,
+  prefs: TimeFormatPrefs = DEFAULT_TIME_FORMAT_PREFS,
+): string {
+  const date = new Date(ms);
+  if (sameLocalDay(date, new Date(now))) return formatClockTime(ms, prefs);
+  const days = localCalendarDaysBetween(date, new Date(now));
+  if (days >= 1 && days < 7) {
+    return date.toLocaleDateString(localeArg(prefs), { weekday: 'short' });
+  }
+  return date.toLocaleDateString(localeArg(prefs), { month: 'short', day: 'numeric' });
 }
 
 /** Full, unambiguous date + time (4-digit year) for a hover tooltip / `title`. */
