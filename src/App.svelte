@@ -62,6 +62,7 @@
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
+  import { createInitialSyncTracker } from './lib/community-initial-sync';
   import { FriendService, contactsFromFriends } from './lib/friend-service';
   import { DmInviteService, type PendingDmInviteDto } from './lib/dm-invite-service';
   import { ChannelMessageService } from './lib/channel-message-service';
@@ -1275,6 +1276,18 @@
   // Forwarded into ChannelMembersPanel via CommunityView so a switch shows
   // "Loading members…" instead of a bare, misleading "0".
   let membersLoading = $state(false);
+  // ZEB-949 Phase 2: freshly-joined communities show a "Syncing…" state until
+  // their roster/channels sync in (slim invites no longer inline them). The
+  // tracker owns a timeout safety-valve and an explicit clear-on-content; both
+  // bump `initialSyncVersion` via onChange so `communityInitialSyncing` re-runs.
+  let initialSyncVersion = $state(0);
+  const initialSync = createInitialSyncTracker(10_000, () => {
+    initialSyncVersion += 1;
+  });
+  const communityInitialSyncing = $derived.by(() => {
+    void initialSyncVersion; // reactive dep on mark/clear/timeout
+    return !!selectedCommunityId && initialSync.isSyncing(selectedCommunityId);
+  });
   // ZEB-404: timestamp throttle for the message-triggered roster refetch (see
   // the channelMessageService.onMessage wiring). Time-based — a failed or
   // too-early refresh self-heals on the next message rather than permanently
@@ -1464,6 +1477,11 @@
       // Drop if the user switched communities while we were awaiting.
       if (selectedCommunityId !== id) return;
       communityMembers = fresh;
+      // ZEB-949: the first roster content beyond self means the initial sync has
+      // produced results — drop the "Syncing…" state. Members and channels
+      // co-arrive in one CRDT state-root merge, so this also un-syncs the channel
+      // panel at the right moment; the tracker's timeout covers any edge case.
+      if (fresh.filter((m) => m.status === 'joined').length > 1) initialSync.clear(id);
     } catch (e) {
       // listCommunityMembers throws when the adapter isn't connected
       // (mock-data mode) or the backend isn't ready. Surface the failure to
@@ -4114,6 +4132,7 @@
         communityKind={communityService.getKind(selectedCommunityNode.id)}
         members={communityMembers}
         membersLoading={membersLoading}
+        initialSyncing={communityInitialSyncing}
         ownAddress={selfOwnerId ?? ''}
         myPower={myCommunityPower}
         isDegraded={isCurrentCommunityDegraded}
@@ -4754,6 +4773,10 @@
           redeemStatusTimer = null;
         }, 6000);
         changeSelectedCommunity(dto.communityId);
+        // ZEB-949: mark this fresh join as initial-syncing so the roster/channel
+        // panels show "Syncing…" until the first real content arrives (or the
+        // tracker's timeout fires). Cleared in refreshCommunityMembers below.
+        initialSync.markJoined(dto.communityId);
         await refreshCommunityMembers(dto.communityId);
       } catch (e) {
         // ZEB-885: redeem_invite rejects with a structured { code, message };

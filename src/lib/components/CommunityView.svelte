@@ -29,6 +29,7 @@
     ownAddress,
     members,
     membersLoading = false,
+    initialSyncing = false,
     isDegraded,
     sharedInProfile,
     communityService,
@@ -65,6 +66,11 @@
      *  shows a loading affordance instead of a bare "0 members" while the
      *  roster is being fetched. */
     membersLoading?: boolean;
+    /** ZEB-949 Phase 2: true while a freshly-joined community is doing its first
+     *  roster/channel sync (slim invites no longer inline them). Drives a
+     *  "Syncing members… / Syncing channels…" affordance instead of misleading
+     *  empty states. */
+    initialSyncing?: boolean;
     isDegraded: boolean;
     sharedInProfile: boolean;
     communityService: CommunityService;
@@ -545,16 +551,22 @@
         />
       {/if}
     {:else}
-      <div class="empty-channels">
-        <p>No channels in this community yet.</p>
-        {#if myPower >= 50}
-          <p>Click <strong>Create channel</strong> to add one.</p>
+      <div class="empty-channels" role="status">
+        {#if initialSyncing}
+          <!-- ZEB-949: freshly joined; channels are syncing in, not absent. -->
+          <p data-testid="channels-syncing-banner">Syncing channels…</p>
+        {:else}
+          <p>No channels in this community yet.</p>
+          {#if myPower >= 50}
+            <p>Click <strong>Create channel</strong> to add one.</p>
+          {/if}
         {/if}
       </div>
     {/if}
     <ChannelMembersPanel
       {members}
       loading={membersLoading}
+      {initialSyncing}
       {ownAddress}
       {trustService}
       {resolveCard}
