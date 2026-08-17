@@ -1,5 +1,5 @@
 // ZEB-943 — date-aware message timestamp formatting.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   formatMessageTimestamp,
   formatFullTimestamp,
@@ -182,5 +182,38 @@ describe('formatMailRecency', () => {
     const now = at(2026, 7, 16, 9, 0);
     const ms = at(2026, 7, 9, 23, 0);
     expect(formatMailRecency(ms, now, prefs)).toBe(monthDayOf(ms));
+  });
+});
+
+// A DST-observing zone makes a local calendar day 23h (spring-forward) or 25h
+// (fall-back), so the underlying day diff must count LOCAL midnights and ROUND
+// — a `floor` over raw elapsed ms misfiles the 23h day as 0 calendar days and
+// would mislabel a 1-day-old message as month/day. Node re-reads `process.env.TZ`
+// on every Date op, so pinning it here exercises the transition regardless of
+// the CI runner's own zone. US 2026: spring-forward Sun 2026-03-08 (23h day),
+// fall-back Sun 2026-11-01 (25h day).
+describe('formatMailRecency — DST boundaries (round, not floor)', () => {
+  const origTZ = process.env.TZ;
+  beforeAll(() => {
+    process.env.TZ = 'America/New_York';
+  });
+  afterAll(() => {
+    if (origTZ === undefined) delete process.env.TZ;
+    else process.env.TZ = origTZ;
+  });
+
+  const weekdayOf = (ms: number) => new Date(ms).toLocaleDateString('en-US', { weekday: 'short' });
+
+  it('labels a previous-day message as the weekday across spring-forward (23h day)', () => {
+    const ms = at(2026, 2, 8, 9, 0); // Sun 2026-03-08 — the 23h local day
+    const now = at(2026, 2, 9, 10, 0); // Mon 2026-03-09
+    // round(23h/24h) = 1 calendar day → weekday; a floor day-diff → 0 → month/day.
+    expect(formatMailRecency(ms, now, prefs)).toBe(weekdayOf(ms));
+  });
+
+  it('labels a previous-day message as the weekday across fall-back (25h day)', () => {
+    const ms = at(2026, 10, 1, 9, 0); // Sun 2026-11-01 — the 25h local day
+    const now = at(2026, 10, 2, 10, 0); // Mon 2026-11-02
+    expect(formatMailRecency(ms, now, prefs)).toBe(weekdayOf(ms));
   });
 });
