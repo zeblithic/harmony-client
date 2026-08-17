@@ -2219,6 +2219,8 @@ mod tests {
             // inside its wall-clock window).
             parole_interval: Duration::from_secs(3600),
             parole_batch: 2,
+            // ZEB-941: production default; this real-time test never marks a bridge.
+            repair_exempt_window: Duration::from_secs(1200),
             jitter_seed: Some(0x2E_B6_20),
         };
         let _supervisor = tokio::spawn(run_reconnect_supervisor(
@@ -2528,6 +2530,8 @@ mod tests {
             // inside its wall-clock window).
             parole_interval: Duration::from_secs(3600),
             parole_batch: 2,
+            // ZEB-941: production default; this real-time test never marks a bridge.
+            repair_exempt_window: Duration::from_secs(1200),
             jitter_seed: Some(0x2E_B6_20),
         };
         let _supervisor = tokio::spawn(run_reconnect_supervisor(

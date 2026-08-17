@@ -184,6 +184,18 @@ pub struct SupervisorConfig {
     /// caps steady-state parole load regardless of the Dormant population;
     /// a failing parolee re-dormants after `dormant_after` on its own.
     pub parole_batch: usize,
+    /// ZEB-941: how long a [`mark_reachability_bridge`](SupervisorHandle::mark_reachability_bridge)
+    /// exemption keeps a DENIED (non-ring-neighbor) peer dialable past the R4
+    /// dispatch-point Dormant park. This is the seam by which R4 admission defers
+    /// to R1's coverage-driven repair (`community_gateway_dial_driver` action 4):
+    /// R1 marks the Dormant peers it needs dialed to heal a split, and the mark
+    /// lets those dials escape the admit veto for one window. Refreshed on every
+    /// repair pass while coverage stays degraded, so it self-extends during an
+    /// ongoing repair and self-expires once coverage heals (no explicit unpin).
+    /// Default ≥ the gateway repair cadence cap (`GATEWAY_DIAL_RETRY_CAP_MS`, 10 min)
+    /// so a live repair never lapses between re-marks. Only ever consulted in
+    /// router mode (peer mode admits everything, so the park never fires).
+    pub repair_exempt_window: Duration,
     /// `Some(seed)` makes jitter deterministic (tests); `None` seeds from entropy.
     pub jitter_seed: Option<u64>,
 }
@@ -200,6 +212,9 @@ impl Default for SupervisorConfig {
             higher_id_fallback_delay: Duration::from_secs(5),
             parole_interval: Duration::from_secs(900),
             parole_batch: 2,
+            // ZEB-941: 20 min — comfortably above the gateway repair cap (10 min),
+            // so an ongoing coverage repair re-marks before the exemption lapses.
+            repair_exempt_window: Duration::from_secs(1200),
             jitter_seed: None,
         }
     }
@@ -227,6 +242,13 @@ struct PeerSlot {
     /// it. (The ZEB-804 `connected_via_registry` counter needs no owner and is
     /// stamped by `mark_connected` directly.)
     pending_reconnected_marker: bool,
+    /// ZEB-941: when set, the instant this peer was last marked a reachability
+    /// bridge (R1 coverage repair). While `now - since < repair_exempt_window`,
+    /// the dispatch-point admit veto is waived so a DENIED non-neighbor can still
+    /// be dialed to heal a split. `None` = no exemption (the default; every peer
+    /// admitted purely on ring membership). Paused-clock `Instant`, like every
+    /// other scheduling field — never the free-running wall clock.
+    repair_exempt_since: Option<Instant>,
 }
 
 /// Message from a spawned dial task back to the supervisor loop.
@@ -329,6 +351,27 @@ impl SupervisorHandle {
         let _ = self.inner.admission_oracle.set(oracle);
     }
 
+    /// ZEB-941: mark `peer` a reachability bridge — waive the R4 dispatch-point
+    /// admit veto for it for `repair_exempt_window`, so a DENIED (non-ring-neighbor)
+    /// peer can still be dialed to heal a community split. Called by R1's
+    /// coverage-driven repair (`community_gateway_dial_driver` action 4) ALONGSIDE
+    /// its re-arming `kick`: the kick re-arms the Dormant slot, this waives the
+    /// veto so the re-armed dial actually dispatches instead of being re-parked.
+    ///
+    /// Sets the exemption on an EXISTING slot only — a peer with no slot has
+    /// departed (ZEB-627 eviction) or never had a record, and must not be
+    /// resurrected; record arrival re-creates the slot and its own kick re-arms it.
+    /// Idempotent: re-marking refreshes the window, which is how an ongoing repair
+    /// keeps a genuine bridge alive (and lets it self-expire once coverage heals).
+    /// Inert unless the peer is actually denied — in peer mode, or for an admitted
+    /// peer, the dispatch park never fires and the exemption is never consulted.
+    pub fn mark_reachability_bridge(&self, peer: [u8; 32]) {
+        let mut states = self.inner.states.lock().expect("states lock");
+        if let Some(slot) = states.get_mut(&peer) {
+            slot.repair_exempt_since = Some(Instant::now());
+        }
+    }
+
     /// Request a presence sweep (re-arm all known non-connected peers). Subject
     /// to `presence_sweep_cooldown` gating inside the loop.
     pub fn kick_sweep(&self) {
@@ -349,6 +392,7 @@ impl SupervisorHandle {
                 epoch: 0,
                 ever_connected: false,
                 pending_reconnected_marker: false,
+                repair_exempt_since: None,
             });
             // ZEB-622: a (non-Connected)→Connected inbound edge on a peer that has
             // connected before is a real recovery. `mark_connected` can't reach
@@ -462,6 +506,7 @@ impl SupervisorHandle {
                 epoch: 0,
                 ever_connected: false,
                 pending_reconnected_marker: false,
+                repair_exempt_since: None,
             },
         );
     }
@@ -477,6 +522,20 @@ impl SupervisorHandle {
     #[cfg(test)]
     pub fn sweep_pending(&self) -> bool {
         self.inner.sweep_requested.load(Ordering::Acquire)
+    }
+
+    /// Test-only read accessor (ZEB-941): the peer's reachability-repair exemption
+    /// instant, or `None` if the peer has no slot or was never marked. Lets the
+    /// gateway driver's action-4 test observe that a coverage-repair bridge was
+    /// marked (parallels [`Self::pending_trigger`] observing the kick). Read-only.
+    #[cfg(test)]
+    pub fn repair_exempt_since(&self, peer: [u8; 32]) -> Option<Instant> {
+        self.inner
+            .states
+            .lock()
+            .expect("states lock")
+            .get(&peer)
+            .and_then(|s| s.repair_exempt_since)
     }
 }
 
@@ -668,7 +727,16 @@ pub async fn run_reconnect_supervisor(
                 // later admit re-arms (via kick_sweep/do_sweep) and dials it. Disabled oracle /
                 // peer mode / unknown node_id all admit — pre-R4 behavior unchanged.
                 if let Some(o) = inner.admission_oracle.get() {
-                    if !o.admit(peer) {
+                    // ZEB-941: a live reachability-repair exemption (R1 marked this a
+                    // bridge within the last `repair_exempt_window`) waives the R4 admit
+                    // veto, so a coverage-repair dial to a DENIED non-neighbor escapes the
+                    // park. The exemption self-expires, so a healed community re-parks the
+                    // bridge on a later pass; peer mode / an admitted peer never reaches
+                    // this branch, so the exemption is a no-op there.
+                    let repair_exempt = slot.repair_exempt_since.is_some_and(|since| {
+                        now.saturating_duration_since(since) < config.repair_exempt_window
+                    });
+                    if !o.admit(peer) && !repair_exempt {
                         slot.state = PeerState::Dormant { since_ms: now_ms() };
                         continue;
                     }
@@ -847,6 +915,7 @@ fn apply_trigger(
                     epoch: 0,
                     ever_connected: false,
                     pending_reconnected_marker: false,
+                    repair_exempt_since: None,
                 },
             );
         }
@@ -1209,6 +1278,10 @@ mod tests {
             // struct-update syntax.
             parole_interval: Duration::from_secs(3600),
             parole_batch: 2,
+            // ZEB-941: 30 min — beyond every pre-ZEB-941 test's virtual timeline
+            // (like parole's 1h default). Tests exercising exemption EXPIRY override
+            // this via struct-update syntax.
+            repair_exempt_window: Duration::from_secs(1800),
             jitter_seed: Some(0xC0FFEE),
         }
     }
@@ -2388,6 +2461,124 @@ mod tests {
         assert!(
             dialer.count_for(p) > 0,
             "admitted peer dialed after the sweep re-arms it"
+        );
+    }
+
+    /// ZEB-941: a reachability-repair exemption lets a DENIED (non-ring-neighbor) peer
+    /// escape the dispatch-point Dormant park and dial anyway — the mechanism by which
+    /// R4 admission defers to R1's coverage repair. Mirrors
+    /// `r4_denied_peer_parked_until_admitted_then_dialed`, but the peer stays denied the
+    /// whole time: the ONLY thing that makes it dial is the exemption, not an admission
+    /// delta.
+    #[tokio::test(start_paused = true)]
+    async fn r4_repair_exempt_bridge_dials_while_denied() {
+        use crate::admission_oracle::AdmissionOracle;
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let dk = [0x81u8; 32];
+
+        let oracle = Arc::new(AdmissionOracle::new(true));
+        oracle.bind([0u8; 16], p, dk);
+        oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied — and stays denied
+        let handle = SupervisorHandle::new();
+        handle.set_admission_oracle(Arc::clone(&oracle));
+
+        // Short sweep cooldown so the phase-2 kick_sweep re-arms promptly; parole disabled.
+        let config = cfg(1_000, 64_000, 10_000, 1_000, 8, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        // Phase 1 — denied and NOT exempt: parked at dispatch, never dialed.
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(5_000)).await;
+        assert_eq!(dialer.count_for(p), 0, "denied, un-exempt peer is parked");
+
+        // Phase 2 — grant the reachability-repair exemption (R1's action-4 analogue),
+        // then re-arm. The peer dials despite admission STILL denying it.
+        handle.mark_reachability_bridge(p);
+        handle.kick_sweep();
+        tokio::time::sleep(ms(5_000)).await;
+        assert!(
+            dialer.count_for(p) > 0,
+            "exempt bridge dials even though admission still denies it"
+        );
+    }
+
+    /// ZEB-941: the reachability-repair exemption is TIME-BOXED, not permanent. A
+    /// bridge marked once (and never re-marked) dials while the window is live, then
+    /// re-parks Dormant once it lapses — so a healed community stops paying for a
+    /// bridge it no longer needs. Guards against a permanent-exemption regression
+    /// (which would silently defeat the R4 degree bound for any once-marked peer).
+    #[tokio::test(start_paused = true)]
+    async fn r4_repair_exempt_bridge_re_parks_after_window() {
+        use crate::admission_oracle::AdmissionOracle;
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let dk = [0x81u8; 32];
+
+        let oracle = Arc::new(AdmissionOracle::new(true));
+        oracle.bind([0u8; 16], p, dk);
+        oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied throughout
+        let handle = SupervisorHandle::new();
+        handle.set_admission_oracle(Arc::clone(&oracle));
+
+        // 20s exemption window; `dormant_after` huge so the ONLY Dormant transition
+        // under test is the admit re-park (not a failure-ladder timeout).
+        let config = SupervisorConfig {
+            repair_exempt_window: ms(20_000),
+            ..cfg(1_000, 8_000, 3_600_000, 1_000, 8, 3_000)
+        };
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        // Let the slot materialize + park Dormant (denied) before marking — the mark
+        // only lands on an existing slot (production marks Dormant-snapshot peers).
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(3_000)).await;
+        handle.mark_reachability_bridge(p);
+        handle.kick_sweep();
+
+        // Within the window: the exempt bridge dials despite being denied.
+        tokio::time::sleep(ms(12_000)).await;
+        assert!(
+            dialer.count_for(p) > 0,
+            "exempt bridge dials within the window"
+        );
+
+        // Past the window with no re-mark: the exemption lapses → re-parked Dormant.
+        tokio::time::sleep(ms(60_000)).await;
+        assert!(
+            handle
+                .states_snapshot()
+                .iter()
+                .any(|(id, st)| *id == p && matches!(st, PeerStateWire::Dormant { .. })),
+            "bridge re-parks Dormant once the exemption window lapses"
+        );
+        // …and stays parked: no further dials after the lapse.
+        let settled = dialer.count_for(p);
+        tokio::time::sleep(ms(60_000)).await;
+        assert_eq!(
+            dialer.count_for(p),
+            settled,
+            "no further dials once the exemption has lapsed"
         );
     }
 

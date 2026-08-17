@@ -638,6 +638,14 @@ impl CommunityGatewayDialDriver {
                 for owner in &refresh_targets {
                     for row in rows_by_owner.get(owner).into_iter().flatten() {
                         if dormant.contains(&row.node_id) {
+                            // ZEB-941: waive the R4 admit veto for this coverage-repair
+                            // dial so a DENIED (non-ring-neighbor) bridge to an unproven
+                            // member actually dispatches instead of being re-parked
+                            // Dormant. Scoped to the same target set as the kick and
+                            // self-expiring (`repair_exempt_window`); inert in peer mode,
+                            // where admission never denies. Mark before the kick so the
+                            // exemption is in place when the re-armed dial dispatches.
+                            sup.mark_reachability_bridge(row.node_id);
                             sup.kick(row.node_id, ReconnectTrigger::RecordChanged);
                         }
                     }
@@ -1756,6 +1764,75 @@ mod tests {
             handle.pending_trigger(a_node),
             None,
             "the proven member's devices are not targets"
+        );
+    }
+
+    /// ZEB-941: action 4 also marks each Dormant coverage-repair target a
+    /// reachability bridge (alongside the kick), so the re-armed dial escapes the
+    /// R4 admit veto instead of being re-parked. Scoped exactly like the kick: only
+    /// the Dormant device of an UNPROVEN member is marked — a Retrying device and a
+    /// PROVEN member's Dormant device are left un-exempt (the mark is not "every
+    /// Dormant peer", so the R4 degree bound holds for everything but the bridge).
+    #[tokio::test]
+    async fn dormant_bridge_of_unproven_member_marked_reachability_exempt() {
+        use crate::reconnect_supervisor::PeerState;
+        let community = SpaceId([0x37; 16]);
+        let (_a_pub, a_owner) = test_member(42);
+        let (_b_pub, b_owner) = test_member(43);
+        let (a_dormant, b_dormant, b_retrying) = ([0xA6; 32], [0xB6; 32], [0xB7; 32]);
+        let handle = SupervisorHandle::new();
+        let h = harness(community, vec![a_owner, b_owner], None, true, None);
+        let now = now_ms();
+        // A: proven by traffic (Healthy contribution) but its supervisor slot is
+        // Dormant — it must NOT be marked, proving the mark is scoped to the
+        // unproven set, not "every Dormant peer".
+        h.resolver.update(
+            a_owner,
+            payload_at(a_dormant, now - 1_000),
+            hlc(now - 1_000),
+        );
+        // B: unproven (no traffic); one Dormant device (the bridge) + one Retrying.
+        let mut d1 = payload_at(b_dormant, now - 1_000);
+        d1.home_relay_url = "https://d1.example/".into();
+        let mut d2 = payload_at(b_retrying, now - 1_000);
+        d2.home_relay_url = "https://d2.example/".into();
+        h.resolver.update(b_owner, d1, hlc(now - 1_000));
+        h.resolver.update(b_owner, d2, hlc(now - 1_000));
+        h.traffic.lock().unwrap().insert(a_dormant, now - 500); // A proven, B unproven
+        h.resolver.set_supervisor(handle.clone());
+        handle.set_peer_state_for_test(
+            a_dormant,
+            PeerState::Dormant {
+                since_ms: now - 5_000,
+            },
+        );
+        handle.set_peer_state_for_test(
+            b_dormant,
+            PeerState::Dormant {
+                since_ms: now - 5_000,
+            },
+        );
+        handle.set_peer_state_for_test(
+            b_retrying,
+            PeerState::Retrying {
+                attempt: 3,
+                next_at: tokio::time::Instant::now() + Duration::from_secs(60),
+            },
+        );
+
+        h.driver.run_one_pass().await;
+
+        assert!(
+            handle.repair_exempt_since(b_dormant).is_some(),
+            "the Dormant bridge of the unproven member is marked reachability-exempt"
+        );
+        assert!(
+            handle.repair_exempt_since(b_retrying).is_none(),
+            "a Retrying device is not a revive target — not marked"
+        );
+        assert!(
+            handle.repair_exempt_since(a_dormant).is_none(),
+            "a PROVEN member's Dormant device is not a target — not marked"
         );
     }
 
