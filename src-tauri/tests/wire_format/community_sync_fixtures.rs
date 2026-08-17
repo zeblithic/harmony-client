@@ -207,7 +207,7 @@ fn encrypted_envelope_wire_bytes_pinned_v3_with_ratchet() {
 
 /// ZEB-249: Wire-format pinning for `CommunityInvitePayload` with the new
 /// `epoch_snapshot: InviteEpochSnapshot` field (replacing v1's `membership_key: EpochKey`).
-/// Minimal fixture: open community (no invite_token / admin_bootstrap / admin_identity_pub),
+/// Minimal fixture: open community (no invite_token / admin_bootstrap / inviter_identity_pub),
 /// empty state_snapshot (no members / channels / power_levels).
 ///
 /// Run with `--no-capture` to print the actual hex once, then replace PLACEHOLDER.
@@ -228,7 +228,7 @@ fn invite_payload_with_epoch_snapshot_wire_bytes_pinned() {
         expires_at: None,
         invite_token: None,
         admin_bootstrap: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,

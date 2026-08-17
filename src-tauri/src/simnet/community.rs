@@ -201,7 +201,7 @@ impl SimCommunity {
                 expires_at: None,
                 invite_token: None,
                 admin_bootstrap: None,
-                admin_identity_pub: None,
+                inviter_identity_pub: None,
                 forked_from: None,
                 pre_fork_snapshot: None,
                 inviter_enrollment: None,
@@ -277,7 +277,7 @@ impl SimCommunity {
                 delta_tx: None,
                 pending_redemptions: None,
                 crdt_state: None,
-                admin_identity_pub: None,
+                inviter_identity_pub: None,
                 nav_emitter: None,
                 root_serve_rx: None,
             });

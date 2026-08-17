@@ -36209,11 +36209,11 @@ pub(crate) async fn generate_invite_impl(
         sealed_epoch_keys_bytes,
         invite_token,
         admin_bootstrap,
-        admin_identity_pub,
+        inviter_identity_pub,
         untargeted_decrypt_key,
     ) = if is_invite_only {
         // Inviter identity: device-#2 signing key (signs the token), reticulum
-        // identity (admin_identity_pub), device id (per-device HLC stream).
+        // identity (inviter_identity_pub), device id (per-device HLC stream).
         let (self_owner, self_private_identity, community_signing_key, device_id) = {
             let o = dm_outbox.lock().await;
             (
@@ -36379,14 +36379,14 @@ pub(crate) async fn generate_invite_impl(
         // redeemer's empty CRDT verify the admin's publish-back at first contact.
         let admin_bootstrap = crate::invite_mint::extract_admin_bootstrap(&events, space_id, admin)
             .map_err(|e| e.to_string())?;
-        let admin_identity_pub: [u8; 64] = self_private_identity.identity.to_public_bytes();
+        let inviter_identity_pub: [u8; 64] = self_private_identity.identity.to_public_bytes();
 
         (
             sealed_epoch_key_bytes,
             sealed_epoch_keys_bytes,
             Some(token),
             Some(admin_bootstrap),
-            Some(admin_identity_pub),
+            Some(inviter_identity_pub),
             untargeted_decrypt_key,
         )
     } else {
@@ -36500,7 +36500,7 @@ pub(crate) async fn generate_invite_impl(
         expires_at: None,
         invite_token,
         admin_bootstrap,
-        admin_identity_pub,
+        inviter_identity_pub,
         forked_from,
         pre_fork_snapshot,
         // ZEB-339: required for invite-only payloads (open-community payloads
@@ -40980,7 +40980,7 @@ mod preview_invite_tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -41036,7 +41036,7 @@ mod preview_invite_tests {
             expires_at: None,
             invite_token: Some(token),
             admin_bootstrap: Some(admin_bootstrap),
-            admin_identity_pub: Some([0u8; 64]),
+            inviter_identity_pub: Some([0u8; 64]),
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: Some(inviter.cert.clone()),
@@ -41441,7 +41441,7 @@ pub struct RedeemInviteOverrides {
     /// The joiner's engine has no resolver entry for admin pre-bootstrap,
     /// so `insert_local_event_with_pubs` is called with explicit pubs.
     /// Must be `Some` whenever `pre_delivered_countersign` is `Some`.
-    pub admin_identity_pub: Option<[u8; 64]>,
+    pub inviter_identity_pub: Option<[u8; 64]>,
 
     /// ZEB-501: explicit step-7d redeem-timeout override. When `Some`, the
     /// await for a `JoinCountersign` uses this duration instead of the
@@ -42127,7 +42127,7 @@ where
         // evaluation. Order is critical — the publish-back is generated
         // strictly later than the unicast arrives at admin, so the
         // bootstrap insert here cannot be raced.
-        let (admin_bootstrap, admin_identity_pub) =
+        let (admin_bootstrap, inviter_identity_pub) =
             crate::community_invite::verify_admin_bootstrap(&payload)
                 // ZEB-274: rollback collapses into community_sync_guard Drop on early-return.
                 // ZEB-885: RedeemBootstrapVerifyError → its matching bootstrap_*
@@ -42138,7 +42138,7 @@ where
         // hundred bytes) and required because the engine consumes by
         // value.
         let admin_bootstrap_owned = admin_bootstrap.clone();
-        let admin_identity_pub_owned = *admin_identity_pub;
+        let inviter_identity_pub_owned = *inviter_identity_pub;
         // ZEB-274: engine_arc() lookup removed — spawn_engine_with_guard
         // returned the engine handle directly. The engine-vanished
         // rollback is no longer reachable here.
@@ -42154,7 +42154,7 @@ where
         // causing a publish-back rejection downstream. Surface
         // explicitly on Rejected just like on Err.
         match engine_arc
-            .insert_local_event_with_pubs(admin_bootstrap_owned, admin_identity_pub_owned, None)
+            .insert_local_event_with_pubs(admin_bootstrap_owned, inviter_identity_pub_owned, None)
             .await
         {
             Ok(crate::community_state_crdt::InsertOutcome::Inserted)
@@ -42290,14 +42290,14 @@ where
         // first-contact joins that have no DM cache entry for the
         // inviter).
         if let Some(cs) = overrides.pre_delivered_countersign.clone() {
-            let admin_pub = match overrides.admin_identity_pub {
+            let admin_pub = match overrides.inviter_identity_pub {
                 Some(p) => p,
                 None => {
                     let _ = community_registry
                         .take_pending_redemption(&minted.bootstrap_join.id)
                         .await;
                     return Err(
-                        "pre_delivered_countersign requires admin_identity_pub override".into(),
+                        "pre_delivered_countersign requires inviter_identity_pub override".into(),
                     );
                 }
             };
@@ -43794,8 +43794,8 @@ mod redeem_invite_inner_tests {
             admin_bootstrap: Some(admin_bootstrap),
             // Presence-only requirement of `encode_invite_url`; a dummy value is
             // fine because the forged token errors at the ZEB-497 fail-fast
-            // verify (step 2), before admin_identity_pub is ever validated.
-            admin_identity_pub: Some([0u8; 64]),
+            // verify (step 2), before inviter_identity_pub is ever validated.
+            inviter_identity_pub: Some([0u8; 64]),
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: Some(inviter.cert.clone()),
@@ -43865,7 +43865,7 @@ mod redeem_invite_inner_tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -43937,7 +43937,7 @@ mod redeem_invite_inner_tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -44035,7 +44035,7 @@ mod redeem_invite_inner_tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
             inviter_enrollment: None,
@@ -44169,7 +44169,7 @@ mod redeem_invite_inner_tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
             inviter_enrollment: None,
@@ -44285,7 +44285,7 @@ mod redeem_invite_inner_tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
             inviter_enrollment: None,
@@ -44381,7 +44381,7 @@ mod redeem_invite_inner_tests {
             expires_at: None,
             invite_token: Some(token),
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -44457,7 +44457,7 @@ mod redeem_invite_inner_tests {
             expires_at: None,
             invite_token: Some(token),
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -44536,7 +44536,7 @@ mod redeem_invite_inner_tests {
                 sig: [0; 64],
             }),
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -44669,7 +44669,7 @@ mod redeem_invite_inner_tests {
                 sig: [0; 64],
             }),
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -44742,7 +44742,7 @@ mod redeem_invite_inner_tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -44806,7 +44806,7 @@ mod zeb436_orphan_adoption_tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -45342,7 +45342,7 @@ mod zeb436_orphan_adoption_tests {
             expires_at: None,
             invite_token: Some(invite_token),
             admin_bootstrap: Some(admin_bootstrap),
-            admin_identity_pub: Some(admin_pub),
+            inviter_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
             // ZEB-497: the inviter_enrollment cert is now cryptographically
@@ -45690,7 +45690,7 @@ mod join_open_community_tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -63045,7 +63045,7 @@ pub struct RedemptionOutcome {
     ///   "we found Alice but local insert failed". Added in ZEB-325
     ///   PR #159 F1.
     /// * `"missing_admin_identity_pub"` — open invite (no
-    ///   admin_identity_pub binding); case-A discovery is not
+    ///   inviter_identity_pub binding); case-A discovery is not
     ///   applicable. `community_id` is `None`.
     /// * `"pkarr_resolved_no_handshake"` — legacy Phase 2b stub status;
     ///   no longer returned by Phase 2c+. Kept in the type union for
@@ -63100,7 +63100,7 @@ impl RedemptionOutcome {
         }
     }
 
-    /// Open invite carrying no `admin_identity_pub` binding — case-A
+    /// Open invite carrying no `inviter_identity_pub` binding — case-A
     /// discovery is not applicable. No membership landed.
     fn missing_admin_identity_pub() -> Self {
         Self {
@@ -64463,7 +64463,7 @@ mod zeb908_reuse_live_session_tests {
 /// Flow:
 ///
 ///   1. Decode invite URL.
-///   2. Case-A guards (invite_token + admin_identity_pub required).
+///   2. Case-A guards (invite_token + inviter_identity_pub required).
 ///   3. Pkarr window-resolve the inviter's routing record.
 ///   4. Verify inner sig + identity binding + clock skew.
 ///   5. Decode the inner `ReachabilityAnnouncePayload`.
@@ -64700,7 +64700,7 @@ where
     let Some(ref token) = payload.invite_token else {
         return Ok(RedemptionOutcome::unreachable());
     };
-    let Some(admin_id_pub) = payload.admin_identity_pub else {
+    let Some(admin_id_pub) = payload.inviter_identity_pub else {
         return Ok(RedemptionOutcome::missing_admin_identity_pub());
     };
 
@@ -65679,7 +65679,7 @@ where
         pre_minted: Some(minted),
         pre_delivered_countersign: delivered.as_ref().map(|(_, cs)| cs.clone()),
         pre_delivered_chain: delivered.map(|(chain, _)| chain).unwrap_or_default(),
-        admin_identity_pub: Some(admin_id_pub),
+        inviter_identity_pub: Some(admin_id_pub),
         // ZEB-501: production uses the env-or-5s default in both modes (the
         // pre-delivered countersign resolves the oneshot well within it;
         // latch mode gives an existing Zenoh session that long to complete
@@ -77971,7 +77971,7 @@ mod generate_invite_helper_tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -78031,7 +78031,7 @@ mod generate_invite_helper_tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: Some(original_id),
             pre_fork_snapshot: Some(snapshot.clone()),
             inviter_enrollment: None,

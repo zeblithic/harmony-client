@@ -139,7 +139,7 @@ pub struct CommunityInvitePayload {
     /// receive-side membership-at-HLC gate evaluates publisher status
     /// against the joiner's local prefix (which has no admin entry).
     /// Joiner's `redeem_invite_inner` verifies this against
-    /// `admin_identity_pub` and inserts via
+    /// `inviter_identity_pub` and inserts via
     /// `engine.insert_local_event_with_pubs` before sending the unicast
     /// packet — the publish-back is generated strictly later, so this
     /// closes the race by construction. Open communities ignore this
@@ -151,31 +151,32 @@ pub struct CommunityInvitePayload {
     /// matching `harmony_identity::Identity::to_public_bytes()`). Required
     /// (present) for invite-only payloads (ZEB-260).
     ///
-    /// ZEB-950: despite the `admin_identity_pub` name, this is the identity of
-    /// whoever GENERATED the invite — the admin in the v1 common case, but any
-    /// member with power ≥ the community's `invite` threshold since moderator
-    /// invites shipped. `generate_invite_impl` sets it from the generator's own
-    /// identity, so a non-admin inviter supplies their own with no change. The
-    /// invite token is verified against the inviter's ENROLLED DEVICE keys
-    /// (resolved from materialized membership — `verify_invite_token_sig_with_enrolled`),
-    /// not against this field, so a moderator's token is accepted. A rename to
-    /// `inviter_identity_pub` (wire key `ap` unchanged) is tracked as a
-    /// dedicated follow-up PR.
+    /// This is the identity of whoever GENERATED the invite — the admin in the
+    /// v1 common case, but any member with power ≥ the community's `invite`
+    /// threshold since moderator invites shipped (ZEB-950). `generate_invite_impl`
+    /// sets it from the generator's own identity, so a non-admin inviter supplies
+    /// their own with no change. The invite token is verified against the
+    /// inviter's ENROLLED DEVICE keys (resolved from materialized membership —
+    /// `verify_invite_token_sig_with_enrolled`), not against this field, so a
+    /// moderator's token is accepted. (ZEB-951 renamed this field from the former
+    /// `admin_identity_pub`; wire key `ap` unchanged, so encoding is byte-identical.
+    /// The redeem error-code vocabulary keeps its stable `missing_admin_identity_pub`
+    /// string — a frontend contract, deliberately not renamed.)
     ///
     /// ZEB-339: NO LONGER used to verify `admin_bootstrap` (that goes through
     /// the admin's EnrollmentCert carried on the bootstrap event — see
     /// `verify_admin_bootstrap`), and the old
-    /// `address_hash(admin_identity_pub) == admin_addr` binding does not hold
+    /// `address_hash(inviter_identity_pub) == admin_addr` binding does not hold
     /// under the owner/device split. Still threaded into
     /// `insert_local_event_with_pubs`, which ignores it post-ZEB-339.
     #[serde(
         rename = "ap",
         skip_serializing_if = "Option::is_none",
         default,
-        serialize_with = "serialize_admin_identity_pub_as_bstr",
-        deserialize_with = "deserialize_admin_identity_pub_from_bstr"
+        serialize_with = "serialize_inviter_identity_pub_as_bstr",
+        deserialize_with = "deserialize_inviter_identity_pub_from_bstr"
     )]
-    pub admin_identity_pub: Option<[u8; 64]>,
+    pub inviter_identity_pub: Option<[u8; 64]>,
 
     /// ZEB-285: SpaceId of the community this one was forked from.
     /// Mirrors CommunityState.forked_from; carried in the invite so
@@ -814,8 +815,8 @@ where
 /// Serialize `Option<[u8; 64]>` as a CBOR bstr (Some) or absent (None,
 /// via `skip_serializing_if`). Mirrors the existing
 /// `serialize_identity_pub_as_bstr` shape; wraps it for the optional
-/// case used by `CommunityInvitePayload::admin_identity_pub`.
-fn serialize_admin_identity_pub_as_bstr<S>(
+/// case used by `CommunityInvitePayload::inviter_identity_pub`.
+fn serialize_inviter_identity_pub_as_bstr<S>(
     val: &Option<[u8; 64]>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
@@ -836,7 +837,7 @@ where
 /// `default` (None) and the present-bstr case here. Uses
 /// `deserialize_option` so CBOR null is handled gracefully (mirrors
 /// `owner_state_types::OptPubVisitor`).
-fn deserialize_admin_identity_pub_from_bstr<'de, D>(
+fn deserialize_inviter_identity_pub_from_bstr<'de, D>(
     deserializer: D,
 ) -> Result<Option<[u8; 64]>, D::Error>
 where
@@ -871,7 +872,7 @@ where
         fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Option<[u8; 64]>, E> {
             if value.len() != 64 {
                 return Err(E::custom(format!(
-                    "admin_identity_pub must be 64 bytes, got {}",
+                    "inviter_identity_pub must be 64 bytes, got {}",
                     value.len()
                 )));
             }
@@ -929,17 +930,17 @@ pub enum InviteUrlError {
     #[error("invite body exceeds the decoded ceiling (got {0} bytes)")]
     DecompressedTooLarge(usize),
     /// Caller passed an invite-only payload missing the admin bootstrap
-    /// fields (`admin_bootstrap` and/or `admin_identity_pub`). The reader
+    /// fields (`admin_bootstrap` and/or `inviter_identity_pub`). The reader
     /// would reject the resulting URL via `verify_admin_bootstrap`; we
     /// catch this at the writer to surface a clearer error and avoid
     /// shipping un-redeemable URLs. ZEB-260.
-    #[error("invite-only payload missing admin_bootstrap or admin_identity_pub")]
+    #[error("invite-only payload missing admin_bootstrap or inviter_identity_pub")]
     InviteOnlyMissingBootstrap,
-    /// Caller populated `admin_bootstrap` or `admin_identity_pub` on an
+    /// Caller populated `admin_bootstrap` or `inviter_identity_pub` on an
     /// open-community payload. These fields are scoped to invite-only
     /// flows; encoding them on an open-community URL would leak admin's
     /// signed bootstrap event over a URL that doesn't need it. ZEB-260.
-    #[error("open-community payload must not carry admin_bootstrap / admin_identity_pub")]
+    #[error("open-community payload must not carry admin_bootstrap / inviter_identity_pub")]
     OpenCommunityHasBootstrap,
     /// Caller passed an invite-only payload missing `invite_token`. The
     /// reader-side `redeem_invite_inner` would tear down the spawned
@@ -1236,7 +1237,7 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
         return Err(InviteUrlError::InviteOnlyMissingToken);
     }
     if payload.is_invite_only
-        && (payload.admin_bootstrap.is_none() || payload.admin_identity_pub.is_none())
+        && (payload.admin_bootstrap.is_none() || payload.inviter_identity_pub.is_none())
     {
         return Err(InviteUrlError::InviteOnlyMissingBootstrap);
     }
@@ -1259,7 +1260,7 @@ pub fn encode_invite_url(payload: &CommunityInvitePayload) -> Result<String, Inv
         return Err(InviteUrlError::InviteOnlyBootstrapMissingEnrollment);
     }
     if !payload.is_invite_only
-        && (payload.admin_bootstrap.is_some() || payload.admin_identity_pub.is_some())
+        && (payload.admin_bootstrap.is_some() || payload.inviter_identity_pub.is_some())
     {
         return Err(InviteUrlError::OpenCommunityHasBootstrap);
     }
@@ -1335,7 +1336,7 @@ pub fn decode_invite_url(url: &str) -> Result<CommunityInvitePayload, InviteUrlE
     // (open / untargeted / targeted invite-only).
     validate_sealed_epoch_key_shape(&payload)?;
     // ZEB-339: invite-only payloads must carry the inviter's EnrollmentCert
-    // (mirrors the admin_bootstrap / admin_identity_pub presence requirement).
+    // (mirrors the admin_bootstrap / inviter_identity_pub presence requirement).
     if payload.is_invite_only && payload.inviter_enrollment.is_none() {
         return Err(InviteUrlError::InviteOnlyMissingInviterEnrollment);
     }
@@ -1574,7 +1575,7 @@ impl CommunityInviteVerifyError {
 
 /// Errors from `verify_admin_bootstrap` — the six-step binding chain
 /// the joiner runs against the invite payload's `admin_bootstrap` +
-/// `admin_identity_pub` fields before inserting the bootstrap into the
+/// `inviter_identity_pub` fields before inserting the bootstrap into the
 /// engine. ZEB-260: closing the cold-cache gap that prevents the new
 /// joiner's empty CRDT from admitting the admin's first publish-back.
 ///
@@ -1584,7 +1585,7 @@ impl CommunityInviteVerifyError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedeemBootstrapVerifyError {
     /// Invite-only payload missing `admin_bootstrap` and/or
-    /// `admin_identity_pub`. Fires for old PR #89 invite URLs (which
+    /// `inviter_identity_pub`. Fires for old PR #89 invite URLs (which
     /// never carried these fields). Stable IPC string:
     /// "redeem_invite: invite-only payload missing admin bootstrap".
     BootstrapMissing,
@@ -1597,7 +1598,7 @@ pub enum RedeemBootstrapVerifyError {
     BootstrapCommunityMismatch,
 
     /// Ed25519 signature verification of `admin_bootstrap` failed under
-    /// `admin_identity_pub`.
+    /// `inviter_identity_pub`.
     BootstrapSignatureInvalid,
 
     /// `admin_bootstrap.kind` is not `Join`, or `countersig` is `Some`.
@@ -1999,12 +2000,12 @@ mod redeem_invite_error_code_tests {
 /// Run the binding chain that admits the admin's signed bootstrap event
 /// into the joiner's engine (ZEB-260, updated ZEB-339). Pure / sync.
 ///
-/// Returns `Ok((&admin_bootstrap, &admin_identity_pub))` on success so
+/// Returns `Ok((&admin_bootstrap, &inviter_identity_pub))` on success so
 /// the caller can pass them to `engine.insert_local_event_with_pubs`.
 /// Returns `Err(variant)` on the first failure.
 ///
 /// The chain (each step's failure → distinct error variant):
-///   1. Required fields present (`admin_bootstrap` + `admin_identity_pub`
+///   1. Required fields present (`admin_bootstrap` + `inviter_identity_pub`
 ///      both `Some`). [BootstrapMissing]
 ///   2. (Removed ZEB-339) — the old flat `address_hash == admin_addr`
 ///      check is incompatible with the owner/device split. The actor
@@ -2024,7 +2025,7 @@ mod redeem_invite_error_code_tests {
 /// Caller (`redeem_invite_inner` invite-only branch, Task 4) calls this
 /// AFTER `spawn_engine` and BEFORE the unicast send. On `Ok`, the caller
 /// proceeds to `engine.insert_local_event_with_pubs(admin_bootstrap,
-/// admin_identity_pub, None)`. On `Err`, the caller tears down the
+/// inviter_identity_pub, None)`. On `Err`, the caller tears down the
 /// engine via `shutdown_engine_and_cleanup_persistence` and surfaces
 /// the error string.
 pub fn verify_admin_bootstrap(
@@ -2041,8 +2042,8 @@ pub fn verify_admin_bootstrap(
         .admin_bootstrap
         .as_ref()
         .ok_or(RedeemBootstrapVerifyError::BootstrapMissing)?;
-    let admin_identity_pub = payload
-        .admin_identity_pub
+    let inviter_identity_pub = payload
+        .inviter_identity_pub
         .as_ref()
         .ok_or(RedeemBootstrapVerifyError::BootstrapMissing)?;
 
@@ -2084,7 +2085,7 @@ pub fn verify_admin_bootstrap(
         return Err(RedeemBootstrapVerifyError::BootstrapKindInvalid);
     }
 
-    Ok((admin_bootstrap, admin_identity_pub))
+    Ok((admin_bootstrap, inviter_identity_pub))
 }
 
 /// Encode a [`CommunityInvitePacket`] to wire bytes.
@@ -2511,18 +2512,18 @@ pub fn verify_envelope_sig(
 ///
 /// Verifies that `token.sig` covers the canonical token bytes (as produced
 /// by `canonical_invite_token_bytes`) and was produced by the Ed25519 key
-/// embedded in `admin_identity_pub[32..]`.
+/// embedded in `inviter_identity_pub[32..]`.
 ///
 /// Returns `Err(CommunityInviteVerifyError::InviteTokenSigInvalid)` on any
 /// failure (malformed pub, bad signature).
 pub fn verify_invite_token_signature(
     token: &InviteToken,
-    admin_identity_pub: &[u8; 64],
+    inviter_identity_pub: &[u8; 64],
 ) -> Result<(), CommunityInviteVerifyError> {
     let token_canonical = canonical_invite_token_bytes(token)
         .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
     use ed25519_dalek::Signature;
-    let identity = harmony_identity::Identity::from_public_bytes(admin_identity_pub)
+    let identity = harmony_identity::Identity::from_public_bytes(inviter_identity_pub)
         .map_err(|_| CommunityInviteVerifyError::InviteTokenSigInvalid)?;
     let sig = Signature::from_bytes(&token.sig);
     identity
@@ -3002,7 +3003,7 @@ mod tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -3064,7 +3065,7 @@ mod tests {
                 sig: [0u8; 64],
             }),
             admin_bootstrap: Some(admin_bootstrap),
-            admin_identity_pub: Some([0u8; 64]),
+            inviter_identity_pub: Some([0u8; 64]),
             forked_from: None,
             pre_fork_snapshot: None,
             // ZEB-339: invite-only payloads must carry the inviter's cert.
@@ -3741,7 +3742,7 @@ mod tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -3825,7 +3826,7 @@ mod tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: Some(forked_from_id),
             pre_fork_snapshot: Some(snapshot.clone()),
             inviter_enrollment: None,

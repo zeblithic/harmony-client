@@ -1181,7 +1181,7 @@ async fn build_open_invite_url_for_alice(s: &OpenJoinSetup) -> String {
         expires_at: None,
         invite_token: None,
         admin_bootstrap: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,

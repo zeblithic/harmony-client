@@ -824,7 +824,7 @@ async fn fork_invite_carries_snapshot_to_invitee() {
         expires_at: None,
         invite_token: None,
         admin_bootstrap: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         forked_from: Some(community_id),
         pre_fork_snapshot: Some(snapshot.clone()),
         inviter_enrollment: None,

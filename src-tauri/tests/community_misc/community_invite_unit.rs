@@ -65,7 +65,7 @@ fn community_invite_payload_round_trips_open_form() {
         expires_at: None,
         invite_token: None,
         admin_bootstrap: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
@@ -114,7 +114,7 @@ fn community_invite_payload_round_trips_invite_only_form() {
         }),
         invite_token: Some(token.clone()),
         admin_bootstrap: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
@@ -187,7 +187,7 @@ fn invite_url_round_trips_open_payload() {
         expires_at: None,
         invite_token: None,
         admin_bootstrap: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
@@ -265,7 +265,7 @@ fn decode_trims_whitespace() {
         expires_at: None,
         invite_token: None,
         admin_bootstrap: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
@@ -294,15 +294,15 @@ fn encode_rejects_invite_only_without_admin_bootstrap() {
 }
 
 #[test]
-fn encode_rejects_invite_only_without_admin_identity_pub() {
+fn encode_rejects_invite_only_without_inviter_identity_pub() {
     use harmony_app::community_invite::{encode_invite_url, InviteUrlError};
     // Symmetric to the missing-admin_bootstrap test above: mutate ONE
-    // field (admin_identity_pub → None) on top of a known-valid
+    // field (inviter_identity_pub → None) on top of a known-valid
     // invite-only fixture. Both fields are required for invite-only
     // encoding; this test pins the symmetric branch of the same
     // InviteOnlyMissingBootstrap rejection.
     let mut payload = admin_bootstrap_helpers::good_invite_only_payload();
-    payload.admin_identity_pub = None;
+    payload.inviter_identity_pub = None;
     assert!(matches!(
         encode_invite_url(&payload).unwrap_err(),
         InviteUrlError::InviteOnlyMissingBootstrap
@@ -310,7 +310,7 @@ fn encode_rejects_invite_only_without_admin_identity_pub() {
 }
 
 #[test]
-fn encode_rejects_open_community_with_admin_identity_pub_set() {
+fn encode_rejects_open_community_with_inviter_identity_pub_set() {
     use harmony_app::community_invite::{
         encode_invite_url, CommunityInvitePayload, InviteEpochSnapshot, InviteUrlError,
         MaterializedCommunityState,
@@ -331,7 +331,7 @@ fn encode_rejects_open_community_with_admin_identity_pub_set() {
         expires_at: None,
         invite_token: None,
         admin_bootstrap: None,
-        admin_identity_pub: Some([0xAB; 64]),
+        inviter_identity_pub: Some([0xAB; 64]),
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
@@ -387,7 +387,7 @@ fn encode_rejects_open_community_with_admin_bootstrap_set() {
         expires_at: None,
         invite_token: None,
         admin_bootstrap: Some(bs),
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: None,
@@ -1376,12 +1376,12 @@ mod admin_bootstrap_helpers {
 
     /// Build a known-good invite-only `CommunityInvitePayload` with
     /// well-formed `admin_bootstrap` (cert-bearing, ZEB-339 model) +
-    /// `admin_identity_pub`. The per-branch tests below mutate one field
+    /// `inviter_identity_pub`. The per-branch tests below mutate one field
     /// at a time.
     pub fn good_invite_only_payload() -> CommunityInvitePayload {
         let admin = admin_owner(0xAA);
         let admin_addr = admin.owner;
-        // admin_identity_pub: 64-byte [x25519 || ed25519] representation.
+        // inviter_identity_pub: 64-byte [x25519 || ed25519] representation.
         // The engine ignores it post-ZEB-339 (VerifyContext no longer carries
         // it), but the field must be Some for step 1 (BootstrapMissing gate).
         // The x25519 half (combined[0..32]) is intentionally zeroed because
@@ -1417,7 +1417,7 @@ mod admin_bootstrap_helpers {
                 sig: [0xDD; 64],
             }),
             admin_bootstrap: Some(bootstrap),
-            admin_identity_pub: Some(admin_pub),
+            inviter_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -1454,9 +1454,9 @@ mod verify_admin_bootstrap_tests {
     }
 
     #[test]
-    fn rejects_invite_only_without_admin_identity_pub() {
+    fn rejects_invite_only_without_inviter_identity_pub() {
         let mut p = good_invite_only_payload();
-        p.admin_identity_pub = None;
+        p.inviter_identity_pub = None;
         assert_eq!(
             verify_admin_bootstrap(&p).unwrap_err(),
             RedeemBootstrapVerifyError::BootstrapMissing
@@ -1466,7 +1466,7 @@ mod verify_admin_bootstrap_tests {
     // NOTE: rejects_invalid_admin_pubkey and rejects_admin_address_mismatch
     // have been removed (ZEB-339). Step 2 (the flat identity_pub address_hash
     // == admin_addr gate) no longer exists in verify_admin_bootstrap; the
-    // admin_identity_pub field is no longer gated against admin_addr.
+    // inviter_identity_pub field is no longer gated against admin_addr.
     // Cryptographic binding is now enforced by step 5 (cert model) instead.
 
     #[test]
@@ -1547,7 +1547,7 @@ mod verify_admin_bootstrap_tests {
         let mut p = good_invite_only_payload();
         p.admin_bootstrap = Some(bs);
         p.admin_addr = admin.owner;
-        p.admin_identity_pub = Some(admin_pub);
+        p.inviter_identity_pub = Some(admin_pub);
         assert_eq!(
             verify_admin_bootstrap(&p).unwrap_err(),
             RedeemBootstrapVerifyError::BootstrapKindInvalid
@@ -1592,7 +1592,7 @@ mod verify_admin_bootstrap_tests {
                 sig: [0xDD; 64],
             }),
             admin_bootstrap: Some(leave_bootstrap),
-            admin_identity_pub: Some(admin_pub),
+            inviter_identity_pub: Some(admin_pub),
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,

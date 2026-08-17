@@ -2380,7 +2380,7 @@ mod task3_kick_setpower_round_trip {
             delta_tx: Some(delta_a_tx),
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -2408,7 +2408,7 @@ mod task3_kick_setpower_round_trip {
             delta_tx: Some(delta_b_tx),
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -2455,7 +2455,7 @@ mod task3_kick_setpower_round_trip {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -2840,10 +2840,10 @@ async fn build_unreachable_invite_only_redeem_fixture() -> UnreachableRedeemFixt
         expires_at: None,
         invite_token: Some(invite_token),
         admin_bootstrap: Some(admin_bootstrap),
-        // ZEB-339: admin_identity_pub is inert on the post-ZEB-339 verify path
+        // ZEB-339: inviter_identity_pub is inert on the post-ZEB-339 verify path
         // (verify_admin_bootstrap binds the cert, not this pub) but is required
         // present at encode. Pass an inert placeholder.
-        admin_identity_pub: Some([0u8; 64]),
+        inviter_identity_pub: Some([0u8; 64]),
         forked_from: None,
         pre_fork_snapshot: None,
         // ZEB-339: invite-only payloads must carry the inviter's EnrollmentCert.

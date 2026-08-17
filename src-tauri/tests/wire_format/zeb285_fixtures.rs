@@ -267,7 +267,7 @@ fn community_invite_with_fork_fields_pinned() {
         expires_at: None,
         invite_token: None,
         admin_bootstrap: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         forked_from: Some(SpaceId([0xa0; 16])),
         pre_fork_snapshot: Some(snapshot),
         inviter_enrollment: None,

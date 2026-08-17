@@ -1209,13 +1209,13 @@ pub struct CommunitySyncEngineConfig {
 
     /// ZEB-254: 64-byte composite identity pub of the community admin
     /// (`X25519_pub || Ed25519_pub`), as decoded from the invite URL
-    /// (`CommunityInvitePayload.admin_identity_pub`). Carried on the
+    /// (`CommunityInvitePayload.inviter_identity_pub`). Carried on the
     /// config for API stability; the engine no longer threads it into a
     /// verify-path consumer (ZEB-339 moved PendingJoin verification to
     /// the carried EnrollmentCert / materialized enrolled_device_keys).
     /// `None` for engines that never see an invite payload (admin's own
     /// `create_community`, boot reconcile, open communities).
-    pub admin_identity_pub: Option<[u8; 64]>,
+    pub inviter_identity_pub: Option<[u8; 64]>,
 
     /// ZEB-254 Task 11: callback fired when a `JoinCountersign` targeting a
     /// self-authored `PendingJoin` lands (joiner-side clear hook). Production
@@ -4921,7 +4921,7 @@ async fn prepare_ingest(ctx: &InternalCtx, wire: &[u8]) -> PreparedIngest {
     //        admin's first publish-back. FIXED in 2026-05 by plumbing
     //        admin's signed bootstrap through the invite URL
     //        (CommunityInvitePayload.admin_bootstrap +
-    //        admin_identity_pub) and inserting it during
+    //        inviter_identity_pub) and inserting it during
     //        redeem_invite_inner before the unicast send.
     //      Case B — open-community brand-new joiner whose self-Join
     //        is only inside their own publish blob. DEFERRED.
@@ -7260,7 +7260,7 @@ impl CommunitySyncRegistry {
             // verify-path consumer; the engine ignores this field, so the
             // registry no longer pays a spawn-time resolver lookup to
             // populate it.
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             // ZEB-254 Task 11: clone the nav_emitter from the registry so
             // the engine can fire nav-updated on joiner-side countersign.
             // `None` for test registries that don't supply one.
@@ -8093,7 +8093,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: Some(serve_rx),
         });
@@ -8138,7 +8138,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -8359,7 +8359,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: Some(serve_rx_a),
         });
@@ -8398,7 +8398,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: Some(serve_rx_b),
         });
@@ -8543,7 +8543,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: Some(serve_rx_a),
         });
@@ -8583,7 +8583,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -8758,7 +8758,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: Some(serve_rx_a),
         });
@@ -8796,7 +8796,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -8984,7 +8984,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: Some(serve_rx_a),
         });
@@ -9022,7 +9022,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -9240,7 +9240,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -11504,7 +11504,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: Some(serve_rx),
         });
@@ -11543,7 +11543,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -11720,7 +11720,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -11752,7 +11752,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -11925,7 +11925,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -12043,7 +12043,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: Some(serve_rx),
         });
@@ -12267,7 +12267,7 @@ mod tests {
                 delta_tx: None,
                 pending_redemptions: None,
                 crdt_state: None,
-                admin_identity_pub: None,
+                inviter_identity_pub: None,
                 nav_emitter: None,
                 root_serve_rx: Some(serve_rx),
             });
@@ -12304,7 +12304,7 @@ mod tests {
                 delta_tx: None,
                 pending_redemptions: None,
                 crdt_state: None,
-                admin_identity_pub: None,
+                inviter_identity_pub: None,
                 nav_emitter: None,
                 root_serve_rx: None,
             });
@@ -13083,7 +13083,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -13252,7 +13252,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: Some(serve_rx),
         });
@@ -13292,7 +13292,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -13601,7 +13601,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });
@@ -13917,7 +13917,7 @@ mod tests {
             delta_tx: None,
             pending_redemptions: None,
             crdt_state: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             nav_emitter: None,
             root_serve_rx: None,
         });

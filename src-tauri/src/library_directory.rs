@@ -27,7 +27,7 @@ use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
 /// Ed25519_pub(32)) identity bundle — the Ed25519 half verifies
 /// `community_signature`. The X25519 half is unused in Phase 1 but
 /// kept for shape consistency with
-/// `CommunityInvitePayload::admin_identity_pub`.
+/// `CommunityInvitePayload::inviter_identity_pub`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryDirectoryEntry {
     #[serde(rename = "cd")]
@@ -386,7 +386,7 @@ pub fn verify_entry(entry: &LibraryDirectoryEntry) -> Result<AttestationStatus, 
     // derived 16-byte `address_hash` is the OwnerAddr. The invite payload
     // carries `admin_addr: OwnerAddr` (always present; for invite-only
     // payloads the full identity_pub also rides along in
-    // `admin_identity_pub`). For open-community URLs in the directory,
+    // `inviter_identity_pub`). For open-community URLs in the directory,
     // only `admin_addr` is guaranteed-present — compare on that axis.
     let entry_admin_addr = OwnerAddr(identity.address_hash);
     if payload.admin_addr != entry_admin_addr {
@@ -1382,7 +1382,7 @@ mod tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -1463,7 +1463,7 @@ mod tests {
                 sig: [0u8; 64],
             }),
             admin_bootstrap: Some(admin_bootstrap),
-            admin_identity_pub: Some([0u8; 64]),
+            inviter_identity_pub: Some([0u8; 64]),
             forked_from: None,
             pre_fork_snapshot: None,
             // ZEB-339: invite-only payloads must carry the inviter's
@@ -2726,7 +2726,7 @@ mod tests {
                 sig: [0u8; 64],
             }),
             admin_bootstrap: Some(admin_bootstrap),
-            admin_identity_pub: Some(admin_identity.identity.to_public_bytes()),
+            inviter_identity_pub: Some(admin_identity.identity.to_public_bytes()),
             forked_from: None,
             pre_fork_snapshot: None,
             // ZEB-339: invite-only payloads must carry the inviter's
@@ -2796,7 +2796,7 @@ mod tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,
@@ -2870,7 +2870,7 @@ mod tests {
             expires_at: None,
             invite_token: None,
             admin_bootstrap: None,
-            admin_identity_pub: None,
+            inviter_identity_pub: None,
             forked_from: None,
             pre_fork_snapshot: None,
             inviter_enrollment: None,

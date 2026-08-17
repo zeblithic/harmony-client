@@ -50,7 +50,7 @@ fn invite_only_payload(
         expires_at: None,
         invite_token: Some(token),
         admin_bootstrap: None,
-        admin_identity_pub: None,
+        inviter_identity_pub: None,
         forked_from: None,
         pre_fork_snapshot: None,
         inviter_enrollment: Some(cert),
