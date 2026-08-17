@@ -1741,6 +1741,65 @@ pub async fn run(
                 SupervisorConfig::default(),
             )));
 
+            // ZEB-931: before the boot-seed, backfill the now-installed oracle with
+            // the address book's reachability bindings. The oracle was installed just
+            // above, but the resolver that feeds it was populated back in `start_node`
+            // (BOOT-PROBE 10, inline-awaited into this same shared `book`), so those
+            // binds hit a `None` oracle and were dropped. Without this backfill a
+            // router-mode node finds its boot-seeded peers unbound → `admit` fails open
+            // → it dials the full persisted roster instead of ~degree ring neighbors
+            // (the R4 fan-out storm). Peer mode skips this entirely (oracle disabled),
+            // keeping boot byte-identical. `addrbook_runtime` is not consumed until far
+            // below, so borrowing it here is free.
+            if admission_oracle.enabled() {
+                if let (Some(ref addrbook), Some(ref registry)) =
+                    (&addrbook_runtime, &community_registry)
+                {
+                    let ids = registry.known_ids().await;
+                    // Snapshot each community's CURRENT materialized membership so the
+                    // backfill applies the same `device_is_enrolled` gate every sibling
+                    // ingest path uses (BOOT-PROBE 10, live `ingest_verified_row`): a row
+                    // is re-bound only if its actor is still a Joined member with that
+                    // device enrolled. Rows were gated at ingest, but membership can
+                    // change afterward and the book keeps a row until its TTL — this
+                    // re-check keeps the backfill from re-binding a stale (departed /
+                    // device-retired) row. Mirrors BOOT-PROBE 10's per-community
+                    // materialize; the engine guard is scoped tightly.
+                    let mut membership: std::collections::HashMap<
+                        crate::owner_state_types::SpaceId,
+                        crate::community_membership::MaterializedMembership,
+                    > = std::collections::HashMap::new();
+                    for cid in &ids {
+                        if let Some(engine) = registry.engine_arc(cid).await {
+                            let state_arc = engine.state();
+                            let mat = {
+                                let st = state_arc.lock().await;
+                                st.materialized(engine.admin_addr())
+                            };
+                            membership.insert(*cid, mat);
+                        }
+                    }
+                    let bound =
+                        crate::iroh_zenoh_registration::backfill_admission_oracle_from_address_book(
+                            &admission_oracle,
+                            &addrbook.book,
+                            ids.iter().copied(),
+                            crate::iroh_friend_acceptor::wall_now_ms(),
+                            |cid, actor, device| {
+                                membership.get(cid).is_some_and(|m| {
+                                    crate::voice_presence::device_is_enrolled(m, actor, device)
+                                })
+                            },
+                        );
+                    if bound > 0 {
+                        tracing::info!(
+                            "ZEB-931: backfilled {bound} address-book binding(s) into the \
+                             admission oracle before boot-seed"
+                        );
+                    }
+                }
+            }
+
             // Boot seed: every peer the resolver already knows enters the supervisor
             // as a `NewPeer` kick (recency-ordered), so a peer whose first dial fails
             // or later drops is reconnected indefinitely — not dialed once at boot.

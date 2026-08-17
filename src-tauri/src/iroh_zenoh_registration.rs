@@ -144,6 +144,58 @@ pub fn seed_boot_peers_into_supervisor(
     ordered
 }
 
+/// ZEB-931: bind every joined community's reachability rows into the admission
+/// oracle before the boot-seed kick. The oracle is installed in `event_loop::run`
+/// *after* the resolver was populated in `start_node`, so those boot-time binds
+/// were dropped (no-op against a `None` oracle); without this backfill a
+/// router-mode node finds its boot-seeded peers unbound, [`admit`] fails open,
+/// and it dials the full persisted roster instead of ~degree ring neighbors
+/// (the R4 fan-out storm). Walks each community's current (TTL-fresh)
+/// reachability rows and binds `(actor, iroh_node_id, device)` so the boot-seed
+/// kicks classify against real bindings. Relay rows carry no dialable node-id
+/// and are skipped. Returns the number of bindings applied (for the boot log).
+///
+/// `is_enrolled(community, actor, device)` gates each row against **current**
+/// materialized membership — the same `device_is_enrolled` check every other
+/// routing-ingest path applies (BOOT-PROBE 10, live `ingest_verified_row`).
+/// Rows were enrollment-gated when ingested, but membership can change afterward
+/// and the book retains a row until its TTL, so re-checking here keeps the
+/// backfill from re-binding a stale row (a departed member or a retired device).
+/// Binding a stale row could never *admit* it (admission also requires the key
+/// in the controller's current admitted set), but it could transiently mis-park
+/// a current member mid device-rotation; the gate removes that edge and keeps
+/// this path consistent with its siblings.
+///
+/// Peer mode never calls this — the caller gates on
+/// [`crate::admission_oracle::AdmissionOracle::enabled`], keeping peer-mode boot
+/// byte-identical to pre-R4.
+///
+/// [`admit`]: crate::admission_oracle::AdmissionOracle::admit
+pub fn backfill_admission_oracle_from_address_book(
+    oracle: &crate::admission_oracle::AdmissionOracle,
+    book: &crate::community_address_book::CommunityAddressBook,
+    community_ids: impl IntoIterator<Item = crate::owner_state_types::SpaceId>,
+    now_ms: u64,
+    is_enrolled: impl Fn(
+        &crate::owner_state_types::SpaceId,
+        &crate::owner_state_types::OwnerAddr,
+        &[u8; 32],
+    ) -> bool,
+) -> usize {
+    let mut bound = 0usize;
+    for cid in community_ids {
+        for row in book.rows_for_community(&cid, now_ms) {
+            if let crate::community_address_book::AddressBookEntry::Reachability(p) = &row.entry {
+                if is_enrolled(&cid, &row.actor, &row.device) {
+                    oracle.bind(row.actor.0, p.iroh_node_id, row.device);
+                    bound += 1;
+                }
+            }
+        }
+    }
+    bound
+}
+
 /// Build the `iroh/<hex>` listener locator for this node — adding it to
 /// `listen/endpoints` forces Zenoh to invoke the factory at `zenoh::open`, which
 /// starts the inbound forwarder even on inbound-only / no-known-peer nodes.
@@ -360,6 +412,95 @@ mod tests {
             seeded,
             vec![[0xC3; 32], [0xB2; 32]],
             "fleet-only siblings seeded, newest effective_announced_at_ms first"
+        );
+    }
+
+    /// ZEB-931: the boot backfill binds every joined community's reachability
+    /// rows into the admission oracle BEFORE the boot-seed, so a router-mode
+    /// node classifies its kicks against real bindings instead of failing open
+    /// and over-dialing the full roster. Mirrors
+    /// `seed_from_pkarr_some_binds_none_fails_open`: an unbound node fails open
+    /// (dialed); after the backfill a ring neighbor is admitted and a
+    /// non-neighbor is denied (parked Dormant at the dial-dispatch point).
+    #[test]
+    fn backfill_binds_reachability_rows_so_router_mode_classifies() {
+        use crate::admission_oracle::AdmissionOracle;
+        use crate::community_address_book::{
+            AddressBookEntry, AddressBookRow, CommunityAddressBook,
+        };
+        use crate::owner_state_types::{Hlc, OwnerAddr, SpaceId};
+        use crate::reachability_record::ReachabilityAnnouncePayload;
+        use std::collections::BTreeSet;
+
+        fn row(owner: u8, node: u8, device: u8) -> AddressBookRow {
+            AddressBookRow {
+                entry: AddressBookEntry::Reachability(ReachabilityAnnouncePayload {
+                    iroh_node_id: [node; 32],
+                    home_relay_url: "https://derp.example/".into(),
+                    direct_addresses: vec![],
+                    announced_at_ms: 1_000,
+                    identity_signature: [0; 64],
+                    butler_set: Vec::new(),
+                    bs_at: 0,
+                }),
+                actor: OwnerAddr([owner; 16]),
+                device: [device; 32],
+                at: Hlc {
+                    wall_ms: 1_000,
+                    logical: 0,
+                    device_id: String::new(),
+                },
+                stamped_at_ms: 1_000,
+            }
+        }
+
+        let now = 2_000u64;
+        let community = SpaceId([0x77; 16]);
+        let book = CommunityAddressBook::new();
+        book.upsert(community, row(0x01, 0x0A, 0xA1), now); // ring neighbor: device A1 (enrolled)
+        book.upsert(community, row(0x02, 0x0B, 0xB2), now); // non-neighbor: device B2 (enrolled)
+        book.upsert(community, row(0x03, 0x0C, 0xC3), now); // departed member: device C3 (NOT enrolled)
+
+        let oracle = AdmissionOracle::new(true); // router mode
+
+        // Pre-backfill: no node-id is bound -> unknown -> fail open (dialed).
+        for n in [0x0Au8, 0x0B, 0x0C] {
+            assert!(oracle.admit(&[n; 32]), "pre-backfill unknown fails open");
+        }
+
+        // The same `device_is_enrolled` gate every sibling ingest path applies:
+        // C3's actor has departed (or its device was retired), so its stale row
+        // must NOT be re-bound even though it is still TTL-fresh in the book.
+        let enrolled: std::collections::BTreeSet<[u8; 32]> =
+            BTreeSet::from([[0xA1; 32], [0xB2; 32]]);
+        let bound = backfill_admission_oracle_from_address_book(
+            &oracle,
+            &book,
+            [community],
+            now,
+            |_cid, _actor, device| enrolled.contains(device),
+        );
+        assert_eq!(
+            bound, 2,
+            "only the two enrolled rows bound; departed row skipped"
+        );
+
+        // The controller publishes the ring-neighbor union — here just device A1.
+        oracle.publish_admitted(BTreeSet::from([[0xA1u8; 32]]));
+
+        // Node A is bound to an admitted key -> admitted; node B is bound to a
+        // non-admitted key -> denied (parked Dormant at dispatch, not dialed).
+        assert!(oracle.admit(&[0x0A; 32]), "backfilled neighbor admitted");
+        assert!(
+            !oracle.admit(&[0x0B; 32]),
+            "backfilled non-neighbor denied -> parked, not over-dialed"
+        );
+        // Node C was never bound (gate skipped the departed row) -> unknown ->
+        // fail open: the stale row cannot mis-park it, and it certainly cannot
+        // be admitted (its key is not in the admitted set either way).
+        assert!(
+            oracle.admit(&[0x0C; 32]),
+            "departed row skipped -> unbound -> fail open, not mis-parked"
         );
     }
 }
