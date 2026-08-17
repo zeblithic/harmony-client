@@ -36232,19 +36232,28 @@ pub(crate) async fn generate_invite_impl(
             )
         };
 
-        // Security gate, extracted to `invite_only_generation_guard` so it's
-        // unit-tested without a NodeState harness: restrict invite-only
-        // generation to the admin (v1). The power gate is implicit —
-        // POWER_THRESHOLDS.invite == 0, so admin-only is the operative
-        // restriction; reinstate a real `power < threshold` check
-        // (materialize_with_now(&events, admin, ..)) when non-admin invite ships.
-        // ZEB-369: targeted requests (invitee_hint = Some) are now supported
-        // (handled in the targeted branch below); no longer rejected here.
-        invite_only_generation_guard(self_owner, admin)?;
+        // ZEB-950: invite generation is gated on the community's `invite` power
+        // threshold (default 0 = any joined member), not admin identity.
+        // Materialize the caller's power + Joined status at-now and run the pure
+        // guard. A departed member cannot mint. The real consensus boundary is
+        // the witness countersign power check in verify_event (ZEB-911); this
+        // gate is advisory/UX. ZEB-369: targeted requests (invitee_hint = Some)
+        // are handled in the targeted branch below; not an authz concern here.
         let wall_now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let self_mat =
+            crate::community_membership::materialize_with_now(&events, admin, Some(wall_now_ms));
+        let self_joined = matches!(
+            self_mat.members.get(&self_owner).map(|m| m.status),
+            Some(crate::community_membership::MemberStatus::Joined)
+        );
+        if !self_joined {
+            return Err("only a joined member can generate an invite".to_string());
+        }
+        let self_power = self_mat.power_levels.get(&self_owner).copied().unwrap_or(0);
+        invite_generation_power_guard(self_power, self_mat.power_thresholds.invite)?;
 
         // ZEB-369: branch on `invitee_hint`. A targeted invite seals the epoch
         // key to EACH of the invitee's enrolled device-#2 keys (resolved from
@@ -36580,25 +36589,25 @@ pub(crate) async fn generate_invite_impl(
     Ok(url)
 }
 
-/// ZEB-367/ZEB-369: security gates for invite-only invite generation, factored
-/// out of `generate_invite` so they're unit-testable without a NodeState/Tauri
-/// harness.
+/// ZEB-950: pure authorization gate for invite generation — a member may
+/// generate an invite iff their power meets the community's `invite` threshold
+/// (default 0 = every member). This replaced the v1 admin-identity lock.
 ///
-/// - v1 restricts invite-only generation to the admin (only the admin holds the
-///   epoch key and can produce the admin_bootstrap). Non-admin invite is a
-///   follow-up; reinstate a real power check then.
+/// Factored out of `generate_invite_impl` so it's unit-testable without a
+/// NodeState/Tauri harness; the caller's power + Joined status is materialized
+/// at the call site (covered end-to-end by `moderator_invite_tests`).
 ///
-/// ZEB-369 dropped the prior `invitee_hint.is_some()` rejection: targeted
-/// invite-only invites are now supported (the epoch key is sealed to the
-/// invitee's enrolled device-#2 keys resolved from materialized membership —
-/// see `resolve_invitee_device_keys`). `invitee_hint` (targeted vs untargeted)
-/// is no longer an authorization concern here; admin-only is the only gate.
-fn invite_only_generation_guard(
-    self_owner: crate::owner_state_types::OwnerAddr,
-    admin: crate::owner_state_types::OwnerAddr,
-) -> Result<(), String> {
-    if self_owner != admin {
-        return Err("only the admin can generate invite-only invites (v1)".to_string());
+/// NOTE: this is a client-side/advisory gate. The consensus boundary is the
+/// witness countersign power check in `verify_event` (ZEB-911) — a member who
+/// bypasses this still cannot get an invite finalized without a sufficiently-
+/// powered witness. ZEB-369: targeted vs untargeted is not an authorization
+/// concern here (the epoch key is sealed to the invitee's enrolled device-#2
+/// keys resolved from materialized membership — see `resolve_invitee_device_keys`).
+fn invite_generation_power_guard(self_power: u8, invite_threshold: u8) -> Result<(), String> {
+    if self_power < invite_threshold {
+        return Err(format!(
+            "insufficient power to generate an invite: have {self_power}, need {invite_threshold}"
+        ));
     }
     Ok(())
 }
@@ -77573,32 +77582,21 @@ mod generate_invite_helper_tests {
     use crate::community_invite::{decode_invite_url, CommunityInvitePayload};
     use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
-    // ── ZEB-367/ZEB-369: invite-only generation security gate ────────────
-    // These exercise `invite_only_generation_guard` directly — the admin-only
-    // rejection in `generate_invite`'s invite-only branch that can't otherwise
-    // be reached without a full NodeState harness. ZEB-369 dropped the prior
-    // targeted-request rejection (targeted invites are now supported).
+    // ── ZEB-950: invite generation gates on the community's invite POWER
+    // threshold, not admin identity. The pure guard is unit-tested here; the
+    // call-site materialize (caller's power + Joined status) is covered by the
+    // end-to-end test in `moderator_invite_tests`.
 
     #[test]
-    fn invite_only_guard_rejects_non_admin_caller() {
-        let admin = OwnerAddr([0x11; 16]);
-        let someone_else = OwnerAddr([0x22; 16]);
-        let err = invite_only_generation_guard(someone_else, admin)
-            .expect_err("non-admin caller must be rejected (v1 admin-only)");
-        assert!(
-            err.contains("admin"),
-            "rejection must explain the admin-only restriction: {err}"
-        );
-    }
-
-    #[test]
-    fn invite_only_guard_allows_admin() {
-        // ZEB-369: targeted vs untargeted is no longer an authorization concern;
-        // the admin is allowed to generate either shape. (The targeted-vs-
-        // untargeted branching now lives in `generate_invite_impl`, gated by the
-        // resolver finding the invitee's device keys.)
-        let admin = OwnerAddr([0x11; 16]);
-        invite_only_generation_guard(admin, admin).expect("admin must be allowed");
+    fn invite_generation_power_guard_gates_on_threshold() {
+        // At the default threshold 0, any member (power 0) may invite.
+        assert!(invite_generation_power_guard(0, 0).is_ok());
+        assert!(invite_generation_power_guard(50, 0).is_ok());
+        // A raised threshold rejects an under-powered member and admits an
+        // at/above one (boundary: `< threshold` rejects, `== threshold` passes).
+        assert!(invite_generation_power_guard(50, 60).is_err());
+        assert!(invite_generation_power_guard(60, 60).is_ok());
+        assert!(invite_generation_power_guard(100, 60).is_ok());
     }
 
     // ── ZEB-564: resolve_invite_expiry_ms — TTL duration → absolute wall-clock ms ──
