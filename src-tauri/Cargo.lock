@@ -2829,6 +2829,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek 2.2.0",
  "fd-lock",
+ "flate2",
  "flume",
  "frost-ristretto255",
  "futures",

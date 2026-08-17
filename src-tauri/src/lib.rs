@@ -36530,17 +36530,25 @@ pub(crate) async fn generate_invite_impl(
     // (Fix: PR #122 bot review — CodeAnt invariant + size cap issue.)
     let url = match crate::community_invite::encode_invite_url(&payload) {
         Ok(url) => url,
-        Err(crate::community_invite::InviteUrlError::TooLarge(actual_len))
-            if payload.pre_fork_snapshot.is_some() =>
-        {
+        // ZEB-948: both size errors mean "payload too big to fit an invite URL"
+        // and must trigger the same fork-invite degradation. `TooLarge` is the
+        // compressed-body/base64-cap failure; `DecompressedTooLarge` is the
+        // raw-body/decoded-ceiling failure the compression guard added at encode
+        // (without which a compressible oversized payload would mint a URL the
+        // decoder later rejects). Handle both, or a large fork invite hard-fails
+        // instead of degrading to no-snapshot mode.
+        Err(
+            crate::community_invite::InviteUrlError::TooLarge(oversize_len)
+            | crate::community_invite::InviteUrlError::DecompressedTooLarge(oversize_len),
+        ) if payload.pre_fork_snapshot.is_some() => {
             tracing::warn!(
                 community_id = %hex::encode(space_id.0),
-                actual_b64_len = actual_len,
-                cap = crate::community_invite::MAX_INVITE_BODY_B64_CHARS,
-                "ZEB-285 generate_invite: fork-invite payload exceeds URL cap; \
-                 falling back to no-snapshot mode. Fork-invitees joining via this \
-                 URL will see no pre-fork history. Phase 2 will add content-addressed \
-                 delivery for large snapshots."
+                oversize_len,
+                b64_cap = crate::community_invite::MAX_INVITE_BODY_B64_CHARS,
+                "ZEB-285 generate_invite: fork-invite payload exceeds the URL size \
+                 limit; falling back to no-snapshot mode. Fork-invitees joining via \
+                 this URL will see no pre-fork history. Phase 2 will add \
+                 content-addressed delivery for large snapshots."
             );
             payload.forked_from = None;
             payload.pre_fork_snapshot = None;

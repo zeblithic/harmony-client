@@ -201,6 +201,9 @@ hmac = "0.12"
 sha2 = "0.10"
 async-trait = "0.1"
 base64 = "0.22"
+# ZEB-948: raw-DEFLATE compression of the community-invite URL body. Default
+# features use the pure-Rust miniz_oxide backend (no C/zlib dependency).
+flate2 = "1"
 thiserror = "1"
 tempfile = "3"
 rusqlite = { version = "0.31", features = ["bundled"] }
