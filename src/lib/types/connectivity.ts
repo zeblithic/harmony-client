@@ -101,7 +101,7 @@ export interface PkarrPublicationStatus {
  *    `redeem_invite_inner_with_overrides` errored (engine insert, fence,
  *    commit rollback, etc.). `communityId` is set so the frontend can
  *    surface "we found Alice but the local insert failed".
- *  - `'missing_admin_identity_pub'` — invite has no admin identity key for
+ *  - `'missing_inviter_identity_pub'` — invite has no inviter identity key for
  *    verification; cannot safely complete discovery.
  *  - `'fallback_reticulum'` — use the LAN Reticulum path instead.
  *  - An opaque backend string for future variants.
@@ -113,7 +113,7 @@ export interface RedemptionOutcome {
     | 'inviter_unreachable'
     | 'no_member_reachable'
     | 'join_failed'
-    | 'missing_admin_identity_pub'
+    | 'missing_inviter_identity_pub'
     | 'fallback_reticulum'
     | string;
   communityId?: string;

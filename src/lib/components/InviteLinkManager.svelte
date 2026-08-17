@@ -71,7 +71,7 @@
     </button>
   {:else}
     {#if kind === 'invite-only'}
-      <p class="warning">Don't post publicly — it embeds your admin bootstrap signature. Each link can only be redeemed once.</p>
+      <p class="warning">Don't post publicly — it embeds your invite signature. Each link can only be redeemed once.</p>
     {:else if kind === 'open'}
       <p class="warning">Anyone with this URL can join. The same link works indefinitely.</p>
     {:else}

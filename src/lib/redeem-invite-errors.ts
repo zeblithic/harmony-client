@@ -16,7 +16,7 @@ export type RedeemInviteErrorCode =
   | 'invite_expired'
   | 'invite_verify_failed'
   | 'invite_token_missing'
-  | 'missing_admin_identity_pub'
+  | 'missing_inviter_identity_pub'
   | 'inviter_unreachable'
   | 'relays_warming_up'
   | 'node_not_ready'
@@ -93,13 +93,13 @@ const COPY: Record<RedeemInviteErrorCode, RedeemInviteCopy> = {
     summary: 'Invite link is incomplete.',
     hint: "It's missing its single-use access token. Ask the inviter to regenerate it.",
   },
-  missing_admin_identity_pub: {
+  missing_inviter_identity_pub: {
     summary: "Couldn't verify the inviter over the network.",
     hint: 'Try the local-network fallback below to join.',
   },
   inviter_unreachable: {
     summary: 'Inviter is offline — try again later.',
-    hint: "The community admin needs to be reachable when you redeem. Retry once they're back online.",
+    hint: "The inviter needs to be reachable when you redeem. Retry once they're back online.",
   },
   relays_warming_up: {
     // ZEB-879: the pkarr resolver returns this while its relay pool is still

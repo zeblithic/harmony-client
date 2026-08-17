@@ -149,7 +149,7 @@
   const IROH_LAN_RECOVERABLE_CODES = new Set([
     'inviter_unreachable',
     'relays_warming_up',
-    'missing_admin_identity_pub',
+    'missing_inviter_identity_pub',
     'unknown',
   ]);
 
@@ -244,7 +244,7 @@
           '. Try restarting the app and redeeming again; if it keeps failing, please report it as a bug.';
         showFallbackButton = false;
       } else {
-        // missing_admin_identity_pub, fallback_reticulum, or other — hand off to LAN path
+        // missing_inviter_identity_pub, fallback_reticulum, or other — hand off to LAN path
         irohStage = null;
         showFallbackButton = true;
       }
