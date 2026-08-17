@@ -369,10 +369,22 @@ impl SupervisorHandle {
     /// keeps a genuine bridge alive (and lets it self-expire once coverage heals).
     /// Inert unless the peer is actually denied — in peer mode, or for an admitted
     /// peer, the dispatch park never fires and the exemption is never consulted.
+    ///
+    /// Skips a slot already `Connected` (ZEB-941, Greptile review): action 4
+    /// snapshots the peer Dormant and calls this on a task independent of the
+    /// inbound-accept handler, so a connect can land in between — and it already
+    /// consumed the exemption on that edge. Re-arming a Connected slot here would
+    /// leave a stale exemption that a later drop reuses to redial a denied
+    /// non-neighbor with no fresh repair decision, defeating the R4 degree bound.
+    /// A Connected peer never reaches the dispatch veto, so it needs no waiver;
+    /// this and the two `mark_connected`/`apply_result` clears all serialize on
+    /// `states.lock()`, so the state read here cannot race the connect it guards.
     pub fn mark_reachability_bridge(&self, peer: [u8; 32]) {
         let mut states = self.inner.states.lock().expect("states lock");
         if let Some(slot) = states.get_mut(&peer) {
-            slot.repair_exempt_since = Some(Instant::now());
+            if !matches!(slot.state, PeerState::Connected { .. }) {
+                slot.repair_exempt_since = Some(Instant::now());
+            }
         }
     }
 
@@ -2665,6 +2677,77 @@ mod tests {
                 .iter()
                 .any(|(id, st)| *id == p && matches!(st, PeerStateWire::Dormant { .. })),
             "the dropped bridge re-parks Dormant without a fresh repair mark"
+        );
+    }
+
+    /// ZEB-941 (Greptile review): the mark→connect ordering is a RACE, not a
+    /// causal chain. Action 4 snapshots a peer as Dormant, then later calls
+    /// `mark_reachability_bridge` on a SEPARATE task from the one handling the
+    /// inbound accept (`mark_connected`) — so a connect can land *between* the
+    /// snapshot and the mark. Since `mark_connected` already consumed the
+    /// exemption on that edge, a state-blind mark would re-arm a fresh exemption
+    /// on the now-Connected slot; a later drop within the window would then
+    /// redial the still-denied non-neighbor with no fresh repair decision,
+    /// bypassing the R4 degree bound. The mark must therefore refuse to arm a
+    /// Connected slot (a Connected peer never reaches the dispatch veto, so it
+    /// needs no waiver). Here we force the losing ordering directly.
+    #[tokio::test(start_paused = true)]
+    async fn r4_repair_exempt_mark_after_connect_race_does_not_re_arm() {
+        use crate::admission_oracle::AdmissionOracle;
+        let dialer = RecordingDialer::failing();
+        let resolver = Arc::new(ReachabilityResolver::new());
+        let telemetry = Arc::new(DialTelemetry::new());
+        let p = peer(1);
+        seed(&resolver, p);
+        let dk = [0x81u8; 32];
+
+        let oracle = Arc::new(AdmissionOracle::new(true));
+        oracle.bind([0u8; 16], p, dk);
+        oracle.publish_admitted(std::collections::BTreeSet::new()); // p denied throughout
+        let handle = SupervisorHandle::new();
+        handle.set_admission_oracle(Arc::clone(&oracle));
+
+        // dormant_after huge so the ONLY Dormant transition is the admit re-park.
+        let config = cfg(1_000, 8_000, 3_600_000, 1_000, 8, 3_000);
+        tokio::spawn(run_reconnect_supervisor(
+            handle.clone(),
+            dialer.clone(),
+            resolver.clone(),
+            telemetry.clone(),
+            peer(0),
+            config,
+        ));
+
+        // The pre-existing Dormant slot action 4 snapshots (denied → parked).
+        handle.kick(p, ReconnectTrigger::NewPeer);
+        tokio::time::sleep(ms(3_000)).await;
+        assert_eq!(dialer.count_for(p), 0, "denied peer parks Dormant, no dial");
+
+        // RACE: the inbound accept lands (and consumes the exemption) BEFORE
+        // action 4's delayed mark. Model the losing interleaving by calling
+        // `mark_connected` first, then the mark on the now-Connected slot.
+        handle.mark_connected(p);
+        handle.mark_reachability_bridge(p);
+        assert!(
+            handle.repair_exempt_since(p).is_none(),
+            "mark must NOT arm an exemption on an already-Connected slot"
+        );
+
+        // Consequence: a post-connect drop re-parks Dormant and is NOT re-dialed
+        // — the mark left no stale authorization to reuse.
+        handle.kick(p, ReconnectTrigger::Dropped);
+        tokio::time::sleep(ms(20_000)).await;
+        assert_eq!(
+            dialer.count_for(p),
+            0,
+            "post-race drop must not re-dial a denied non-neighbor"
+        );
+        assert!(
+            handle
+                .states_snapshot()
+                .iter()
+                .any(|(id, st)| *id == p && matches!(st, PeerStateWire::Dormant { .. })),
+            "the dropped bridge re-parks Dormant, no stale exemption"
         );
     }
 
