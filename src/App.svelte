@@ -1477,11 +1477,12 @@
       // Drop if the user switched communities while we were awaiting.
       if (selectedCommunityId !== id) return;
       communityMembers = fresh;
-      // ZEB-949: the first roster content beyond self means the initial sync has
-      // produced results — drop the "Syncing…" state. Members and channels
-      // co-arrive in one CRDT state-root merge, so this also un-syncs the channel
-      // panel at the right moment; the tracker's timeout covers any edge case.
-      if (fresh.filter((m) => m.status === 'joined').length > 1) initialSync.clear(id);
+      // ZEB-949: no explicit initialSyncing clear here. Each panel self-hides its
+      // "Syncing…" message the moment ITS own content arrives (member list once a
+      // member is visible; channel area once a channel is active), so a
+      // members-based clear would race the channel stream and could flash "No
+      // channels yet" before channels apply. The tracker's timeout safety-valve
+      // resolves genuinely-empty communities.
     } catch (e) {
       // listCommunityMembers throws when the adapter isn't connected
       // (mock-data mode) or the backend isn't ready. Surface the failure to
@@ -4844,6 +4845,10 @@
             parentId: null,
           });
           changeSelectedCommunity(dto.communityId);
+          // ZEB-949: mark this fresh join as initial-syncing (mirrors the redeem
+          // dialog) so directory / open-community joins also show "Syncing…"
+          // until the roster/channels sync in.
+          initialSync.markJoined(dto.communityId);
           await refreshCommunityMembers(dto.communityId);
         }}
         onJoin={async (communityId) => {
@@ -4869,6 +4874,10 @@
             parentId: null,
           });
           changeSelectedCommunity(dto.communityId);
+          // ZEB-949: mark this fresh join as initial-syncing (mirrors the redeem
+          // dialog) so directory / open-community joins also show "Syncing…"
+          // until the roster/channels sync in.
+          initialSync.markJoined(dto.communityId);
           await refreshCommunityMembers(dto.communityId);
         }}
         onClose={() => (libraryDirectoryOpen = false)}

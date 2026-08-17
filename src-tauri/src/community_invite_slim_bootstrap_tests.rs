@@ -288,13 +288,15 @@ fn slim_invite_fits_cap_while_old_full_roster_blows_it() {
         full.len()
     );
 
-    // Slim size is content-independent (the roster is simply not present).
-    let slim_again =
-        encode_invite_url(&payload_with_snapshot(MaterializedCommunityState::default()))
-            .expect("encode slim again");
-    assert_eq!(
+    // The slim invite is a small fraction of the old full-roster invite for the
+    // same 500-member community — the O(members) roster is simply not present.
+    // (That the ENCODER emits a slim snapshot regardless of community size is a
+    // property of `generate_invite_impl`, covered by the generate/redeem
+    // integration tests; this fixture pins the codec-level size consequence.)
+    assert!(
+        full.len() > slim.len() * 10,
+        "stripping the roster should shrink the invite by >10x: slim={} full={}",
         slim.len(),
-        slim_again.len(),
-        "slim size does not depend on community size"
+        full.len()
     );
 }
