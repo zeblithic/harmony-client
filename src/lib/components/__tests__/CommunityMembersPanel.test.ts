@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor } from '@testing-library/svelte';
 import CommunityMembersPanel from '../CommunityMembersPanel.svelte';
 import type { CommunityMember } from '../../types';
 
@@ -261,5 +261,50 @@ describe('CommunityMembersPanel', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toContain('network timeout');
+  });
+});
+
+// ZEB-957: the moderation (kick/unban) confirmation dialog must resolve the
+// target's name through the display-name ladder, not the raw roster displayName.
+describe('moderation dialog resolves the target name through the ladder (ZEB-957)', () => {
+  // Scope the kebab to the target's own row: the admin self-row also carries a
+  // kebab, so a global "Member actions" query is ambiguous.
+  async function openKickDialogFor(container: HTMLElement, rowMatch: string) {
+    const row = await waitFor(() => {
+      const r = Array.from(container.querySelectorAll('.member-row')).find((el) =>
+        el.textContent?.includes(rowMatch),
+      );
+      if (!r) throw new Error(`row containing "${rowMatch}" not ready`);
+      return r as HTMLElement;
+    });
+    await fireEvent.click(row.querySelector('.kebab-btn') as HTMLButtonElement);
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Kick' }));
+  }
+
+  it('shows the friend nickname in the kick confirmation, not the roster displayName', async () => {
+    const { container } = render(CommunityMembersPanel, {
+      props: {
+        ...baseProps(),
+        communityService: makeService([alice, bob]),
+        resolveNickname: (id: string) => (id === bob.address ? 'Ziggy' : undefined),
+      },
+    });
+    await openKickDialogFor(container, 'Ziggy');
+    expect(screen.getByText(/Kick Ziggy from/i)).toBeTruthy();
+  });
+
+  it('falls through a blank published name to hex, never a blank confirmation', async () => {
+    const blankMember: CommunityMember = {
+      address: 'dddd1111'.padEnd(32, '0'),
+      displayName: '   ',
+      power: 0,
+      status: 'joined',
+      joinedAt: 1700000003000,
+    };
+    const { container } = render(CommunityMembersPanel, {
+      props: { ...baseProps(), communityService: makeService([alice, blankMember]) },
+    });
+    await openKickDialogFor(container, 'dddd1111');
+    expect(screen.getByText(/Kick dddd1111 from/i)).toBeTruthy();
   });
 });

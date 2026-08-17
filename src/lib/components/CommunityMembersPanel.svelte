@@ -6,6 +6,7 @@
   import MemberRow from './MemberRow.svelte';
   import type { KebabAction, OpenCardPayload } from './MemberRow.svelte';
   import type { ResolvedCard } from '../member-card-service';
+  import { resolveMentionLabel } from '../mention-render';
   import ModerationReasonDialog from './ModerationReasonDialog.svelte';
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
   import RecentActionsBadge from './RecentActionsBadge.svelte';
@@ -370,7 +371,9 @@
 <ModerationReasonDialog
   bind:open={dialogOpen}
   action={dialogAction}
-  targetName={dialogTarget?.displayName ?? dialogTarget?.address.slice(0, 8) ?? ''}
+  targetName={dialogTarget
+    ? resolveMentionLabel(dialogTarget.address, resolveNickname, resolveCard, () => dialogTarget!.displayName)
+    : ''}
   {communityName}
   onConfirm={onDialogConfirm}
   onCancel={onDialogCancel}
