@@ -13,6 +13,7 @@
     trustService,
     collapsed,
     loading = false,
+    initialSyncing = false,
     onAvatarClick,
     resolveCard,
     resolveNickname,
@@ -28,6 +29,11 @@
      *  bare "0", which otherwise reads as "this community has no members" during
      *  the fetch. Only meaningful when the roster is still empty. */
     loading?: boolean;
+    /** ZEB-949 Phase 2: true while a freshly-joined community is doing its first
+     *  roster sync (slim invites no longer inline the roster). Shows "Syncing
+     *  members…" instead of a bare empty list. Distinct from `loading`, which
+     *  covers only the local list_community_members IPC round-trip. */
+    initialSyncing?: boolean;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
     /** ZEB-341: optional profile-card resolver for member display names. */
     resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
@@ -116,13 +122,22 @@
       <span class="title">Members</span>
       <!-- During the initial post-switch fetch the true count is unknown, so
            "0" would be a lie — show an ellipsis until the roster resolves. -->
-      <span class="count">{loading && visible.length === 0 ? '…' : visible.length}</span>
+      <span class="count"
+        >{(loading || initialSyncing) && visible.length === 0 ? '…' : visible.length}</span
+      >
     </header>
     {#if loading && visible.length === 0}
       <!-- ZEB-553 item 11: kept a sibling of the <ul> (not an <li>) so the list
            stays a pure list of listitems for screen readers, and the loading
            message is a clean status live-region instead. -->
       <p class="member-loading" role="status">Loading members…</p>
+    {:else if initialSyncing && visible.length === 0}
+      <!-- ZEB-949 Phase 2: freshly joined; the roster is syncing in, not empty.
+           Only when genuinely empty (self hasn't materialized yet) — once any
+           member is visible the real list renders and this clears. -->
+      <p class="member-loading" role="status" data-testid="members-syncing-banner">
+        Syncing members…
+      </p>
     {:else}
       <!-- Explicit list roles: `list-style: none` strips the implicit
            list/listitem semantics in Safari + VoiceOver, so a screen reader

@@ -62,6 +62,7 @@
   import { ProfileBroadcastService } from './lib/profile-broadcast-service';
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
+  import { createInitialSyncTracker } from './lib/community-initial-sync';
   import { FriendService, contactsFromFriends } from './lib/friend-service';
   import { DmInviteService, type PendingDmInviteDto } from './lib/dm-invite-service';
   import { ChannelMessageService } from './lib/channel-message-service';
@@ -1275,6 +1276,18 @@
   // Forwarded into ChannelMembersPanel via CommunityView so a switch shows
   // "Loading members…" instead of a bare, misleading "0".
   let membersLoading = $state(false);
+  // ZEB-949 Phase 2: freshly-joined communities show a "Syncing…" state until
+  // their roster/channels sync in (slim invites no longer inline them). The
+  // tracker owns a timeout safety-valve and an explicit clear-on-content; both
+  // bump `initialSyncVersion` via onChange so `communityInitialSyncing` re-runs.
+  let initialSyncVersion = $state(0);
+  const initialSync = createInitialSyncTracker(10_000, () => {
+    initialSyncVersion += 1;
+  });
+  const communityInitialSyncing = $derived.by(() => {
+    void initialSyncVersion; // reactive dep on mark/clear/timeout
+    return !!selectedCommunityId && initialSync.isSyncing(selectedCommunityId);
+  });
   // ZEB-404: timestamp throttle for the message-triggered roster refetch (see
   // the channelMessageService.onMessage wiring). Time-based — a failed or
   // too-early refresh self-heals on the next message rather than permanently
@@ -1464,6 +1477,12 @@
       // Drop if the user switched communities while we were awaiting.
       if (selectedCommunityId !== id) return;
       communityMembers = fresh;
+      // ZEB-949: no explicit initialSyncing clear here. Each panel self-hides its
+      // "Syncing…" message the moment ITS own content arrives (member list once a
+      // member is visible; channel area once a channel is active), so a
+      // members-based clear would race the channel stream and could flash "No
+      // channels yet" before channels apply. The tracker's timeout safety-valve
+      // resolves genuinely-empty communities.
     } catch (e) {
       // listCommunityMembers throws when the adapter isn't connected
       // (mock-data mode) or the backend isn't ready. Surface the failure to
@@ -4114,6 +4133,7 @@
         communityKind={communityService.getKind(selectedCommunityNode.id)}
         members={communityMembers}
         membersLoading={membersLoading}
+        initialSyncing={communityInitialSyncing}
         ownAddress={selfOwnerId ?? ''}
         myPower={myCommunityPower}
         isDegraded={isCurrentCommunityDegraded}
@@ -4754,6 +4774,10 @@
           redeemStatusTimer = null;
         }, 6000);
         changeSelectedCommunity(dto.communityId);
+        // ZEB-949: mark this fresh join as initial-syncing so the roster/channel
+        // panels show "Syncing…" until the first real content arrives (or the
+        // tracker's timeout fires). Cleared in refreshCommunityMembers below.
+        initialSync.markJoined(dto.communityId);
         await refreshCommunityMembers(dto.communityId);
       } catch (e) {
         // ZEB-885: redeem_invite rejects with a structured { code, message };
@@ -4821,6 +4845,10 @@
             parentId: null,
           });
           changeSelectedCommunity(dto.communityId);
+          // ZEB-949: mark this fresh join as initial-syncing (mirrors the redeem
+          // dialog) so directory / open-community joins also show "Syncing…"
+          // until the roster/channels sync in.
+          initialSync.markJoined(dto.communityId);
           await refreshCommunityMembers(dto.communityId);
         }}
         onJoin={async (communityId) => {
@@ -4846,6 +4874,10 @@
             parentId: null,
           });
           changeSelectedCommunity(dto.communityId);
+          // ZEB-949: mark this fresh join as initial-syncing (mirrors the redeem
+          // dialog) so directory / open-community joins also show "Syncing…"
+          // until the roster/channels sync in.
+          initialSync.markJoined(dto.communityId);
           await refreshCommunityMembers(dto.communityId);
         }}
         onClose={() => (libraryDirectoryOpen = false)}
