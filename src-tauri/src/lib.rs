@@ -344,6 +344,9 @@ pub mod reconnect_supervisor;
 // Test-only; compiled only under `cfg(test)`, never in a release binary.
 #[cfg(test)]
 mod simnet;
+// ZEB-949 Phase 2: slim-bootstrap invite regression + size coverage.
+#[cfg(test)]
+mod community_invite_slim_bootstrap_tests;
 // ZEB-622: peer liveness — passive per-peer transport state machine fusing
 // registry connect/drop edges, iroh path events, and zenoh transport events
 // into Connected/Degraded/Disconnected. Pure logic; producers wired in later tasks.
