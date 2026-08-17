@@ -200,6 +200,8 @@ async fn inner() {
         // its wall-clock window).
         parole_interval: Duration::from_secs(3600),
         parole_batch: 2,
+        // ZEB-941: production default; this integration test never marks a bridge.
+        repair_exempt_window: Duration::from_secs(1200),
         jitter_seed: Some(0xD1A1),
     };
     tokio::spawn(run_reconnect_supervisor(
