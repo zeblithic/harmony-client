@@ -225,6 +225,89 @@ describe('RedeemInviteDialog', () => {
     expect(getByTestId('fallback-lan-btn')).toBeTruthy();
   });
 
+  // ── ZEB-955: Ok-side statuses that route to the LAN fallback must EXPLAIN the
+  // button, never show it mute. The `else` branch of handleIrohRedeem catches
+  // three statuses; each gets its own message. ──────────────────────────────
+
+  it('shows the missing-inviter-identity copy and fallback button for missing_inviter_identity_pub', async () => {
+    // Reuses the authored table copy (summary + a hint whose wording already
+    // points at "the local-network fallback below") — previously this Ok-side
+    // status set showFallbackButton with NO message, so the button appeared mute.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_redeem_invite_iroh') {
+        return Promise.resolve({ status: 'missing_inviter_identity_pub' });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { getByTestId, getByPlaceholderText } = render(RedeemInviteDialog, {
+      props: { onSubmit: vi.fn(), onCancel: vi.fn() },
+    });
+
+    const input = getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: 'harmony://invite/v1?ci=x' } });
+    await fireEvent.click(getByTestId('iroh-redeem-btn'));
+
+    await waitFor(() => {
+      const banner = getByTestId('iroh-error-banner');
+      expect(banner.textContent).toContain("Couldn't verify the inviter over the network");
+      expect(banner.textContent).toContain('local-network fallback below');
+    });
+    expect(getByTestId('fallback-lan-btn')).toBeTruthy();
+  });
+
+  it('shows routing copy and fallback button for fallback_reticulum', async () => {
+    // `fallback_reticulum` is a routing signal (the backend says "use the LAN
+    // path"), NOT a failure — the copy must frame it that way and must NOT be
+    // the generic "check your connection and retry" unknown-error copy.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_redeem_invite_iroh') {
+        return Promise.resolve({ status: 'fallback_reticulum' });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { getByTestId, getByPlaceholderText } = render(RedeemInviteDialog, {
+      props: { onSubmit: vi.fn(), onCancel: vi.fn() },
+    });
+
+    const input = getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: 'harmony://invite/v1?ci=x' } });
+    await fireEvent.click(getByTestId('iroh-redeem-btn'));
+
+    await waitFor(() => {
+      const banner = getByTestId('iroh-error-banner');
+      expect(banner.textContent).toContain('redeemed over the local network');
+      expect(banner.textContent).not.toMatch(/check your connection/i);
+    });
+    expect(getByTestId('fallback-lan-btn')).toBeTruthy();
+  });
+
+  it('shows a generic explanation and fallback button for an opaque future status', async () => {
+    // A status the frontend hasn't learned yet still explains the button rather
+    // than showing it mute, and offers the LAN fallback as the actionable route.
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === 'connectivity_redeem_invite_iroh') {
+        return Promise.resolve({ status: 'some_future_backend_status' });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { getByTestId, getByPlaceholderText } = render(RedeemInviteDialog, {
+      props: { onSubmit: vi.fn(), onCancel: vi.fn() },
+    });
+
+    const input = getByPlaceholderText(/harmony:\/\/invite/) as HTMLTextAreaElement;
+    await fireEvent.input(input, { target: { value: 'harmony://invite/v1?ci=x' } });
+    await fireEvent.click(getByTestId('iroh-redeem-btn'));
+
+    await waitFor(() => {
+      const banner = getByTestId('iroh-error-banner');
+      expect(banner.textContent).toContain("Couldn't complete this invite over the network");
+    });
+    expect(getByTestId('fallback-lan-btn')).toBeTruthy();
+  });
+
   it('fallback button calls onSubmit (LAN path) after iroh failure', async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'connectivity_redeem_invite_iroh') {

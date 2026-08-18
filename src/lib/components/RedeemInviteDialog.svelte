@@ -244,8 +244,31 @@
           '. Try restarting the app and redeeming again; if it keeps failing, please report it as a bug.';
         showFallbackButton = false;
       } else {
-        // missing_inviter_identity_pub, fallback_reticulum, or other — hand off to LAN path
+        // ZEB-955: Ok-side statuses that route to the LAN fallback. This branch
+        // previously set showFallbackButton with NO message, so the fallback
+        // button appeared mute — the one fallback-offering outcome that didn't
+        // explain why it switched away from a direct redeem. Give each status a
+        // message (matching the sibling branches above); button behavior is
+        // unchanged — the LAN fallback stays offered for all three.
         irohStage = null;
+        if (outcome.status === 'missing_inviter_identity_pub') {
+          // Known code with authored copy whose hint already names "the
+          // local-network fallback below" — reuse it, don't duplicate the string.
+          const copy = redeemInviteCopy('missing_inviter_identity_pub');
+          irohError = copy.hint ? `${copy.summary} ${copy.hint}` : copy.summary;
+        } else if (outcome.status === 'fallback_reticulum') {
+          // A routing signal, not a failure — frame it as "use the LAN path,"
+          // NOT the generic "check your connection and retry" unknown copy.
+          irohError =
+            'This invite is set up to be redeemed over the local network. ' +
+            'Use the local-network option below to join.';
+        } else {
+          // Opaque/future backend status: still explain the button rather than
+          // showing it mute, and offer the LAN fallback as the actionable route.
+          irohError =
+            "Couldn't complete this invite over the network. " +
+            'Try the local-network fallback below to join.';
+        }
         showFallbackButton = true;
       }
     } catch (e) {
