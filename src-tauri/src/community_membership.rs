@@ -4378,8 +4378,27 @@ pub fn verify_event(
             // enrolled_key_from_cert (step 1 above), which binds the carried
             // cert.owner_id == event.actor.
 
-            // P2: invite_token.inviter must equal ctx.admin_addr.
-            if invite_token.inviter != ctx.admin_addr {
+            // P2 (ZEB-954): the token's inviter must be a Joined member whose
+            // power meets the community's invite threshold — mirroring the
+            // ZEB-950 mint gate (`lib.rs` generate_invite_impl) and the ZEB-911
+            // countersign gate, so all three "who may invite" gates agree.
+            // (Previously hard-required inviter == admin_addr, which rejected
+            // every moderator-minted invite-only invite even though mint and
+            // countersign permit any powered member. The authoritative
+            // roster-binding step is the ZEB-911 countersign, itself
+            // power-checked against prior_state.) The explicit Joined check is
+            // load-bearing: with the v1 default invite threshold of 0 the power
+            // check is a no-op, so membership status is what stops a
+            // left/kicked/banned ex-moderator's stale token from admitting.
+            let inviter_joined = matches!(
+                prior_state
+                    .members
+                    .get(&invite_token.inviter)
+                    .map(|m| m.status),
+                Some(MemberStatus::Joined),
+            );
+            if !inviter_joined || !actor_power_meets_invite_tier(prior_state, invite_token.inviter)
+            {
                 return Err(VerifyError::PendingJoinTokenInvalid);
             }
 
@@ -10278,21 +10297,26 @@ mod zeb_254_pending_join_verify_tests {
         );
     }
 
+    // ZEB-954 (was `pending_join_rejected_when_token_inviter_not_admin`): P2 no
+    // longer keys on admin identity — it now requires the inviter to be a Joined
+    // member with power >= the community's invite threshold (mirroring the
+    // ZEB-950 mint gate and the ZEB-911 countersign gate). A token from someone
+    // absent from the roster (here, a rogue against an empty prior state) is
+    // therefore still rejected: not a member => not Joined.
     #[test]
-    fn pending_join_rejected_when_token_inviter_not_admin() {
-        let (rogue_priv, _rogue_pub, rogue_addr) = make_identity(0xc1);
-        let (_admin2_priv, _admin2_pub, admin2_addr) = make_identity(0xa2);
-        let (joiner_priv, _joiner_pub, joiner_addr) = make_identity(0xb1);
+    fn pending_join_rejected_when_inviter_not_joined_member() {
+        let (rogue, _rogue_pub, rogue_addr) = make_identity(0xc1);
+        let (_admin2, _admin2_pub, admin2_addr) = make_identity(0xa2);
+        let (joiner, _joiner_pub, joiner_addr) = make_identity(0xb1);
         let community_id = SpaceId([7u8; 16]);
-        // Token is signed by rogue, not admin2.
+        // Token is signed by rogue, who is NOT in the roster.
         let token = make_invite_token(
-            &rogue_priv,
+            &rogue,
             rogue_addr,
             Some(joiner_addr),
             Some(1_700_000_100_000),
         );
-        let event = make_pending_join_event(&joiner_priv, joiner_addr, community_id, token);
-        // ctx uses admin2 as admin — rogue != admin2, so P2 (inviter != admin) fires.
+        let event = make_pending_join_event(&joiner, joiner_addr, community_id, token);
         let ctx = VerifyContext {
             now_ms: None,
             expected_community_id: community_id,
@@ -10303,7 +10327,112 @@ mod zeb_254_pending_join_verify_tests {
         let result = verify_event(&event, &mat, &ctx);
         assert!(
             matches!(result, Err(VerifyError::PendingJoinTokenInvalid)),
-            "token from non-admin inviter must yield PendingJoinTokenInvalid; got {:?}",
+            "inviter absent from the roster must yield PendingJoinTokenInvalid; got {:?}",
+            result
+        );
+    }
+
+    // ZEB-954: a moderator-minted invite-only invite must be admitted. ZEB-950
+    // relaxed the mint gate and ZEB-911 relaxed accept+countersign to "any
+    // Joined member with power >= invite threshold", but P2 still hard-required
+    // inviter == admin, so every moderator-minted invite-only redemption was
+    // rejected on every replica. This is the RED repro: the moderator is a
+    // Joined, powered member (!= admin) with an enrolled device key, so the
+    // token sig resolves (P5) and admission must now succeed.
+    #[test]
+    fn pending_join_admitted_when_inviter_is_joined_moderator() {
+        let (admin, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (moderator, _mod_pub, moderator_addr) = make_identity(0xa2);
+        let (joiner, _joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        // Token minted by the MODERATOR, not the admin.
+        let token = make_invite_token(
+            &moderator,
+            moderator_addr,
+            Some(joiner_addr),
+            Some(1_700_000_100_000),
+        );
+        let event = make_pending_join_event(&joiner, joiner_addr, community_id, token);
+        // Prior roster: admin bootstrap + moderator as a Joined member with power
+        // >= the invite tier and their enrolled device key present (so P5's
+        // token-sig check resolves against the moderator's key).
+        let mut mat = inviter_prior(&admin, community_id);
+        mat.members.insert(
+            moderator_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: BTreeSet::from([moderator
+                    .device_key
+                    .verifying_key()
+                    .to_bytes()]),
+                revoked_device_keys: BTreeSet::new(),
+            },
+        );
+        mat.power_levels
+            .insert(moderator_addr, POWER_THRESHOLDS.kick); // 50 >= invite(0)
+        let ctx = VerifyContext {
+            now_ms: None,
+            expected_community_id: community_id,
+            admin_addr, // real admin != moderator
+            is_invite_only: true,
+        };
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(
+            result.is_ok(),
+            "moderator-minted invite-only PendingJoin must be admitted; got {:?}",
+            result
+        );
+    }
+
+    // ZEB-954: the power half of the relaxed P2 is load-bearing. A Joined
+    // inviter whose power is BELOW a community that raised its invite threshold
+    // is still rejected — admission enforces the threshold, not merely
+    // membership. (Guards against over-relaxing P2 to a bare Joined check.)
+    #[test]
+    fn pending_join_rejected_when_inviter_power_below_invite_threshold() {
+        let (admin, _admin_pub, admin_addr) = make_identity(0xa1);
+        let (weak, _weak_pub, weak_addr) = make_identity(0xa2);
+        let (joiner, _joiner_pub, joiner_addr) = make_identity(0xb1);
+        let community_id = SpaceId([7u8; 16]);
+        let token = make_invite_token(&weak, weak_addr, Some(joiner_addr), Some(1_700_000_100_000));
+        let event = make_pending_join_event(&joiner, joiner_addr, community_id, token);
+        let mut mat = inviter_prior(&admin, community_id);
+        mat.members.insert(
+            weak_addr,
+            MemberState {
+                status: MemberStatus::Joined,
+                joined_at: Hlc {
+                    wall_ms: 1,
+                    logical: 0,
+                    device_id: "t".into(),
+                },
+                left_at: None,
+                enrolled_device_keys: BTreeSet::from([weak.device_key.verifying_key().to_bytes()]),
+                revoked_device_keys: BTreeSet::new(),
+            },
+        );
+        // Joined, but power 10 < the community's raised invite threshold of 25.
+        mat.power_levels.insert(weak_addr, 10);
+        mat.power_thresholds = PowerThresholds {
+            invite: 25,
+            ..POWER_THRESHOLDS
+        };
+        let ctx = VerifyContext {
+            now_ms: None,
+            expected_community_id: community_id,
+            admin_addr,
+            is_invite_only: true,
+        };
+        let result = verify_event(&event, &mat, &ctx);
+        assert!(
+            matches!(result, Err(VerifyError::PendingJoinTokenInvalid)),
+            "Joined inviter below the invite threshold must be rejected; got {:?}",
             result
         );
     }
