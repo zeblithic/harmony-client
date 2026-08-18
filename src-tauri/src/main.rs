@@ -441,8 +441,11 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            // ZEB-901: same QADv6 IPv6-probe suppression as the GUI/serve
+            // subscriber; shared const so the directive lives in one place.
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(harmony_app::DEFAULT_ENV_FILTER)
+            }),
         )
         .try_init();
 }
