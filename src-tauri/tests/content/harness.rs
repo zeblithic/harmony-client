@@ -37,6 +37,11 @@ use harmony_runtime::{NodeConfig, NodeRuntime};
 pub struct TestHarness {
     pub ingest_tx: mpsc::Sender<IngestRequest>,
     pub verb_tx: mpsc::Sender<ContentVerbRequest>,
+    /// ZEB-945: a clone of the fetch-completion sender the event loop consumes.
+    /// Exposed so a test can synthetically inject a completion signal (the
+    /// `fetch_complete_arm_pins_root_in_intent` site); the loop still owns the
+    /// receiver, so the other consumers simply ignore this handle.
+    pub fetch_completion_tx: mpsc::Sender<[u8; 32]>,
     _shutdown_tx: watch::Sender<bool>,
     _tmp: tempfile::TempDir,
     runtime_thread: Option<std::thread::JoinHandle<()>>,
@@ -74,12 +79,32 @@ impl Drop for TestHarness {
 /// All error paths panic (never returns `None`) so a real start failure is a
 /// loud test failure, not a silent skip (the ZEB-165 / ZEB-420 anti-false-green
 /// invariant).
+///
+/// The event loop starts with an empty `pin_intent`; use
+/// [`spawn_test_runtime_with_pins`] when a test needs a root pre-seeded (ZEB-945).
 pub async fn spawn_test_runtime(label: &str) -> TestHarness {
+    spawn_test_runtime_with_pins(label, std::collections::HashSet::new()).await
+}
+
+/// Like [`spawn_test_runtime`], but seeds the event loop's `pin_intent` with
+/// `initial_pins` — the set of root CIDs the node already intends to pin. The
+/// fetch-completion arm only runs the pin cascade for CIDs it finds in this set,
+/// so a test that injects a completion via [`TestHarness::fetch_completion_tx`]
+/// must seed the corresponding CID here first (ZEB-945:
+/// `fetch_complete_arm_pins_root_in_intent`).
+pub async fn spawn_test_runtime_with_pins(
+    label: &str,
+    initial_pins: std::collections::HashSet<[u8; 32]>,
+) -> TestHarness {
     let tmp = tempdir().unwrap();
     let app_data_dir = tmp.path().to_path_buf();
 
     let (ingest_tx, ingest_rx) = mpsc::channel::<IngestRequest>(8);
-    let (verb_tx, content_verb_rx) = mpsc::channel::<ContentVerbRequest>(32);
+    // ZEB-945: verb buffer 64 (was 32) so the rapid_pin_unpin site — the one
+    // runtime test that deliberately used 64 — converts onto this harness. A
+    // bigger buffer only relaxes backpressure on these functional (not
+    // backpressure) tests, so it's safe for the move/rename/folder sites too.
+    let (verb_tx, content_verb_rx) = mpsc::channel::<ContentVerbRequest>(64);
     let (_publish_tx, publish_rx) = mpsc::channel(4);
     let (_fetch_tx, fetch_rx) = mpsc::channel(4);
     let (_follow_tx, follow_rx) = mpsc::channel(4);
@@ -138,7 +163,10 @@ pub async fn spawn_test_runtime(label: &str) -> TestHarness {
     };
 
     let (fetch_completion_tx, fetch_completion_rx) = mpsc::channel::<[u8; 32]>(4);
-    let pin_intent: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    // ZEB-945: keep a clone for the returned TestHarness; the original is moved
+    // into run() below (the loop owns both ends of this channel otherwise).
+    let fetch_completion_tx_for_harness = fetch_completion_tx.clone();
+    let pin_intent: std::collections::HashSet<[u8; 32]> = initial_pins;
 
     // `label` is a borrow, but the runtime thread's closure is `'static`; move an
     // owned copy in for the build-failure message.
@@ -284,6 +312,7 @@ pub async fn spawn_test_runtime(label: &str) -> TestHarness {
     TestHarness {
         ingest_tx,
         verb_tx,
+        fetch_completion_tx: fetch_completion_tx_for_harness,
         _shutdown_tx: shutdown_tx,
         _tmp: tmp,
         runtime_thread: Some(runtime_thread),
