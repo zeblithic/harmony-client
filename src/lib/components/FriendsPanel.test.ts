@@ -839,3 +839,81 @@ describe('FriendsPanel — friend request accept (ZEB-694 Task B5)', () => {
     expect(queryByTestId(`friend-name-${ownerIdHex}`)).toBeNull();
   });
 });
+
+// ── ZEB-960: the label ladders here use `||` (which already drops "") but a
+// whitespace-only name is truthy and survives — masking a valid card name and
+// rendering a blank label. nonEmpty() closes that hole on every rung. ──
+describe('FriendsPanel — ZEB-960 whitespace name ladder', () => {
+  const ID = (b: string) => b.repeat(32); // 16-byte owner_id = 32 hex chars
+
+  it('a whitespace nickname no longer masks the card name', async () => {
+    const id = ID('a');
+    const friends = [
+      { ownerIdHex: id, display: null, nickname: '   ', status: 'active', establishedVia: 'mutual_key', referrable: false },
+    ];
+    const service = mockService({ listFriends: vi.fn().mockResolvedValue(friends) });
+    const cards = mockCards({ [id]: { displayName: 'CardName' } });
+    const { findByTestId, getByTestId } = render(FriendsPanel, {
+      props: { service, resolveCard: cards.resolveCard },
+    });
+    await findByTestId('friend-list');
+    expect(getByTestId(`friend-name-${id}`).textContent).toBe('CardName');
+  });
+
+  it('a whitespace display hint with no card falls to the short hex, not blank', async () => {
+    const id = ID('b');
+    const friends = [
+      { ownerIdHex: id, display: '   ', nickname: null, status: 'active', establishedVia: 'token', referrable: false },
+    ];
+    const service = mockService({ listFriends: vi.fn().mockResolvedValue(friends) });
+    const { findByTestId, getByTestId } = render(FriendsPanel, { props: { service } });
+    await findByTestId('friend-list');
+    expect(getByTestId(`friend-name-${id}`).textContent).toContain('bbbbbbbbbbbb');
+  });
+
+  it('a pending request with a whitespace display hint falls to the short hex', async () => {
+    const id = ID('c');
+    const pending = [{ ownerIdHex: id, display: '   ', receivedAtMs: 0, introducedBy: null }];
+    const service = mockService({ listPendingRequests: vi.fn().mockResolvedValue(pending) });
+    const { findByTestId, getByTestId } = render(FriendsPanel, { props: { service } });
+    await findByTestId('pending-list');
+    expect(getByTestId(`friend-name-${id}`).textContent).toContain('cccccccccccc');
+  });
+
+  it('a referral with a whitespace display shows the short hex, not blank', async () => {
+    const via = ID('a');
+    const target = ID('d');
+    const friends = [
+      { ownerIdHex: via, display: 'Alice', status: 'active', establishedVia: 'mutual_key', referrable: true },
+    ];
+    const browseReferrals = vi.fn().mockResolvedValue([
+      { ownerIdHex: target, display: '   ', alreadyFriend: false },
+    ]);
+    const service = mockService({
+      listFriends: vi.fn().mockResolvedValue(friends),
+      browseReferrals,
+    });
+    const { findByTestId, getByTestId } = render(FriendsPanel, { props: { service } });
+    await findByTestId('friend-list');
+    await fireEvent.click(getByTestId('browse-referrals-btn'));
+    const list = await findByTestId('referrals-list');
+    expect(list.textContent).toContain('dddddddddddd');
+  });
+
+  it('the add-by-key connected toast falls to the short hex for a whitespace display', async () => {
+    const PEER = 'ab'.repeat(64); // 128 hex chars
+    const linkedId = ID('e');
+    const addByKey = vi
+      .fn()
+      .mockResolvedValue({ kind: 'linked', ownerIdHex: linkedId, display: '   ' });
+    const service = mockService({ addByKey });
+    const { getByTestId, findByTestId } = render(FriendsPanel, { props: { service } });
+    await findByTestId('friends-panel');
+
+    await fireEvent.input(getByTestId('add-by-key-input'), { target: { value: PEER } });
+    await fireEvent.click(getByTestId('add-by-key-btn'));
+    await vi.waitFor(() =>
+      expect(getByTestId('add-by-key-status').textContent).toContain('eeeeeeeeeeee'),
+    );
+  });
+});

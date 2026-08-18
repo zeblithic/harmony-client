@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { FileGrant } from '../types';
   import Avatar from './Avatar.svelte';
+  import { nonEmpty } from '../display-label';
+  import { shortAddr } from '../short-addr';
 
   let {
     grants,
@@ -26,6 +28,10 @@
     onRevoke: (address: string) => Promise<void>;
   } = $props();
 
+  // A grantee's card displayName has no non-blank publish constraint, so it can
+  // be "" / "   ". Guard every name with nonEmpty() and fall back to the shared
+  // shortAddr (ZEB-607) — never a blank label, and never the full untruncated
+  // address.
   let grantedAddresses = $derived(new Set((grants ?? []).map((g) => g.granteeAddress)));
   let pickableFriends = $derived(
     availableFriends.filter((f) => !grantedAddresses.has(f.address)),
@@ -113,16 +119,16 @@
           <li class="peer-row">
             <Avatar
               address={grant.granteeAddress}
-              displayName={grant.displayName ?? grant.granteeAddress}
+              displayName={nonEmpty(grant.displayName) ?? shortAddr(grant.granteeAddress)}
               size={28}
             />
-            <span class="peer-name">{grant.displayName ?? grant.granteeAddress}</span>
+            <span class="peer-name">{nonEmpty(grant.displayName) ?? shortAddr(grant.granteeAddress)}</span>
             <span class="peer-role">can view</span>
             <span class="peer-icon" aria-hidden="true">&#x1F513;</span>
             <button
               type="button"
               class="remove-btn"
-              aria-label="Revoke {grant.displayName ?? grant.granteeAddress}"
+              aria-label="Revoke {nonEmpty(grant.displayName) ?? shortAddr(grant.granteeAddress)}"
               disabled={revokePending === grant.granteeAddress}
               onclick={() => handleRevoke(grant.granteeAddress)}
             >
@@ -153,7 +159,7 @@
         >
           <option value="" disabled selected>Share with...</option>
           {#each pickableFriends as friend (friend.address)}
-            <option value={friend.address}>{friend.displayName ?? friend.address}</option>
+            <option value={friend.address}>{nonEmpty(friend.displayName) ?? shortAddr(friend.address)}</option>
           {/each}
         </select>
       </div>

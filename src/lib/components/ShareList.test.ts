@@ -169,3 +169,39 @@ describe('ShareList', () => {
     expect(screen.queryByText('Alice')).toBeNull();
   });
 });
+
+// ── ZEB-960: never render a blank label or leak the full grantee address ──
+//
+// A grantee's card displayName has no non-blank constraint at publish, so a
+// peer can carry displayName = "" / "   ". The old `displayName ?? address`
+// rendered a whitespace name as the label (blank) and — for a null name — the
+// FULL untruncated address. The ladder now guards with nonEmpty() and falls
+// back to a truncated short id.
+describe('ShareList — ZEB-960 name ladder', () => {
+  // Long enough (>16 chars) that the shared shortAddr (ZEB-607: first 8 + '…' +
+  // last 4) truncates, so the full-address leak is visibly distinct.
+  const LONG = 'deadbeefcafe0011223344';
+  const SHORT = 'deadbeef…3344';
+
+  it('renders the short id (not a blank label) for a whitespace-only grant name', () => {
+    renderShareList({ grants: [{ granteeAddress: LONG, displayName: '   ', grantedAt: 1 }] });
+    expect(screen.getByText(SHORT)).toBeTruthy();
+    // The revoke control names the peer by the same short id, never a blank.
+    expect(screen.getByRole('button', { name: `Revoke ${SHORT}` })).toBeTruthy();
+  });
+
+  it('truncates the fallback for a null grant name instead of leaking the full address', () => {
+    renderShareList({ grants: [{ granteeAddress: LONG, displayName: null, grantedAt: 1 }] });
+    expect(screen.getByText(SHORT)).toBeTruthy();
+    // The full untruncated address must NOT appear anywhere.
+    expect(screen.queryByText(LONG)).toBeNull();
+  });
+
+  it('shows the short id (not a blank option) for a whitespace-only picker friend', () => {
+    renderShareList({ grants: [], availableFriends: [{ address: LONG, displayName: '   ' }] });
+    const select = screen.getByLabelText('Share with...') as HTMLSelectElement;
+    const texts = Array.from(select.options).map((o) => o.text);
+    expect(texts).toContain(SHORT);
+    expect(texts).not.toContain(LONG);
+  });
+});

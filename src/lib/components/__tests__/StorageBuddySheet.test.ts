@@ -212,4 +212,34 @@ describe('StorageBuddySheet', () => {
     expect(slider.max).toBe('40');
     expect(slider.value).toBe('40');
   });
+
+  // ── ZEB-960: petName and card displayName have no non-blank publish
+  // constraint; a whitespace value must fall through to the short address, not
+  // render a blank buddy name / invite candidate. ──
+  describe('ZEB-960 name ladder', () => {
+    it('falls through a whitespace petName AND whitespace card name to the short address', () => {
+      render(StorageBuddySheet, {
+        props: props({
+          buddies: [buddy({ ownerAddress: ADDR_B, petName: '   ', status: 'active' })],
+          friendContacts: new Map<string, Profile>([
+            [ADDR_B, { address: ADDR_B, displayName: '   ' } as Profile],
+          ]),
+        }),
+      });
+      // ADDR_B = 'bb'.repeat(16) → shortAddr = 'bbbbbb…bbbb'
+      expect(screen.getByTestId(`buddy-row-${ADDR_B}`).textContent).toContain('bbbbbb…bbbb');
+    });
+
+    it('lists a whitespace-displayName invite candidate by its short address', () => {
+      render(StorageBuddySheet, {
+        props: props({
+          friendContacts: new Map<string, Profile>([
+            [ADDR_F, { address: ADDR_F, displayName: '   ' } as Profile],
+          ]),
+        }),
+      });
+      // ADDR_F = 'ff'.repeat(16) → shortAddr = 'ffffff…ffff'
+      expect(screen.getByTestId(`invite-candidate-${ADDR_F}`).textContent).toContain('ffffff…ffff');
+    });
+  });
 });
