@@ -6,6 +6,11 @@
   import { formatMailRecency, type TimeFormatPrefs } from '../time-format';
   import { timeFormatPrefs } from '../time-format-service';
   import { dayClock } from '../day-clock';
+  // ZEB-961: resolve the sender owner_id to its broadcast card name when
+  // available, else the shared short-hex (first8…) — no local shortAddr copy.
+  import { nonEmpty } from '../display-label';
+  import { shortId } from '../short-addr';
+  import type { ResolvedCard } from '../member-card-service';
 
   let {
     entries = [],
@@ -14,6 +19,7 @@
     selectedCid = null,
     syncState = 'idle',
     syncError = null,
+    resolveCard,
     onRefresh,
     onSelectEmail,
     onFolderChange,
@@ -27,6 +33,7 @@
     selectedCid: string | null;
     syncState?: 'idle' | 'syncing' | 'error';
     syncError?: string | null;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
     onRefresh?: () => void;
     onSelectEmail?: (cid: string) => void;
     onFolderChange?: (folder: MailFolderKind) => void;
@@ -53,10 +60,6 @@
     return formatMailRecency(timestamp * 1000, now, prefs);
   }
 
-  function shortAddr(addr: string): string {
-    if (addr.length <= 8) return addr;
-    return addr.slice(0, 8) + '...';
-  }
 </script>
 
 <div class="mail-inbox">
@@ -123,7 +126,7 @@
             onSelectEmail?.(entry.messageCid);
           }}
         >
-          <span class="mail-sender">{shortAddr(entry.senderAddress)}</span>
+          <span class="mail-sender">{nonEmpty(resolveCard?.(entry.senderAddress)?.displayName) ?? shortId(entry.senderAddress)}</span>
           <span class="mail-subject">{entry.subjectSnippet || '(no subject)'}</span>
           <span class="mail-time">{formatTime(entry.timestamp, $dayClock, $timeFormatPrefs)}</span>
           <div class="mail-actions">

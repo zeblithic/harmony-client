@@ -1,17 +1,24 @@
 <script lang="ts">
   import { fly } from 'svelte/transition';
   import type { PendingDmInviteDto } from '../dm-invite-service';
+  // ZEB-961: resolve the inviter's broadcast card name when available (a
+  // non-friend inviter can still have published a profile card), else short hex.
+  import { nonEmpty } from '../display-label';
+  import { shortId } from '../short-addr';
+  import type { ResolvedCard } from '../member-card-service';
 
   let {
     invite,
     onAccept,
     onDecline,
     onLater,
+    resolveCard,
   }: {
     invite: PendingDmInviteDto;
     onAccept: () => void | Promise<void>;
     onDecline: () => void | Promise<void>;
     onLater: () => void;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
 
   // Map the SpaceKind wire tag ('d'/'g') to a human label; fall back to the
@@ -61,7 +68,7 @@
   >
     <div class="invite-info">
       <span class="invite-title">DM invite</span>
-      <span class="invite-body">From {invite.inviterOwnerIdHex.slice(0, 8)}… ({kindLabel(invite.kind)})</span>
+      <span class="invite-body">From {nonEmpty(resolveCard?.(invite.inviterOwnerIdHex)?.displayName) ?? shortId(invite.inviterOwnerIdHex)} ({kindLabel(invite.kind)})</span>
     </div>
     <div class="invite-actions">
       <button

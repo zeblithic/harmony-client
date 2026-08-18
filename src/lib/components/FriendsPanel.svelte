@@ -1212,7 +1212,7 @@
               <span
                 class="friend-name"
                 data-testid="dm-invite-inviter-{invite.spaceIdHex}"
-              >{invite.inviterOwnerIdHex.slice(0, 8)}…</span>
+              >{cardName(invite.inviterOwnerIdHex) ?? shortId(invite.inviterOwnerIdHex)}</span>
               <span class="friend-addr">{dmInviteKindLabel(invite.kind)} · {relativeTime(invite.receivedAtMs)}</span>
             </div>
             <div class="request-actions">

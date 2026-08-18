@@ -4031,6 +4031,7 @@
          transition when the queue head changes. -->
     <DmInviteToast
       invite={dmInviteQueue[0]}
+      {resolveCard}
       onAccept={() => handleDmInviteAccept(dmInviteQueue[0].spaceIdHex)}
       onDecline={() => handleDmInviteDecline(dmInviteQueue[0].spaceIdHex)}
       onLater={() => {
@@ -4453,6 +4454,7 @@
         selectedCid={selectedMailCid}
         syncState={mailSyncState}
         syncError={mailSyncError}
+        {resolveCard}
         onRefresh={() => { mailService.refresh().catch(() => {}); }}
         onSelectEmail={async (cid) => {
           selectedMailCid = cid;
@@ -4501,6 +4503,7 @@
       message={selectedMailDetail}
       loading={mailDetailLoading}
       error={mailDetailError}
+      {resolveCard}
       onReply={(_cid, msgId) => {
         composeReplyTo = msgId;
         composeInitialTo = selectedMailDetail?.senderAddress ?? '';

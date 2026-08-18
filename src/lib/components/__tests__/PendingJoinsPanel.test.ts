@@ -176,3 +176,70 @@ describe('PendingJoinsPanel', () => {
         });
     });
 });
+
+describe('PendingJoinsPanel display-name resolution (ZEB-961)', () => {
+    const JOINER = 'ab'.repeat(16); // 32-char owner_id hex
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+    });
+
+    function mockPending(hint?: string) {
+        return (cmd: string) => {
+            if (cmd === 'list_pending_joins') {
+                return Promise.resolve([
+                    {
+                        eventId: 'aaa',
+                        joinerAddr: JOINER,
+                        pendingAtHlc: { wallMs: 1_700_000_000_000, logical: 0, deviceId: '00' },
+                        ...(hint ? { inviteeHint: hint } : {}),
+                    },
+                ]);
+            }
+            if (cmd === 'list_recent_counter_signs') return Promise.resolve([]);
+            return Promise.resolve(null);
+        };
+    }
+
+    test('resolves the local nickname OVER card, hint and hex', async () => {
+        const { invoke } = await import('@tauri-apps/api/core');
+        (invoke as any).mockImplementation(mockPending('alice'));
+        const { container } = render(PendingJoinsPanel, {
+            props: {
+                communityId: 'abc',
+                canModerate: true,
+                resolveCard: (id: string) =>
+                    id === JOINER ? { displayName: 'JoinerCard', statusText: '' } : undefined,
+                resolveNickname: (id: string) => (id === JOINER ? 'JoinerNick' : undefined),
+            },
+        });
+        await waitFor(() =>
+            expect(container.querySelector('.joiner')?.textContent).toBe('JoinerNick'),
+        );
+    });
+
+    test('honors the inviteeHint (roster rung) when no card/nickname resolves', async () => {
+        const { invoke } = await import('@tauri-apps/api/core');
+        (invoke as any).mockImplementation(mockPending('alice'));
+        const { container } = render(PendingJoinsPanel, {
+            props: {
+                communityId: 'abc',
+                canModerate: true,
+                resolveCard: () => undefined,
+                resolveNickname: () => undefined,
+            },
+        });
+        await waitFor(() => expect(container.querySelector('.joiner')?.textContent).toBe('alice'));
+    });
+
+    test('falls back to short hex when neither resolver nor hint is present', async () => {
+        const { invoke } = await import('@tauri-apps/api/core');
+        (invoke as any).mockImplementation(mockPending());
+        const { container } = render(PendingJoinsPanel, {
+            props: { communityId: 'abc', canModerate: true },
+        });
+        await waitFor(() =>
+            expect(container.querySelector('.joiner')?.textContent).toBe(JOINER.slice(0, 8)),
+        );
+    });
+});

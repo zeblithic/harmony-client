@@ -2,6 +2,10 @@
   import { onMount, onDestroy } from 'svelte';
   import { PairingService, extractError, type PairingState } from '../pairing-service';
   import Modal from './Modal.svelte';
+  // ZEB-961: format the inviter owner-hex through the shared short-id helper.
+  // Justified hex: pre-enrollment device discovery has no card/nickname source,
+  // and the peer's displayName is already shown alongside.
+  import { shortId } from '../short-addr';
 
   // `onComplete` (optional) fires only when enrollment reaches the terminal
   // `complete` state, distinct from `onClose` (which also fires on cancel /
@@ -114,7 +118,7 @@
           <button class="peer-row" onclick={() => handleSelectPeer(peer.sessionId)}>
             <strong>{peer.displayName}</strong>
             {#if peer.ownerIdIfInviter}
-              <span class="owner-id">owner {peer.ownerIdIfInviter.slice(0, 8)}…</span>
+              <span class="owner-id">owner {shortId(peer.ownerIdIfInviter)}</span>
             {/if}
           </button>
         </li>

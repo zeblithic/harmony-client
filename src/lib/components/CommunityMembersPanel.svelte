@@ -325,7 +325,7 @@
         >&times;</button>
       </p>
     {/if}
-    <RecentActionsBadge events={recentEvents} />
+    <RecentActionsBadge events={recentEvents} {resolveCard} {resolveNickname} />
     <ul class="member-list" role="list" aria-label="Active members">
       {#each joined as member (member.address)}
         <MemberRow
