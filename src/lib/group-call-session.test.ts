@@ -290,6 +290,58 @@ describe('GroupCallSession signaling + roster', () => {
   });
 });
 
+// ZEB-958 ────────────────────────────────────────────────────────────────────
+// Participant names must climb the nickname → card ladder with a nonEmpty guard,
+// not read card.displayName raw (which shows hex over a known nickname, and
+// renders a whitespace-only published card name as a blank tile label).
+describe('GroupCallSession participant name ladder (ZEB-958)', () => {
+  it('resolves a live participant name via the nickname over the card displayName', async () => {
+    const d = makeDeps({
+      resolveCard: (h: string) => (h === ALICE ? { displayName: 'AliceCard' } : undefined),
+      resolveNickname: (h: string) => (h === ALICE ? 'Ziggy' : undefined),
+    });
+    const s = new GroupCallSession(d.deps);
+    await s.joinActive('c1'.repeat(16), 'space-1');
+    s.onPresenceChanged('c1'.repeat(16), [
+      { owner: SELF_OWNER, device: SELF_DEVICE, muted: true },
+      { owner: ALICE, device: ALICE_DEVICE, muted: false },
+    ]);
+    const alice = get(s.state).participants.find((p) => p.ownerHex === ALICE);
+    expect(alice?.displayName).toBe('Ziggy');
+  });
+
+  it('resolves a ringing (non-live) member name through the ladder too', async () => {
+    const d = makeDeps({
+      resolveCard: (h: string) => (h === BOB ? { displayName: 'BobCard' } : undefined),
+      resolveNickname: (h: string) => (h === BOB ? 'BobNick' : undefined),
+    });
+    const s = new GroupCallSession(d.deps);
+    await s.joinActive('c1'.repeat(16), 'space-1');
+    // Only self is live; BOB is a member with no beacon ⇒ a ringing row.
+    s.onPresenceChanged('c1'.repeat(16), [
+      { owner: SELF_OWNER, device: SELF_DEVICE, muted: true },
+    ]);
+    const bob = get(s.state).participants.find((p) => p.ownerHex === BOB);
+    expect(bob?.state).toBe('ringing');
+    expect(bob?.displayName).toBe('BobNick');
+  });
+
+  it('leaves displayName undefined when the published card name is whitespace (leaf hex applies)', async () => {
+    const d = makeDeps({
+      resolveCard: (h: string) => (h === ALICE ? { displayName: '   ' } : undefined),
+      resolveNickname: () => undefined,
+    });
+    const s = new GroupCallSession(d.deps);
+    await s.joinActive('c1'.repeat(16), 'space-1');
+    s.onPresenceChanged('c1'.repeat(16), [
+      { owner: SELF_OWNER, device: SELF_DEVICE, muted: true },
+      { owner: ALICE, device: ALICE_DEVICE, muted: false },
+    ]);
+    const alice = get(s.state).participants.find((p) => p.ownerHex === ALICE);
+    expect(alice?.displayName).toBeUndefined();
+  });
+});
+
 // 2 ────────────────────────────────────────────────────────────────────────────
 describe('GroupCallSession ring timeout', () => {
   let d: ReturnType<typeof makeDeps>;

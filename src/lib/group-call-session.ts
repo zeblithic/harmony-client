@@ -17,6 +17,7 @@ import { OpusCodec } from './voice/opus-codec';
 import { Codec2Codec } from './voice/codec2-codec';
 import type { CodecType } from './voice/voice-codec';
 import { followAudioDevices, type DeviceFollowerDeps } from './voice/audio-device-follower';
+import { resolveMemberName } from './display-label';
 
 export type GroupCallPhase = 'idle' | 'incoming' | 'connecting' | 'active' | 'leaving';
 
@@ -67,6 +68,8 @@ export interface GroupCallSessionDeps {
   /** ZEB-359: device preference source. Absent ⇒ system defaults, no following. */
   audioDevices?: DeviceFollowerDeps['prefs'];
   resolveCard?: (ownerHex: string) => { displayName?: string; avatarUrl?: string } | undefined;
+  /** Friend nickname resolver — the top rung of the name ladder (ZEB-958). */
+  resolveNickname?: (ownerHex: string) => string | undefined;
   /** Resolve a group DM space → its full member owner-hex list (drives the
    *  ringing/declined rows that have no live beacon yet). */
   resolveMembers?: (spaceId: string) => string[];
@@ -253,16 +256,18 @@ export class GroupCallSession {
         ? (!this.muted && !this.deafened && this.lastSelfSpeaking)
         : (this.receiver?.isSpeaking(r.deviceHex.slice(0, 32)) ?? false);
       const card = this.deps.resolveCard?.(r.ownerHex);
+      const displayName = resolveMemberName(this.deps.resolveNickname?.(r.ownerHex), card?.displayName);
       out.push({ ownerHex: r.ownerHex, deviceHex: r.deviceHex, muted: r.muted, speaking, state: 'in-call',
-        ...(card?.displayName ? { displayName: card.displayName } : {}),
+        ...(displayName ? { displayName } : {}),
         ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}) });
     }
     for (const ownerHex of members) {
       if (live.has(ownerHex) || ownerHex === this.deps.selfOwnerHex) continue;
       const card = this.deps.resolveCard?.(ownerHex);
+      const displayName = resolveMemberName(this.deps.resolveNickname?.(ownerHex), card?.displayName);
       out.push({ ownerHex, deviceHex: '', muted: true, speaking: false,
         state: this.declinedOwners.has(ownerHex) ? 'declined' : 'ringing',
-        ...(card?.displayName ? { displayName: card.displayName } : {}),
+        ...(displayName ? { displayName } : {}),
         ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}) });
     }
     this.patch({ participants: out });

@@ -22,6 +22,7 @@ import { OpusCodec } from './voice/opus-codec';
 import { Codec2Codec } from './voice/codec2-codec';
 import type { CodecType } from './voice/voice-codec';
 import { followAudioDevices, type DeviceFollowerDeps } from './voice/audio-device-follower';
+import { resolveMemberName } from './display-label';
 
 export type CallPhase =
   | 'idle'
@@ -35,6 +36,13 @@ export interface CallSessionState {
   phase: CallPhase;
   callId: string | null;
   peerOwnerHex: string | null;
+  /**
+   * The peer's name resolved through the `nickname → card` ladder (ZEB-958),
+   * or `null` when neither yields a non-blank name (the in-call bar then renders
+   * its own hex short-id). Only the callee side carries a peer here — the caller
+   * side leaves `peerOwnerHex`/`peerDisplayName` null and shows "In call".
+   */
+  peerDisplayName: string | null;
   muted: boolean;
   pttMode: boolean;
   pttHeld: boolean;
@@ -79,6 +87,8 @@ export interface CallSessionDeps {
   audioDevices?: DeviceFollowerDeps['prefs'];
   /** Resolve an owner hex → { displayName, avatarUrl } for the call UI (optional). */
   resolveCard?: (ownerHex: string) => { displayName?: string; avatarUrl?: string } | undefined;
+  /** Friend nickname resolver — the top rung of the name ladder (ZEB-958). */
+  resolveNickname?: (ownerHex: string) => string | undefined;
   /**
    * ZEB-357: fired once per call at its terminal transition, ONLY when this
    * side placed the call (single-writer rule — the caller observes every
@@ -92,6 +102,7 @@ const INITIAL: CallSessionState = {
   phase: 'idle',
   callId: null,
   peerOwnerHex: null,
+  peerDisplayName: null,
   muted: true,
   pttMode: false,
   pttHeld: false,
@@ -202,7 +213,7 @@ export class CallSession {
     this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
     this.vad.reset();
     this.patch({
-      phase: 'ringingOut', callId, peerOwnerHex: null,
+      phase: 'ringingOut', callId, peerOwnerHex: null, peerDisplayName: null,
       muted: true, deafened: false, pttMode: false, pttHeld: false,
       startedAt: null, endReason: null,
     });
@@ -241,6 +252,7 @@ export class CallSession {
     this.spaceId = spaceId;
     this.patch({
       phase: 'incoming', callId, peerOwnerHex: callerOwnerHex,
+      peerDisplayName: resolveMemberName(this.deps.resolveNickname?.(callerOwnerHex), this.deps.resolveCard?.(callerOwnerHex)?.displayName) ?? null,
       muted: true, deafened: false, pttMode: false, pttHeld: false,
       startedAt: null, endReason: null,
     });

@@ -44,7 +44,7 @@
 
 {#if $callState?.phase === 'active' || $callState?.phase === 'connecting'}
   <div class="call-bar" data-testid="call-bar">
-    <span class="peer-label">{peerLabel($callState?.peerOwnerHex)}</span>
+    <span class="peer-label">{$callState?.peerDisplayName ?? peerLabel($callState?.peerOwnerHex)}</span>
     <time class="elapsed">{fmtElapsed($callState?.startedAt)}</time>
     {#if $callState?.reconnecting}
       <!-- ZEB-353: the inbound DM media subscriber dropped and is re-declaring

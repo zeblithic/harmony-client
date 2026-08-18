@@ -180,6 +180,44 @@ describe('VoiceSession lifecycle + gate', () => {
     expect(roster[1].muted).toBe(true);
   });
 
+  // ZEB-958 — channel-voice roster names must climb nickname → card with a
+  // nonEmpty guard, not read card.displayName raw.
+  it('resolves a roster name via the nickname over the card displayName', async () => {
+    const PEER = 'cc'.repeat(16);
+    const s = new VoiceSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      resolveCard: (h: string) => (h === PEER ? { displayName: 'PeerCard' } : undefined),
+      resolveNickname: (h: string) => (h === PEER ? 'Ziggy' : undefined),
+      ...d.factories,
+    });
+    await s.join('comm', 'chan');
+    d.emit('voice-presence-changed', {
+      community: 'comm', channel: 'chan',
+      roster: [{ owner: PEER, device: 'dd'.repeat(16), muted: false }],
+    });
+    expect(get(s.state).roster.find((m) => m.ownerHex === PEER)?.displayName).toBe('Ziggy');
+  });
+
+  it('leaves a roster displayName undefined for a whitespace-only published card name', async () => {
+    const PEER = 'cc'.repeat(16);
+    const s = new VoiceSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      resolveCard: (h: string) => (h === PEER ? { displayName: '   ' } : undefined),
+      resolveNickname: () => undefined,
+      ...d.factories,
+    });
+    await s.join('comm', 'chan');
+    d.emit('voice-presence-changed', {
+      community: 'comm', channel: 'chan',
+      roster: [{ owner: PEER, device: 'dd'.repeat(16), muted: false }],
+    });
+    expect(get(s.state).roster.find((m) => m.ownerHex === PEER)?.displayName).toBeUndefined();
+  });
+
   it('ignores presence for a different channel', async () => {
     const s = newSession();
     await s.join('comm', 'chan');

@@ -10,6 +10,7 @@ import { OpusCodec } from './voice/opus-codec';
 import { Codec2Codec } from './voice/codec2-codec';
 import type { CodecType } from './voice/voice-codec';
 import { followAudioDevices, type DeviceFollowerDeps } from './voice/audio-device-follower';
+import { resolveMemberName } from './display-label';
 
 export type SessionPhase = 'idle' | 'joining' | 'connected' | 'leaving';
 
@@ -167,6 +168,8 @@ export interface VoiceSessionDeps {
   audioDevices?: DeviceFollowerDeps['prefs'];
   /** Resolve an owner hex → { displayName, avatarUrl } for tiles (optional). */
   resolveCard?: (ownerHex: string) => { displayName?: string; avatarUrl?: string } | undefined;
+  /** Friend nickname resolver — the top rung of the name ladder (ZEB-958). */
+  resolveNickname?: (ownerHex: string) => string | undefined;
   /** Subscribe/refresh member cards for visible roster owners (optional). */
   onRosterOwners?: (ownerHexes: string[]) => void;
 }
@@ -686,6 +689,7 @@ export class VoiceSession {
           ? (!this.muted && !this.deafened && this.lastSelfSpeaking)
           : (this.receiver?.isSpeaking(r.deviceHex.slice(0, 32)) ?? false);
         const card = this.deps.resolveCard?.(r.ownerHex);
+        const displayName = resolveMemberName(this.deps.resolveNickname?.(r.ownerHex), card?.displayName);
         return {
           ownerHex: r.ownerHex, deviceHex: r.deviceHex, muted: r.muted, speaking,
           modMuted: this.modMutedOwners.has(r.ownerHex),
@@ -693,7 +697,7 @@ export class VoiceSession {
           handRaisedAt: r.handRaisedAt,
           handFirstObservedMs: r.handFirstObservedMs,
           invited: this.invitedOwners.has(r.ownerHex),
-          ...(card?.displayName ? { displayName: card.displayName } : {}),
+          ...(displayName ? { displayName } : {}),
           ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
         } as RosterMember;
       });

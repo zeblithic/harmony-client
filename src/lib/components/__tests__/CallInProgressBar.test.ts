@@ -11,6 +11,7 @@ function fakeSession(stateOverrides: Partial<CallSessionState> = {}) {
     phase: 'idle',
     callId: null,
     peerOwnerHex: null,
+    peerDisplayName: null,
     muted: true,
     pttMode: false,
     pttHeld: false,
@@ -104,6 +105,27 @@ describe('CallInProgressBar', () => {
     render(CallInProgressBar, { props: { session: session as never, onEnd } });
     await fireEvent.click(screen.getByRole('button', { name: /end call/i }));
     expect(onEnd).toHaveBeenCalled();
+  });
+
+  // ZEB-958 — the in-call bar prefers the resolved peer name over raw hex.
+  it('renders the resolved peer name when peerDisplayName is set', () => {
+    const session = fakeSession({
+      phase: 'active', startedAt: Date.now(),
+      peerOwnerHex: 'abcdef'.repeat(5) + 'ab', peerDisplayName: 'Ziggy',
+    });
+    render(CallInProgressBar, { props: { session: session as never, onEnd: vi.fn() } });
+    expect(screen.getByText('Ziggy')).toBeInTheDocument();
+    // The hex short-id must NOT also show once a name resolved.
+    expect(screen.queryByText(/abcdef…/)).toBeNull();
+  });
+
+  it('falls back to the hex short-id when peerDisplayName is absent', () => {
+    const session = fakeSession({
+      phase: 'active', startedAt: Date.now(),
+      peerOwnerHex: 'abcdef'.repeat(5) + 'ab', peerDisplayName: null,
+    });
+    render(CallInProgressBar, { props: { session: session as never, onEnd: vi.fn() } });
+    expect(screen.getByText('abcdef…')).toBeInTheDocument();
   });
 
   it('shows a Reconnecting… badge while reconnecting (ZEB-353)', () => {
