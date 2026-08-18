@@ -531,6 +531,89 @@ async fn zeb911_witness_accepts_and_countersigns_pending_join() {
     );
 }
 
+/// ZEB-954 e2e: a MODERATOR-minted invite-only invite — its token `inviter` a
+/// Joined, non-admin member (the witness), NOT the admin — converges all the
+/// way to `Joined` through the witness auto-countersign path. This is the
+/// convergence that does NOT need the cold-publish fast-path: admission runs
+/// against the receiving member's OWN full materialized state (`verify_event`
+/// P2/P5), where the inviter's Joined + invite-power status and token signature
+/// are authoritative and cannot be omitted. Pre-ZEB-954, P2 hard-required
+/// `inviter == admin`, so this joiner's PendingJoin was rejected at insert and
+/// never committed; the relaxed P2 admits it and the join converges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zeb954_moderator_minted_invite_converges_to_joined_via_witness() {
+    let fx = setup_witness_community().await;
+    let pending_id: EventId = [0x93; 16];
+    // Token minted BY the moderator (the non-admin witness) and attributed to
+    // them as inviter — exactly the case the old admin-only P2 rejected.
+    let packet = fx.joiner_packet(&fx.witness.device_key, fx.witness.owner, pending_id);
+
+    // The receiver is the witness's node; it verifies the moderator-minted token
+    // against its OWN materialized state, commits the joiner's PendingJoin, and
+    // auto-counter-signs.
+    let outbox = outbox_for(fx.witness.owner, 0x64);
+    community_invite::handle_unicast(&fx.registry, &outbox, &fx.crdt_state, packet, None::<&()>)
+        .await
+        .expect("witness must accept a moderator-minted redeem handshake");
+
+    assert!(
+        fx.has_pending_join_from_joiner().await,
+        "the moderator-minted joiner's PendingJoin must commit — P2 admits a Joined non-admin inviter"
+    );
+
+    // Auto-counter-sign is a spawned post-insert hook, so poll rather than sleep.
+    let state = fx
+        .registry
+        .state_for(&fx.community_id)
+        .await
+        .expect("state");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let g = state.lock().await;
+                let found = g.events().any(|e| {
+                    e.actor == fx.witness.owner
+                        && matches!(
+                            &e.kind,
+                            MembershipEventKind::JoinCountersign { target_event_id }
+                            if *target_event_id == pending_id
+                        )
+                });
+                if found {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for the witness's auto-minted JoinCountersign");
+
+    // End-to-end: the moderator-invited joiner materializes Joined — no
+    // admin-authored event about them, no cold-publish bootstrap involved.
+    let events = fx.events().await;
+    let mat = materialize(&events, fx.admin.owner);
+    assert_eq!(
+        mat.members.get(&fx.joiner.owner).map(|m| m.status),
+        Some(MemberStatus::Joined),
+        "moderator-invited joiner must reach Joined via the witness countersign"
+    );
+    // Guard against the token silently attributing to the admin: the committed
+    // PendingJoin must carry the non-admin moderator as its inviter.
+    assert!(
+        events.iter().any(|e| {
+            e.actor == fx.joiner.owner
+                && matches!(
+                    &e.kind,
+                    MembershipEventKind::PendingJoin { invite_token }
+                    if invite_token.inviter == fx.witness.owner
+                        && invite_token.inviter != fx.admin.owner
+                )
+        }),
+        "the joiner's committed PendingJoin must carry the non-admin moderator as inviter"
+    );
+}
+
 /// Eligibility is a membership-state check, not a transport one: a receiver
 /// absent from the community's CRDT is refused with `SelfNotJoined` and commits
 /// nothing, even though the packet itself is fully valid (it is the exact
