@@ -173,6 +173,21 @@ export function contactsFromFriends(friends: FriendDto[]): Map<string, Profile> 
   return contacts;
 }
 
+/**
+ * ZEB-962 (CodeRabbit #709): the personal-nickname map behind `resolveNickname`,
+ * keyed by lowercased owner hex. Only non-blank nicknames are kept — a plain
+ * truthiness filter (`f.nickname`) drops `""` but lets a whitespace-only
+ * nickname into state, which `resolveNickname` would then return verbatim.
+ */
+export function nicknameMapFromFriends(friends: FriendDto[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const f of friends) {
+    const nick = nonEmpty(f.nickname);
+    if (nick !== undefined) map.set(f.ownerIdHex.toLowerCase(), nick);
+  }
+  return map;
+}
+
 export class FriendService {
   /** Listeners notified when the backend emits `friend-list-changed` (a friend
    *  was added or removed, possibly on another device). A registry (not a

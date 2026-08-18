@@ -38,6 +38,24 @@ export function getThreadMeta(messages: Message[]): Map<string, ThreadMetaEntry>
   return meta;
 }
 
+/**
+ * ZEB-962 (CodeRabbit #709): the unique non-self author owner IDs across a feed,
+ * for the `feedAuthors` card-subscription bucket. The feed/media/thread render
+ * sites resolve author cards via `MemberCardService`, which only resolves owners
+ * some bucket has subscribed — community authors are covered by the `community`
+ * bucket and the 1:1 peer by `dm`, but group-chat / non-friend message authors
+ * and thread participants are in neither. The `'self'` sentinel is not an
+ * owner_id (see mention-render) and is excluded.
+ */
+export function feedAuthorOwnerIds(messages: Message[]): string[] {
+  const authors = new Set<string>();
+  for (const m of messages) {
+    const addr = m.sender.address;
+    if (addr && addr !== 'self') authors.add(addr);
+  }
+  return [...authors];
+}
+
 export function groupMessages(messages: Message[]): FeedItem[] {
   const items: FeedItem[] = [];
   let quietBuffer: Message[] = [];
