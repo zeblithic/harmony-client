@@ -289,6 +289,18 @@
   $effect(() => {
     if (groupCallPhase !== 'active') void memberCardService.setBucket('groupCall', []);
   });
+  // ZEB-959 (PR #710 review): subscribe the 1:1 call peer's card for the life of
+  // the call so refreshPeerName() has a card to resolve to. Only the callee side
+  // carries peerOwnerHex (the caller placed the call from an already-open DM whose
+  // peer the `dm` bucket already pins), and it clears to null on call end — so this
+  // bucket holds exactly the incoming caller while the ring/call is live and
+  // releases on idle, without depending on the caller being a bucketed friend or
+  // the DM being open. Mirrors the groupCall bucket; unioned, so it never clobbers
+  // the dm/friends/community subscriptions.
+  const callPeerOwner = $derived($callSessionState?.peerOwnerHex ?? null);
+  $effect(() => {
+    void memberCardService.setBucket('dmCall', callPeerOwner ? [callPeerOwner] : []);
+  });
   // ZEB-959: the call sessions resolve peer names into their own state once — the
   // 1:1 bar at onIncoming, the group roster on presence/decline/speaking events.
   // The App's card + nickname data is async, so a card landing after that point
