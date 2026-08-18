@@ -111,6 +111,9 @@ pub mod address_book_sync;
 pub mod admission_oracle;
 pub mod api;
 mod app_tracing;
+// ZEB-901: re-export the shared default log filter so the binary crate
+// (`main.rs::init_tracing`) can reuse it without the private module being public.
+pub use app_tracing::DEFAULT_ENV_FILTER;
 pub mod avatar_blob_store;
 pub mod backup_state;
 pub mod butler_deposit;

@@ -13,6 +13,20 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
+/// ZEB-901: the fallback log filter used when `RUST_LOG` is unset — `info` plus
+/// a span-directive that suppresses iroh's `QADv6` (QUIC Address Discovery over
+/// IPv6) events at WARN and below. On IPv4-only hosts iroh probes n0 relays'
+/// IPv6 addresses every ~75s, each failing `HostUnreachable`; the WARNs are
+/// benign but bury real warnings during triage. Scoped to the `QADv6` span, so
+/// the v4 paths and every other `noq_udp` send keep full WARN visibility. An
+/// explicit `RUST_LOG` overrides this wholesale — the operator owns it.
+///
+/// Shared by both `EnvFilter` fallback sites (this module's subscriber and
+/// `main.rs::init_tracing`) so the directive lives in exactly one place;
+/// re-exported at the crate root as `harmony_app::DEFAULT_ENV_FILTER` for the
+/// binary crate (`main.rs`), which can't see this private module directly.
+pub const DEFAULT_ENV_FILTER: &str = "info,[QADv6]=error";
+
 /// Pure path join — the profile-aware app-data dir + `/logs`. Split out
 /// from `log_dir` so it can be unit-tested deterministically without
 /// depending on the host's data dir. ZEB-446: delegates to the same
@@ -66,7 +80,8 @@ fn install_subscriber(log_dir: Option<PathBuf>) {
 /// Shared installer body, additionally parameterized on the console target so
 /// `init_serve_tracing` reuses the exact same EnvFilter + file-layer wiring.
 fn install_subscriber_to(log_dir: Option<PathBuf>, console: ConsoleTarget) {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_ENV_FILTER));
 
     // Console always; rolling file when a usable log dir is available.
     let mut layers: Vec<Box<dyn Layer<_> + Send + Sync + 'static>> = Vec::new();
@@ -127,6 +142,26 @@ mod tests {
                 .join("coord")
                 .join("logs")
         );
+    }
+
+    #[test]
+    fn default_env_filter_suppresses_qadv6_probe_noise() {
+        // ZEB-901: the shared default filter must carry the QADv6 span
+        // suppression. `EnvFilter::new` parses lossily (a malformed directive is
+        // silently dropped, not an error), so guard the directive syntax itself
+        // — otherwise a typo would leave the v6-probe WARN spam un-suppressed.
+        assert!(
+            "[QADv6]=error"
+                .parse::<tracing_subscriber::filter::Directive>()
+                .is_ok(),
+            "QADv6 suppression directive must be well-formed"
+        );
+        assert!(
+            DEFAULT_ENV_FILTER.contains("[QADv6]=error"),
+            "default filter must suppress the QADv6 IPv6-probe noise (ZEB-901)"
+        );
+        // The full default string must also build as a filter.
+        let _ = EnvFilter::new(DEFAULT_ENV_FILTER);
     }
 
     #[test]
