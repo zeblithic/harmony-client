@@ -637,7 +637,7 @@
       incomingCall = {
         callId: p.callId,
         spaceId: p.spaceId,
-        callerName: resolveMemberName(p.callerOwner, resolveNickname, resolveCard) ?? p.callerOwner.slice(0, 8),
+        callerName: resolveMemberName(resolveNickname(p.callerOwner), card?.displayName) ?? p.callerOwner.slice(0, 8),
         ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
       };
       // ZEB-356: escalate to the OS if the window is unfocused (no-op if focused).
@@ -667,7 +667,7 @@
     const gst = groupCall ? get(groupCall.state) : null;
     if (gst && gst.phase === 'incoming' && gst.callId === p.callId) {
       const card = resolveCard(p.callerOwner);
-      const name = resolveMemberName(p.callerOwner, resolveNickname, resolveCard) ?? p.callerOwner.slice(0, 8);
+      const name = resolveMemberName(resolveNickname(p.callerOwner), card?.displayName) ?? p.callerOwner.slice(0, 8);
       const groupName = navService.nodes.find((n) => n.id === p.spaceId)?.name ?? 'a group';
       // T13: raise the in-app ring toast (cleared when the group phase leaves
       // 'incoming' via the subscription in buildVoiceSession).

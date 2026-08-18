@@ -252,7 +252,7 @@ export class CallSession {
     this.spaceId = spaceId;
     this.patch({
       phase: 'incoming', callId, peerOwnerHex: callerOwnerHex,
-      peerDisplayName: resolveMemberName(callerOwnerHex, this.deps.resolveNickname, this.deps.resolveCard) ?? null,
+      peerDisplayName: resolveMemberName(this.deps.resolveNickname?.(callerOwnerHex), this.deps.resolveCard?.(callerOwnerHex)?.displayName) ?? null,
       muted: true, deafened: false, pttMode: false, pttHeld: false,
       startedAt: null, endReason: null,
     });
