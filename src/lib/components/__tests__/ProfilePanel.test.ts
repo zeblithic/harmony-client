@@ -125,4 +125,19 @@ describe('ProfilePanel', () => {
     expect(resolve).not.toHaveBeenCalled();
     expect(screen.getByText('No page content.')).toBeTruthy();
   });
+
+  // ZEB-962: `card?.displayName || 'Name unavailable'` floored `""` but let a
+  // whitespace-only card name through as a blank header. `nonEmpty` closes it.
+  it('shows the fallback for a whitespace-only card display name', () => {
+    const { resolver } = makeResolver(undefined);
+    render(ProfilePanel, {
+      props: {
+        ownerIdHex: OWNER_HEX,
+        card: { displayName: '   ', profilePageRoot: PAGE_CID },
+        resolver,
+        onClose: vi.fn(),
+      },
+    });
+    expect(screen.getByText('Name unavailable')).toBeTruthy();
+  });
 });

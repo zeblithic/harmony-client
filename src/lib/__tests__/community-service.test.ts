@@ -88,6 +88,24 @@ describe('CommunityService', () => {
     ]);
   });
 
+  // ZEB-962: a peer can broadcast a whitespace-only display name; `?? undefined`
+  // only null-normalizes, so `"   "` was baked verbatim into CommunityMember.
+  // `nonEmpty` normalizes blank/whitespace to absent at the ingest boundary.
+  it('listCommunityMembers normalizes a whitespace-only displayName to undefined', async () => {
+    await service.connectAdapter(adapter);
+    (adapter.invoke as any).mockResolvedValue([
+      {
+        addr: 'a3f8c1d2',
+        displayName: '   ',
+        status: 'joined',
+        power: 0,
+        joinedAt: { wallMs: 1, logical: 0, deviceId: 'd' },
+      },
+    ]);
+    const r = await service.listCommunityMembers('bb'.repeat(4));
+    expect(r[0].displayName).toBeUndefined();
+  });
+
   it('redeemInvite returns the DTO and learns the community kind', async () => {
     await service.connectAdapter(adapter);
     (adapter.invoke as any).mockResolvedValue({

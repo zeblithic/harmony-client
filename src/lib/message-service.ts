@@ -1,5 +1,6 @@
 import type { TauriAdapter } from './zenoh-service';
 import type { Message, MessagePriority } from './types';
+import { nonEmpty } from './display-label';
 import { messages as mockMessages } from './mock-data';
 import { describeCallEvent, parseCallEvent, type CallEventPayload } from './call-log';
 
@@ -550,7 +551,10 @@ export class MessageService {
       ? { address: 'self', displayName: this.selfDisplayName() }
       : {
           address: wire.senderAddress,
-          displayName: wire.senderName || wire.senderAddress.slice(0, 8),
+          // ZEB-962: `nonEmpty` floors a whitespace-only broadcast name to the
+          // hex prefix at the bake — `||` only floors `""`, so `"   "` was
+          // stored verbatim and rendered blank by every raw sender consumer.
+          displayName: nonEmpty(wire.senderName) ?? wire.senderAddress.slice(0, 8),
         };
 
     return {

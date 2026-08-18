@@ -1,10 +1,11 @@
 <script lang="ts">
   import type { Message } from '../types';
   import { TrustService } from '../trust-service';
+  import type { ResolvedCard } from '../member-card-service';
   import MediaCard from './MediaCard.svelte';
   import UntrustedMediaCard from './UntrustedMediaCard.svelte';
 
-  let { messages, trustService, trustVersion = 0, threadMessageIds = new Set<string>(), onLinkBack, onAvatarClick, onTrustChange }: {
+  let { messages, trustService, trustVersion = 0, threadMessageIds = new Set<string>(), onLinkBack, onAvatarClick, onTrustChange, resolveNickname, resolveCard }: {
     messages: Message[];
     trustService: TrustService;
     trustVersion?: number;
@@ -12,6 +13,9 @@
     onLinkBack?: (messageId: string) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
     onTrustChange?: () => void;
+    // ZEB-962: thread the author ladder to the media cards (DM senders blank).
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
 
   let mediaItems = $derived(
@@ -41,9 +45,9 @@
       <div class={threadMessageIds.has(message.id) ? 'thread-card' : ''}>
         <!-- communityId not yet available on Message; per-community trust will apply once content transport provides context -->
         {#if isTrustGated(attachment, message.sender.address)}
-          <UntrustedMediaCard {message} {attachment} {onLinkBack} {onAvatarClick} onLoad={handleLoad} />
+          <UntrustedMediaCard {message} {attachment} {onLinkBack} {onAvatarClick} onLoad={handleLoad} {resolveNickname} {resolveCard} />
         {:else}
-          <MediaCard {message} {attachment} {onLinkBack} {onAvatarClick} />
+          <MediaCard {message} {attachment} {onLinkBack} {onAvatarClick} {resolveNickname} {resolveCard} />
         {/if}
         {#if threadMessageIds.has(message.id)}
           <span class="thread-tag">in thread</span>

@@ -129,4 +129,32 @@ describe('UntrustedMediaCard', () => {
     const region = screen.getByLabelText(/blocked media.*image.*alice/i);
     expect(region).toBeTruthy();
   });
+
+  // ZEB-962: a DM sender carries a blank baked name; both the aria-label and the
+  // `.card-sender` must resolve through the author ladder, not render blank.
+  it('resolves a blank DM sender through the card for name and aria-label', () => {
+    const PEER = 'ef'.repeat(16);
+    const dmMessage: Message = { ...mockMessage, sender: { address: PEER, displayName: '' } };
+    const { container } = render(UntrustedMediaCard, {
+      props: {
+        message: dmMessage,
+        attachment: mockImageAttachment,
+        resolveCard: (id: string) => (id === PEER ? { displayName: 'Zeb', statusText: '' } : undefined),
+      } as any,
+    });
+    expect(container.querySelector('.card-sender')?.textContent).toBe('Zeb');
+    expect(container.querySelector('.untrusted-card')?.getAttribute('aria-label')).toContain('Zeb');
+  });
+
+  it('falls back to short hex for a blank DM sender when no resolver is provided', () => {
+    const PEER = 'ef'.repeat(16);
+    const dmMessage: Message = { ...mockMessage, sender: { address: PEER, displayName: '' } };
+    const { container } = render(UntrustedMediaCard, {
+      props: { message: dmMessage, attachment: mockImageAttachment } as any,
+    });
+    expect(container.querySelector('.card-sender')?.textContent).toBe(PEER.slice(0, 8));
+    expect(container.querySelector('.untrusted-card')?.getAttribute('aria-label')).toContain(
+      PEER.slice(0, 8),
+    );
+  });
 });

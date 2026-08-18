@@ -4334,6 +4334,8 @@
       onAvatarClick={handleAvatarClick}
       onTrustChange={handleTrustChange}
       {threadMessageIds}
+      {resolveCard}
+      {resolveNickname}
     />
   {/snippet}
   {#snippet settingsPanel()}

@@ -150,6 +150,32 @@ describe('ForkGenealogyGraph', () => {
     expect(chips.some((t) => t.includes('Treasury split'))).toBe(true);
   });
 
+  // ZEB-962: the component dropped its copy-pasted local `nonEmpty` for the
+  // canonical `display-label` helper. This pins the guard the dedup must keep:
+  // a whitespace-only node name resolves to the truncated-hex placeholder, never
+  // a blank card. (Present names stay covered by the rendering tests above.)
+  it('renders the truncated-hex placeholder for a whitespace-only node name', () => {
+    const { container } = render(ForkGenealogyGraph, {
+      props: {
+        lineage: {
+          forkedFrom: '22'.repeat(16),
+          forkedAtWallMs: 1_710_000_000_000,
+          parentLineage: [
+            { spaceId: '11'.repeat(16), name: '   ', forkedAtWallMs: null, reason: null },
+          ],
+          selfSpaceId: '00'.repeat(16),
+          selfName: 'The Fork',
+          forkReason: null,
+        },
+        descendants: [],
+        localNavIds: new Set<string>(),
+      },
+    });
+    const names = Array.from(container.querySelectorAll('.card-name')).map((n) => n.textContent);
+    expect(names).toContain('0x11111111…');
+    expect(names).not.toContain('   ');
+  });
+
   it('root community with no forks renders a single self card and no edges', () => {
     const { container } = render(ForkGenealogyGraph, {
       props: {

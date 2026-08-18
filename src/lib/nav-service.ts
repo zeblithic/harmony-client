@@ -201,17 +201,29 @@ export class NavService {
             avatarCid: wire.avatarCid,
             avatarMiniCid: wire.avatarMiniCid,
           });
-          // Update DM nodes to match latest peer profile
+          // Update DM nodes to match latest peer profile.
+          // ZEB-962: route the incoming profile name through the same
+          // `resolveSpaceName` ladder the nav-updated path uses. The raw
+          // `wire.displayName` assignment bypassed the guard resolveSpaceName
+          // applies (a whitespace-only broadcast name would blank an
+          // already-resolved sidebar row — the field NavNodeRow + the DM header
+          // render). `this.profiles` above stays verbatim: it is a peer-profile
+          // cache whose name reads are each guarded (resolveSpaceName here,
+          // ProfilePopover's own ladder for getProfile()).
           let nodeChanged = false;
           const updated = this.nodes.map((n) => {
             if (n.peer?.address !== wire.address) return n;
-            const peerChanged = n.name !== wire.displayName || n.peer.avatarUrl !== avatarUrl;
+            const resolvedName = resolveSpaceName(n.name, n.name, wire.displayName, wire.address);
+            const peerChanged =
+              n.name !== resolvedName ||
+              n.peer.displayName !== resolvedName ||
+              n.peer.avatarUrl !== avatarUrl;
             if (!peerChanged) return n;
             nodeChanged = true;
             return {
               ...n,
-              name: wire.displayName,
-              peer: { ...n.peer, displayName: wire.displayName, avatarUrl },
+              name: resolvedName,
+              peer: { ...n.peer, displayName: resolvedName, avatarUrl },
             };
           });
           if (nodeChanged) this.nodes = updated;
