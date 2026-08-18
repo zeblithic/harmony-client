@@ -336,10 +336,12 @@
               isOpen={openThreadId === item.message.id}
               onOpen={onThreadOpen}
               onVisibilityChange={handleThreadVisibility}
+              {resolveNickname}
+              {resolveCard}
             />
           {/if}
         {:else}
-          <QuietMessageGroup messages={item.messages} {collapsed} {onMediaClick} {onAvatarClick} {trustService} {trustVersion} />
+          <QuietMessageGroup messages={item.messages} {collapsed} {onMediaClick} {onAvatarClick} {trustService} {trustVersion} {resolveNickname} {resolveCard} />
         {/if}
       {/each}
     </div>

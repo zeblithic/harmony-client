@@ -124,4 +124,32 @@ describe('ThreadIndicator', () => {
     expect(obs.disconnect).toHaveBeenCalled();
     expect(onVisibilityChange).toHaveBeenCalledWith('root-1', false);
   });
+
+  // ZEB-962: DM thread participants carry a blank baked name (resolved live, not
+  // frozen at ingest), so the reply preview + aria-label must resolve through the
+  // author ladder rather than render the raw blank.
+  it('resolves a blank DM participant name through the card', () => {
+    const PEER = 'ef'.repeat(16);
+    const { container } = render(ThreadIndicator, {
+      props: {
+        count: 2,
+        participants: [{ address: PEER, displayName: '' }],
+        rootId: 'root-1',
+        resolveCard: (id: string) => (id === PEER ? { displayName: 'Zeb', statusText: '' } : undefined),
+      } as any,
+    });
+    expect(container.querySelector('.thread-info')?.textContent).toContain('Zeb');
+    expect(container.querySelector('.thread-indicator')?.getAttribute('aria-label')).toContain('Zeb');
+  });
+
+  it('falls back to short hex when no card resolves a blank DM name', () => {
+    const PEER = 'ef'.repeat(16);
+    const { container } = render(ThreadIndicator, {
+      props: { count: 1, participants: [{ address: PEER, displayName: '' }], rootId: 'root-1' } as any,
+    });
+    expect(container.querySelector('.thread-info')?.textContent).toContain(PEER.slice(0, 8));
+    expect(container.querySelector('.thread-indicator')?.getAttribute('aria-label')).toContain(
+      PEER.slice(0, 8),
+    );
+  });
 });

@@ -25,6 +25,7 @@
     GENEALOGY_CARD_H,
     type GenealogyNode,
   } from '../fork-genealogy-layout';
+  import { nonEmpty } from '../display-label';
 
   let {
     lineage,
@@ -49,10 +50,6 @@
 
   function truncId(spaceId: string): string {
     return `0x${spaceId.slice(0, 8)}…`;
-  }
-  function nonEmpty(s: string | null | undefined): string | null {
-    const t = s?.trim();
-    return t && t.length > 0 ? t : null;
   }
   function displayName(node: GenealogyNode): string {
     if (node.kind === 'descendant') {

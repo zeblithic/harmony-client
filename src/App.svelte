@@ -63,7 +63,7 @@
   import type { TauriAdapter } from './lib/zenoh-service';
   import { CommunityService, rosterHasJoinedAuthor, toNavPayload } from './lib/community-service';
   import { createInitialSyncTracker } from './lib/community-initial-sync';
-  import { FriendService, contactsFromFriends } from './lib/friend-service';
+  import { FriendService, contactsFromFriends, nicknameMapFromFriends } from './lib/friend-service';
   import { DmInviteService, type PendingDmInviteDto } from './lib/dm-invite-service';
   import { ChannelMessageService } from './lib/channel-message-service';
   import type { CommunityMember } from './lib/types';
@@ -95,7 +95,7 @@
   import { AvatarResolver } from './lib/avatar-resolver';
   import { ProfilePageResolver } from './lib/profile-page-resolver';
   import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation, FileGrant, ReceivedFile } from './lib/types';
-  import { getThreadMeta } from './lib/feed-utils';
+  import { getThreadMeta, feedAuthorOwnerIds } from './lib/feed-utils';
   import { resolveAuthorLabel } from './lib/mention-render';
   import { resolveMemberName } from './lib/display-label';
   import { findNode, findNearestFolder, resolveChannelSelection } from './lib/nav-utils';
@@ -1709,12 +1709,10 @@
       dmContacts = contactsFromFriends(friends);
       // ZEB-432: rebuild the nickname map under the same commit guard so it
       // stays consistent with the DM-contact map (and never regresses to an
-      // older friends snapshot).
-      friendNicknames = new Map(
-        friends
-          .filter((f) => f.nickname)
-          .map((f) => [f.ownerIdHex.toLowerCase(), f.nickname as string]),
-      );
+      // older friends snapshot). ZEB-962: `nicknameMapFromFriends` filters with
+      // `nonEmpty`, so a whitespace-only nickname never enters state (a plain
+      // truthiness filter kept `"   "`, which `resolveNickname` would return).
+      friendNicknames = nicknameMapFromFriends(friends);
     } catch (e) {
       // Expected pre-owner-load ("owner not loaded") and in mock mode
       // (no adapter). Keep the last known-good map rather than wiping —
@@ -3772,6 +3770,19 @@
     })
   );
 
+  // ZEB-962 (CodeRabbit #709): the feed / media / thread render sites resolve
+  // author cards via `resolveCard`, which only resolves owners the
+  // MemberCardService has subscribed. Community authors are covered by the
+  // `community` bucket and the active 1:1 peer by `dm`, but group-chat /
+  // non-friend message authors and thread participants (getThreadMeta) are in
+  // neither — reconcile every non-self author in the active view into a
+  // dedicated `feedAuthors` bucket. `channelMessages` is scoped to the active
+  // channel/DM, so this clears+refills only this bucket on view change (union
+  // semantics leave community/dm/voice untouched).
+  $effect(() => {
+    void memberCardService.setBucket('feedAuthors', feedAuthorOwnerIds(channelMessages));
+  });
+
   // Thread derivations — scoped to the active channel so thread
   // indicators and panel contents don't leak cross-channel messages.
   let threadMeta = $derived(getThreadMeta(channelMessages));
@@ -4334,6 +4345,8 @@
       onAvatarClick={handleAvatarClick}
       onTrustChange={handleTrustChange}
       {threadMessageIds}
+      {resolveCard}
+      {resolveNickname}
     />
   {/snippet}
   {#snippet settingsPanel()}

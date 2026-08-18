@@ -1,5 +1,6 @@
 <script lang="ts">
   import Avatar from './Avatar.svelte';
+  import { nonEmpty } from '../display-label';
   import type { ProfilePageResolver } from '../profile-page-resolver';
 
   /**
@@ -130,7 +131,7 @@
   <div class="panel-header">
     <Avatar address={ownerIdHex} displayName={card?.displayName ?? ''} avatarUrl={card?.avatarUrl} size={72} />
     <div class="panel-identity">
-      <div class="panel-name">{card?.displayName || 'Name unavailable'}</div>
+      <div class="panel-name">{nonEmpty(card?.displayName) ?? 'Name unavailable'}</div>
       {#if card?.statusText}
         <div class="panel-status">{card.statusText}</div>
       {/if}

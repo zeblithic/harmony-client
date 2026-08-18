@@ -401,3 +401,30 @@ describe('ProfilePopover', () => {
     }
   });
 });
+
+// ZEB-962: the name line reads a verbatim-cache display name. `|| 'Name
+// unavailable'` (owner-card) floors `""` but lets a whitespace-only name
+// through; the reticulum-mode line had no fallback at all. `nonEmpty` guards
+// both so a blank/whitespace broadcast name never renders as an empty line.
+describe('ProfilePopover blank-name guard (ZEB-962)', () => {
+  afterEach(() => cleanup());
+
+  it('reticulum mode: a whitespace-only profile name shows the fallback, not a blank line', () => {
+    render(ProfilePopover, {
+      props: baseProps({
+        profile: { address: 'a1b2c3d4', displayName: '   ', statusText: '' },
+      }),
+    });
+    expect(screen.getByText('Name unavailable')).toBeTruthy();
+  });
+
+  it('owner-card mode: a whitespace-only card name shows the fallback', () => {
+    render(ProfilePopover, {
+      props: baseProps({
+        mode: 'owner-card',
+        card: { ownerIdHex: 'ab'.repeat(16), displayName: '  ', statusText: '', power: 0 },
+      }),
+    });
+    expect(screen.getByText('Name unavailable')).toBeTruthy();
+  });
+});

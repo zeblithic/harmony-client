@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import { nonEmpty } from '../display-label';
   import { listen } from '@tauri-apps/api/event';
   import type { Profile } from '../types';
   import type {
@@ -263,7 +264,7 @@
   <div class="popover-header">
     <Avatar address={card.ownerIdHex} displayName={card.displayName} avatarUrl={card.avatarUrl} size={64} />
     <div class="popover-identity">
-      <div class="popover-name">{card.displayName || 'Name unavailable'}</div>
+      <div class="popover-name">{nonEmpty(card.displayName) ?? 'Name unavailable'}</div>
       {#if card.statusText}
         <div class="popover-status">{card.statusText}</div>
       {/if}
@@ -299,7 +300,7 @@
   <div class="popover-header">
     <Avatar address={ownerIdHex || profile.address} displayName={profile.displayName} avatarUrl={profile.avatarUrl} size={64} />
     <div class="popover-identity">
-      <div class="popover-name">{profile.displayName}</div>
+      <div class="popover-name">{nonEmpty(profile.displayName) ?? 'Name unavailable'}</div>
       {#if profile.statusText}
         <div class="popover-status">{profile.statusText}</div>
       {/if}

@@ -13,6 +13,7 @@
    */
   import type { CommunityMember, Message } from '../types';
   import type { TrustService } from '../trust-service';
+  import type { ResolvedCard } from '../member-card-service';
   import type { VotingAdapter } from '../voting-adapter';
   import { loadRailTab, saveRailTab, type RailTab } from '../media-panel-prefs';
   import AssemblyRail from './AssemblyRail.svelte';
@@ -31,6 +32,8 @@
     onLinkBack,
     onAvatarClick,
     onTrustChange,
+    resolveNickname,
+    resolveCard,
   }: {
     /** Active community, or null outside community contexts (media-only). */
     communityId?: string | null;
@@ -49,6 +52,9 @@
     onLinkBack?: (messageId: string) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
     onTrustChange?: () => void;
+    // ZEB-962: author-ladder resolvers, passed through to the media cards.
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
 
   let railTab = $state<RailTab>(loadRailTab());
@@ -88,7 +94,7 @@
     onViewAllProposals={() => onViewAllProposals?.(communityId)}
   />
 {:else}
-  <MediaFeed {messages} {trustService} {trustVersion} {threadMessageIds} {onLinkBack} {onAvatarClick} {onTrustChange} />
+  <MediaFeed {messages} {trustService} {trustVersion} {threadMessageIds} {onLinkBack} {onAvatarClick} {onTrustChange} {resolveNickname} {resolveCard} />
 {/if}
 
 <style>

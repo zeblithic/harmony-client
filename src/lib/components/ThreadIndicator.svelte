@@ -1,14 +1,30 @@
 <script lang="ts">
   import type { Peer } from '../types';
+  import { resolveAuthorLabel } from '../mention-render';
+  import type { ResolvedCard } from '../member-card-service';
 
-  let { count, participants, rootId, isOpen = false, onOpen, onVisibilityChange }: {
+  let {
+    count,
+    participants,
+    rootId,
+    isOpen = false,
+    onOpen,
+    onVisibilityChange,
+    resolveNickname,
+    resolveCard,
+  }: {
     count: number;
     participants: Peer[];
     rootId: string;
     isOpen?: boolean;
     onOpen?: (rootId: string) => void;
     onVisibilityChange?: (rootId: string, visible: boolean) => void;
+    // ZEB-962: DM participants carry a blank baked name; resolve at render.
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
+
+  const participantLabel = (p: Peer) => resolveAuthorLabel(p, resolveNickname, resolveCard);
 
   let el: HTMLButtonElement | undefined = $state();
 
@@ -34,7 +50,7 @@
   });
 
   let nameList = $derived.by(() => {
-    const names = participants.slice(0, 3).map(p => p.displayName);
+    const names = participants.slice(0, 3).map(participantLabel);
     const extra = participants.length - 3;
     if (extra > 0) names.push(`+${extra} more`);
     return names.join(', ');
@@ -43,7 +59,7 @@
   let replyWord = $derived(count === 1 ? 'reply' : 'replies');
 
   let ariaLabel = $derived(
-    `${count} ${replyWord} from ${participants.map(p => p.displayName).join(', ')}. Open thread.`
+    `${count} ${replyWord} from ${participants.map(participantLabel).join(', ')}. Open thread.`
   );
 </script>
 

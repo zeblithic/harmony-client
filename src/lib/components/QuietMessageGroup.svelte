@@ -2,14 +2,29 @@
   import type { Message } from '../types';
   import type { TrustService } from '../trust-service';
   import TextMessage from './TextMessage.svelte';
+  import { resolveAuthorLabel } from '../mention-render';
+  import type { ResolvedCard } from '../member-card-service';
 
-  let { messages, collapsed = false, onMediaClick, onAvatarClick, trustService, trustVersion = 0 }: {
+  let {
+    messages,
+    collapsed = false,
+    onMediaClick,
+    onAvatarClick,
+    trustService,
+    trustVersion = 0,
+    resolveNickname,
+    resolveCard,
+  }: {
     messages: Message[];
     collapsed?: boolean;
     onMediaClick?: (mediaId: string) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
     trustService?: TrustService;
     trustVersion?: number;
+    // ZEB-962: resolve author names for the summary AND forward to child
+    // TextMessages, so a blank DM sender name never renders raw.
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
 
   let expanded = $state(false);
@@ -26,7 +41,9 @@
   });
 
   let senderNames = $derived(
-    [...new Set(messages.map((m) => m.sender.displayName))].join(', ')
+    [
+      ...new Set(messages.map((m) => resolveAuthorLabel(m.sender, resolveNickname, resolveCard))),
+    ].join(', ')
   );
 
   let summary = $derived(
@@ -42,7 +59,7 @@
   {#if expanded}
     <div class="quiet-expanded">
       {#each messages as message (message.id)}
-        <TextMessage {message} {collapsed} {onMediaClick} {onAvatarClick} {trustService} {trustVersion} />
+        <TextMessage {message} {collapsed} {onMediaClick} {onAvatarClick} {trustService} {trustVersion} {resolveNickname} {resolveCard} />
       {/each}
     </div>
   {/if}

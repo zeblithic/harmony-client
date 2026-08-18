@@ -5,18 +5,24 @@
   import { dayClock } from '../day-clock';
   import { timeFormatPrefs } from '../time-format-service';
   import Avatar from './Avatar.svelte';
+  import { resolveAuthorLabel } from '../mention-render';
+  import type { ResolvedCard } from '../member-card-service';
 
-  let { message, attachment, onLinkBack, onAvatarClick, onLoad }: {
+  let { message, attachment, onLinkBack, onAvatarClick, onLoad, resolveNickname, resolveCard }: {
     message: Message;
     attachment: MediaAttachment;
     onLinkBack?: (messageId: string) => void;
     onAvatarClick?: (address: string, event: MouseEvent) => void;
     onLoad?: (attachmentId: string) => void;
+    // ZEB-962: DM senders carry a blank baked name; resolve at render.
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
   } = $props();
 
   // ZEB-943: format against the app-wide day clock so the label reclassifies at
   // local midnight without a remount (day-clock.ts). No per-message timer.
   let timeStr = $derived(formatMessageTimestamp(message.timestamp, $dayClock, $timeFormatPrefs));
+  let senderLabel = $derived(resolveAuthorLabel(message.sender, resolveNickname, resolveCard));
 
   type LoadState = 'blocked' | 'confirming' | 'cooldown';
   let loadState = $state<LoadState>('blocked');
@@ -57,17 +63,17 @@
 <div
   class="untrusted-card"
   id="media-{attachment.id}"
-  aria-label="Blocked media, {TYPE_LABELS[attachment.type] ?? attachment.type}, from {message.sender.displayName}"
+  aria-label="Blocked media, {TYPE_LABELS[attachment.type] ?? attachment.type}, from {senderLabel}"
 >
   <button class="card-header" onclick={() => onLinkBack?.(message.id)}>
     <Avatar
       address={message.sender.address}
-      displayName={message.sender.displayName}
+      displayName={senderLabel}
       avatarUrl={message.sender.avatarUrl}
       size={20}
       onclick={(e) => { e.stopPropagation(); onAvatarClick?.(message.sender.address, e); }}
     />
-    <span class="card-sender">{message.sender.displayName}</span>
+    <span class="card-sender">{senderLabel}</span>
     <time class="card-time" datetime={new Date(message.timestamp).toISOString()} title={formatFullTimestamp(message.timestamp, $timeFormatPrefs)}>{timeStr}</time>
     <span class="link-back-icon" title="Jump to message">&#8599;</span>
   </button>

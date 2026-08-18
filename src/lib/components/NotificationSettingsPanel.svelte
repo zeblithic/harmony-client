@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { NotificationAction, NavNode, Peer, TrustLevel } from '../types';
+  import { nonEmpty } from '../display-label';
+  import { shortId } from '../short-addr';
   import { NotificationService } from '../notification-service';
   import type { TrustService } from '../trust-service';
 
@@ -309,7 +311,7 @@
       {#each peers as peer (peer.address)}
         <div class="override-section">
           <div class="override-header">
-            <span class="override-name">{peer.displayName}</span>
+            <span class="override-name">{nonEmpty(peer.displayName) ?? shortId(peer.address)}</span>
             {#if getPeerPolicy(peer.address)}
               <button class="reset-btn" onclick={() => clearPeer(peer.address)}>Reset</button>
             {/if}

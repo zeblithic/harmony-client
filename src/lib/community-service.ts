@@ -10,6 +10,7 @@ import {
 } from './types';
 import type { ChannelMessageDto } from './channel-message-service';
 import type { NavUpdatedPayload } from './nav-service';
+import { nonEmpty } from './display-label';
 
 interface MembersChangedPayload { communityId: string; }
 interface DegradedPayload { communityId: string; degraded: boolean; }
@@ -159,7 +160,10 @@ interface MemberInfoDto {
 function dtoToMember(d: MemberInfoDto): CommunityMember {
   return {
     address: d.addr,
-    displayName: d.displayName ?? undefined,
+    // ZEB-962: normalize a whitespace-only name to absent at ingest (`?? undefined`
+    // only null-normalizes; `nonEmpty` also treats `"   "` as absent) so every
+    // downstream consumer sees a clean optional rather than a blank string.
+    displayName: nonEmpty(d.displayName),
     status: d.status,
     power: d.power,
     joinedAt: d.joinedAt?.wallMs,

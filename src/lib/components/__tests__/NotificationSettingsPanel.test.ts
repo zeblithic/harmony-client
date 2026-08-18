@@ -2,6 +2,7 @@ import { render, screen, fireEvent } from '@testing-library/svelte';
 import { describe, it, expect, vi } from 'vitest';
 import NotificationSettingsPanel from '../NotificationSettingsPanel.svelte';
 import { NotificationService } from '../../notification-service';
+import { shortId } from '../../short-addr';
 import type { NavNode, Peer } from '../../types';
 
 const mockPeers: Peer[] = [
@@ -97,5 +98,21 @@ describe('NotificationSettingsPanel', () => {
     const closeBtn = screen.getByLabelText('Close settings');
     await fireEvent.click(closeBtn);
     expect(onClose).toHaveBeenCalled();
+  });
+
+  // ZEB-962: the peer override row rendered `peer.displayName` raw — a
+  // whitespace-only broadcast name showed a blank row. Floor to short hex.
+  it('floors a whitespace-only peer name to short hex, not blank', async () => {
+    const BLANK = 'ee'.repeat(16);
+    const svc = new NotificationService();
+    render(NotificationSettingsPanel, {
+      props: {
+        service: svc,
+        peers: [{ address: BLANK, displayName: '   ' }],
+        communities: mockCommunities,
+      },
+    });
+    await fireEvent.click(screen.getByText('Peers'));
+    expect(screen.getByText(shortId(BLANK))).toBeTruthy();
   });
 });

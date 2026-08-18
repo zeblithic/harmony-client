@@ -1,5 +1,6 @@
 import type { TauriAdapter } from './zenoh-service';
 import type { Profile } from './types';
+import { nonEmpty } from './display-label';
 
 /**
  * ZEB-370 Phase 1 + ZEB-371 Phase 1b: frontend friend-graph service. Mirrors
@@ -164,10 +165,27 @@ export function contactsFromFriends(friends: FriendDto[]): Map<string, Profile> 
       f.ownerIdHex.length > 8 ? f.ownerIdHex.slice(0, 8) + '…' : f.ownerIdHex;
     contacts.set(f.ownerIdHex, {
       address: f.ownerIdHex,
-      displayName: f.nickname || f.display || shortHex,
+      // ZEB-962: `nonEmpty` (not `||`) so a whitespace-only nickname/display
+      // is treated as absent — `||` drops only `""`, letting `"   "` bake in.
+      displayName: nonEmpty(f.nickname) ?? nonEmpty(f.display) ?? shortHex,
     });
   }
   return contacts;
+}
+
+/**
+ * ZEB-962 (CodeRabbit #709): the personal-nickname map behind `resolveNickname`,
+ * keyed by lowercased owner hex. Only non-blank nicknames are kept — a plain
+ * truthiness filter (`f.nickname`) drops `""` but lets a whitespace-only
+ * nickname into state, which `resolveNickname` would then return verbatim.
+ */
+export function nicknameMapFromFriends(friends: FriendDto[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const f of friends) {
+    const nick = nonEmpty(f.nickname);
+    if (nick !== undefined) map.set(f.ownerIdHex.toLowerCase(), nick);
+  }
+  return map;
 }
 
 export class FriendService {

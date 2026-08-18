@@ -72,4 +72,41 @@ describe('QuietMessageGroup', () => {
     const dimmed = container.querySelector('.quiet-expanded');
     expect(dimmed).toBeTruthy();
   });
+
+  // ZEB-962: the collapsed summary aggregates sender names. A blank DM sender
+  // name left a naked ", " in the summary; resolve each through the author ladder.
+  it('resolves a blank DM sender through the card in the summary', () => {
+    const PEER = 'ef'.repeat(16);
+    const dmMsg: Message = {
+      id: 'm1',
+      sender: { address: PEER, displayName: '' },
+      text: 'quiet',
+      timestamp: Date.now(),
+      media: [],
+      priority: 'quiet',
+    };
+    const { container } = render(QuietMessageGroup, {
+      props: {
+        messages: [dmMsg],
+        resolveCard: (id: string) => (id === PEER ? { displayName: 'Zeb', statusText: '' } : undefined),
+      } as any,
+    });
+    expect(container.querySelector('.quiet-summary')?.textContent).toContain('Zeb');
+  });
+
+  it('falls back to short hex for a blank DM sender when no resolver is provided', () => {
+    const PEER = 'ef'.repeat(16);
+    const dmMsg: Message = {
+      id: 'm1',
+      sender: { address: PEER, displayName: '' },
+      text: 'quiet',
+      timestamp: Date.now(),
+      media: [],
+      priority: 'quiet',
+    };
+    const { container } = render(QuietMessageGroup, {
+      props: { messages: [dmMsg] } as any,
+    });
+    expect(container.querySelector('.quiet-summary')?.textContent).toContain(PEER.slice(0, 8));
+  });
 });

@@ -1,5 +1,7 @@
 <script lang="ts">
   import { generateIdenticon } from '../identicon';
+  import { nonEmpty } from '../display-label';
+  import { shortId } from '../short-addr';
 
   let { address, size = 24, displayName = '', avatarUrl, onclick }: {
     address: string;
@@ -10,11 +12,14 @@
   } = $props();
 
   let identiconSvg = $derived(generateIdenticon(address, size));
+  // ZEB-962: the shared accessible label. A peer can broadcast a blank/whitespace
+  // name, so never render an empty `alt`/`title`; fall back to the identity floor.
+  let label = $derived(nonEmpty(displayName) ?? shortId(address));
 </script>
 
 {#snippet avatarContent()}
   {#if avatarUrl}
-    <img src={avatarUrl} alt={displayName} width={size} height={size} />
+    <img src={avatarUrl} alt={label} width={size} height={size} />
   {:else}
     {@html identiconSvg}
   {/if}
@@ -24,7 +29,7 @@
   <button
     class="avatar interactive"
     style="width: {size}px; height: {size}px;"
-    title={displayName}
+    title={label}
     onclick={(e) => onclick?.(e)}
     type="button"
   >
@@ -34,7 +39,7 @@
   <span
     class="avatar"
     style="width: {size}px; height: {size}px;"
-    title={displayName}
+    title={label}
   >
     {@render avatarContent()}
   </span>
