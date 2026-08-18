@@ -6,10 +6,17 @@
     // ZEB-946: the "since …" HLC timestamp honors the owner's time-format prefs.
     import { formatFullTimestamp, type TimeFormatPrefs } from '../time-format';
     import { timeFormatPrefs } from '../time-format-service';
+    // ZEB-961: resolve the joiner owner_id through the shared display-name ladder
+    // (nickname → card → inviteeHint → short hex). The parent
+    // (CommunitySettingsPanel) threads its own resolveCard/resolveNickname down.
+    import { resolveMentionLabel } from '../mention-render';
+    import type { ResolvedCard } from '../member-card-service';
 
-    let { communityId, canModerate }: {
+    let { communityId, canModerate, resolveCard, resolveNickname }: {
         communityId: string;
         canModerate: boolean;
+        resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+        resolveNickname?: (ownerIdHex: string) => string | undefined;
     } = $props();
 
     interface PendingJoinDto {
@@ -206,7 +213,7 @@
                 <ul>
                     {#each pending as p (p.eventId)}
                         <li class="join-row">
-                            <span class="joiner">{p.inviteeHint ?? p.joinerAddr.slice(0, 12)}</span>
+                            <span class="joiner">{resolveMentionLabel(p.joinerAddr, resolveNickname, resolveCard, () => p.inviteeHint)}</span>
                             <span class="time">since {formatHlc(p.pendingAtHlc, $timeFormatPrefs)}</span>
                             <button class="reject-btn" type="button" onclick={() => kickJoiner(p.joinerAddr)}>
                                 Reject (kick)
@@ -229,7 +236,7 @@
                 <ul>
                     {#each recent as r (r.joinEventId)}
                         <li class="join-row">
-                            <span class="joiner">{r.joinerAddr.slice(0, 12)}</span>
+                            <span class="joiner">{resolveMentionLabel(r.joinerAddr, resolveNickname, resolveCard)}</span>
                             <span class="time">at {formatHlc(r.countersignedAtHlc, $timeFormatPrefs)}</span>
                         </li>
                     {/each}

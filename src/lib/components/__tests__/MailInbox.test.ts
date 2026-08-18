@@ -8,6 +8,8 @@ import {
   _resetTimeFormatServiceForTest,
 } from '../../time-format-service';
 import { formatClockTime } from '../../time-format';
+// ZEB-961: the sender label resolves through the shared display-name ladder.
+import { shortId } from '../../short-addr';
 
 function makeEntry(timestampSec: number): MailEntry {
   return {
@@ -65,5 +67,50 @@ describe('MailInbox time honors the clock preference (ZEB-946)', () => {
     expect(mailTime(container)).toBe(
       new Date(oldMs).toLocaleDateString([], { month: 'short', day: 'numeric' }),
     );
+  });
+});
+
+describe('MailInbox sender name resolution (ZEB-961)', () => {
+  const SENDER = 'aa'.repeat(16); // 32-char owner_id hex
+
+  function entry(): MailEntry {
+    return {
+      messageCid: 'cid-1',
+      messageId: 'mid-1',
+      senderAddress: SENDER,
+      timestamp: Math.floor(Date.now() / 1000),
+      subjectSnippet: 'hi',
+      read: false,
+      bodyState: 'local',
+    };
+  }
+
+  function senderLabel(container: HTMLElement): string | null {
+    return container.querySelector('.mail-sender')?.textContent ?? null;
+  }
+
+  it('resolves the sender card name when a resolver is provided', () => {
+    const { container } = render(MailInbox, {
+      props: {
+        entries: [entry()],
+        activeFolder: 'inbox',
+        selectedCid: null,
+        resolveCard: (id: string) =>
+          id === SENDER ? { displayName: 'Postmaster', statusText: '' } : undefined,
+      },
+    });
+    expect(senderLabel(container)).toBe('Postmaster');
+  });
+
+  it('falls back to the shared shortId when no card resolves', () => {
+    const { container } = render(MailInbox, {
+      props: {
+        entries: [entry()],
+        activeFolder: 'inbox',
+        selectedCid: null,
+        resolveCard: () => undefined,
+      },
+    });
+    expect(senderLabel(container)).toBe(shortId(SENDER));
   });
 });

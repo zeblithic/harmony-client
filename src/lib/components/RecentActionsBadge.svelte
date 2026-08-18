@@ -1,7 +1,20 @@
 <script lang="ts">
   import type { ModerationEvent } from '../types';
+  import type { ResolvedCard } from '../member-card-service';
+  import { resolveMentionLabel } from '../mention-render';
 
-  let { events }: { events: ModerationEvent[] } = $props();
+  // ZEB-961: resolve the actor/target owner_ids through the shared display-name
+  // ladder (nickname → card → short hex) instead of raw hex. The parent
+  // (CommunityMembersPanel) threads its own resolveCard/resolveNickname down.
+  let {
+    events,
+    resolveCard,
+    resolveNickname,
+  }: {
+    events: ModerationEvent[];
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
+    resolveNickname?: (ownerIdHex: string) => string | undefined;
+  } = $props();
 
   let expanded = $state(false);
 
@@ -16,10 +29,6 @@
     return `${diffDay} day${diffDay === 1 ? '' : 's'} ago`;
   }
 
-  function shortAddr(addr: string): string {
-    return addr.slice(0, 8);
-  }
-
   function tierName(level: number): string {
     if (level >= 100) return 'Admin';
     if (level >= 50) return 'Moderator';
@@ -27,8 +36,8 @@
   }
 
   function describeEvent(ev: ModerationEvent): string {
-    const actor = shortAddr(ev.actorAddr);
-    const target = shortAddr(ev.targetAddr);
+    const actor = resolveMentionLabel(ev.actorAddr, resolveNickname, resolveCard);
+    const target = resolveMentionLabel(ev.targetAddr, resolveNickname, resolveCard);
     if (ev.kind === 'kick') {
       const suffix = ev.reason ? ` ("${ev.reason}")` : '';
       return `${actor} kicked ${target}${suffix}`;

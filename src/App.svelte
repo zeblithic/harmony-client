@@ -2008,6 +2008,27 @@
   let selectedMailDetail = $state<MailMessageDetail | null>(null);
   let mailDetailLoading = $state(false);
   let mailDetailError = $state<string | null>(null);
+  // ZEB-961: card-subscription buckets for the invite/mail identity surfaces —
+  // resolveCard() only resolves a card the MemberCardService has subscribed, so
+  // these reconcile the `dmInvite`/`mail` buckets to the currently-visible
+  // inviters/senders (mirrors the community/dm/voice buckets above). Union
+  // semantics: an empty list clears only that bucket, never the others.
+  $effect(() => {
+    void memberCardService.setBucket(
+      'dmInvite',
+      dmInviteQueue.map((i) => i.inviterOwnerIdHex),
+    );
+  });
+  $effect(() => {
+    const owners = mailEntries.map((e) => e.senderAddress);
+    if (selectedMailDetail) {
+      owners.push(
+        selectedMailDetail.senderAddress,
+        ...selectedMailDetail.recipients.map((r) => r.address),
+      );
+    }
+    void memberCardService.setBucket('mail', owners);
+  });
   let showCompose = $state(false);
   let composeReplyTo = $state<string | null>(null);
   let composeInitialTo = $state('');
@@ -4031,6 +4052,7 @@
          transition when the queue head changes. -->
     <DmInviteToast
       invite={dmInviteQueue[0]}
+      {resolveCard}
       onAccept={() => handleDmInviteAccept(dmInviteQueue[0].spaceIdHex)}
       onDecline={() => handleDmInviteDecline(dmInviteQueue[0].spaceIdHex)}
       onLater={() => {
@@ -4453,6 +4475,7 @@
         selectedCid={selectedMailCid}
         syncState={mailSyncState}
         syncError={mailSyncError}
+        {resolveCard}
         onRefresh={() => { mailService.refresh().catch(() => {}); }}
         onSelectEmail={async (cid) => {
           selectedMailCid = cid;
@@ -4501,6 +4524,7 @@
       message={selectedMailDetail}
       loading={mailDetailLoading}
       error={mailDetailError}
+      {resolveCard}
       onReply={(_cid, msgId) => {
         composeReplyTo = msgId;
         composeInitialTo = selectedMailDetail?.senderAddress ?? '';

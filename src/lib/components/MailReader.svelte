@@ -4,17 +4,24 @@
   // word-month date stays locale-default (readable + order-unambiguous).
   import type { TimeFormatPrefs } from '../time-format';
   import { timeFormatPrefs } from '../time-format-service';
+  // ZEB-961: resolve sender/recipient owner_ids to their broadcast card names
+  // when available, else the shared short-hex (first8…last4) — no local copy.
+  import { nonEmpty } from '../display-label';
+  import { shortAddr } from '../short-addr';
+  import type { ResolvedCard } from '../member-card-service';
 
   let {
     message = null,
     loading = false,
     error = null,
+    resolveCard,
     onReply,
     onBack,
   }: {
     message: MailMessageDetail | null;
     loading?: boolean;
     error?: string | null;
+    resolveCard?: (ownerIdHex: string) => ResolvedCard | undefined;
     onReply?: (messageCid: string, messageId: string) => void;
     onBack?: () => void;
   } = $props();
@@ -34,11 +41,6 @@
       minute: '2-digit',
       ...(prefs.hour12 === undefined ? {} : { hour12: prefs.hour12 }),
     });
-  }
-
-  function shortAddr(addr: string): string {
-    if (addr.length <= 12) return addr;
-    return addr.slice(0, 8) + '...' + addr.slice(-4);
   }
 
   function formatSize(bytes: number): string {
@@ -84,12 +86,12 @@
     <div class="reader-header">
       <h2 class="subject">{message.subject || '(no subject)'}</h2>
       <div class="meta">
-        <span class="from">From: <code>{shortAddr(message.senderAddress)}</code></span>
+        <span class="from">From: <code>{nonEmpty(resolveCard?.(message.senderAddress)?.displayName) ?? shortAddr(message.senderAddress)}</code></span>
         <span class="date">{formatDate(message.timestamp, $timeFormatPrefs)}</span>
       </div>
       {#if message.recipients.length > 0}
         <div class="recipients">
-          To: {message.recipients.map(r => shortAddr(r.address)).join(', ')}
+          To: {message.recipients.map(r => nonEmpty(resolveCard?.(r.address)?.displayName) ?? shortAddr(r.address)).join(', ')}
         </div>
       {/if}
     </div>

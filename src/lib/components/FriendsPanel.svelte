@@ -844,6 +844,10 @@
     const ids = [
       ...friends.map((f) => f.ownerIdHex),
       ...pendingRequests.map((r) => r.ownerIdHex),
+      // ZEB-961: subscribe pending DM-invite inviters so their broadcast card
+      // can resolve in the DM-invites row (a non-friend inviter is in no other
+      // bucket, so without this the row falls back to hex indefinitely).
+      ...dmInvites.map((i) => i.inviterOwnerIdHex),
     ];
     setFriendsBucket?.(ids);
   });
@@ -1212,7 +1216,7 @@
               <span
                 class="friend-name"
                 data-testid="dm-invite-inviter-{invite.spaceIdHex}"
-              >{invite.inviterOwnerIdHex.slice(0, 8)}…</span>
+              >{cardName(invite.inviterOwnerIdHex) ?? shortId(invite.inviterOwnerIdHex)}</span>
               <span class="friend-addr">{dmInviteKindLabel(invite.kind)} · {relativeTime(invite.receivedAtMs)}</span>
             </div>
             <div class="request-actions">

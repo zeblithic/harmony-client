@@ -21,4 +21,22 @@ describe('DmInviteToast', () => {
     expect(onDecline).toHaveBeenCalledOnce();
     expect(onLater).toHaveBeenCalledOnce();
   });
+
+  // ZEB-961: resolve the inviter's broadcast card name when a resolver is
+  // provided (the inviter may have published a profile card even as a non-friend).
+  it('resolves the inviter card name over hex when resolveCard is provided', () => {
+    const { getByText, queryByText } = render(DmInviteToast, {
+      props: {
+        invite,
+        onAccept: vi.fn(),
+        onDecline: vi.fn(),
+        onLater: vi.fn(),
+        resolveCard: (id: string) =>
+          id === invite.inviterOwnerIdHex ? { displayName: 'Zeb', statusText: '' } : undefined,
+      },
+    });
+    expect(getByText(/From Zeb/)).toBeTruthy();
+    // The hex must not show once the card name resolves.
+    expect(queryByText(/deadbeef/)).toBeNull();
+  });
 });

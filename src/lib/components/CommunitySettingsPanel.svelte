@@ -621,7 +621,7 @@
     {#if canModerate}
       <div class="section">
         <div class="section-label">Join requests</div>
-        <PendingJoinsPanel {communityId} {canModerate} />
+        <PendingJoinsPanel {communityId} {canModerate} {resolveCard} {resolveNickname} />
       </div>
     {/if}
 

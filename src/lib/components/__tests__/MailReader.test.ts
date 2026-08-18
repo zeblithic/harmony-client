@@ -8,6 +8,8 @@ import {
   setTimeFormatSettings,
   _resetTimeFormatServiceForTest,
 } from '../../time-format-service';
+// ZEB-961: the From/To labels resolve through the shared display-name ladder.
+import { shortAddr } from '../../short-addr';
 
 function makeMessage(timestampSec: number): MailMessageDetail {
   return {
@@ -63,5 +65,57 @@ describe('MailReader header time honors the clock preference (ZEB-946)', () => {
     // No override → the exact prior `toLocaleString()` output, in ANY locale
     // (the combined call preserves the locale-native date/time separator).
     expect(headerDate(container)).toBe(new Date(MS).toLocaleString([], HEADER_OPTIONS));
+  });
+});
+
+describe('MailReader From/To name resolution (ZEB-961)', () => {
+  const SENDER = 'aa'.repeat(16); // 32-char owner_id hex
+  const RECIP = 'bb'.repeat(16);
+
+  function msg(): MailMessageDetail {
+    return {
+      messageCid: 'cid-1',
+      messageId: 'mid-1',
+      subject: 'S',
+      body: 'B',
+      senderAddress: SENDER,
+      recipients: [{ address: RECIP, recipientType: 'to' }],
+      timestamp: TS,
+      attachments: [],
+      isReply: false,
+      isForward: false,
+      bodyState: 'local',
+    };
+  }
+
+  function fromLabel(container: HTMLElement): string | null {
+    return container.querySelector('.from code')?.textContent ?? null;
+  }
+  function toLabel(container: HTMLElement): string | null {
+    return container.querySelector('.recipients')?.textContent ?? null;
+  }
+
+  it('resolves sender + recipient card names when a resolver is provided', () => {
+    const { container } = render(MailReader, {
+      props: {
+        message: msg(),
+        resolveCard: (id: string) =>
+          id === SENDER
+            ? { displayName: 'Alice', statusText: '' }
+            : id === RECIP
+              ? { displayName: 'Bob', statusText: '' }
+              : undefined,
+      },
+    });
+    expect(fromLabel(container)).toBe('Alice');
+    expect(toLabel(container)).toContain('Bob');
+  });
+
+  it('falls back to the shared shortAddr when no card resolves', () => {
+    const { container } = render(MailReader, {
+      props: { message: msg(), resolveCard: () => undefined },
+    });
+    expect(fromLabel(container)).toBe(shortAddr(SENDER));
+    expect(toLabel(container)).toContain(shortAddr(RECIP));
   });
 });
