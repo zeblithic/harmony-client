@@ -85,6 +85,72 @@ describe('CallSession peer name ladder (ZEB-958)', () => {
   });
 });
 
+// ZEB-959 — a card/nickname can arrive AFTER onIncoming's resolve-once point
+// (the App's card subscription is async). refreshPeerName() re-runs the ladder
+// from the retained peerOwnerHex so a call that started showing hex upgrades to
+// the real name when the data lands mid-call, without a re-invite. The App pokes
+// it from a cardVersion/friendNicknames reactive effect.
+describe('CallSession reactive peer-name refresh (ZEB-959)', () => {
+  const CALLER = 'cc'.repeat(16);
+
+  // Mutable refs so a resolver can start empty and "resolve" a name later,
+  // modelling the async card/nickname subscription landing after onIncoming.
+  function sessionWithRefs() {
+    const ref: { card: string | undefined; nick: string | undefined } = { card: undefined, nick: undefined };
+    const d = deps();
+    const s = new CallSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      resolveCard: (h) => (h === CALLER && ref.card !== undefined ? { displayName: ref.card } : undefined),
+      resolveNickname: (h) => (h === CALLER ? ref.nick : undefined),
+      ...d.factories,
+    });
+    return { s, ref };
+  }
+
+  it('upgrades a hex-only label when the card lands after onIncoming', () => {
+    const { s, ref } = sessionWithRefs();
+    s.onIncoming('call-1', CALLER, 'space-1');
+    expect(get(s.state).peerDisplayName).toBeNull(); // no card yet → bar shows hex
+
+    ref.card = 'CallerCard'; // card subscription resolves mid-call
+    s.refreshPeerName();
+    expect(get(s.state).peerDisplayName).toBe('CallerCard');
+  });
+
+  it('prefers a nickname that arrives after a card was already shown', () => {
+    const { s, ref } = sessionWithRefs();
+    ref.card = 'CallerCard';
+    s.onIncoming('call-1', CALLER, 'space-1');
+    expect(get(s.state).peerDisplayName).toBe('CallerCard');
+
+    ref.nick = 'Ziggy'; // friend nickname lands after the card
+    s.refreshPeerName();
+    expect(get(s.state).peerDisplayName).toBe('Ziggy');
+  });
+
+  it('is a no-op when no peer is present (caller side / idle)', () => {
+    const { s, ref } = sessionWithRefs();
+    ref.card = 'CallerCard'; // even with data available, nothing to resolve to
+    s.refreshPeerName();
+    expect(get(s.state).peerOwnerHex).toBeNull();
+    expect(get(s.state).peerDisplayName).toBeNull();
+  });
+
+  it('does not emit a store update when the resolved name is unchanged', () => {
+    const { s, ref } = sessionWithRefs();
+    ref.card = 'CallerCard';
+    s.onIncoming('call-1', CALLER, 'space-1');
+    let emissions = 0;
+    const unsub = s.state.subscribe(() => { emissions++; });
+    emissions = 0; // discard the immediate subscribe-time replay
+    s.refreshPeerName(); // same card → ladder yields the same name
+    unsub();
+    expect(emissions).toBe(0);
+  });
+});
+
 describe('CallSession DM signaling', () => {
   let d: ReturnType<typeof deps>;
   beforeEach(() => { d = deps(); });

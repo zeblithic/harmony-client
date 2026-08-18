@@ -31,6 +31,24 @@ export interface Participant {
   state: 'in-call' | 'ringing' | 'declined';
 }
 
+/** Shallow per-participant equality so refreshParticipants only patches the
+ *  store on a real change (ZEB-959) — mirrors voice-session's rostersEqual. */
+function participantsEqual(a: Participant[], b: Participant[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i], y = b[i];
+    if (
+      x.ownerHex !== y.ownerHex || x.deviceHex !== y.deviceHex ||
+      x.muted !== y.muted || x.speaking !== y.speaking ||
+      x.displayName !== y.displayName || x.avatarUrl !== y.avatarUrl ||
+      x.state !== y.state
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export interface GroupCallSessionState {
   phase: GroupCallPhase;
   callId: string | null;
@@ -112,6 +130,9 @@ export class GroupCallSession {
   private declinedOwners = new Set<string>();
   /** Last self-speaking value pushed through the gate, for the roster diff. */
   private lastSelfSpeaking = false;
+  /** Sorted owner-set key last reported to onRosterOwners (ZEB-959) — so a
+   *  card-bump poke re-resolves names without re-reconciling the card bucket. */
+  private lastOwnerKey = '';
 
   constructor(deps: GroupCallSessionDeps) {
     this.deps = deps;
@@ -148,6 +169,7 @@ export class GroupCallSession {
     this.muted = true; this.deafened = false; this.pttMode = false; this.pttHeld = false;
     this.callId = null; this.spaceId = null;
     this.liveRoster = []; this.declinedOwners = new Set(); this.lastSelfSpeaking = false;
+    this.lastOwnerKey = ''; // re-feed the card bucket on the next call (App clears it on end)
     this.vad.reset();
     this.store.set({ ...INITIAL });
   }
@@ -231,7 +253,9 @@ export class GroupCallSession {
   onPresenceChanged(callId: string, roster: { owner: string; device: string; muted: boolean }[]): void {
     if (this.callId !== callId) return;
     this.liveRoster = roster.map((r) => ({ ownerHex: r.owner, deviceHex: r.device, muted: r.muted }));
-    this.deps.onRosterOwners?.(this.liveRoster.map((r) => r.ownerHex));
+    // onRosterOwners is fed from refreshParticipants (ZEB-959) with the full
+    // rendered set — live AND silent ringing — so ringing members' cards are
+    // subscribed too, not just the live beacon owners.
     this.refreshParticipants();
   }
 
@@ -243,6 +267,18 @@ export class GroupCallSession {
 
   private setSelfSpeaking(v: boolean): void {
     if (v !== this.lastSelfSpeaking) { this.lastSelfSpeaking = v; this.refreshParticipants(); }
+  }
+
+  /**
+   * ZEB-959: re-resolve participant names from the current resolvers. The roster
+   * already self-heals on presence/decline/speaking events, but a silent ringing
+   * row can lag on hex until the next such event if its card lands late. The App
+   * pokes this from a `cardVersion`/`friendNicknames` reactive effect. Guarded on
+   * an active `callId` so an idle poke (cards land constantly outside calls) never
+   * churns the store.
+   */
+  refreshNames(): void {
+    if (this.callId) this.refreshParticipants();
   }
 
   /** Merge live beacons (in-call) with full membership (ringing/declined). */
@@ -270,7 +306,34 @@ export class GroupCallSession {
         ...(displayName ? { displayName } : {}),
         ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}) });
     }
-    this.patch({ participants: out });
+    const st = get(this.store);
+    // ZEB-959 (CodeRabbit #710): subscribe EVERY rendered owner's card — live and
+    // silent ringing alike. A ringing member exists only in resolveMembers(spaceId);
+    // with no subscription its card is never fetched, so cardVersion never bumps for
+    // it and refreshNames() can never replace the hex label. Report the full set to
+    // onRosterOwners, guarded on a sorted owner-set key so a card-bump poke (same
+    // members) doesn't re-reconcile the bucket. The key resets in resetToIdle so a
+    // later call with the same roster still re-subscribes after the App clears it.
+    //
+    // Greptile #710 (P1): feed ONLY during the 'active' phase. The App owns (clears)
+    // the groupCall bucket in every non-active phase, so feeding + caching
+    // lastOwnerKey during incoming/connecting would let this guard suppress the
+    // re-feed after that clear, leaving ringing members on hex. connect() runs a
+    // refresh immediately after entering 'active', so the bucket is always
+    // repopulated on the transition in.
+    if (st.phase === 'active') {
+      const ownerKey = [...new Set(out.map((p) => p.ownerHex))].sort().join(',');
+      if (ownerKey !== this.lastOwnerKey) {
+        this.lastOwnerKey = ownerKey;
+        this.deps.onRosterOwners?.(out.map((p) => p.ownerHex));
+      }
+    }
+    // ZEB-959 (CodeAnt #710): patch only on a real change — refreshNames() now runs
+    // on every card/nickname bump during a call, and an unconditional patch would
+    // rebuild the array and wake every subscriber even when nothing changed.
+    if (!participantsEqual(out, st.participants)) {
+      this.patch({ participants: out });
+    }
   }
 
   // ---------------------------------------------------------------------------

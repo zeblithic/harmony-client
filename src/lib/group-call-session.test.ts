@@ -342,6 +342,110 @@ describe('GroupCallSession participant name ladder (ZEB-958)', () => {
   });
 });
 
+// ZEB-959 ────────────────────────────────────────────────────────────────────
+// A member card can land AFTER the last presence/decline/speaking event, leaving
+// a silent ringing row stuck on hex until the next such event. refreshNames()
+// re-runs refreshParticipants() so the App can poke a re-resolve from its
+// cardVersion/friendNicknames reactive effect. Guarded on an active callId so an
+// idle poke (cards land constantly outside calls) never churns the store.
+describe('GroupCallSession reactive name refresh (ZEB-959)', () => {
+  it('upgrades a ringing row when the card lands after the last presence event', async () => {
+    const ref: { name: string | undefined } = { name: undefined };
+    const d = makeDeps({
+      resolveCard: (h: string) => (h === BOB && ref.name !== undefined ? { displayName: ref.name } : undefined),
+      resolveNickname: () => undefined,
+    });
+    const s = new GroupCallSession(d.deps);
+    await s.joinActive('c1'.repeat(16), 'space-1');
+    // BOB is a member with no beacon ⇒ ringing; his card hasn't loaded yet.
+    s.onPresenceChanged('c1'.repeat(16), [
+      { owner: SELF_OWNER, device: SELF_DEVICE, muted: true },
+    ]);
+    expect(get(s.state).participants.find((p) => p.ownerHex === BOB)?.displayName).toBeUndefined();
+
+    ref.name = 'BobCard'; // card subscription resolves after the presence event
+    s.refreshNames();
+    const bob = get(s.state).participants.find((p) => p.ownerHex === BOB);
+    expect(bob?.state).toBe('ringing');
+    expect(bob?.displayName).toBe('BobCard');
+  });
+
+  it('does not emit a store update when there is no active call (idle)', () => {
+    const d = makeDeps();
+    const s = new GroupCallSession(d.deps);
+    let emissions = 0;
+    const unsub = s.state.subscribe(() => { emissions++; });
+    emissions = 0; // discard the immediate subscribe-time replay
+    s.refreshNames(); // no active callId → guarded no-op, no participant re-patch
+    unsub();
+    expect(emissions).toBe(0);
+  });
+
+  // CodeRabbit #710 (Major): refreshNames() is toothless for a silent ringing
+  // member unless that member's card is actually subscribed — a ringing member
+  // exists only in resolveMembers(spaceId), so if the bucket subscribes only the
+  // live beacon set their cardVersion never bumps. The session must report EVERY
+  // rendered owner (live + ringing) to onRosterOwners so the App bucket fetches
+  // them, mirroring the feedAuthors bucket from ZEB-962.
+  it('subscribes silent ringing members, not just the live roster (CodeRabbit #710)', async () => {
+    const fed: string[][] = [];
+    const d = makeDeps({ onRosterOwners: (owners: string[]) => { fed.push(owners); } });
+    const s = new GroupCallSession(d.deps);
+    await s.joinActive('c1'.repeat(16), 'space-1');
+    // Only self is live; ALICE/BOB/CAROL are members with no beacon ⇒ ringing.
+    s.onPresenceChanged('c1'.repeat(16), [
+      { owner: SELF_OWNER, device: SELF_DEVICE, muted: true },
+    ]);
+    const last = fed.at(-1) ?? [];
+    expect(last).toContain(BOB);   // ringing member is subscribed for its card
+    expect(last).toContain(CAROL); // ringing member is subscribed for its card
+  });
+
+  // CodeAnt #710 (Minor): refreshNames() now runs on every card/nickname bump
+  // during a call. refreshParticipants() must patch only on a real change —
+  // otherwise every unrelated card update rebuilds the array and wakes all
+  // subscribers. Mirrors voice-session's change-only refreshRoster.
+  it('does not re-patch participants when a refresh resolves no change (CodeAnt #710)', async () => {
+    const d = makeDeps({
+      resolveCard: (h: string) => (h === BOB ? { displayName: 'BobCard' } : undefined),
+      resolveNickname: () => undefined,
+    });
+    const s = new GroupCallSession(d.deps);
+    await s.joinActive('c1'.repeat(16), 'space-1');
+    s.onPresenceChanged('c1'.repeat(16), [
+      { owner: SELF_OWNER, device: SELF_DEVICE, muted: true },
+    ]);
+    let emissions = 0;
+    const unsub = s.state.subscribe(() => { emissions++; });
+    emissions = 0; // discard the immediate subscribe-time replay
+    s.refreshNames(); // same cards/nicknames ⇒ identical roster ⇒ no re-patch
+    unsub();
+    expect(emissions).toBe(0);
+  });
+
+  // Greptile #710 (P1): the lastOwnerKey guard must NOT cache during a non-active
+  // phase. A card-bump poke during the incoming ring runs refreshParticipants
+  // (callId is set) and, without the phase gate, cached the owner key — but the
+  // App clears the groupCall bucket in every non-active phase, so the active
+  // refresh then suppressed the re-feed and left the bucket empty (ringing members
+  // stuck on hex). The active-phase refresh (connect() → phase active) must always
+  // re-feed onRosterOwners after any incoming/connecting-phase refresh.
+  it('re-feeds the card bucket on the active transition despite an incoming-phase refresh (Greptile #710)', async () => {
+    const fed: string[][] = [];
+    const d = makeDeps({ onRosterOwners: (owners: string[]) => { fed.push([...owners]); } });
+    const s = new GroupCallSession(d.deps);
+    // Incoming ring: callId + spaceId are set, so a card-bump poke runs
+    // refreshParticipants while phase === 'incoming' (members resolve to ringing).
+    s.onIncomingGroup('c1'.repeat(16), BOB, 'space-1');
+    s.refreshNames();
+    const fedBeforeActive = fed.length;
+    // Accept → connecting → active. connect()'s active-phase refresh must re-feed.
+    await s.accept();
+    const activeFeeds = fed.slice(fedBeforeActive);
+    expect(activeFeeds.some((owners) => owners.includes(BOB))).toBe(true);
+  });
+});
+
 // 2 ────────────────────────────────────────────────────────────────────────────
 describe('GroupCallSession ring timeout', () => {
   let d: ReturnType<typeof makeDeps>;
