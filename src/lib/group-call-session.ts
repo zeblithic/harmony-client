@@ -245,6 +245,18 @@ export class GroupCallSession {
     if (v !== this.lastSelfSpeaking) { this.lastSelfSpeaking = v; this.refreshParticipants(); }
   }
 
+  /**
+   * ZEB-959: re-resolve participant names from the current resolvers. The roster
+   * already self-heals on presence/decline/speaking events, but a silent ringing
+   * row can lag on hex until the next such event if its card lands late. The App
+   * pokes this from a `cardVersion`/`friendNicknames` reactive effect. Guarded on
+   * an active `callId` so an idle poke (cards land constantly outside calls) never
+   * churns the store.
+   */
+  refreshNames(): void {
+    if (this.callId) this.refreshParticipants();
+  }
+
   /** Merge live beacons (in-call) with full membership (ringing/declined). */
   private refreshParticipants(): void {
     const members = this.spaceId ? (this.deps.resolveMembers?.(this.spaceId) ?? []) : [];

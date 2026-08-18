@@ -289,6 +289,20 @@
   $effect(() => {
     if (groupCallPhase !== 'active') void memberCardService.setBucket('groupCall', []);
   });
+  // ZEB-959: the call sessions resolve peer names into their own state once — the
+  // 1:1 bar at onIncoming, the group roster on presence/decline/speaking events.
+  // The App's card + nickname data is async, so a card landing after that point
+  // would otherwise leave the 1:1 in-call bar (and a silent group ringing row)
+  // stuck on hex for the call's life. Poke both sessions to re-resolve whenever a
+  // card or nickname lands/changes; each poke is a guarded no-op off-call and
+  // patches only on a real name change. (voice-session is not poked — its ~10 Hz
+  // drain-tick refreshRoster already self-heals within a tick.)
+  $effect(() => {
+    cardVersion; // reactive dep: a member card landed or changed
+    friendNicknames; // reactive dep: a friend nickname landed or changed
+    callSession?.refreshPeerName();
+    groupCall?.refreshNames();
+  });
   // Incoming-call banner model. Set when an `incoming-call` event lands AND the
   // session actually entered the 'incoming' phase (not busy-auto-declined);
   // cleared whenever the call leaves that phase (accepted / declined / canceled).

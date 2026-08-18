@@ -260,6 +260,25 @@ export class CallSession {
     this.ringTimer = setTimeout(() => { void this.decline('timeout'); }, RING_TIMEOUT_MS);
   }
 
+  /**
+   * ZEB-959: re-resolve `peerDisplayName` from the current resolvers. `onIncoming`
+   * resolves the name once, but the App's card/nickname subscriptions are async —
+   * a card landing mid-call would otherwise leave the bar on hex for the call's
+   * life. The App pokes this from a `cardVersion`/`friendNicknames` reactive
+   * effect. No-op unless a peer is present (only the callee carries `peerOwnerHex`;
+   * the caller side and idle both leave it null). Patches only on a real change so
+   * an unrelated card bump doesn't churn the store.
+   */
+  refreshPeerName(): void {
+    const s = get(this.store);
+    if (!s.peerOwnerHex) return;
+    const name = resolveMemberName(
+      this.deps.resolveNickname?.(s.peerOwnerHex),
+      this.deps.resolveCard?.(s.peerOwnerHex)?.displayName,
+    ) ?? null;
+    if (name !== s.peerDisplayName) this.patch({ peerDisplayName: name });
+  }
+
   /** Callee side: accept the inbound call and connect the media engine. */
   async accept(): Promise<void> {
     if (get(this.store).phase !== 'incoming') return;

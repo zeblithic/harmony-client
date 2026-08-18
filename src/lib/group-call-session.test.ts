@@ -342,6 +342,46 @@ describe('GroupCallSession participant name ladder (ZEB-958)', () => {
   });
 });
 
+// ZEB-959 ────────────────────────────────────────────────────────────────────
+// A member card can land AFTER the last presence/decline/speaking event, leaving
+// a silent ringing row stuck on hex until the next such event. refreshNames()
+// re-runs refreshParticipants() so the App can poke a re-resolve from its
+// cardVersion/friendNicknames reactive effect. Guarded on an active callId so an
+// idle poke (cards land constantly outside calls) never churns the store.
+describe('GroupCallSession reactive name refresh (ZEB-959)', () => {
+  it('upgrades a ringing row when the card lands after the last presence event', async () => {
+    const ref: { name: string | undefined } = { name: undefined };
+    const d = makeDeps({
+      resolveCard: (h: string) => (h === BOB && ref.name !== undefined ? { displayName: ref.name } : undefined),
+      resolveNickname: () => undefined,
+    });
+    const s = new GroupCallSession(d.deps);
+    await s.joinActive('c1'.repeat(16), 'space-1');
+    // BOB is a member with no beacon ⇒ ringing; his card hasn't loaded yet.
+    s.onPresenceChanged('c1'.repeat(16), [
+      { owner: SELF_OWNER, device: SELF_DEVICE, muted: true },
+    ]);
+    expect(get(s.state).participants.find((p) => p.ownerHex === BOB)?.displayName).toBeUndefined();
+
+    ref.name = 'BobCard'; // card subscription resolves after the presence event
+    s.refreshNames();
+    const bob = get(s.state).participants.find((p) => p.ownerHex === BOB);
+    expect(bob?.state).toBe('ringing');
+    expect(bob?.displayName).toBe('BobCard');
+  });
+
+  it('does not emit a store update when there is no active call (idle)', () => {
+    const d = makeDeps();
+    const s = new GroupCallSession(d.deps);
+    let emissions = 0;
+    const unsub = s.state.subscribe(() => { emissions++; });
+    emissions = 0; // discard the immediate subscribe-time replay
+    s.refreshNames(); // no active callId → guarded no-op, no participant re-patch
+    unsub();
+    expect(emissions).toBe(0);
+  });
+});
+
 // 2 ────────────────────────────────────────────────────────────────────────────
 describe('GroupCallSession ring timeout', () => {
   let d: ReturnType<typeof makeDeps>;
