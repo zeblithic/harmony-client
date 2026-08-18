@@ -76,4 +76,21 @@ describe('FriendsPanel DM-invite inviter name resolution (ZEB-961)', () => {
       expect(getByTestId('dm-invite-inviter-a1').textContent).toBe(`${INVITER.slice(0, 12)}…`),
     );
   });
+
+  // ZEB-961 (CodeRabbit #708): the resolver only resolves a card the service has
+  // subscribed, so the panel must include its pending DM-invite inviters in the
+  // card bucket it drives — otherwise the row above can never resolve a name.
+  it('subscribes DM-invite inviters into the friends card bucket', async () => {
+    const setFriendsBucket = vi.fn();
+    render(FriendsPanel, {
+      props: {
+        service: mockService(),
+        dmInviteService: mockDmSvc([invite]),
+        setFriendsBucket,
+      },
+    });
+    await waitFor(() =>
+      expect(setFriendsBucket).toHaveBeenCalledWith(expect.arrayContaining([INVITER])),
+    );
+  });
 });
