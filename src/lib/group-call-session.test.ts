@@ -422,6 +422,28 @@ describe('GroupCallSession reactive name refresh (ZEB-959)', () => {
     unsub();
     expect(emissions).toBe(0);
   });
+
+  // Greptile #710 (P1): the lastOwnerKey guard must NOT cache during a non-active
+  // phase. A card-bump poke during the incoming ring runs refreshParticipants
+  // (callId is set) and, without the phase gate, cached the owner key — but the
+  // App clears the groupCall bucket in every non-active phase, so the active
+  // refresh then suppressed the re-feed and left the bucket empty (ringing members
+  // stuck on hex). The active-phase refresh (connect() → phase active) must always
+  // re-feed onRosterOwners after any incoming/connecting-phase refresh.
+  it('re-feeds the card bucket on the active transition despite an incoming-phase refresh (Greptile #710)', async () => {
+    const fed: string[][] = [];
+    const d = makeDeps({ onRosterOwners: (owners: string[]) => { fed.push([...owners]); } });
+    const s = new GroupCallSession(d.deps);
+    // Incoming ring: callId + spaceId are set, so a card-bump poke runs
+    // refreshParticipants while phase === 'incoming' (members resolve to ringing).
+    s.onIncomingGroup('c1'.repeat(16), BOB, 'space-1');
+    s.refreshNames();
+    const fedBeforeActive = fed.length;
+    // Accept → connecting → active. connect()'s active-phase refresh must re-feed.
+    await s.accept();
+    const activeFeeds = fed.slice(fedBeforeActive);
+    expect(activeFeeds.some((owners) => owners.includes(BOB))).toBe(true);
+  });
 });
 
 // 2 ────────────────────────────────────────────────────────────────────────────

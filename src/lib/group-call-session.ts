@@ -306,6 +306,7 @@ export class GroupCallSession {
         ...(displayName ? { displayName } : {}),
         ...(card?.avatarUrl ? { avatarUrl: card.avatarUrl } : {}) });
     }
+    const st = get(this.store);
     // ZEB-959 (CodeRabbit #710): subscribe EVERY rendered owner's card — live and
     // silent ringing alike. A ringing member exists only in resolveMembers(spaceId);
     // with no subscription its card is never fetched, so cardVersion never bumps for
@@ -313,15 +314,24 @@ export class GroupCallSession {
     // onRosterOwners, guarded on a sorted owner-set key so a card-bump poke (same
     // members) doesn't re-reconcile the bucket. The key resets in resetToIdle so a
     // later call with the same roster still re-subscribes after the App clears it.
-    const ownerKey = [...new Set(out.map((p) => p.ownerHex))].sort().join(',');
-    if (ownerKey !== this.lastOwnerKey) {
-      this.lastOwnerKey = ownerKey;
-      this.deps.onRosterOwners?.(out.map((p) => p.ownerHex));
+    //
+    // Greptile #710 (P1): feed ONLY during the 'active' phase. The App owns (clears)
+    // the groupCall bucket in every non-active phase, so feeding + caching
+    // lastOwnerKey during incoming/connecting would let this guard suppress the
+    // re-feed after that clear, leaving ringing members on hex. connect() runs a
+    // refresh immediately after entering 'active', so the bucket is always
+    // repopulated on the transition in.
+    if (st.phase === 'active') {
+      const ownerKey = [...new Set(out.map((p) => p.ownerHex))].sort().join(',');
+      if (ownerKey !== this.lastOwnerKey) {
+        this.lastOwnerKey = ownerKey;
+        this.deps.onRosterOwners?.(out.map((p) => p.ownerHex));
+      }
     }
     // ZEB-959 (CodeAnt #710): patch only on a real change — refreshNames() now runs
     // on every card/nickname bump during a call, and an unconditional patch would
     // rebuild the array and wake every subscriber even when nothing changed.
-    if (!participantsEqual(out, get(this.store).participants)) {
+    if (!participantsEqual(out, st.participants)) {
       this.patch({ participants: out });
     }
   }
