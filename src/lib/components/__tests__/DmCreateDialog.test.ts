@@ -234,5 +234,24 @@ describe('DmCreateDialog', () => {
       const name = onSubmit.mock.calls[0][0].name as string;
       expect(name).toContain(SHORT);
     });
+
+    // CodeAnt (PR #706): once a blank-name contact is shown BY its short
+    // address, that address must also be searchable — otherwise the user sees
+    // an identifier they cannot type to find. The search now matches the
+    // address as well as the displayName.
+    it('finds a whitespace-displayName contact by typing its address', async () => {
+      const { getByLabelText, getByRole } = render(DmCreateDialog, {
+        props: {
+          profiles: buildProfiles([[LONG, '   ']]),
+          onSubmit: vi.fn(),
+          onCancel: vi.fn(),
+        },
+      });
+      await fireEvent.input(getByLabelText('Search contacts'), {
+        target: { value: '00112233' },
+      });
+      // The contact (shown by its short address) survives the address search.
+      expect(getByRole('button', { name: SHORT })).toBeInTheDocument();
+    });
   });
 });

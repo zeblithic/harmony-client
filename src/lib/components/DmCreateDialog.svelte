@@ -40,7 +40,10 @@
   let filteredProfiles = $derived.by(() => {
     const q = searchQuery.toLowerCase();
     return Array.from(profiles.entries())
-      .filter(([_addr, p]) => (p.displayName ?? '').toLowerCase().includes(q))
+      // Match the address too, not just the name: a contact with a blank card
+      // name is shown BY its (short) address, so that identifier must be
+      // typeable to find them.
+      .filter(([addr, p]) => (p.displayName ?? '').toLowerCase().includes(q) || addr.toLowerCase().includes(q))
       .filter(([addr, _p]) => !selected.includes(addr))
       .slice(0, 50);
   });
