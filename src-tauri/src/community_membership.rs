@@ -5402,18 +5402,51 @@ pub fn bootstrap_admit_invite_only_publisher(
     // events (the admin's so the InviteToken signer key resolves). The merge's
     // per-event `verify_event` is the authoritative gate; this only needs to
     // reconstruct enough prior to verify + materialize the publisher's join.
+    //
+    // ZEB-954: a moderator-minted invite-only token stamps `inviter = the
+    // moderator`, not the admin, and verify_event P2 now requires the inviter to
+    // be a Joined member meeting the invite tier. So the reconstruction must also
+    // restore the inviter's OWN membership — else a valid moderator invite is
+    // rejected on a cold receiver. Pull the token inviter from the publisher's
+    // self-authorizing PendingJoin and seed their ZEB-911 admission chain (which
+    // terminates at the admin bootstrap the receiver already trusts). Chain
+    // events bypass the membership-kind filter because `admission_chain_for`
+    // already ships the exact status timeline (incl. Leave/Kick), and every
+    // seeded event still re-verifies against its own prior state below — so this
+    // widens no trust surface: a departed inviter's chain replays to not-Joined
+    // and their token is rejected.
+    let inviter_chain_ids: std::collections::HashSet<[u8; 16]> = incoming_events
+        .iter()
+        .find(|e| {
+            e.actor == publisher_addr && matches!(e.kind, MembershipEventKind::PendingJoin { .. })
+        })
+        .and_then(|e| match &e.kind {
+            MembershipEventKind::PendingJoin { invite_token } => Some(invite_token.inviter),
+            _ => None,
+        })
+        .filter(|inv| *inv != admin_addr && *inv != publisher_addr)
+        .map(|inv| {
+            admission_chain_for(incoming_events, inv, admin_addr)
+                .into_iter()
+                .map(|e| e.id)
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut candidates: Vec<&SignedMembershipEvent> = incoming_events
         .iter()
-        .filter(|e| (e.actor == admin_addr || e.actor == publisher_addr) && before_root(e))
         .filter(|e| {
-            matches!(
-                e.kind,
-                MembershipEventKind::Join
-                    | MembershipEventKind::PendingJoin { .. }
-                    | MembershipEventKind::JoinCountersign { .. }
-                    | MembershipEventKind::DeviceAnnounce
-                    | MembershipEventKind::Leave
-            )
+            before_root(e)
+                && (inviter_chain_ids.contains(&e.id)
+                    || ((e.actor == admin_addr || e.actor == publisher_addr)
+                        && matches!(
+                            e.kind,
+                            MembershipEventKind::Join
+                                | MembershipEventKind::PendingJoin { .. }
+                                | MembershipEventKind::JoinCountersign { .. }
+                                | MembershipEventKind::DeviceAnnounce
+                                | MembershipEventKind::Leave
+                        )))
         })
         .collect();
     candidates.sort_by(|a, b| event_sort_key(a).cmp(&event_sort_key(b)));
@@ -10799,6 +10832,91 @@ mod zeb_254_pending_join_verify_tests {
         assert!(
             got.is_none(),
             "a bare Joined publisher (admin founder Join) must not self-admit invite-only"
+        );
+    }
+
+    /// ZEB-954: a MODERATOR-minted invite-only token must bootstrap-admit a cold
+    /// publisher too. The joiner redeemed a moderator's link, so their
+    /// self-authorizing PendingJoin carries a token whose `inviter` is the
+    /// moderator, not the admin. Since verify_event P2 now requires the inviter
+    /// to be a Joined member meeting the invite tier, the cold receiver must
+    /// reconstruct the moderator's OWN admission (their ZEB-911 admission chain:
+    /// an admin-signed PendingJoin + the admin's ratifying JoinCountersign)
+    /// before verifying the joiner's token — else P2 rejects the valid invite.
+    #[test]
+    fn bootstrap_admit_invite_only_publisher_admits_moderator_minted_token() {
+        let admin = mint_test_owner(0xd1);
+        let moderator = mint_test_owner(0xd2);
+        let joiner = mint_test_owner(0xd3);
+        let community_id = SpaceId([0xdc; 16]);
+
+        // Admin bootstrap (root of trust): id [1;16], wall 1.
+        let admin_join = admin_bootstrap_join(&admin, community_id);
+
+        // The moderator's own admission: an admin-signed PendingJoin + the
+        // admin's JoinCountersign ratifying it → the moderator materializes to
+        // Joined (with power >= the v1 invite tier of 0).
+        let mod_token = make_invite_token(&admin, admin.owner, Some(moderator.owner), None);
+        let mod_pending = {
+            let payload = EventPayload {
+                id: [0x21; 16],
+                community_id,
+                kind: MembershipEventKind::PendingJoin {
+                    invite_token: mod_token,
+                },
+                actor: moderator.owner,
+                at: Hlc {
+                    wall_ms: 1_700_000_000_100,
+                    logical: 0,
+                    device_id: "mod-device".into(),
+                },
+            };
+            let ev = sign_event(&payload, &moderator.device_key).expect("sign mod PendingJoin");
+            SignedMembershipEvent {
+                enrollment: Some(moderator.cert.clone()),
+                ..ev
+            }
+        };
+        let mod_countersign = {
+            let payload = EventPayload {
+                id: [0x22; 16],
+                community_id,
+                kind: MembershipEventKind::JoinCountersign {
+                    target_event_id: mod_pending.id,
+                },
+                actor: admin.owner,
+                at: Hlc {
+                    wall_ms: 1_700_000_000_500,
+                    logical: 0,
+                    device_id: "admin".into(),
+                },
+            };
+            sign_event(&payload, &admin.device_key).expect("sign mod countersign")
+        };
+
+        // The joiner's self-authorizing PendingJoin, minted by the MODERATOR
+        // (make_pending_join_event stamps id [9;16], wall 1_700_000_001_000).
+        let joiner_token = make_invite_token(&moderator, moderator.owner, Some(joiner.owner), None);
+        let pending = make_pending_join_event(&joiner, joiner.owner, community_id, joiner_token);
+
+        // Root publish strictly after every prior event.
+        let root_at = Hlc {
+            wall_ms: 1_700_000_002_000,
+            logical: 0,
+            device_id: "root".into(),
+        };
+        let events = vec![admin_join, mod_pending, mod_countersign, pending];
+        let ms = bootstrap_admit_invite_only_publisher(
+            &events,
+            joiner.owner,
+            admin.owner,
+            community_id,
+            &root_at,
+        )
+        .expect("a moderator-minted invite-only PendingJoin must bootstrap-admit the joiner");
+        assert!(
+            matches!(ms.status, MemberStatus::PendingJoin),
+            "moderator-invited joiner is admitted as PendingJoin (pre-counter-sign)"
         );
     }
 
