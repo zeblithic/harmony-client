@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Profile } from '../types';
+  import { nonEmpty } from '../display-label';
 
   let {
     profiles,
@@ -67,7 +68,7 @@
     const truncate = (s: string, n: number) =>
       s.length > n ? s.slice(0, n - 1) + '…' : s;
     const labelFor = (addr: string) =>
-      profiles.get(addr)?.displayName ?? shortAddr(addr);
+      nonEmpty(profiles.get(addr)?.displayName) ?? shortAddr(addr);
     const name =
       kind === 'dm'
         ? `DM with ${labelFor(selected[0])}`
@@ -100,9 +101,9 @@
           type="button"
           class="chip"
           onclick={() => toggleSelect(addr)}
-          aria-label={`Remove ${profile?.displayName ?? shortAddr(addr)}`}
+          aria-label={`Remove ${nonEmpty(profile?.displayName) ?? shortAddr(addr)}`}
         >
-          {profile?.displayName ?? shortAddr(addr)} ✕
+          {nonEmpty(profile?.displayName) ?? shortAddr(addr)} ✕
         </button>
       {/each}
     </div>
@@ -111,7 +112,7 @@
   <div class="contact-list">
     {#each filteredProfiles as [addr, profile] (addr)}
       <button type="button" class="contact" onclick={() => toggleSelect(addr)}>
-        {profile.displayName ?? shortAddr(addr)}
+        {nonEmpty(profile.displayName) ?? shortAddr(addr)}
       </button>
     {/each}
     {#if filteredProfiles.length === 0}

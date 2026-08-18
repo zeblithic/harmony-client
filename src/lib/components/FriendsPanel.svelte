@@ -35,6 +35,7 @@
     onIdentityDiscoverableChanged,
   } from '../connectivity-adapter';
   import { relativeTime } from '../file-utils';
+  import { nonEmpty } from '../display-label';
   import Avatar from './Avatar.svelte';
   import type { ResolvedCard } from '../member-card-service';
   import type { OpenCardPayload } from './MemberRow.svelte';
@@ -447,7 +448,7 @@
     addStatus = null;
     try {
       const result = await service.redeemFriendToken(url);
-      addStatus = `Added ${result.display ?? shortId(result.ownerIdHex)}`;
+      addStatus = `Added ${nonEmpty(result.display) ?? shortId(result.ownerIdHex)}`;
       pasteUrl = '';
       await refresh();
     } catch (e) {
@@ -674,7 +675,7 @@
       const outcome = await service.addByKey(identityPubHex);
       if (destroyed) return;
       if (outcome.kind === 'linked') {
-        addByKeyStatus = `Now connected with ${outcome.display ?? shortId(outcome.ownerIdHex)}`;
+        addByKeyStatus = `Now connected with ${nonEmpty(outcome.display) ?? shortId(outcome.ownerIdHex)}`;
         await refresh();
       } else if (outcome.kind === 'unreachable') {
         addByKeyStatus = "Still couldn't reach them — we'll keep trying in the background.";
@@ -732,7 +733,7 @@
       // mutate state after unmount (CodeAnt).
       if (destroyed) return;
       if (outcome.kind === 'linked') {
-        addByKeyStatus = `Connected with ${outcome.display ?? shortId(outcome.ownerIdHex)}`;
+        addByKeyStatus = `Connected with ${nonEmpty(outcome.display) ?? shortId(outcome.ownerIdHex)}`;
         addByKeyInput = '';
         await refresh();
       } else if (outcome.kind === 'pending') {
@@ -794,10 +795,11 @@
 
   // ── ZEB-419 / ZEB-840: live owner-card resolution (name + avatar) ─────────
   // resolveCard reads App's shared cardVersion internally, so calling it in the
-  // template makes the rows repaint when a poll/event fills a card. Empty strings
-  // fall through (`||` not `??`) so a blank card name never masks a usable hint.
+  // template makes the rows repaint when a poll/event fills a card. A blank or
+  // whitespace-only card name falls through (`nonEmpty` guard) so it never masks
+  // a usable hint — a published card displayName has no non-blank constraint.
   function cardName(ownerIdHex: string): string | undefined {
-    return resolveCard?.(ownerIdHex)?.displayName || undefined;
+    return nonEmpty(resolveCard?.(ownerIdHex)?.displayName);
   }
   function cardAvatarUrl(ownerIdHex: string): string | undefined {
     return resolveCard?.(ownerIdHex)?.avatarUrl;
@@ -805,11 +807,13 @@
   // Label ladder: personal nickname ► live card name ► frozen link hint ►
   // short owner_id. The short-hex line under the name stays the verifiable id.
   function friendLabel(f: FriendDto): string {
-    return f.nickname || cardName(f.ownerIdHex) || f.display || shortId(f.ownerIdHex);
+    return (
+      nonEmpty(f.nickname) ?? cardName(f.ownerIdHex) ?? nonEmpty(f.display) ?? shortId(f.ownerIdHex)
+    );
   }
   // Pending requests have no nickname rung (you nickname a peer after accepting).
   function requestLabel(r: PendingFriendRequestDto): string {
-    return cardName(r.ownerIdHex) || r.display || shortId(r.ownerIdHex);
+    return cardName(r.ownerIdHex) ?? nonEmpty(r.display) ?? shortId(r.ownerIdHex);
   }
 
   // ZEB-419: open the owner-card drill-down (App's ProfilePopover owner-card
@@ -979,7 +983,7 @@
                   {@const introKey = `${f.ownerIdHex}:${r.ownerIdHex}`}
                   <li class="referral-item" data-testid="referral-item">
                     <span class="referral-name" title={r.ownerIdHex}>
-                      {r.display ?? shortId(r.ownerIdHex)}
+                      {nonEmpty(r.display) ?? shortId(r.ownerIdHex)}
                     </span>
                     {#if r.alreadyFriend}
                       <span class="already-friend-badge" data-testid="already-friend-badge">

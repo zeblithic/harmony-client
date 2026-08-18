@@ -200,4 +200,39 @@ describe('DmCreateDialog', () => {
     const submitBtn = getByText(/start dm/i);
     expect(submitBtn).toBeDisabled();
   });
+
+  // ── ZEB-960: a whitespace-only card displayName must fall to the short
+  // address, never render (or persist) a blank label. ──
+  describe('ZEB-960 name ladder', () => {
+    const LONG = '0011223344556677'; // >8 chars, so shortAddr truncates
+    const SHORT = '00112233…';
+
+    it('lists a whitespace-displayName contact by its short address, not a blank button', () => {
+      const { getByRole } = render(DmCreateDialog, {
+        props: {
+          profiles: buildProfiles([[LONG, '   ']]),
+          onSubmit: vi.fn(),
+          onCancel: vi.fn(),
+        },
+      });
+      expect(getByRole('button', { name: SHORT })).toBeInTheDocument();
+    });
+
+    it('builds the persisted DM name from the short address, never blank whitespace', async () => {
+      const onSubmit = vi.fn();
+      const { container, getByText } = render(DmCreateDialog, {
+        props: {
+          profiles: buildProfiles([[LONG, '   ']]),
+          onSubmit,
+          onCancel: vi.fn(),
+        },
+      });
+      // The contact button carries a blank (whitespace) label pre-fix, so
+      // select it structurally rather than by its (empty) accessible name.
+      await fireEvent.click(container.querySelector('.contact')!);
+      await fireEvent.click(getByText(/start dm/i));
+      const name = onSubmit.mock.calls[0][0].name as string;
+      expect(name).toContain(SHORT);
+    });
+  });
 });

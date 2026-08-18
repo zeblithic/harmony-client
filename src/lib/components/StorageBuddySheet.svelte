@@ -5,6 +5,7 @@
   import type { Profile } from '../types';
   import type { ContributionSummaryDto, StorageBuddyDto } from '../storage-buddy-service';
   import { formatBytes } from '../file-utils';
+  import { nonEmpty } from '../display-label';
 
   let {
     buddies,
@@ -48,7 +49,14 @@
   }
 
   function label(b: StorageBuddyDto): string {
-    return b.petName ?? friendContacts.get(b.ownerAddress)?.displayName ?? shortAddr(b.ownerAddress);
+    // A local petName and a peer's published card displayName both lack a
+    // non-blank constraint — guard each with nonEmpty() so a whitespace value
+    // falls through to the short address instead of rendering a blank name.
+    return (
+      nonEmpty(b.petName) ??
+      nonEmpty(friendContacts.get(b.ownerAddress)?.displayName) ??
+      shortAddr(b.ownerAddress)
+    );
   }
 
   function shortAddr(addr: string): string {
@@ -372,8 +380,8 @@
               data-testid="invite-candidate-{addr}"
               onclick={() => (selectedInvite = selectedInvite === addr ? null : addr)}
             >
-              <Avatar address={addr} displayName={profile.displayName ?? shortAddr(addr)} size={24} />
-              {profile.displayName ?? shortAddr(addr)}
+              <Avatar address={addr} displayName={nonEmpty(profile.displayName) ?? shortAddr(addr)} size={24} />
+              {nonEmpty(profile.displayName) ?? shortAddr(addr)}
             </button>
           {/each}
         </div>
