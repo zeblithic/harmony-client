@@ -380,6 +380,48 @@ describe('GroupCallSession reactive name refresh (ZEB-959)', () => {
     unsub();
     expect(emissions).toBe(0);
   });
+
+  // CodeRabbit #710 (Major): refreshNames() is toothless for a silent ringing
+  // member unless that member's card is actually subscribed — a ringing member
+  // exists only in resolveMembers(spaceId), so if the bucket subscribes only the
+  // live beacon set their cardVersion never bumps. The session must report EVERY
+  // rendered owner (live + ringing) to onRosterOwners so the App bucket fetches
+  // them, mirroring the feedAuthors bucket from ZEB-962.
+  it('subscribes silent ringing members, not just the live roster (CodeRabbit #710)', async () => {
+    const fed: string[][] = [];
+    const d = makeDeps({ onRosterOwners: (owners: string[]) => { fed.push(owners); } });
+    const s = new GroupCallSession(d.deps);
+    await s.joinActive('c1'.repeat(16), 'space-1');
+    // Only self is live; ALICE/BOB/CAROL are members with no beacon ⇒ ringing.
+    s.onPresenceChanged('c1'.repeat(16), [
+      { owner: SELF_OWNER, device: SELF_DEVICE, muted: true },
+    ]);
+    const last = fed.at(-1) ?? [];
+    expect(last).toContain(BOB);   // ringing member is subscribed for its card
+    expect(last).toContain(CAROL); // ringing member is subscribed for its card
+  });
+
+  // CodeAnt #710 (Minor): refreshNames() now runs on every card/nickname bump
+  // during a call. refreshParticipants() must patch only on a real change —
+  // otherwise every unrelated card update rebuilds the array and wakes all
+  // subscribers. Mirrors voice-session's change-only refreshRoster.
+  it('does not re-patch participants when a refresh resolves no change (CodeAnt #710)', async () => {
+    const d = makeDeps({
+      resolveCard: (h: string) => (h === BOB ? { displayName: 'BobCard' } : undefined),
+      resolveNickname: () => undefined,
+    });
+    const s = new GroupCallSession(d.deps);
+    await s.joinActive('c1'.repeat(16), 'space-1');
+    s.onPresenceChanged('c1'.repeat(16), [
+      { owner: SELF_OWNER, device: SELF_DEVICE, muted: true },
+    ]);
+    let emissions = 0;
+    const unsub = s.state.subscribe(() => { emissions++; });
+    emissions = 0; // discard the immediate subscribe-time replay
+    s.refreshNames(); // same cards/nicknames ⇒ identical roster ⇒ no re-patch
+    unsub();
+    expect(emissions).toBe(0);
+  });
 });
 
 // 2 ────────────────────────────────────────────────────────────────────────────
