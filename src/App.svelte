@@ -97,6 +97,7 @@
   import type { AppMode, Message, MessagePriority, Profile, ThreadDisplayMode, FileViewMode, ContentSection, ReplicationTier, MailFolderKind, MailMessageDetail, ContentItem, CleanupRecommendation, FileGrant, ReceivedFile } from './lib/types';
   import { getThreadMeta } from './lib/feed-utils';
   import { resolveAuthorLabel } from './lib/mention-render';
+  import { resolveMemberName } from './lib/display-label';
   import { findNode, findNearestFolder, resolveChannelSelection } from './lib/nav-utils';
   import { isTauri } from './lib/tauri-env';
   import { onMount } from 'svelte';
@@ -499,6 +500,7 @@
             ...(card.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
           };
         },
+        resolveNickname,
         onRosterOwners: (ownerHexes: string[]) => {
           // ZEB-840: the 1:1 voice-call roster is its own bucket, unioned with
           // the community / dm / friends buckets — a call-roster reconcile no
@@ -524,6 +526,7 @@
             ...(card.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
           };
         },
+        resolveNickname,
         // ZEB-357: caller-side terminal outcomes author a call-event DM.
         onCallOutcome: recordCallOutcome,
       });
@@ -547,6 +550,7 @@
             ...(card.avatarUrl ? { avatarUrl: card.avatarUrl } : {}),
           };
         },
+        resolveNickname,
         resolveMembers: (spaceId: string) => getCachedGroupMembers(spaceId),
         onRosterOwners: (ownerHexes: string[]) => {
           // ZEB-840: the group-call roster is its own bucket, unioned with the
@@ -633,7 +637,7 @@
       incomingCall = {
         callId: p.callId,
         spaceId: p.spaceId,
-        callerName: card?.displayName ?? p.callerOwner.slice(0, 8),
+        callerName: resolveMemberName(p.callerOwner, resolveNickname, resolveCard) ?? p.callerOwner.slice(0, 8),
         ...(card?.avatarUrl ? { callerAvatarUrl: card.avatarUrl } : {}),
       };
       // ZEB-356: escalate to the OS if the window is unfocused (no-op if focused).
@@ -663,7 +667,7 @@
     const gst = groupCall ? get(groupCall.state) : null;
     if (gst && gst.phase === 'incoming' && gst.callId === p.callId) {
       const card = resolveCard(p.callerOwner);
-      const name = card?.displayName ?? p.callerOwner.slice(0, 8);
+      const name = resolveMemberName(p.callerOwner, resolveNickname, resolveCard) ?? p.callerOwner.slice(0, 8);
       const groupName = navService.nodes.find((n) => n.id === p.spaceId)?.name ?? 'a group';
       // T13: raise the in-app ring toast (cleared when the group phase leaves
       // 'incoming' via the subscription in buildVoiceSession).

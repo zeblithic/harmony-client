@@ -41,6 +41,50 @@ function lastArgsFor(invoke: ReturnType<typeof vi.fn>, cmd: string): Record<stri
   return undefined;
 }
 
+// ZEB-958 — the 1:1 in-call bar showed the caller's raw hex. The session now
+// resolves a peerDisplayName through the nickname → card ladder on an incoming
+// invite (activating the previously-dead resolveCard dep + a new resolveNickname
+// rung), leaving it null when neither yields a non-blank name so the bar falls
+// back to its own hex short-id.
+describe('CallSession peer name ladder (ZEB-958)', () => {
+  const CALLER = 'cc'.repeat(16);
+
+  function sessionWith(
+    resolveCard: (h: string) => { displayName?: string } | undefined,
+    resolveNickname: (h: string) => string | undefined,
+  ) {
+    const d = deps();
+    return new CallSession({
+      invoke: d.invoke, listen: d.listen,
+      selfOwnerHex: 'aa'.repeat(16), selfDeviceHex: 'bb'.repeat(16),
+      senderHash: new Uint8Array(16),
+      resolveCard, resolveNickname,
+      ...d.factories,
+    });
+  }
+
+  it('resolves peerDisplayName via the nickname over the card on an incoming invite', () => {
+    const s = sessionWith(
+      (h) => (h === CALLER ? { displayName: 'CallerCard' } : undefined),
+      (h) => (h === CALLER ? 'Ziggy' : undefined),
+    );
+    s.onIncoming('call-1', CALLER, 'space-1');
+    expect(get(s.state).peerDisplayName).toBe('Ziggy');
+  });
+
+  it('falls to the card name when there is no nickname', () => {
+    const s = sessionWith((h) => (h === CALLER ? { displayName: 'CallerCard' } : undefined), () => undefined);
+    s.onIncoming('call-1', CALLER, 'space-1');
+    expect(get(s.state).peerDisplayName).toBe('CallerCard');
+  });
+
+  it('leaves peerDisplayName null for a whitespace-only published card name (bar shows hex)', () => {
+    const s = sessionWith(() => ({ displayName: '   ' }), () => undefined);
+    s.onIncoming('call-1', CALLER, 'space-1');
+    expect(get(s.state).peerDisplayName).toBeNull();
+  });
+});
+
 describe('CallSession DM signaling', () => {
   let d: ReturnType<typeof deps>;
   beforeEach(() => { d = deps(); });
