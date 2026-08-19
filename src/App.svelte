@@ -1446,11 +1446,20 @@
     channelUnread?.markChannelRead(communityId, channelId);
   }
 
-  // ZEB-663: nav channel management — gated to the selected community at power
-  // ≥ kick (App resolves power for the selected community only).
-  function canManageSelectedCommunityChannels(communityId: string): boolean {
-    return communityId === selectedCommunityId && myCommunityPower >= POWER_THRESHOLDS.kick;
-  }
+  // ZEB-965: the channel list (and its manage affordances) moved into
+  // CommunityView's right-hand ChannelsPanel; the power ≥ kick gate now lives
+  // in CommunityView (canManageChannels), replacing the App-level
+  // canManageSelectedCommunityChannels predicate.
+
+  // ZEB-965: active Tier-2 proposal count for the selected community — drives
+  // the ChannelsPanel proposals-row badge. Reading proposalCountVersion
+  // registers the reactive dependency (bumped by ProposalCountService.onChange).
+  let selectedCommunityProposalCount = $derived.by(() => {
+    void proposalCountVersion;
+    return selectedCommunityId != null
+      ? proposalCountService.countFor(selectedCommunityId)
+      : undefined;
+  });
 
   // Wired as fire-and-forget nav-row callbacks (onRenameChannel/onDeleteChannel
   // aren't awaited), so an unguarded listChannels rejection would surface as an
@@ -3641,11 +3650,11 @@
   let navActiveNodeId = $derived(
     notesSelected
       ? null
-      : selectedCommunityId
-        // ZEB-663: on the Channels view, highlight the active channel row;
-        // otherwise (proposals/charter/tier3, or no channel yet) the community.
-        ? (communityActiveView === 'channels' ? (selectedChannelId ?? selectedCommunityId) : selectedCommunityId)
-        : activeChannel,
+      // ZEB-965: the left nav renders communities flat (channel rows moved to
+      // CommunityView's ChannelsPanel, which highlights the active channel
+      // itself), so the community row is the left-nav highlight whenever a
+      // community is selected — regardless of which channel/view is open.
+      : (selectedCommunityId ?? activeChannel),
   );
 
   function switchMode(mode: AppMode) {
@@ -4130,17 +4139,6 @@
           }
           return false;
         }}
-        proposalCount={(node) => {
-          // Reading proposalCountVersion registers the reactive dependency.
-          void proposalCountVersion;
-          return proposalCountService.countFor(node.id);
-        }}
-        onSelectProposals={openCommunityProposals}
-        proposalsActiveFor={communityActiveView === 'proposals' ? selectedCommunityId : null}
-        canManageChannels={canManageSelectedCommunityChannels}
-        onAddChannel={() => { showCreateChannelDialog = true; }}
-        onRenameChannel={openRenameChannel}
-        onDeleteChannel={openDeleteChannel}
         identity={identityChipInfo}
         showConnectionStatus={true}
         onModeChange={switchMode}
@@ -4208,6 +4206,16 @@
         {votingAdapter}
         {selectedChannelId}
         bind:activeView={communityActiveView}
+        {navNodes}
+        onSelectChannel={(channelId) => {
+          // ZEB-965: right-panel channel row → the same selection primitive the
+          // left-nav channel rows used (unread/mention clearing included).
+          if (selectedCommunityNode) openCommunityChannel(selectedCommunityNode.id, channelId);
+        }}
+        onAddChannel={() => { showCreateChannelDialog = true; }}
+        onRenameChannel={openRenameChannel}
+        onDeleteChannel={openDeleteChannel}
+        proposalCount={selectedCommunityProposalCount}
         onForkSuccess={(forkSpaceId) => {
           // ZEB-285: navigate to the newly created fork community and
           // refresh its member roster (matching create/join/redeem flows).

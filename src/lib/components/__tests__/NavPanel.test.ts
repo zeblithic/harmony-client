@@ -508,75 +508,63 @@ describe('NavPanel', () => {
     });
   });
 
-  describe('Proposals nav row (ZEB-606)', () => {
+  describe('Left nav is communities-flat (ZEB-965)', () => {
     const base = { unreadCount: 0, mentionCount: 0, unreadLevel: 'none' as const };
     const expandedCommunity: NavNode[] = [
       { id: 'comm-1', parentId: null, type: 'community', name: 'IPFS Crew', expanded: true, ...base, lastActivity: 2 },
       { id: 'chan-1', parentId: 'comm-1', type: 'channel', name: 'general', expanded: false, ...base, lastActivity: 1 },
     ];
 
-    it('renders the row with a mono count badge inside an expanded community', () => {
+    // ZEB-965: the proposals row (ZEB-606), channel rows, and the ＋ add-channel
+    // row (ZEB-663) all moved to CommunityView's right-hand ChannelsPanel.
+    it('renders the community row but neither its channels nor a proposals row', () => {
       const { container } = render(NavPanel, {
-        props: {
-          nodes: expandedCommunity,
-          collapsed: false,
-          proposalCount: () => 3,
-          onSelectProposals: vi.fn(),
-        },
+        props: { nodes: expandedCommunity, collapsed: false },
       });
-      const row = container.querySelector('[data-testid="proposals-row-comm-1"]');
-      expect(row).toBeTruthy();
-      expect(row?.textContent).toContain('proposals');
-      expect(row?.querySelector('.count-badge')?.textContent).toBe('3');
-    });
-
-    it('shows no badge for zero or unknown counts (row still renders)', () => {
-      const { container } = render(NavPanel, {
-        props: {
-          nodes: expandedCommunity,
-          collapsed: false,
-          proposalCount: () => 0,
-          onSelectProposals: vi.fn(),
-        },
-      });
-      const row = container.querySelector('[data-testid="proposals-row-comm-1"]');
-      expect(row).toBeTruthy();
-      expect(row?.querySelector('.count-badge')).toBeNull();
-    });
-
-    it('clicking the row fires onSelectProposals with the community id', async () => {
-      const onSelectProposals = vi.fn();
-      const { container } = render(NavPanel, {
-        props: { nodes: expandedCommunity, collapsed: false, proposalCount: () => 1, onSelectProposals },
-      });
-      await fireEvent.click(container.querySelector('[data-testid="proposals-row-comm-1"]')!);
-      expect(onSelectProposals).toHaveBeenCalledWith('comm-1');
-    });
-
-    it('is active when proposalsActiveFor matches the community', () => {
-      const { container } = render(NavPanel, {
-        props: {
-          nodes: expandedCommunity,
-          collapsed: false,
-          proposalCount: () => 1,
-          onSelectProposals: vi.fn(),
-          proposalsActiveFor: 'comm-1',
-        },
-      });
-      expect(container.querySelector('[data-testid="proposals-row-comm-1"]')?.classList.contains('active')).toBe(true);
-    });
-
-    it('renders no row without the resolver (no votingAdapter contexts)', () => {
-      const { container } = render(NavPanel, { props: { nodes: expandedCommunity, collapsed: false } });
+      expect(screen.getByText('IPFS Crew')).toBeTruthy();
+      expect(screen.queryByText('general')).toBeNull();
       expect(container.querySelector('[data-testid="proposals-row-comm-1"]')).toBeNull();
+      expect(container.querySelector('[data-testid="add-channel-row-comm-1"]')).toBeNull();
     });
 
-    it('renders no row for a collapsed community', () => {
-      const collapsedNodes = [{ ...expandedCommunity[0], expanded: false }];
+    it('community rows carry no expand/collapse chevron', () => {
+      render(NavPanel, { props: { nodes: expandedCommunity, collapsed: false } });
+      expect(screen.queryByLabelText(/Collapse community|Expand community/)).toBeNull();
+    });
+  });
+
+  describe('Notes as a footer mode button (ZEB-965)', () => {
+    it('renders Notes inside the App-mode button group, not as a top nav row', () => {
       const { container } = render(NavPanel, {
-        props: { nodes: collapsedNodes, collapsed: false, proposalCount: () => 1, onSelectProposals: vi.fn() },
+        props: { nodes: [], collapsed: false, onSelectNotes: vi.fn() },
       });
-      expect(container.querySelector('[data-testid="proposals-row-comm-1"]')).toBeNull();
+      const group = container.querySelector('[role="group"][aria-label="App mode"]')!;
+      const notesBtn = screen.getByRole('button', { name: 'Notes' });
+      expect(group.contains(notesBtn)).toBe(true);
+      expect(container.querySelector('.notes-nav-row')).toBeNull();
+    });
+
+    it('clicking Notes fires onSelectNotes and active state follows notesActive', async () => {
+      const onSelectNotes = vi.fn();
+      render(NavPanel, {
+        props: { nodes: [], collapsed: false, onSelectNotes, notesActive: true },
+      });
+      const notesBtn = screen.getByRole('button', { name: 'Notes' });
+      expect(notesBtn.getAttribute('aria-pressed')).toBe('true');
+      await fireEvent.click(notesBtn);
+      expect(onSelectNotes).toHaveBeenCalled();
+    });
+
+    it('Messages does not read active while Notes is the selected view', () => {
+      render(NavPanel, {
+        props: { nodes: [], collapsed: false, appMode: 'messages', onSelectNotes: vi.fn(), notesActive: true },
+      });
+      expect(screen.getByRole('button', { name: 'Messages' }).getAttribute('aria-pressed')).toBe('false');
+    });
+
+    it('renders no Notes button when onSelectNotes is not wired', () => {
+      render(NavPanel, { props: { nodes: [], collapsed: false } });
+      expect(screen.queryByRole('button', { name: 'Notes' })).toBeNull();
     });
   });
 
@@ -636,28 +624,19 @@ describe('NavPanel — collapse persistence (ZEB-838)', () => {
     unreadLevel: 'none',
   };
 
-  it('keeps a community collapsed after the nodes prop is rebuilt by a backend update', async () => {
-    // Regression: collapsing a community then receiving ANY backend update
-    // (e.g. a message from another client bumps unreadCount → navService
-    // rebuilds the nodes prop) used to re-expand every community, because the
-    // collapse lived only on NavPanel's local mirror, which `$effect.pre`
-    // re-hydrated from the service — where a community defaults to
-    // expanded:true — on the next `nodes` prop change.
+  // ZEB-965: community expand/collapse is retired — the left nav renders
+  // communities flat and channels live in CommunityView's ChannelsPanel. The
+  // ZEB-838 override machinery remains for FOLDER state (tests below); the two
+  // community-collapse persistence tests it carried are superseded by this
+  // flatness regression check.
+  it('never renders channel rows in the left nav, before or after a nodes-prop rebuild', async () => {
     const { rerender } = render(NavPanel, {
       props: { nodes: [community, channel], collapsed: false },
     });
-
-    // Community starts expanded → its channel child renders.
-    expect(screen.getByText('chatroom')).toBeTruthy();
-
-    // User collapses the community.
-    await fireEvent.click(screen.getByLabelText('Collapse community'));
+    expect(screen.getByText('Alpha')).toBeTruthy();
     expect(screen.queryByText('chatroom')).toBeNull();
-    expect(screen.getByLabelText('Expand community')).toBeTruthy();
 
-    // A backend update rebuilds the nodes prop: fresh node objects, the
-    // community still expanded:true (the service default it never learned to
-    // change), unread bumped as if a message just arrived on another client.
+    // A backend update rebuilds the nodes prop (unread bump) — still flat.
     await rerender({
       nodes: [
         { ...community, unreadCount: 3, unreadLevel: 'quiet' },
@@ -665,32 +644,8 @@ describe('NavPanel — collapse persistence (ZEB-838)', () => {
       ],
       collapsed: false,
     });
-
-    // The user's collapse must survive the re-sync.
+    await tick();
     expect(screen.queryByText('chatroom')).toBeNull();
-    expect(screen.getByLabelText('Expand community')).toBeTruthy();
-  });
-
-  it('prunes a stale override when its node is removed, so a re-add uses the service default', async () => {
-    // Qodo (#573): the override Map must not retain ids that leave the tree —
-    // otherwise it grows unbounded, and rejoining a community (same id) would
-    // inherit the old collapse instead of the fresh default.
-    const { rerender } = render(NavPanel, {
-      props: { nodes: [community, channel], collapsed: false },
-    });
-
-    // Collapse it, then the community is removed (user left it).
-    await fireEvent.click(screen.getByLabelText('Collapse community'));
-    expect(screen.getByLabelText('Expand community')).toBeTruthy();
-    await rerender({ nodes: [], collapsed: false });
-    await tick(); // let the prune effect run against the now-empty node set
-    expect(screen.queryByLabelText('Expand community')).toBeNull();
-
-    // Re-added later (rejoined): the stale collapse override must be gone, so it
-    // honors the service default (expanded) — chevron reads "Collapse", child shows.
-    await rerender({ nodes: [community, channel], collapsed: false });
-    expect(screen.getByLabelText('Collapse community')).toBeTruthy();
-    expect(screen.getByText('chatroom')).toBeTruthy();
   });
 
   it('keeps a folder display-mode change after a nodes-prop rebuild', async () => {

@@ -41,13 +41,6 @@
     onSubmitFeedback,
     onShowAbout,
     onOpenDocs,
-    proposalCount,
-    onSelectProposals,
-    proposalsActiveFor = null,
-    canManageChannels,
-    onAddChannel,
-    onRenameChannel,
-    onDeleteChannel,
     identity,
     showConnectionStatus = false,
     contributionSummary = null,
@@ -92,20 +85,6 @@
     onSubmitFeedback?: () => void;
     onShowAbout?: () => void;
     onOpenDocs?: () => void;
-    /** ZEB-606: active Tier-2 proposal count resolver for community rows. */
-    proposalCount?: (node: NavNode) => number | undefined;
-    /** ZEB-606: open a community's Proposals view (nav proposals row). */
-    onSelectProposals?: (communityId: string) => void;
-    /** ZEB-606: community id whose Proposals view is open (row active state). */
-    proposalsActiveFor?: string | null;
-    /** ZEB-663: may the viewer manage the given community's channels? */
-    canManageChannels?: (communityId: string) => boolean;
-    /** ZEB-663: open the create-channel dialog for a community. */
-    onAddChannel?: (communityId: string) => void;
-    /** ZEB-663: open rename dialog for a channel node. */
-    onRenameChannel?: (communityId: string, channelId: string) => void;
-    /** ZEB-663: open delete-confirm for a channel node. */
-    onDeleteChannel?: (communityId: string, channelId: string) => void;
     /** ZEB-606: identity-chip signals (App-computed). Chip renders only when
      *  provided, so bare test construction stays chip-free. */
     identity?: { displayName: string; ownerIdHex: string | null; selfOnline: boolean; selfSovereign: boolean };
@@ -384,18 +363,7 @@
       {:else if appMode === 'spellbook'}
         <!-- Spellbook mode uses its own tab content -->
       {:else}
-        {#if appMode === 'messages' && onSelectNotes}
-          <button
-            type="button"
-            class="notes-nav-row"
-            class:active={notesActive}
-            aria-pressed={notesActive}
-            onclick={() => onSelectNotes?.()}
-          >
-            <span class="notes-nav-icon" aria-hidden="true">📝</span>
-            <span>Notes</span>
-          </button>
-        {/if}
+        <!-- ZEB-965: the Notes entry moved to the footer mode-toggle group. -->
         {#if hasUnheadedTop}
           <NavTree
             nodes={filteredNodes}
@@ -408,13 +376,6 @@
             onSortOrderChange={changeSortOrder}
             {profileLookup}
             {presenceOnline}
-            {proposalCount}
-            {onSelectProposals}
-            {proposalsActiveFor}
-            {canManageChannels}
-            {onAddChannel}
-            {onRenameChannel}
-            {onDeleteChannel}
           />
         {/if}
         {#if hasCommunitiesTop}
@@ -430,13 +391,6 @@
             onSortOrderChange={changeSortOrder}
             {profileLookup}
             {presenceOnline}
-            {proposalCount}
-            {onSelectProposals}
-            {proposalsActiveFor}
-            {canManageChannels}
-            {onAddChannel}
-            {onRenameChannel}
-            {onDeleteChannel}
           />
         {/if}
         {#if hasDmsTop}
@@ -452,13 +406,6 @@
             onSortOrderChange={changeSortOrder}
             {profileLookup}
             {presenceOnline}
-            {proposalCount}
-            {onSelectProposals}
-            {proposalsActiveFor}
-            {canManageChannels}
-            {onAddChannel}
-            {onRenameChannel}
-            {onDeleteChannel}
           />
         {/if}
         <!-- ZEB-553 item 13: zero-community empty-state CTA. Suppressed while a
@@ -487,9 +434,19 @@
            override re-enables them. Hiding the rail button does not remove a
            feature's backend or its contextual entry points. -->
       <div class="mode-toggles" role="group" aria-label="App mode">
-        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'messages'}
-          aria-label="Messages" aria-pressed={appMode === 'messages'}
+        <!-- ZEB-965: Notes is a selection *within* messages mode, so while it's
+             active the Messages button must not also read active. -->
+        <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'messages' && !notesActive}
+          aria-label="Messages" aria-pressed={appMode === 'messages' && !notesActive}
           onclick={() => onModeChange?.('messages')}>Messages</button>
+        {#if onSelectNotes}
+          <!-- ZEB-965: rehomed from its own row at the top of the community
+               list. Clicking always lands in Notes (selectNotes switches to
+               messages mode itself when needed). -->
+          <button type="button" class="nav-action-btn mode-toggle" class:active={notesActive}
+            aria-label="Notes" aria-pressed={notesActive}
+            onclick={() => onSelectNotes?.()}>Notes</button>
+        {/if}
         {#if navFlags.vines}
           <button type="button" class="nav-action-btn mode-toggle" class:active={appMode === 'vines'}
             aria-label="Vines" aria-pressed={appMode === 'vines'}
@@ -590,7 +547,7 @@
   }
 
   /* ZEB-569: active (Settings open) — mirrors the .active convention used by
-     .notes-nav-row / .mode-toggle in this rail. */
+     .mode-toggle in this rail. */
   .settings-btn.active {
     background: var(--primary-soft);
     color: var(--primary-deep);
@@ -628,28 +585,6 @@
     color: var(--text-faint);
     user-select: none;
   }
-
-  /* ZEB-334: pinned, always-present self-notes row at the top of the
-     messages nav. Not a NavNode — a fixed affordance for the private
-     scratchpad that doubles as the zero-community default view. */
-  .notes-nav-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: calc(100% - 16px);
-    margin: 0 8px 4px;
-    padding: 6px 8px;
-    border: none;
-    border-radius: 4px;
-    background: transparent;
-    color: var(--text-primary);
-    font-size: 0.875rem;
-    text-align: left;
-    cursor: pointer;
-  }
-  .notes-nav-row:hover { background: var(--bg-tertiary); }
-  .notes-nav-row.active { background: var(--primary-soft); color: var(--primary-deep); }
-  .notes-nav-icon { font-size: 0.95rem; }
 
   /* ZEB-553 item 13: zero-community empty-state redeem CTA. */
   .nav-empty-state {
