@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- ZEB-968: embedded by the ad-hoc codesign via bundle.macOS.entitlements.
+     Tauri signs with the hardened runtime (bundle.macOS.hardenedRuntime
+     defaults true; codesign flags show `adhoc,runtime` since the ZEB-837
+     seal), and a hardened-runtime app is OS-blocked from microphone capture
+     unless it carries this entitlement — even with the Info.plist usage
+     string in place. Keep hardenedRuntime enabled: it is part of the signed
+     seal whose Gatekeeper behavior ZEB-837 established. -->
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>
