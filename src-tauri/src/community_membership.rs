@@ -2280,6 +2280,22 @@ pub fn event_sort_key(e: &SignedMembershipEvent) -> impl Ord + '_ {
     )
 }
 
+/// ZEB-964: the ZEB-888 wall-clock causality guard as a shared predicate — a
+/// `JoinCountersign` can only fix a canonical claimant when it is not
+/// backdated before the `PendingJoin` it approves. Every consumer that
+/// reasons about whether a countersign "counts" (the canonical-claimant
+/// pre-pass, the claimed-by-other guard, the auto-countersign heal
+/// predicates, the acceptor's response selection) must share this exact
+/// comparison, or they diverge from what materialization will actually
+/// promote. Compares `wall_ms` only (not the full `event_sort_key`) so an
+/// honest same-millisecond countersign is never excluded.
+pub(crate) fn countersign_passes_causality_guard(
+    countersign_wall_ms: u64,
+    target_pending_wall_ms: u64,
+) -> bool {
+    countersign_wall_ms >= target_pending_wall_ms
+}
+
 /// ZEB-888 (Layer 2, defense-in-depth): true iff some committed
 /// `JoinCountersign` targets a `PendingJoin` carrying the SAME invite-token sig
 /// as `pending_id`'s `PendingJoin` but belonging to a DIFFERENT actor — i.e. the
@@ -2289,6 +2305,11 @@ pub fn event_sort_key(e: &SignedMembershipEvent) -> impl Ord + '_ {
 /// other's countersign), which is why the AUTHORITATIVE single-use fence is the
 /// canonical-claimant rule in `materialize_with_now`, not this guard. Returns
 /// `false` if `pending_id` is not a known `PendingJoin`.
+///
+/// ZEB-964: only guard-passing countersigns read as claims — a backdated one
+/// fixes no canonical claimant at materialization, so counting it here would
+/// (a) block the auto-countersign heal for the honest claimant and (b)
+/// disagree with the authoritative fence this guard exists to approximate.
 pub(crate) fn invite_token_claimed_by_other_actor(
     events: &[SignedMembershipEvent],
     pending_id: EventId,
@@ -2301,12 +2322,13 @@ pub(crate) fn invite_token_claimed_by_other_actor(
     }) else {
         return false;
     };
-    // PendingJoin event id -> (token sig, actor), for target-of-countersign lookup.
-    let pending_meta: std::collections::HashMap<EventId, ([u8; 64], OwnerAddr)> = events
+    // PendingJoin event id -> (token sig, actor, wall_ms), for
+    // target-of-countersign lookup + the ZEB-964 causality-guard check.
+    let pending_meta: std::collections::HashMap<EventId, ([u8; 64], OwnerAddr, u64)> = events
         .iter()
         .filter_map(|e| match &e.kind {
             MembershipEventKind::PendingJoin { invite_token } => {
-                Some((e.id, (invite_token.sig, e.actor)))
+                Some((e.id, (invite_token.sig, e.actor, e.at.wall_ms)))
             }
             _ => None,
         })
@@ -2314,7 +2336,11 @@ pub(crate) fn invite_token_claimed_by_other_actor(
     events.iter().any(|c| match &c.kind {
         MembershipEventKind::JoinCountersign { target_event_id } => pending_meta
             .get(target_event_id)
-            .map(|(tok, actor)| *tok == this_tok && *actor != this_actor)
+            .map(|(tok, actor, pending_wall)| {
+                *tok == this_tok
+                    && *actor != this_actor
+                    && countersign_passes_causality_guard(c.at.wall_ms, *pending_wall)
+            })
             .unwrap_or(false),
         _ => false,
     })
@@ -2763,9 +2789,10 @@ pub fn materialize_with_now(
                 if let Some((tok, target_wall)) = pending_token.get(target_event_id) {
                     // Causality guard: a countersign backdated before the
                     // PendingJoin it approves cannot fix the canonical claimant.
-                    // Compare wall_ms (not the full `event_sort_key`) so an honest
-                    // same-millisecond countersign is not falsely excluded.
-                    if c.at.wall_ms < *target_wall {
+                    // ZEB-964: shared predicate — every other consumer that
+                    // decides whether a countersign "counts" must agree with
+                    // this exact comparison.
+                    if !countersign_passes_causality_guard(c.at.wall_ms, *target_wall) {
                         continue;
                     }
                     match best.get(tok).copied() {
@@ -17335,6 +17362,41 @@ mod zeb_888_single_use_materialization_tests {
         assert!(
             !invite_token_claimed_by_other_actor(&events, [0x03; 16]),
             "B holds a different token; A's claim does not cover it"
+        );
+    }
+
+    // ZEB-964: a countersign backdated before the PendingJoin it approves is
+    // excluded by the causality guard at materialization — it fixes no
+    // claimant, so it must not read as a claim here either. Counting it would
+    // permanently block the auto-countersign heal for the honest claimant
+    // whenever the original countersigner's clock ran behind the joiner's.
+    #[test]
+    fn claim_helper_ignores_guard_failing_countersign() {
+        let admin = mint_test_owner(0x10);
+        let a = mint_test_owner(0x20);
+        let b = mint_test_owner(0x30);
+        let sig = [0x77u8; 64];
+        let events = vec![
+            admin_join(&admin),
+            pending_ev(
+                &a,
+                [0x02; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_000,
+            ),
+            pending_ev(
+                &b,
+                [0x03; 16],
+                untargeted_token(admin.owner, sig),
+                1_700_000_003_500,
+            ),
+            // Backdated 500ms BEFORE A's pending: guard-excluded at
+            // materialization, so it fixes no canonical claimant for the token.
+            countersign_ev(&admin, [0x04; 16], [0x02; 16], 1_700_000_002_500),
+        ];
+        assert!(
+            !invite_token_claimed_by_other_actor(&events, [0x03; 16]),
+            "a guard-failing countersign fixes no claimant and must not read as one"
         );
     }
 }
