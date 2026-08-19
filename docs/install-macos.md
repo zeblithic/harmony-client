@@ -30,13 +30,7 @@ Pick the build that matches your chip for the best speed. (The Intel `x64` build
 
 ## 3. First launch — getting past Gatekeeper
 
-Harmony isn't signed with an Apple Developer certificate (a deliberate, permanent choice — see the end of this section), so macOS can't confirm who published it. Gatekeeper blocks the **first** launch and shows **one of two messages**. Both mean the same thing — "this app isn't signed by a certificate Apple recognizes" — and both are expected. Find the message you're seeing below.
-
-### "Harmony is damaged and can't be opened. You should move it to the Trash."
-
-**Do _not_ move it to the Trash — the app is not actually damaged.** This alarming wording is simply how recent macOS (especially Apple Silicon) labels an unsigned app that still carries the invisible "downloaded from the internet" quarantine flag. The download is fine; macOS just refuses to run it until that flag is cleared.
-
-Clear it with a single Terminal command:
+Harmony isn't signed with an Apple Developer certificate (a deliberate, permanent choice — see the end of this section), so macOS can't confirm who published it. Gatekeeper blocks the **first** launch with a message about the app being damaged, unverified, or from an unidentified developer. The exact wording varies by macOS version — but the fix is the same **one Terminal command** in every case:
 
 1. Open **Terminal** (Applications → Utilities → Terminal).
 2. Copy-paste this whole line and press Return:
@@ -47,16 +41,15 @@ Clear it with a single Terminal command:
 
 3. Launch Harmony normally from Applications (double-click). It opens from now on.
 
-> **Right-click → Open does _not_ clear the "damaged" message** — only the Terminal command above does. (If you left Harmony somewhere other than Applications, point the command at wherever it is, e.g. `~/Downloads/Harmony.app`.)
+> If you left Harmony somewhere other than Applications, point the command at wherever it is, e.g. `~/Downloads/Harmony.app`.
 
-### "Harmony can't be opened because Apple cannot check it for malicious software"
+**Don't bother with the traditional workarounds — for Harmony they don't work.** On current macOS (verified on Sequoia and later with the shipping builds):
 
-This friendlier message can be cleared without Terminal:
+- **Right-click → Open** does not offer a working "Open" path.
+- **System Settings → Privacy & Security** does not show an "Open Anyway" entry for the block.
+- If the message says the app is **"damaged" — do _not_ move it to the Trash.** The download is fine; that alarming wording is just how macOS labels an unsigned app still carrying the invisible "downloaded from the internet" quarantine flag.
 
-1. Open **Applications** in Finder, **right-click** (or Control-click) the Harmony icon, choose **Open**, then click **Open** again in the dialog that appears.
-2. On **macOS Sequoia (15) and later**, if that dialog has no **Open** button: open **System Settings → Privacy & Security**, scroll down to the note saying Harmony was blocked, and click **Open Anyway**.
-
-The `xattr -dr com.apple.quarantine /Applications/Harmony.app` command from above also clears this case, if you'd rather just use Terminal.
+The Terminal command clears that quarantine flag directly, which is why it works when the buttons don't.
 
 ---
 
