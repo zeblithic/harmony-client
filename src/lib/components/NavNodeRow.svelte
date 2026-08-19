@@ -305,7 +305,10 @@
     {:else if node.unreadLevel === 'loud' && node.unreadCount > 0}
       <span class="unread-badge loud">{node.unreadCount > 99 ? '99+' : node.unreadCount}</span>
     {:else if node.unreadLevel === 'quiet' && node.unreadCount > 0}
-      <span class="unread-dot"></span>
+      <!-- ZEB-967: community rows are the only left-nav surface for channel
+           activity (post-ZEB-965), so their quiet dot renders at rest instead
+           of hover-only. -->
+      <span class="unread-dot" class:always-visible={node.type === 'community'}></span>
     {/if}
   </span>
 
@@ -555,6 +558,10 @@
     opacity: 0;
     flex-shrink: 0;
     transition: opacity 0.15s;
+  }
+
+  .unread-dot.always-visible {
+    opacity: 1;
   }
 
   .bracket {
