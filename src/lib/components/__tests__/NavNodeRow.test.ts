@@ -527,3 +527,51 @@ describe('NavNodeRow — keyboard-accessible ⋯ trigger (ZEB-664)', () => {
     expect(document.activeElement).toBe(getByTestId('nav-row-ch1'));
   });
 });
+
+describe('NavNodeRow — community quiet dot visible at rest (ZEB-967)', () => {
+  // Post-ZEB-965 the community row is the ONLY left-nav surface for channel
+  // activity, so its quiet dot must not be hover-gated: hover-only means no
+  // passive signal at all. Channel/DM rows keep the hover-reveal design —
+  // their panels carry always-visible badges for the louder tiers.
+  it('community row renders the quiet dot with the always-visible class', () => {
+    const { container } = render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'community', name: 'Crew', unreadCount: 3, unreadLevel: 'quiet' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    const dot = container.querySelector('.unread-dot');
+    expect(dot).toBeTruthy();
+    expect(dot?.classList.contains('always-visible')).toBe(true);
+  });
+
+  it('channel row keeps the hover-gated dot (no always-visible class)', () => {
+    const { container } = render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'channel', name: 'general', unreadCount: 1, unreadLevel: 'quiet' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    const dot = container.querySelector('.unread-dot');
+    expect(dot).toBeTruthy();
+    expect(dot?.classList.contains('always-visible')).toBe(false);
+  });
+
+  it('DM row keeps the hover-gated dot (no always-visible class)', () => {
+    const { container } = render(NavNodeRow, {
+      props: {
+        node: makeNode({ type: 'dm', name: 'ada', unreadCount: 1, unreadLevel: 'quiet' }),
+        colorAncestry: [],
+        displayMode: 'text',
+        isLastChild: false,
+      },
+    });
+    const dot = container.querySelector('.unread-dot');
+    expect(dot).toBeTruthy();
+    expect(dot?.classList.contains('always-visible')).toBe(false);
+  });
+});
