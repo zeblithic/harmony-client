@@ -57,6 +57,7 @@
     selectedChannelId,
     activeView = $bindable('channels'),
     navNodes,
+    kickThreshold = $bindable(POWER_THRESHOLDS.kick),
     onSelectChannel,
     onAddChannel,
     onRenameChannel,
@@ -151,6 +152,11 @@
      *  community's channels sync in moments after mount). Required so the
      *  dependency is visible at the type level (same rationale as navService). */
     navNodes: NavNode[];
+    /** ZEB-965: OUT-binding — the community's customized kick threshold
+     *  (ZEB-251 governance snapshot, global-const fallback). App binds this to
+     *  thread the same demotion gate into the hoisted channel dialogs; this
+     *  component's own gates read `thresholds.kick` directly. */
+    kickThreshold?: number;
     /** ZEB-965: right-panel channel-row click → App.openCommunityChannel.
      *  Selection stays App-owned; this only reports the click. */
     onSelectChannel?: (channelId: string) => void;
@@ -173,11 +179,6 @@
   // switches (component stays mounted; only communityId changes).
   let rightPanel = $state<'channels' | 'members' | 'none'>('channels');
 
-  // ZEB-965: channel management gate — mirrors App's retired
-  // canManageSelectedCommunityChannels predicate (power ≥ the global kick
-  // threshold; CommunityView always renders the selected community, so the
-  // community-identity half of that predicate is implicit here).
-  let canManageChannels = $derived(myPower >= POWER_THRESHOLDS.kick);
   let prevOnChannelConfigChanged: typeof communityService.onChannelConfigChanged;
   // ZEB-285: fork lineage — loaded lazily when the settings modal first opens.
   let lineage = $state<{
@@ -244,6 +245,22 @@
     invite: governance?.invite ?? POWER_THRESHOLDS.invite,
     kick: governance?.kick ?? POWER_THRESHOLDS.kick,
     setPower: governance?.setPower ?? POWER_THRESHOLDS.setPower,
+  });
+
+  // ZEB-965: channel management gate — replaces App's retired
+  // canManageSelectedCommunityChannels predicate (CommunityView always renders
+  // the selected community, so the community-identity half is implicit here).
+  // Gated on the PER-COMMUNITY kick threshold, matching what verify_event
+  // enforces since ZEB-733 — the global const would show/hide the
+  // add/rename/delete UI incorrectly in a community that customized its
+  // threshold (CodeRabbit #716).
+  let canManageChannels = $derived(myPower >= thresholds.kick);
+
+  // ZEB-965: report the community's kick threshold up to App so the hoisted
+  // channel dialogs (ZEB-663) apply the same customized demotion gate. App
+  // has no governance fetch of its own — this binding is the single source.
+  $effect(() => {
+    kickThreshold = thresholds.kick;
   });
 
   $effect(() => {
@@ -601,9 +618,9 @@
           <p data-testid="channels-syncing-banner">Syncing channels…</p>
         {:else}
           <p>No channels in this community yet.</p>
-          {#if myPower >= 50}
+          {#if canManageChannels}
             <!-- ZEB-965: the create affordance is the ＋ add-channel row in the
-                 right-hand Channels panel now. -->
+                 right-hand Channels panel now; same governance-aware gate. -->
             <p>Use <strong>＋ add channel</strong> in the Channels panel to add one.</p>
           {/if}
         {/if}

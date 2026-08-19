@@ -124,6 +124,21 @@ describe('ModifyChannelDialog', () => {
     });
   });
 
+  // ZEB-965 (CodeRabbit #716): the demotion gate must honor a community-
+  // customized kick threshold (ZEB-733 backend parity), not the global const.
+  it('stays open at power ≥ a LOWERED community kick threshold (below the global 50)', async () => {
+    const { props, getByText } = await setupDialog({}, { myPower: 40, kickThreshold: 30 });
+    expect(getByText('Cancel')).toBeTruthy();
+    expect(props.onClose).not.toHaveBeenCalled();
+  });
+
+  it('auto-closes below a RAISED community kick threshold even at power ≥ the global 50', async () => {
+    const { props } = await setupDialog({}, { myPower: 60, kickThreshold: 75 });
+    await waitFor(() => {
+      expect(props.onClose).toHaveBeenCalled();
+    });
+  });
+
   it('Cancel button calls onClose without IPC dispatch', async () => {
     const { getByText, adapter, props } = await setupDialog();
     await fireEvent.click(getByText('Cancel'));

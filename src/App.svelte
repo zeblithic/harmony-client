@@ -1451,6 +1451,11 @@
   // in CommunityView (canManageChannels), replacing the App-level
   // canManageSelectedCommunityChannels predicate.
 
+  // ZEB-965: the selected community's customized kick threshold, reported up
+  // by CommunityView's governance fetch (bind:kickThreshold) — threads the
+  // same ZEB-733-parity demotion gate into the hoisted channel dialogs.
+  let selectedCommunityKickThreshold = $state(POWER_THRESHOLDS.kick);
+
   // ZEB-965: active Tier-2 proposal count for the selected community — drives
   // the ChannelsPanel proposals-row badge. Reading proposalCountVersion
   // registers the reactive dependency (bumped by ProposalCountService.onChange).
@@ -4206,6 +4211,7 @@
         {votingAdapter}
         {selectedChannelId}
         bind:activeView={communityActiveView}
+        bind:kickThreshold={selectedCommunityKickThreshold}
         {navNodes}
         onSelectChannel={(channelId) => {
           // ZEB-965: right-panel channel row → the same selection primitive the
@@ -4777,6 +4783,7 @@
     {communityService}
     open={showCreateChannelDialog}
     myPower={myCommunityPower}
+    kickThreshold={selectedCommunityKickThreshold}
     onClose={() => { showCreateChannelDialog = false; }}
     onCreated={(channelId) => {
       showCreateChannelDialog = false;
@@ -4790,6 +4797,7 @@
       {communityService}
       open={true}
       myPower={myCommunityPower}
+      kickThreshold={selectedCommunityKickThreshold}
       onClose={() => { modifyChannelTarget = null; }}
     />
   {/if}

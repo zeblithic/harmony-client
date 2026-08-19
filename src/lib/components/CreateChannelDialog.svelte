@@ -8,6 +8,7 @@
     communityService,
     open,
     myPower,
+    kickThreshold = POWER_THRESHOLDS.kick,
     onClose,
     onCreated,
   }: {
@@ -15,6 +16,10 @@
     communityService: CommunityService;
     open: boolean;
     myPower: number;
+    /** ZEB-965: the community's customized kick threshold (ZEB-251 governance,
+     *  what verify_event enforces since ZEB-733). Defaults to the global const
+     *  for callers without a governance snapshot. */
+    kickThreshold?: number;
     onClose: () => void;
     onCreated: (channelId: string) => void;
   } = $props();
@@ -35,9 +40,10 @@
   // Per spec §7.5 and §10: if local user is demoted below kick threshold
   // mid-action, auto-close. Power gating is the backend's
   // responsibility, but closing the dialog spares the user a
-  // surprise rejection on submit.
+  // surprise rejection on submit. ZEB-965: the threshold is the community's
+  // customized value, matching backend enforcement (ZEB-733).
   $effect(() => {
-    if (open && myPower < POWER_THRESHOLDS.kick) {
+    if (open && myPower < kickThreshold) {
       onClose();
     }
   });
