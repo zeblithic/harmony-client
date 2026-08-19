@@ -3,7 +3,7 @@
   import { get } from 'svelte/store';
   import type { CommunityService, ChannelInfo, PreForkSnapshotDto } from '../community-service';
   import type { ChannelMessageService } from '../channel-message-service';
-  import { POWER_THRESHOLDS, type CommunityMember, type CommunityGovernance } from '../types';
+  import { POWER_THRESHOLDS, type CommunityMember, type CommunityGovernance, type NavNode } from '../types';
   import { resolveMentionLabel } from '../mention-render';
   import type { TrustService } from '../trust-service';
   import type { NavService } from '../nav-service';
@@ -11,6 +11,7 @@
   import VoiceChannelView from './VoiceChannelView.svelte';
   import TownHallView from './TownHallView.svelte';
   import ChannelMembersPanel from './ChannelMembersPanel.svelte';
+  import ChannelsPanel from './ChannelsPanel.svelte';
   import CommunityMembersPanel from './CommunityMembersPanel.svelte';
   import CommunitySettingsPanel from './CommunitySettingsPanel.svelte';
   import RecoveryBanner from './RecoveryBanner.svelte';
@@ -55,6 +56,13 @@
     onBeforeVoiceJoin,
     selectedChannelId,
     activeView = $bindable('channels'),
+    navNodes,
+    kickThreshold = $bindable(POWER_THRESHOLDS.kick),
+    onSelectChannel,
+    onAddChannel,
+    onRenameChannel,
+    onDeleteChannel,
+    proposalCount = undefined,
   }: {
     communityId: string;
     communityName: string;
@@ -137,12 +145,40 @@
      *  'channels' preserves the ZEB-291 behavior for non-binding parents.
      *  ZEB-608 adds 'charter'. */
     activeView?: 'channels' | 'proposals' | 'tier3' | 'charter';
+    /** ZEB-965: App's REACTIVE nav-node mirror ($state), feeding the
+     *  ChannelsPanel rows. Deliberately a prop and not `navService.nodes` —
+     *  that is a plain property NavService replaces wholesale, so reading it
+     *  here would render a permanently stale channel list (a just-joined
+     *  community's channels sync in moments after mount). Required so the
+     *  dependency is visible at the type level (same rationale as navService). */
+    navNodes: NavNode[];
+    /** ZEB-965: OUT-binding — the community's customized kick threshold
+     *  (ZEB-251 governance snapshot, global-const fallback). App binds this to
+     *  thread the same demotion gate into the hoisted channel dialogs; this
+     *  component's own gates read `thresholds.kick` directly. */
+    kickThreshold?: number;
+    /** ZEB-965: right-panel channel-row click → App.openCommunityChannel.
+     *  Selection stays App-owned; this only reports the click. */
+    onSelectChannel?: (channelId: string) => void;
+    /** ZEB-965: opens the App-hoisted CreateChannelDialog (ZEB-663). */
+    onAddChannel?: () => void;
+    /** ZEB-965: open rename dialog / delete-confirm for a channel (App-hoisted). */
+    onRenameChannel?: (communityId: string, channelId: string) => void;
+    onDeleteChannel?: (communityId: string, channelId: string) => void;
+    /** ZEB-965: active Tier-2 proposal count for the channels-panel proposals
+     *  row badge; undefined = not yet known (no badge). */
+    proposalCount?: number | undefined;
   } = $props();
 
   let channels = $state<ChannelInfo[]>([]);
   let settingsModalOpen = $state(false);
   let communityMembersPanelOpen = $state(false);
-  let membersPanelCollapsed = $state(false);
+  // ZEB-965: the right column is a three-way toggle — channel list (default,
+  // it is the primary channel navigation now that the left nav is
+  // communities-only), members roster, or hidden. Sticky across community
+  // switches (component stays mounted; only communityId changes).
+  let rightPanel = $state<'channels' | 'members' | 'none'>('channels');
+
   let prevOnChannelConfigChanged: typeof communityService.onChannelConfigChanged;
   // ZEB-285: fork lineage — loaded lazily when the settings modal first opens.
   let lineage = $state<{
@@ -209,6 +245,22 @@
     invite: governance?.invite ?? POWER_THRESHOLDS.invite,
     kick: governance?.kick ?? POWER_THRESHOLDS.kick,
     setPower: governance?.setPower ?? POWER_THRESHOLDS.setPower,
+  });
+
+  // ZEB-965: channel management gate — replaces App's retired
+  // canManageSelectedCommunityChannels predicate (CommunityView always renders
+  // the selected community, so the community-identity half is implicit here).
+  // Gated on the PER-COMMUNITY kick threshold, matching what verify_event
+  // enforces since ZEB-733 — the global const would show/hide the
+  // add/rename/delete UI incorrectly in a community that customized its
+  // threshold (CodeRabbit #716).
+  let canManageChannels = $derived(myPower >= thresholds.kick);
+
+  // ZEB-965: report the community's kick threshold up to App so the hoisted
+  // channel dialogs (ZEB-663) apply the same customized demotion gate. App
+  // has no governance fetch of its own — this binding is the single source.
+  $effect(() => {
+    kickThreshold = thresholds.kick;
   });
 
   $effect(() => {
@@ -389,12 +441,21 @@
       </nav>
     {/if}
     <div class="header-actions">
+      <!-- ZEB-965: # and 👥 toggle the right column between the channel list
+           and the members roster; clicking the active one hides the column. -->
       <button
         type="button"
-        class="members-toggle-btn"
-        aria-label={membersPanelCollapsed ? 'Show members panel' : 'Hide members panel'}
-        aria-pressed={!membersPanelCollapsed}
-        onclick={() => { membersPanelCollapsed = !membersPanelCollapsed; }}
+        class="panel-toggle-btn channels-toggle-btn"
+        aria-label={rightPanel === 'channels' ? 'Hide channels panel' : 'Show channels panel'}
+        aria-pressed={rightPanel === 'channels'}
+        onclick={() => { rightPanel = rightPanel === 'channels' ? 'none' : 'channels'; }}
+      >#</button>
+      <button
+        type="button"
+        class="panel-toggle-btn members-toggle-btn"
+        aria-label={rightPanel === 'members' ? 'Hide members panel' : 'Show members panel'}
+        aria-pressed={rightPanel === 'members'}
+        onclick={() => { rightPanel = rightPanel === 'members' ? 'none' : 'members'; }}
       >👥</button>
       <button
         type="button"
@@ -557,24 +618,43 @@
           <p data-testid="channels-syncing-banner">Syncing channels…</p>
         {:else}
           <p>No channels in this community yet.</p>
-          {#if myPower >= 50}
-            <p>Click <strong>Create channel</strong> to add one.</p>
+          {#if canManageChannels}
+            <!-- ZEB-965: the create affordance is the ＋ add-channel row in the
+                 right-hand Channels panel now; same governance-aware gate. -->
+            <p>Use <strong>＋ add channel</strong> in the Channels panel to add one.</p>
           {/if}
         {/if}
       </div>
     {/if}
-    <ChannelMembersPanel
-      {members}
-      loading={membersLoading}
-      {initialSyncing}
-      {ownAddress}
-      {trustService}
-      {resolveCard}
-      {resolveNickname}
-      {isOnline}
-      {onOpenCard}
-      collapsed={membersPanelCollapsed}
-    />
+    {#if rightPanel === 'channels'}
+      <ChannelsPanel
+        nodes={navNodes}
+        {communityId}
+        {selectedChannelId}
+        proposalsActive={activeView === 'proposals'}
+        {proposalCount}
+        canManage={canManageChannels}
+        {initialSyncing}
+        {onSelectChannel}
+        onSelectProposals={() => { activeView = 'proposals'; }}
+        {onAddChannel}
+        {onRenameChannel}
+        {onDeleteChannel}
+      />
+    {:else}
+      <ChannelMembersPanel
+        {members}
+        loading={membersLoading}
+        {initialSyncing}
+        {ownAddress}
+        {trustService}
+        {resolveCard}
+        {resolveNickname}
+        {isOnline}
+        {onOpenCard}
+        collapsed={rightPanel !== 'members'}
+      />
+    {/if}
   </div>
 </section>
 
@@ -719,7 +799,8 @@
     border-radius: 4px;
   }
   .settings-btn:hover { background: var(--bg-tertiary); }
-  .members-toggle-btn {
+  /* ZEB-965: shared styling for the # / 👥 right-panel view toggles. */
+  .panel-toggle-btn {
     background: none;
     border: none;
     cursor: pointer;
@@ -727,8 +808,13 @@
     padding: 4px 8px;
     border-radius: 4px;
   }
-  .members-toggle-btn:hover { background: var(--bg-tertiary); }
-  .members-toggle-btn[aria-pressed="false"] { opacity: 0.5; }
+  .panel-toggle-btn:hover { background: var(--bg-tertiary); }
+  .panel-toggle-btn[aria-pressed="false"] { opacity: 0.5; }
+  /* The # glyph is plain text (unlike the emoji buttons), so pin its color. */
+  .channels-toggle-btn {
+    color: var(--text-primary);
+    font-weight: 600;
+  }
   .two-cols {
     display: flex;
     flex: 1;

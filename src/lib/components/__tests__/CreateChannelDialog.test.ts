@@ -188,6 +188,21 @@ describe('CreateChannelDialog', () => {
     });
   });
 
+  // ZEB-965 (CodeRabbit #716): the demotion gate must honor a community-
+  // customized kick threshold (ZEB-733 backend parity), not the global const.
+  it('stays open at power ≥ a LOWERED community kick threshold (below the global 50)', async () => {
+    const { props, getByPlaceholderText } = await setupDialog({ myPower: 40, kickThreshold: 30 });
+    expect(getByPlaceholderText(/Channel name/i)).toBeTruthy();
+    expect(props.onClose).not.toHaveBeenCalled();
+  });
+
+  it('auto-closes below a RAISED community kick threshold even at power ≥ the global 50', async () => {
+    const { props } = await setupDialog({ myPower: 60, kickThreshold: 75 });
+    await waitFor(() => {
+      expect(props.onClose).toHaveBeenCalled();
+    });
+  });
+
   it('keeps the v2 write-power control present but hidden (ZEB-517)', async () => {
     const { getByLabelText } = await setupDialog();
     // The slider + number-input pair must exist from day one (slider-pairing

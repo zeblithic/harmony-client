@@ -92,7 +92,12 @@ describe('NavTree', () => {
   });
 });
 
-describe('NavTree — AddChannelNavRow gating (ZEB-663)', () => {
+// ZEB-965: communities render FLAT in the left nav — their channel rows (and
+// the synthetic proposals / ＋ add-channel rows, formerly ZEB-663/606) moved to
+// CommunityView's right-hand ChannelsPanel. NavTree still renders channel rows
+// when mounted AT a community (parentId=communityId) — that is the ChannelsPanel
+// mount path. The add-channel/proposals gating tests live in ChannelsPanel.test.ts.
+describe('NavTree — communities are flat in the left nav (ZEB-965)', () => {
   const commNodes: NavNode[] = [
     {
       id: 'c1', parentId: null, type: 'community', name: 'Crew',
@@ -104,65 +109,32 @@ describe('NavTree — AddChannelNavRow gating (ZEB-663)', () => {
     },
   ];
 
-  it('renders the ＋ add-channel row when the viewer can manage the community', () => {
+  it('does not render channel children under a community at the top level (even expanded)', () => {
+    render(NavTree, { props: { nodes: commNodes, parentId: null } });
+    expect(screen.getByText('Crew')).toBeTruthy();
+    expect(screen.queryByText('general')).toBeNull();
+  });
+
+  it('renders no proposals or add-channel rows in the left nav', () => {
+    const { container } = render(NavTree, {
+      props: { nodes: commNodes, parentId: null, canManageChannels: () => true },
+    });
+    expect(container.querySelector('[data-testid="proposals-row-c1"]')).toBeNull();
+    expect(container.querySelector('[data-testid="add-channel-row-c1"]')).toBeNull();
+  });
+
+  it('community rows have no expand/collapse chevron', () => {
+    render(NavTree, { props: { nodes: commNodes, parentId: null, onToggle: vi.fn() } });
+    expect(screen.queryByLabelText(/Collapse community|Expand community/)).toBeNull();
+  });
+
+  it('still renders channel rows when mounted at a community (ChannelsPanel path)', async () => {
+    const onClick = vi.fn();
     const { getByTestId } = render(NavTree, {
-      props: {
-        nodes: commNodes,
-        parentId: null,
-        canManageChannels: () => true,
-        onAddChannel: () => {},
-      },
+      props: { nodes: commNodes, parentId: 'c1', onClick },
     });
-    expect(getByTestId('add-channel-row-c1')).toBeTruthy();
-  });
-
-  it('hides the ＋ add-channel row when the viewer cannot manage', () => {
-    const { queryByTestId } = render(NavTree, {
-      props: {
-        nodes: commNodes,
-        parentId: null,
-        canManageChannels: () => false,
-        onAddChannel: () => {},
-      },
-    });
-    expect(queryByTestId('add-channel-row-c1')).toBeNull();
-  });
-
-  it('hides the ＋ add-channel row when no canManageChannels resolver is provided', () => {
-    const { queryByTestId } = render(NavTree, {
-      props: { nodes: commNodes, parentId: null },
-    });
-    expect(queryByTestId('add-channel-row-c1')).toBeNull();
-  });
-
-  it('clicking the ＋ row dispatches onAddChannel with the community id', async () => {
-    const onAddChannel = vi.fn();
-    const { getByTestId } = render(NavTree, {
-      props: {
-        nodes: commNodes,
-        parentId: null,
-        canManageChannels: () => true,
-        onAddChannel,
-      },
-    });
-    await fireEvent.click(getByTestId('add-channel-row-c1'));
-    expect(onAddChannel).toHaveBeenCalledWith('c1');
-  });
-
-  it('Space activation suppresses the browser default (page scroll) and adds a channel', () => {
-    const onAddChannel = vi.fn();
-    const { getByTestId } = render(NavTree, {
-      props: {
-        nodes: commNodes,
-        parentId: null,
-        canManageChannels: () => true,
-        onAddChannel,
-      },
-    });
-    const row = getByTestId('add-channel-row-c1');
-    const evt = new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true });
-    row.dispatchEvent(evt);
-    expect(evt.defaultPrevented).toBe(true); // Space would otherwise scroll the page
-    expect(onAddChannel).toHaveBeenCalledWith('c1');
+    expect(screen.getByText('general')).toBeTruthy();
+    await fireEvent.click(getByTestId('nav-row-ch1'));
+    expect(onClick).toHaveBeenCalledWith('ch1');
   });
 });

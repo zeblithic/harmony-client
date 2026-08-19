@@ -9,6 +9,7 @@
     communityService,
     open,
     myPower,
+    kickThreshold = POWER_THRESHOLDS.kick,
     onClose,
   }: {
     communityId: string;
@@ -16,6 +17,10 @@
     communityService: CommunityService;
     open: boolean;
     myPower: number;
+    /** ZEB-965: the community's customized kick threshold (ZEB-251 governance,
+     *  what verify_event enforces since ZEB-733). Defaults to the global const
+     *  for callers without a governance snapshot. */
+    kickThreshold?: number;
     onClose: () => void;
   } = $props();
 
@@ -49,8 +54,10 @@
   );
 
   // Per spec §7.6 + §10: auto-close on demotion below kick threshold.
+  // ZEB-965: the threshold is the community's customized value, matching
+  // backend enforcement (ZEB-733).
   $effect(() => {
-    if (open && myPower < POWER_THRESHOLDS.kick) {
+    if (open && myPower < kickThreshold) {
       onClose();
     }
   });

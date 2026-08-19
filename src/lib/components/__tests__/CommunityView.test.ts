@@ -142,6 +142,8 @@ async function setup(
     // resolution effect would pick (first/only channel). Tests override to
     // point the feed at a specific channel.
     selectedChannelId: channelList[0]?.channelId ?? null,
+    // ZEB-965: App's reactive nav mirror; empty by default (panel chrome only).
+    navNodes: [],
     ...propOverrides,
   };
   const renderResult = render(CommunityView, { props });
@@ -149,15 +151,141 @@ async function setup(
 }
 
 describe('CommunityView', () => {
-  it('mounts the two columns (feed + members); the channel rail is retired', async () => {
+  it('mounts the two columns (feed + right panel); channels is the default right view', async () => {
     const { container } = await setup();
     await waitFor(() => {
       expect(container.querySelector('.channel-message-feed')).toBeTruthy();
-      expect(container.querySelector('.members-panel')).toBeTruthy();
+      // ZEB-965: the right column defaults to the channel list — it is the
+      // primary channel navigation now that the left nav is communities-only.
+      expect(container.querySelector('.channels-panel')).toBeTruthy();
     });
-    // ZEB-663: the per-community ChannelSubSidebar is gone — channels live in
-    // the unified nav tree now.
+    expect(container.querySelector('.members-panel')).toBeNull();
+    // ZEB-663: the per-community ChannelSubSidebar is gone.
     expect(container.querySelector('.channel-sub-sidebar')).toBeNull();
+  });
+
+  describe('right-panel channels/members toggle (ZEB-965)', () => {
+    it('👥 switches the right panel to members; # switches back to channels', async () => {
+      const { container, getByLabelText } = await setup();
+      await waitFor(() => {
+        expect(container.querySelector('.channels-panel')).toBeTruthy();
+      });
+      await fireEvent.click(getByLabelText(/Show members panel/i));
+      expect(container.querySelector('.members-panel')).toBeTruthy();
+      expect(container.querySelector('.channels-panel')).toBeNull();
+      await fireEvent.click(getByLabelText(/Show channels panel/i));
+      expect(container.querySelector('.channels-panel')).toBeTruthy();
+      expect(container.querySelector('.members-panel')).toBeNull();
+    });
+
+    it('clicking the active view toggle hides the right panel entirely', async () => {
+      const { container, getByLabelText } = await setup();
+      await waitFor(() => {
+        expect(container.querySelector('.channels-panel')).toBeTruthy();
+      });
+      await fireEvent.click(getByLabelText(/Hide channels panel/i));
+      expect(container.querySelector('.channels-panel')).toBeNull();
+      expect(container.querySelector('.members-panel')).toBeNull();
+      // And back on.
+      await fireEvent.click(getByLabelText(/Show channels panel/i));
+      expect(container.querySelector('.channels-panel')).toBeTruthy();
+    });
+
+    it('reflects the active view in aria-pressed on both header toggles', async () => {
+      const { container, getByLabelText } = await setup();
+      await waitFor(() => {
+        expect(container.querySelector('.channels-panel')).toBeTruthy();
+      });
+      expect(getByLabelText(/Hide channels panel/i).getAttribute('aria-pressed')).toBe('true');
+      expect(getByLabelText(/Show members panel/i).getAttribute('aria-pressed')).toBe('false');
+      await fireEvent.click(getByLabelText(/Show members panel/i));
+      expect(getByLabelText(/Hide members panel/i).getAttribute('aria-pressed')).toBe('true');
+      expect(getByLabelText(/Show channels panel/i).getAttribute('aria-pressed')).toBe('false');
+    });
+
+    it('renders channel rows from the navNodes prop and tracks its updates', async () => {
+      // ZEB-965: NavService.nodes is a plain (non-reactive) property — App
+      // mirrors it into $state and passes it down. The panel must render from
+      // that PROP, not from navService.nodes, or it goes permanently stale
+      // (e.g. a just-joined community whose channels sync in moments later).
+      const communityId = 'aa'.repeat(16);
+      const chanBase = { unreadCount: 0, mentionCount: 0, unreadLevel: 'none' as const, expanded: false };
+      const communityNode = {
+        id: communityId, parentId: null, type: 'community' as const, name: 'Test Community',
+        expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' as const,
+      };
+      const navNodes = [
+        communityNode,
+        { id: 'nav-ch-1', parentId: communityId, type: 'channel' as const, channelKind: 'text' as const, name: 'harbor', ...chanBase },
+      ];
+      const { container, rerender, props } = await setup([general], { navNodes });
+      await waitFor(() => {
+        expect(container.querySelector('[data-testid="nav-row-nav-ch-1"]')).toBeTruthy();
+      });
+      // A later nav update (channel sync) must show up without a remount.
+      await rerender({
+        ...props,
+        navNodes: [
+          ...navNodes,
+          { id: 'nav-ch-2', parentId: communityId, type: 'channel' as const, channelKind: 'text' as const, name: 'lighthouse', ...chanBase },
+        ],
+      });
+      await waitFor(() => {
+        expect(container.querySelector('[data-testid="nav-row-nav-ch-2"]')).toBeTruthy();
+      });
+    });
+
+    it('channel-manage affordances honor a community-customized kick threshold (ZEB-733 parity)', async () => {
+      // CodeRabbit #716: the gate must read the per-community governance kick
+      // threshold (what verify_event enforces since ZEB-733), not the global
+      // const — a community that RAISES kick must hide the affordances from a
+      // power-60 member, and one that LOWERS it must show them to a power-40.
+      const communityId = 'aa'.repeat(16);
+      const chanBase = { unreadCount: 0, mentionCount: 0, unreadLevel: 'none' as const, expanded: false };
+      const navNodes = [
+        {
+          id: communityId, parentId: null, type: 'community' as const, name: 'Test Community',
+          expanded: true, unreadCount: 0, mentionCount: 0, unreadLevel: 'none' as const,
+        },
+        { id: 'nav-ch-1', parentId: communityId, type: 'channel' as const, channelKind: 'text' as const, name: 'harbor', ...chanBase },
+      ];
+
+      // Raised threshold (kick 75), viewer power 60 → no manage affordances.
+      const raised = await setup([general], { navNodes, myPower: 60 }, {
+        get_community_governance: () => Promise.resolve({ adminQuorum: 1, kick: 75 }),
+      });
+      await waitFor(() => {
+        expect(raised.container.querySelector('[data-testid="nav-row-nav-ch-1"]')).toBeTruthy();
+      });
+      await waitFor(() => {
+        expect(raised.container.querySelector(`[data-testid="add-channel-row-${communityId}"]`)).toBeNull();
+        expect(raised.container.querySelector('[data-testid="channel-menu-trigger-nav-ch-1"]')).toBeNull();
+      });
+      raised.unmount();
+
+      // Lowered threshold (kick 30), viewer power 40 → affordances appear once
+      // the governance snapshot resolves.
+      const lowered = await setup([general], { navNodes, myPower: 40 }, {
+        get_community_governance: () => Promise.resolve({ adminQuorum: 1, kick: 30 }),
+      });
+      await waitFor(() => {
+        expect(lowered.container.querySelector(`[data-testid="add-channel-row-${communityId}"]`)).toBeTruthy();
+        expect(lowered.container.querySelector('[data-testid="channel-menu-trigger-nav-ch-1"]')).toBeTruthy();
+      });
+    });
+
+    it('the channels panel proposals row opens the Proposals view (bindable activeView)', async () => {
+      const { container } = await setup([general], { votingAdapter: makeVotingAdapterStub() });
+      await waitFor(() => {
+        expect(container.querySelector('.channels-panel')).toBeTruthy();
+      });
+      const row = container.querySelector('[data-testid^="proposals-row-"]')!;
+      expect(row).toBeTruthy();
+      await fireEvent.click(row);
+      await waitFor(() => {
+        expect(row.classList.contains('active')).toBe(true);
+      });
+    });
   });
 
   // ZEB-663: default #general selection + delete-fallback cascade moved to App

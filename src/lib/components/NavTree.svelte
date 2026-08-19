@@ -3,8 +3,6 @@
   import { getChildNodes, sortNodes, getColorAncestry, getInheritedDisplayMode, getInheritedSortOrder } from '../nav-utils';
   import NavNodeRow from './NavNodeRow.svelte';
   import NavTree from './NavTree.svelte';
-  import ProposalsNavRow from './ProposalsNavRow.svelte';
-  import AddChannelNavRow from './AddChannelNavRow.svelte';
 
   let {
     nodes,
@@ -17,11 +15,7 @@
     profileLookup,
     presenceOnline,
     filterTop,
-    proposalCount,
-    onSelectProposals,
-    proposalsActiveFor,
     canManageChannels,
-    onAddChannel,
     onRenameChannel,
     onDeleteChannel,
   }: {
@@ -39,16 +33,10 @@
      *  the root to partition top-level nodes into headed sections; recursive
      *  calls below do not thread it, so descendants are never filtered. */
     filterTop?: (n: NavNode) => boolean;
-    /** ZEB-606: active Tier-2 count resolver (undefined = feature absent). */
-    proposalCount?: (node: NavNode) => number | undefined;
-    /** ZEB-606: open the community's Proposals view. */
-    onSelectProposals?: (communityId: string) => void;
-    /** ZEB-606: community id whose Proposals view is currently open. */
-    proposalsActiveFor?: string | null;
-    /** ZEB-663: may the viewer manage the given community's channels? */
+    /** ZEB-663: may the viewer manage the given community's channels?
+     *  ZEB-965: only meaningful on the ChannelsPanel mount (parentId=community);
+     *  the left nav renders no channel rows. */
     canManageChannels?: (communityId: string) => boolean;
-    /** ZEB-663: open the create-channel dialog for a community. */
-    onAddChannel?: (communityId: string) => void;
     /** ZEB-663: open rename dialog for a channel node. */
     onRenameChannel?: (communityId: string, channelId: string) => void;
     /** ZEB-663: open delete-confirm for a channel node. */
@@ -87,19 +75,11 @@
     {onDeleteChannel}
   />
 
-  {#if (child.type === 'folder' || child.type === 'community') && child.expanded}
-    <NavTree nodes={nodes} parentId={child.id} {activeNodeId} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} {presenceOnline} {proposalCount} {onSelectProposals} {proposalsActiveFor} {canManageChannels} {onAddChannel} {onRenameChannel} {onDeleteChannel} />
-    {#if child.type === 'community' && proposalCount && onSelectProposals}
-      <ProposalsNavRow
-        communityId={child.id}
-        indent={ancestry.length}
-        count={proposalCount(child)}
-        active={proposalsActiveFor === child.id}
-        onSelect={() => onSelectProposals(child.id)}
-      />
-    {/if}
-    {#if child.type === 'community' && canManageChannels && canManageChannels(child.id)}
-      <AddChannelNavRow communityId={child.id} indent={ancestry.length} onAdd={onAddChannel} />
-    {/if}
+  <!-- ZEB-965: folders still recurse; communities render FLAT — their channel
+       rows (plus the synthetic proposals / add-channel rows) live in
+       CommunityView's right-hand ChannelsPanel, which mounts this component
+       directly at parentId=communityId. -->
+  {#if child.type === 'folder' && child.expanded}
+    <NavTree nodes={nodes} parentId={child.id} {activeNodeId} {onToggle} {onClick} {onDisplayModeChange} {onSortOrderChange} {profileLookup} {presenceOnline} {canManageChannels} {onRenameChannel} {onDeleteChannel} />
   {/if}
 {/each}
