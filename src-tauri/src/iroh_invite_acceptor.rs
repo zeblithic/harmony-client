@@ -495,21 +495,14 @@ where
                     deadline_ms: self.config.poll_deadline.as_millis() as u64,
                 });
             }
+            // ZEB-964: selection is guard-aware — deliver only a countersign
+            // that will actually fix the joiner as canonical claimant. See
+            // `select_deliverable_countersign`.
             let found: Option<SignedMembershipEvent> = {
                 let g = state_arc.lock().await;
-                let matched = g
-                    .events()
-                    .find(|e| {
-                        e.actor == self_owner
-                            && matches!(
-                                &e.kind,
-                                MembershipEventKind::JoinCountersign { target_event_id }
-                                if *target_event_id == bootstrap_join_id
-                            )
-                    })
-                    .cloned();
+                let events: Vec<SignedMembershipEvent> = g.events().cloned().collect();
                 drop(g);
-                matched
+                select_deliverable_countersign(&events, self_owner, bootstrap_join_id)
             };
             if let Some(cs) = found {
                 break cs;
@@ -1031,6 +1024,49 @@ pub enum HandshakeAcceptError {
     },
 }
 
+/// ZEB-964: select the countersign to deliver on the handshake response
+/// stream. Only a countersign that PASSES the ZEB-888 causality guard
+/// (`wall_ms >=` its target PendingJoin's wall) can ever fix the joiner as
+/// the canonical claimant at materialization — a backdated one (minted
+/// before the ZEB-964 HLC clamp existed, and found again on a ZEB-889
+/// same-id re-redeem of a wedged join) would hand the joiner an event that
+/// "joins" it straight back into the permanent PendingJoin wedge. Requires
+/// the target PendingJoin itself to be present in `events` (`handle_unicast`
+/// inserted it before the poll starts); returns `None` otherwise so the
+/// poll keeps waiting for the auto-counter-sign re-mint. Restricted to
+/// `self_owner`-authored countersigns (ZEB-325 F5: respond with our own
+/// signature, not a racing member's); picks the minimal `event_sort_key`
+/// among qualifiers for determinism.
+fn select_deliverable_countersign(
+    events: &[SignedMembershipEvent],
+    self_owner: crate::owner_state_types::OwnerAddr,
+    target_event_id: EventId,
+) -> Option<SignedMembershipEvent> {
+    let pending_wall_ms = events.iter().find_map(|e| {
+        (e.id == target_event_id && matches!(&e.kind, MembershipEventKind::PendingJoin { .. }))
+            .then_some(e.at.wall_ms)
+    })?;
+    events
+        .iter()
+        .filter(|e| {
+            e.actor == self_owner
+                && matches!(
+                    &e.kind,
+                    MembershipEventKind::JoinCountersign { target_event_id: t }
+                    if *t == target_event_id
+                )
+                && crate::community_membership::countersign_passes_causality_guard(
+                    e.at.wall_ms,
+                    pending_wall_ms,
+                )
+        })
+        .min_by(|a, b| {
+            crate::community_membership::event_sort_key(a)
+                .cmp(&crate::community_membership::event_sort_key(b))
+        })
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::community_invite::{
@@ -1205,6 +1241,92 @@ mod tests {
                 CommunityInvitePacket::Invite { .. }
             ),
             "0x10 wire must decode to the Invite variant"
+        );
+    }
+
+    /// ZEB-964: the response poll must deliver a countersign that passes the
+    /// ZEB-888 causality guard (`wall_ms >=` its target PendingJoin's wall) —
+    /// a backdated one (e.g. found again on a ZEB-889 same-id re-redeem of a
+    /// pre-fix wedge) hands the joiner an event that can never fix it as the
+    /// canonical claimant, so the joiner would "successfully" join straight
+    /// back into the wedge.
+    #[test]
+    fn response_poll_selects_guard_passing_countersign() {
+        use super::select_deliverable_countersign;
+
+        let community_id = SpaceId([2u8; 16]);
+        let self_owner = OwnerAddr([0xAAu8; 16]);
+        let other_member = OwnerAddr([0xCCu8; 16]);
+        let joiner = OwnerAddr([0xBBu8; 16]);
+        let target = [0x42u8; 16];
+
+        let pending = SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id: target,
+            community_id,
+            kind: MembershipEventKind::PendingJoin {
+                invite_token: InviteToken {
+                    inviter: self_owner,
+                    invitee_hint: None,
+                    minted_at: Hlc {
+                        wall_ms: 1_000,
+                        logical: 0,
+                        device_id: "i".to_string(),
+                    },
+                    expires_at: None,
+                    sig: [0u8; 64],
+                },
+            },
+            actor: joiner,
+            at: Hlc {
+                wall_ms: 2_000,
+                logical: 0,
+                device_id: "j".to_string(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+        };
+        let cs = |actor: OwnerAddr, id: u8, wall_ms: u64| SignedMembershipEvent {
+            signer_certs: Vec::new(),
+            id: [id; 16],
+            community_id,
+            kind: MembershipEventKind::JoinCountersign {
+                target_event_id: target,
+            },
+            actor,
+            at: Hlc {
+                wall_ms,
+                logical: 0,
+                device_id: "a".to_string(),
+            },
+            sig: [0u8; 64],
+            countersig: None,
+            enrollment: None,
+        };
+
+        // Only a backdated (guard-failing) self countersign: nothing
+        // deliverable — the poll must keep waiting for the re-mint.
+        let events = vec![pending.clone(), cs(self_owner, 0x01, 1_500)];
+        assert!(
+            select_deliverable_countersign(&events, self_owner, target).is_none(),
+            "a guard-failing countersign must not be delivered to the joiner"
+        );
+
+        // The ZEB-964 re-mint lands (guard-passing), alongside the stale one
+        // and another member's countersign: deliver OUR guard-passing one
+        // (ZEB-325 F5: respond with self's signature, not a racing member's).
+        let events = vec![
+            pending,
+            cs(self_owner, 0x01, 1_500),
+            cs(other_member, 0x03, 3_000),
+            cs(self_owner, 0x02, 2_500),
+        ];
+        let picked = select_deliverable_countersign(&events, self_owner, target)
+            .expect("a guard-passing self countersign must be delivered");
+        assert_eq!(
+            picked.id, [0x02u8; 16],
+            "must pick the guard-passing self countersign"
         );
     }
 }

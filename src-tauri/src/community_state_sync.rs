@@ -1635,7 +1635,9 @@ impl CommunitySyncEngine {
 
     /// ZEB-906: boot-time countersigner healing pass. Rescans this engine's
     /// loaded event log for `PendingJoin` events that have NO self-authored
-    /// `JoinCountersign` targeting them and re-fires the (idempotent,
+    /// **guard-passing** `JoinCountersign` targeting them (ZEB-964: a
+    /// countersign backdated before its target is excluded by the ZEB-888
+    /// causality guard and fixes nothing) and re-fires the (idempotent,
     /// eligibility-gated) auto-counter-sign spawn for each.
     ///
     /// This is the recovery path the auto-counter-sign skip sites always
@@ -1706,12 +1708,20 @@ impl CommunitySyncEngine {
                     )
                 })
                 .filter(|pending| {
+                    // ZEB-964: only a GUARD-PASSING self countersign excludes
+                    // a candidate — a backdated one (ZEB-888 causality guard)
+                    // fixes no canonical claimant, and treating it as "already
+                    // signed" is exactly the permanent wedge this pass heals.
                     !events.iter().any(|cs| {
                         cs.actor == self.self_owner
                             && matches!(
                                 &cs.kind,
                                 MembershipEventKind::JoinCountersign { target_event_id }
                                 if *target_event_id == pending.id
+                            )
+                            && crate::community_membership::countersign_passes_causality_guard(
+                                cs.at.wall_ms,
+                                pending.at.wall_ms,
                             )
                     })
                 })
@@ -2515,7 +2525,7 @@ async fn spawn_auto_counter_sign_task(
     use crate::community_membership::{EventPayload, MemberStatus, MembershipEventKind};
 
     // --- Eligibility + idempotency check under the state lock. ---
-    let (self_joined, power_ok, already_signed, token_claimed_by_other) = {
+    let (self_joined, power_ok, already_signed, token_claimed_by_other, pending_wall_ms) = {
         let state_g = state.lock().await;
         // ZEB-888 (Qodo #643 perf): clone the event log ONCE under the lock and
         // reuse it for the eligibility materialize, the idempotency scan, and the
@@ -2543,6 +2553,19 @@ async fn spawn_auto_counter_sign_task(
         // escapes the block.
         let power_ok = crate::community_membership::actor_power_meets_invite_tier(&mat, self_owner);
 
+        // ZEB-964: the countersign's HLC must clamp to its target's wall (see
+        // the mint below), and the idempotency predicate must only count
+        // GUARD-PASSING prior countersigns — so both need the target
+        // PendingJoin's wall_ms. A pending we can't find can never
+        // materialize, so minting for it would be pointless.
+        let pending_wall_ms = log.iter().find_map(|e| {
+            (e.id == pending_id && matches!(&e.kind, MembershipEventKind::PendingJoin { .. }))
+                .then_some(e.at.wall_ms)
+        });
+        // ZEB-964: a self countersign only satisfies idempotency if it passes
+        // the ZEB-888 causality guard — a backdated one (countersigner's
+        // clock behind the joiner's at mint time) fixes no canonical claimant
+        // and permanently wedges the joiner at PendingJoin unless we re-mint.
         let signed_already = log.iter().any(|e| {
             e.actor == self_owner
                 && matches!(
@@ -2550,6 +2573,12 @@ async fn spawn_auto_counter_sign_task(
                     MembershipEventKind::JoinCountersign { target_event_id }
                     if *target_event_id == pending_id
                 )
+                && pending_wall_ms.is_some_and(|pw| {
+                    crate::community_membership::countersign_passes_causality_guard(
+                        e.at.wall_ms,
+                        pw,
+                    )
+                })
         });
         // ZEB-888 (Layer 2, defense-in-depth): don't auto-countersign a
         // PendingJoin whose single-use invite token is already claimed
@@ -2560,18 +2589,62 @@ async fn spawn_auto_counter_sign_task(
         // Joined regardless of this guard).
         let token_claimed_by_other =
             crate::community_membership::invite_token_claimed_by_other_actor(&log, pending_id);
-        (joined, power_ok, signed_already, token_claimed_by_other)
+        // ZEB-964 observability: a self countersign exists but none passes
+        // the guard — the exact silent-wedge signature this fix heals.
+        let backdated_self_cs = !signed_already
+            && log.iter().any(|e| {
+                e.actor == self_owner
+                    && matches!(
+                        &e.kind,
+                        MembershipEventKind::JoinCountersign { target_event_id }
+                        if *target_event_id == pending_id
+                    )
+            });
+        (
+            joined,
+            power_ok,
+            signed_already,
+            token_claimed_by_other,
+            pending_wall_ms.map(|pw| (pw, backdated_self_cs)),
+        )
     };
 
     if !self_joined || !power_ok || already_signed || token_claimed_by_other {
         return;
     }
+    let Some((pending_wall_ms, backdated_self_cs)) = pending_wall_ms else {
+        tracing::debug!(
+            community_id = ?community_id,
+            target = ?pending_id,
+            "ZEB-964 auto-counter-sign: target PendingJoin not in log; skipping"
+        );
+        return;
+    };
+    if backdated_self_cs {
+        tracing::info!(
+            community_id = ?community_id,
+            target = ?pending_id,
+            "ZEB-964: prior self countersign is backdated before its target \
+             (ZEB-888 causality guard) — re-minting a guard-passing one"
+        );
+    }
 
     // --- Build a HLC for the new event (wall-time, logical 0, self device). ---
-    let wall_ms = std::time::SystemTime::now()
+    //
+    // ZEB-964: clamp to the target PendingJoin's wall (HLC receive
+    // discipline). A raw `SystemTime::now()` stamp lands BEFORE the target
+    // whenever this device's clock runs behind the joiner's — an honest
+    // countersign the ZEB-888 causality guard then excludes from
+    // canonical-claimant selection, wedging the joiner at PendingJoin on
+    // every replica. Clamping keeps the guard's anti-backdating power (an
+    // attacker gains nothing: any signer could always stamp at or after the
+    // target's wall) while making the honest path immune to physical clock
+    // skew up to the ZEB-846 forward-skew view ceiling.
+    let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    let wall_ms = now_ms.max(pending_wall_ms);
     let cs_hlc = crate::owner_state_types::Hlc {
         wall_ms,
         logical: 0,
@@ -2640,13 +2713,19 @@ async fn spawn_auto_counter_sign_task(
 
         // Re-check idempotency inside the lock so a race between two
         // concurrent triggers (e.g. two PendingJoin deliveries) doesn't
-        // produce a duplicate JoinCountersign.
+        // produce a duplicate JoinCountersign. ZEB-964: same guard-aware
+        // predicate as the eligibility scan — a backdated self countersign
+        // must not suppress the re-mint.
         let already = state_g.events().any(|e| {
             e.actor == self_owner
                 && matches!(
                     &e.kind,
                     MembershipEventKind::JoinCountersign { target_event_id }
                     if *target_event_id == pending_id
+                )
+                && crate::community_membership::countersign_passes_causality_guard(
+                    e.at.wall_ms,
+                    pending_wall_ms,
                 )
         });
         if already {
@@ -14683,6 +14762,190 @@ mod tests {
             zeb906_countersign_count(&state, [0x2A; 16]).await,
             0,
             "a cancelled (PendingJoin→Leave) attempt must not be countersigned at recheck"
+        );
+    }
+
+    // ── ZEB-964: countersign HLC clamp + guard-aware heal predicate ──────
+    //
+    // The ZEB-888 canonical-claimant pre-pass excludes any JoinCountersign
+    // whose wall_ms predates its target PendingJoin's wall_ms (anti-backdating
+    // causality guard). An HONEST countersign trips the same guard whenever
+    // the countersigner's physical clock runs behind the joiner's — the
+    // countersign is minted from raw `SystemTime::now()` — permanently
+    // wedging the joiner at PendingJoin on every replica. Two fixes, each
+    // pinned here: the mint clamps its HLC to the target's wall (HLC receive
+    // discipline), and the heal paths' "already signed" predicates only count
+    // countersigns that actually pass the guard, so a wedged community
+    // re-mints and converges.
+
+    /// ZEB-964 fix 1: a joiner whose clock runs AHEAD of this countersigner
+    /// stamps its PendingJoin "in our future" (60s here — well inside the
+    /// ZEB-846 5-min forward-skew view ceiling). The minted countersign must
+    /// clamp to the target's wall so the joiner materializes Joined.
+    #[tokio::test]
+    async fn zeb964_auto_counter_sign_clamps_hlc_to_pending_wall() {
+        use crate::community_membership::{
+            materialize, mint_test_owner, sign_event, EventPayload, MemberStatus,
+            MembershipEventKind, SignedMembershipEvent,
+        };
+
+        let community_id = SpaceId([0x99; 16]);
+        let alice = mint_test_owner(0xAD);
+        let bob = mint_test_owner(0xBD);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, _sub_tx) = closing_guard_engine(&dir, community_id, &alice);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let pending_wall_ms = now_ms + 60_000;
+        let bob_pending_payload = EventPayload {
+            id: [0x64; 16],
+            community_id,
+            kind: MembershipEventKind::PendingJoin {
+                invite_token: zeb875_signed_token(&alice, 964),
+            },
+            actor: bob.owner,
+            at: Hlc {
+                wall_ms: pending_wall_ms,
+                logical: 0,
+                device_id: "joiner-dev".into(),
+            },
+        };
+        let bob_pending = SignedMembershipEvent {
+            enrollment: Some(bob.cert.clone()),
+            ..sign_event(&bob_pending_payload, &bob.device_key).expect("sign pending join")
+        };
+        let state = engine.state();
+        {
+            let mut g = state.lock().await;
+            g.insert_verified_for_test(closing_guard_bootstrap_join(
+                community_id,
+                &alice,
+                [0x10; 16],
+                0,
+            ));
+            g.insert_verified_for_test(bob_pending.clone());
+        }
+
+        engine.maybe_spawn_auto_counter_sign(&bob_pending);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        let events: Vec<crate::community_membership::SignedMembershipEvent> = {
+            let g = state.lock().await;
+            g.events().cloned().collect()
+        };
+        let cs = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    &e.kind,
+                    MembershipEventKind::JoinCountersign { target_event_id }
+                    if *target_event_id == bob_pending.id
+                )
+            })
+            .expect("auto-counter-sign must mint a countersign for the pending join");
+        assert!(
+            cs.at.wall_ms >= pending_wall_ms,
+            "countersign HLC must clamp to its target's wall (got {} < {}): an \
+             unclamped stamp is excluded by the ZEB-888 causality guard and the \
+             joiner never materializes Joined",
+            cs.at.wall_ms,
+            pending_wall_ms,
+        );
+        let mat = materialize(&events, alice.owner);
+        assert_eq!(
+            mat.members.get(&bob.owner).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "clamped countersign must fix bob as the canonical claimant"
+        );
+    }
+
+    /// ZEB-964 fix 2: a guard-FAILING (backdated-before-target) self
+    /// countersign must not satisfy the heal paths' "already signed"
+    /// predicate — that wedge is exactly what the re-drive exists to fix.
+    /// The recheck must mint a fresh, guard-passing countersign so the
+    /// joiner finally materializes Joined.
+    #[tokio::test]
+    async fn zeb964_recheck_remints_over_backdated_countersign() {
+        use crate::community_membership::{
+            materialize, sign_event, EventPayload, MemberStatus, MembershipEventKind,
+        };
+
+        let community_id = SpaceId([0x9A; 16]);
+        let alice = crate::community_membership::mint_test_owner(0xAF);
+        let bob = crate::community_membership::mint_test_owner(0xBF);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, _sub_tx, _floor, _cs, _mk) = zeb906_engine(&dir, community_id, &alice, &alice);
+
+        // Backdated 300ms BEFORE the pending it approves (zeb875_pending_join
+        // stamps wall 100_500) — the acceptor's clock ran behind the joiner's.
+        let backdated_cs_payload = EventPayload {
+            id: [0x3B; 16],
+            community_id,
+            kind: MembershipEventKind::JoinCountersign {
+                target_event_id: [0x2B; 16],
+            },
+            actor: alice.owner,
+            at: Hlc {
+                wall_ms: 100_200,
+                logical: 0,
+                device_id: "alice-dev".into(),
+            },
+        };
+        let backdated_cs = sign_event(&backdated_cs_payload, &alice.device_key).expect("sign cs");
+        let state = engine.state();
+        {
+            let mut g = state.lock().await;
+            g.insert_verified_for_test(closing_guard_bootstrap_join(
+                community_id,
+                &alice,
+                [0x10; 16],
+                0,
+            ));
+            g.insert_verified_for_test(zeb875_pending_join(
+                community_id,
+                &bob,
+                zeb875_signed_token(&alice, 11),
+                [0x2B; 16],
+            ));
+            g.insert_verified_for_test(backdated_cs);
+        }
+
+        engine.recheck_uncountersigned_pending_joins().await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        let events: Vec<crate::community_membership::SignedMembershipEvent> = {
+            let g = state.lock().await;
+            g.events().cloned().collect()
+        };
+        assert_eq!(
+            zeb906_countersign_count(&state, [0x2B; 16]).await,
+            2,
+            "recheck must re-mint over a guard-failing countersign (wedged join)"
+        );
+        assert!(
+            events.iter().any(|e| {
+                e.actor == alice.owner
+                    && matches!(
+                        &e.kind,
+                        MembershipEventKind::JoinCountersign { target_event_id }
+                        if *target_event_id == [0x2B; 16]
+                    )
+                    && e.at.wall_ms >= 100_500
+            }),
+            "the re-minted countersign must pass the causality guard"
+        );
+        let mat = materialize(&events, alice.owner);
+        assert_eq!(
+            mat.members.get(&bob.owner).map(|m| m.status),
+            Some(MemberStatus::Joined),
+            "bob must materialize Joined once a guard-passing countersign exists"
         );
     }
 
