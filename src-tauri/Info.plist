@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- ZEB-968: merged into the bundle's generated Info.plist by tauri-bundler
+     (sibling-file convention). WKWebView checks the HOST app's Info.plist for
+     this usage string and does not expose navigator.mediaDevices at all
+     without it — packaged macOS builds could never join voice ("undefined is
+     not an object (evaluating 'navigator.mediaDevices.getUserMedia')").
+     Pairs with Entitlements.plist (hardened-runtime audio-input). -->
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Harmony uses your microphone for voice channels and calls.</string>
+</dict>
+</plist>
