@@ -87,7 +87,11 @@
   import { ReadReceiptService } from './lib/read-receipt-service';
   import { NotesService } from './lib/notes-service';
   import { migrateLocalNotes } from './lib/notes-migrate';
-  import { resolveMessagesReturn } from './lib/notes-return';
+  import {
+    captureNotesReturnStash,
+    resolveMessagesReturn,
+    type NotesReturnStash,
+  } from './lib/notes-return';
   import { MailService } from './lib/mail-service';
   import { VineService } from './lib/vine-service';
   import { resolveOriginalCreator } from './lib/vine-utils';
@@ -3674,32 +3678,45 @@
     currentFolderCid = null;
   }
 
-  // ZEB-966: where the user was before selecting Notes, so the Messages
-  // button can return there. Not $state — only read inside click handlers.
-  let lastCommunityBeforeNotes: string | null = null;
+  // ZEB-966: where the user was before selecting Notes (community, or bare
+  // DM view), so the Messages button can return there. Not $state — only
+  // read inside click handlers.
+  let notesReturnStash: NotesReturnStash | null = null;
 
   // ZEB-334: select the private self-notes space — clears any community so the
   // feed pane renders NotesView (the zero-community default).
   function selectNotes() {
-    lastCommunityBeforeNotes = selectedCommunityId;
+    // Capture BEFORE the community is cleared; a repeated Notes click
+    // preserves the previous stash instead of clobbering it.
+    notesReturnStash = captureNotesReturnStash({
+      selectedCommunityId,
+      notesSelected,
+      previous: notesReturnStash,
+    });
     notesSelected = true;
     changeSelectedCommunity(null);
     if (appMode !== 'messages') switchMode('messages');
   }
 
   // ZEB-966: NavPanel's mode buttons route here. A Messages click while the
-  // Notes space is open returns to the stashed community (same routing as a
-  // left-nav community click); every other click is a plain switchMode. The
-  // outcome is resolved BEFORE switchMode mutates appMode — a cross-mode
-  // switch (e.g. Vines → Messages) must return to Notes, not restore.
+  // Notes space is open returns to the stashed view — a community (same
+  // routing as a left-nav community click) or a bare DM (activeChannel
+  // survives Notes untouched, so leaving Notes reveals it). Every other
+  // click is a plain switchMode. The outcome is resolved BEFORE switchMode
+  // mutates appMode — a cross-mode switch (e.g. Vines → Messages) must
+  // return to Notes, not restore.
   function handleModeChange(mode: AppMode) {
     const outcome =
       mode === 'messages'
         ? resolveMessagesReturn({
             appMode,
             notesSelected,
-            stashedCommunityId: lastCommunityBeforeNotes,
+            stash: notesReturnStash,
             communityExists: (id) => findNode(navNodes, id)?.type === 'community',
+            activeChannelIsLive: () => {
+              const node = findNode(navNodes, activeChannel);
+              return node?.type === 'dm' || node?.type === 'group-chat';
+            },
           })
         : ({ action: 'none' } as const);
     switchMode(mode);
@@ -3707,6 +3724,8 @@
       notesSelected = false;
       changeSelectedCommunity(outcome.communityId);
       void refreshCommunityMembers(outcome.communityId);
+    } else if (outcome.action === 'clear-notes') {
+      notesSelected = false;
     }
   }
 
