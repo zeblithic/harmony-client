@@ -33,16 +33,22 @@ runs:
         # alone consumed the whole 45-min budget before clippy even started).
         # Cap per-connection timeouts so a bad mirror fails fast, and retry the
         # whole update+install up to 3x with an 8-min per-attempt wall-clock cap
-        # instead of hanging. The cap is hard: `timeout -k 10s` follows the
-        # SIGTERM with a SIGKILL 10s later, so an apt/dpkg child that ignores
-        # SIGTERM still can't run past the cap and re-wedge the job (Qodo).
-        # Bootstraps: even this step's own first run is protected. Worst case
-        # 3x8m=24m << the job timeout, vs an unbounded hang.
+        # instead of hanging. Worst case 3x8m=24m << the job timeout, vs an
+        # unbounded hang.
+        #
+        # 0.2.8 cut (run 32210904051): `timeout -k 10s` kills only the direct
+        # `bash -c` child — the `sudo apt-get` GRANDCHILD survives as an orphan
+        # still holding /var/lib/dpkg/lock-frontend, so attempts 2 and 3 failed
+        # instantly on "could not get lock (held by <attempt-1's apt>)" and the
+        # retry loop was useless in exactly the slow-mirror case it exists for.
+        # Two-part fix: reap the whole apt/dpkg subtree between attempts (then
+        # repair any interrupted-dpkg state), and give apt DPkg::Lock::Timeout
+        # so a retry WAITS on a lingering lock instead of failing on sight.
         set -uo pipefail
         run_apt() {
-          sudo apt-get -o Acquire::Retries=3 \
+          sudo apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 \
             -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 \
+          sudo apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 \
             -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y \
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
@@ -60,7 +66,15 @@ runs:
             exit 0
           fi
           echo "::warning::apt attempt $attempt failed or timed out (>8m); retrying in 15s"
-          sleep 15
+          # Reap any apt/dpkg orphaned by the timeout — `timeout` cannot reach
+          # the sudo grandchild, and a survivor holds the dpkg lock forever.
+          sudo pkill -9 -x apt-get 2>/dev/null || true
+          sudo pkill -9 -x dpkg 2>/dev/null || true
+          sleep 2
+          # A kill mid-unpack can leave dpkg interrupted; repair before retrying
+          # (no-op when the kill landed during the download phase).
+          sudo dpkg --configure -a 2>/dev/null || true
+          sleep 13
         done
         echo "::error::Tauri Linux deps install failed after 3 attempts"
         exit 1
