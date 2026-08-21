@@ -557,17 +557,12 @@ impl ChannelLogEngine {
         // backfill; it can't dedupe what it never saw). We walk every
         // sealed segment AND the tail to rebuild last_seen.
         //
-        // Iteration order matters: `ChannelLogReplayTracker::record`
-        // overwrites unconditionally (blind insert), so the LAST call
-        // for any (author, device) lane wins. Sealed segments hold the
-        // older history; the tail holds the most recent events. We
-        // walk segments first then tail so the tail's `record` calls
-        // win — this matches the natural ChannelLog::reload order
-        // (segments first, then tail). Reversing this order would
-        // regress the high-water mark whenever segments contain newer-
-        // than-tail events (possible in the post-tail-flush window
-        // before the next seal lands), allowing already-persisted
-        // events to be re-accepted on respawn.
+        // Iteration order no longer matters (ZEB-969): `record` is a
+        // max-fold, so walking segments and tail in any order yields
+        // each lane's max. This is load-bearing — a below-head event
+        // healed via RBSR sits late in storage order with an OLD stamp,
+        // and the pre-ZEB-969 blind-overwrite `record` would have
+        // regressed the lane head on respawn.
         //
         // Why call `record` directly (vs `check_and_advance`): on-disk
         // events were validated when first appended; re-running the

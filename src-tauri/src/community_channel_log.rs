@@ -1126,16 +1126,23 @@ impl ChannelLogReplayTracker {
 
     /// Advance the tracker to record an accepted event. Caller must
     /// have already validated via `would_accept` (and authorization
-    /// checks). Idempotent for the same (key, hlc) pair only — calling
-    /// twice with the same event will overwrite with an identical
-    /// value but doesn't error.
+    /// checks). Max-fold (ZEB-969): a lane's `last_seen` only ever
+    /// moves forward — recording an event at or below the current head
+    /// is a no-op, never an error. This makes the engine's boot rebuild
+    /// order-independent: a healed below-head event sitting late in
+    /// storage order cannot regress the head on respawn.
     pub fn record(&mut self, event: &SignedChannelEvent) {
         let key = (
             *event.channel_id(),
             *event.author(),
             event.at().device_id.clone(),
         );
-        self.last_seen.insert(key, event.at().clone());
+        match self.last_seen.get(&key) {
+            Some(prev) if !event.at().is_strictly_newer_than(prev) => {}
+            _ => {
+                self.last_seen.insert(key, event.at().clone());
+            }
+        }
     }
 
     /// Combined check + advance for callers that already serialize
@@ -3844,6 +3851,26 @@ mod tests {
             .check_and_advance(&stale)
             .expect_err("stale event must replay-reject");
         assert!(matches!(err, ChannelEventError::Replay { .. }));
+    }
+
+    #[test]
+    fn replay_tracker_record_does_not_regress_lane_head() {
+        // ZEB-969: `record` must be a max-fold. The engine's boot rebuild
+        // walks the persisted log in STORAGE order, and a healed below-head
+        // event sits late in the tail with an old stamp — blind overwrite
+        // would regress the lane head on respawn and re-open a
+        // duplicate-accept window on the live path.
+        let mut t = ChannelLogReplayTracker::new();
+        let newer = fixture_signed_event(2000, 0, "a-dev");
+        let older = fixture_signed_event(1000, 0, "a-dev");
+        t.record(&newer);
+        t.record(&older);
+        let key = (*newer.channel_id(), *newer.author(), "a-dev".to_string());
+        assert_eq!(
+            t.last_seen().get(&key).expect("lane present").wall_ms,
+            2000,
+            "an older stamp must not regress last_seen"
+        );
     }
 
     #[test]
