@@ -319,13 +319,17 @@ impl<S: ServingSensor, A: RemediationActuator, C: Clock> RelayAcceptorWatchdog<S
                 // actuator detaches the real work; a late completion still
                 // brings the node up, and `Phase::Escalated` then clears
                 // through the normal `recovered()` path on the first serve.
-                let bound = Duration::from_millis(self.cfg.restart_wedge_bound_ms.max(1));
+                // Log the clamped value below — with a zero config the enforced
+                // bound is 1ms, and the diagnostic must match it (CodeRabbit
+                // PR #720).
+                let bound_ms = self.cfg.restart_wedge_bound_ms.max(1);
+                let bound = Duration::from_millis(bound_ms);
                 if tokio::time::timeout(bound, self.actuator.restart_node())
                     .await
                     .is_err()
                 {
                     tracing::error!(
-                        bound_ms = self.cfg.restart_wedge_bound_ms,
+                        bound_ms,
                         "ZEB-970 watchdog: tier-2 restart exceeded its wall-clock bound — \
                          likely wedged stopping the node; escalating (node may stay down \
                          until app relaunch; a late completion still brings it up)"
