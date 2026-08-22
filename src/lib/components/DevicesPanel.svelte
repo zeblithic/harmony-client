@@ -20,7 +20,12 @@
   import { setButlerPin, extractButlerPinError } from '../butler-pin-service';
   import { fetchCommunitiesCount } from '../owner-meta';
   // ZEB-946: standalone date/time labels honor the owner's time-format prefs.
-  import { formatDateOnly, formatFullTimestamp, type TimeFormatPrefs } from '../time-format';
+  import {
+    formatDateOnly,
+    formatFullTimestamp,
+    formatLastSeen as formatLastSeenShared,
+    type TimeFormatPrefs,
+  } from '../time-format';
   import { timeFormatPrefs } from '../time-format-service';
   import {
     BACKUP_FLAGS_CHANGED_EVENT,
@@ -833,18 +838,11 @@
   }
 
   // ZEB-668 S4: heartbeat-tolerant relative time. The stamp cadence is
-  // ~7.5 min (fleet-net re-stamp tick) — hence "just now" out to 10 min and
-  // the "~" prefix on minute/hour buckets (honesty ledger: last seen = last
-  // fleet heartbeat, not live presence).
+  // ~7.5 min (fleet-net re-stamp tick) — hence the shared helper's default
+  // 10-minute "just now" floor fits this panel as-is. Lifted to time-format.ts
+  // for ZEB-972 (presence dots reuse it with a 1-minute floor).
   function formatLastSeen(ms: number, prefs: TimeFormatPrefs): string {
-    const min = Math.floor((Date.now() - ms) / 60000);
-    if (min < 10) return 'just now';
-    if (min < 60) return `~${min}m ago`;
-    const h = Math.floor(min / 60);
-    if (h < 24) return `~${h}h ago`;
-    const d = Math.floor(h / 24);
-    if (d < 30) return `${d}d ago`;
-    return formatDateOnly(ms, prefs);
+    return formatLastSeenShared(ms, Date.now(), prefs);
   }
 
   /** ZEB-721: coarse "~Nm / ~Nh / ~Nd" rendering of a clock-regression skew (seconds). */

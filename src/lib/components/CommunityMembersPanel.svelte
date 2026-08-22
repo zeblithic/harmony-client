@@ -6,6 +6,8 @@
   import MemberRow from './MemberRow.svelte';
   import type { KebabAction, OpenCardPayload } from './MemberRow.svelte';
   import type { ResolvedCard } from '../member-card-service';
+  // ZEB-972: three-state presence — stale rows are excluded from count/sort.
+  import type { PresenceDisplay } from '../presence-service';
   import { resolveMentionLabel } from '../mention-render';
   import ModerationReasonDialog from './ModerationReasonDialog.svelte';
   import LastAdminWarningDialog from './LastAdminWarningDialog.svelte';
@@ -18,7 +20,7 @@
     ownAddress,
     resolveCard,
     resolveNickname,
-    isOnline,
+    presence,
     selfInvisible = false,
     onOpenCard,
     thresholds = POWER_THRESHOLDS,
@@ -36,9 +38,11 @@
     /** ZEB-432: optional local friend-nickname resolver (ZEB-419), preferred
      *  over the profile-card name. Same pure-consumer contract as resolveCard. */
     resolveNickname?: (ownerIdHex: string) => string | undefined;
-    /** ZEB-537: optional online-presence resolver. Pure consumer of the
-     *  parent's PresenceService — same contract as resolveCard. */
-    isOnline?: (ownerIdHex: string) => boolean;
+    /** ZEB-537/ZEB-972: optional three-state presence resolver. Pure consumer
+     *  of the parent's PresenceService (`presenceFor`) — same contract as
+     *  resolveCard. Three states so stale rows are not counted or lit as
+     *  online. */
+    presence?: (ownerIdHex: string) => PresenceDisplay;
     /** ZEB-600: true when the viewer has "Appear offline" on — forwarded to
      *  MemberRow so only the self row shows the hollow "invisible" dot. */
     selfInvisible?: boolean;
@@ -122,7 +126,9 @@
   // the resolver can't answer for self; we decide it from `selfInvisible` here.
   function memberOnline(m: CommunityMember): boolean {
     if (m.address === ownAddress) return !selfInvisible;
-    return isOnline?.(m.address) ?? false;
+    // ZEB-972: only a genuinely fresh row counts — `stale` sorts/counts as
+    // not-online, matching the honest dot MemberRow renders for it.
+    return presence?.(m.address).state === 'online';
   }
   // ZEB-600: sort online-first (stable — Array.sort keeps the backend order
   // within each group), so who's around floats to the top.
@@ -333,7 +339,7 @@
           {viewer}
           {resolveCard}
           {resolveNickname}
-          {isOnline}
+          {presence}
           {selfInvisible}
           {onOpenCard}
           {thresholds}
@@ -355,7 +361,7 @@
               {viewer}
               {resolveCard}
               {resolveNickname}
-              {isOnline}
+              {presence}
               {selfInvisible}
               {onOpenCard}
               {thresholds}

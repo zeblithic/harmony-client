@@ -115,7 +115,7 @@ describe('ChannelMembersPanel — ZEB-553 presence dots on the default roster', 
     const { container } = render(ChannelMembersPanel, {
       props: baseProps({
         members: [self, member({ address: PEER }), member({ address: PEER2 })],
-        isOnline: (id: string) => id === PEER,
+        presence: (id: string) => ({ state: (id === PEER ? 'online' : 'offline') as 'online' | 'offline' }),
       }),
     });
     const rows = container.querySelectorAll('.member-row');
@@ -130,7 +130,7 @@ describe('ChannelMembersPanel — ZEB-553 presence dots on the default roster', 
     const { container } = render(ChannelMembersPanel, {
       props: baseProps({
         members: [self, member({ address: PEER })],
-        isOnline: () => false, // zenoh never loops our own beacon back
+        presence: () => ({ state: 'offline' as const }), // zenoh never loops our own beacon back
       }),
     });
     // Rows are ordered self-first; only the self dot is lit.
@@ -148,7 +148,7 @@ describe('ChannelMembersPanel — ZEB-553 presence dots on the default roster', 
 
   it('marks each presence dot with role="img" + an online/offline label (finding 15)', () => {
     const { container } = render(ChannelMembersPanel, {
-      props: baseProps({ members: [self, member({ address: PEER })], isOnline: () => false }),
+      props: baseProps({ members: [self, member({ address: PEER })], presence: () => ({ state: 'offline' as const }) }),
     });
     const dots = container.querySelectorAll('.presence-dot');
     expect(dots.length).toBe(2);
@@ -251,5 +251,39 @@ describe('ChannelMembersPanel — ZEB-553 item 11 roster loading state', () => {
     });
     expect(queryByText(/Loading members/i)).toBeNull();
     expect(container.querySelector('.member-list')).not.toBeNull();
+  });
+});
+
+// ZEB-972 — stale presence honesty on the always-visible roster. A roster row
+// whose beacon is overdue for backend eviction must stop reading as online:
+// hollow stale dot + honest last-seen title.
+describe('ChannelMembersPanel — ZEB-972 stale presence honesty', () => {
+  it('renders a stale member hollow (not online) with a last-seen + warning title', () => {
+    const seen = Date.now() - 2 * 60_000;
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({
+        members: [self, member({ address: PEER })],
+        presence: (id: string) =>
+          id === PEER
+            ? { state: 'stale' as const, lastSeenMs: seen }
+            : { state: 'offline' as const },
+      }),
+    });
+    expect(container.querySelectorAll('.presence-dot.online').length).toBe(1); // self only
+    const staleDot = container.querySelector('.presence-dot.stale');
+    expect(staleDot).not.toBeNull();
+    expect(staleDot?.getAttribute('title')).toBe('Last seen ~2m ago — connection may be stale');
+  });
+
+  it('renders an offline member with a session-known stamp as "Offline · last seen …"', () => {
+    const seen = Date.now() - 5 * 60_000;
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({
+        members: [self, member({ address: PEER })],
+        presence: () => ({ state: 'offline' as const, lastSeenMs: seen }),
+      }),
+    });
+    const dots = container.querySelectorAll('.presence-dot');
+    expect(dots[1]?.getAttribute('title')).toBe('Offline · last seen ~5m ago');
   });
 });

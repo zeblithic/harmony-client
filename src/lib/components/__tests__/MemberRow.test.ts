@@ -365,7 +365,7 @@ describe('MemberRow presence dot (ZEB-553)', () => {
       props: {
         member: selfMember,
         viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
-        isOnline: () => false, // resolver never reports our own beacon
+        presence: () => ({ state: 'offline' as const }), // resolver never reports our own beacon
       },
     });
     expect(container.querySelector('.presence-dot.online')).not.toBeNull();
@@ -377,7 +377,7 @@ describe('MemberRow presence dot (ZEB-553)', () => {
       props: {
         member: peer,
         viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
-        isOnline: () => false,
+        presence: () => ({ state: 'offline' as const }),
       },
     });
     expect(container.querySelector('.presence-dot')).not.toBeNull(); // dot still present
@@ -390,7 +390,7 @@ describe('MemberRow presence dot (ZEB-553)', () => {
       props: {
         member: peer,
         viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
-        isOnline: (id: string) => id === PEER,
+        presence: (id: string) => ({ state: (id === PEER ? 'online' : 'offline') as 'online' | 'offline' }),
       },
     });
     expect(container.querySelector('.presence-dot.online')).not.toBeNull();
@@ -402,7 +402,7 @@ describe('MemberRow presence dot (ZEB-553)', () => {
       props: {
         member: peer,
         viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
-        isOnline: () => false,
+        presence: () => ({ state: 'offline' as const }),
       },
     });
     const dot = container.querySelector('.presence-dot');
@@ -428,7 +428,7 @@ describe('MemberRow self-invisible dot (ZEB-600)', () => {
       props: {
         member: selfMember,
         viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
-        isOnline: () => false,
+        presence: () => ({ state: 'offline' as const }),
         selfInvisible: true,
       },
     });
@@ -445,7 +445,7 @@ describe('MemberRow self-invisible dot (ZEB-600)', () => {
       props: {
         member: selfMember,
         viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
-        isOnline: () => false,
+        presence: () => ({ state: 'offline' as const }),
         selfInvisible: false,
       },
     });
@@ -460,7 +460,7 @@ describe('MemberRow self-invisible dot (ZEB-600)', () => {
       props: {
         member: peer,
         viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
-        isOnline: () => true,
+        presence: () => ({ state: 'online' as const, lastSeenMs: Date.now() }),
         selfInvisible: true, // set, but must only affect the self row
       },
     });
@@ -489,5 +489,69 @@ describe('MemberRow joined-date honors the time-format preference (ZEB-946)', ()
     expect(container.querySelector('.joined-date')?.textContent).toBe(
       formatDateOnly(joinedAt, { dateOrder: 'ymd' }),
     );
+  });
+});
+
+// ZEB-972 — three-state presence honesty. `stale` (roster row present but the
+// beacon is overdue for backend eviction — the push pipeline itself is
+// suspect) must stop claiming live presence: hollow ring, honest last-seen
+// title. Offline rows with a session-known beacon stamp surface it as
+// "last seen" instead of a bare "Offline".
+describe('MemberRow presence dot three-state (ZEB-972)', () => {
+  const PEER = 'cc'.repeat(16);
+
+  function renderPeer(presence: (ownerIdHex: string) => { state: 'online' | 'stale' | 'offline'; lastSeenMs?: number }) {
+    return render(MemberRow, {
+      props: {
+        member: makeMember(0, 'joined', PEER),
+        viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
+        presence,
+      },
+    });
+  }
+
+  it('online → solid green dot titled Online', () => {
+    const { container } = renderPeer(() => ({ state: 'online', lastSeenMs: Date.now() }));
+    const dot = container.querySelector('.presence-dot');
+    expect(dot?.classList.contains('online')).toBe(true);
+    expect(dot?.classList.contains('stale')).toBe(false);
+    expect(dot?.getAttribute('title')).toBe('Online');
+  });
+
+  it('stale → hollow (not online) dot with a last-seen + stale-warning title', () => {
+    const seen = Date.now() - 2 * 60_000;
+    const { container } = renderPeer(() => ({ state: 'stale', lastSeenMs: seen }));
+    const dot = container.querySelector('.presence-dot');
+    expect(dot?.classList.contains('stale')).toBe(true);
+    expect(dot?.classList.contains('online')).toBe(false);
+    expect(dot?.getAttribute('title')).toBe('Last seen ~2m ago — connection may be stale');
+    expect(dot?.getAttribute('aria-label')).toBe('Last seen ~2m ago — connection may be stale');
+  });
+
+  it('offline with a session-known stamp → "Offline · last seen …" title', () => {
+    const seen = Date.now() - 5 * 60_000;
+    const { container } = renderPeer(() => ({ state: 'offline', lastSeenMs: seen }));
+    const dot = container.querySelector('.presence-dot');
+    expect(dot?.classList.contains('online')).toBe(false);
+    expect(dot?.classList.contains('stale')).toBe(false);
+    expect(dot?.getAttribute('title')).toBe('Offline · last seen ~5m ago');
+  });
+
+  it('offline never-seen → bare Offline title', () => {
+    const { container } = renderPeer(() => ({ state: 'offline' }));
+    expect(container.querySelector('.presence-dot')?.getAttribute('title')).toBe('Offline');
+  });
+
+  it('self dot ignores the presence resolver (always online unless invisible)', () => {
+    const { container } = render(MemberRow, {
+      props: {
+        member: makeMember(0, 'joined', VIEWER_ADDR),
+        viewer: { addr: VIEWER_ADDR, power: 0, isLastAdmin: false },
+        presence: () => ({ state: 'stale' as const, lastSeenMs: Date.now() - 120_000 }),
+      },
+    });
+    const dot = container.querySelector('.presence-dot');
+    expect(dot?.classList.contains('online')).toBe(true);
+    expect(dot?.getAttribute('title')).toBe('Online');
   });
 });

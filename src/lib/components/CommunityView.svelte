@@ -47,7 +47,7 @@
     votingAdapter,
     resolveCard,
     resolveNickname,
-    isOnline,
+    presence,
     selfInvisible = false,
     subscribeVisibleCards,
     unsubscribeCards,
@@ -89,10 +89,11 @@
     /** ZEB-432: optional local friend-nickname resolver (ZEB-419), preferred
      *  over the profile-card name in the roster and on message authors. */
     resolveNickname?: (ownerIdHex: string) => string | undefined;
-    /** ZEB-537: optional online-presence resolver for the members roster.
-     *  Pure consumer of the parent's PresenceService (same contract as
-     *  resolveCard). Undefined until the presence subscription is wired. */
-    isOnline?: (ownerIdHex: string) => boolean;
+    /** ZEB-537/ZEB-972: optional three-state presence resolver for the members
+     *  roster. Pure consumer of the parent's PresenceService (`presenceFor`,
+     *  same contract as resolveCard). Undefined until the presence
+     *  subscription is wired. */
+    presence?: (ownerIdHex: string) => import('../presence-service').PresenceDisplay;
     /** ZEB-600: true when the viewer has "Appear offline" on — forwarded to the
      *  members panel so the self row shows the hollow "invisible" dot. */
     selfInvisible?: boolean;
@@ -650,7 +651,7 @@
         {trustService}
         {resolveCard}
         {resolveNickname}
-        {isOnline}
+        {presence}
         {onOpenCard}
         collapsed={rightPanel !== 'members'}
       />
@@ -736,7 +737,7 @@
         ownAddress={ownAddress}
         {resolveCard}
         {resolveNickname}
-        {isOnline}
+        {presence}
         {selfInvisible}
         {onOpenCard}
         {thresholds}

@@ -202,9 +202,9 @@
   // ZEB-537: per-community online presence. Mirrors MemberCardService's
   // optional-adapter + reactivity-seam pattern: constructed early so it's
   // available at boot, the adapter is wired in Tauri-init, and a $state
-  // version counter bumped on every presence update re-runs the inline
-  // isOnline() resolver read in MemberRow's $derived so the online dot
-  // repaints live.
+  // version counter bumped on every presence update (and by the ZEB-972
+  // 15 s staleness ticker) re-runs the inline presenceFor() resolver read in
+  // MemberRow's $derived so the dot repaints live.
   const presenceService = new PresenceService();
   let presenceVersion = $state(0);
   // ZEB-600: the viewer's own presence visibility ("Appear offline" inverse).
@@ -735,13 +735,29 @@
     return friendNicknames.get(ownerIdHex.toLowerCase()) || undefined;
   }
 
-  // ZEB-537: online-presence resolver threaded into the members roster, mirroring
-  // resolveCard. Reading presenceVersion registers the reactive dependency so
-  // consumers re-run when a presence-updated event mutates the service's map.
-  function isOnline(ownerIdHex: string): boolean {
+  // ZEB-537/ZEB-972: presence resolver threaded into the members roster,
+  // mirroring resolveCard. Reading presenceVersion registers the reactive
+  // dependency so consumers re-run when a presence-updated event mutates the
+  // service's map — or when the staleness ticker below bumps the counter.
+  function presenceFor(ownerIdHex: string): import('./lib/presence-service').PresenceDisplay {
     presenceVersion; // reactive dep: re-run derived consumers when presence changes
-    return presenceService.isOnline(ownerIdHex);
+    return presenceService.presenceFor(ownerIdHex);
   }
+
+  // ZEB-972: staleness ticker. The backend push (`presence-updated`) is the
+  // normal re-render trigger, but staleness is a function of TIME, not events —
+  // and the failure mode this guards against is precisely "the backend stopped
+  // sending events" (the sweeper in the event loop is the sole roster-eviction
+  // path; ZEB-970's wedge froze it and dots stayed green for the whole
+  // incident). A 15 s bump re-evaluates every dot through presenceFor without
+  // any backend involvement, so a frozen roster degrades to `stale` within
+  // ~PRESENCE_STALE_AFTER_MS + 15 s on the frontend's own clock.
+  $effect(() => {
+    const t = setInterval(() => {
+      presenceVersion++;
+    }, 15_000);
+    return () => clearInterval(t);
+  });
 
   // ZEB-341 Task 8 / ZEB-840: each subscription driver owns a NAMED bucket on
   // the single MemberCardService; the service subscribes to the UNION of all
@@ -4350,7 +4366,7 @@
         }}
         {resolveCard}
         {resolveNickname}
-        {isOnline}
+        presence={presenceFor}
         selfInvisible={!presenceVisible}
         {subscribeVisibleCards}
         {unsubscribeCards}
