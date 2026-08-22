@@ -330,10 +330,7 @@ impl<S: ServingSensor, A: RemediationActuator, C: Clock> RelayAcceptorWatchdog<S
                          likely wedged stopping the node; escalating (node may stay down \
                          until app relaunch; a late completion still brings it up)"
                     );
-                    self.memory
-                        .lock()
-                        .expect("watchdog memory poisoned")
-                        .phase = Phase::Escalated;
+                    self.memory.lock().expect("watchdog memory poisoned").phase = Phase::Escalated;
                 }
             }
             Verdict::Escalate => {
