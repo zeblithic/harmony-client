@@ -3508,6 +3508,11 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
     // async — same `thread::scope` + ephemeral current-thread runtime pattern as
     // the registry shutdowns above.
     if let Some(endpoint) = iroh_endpoint_for_shutdown {
+        // ZEB-970: INFO on both sides of the close, deliberately. The tier-2
+        // restart wedge was only attributable by line *absence*: this pair
+        // discriminates "wedged joining the event-loop thread" (no line below)
+        // from "wedged inside the iroh close" (open line, no complete line).
+        tracing::info!("ZEB-834: closing iroh endpoint on stop");
         std::thread::scope(|s| {
             s.spawn(|| {
                 match tokio::runtime::Builder::new_current_thread()
@@ -3518,7 +3523,7 @@ pub(crate) fn stop_inner(state: &Mutex<NodeState>, expected_gen: Option<u64>) ->
                         rt.block_on(crate::iroh_transport_lifecycle::close_iroh_endpoint(
                             endpoint,
                         ));
-                        tracing::debug!("ZEB-834: iroh endpoint close on stop complete");
+                        tracing::info!("ZEB-834: iroh endpoint close on stop complete");
                     }
                     Err(e) => {
                         tracing::error!(
@@ -3855,8 +3860,23 @@ impl crate::relay_acceptor_watchdog::RemediationActuator for ProdWatchdogActuato
         // Tier 2: gen-guarded full-node restart. The watchdog task is NOT stored
         // in `NodeState`, so this `stop_inner` does not abort the caller; the run
         // loop exits cooperatively on the shutdown watch after the restart.
-        (self.restart)().await;
+        //
+        // ZEB-970: detached per the `RemediationActuator::restart_node`
+        // contract — the watchdog drops this future at the wedge bound, and
+        // only the wait may die with it, never the restart itself.
+        await_detached((self.restart)()).await;
     }
+}
+
+/// ZEB-970: run `fut` as its own task and await the handle. Awaiting a
+/// `JoinHandle` is cancel-safe — dropping this future (the watchdog's wedge
+/// bound expiring) leaves the spawned task running to completion, so a slow or
+/// wedged restart is abandoned by the *watchdog* without being cancelled
+/// mid-flight (a cancelled `start_node_inner` would orphan half-installed
+/// node state).
+async fn await_detached(fut: futures::future::BoxFuture<'static, ()>) {
+    let handle = tokio::spawn(fut);
+    let _ = handle.await;
 }
 
 /// Perform one gen-guarded full-node restart. Shared by both the headless
@@ -3865,13 +3885,21 @@ impl crate::relay_acceptor_watchdog::RemediationActuator for ProdWatchdogActuato
 ///
 /// - **Generation guard:** if another start already superseded us,
 ///   `stop_inner(Some(gen))` is a no-op and we abort (no double-restart).
-/// - **`block_in_place`:** `stop_inner` joins the event-loop thread; running the
-///   blocking join via `block_in_place` keeps it from starving other tasks on
-///   this Tokio worker (Qodo).
+/// - **`spawn_blocking` (ZEB-970, formerly `block_in_place`):** `stop_inner`
+///   joins the event-loop thread and can wedge outright (the field incident:
+///   the unbounded iroh close on a dead network). On the blocking pool a wedge
+///   strands one pool thread; `block_in_place` would strand this task's
+///   worker AND is illegal on a current-thread runtime. The handles are
+///   re-resolved inside the `'static` closure from the owned/Tauri handle —
+///   the same dual-path dispatch `build_watchdog_restart_fn` documents.
 /// - **Bounded retry:** `start_node_inner` is stop-first, so a retry is safe; a
 ///   transient failure can clear on the second attempt. A deterministic failure
 ///   escalates — the node is left stopped, surfaced via the ERROR log and the
 ///   `escalated` health field (the surface for a headless fleet node).
+/// - **INFO breadcrumbs (ZEB-970):** every phase transition of the restart
+///   logs at INFO. The field wedge was only diagnosable by the *absence* of
+///   lines between "event loop stopped" and the next boot probe; these lines
+///   pin the wedge point next time.
 async fn do_watchdog_node_restart(
     state: &Mutex<NodeState>,
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
@@ -3879,16 +3907,47 @@ async fn do_watchdog_node_restart(
     owned_state: Option<std::sync::Arc<Mutex<NodeState>>>,
 ) {
     use std::sync::atomic::Ordering;
-    let gen = state.lock().expect("NodeState mutex poisoned").generation;
-    // Mark this restart as watchdog-initiated so the freshly-spawned watchdog
-    // preserves the escalation memory (see spawn_relay_acceptor_watchdog).
-    WATCHDOG_TIER2_IN_FLIGHT.store(true, Ordering::SeqCst);
-    let stopped = tokio::task::block_in_place(|| stop_inner(state, Some(gen)));
+    tracing::info!("ZEB-970 watchdog: tier-2 restart — stopping node");
+    let stop_result = tokio::task::spawn_blocking({
+        let wry_handle = wry_handle.clone();
+        let owned_state = owned_state.clone();
+        move || {
+            let stop = |state: &Mutex<NodeState>| {
+                let gen = state.lock().expect("NodeState mutex poisoned").generation;
+                // Mark this restart as watchdog-initiated so the freshly-spawned
+                // watchdog preserves the escalation memory (see
+                // spawn_relay_acceptor_watchdog).
+                WATCHDOG_TIER2_IN_FLIGHT.store(true, Ordering::SeqCst);
+                stop_inner(state, Some(gen))
+            };
+            if let Some(owned) = owned_state.as_deref() {
+                stop(owned)
+            } else if let Some(app) = wry_handle {
+                use tauri::Manager as _;
+                let st = app.state::<Mutex<NodeState>>();
+                stop(&st)
+            } else {
+                // Unreachable: build_watchdog_restart_fn errors out before
+                // calling us when neither handle exists.
+                false
+            }
+        }
+    })
+    .await;
+    let stopped = match stop_result {
+        Ok(stopped) => stopped,
+        Err(e) => {
+            WATCHDOG_TIER2_IN_FLIGHT.store(false, Ordering::SeqCst);
+            tracing::error!(error = %e, "ZEB-970 watchdog: node stop task panicked — restart aborted");
+            return;
+        }
+    };
     if !stopped {
         WATCHDOG_TIER2_IN_FLIGHT.store(false, Ordering::SeqCst);
         tracing::warn!("ZEB-803 watchdog: restart skipped — generation changed");
         return;
     }
+    tracing::info!("ZEB-970 watchdog: node stopped — starting replacement node");
     for attempt in 1..=2u32 {
         // Re-assert per attempt: the first attempt's spawn consumes the flag on
         // success, so a retry must set it again.
@@ -3902,7 +3961,14 @@ async fn do_watchdog_node_restart(
         )
         .await
         {
-            Ok(_) => return, // the new node's watchdog spawn consumed the flag
+            Ok(_) => {
+                // The new node's watchdog spawn consumed the flag. If the
+                // watchdog escalated at its wedge bound meanwhile, this line
+                // is the "late completion" marker — the node IS up, and the
+                // escalation clears on the first successful serve.
+                tracing::info!("ZEB-970 watchdog: tier-2 restart complete — node is up");
+                return;
+            }
             Err(e) => {
                 tracing::warn!(attempt, error = %e, "ZEB-803 watchdog: restart start_node_inner failed");
             }
@@ -3992,6 +4058,10 @@ fn spawn_relay_acceptor_watchdog(
         tier1_cooldown_ms: cadence_ms.saturating_mul(2),
         tier2_cooldown_ms: cadence_ms.saturating_mul(2),
         max_restarts: 3,
+        // ZEB-970: 3 minutes dwarfs any healthy stop+start (a normal restart is
+        // seconds; the worst observed cold iroh bind is well under a minute)
+        // while staying far below the "down until someone notices" horizon.
+        restart_wedge_bound_ms: 180_000,
     };
     let sensor = ProdWatchdogSensor {
         telemetry,
@@ -4034,6 +4104,29 @@ mod watchdog_wiring_tests {
         let s1 = sensor.sample(99);
         assert_eq!(s1.now_ms, 99);
         assert!(s1.last_served_ms.is_some());
+    }
+
+    /// ZEB-970: the watchdog drops `restart_node`'s future at the wedge bound.
+    /// The prod actuator must therefore detach the real restart work — a
+    /// cancelled await abandons only the wait, and a slow (or late) restart
+    /// still runs to completion.
+    #[tokio::test(start_paused = true)]
+    async fn detached_restart_survives_caller_cancellation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let done2 = done.clone();
+        let fut: futures::future::BoxFuture<'static, ()> = Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            done2.store(true, Ordering::SeqCst);
+        });
+        // Simulate the watchdog's wedge bound expiring mid-restart.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), await_detached(fut)).await;
+        // Give the detached task room to finish past its 5s sleep.
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert!(
+            done.load(Ordering::SeqCst),
+            "cancelling the bounded await must not cancel the detached restart work"
+        );
     }
 }
 

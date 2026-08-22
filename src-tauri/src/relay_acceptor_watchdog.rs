@@ -25,6 +25,14 @@ pub struct WatchdogConfig {
     pub tier2_cooldown_ms: u64,
     /// Consecutive full restarts without recovery before escalating.
     pub max_restarts: u32,
+    /// ZEB-970: wall-clock bound on ONE tier-2 restart. A restart that has not
+    /// completed within this bound is judged wedged (in the field: `stop_inner`
+    /// stuck in the unbounded iroh `Endpoint::close()` on a dead network) — the
+    /// watchdog escalates loudly instead of silently parking forever. The
+    /// actuator's `restart_node` future is DROPPED at the bound, so
+    /// implementations must detach the real work (see the trait doc); a late
+    /// completion still brings the node up.
+    pub restart_wedge_bound_ms: u64,
 }
 
 /// One sample of the observed signals.
@@ -212,6 +220,12 @@ pub trait RemediationActuator: Send + Sync {
     /// Tier 1: in-place re-probe (`endpoint.network_change()`).
     async fn probe_network(&self);
     /// Tier 2: full-node restart (`stop_inner` + `start_node_inner`).
+    ///
+    /// ZEB-970 contract: the watchdog wraps this future in
+    /// `WatchdogConfig::restart_wedge_bound_ms` and DROPS it on expiry.
+    /// Implementations must therefore be cancel-safe: run the actual
+    /// stop/start as a detached task and await its handle here, so a dropped
+    /// future abandons only the *wait*, never the restart itself.
     async fn restart_node(&self);
 }
 
@@ -297,7 +311,31 @@ impl<S: ServingSensor, A: RemediationActuator, C: Clock> RelayAcceptorWatchdog<S
                     connected = inputs.connected_peers,
                     "ZEB-803 watchdog: tier-1 probe did not restore serving — tier 2 full-node restart"
                 );
-                self.actuator.restart_node().await;
+                // ZEB-970: bound the restart. Without this, a `stop_inner`
+                // wedged in the unbounded iroh close parked this await — and
+                // the watchdog — forever, with zero log output (the field
+                // incident: node down until manual app relaunch). Dropping the
+                // actuator future at the bound is safe because the prod
+                // actuator detaches the real work; a late completion still
+                // brings the node up, and `Phase::Escalated` then clears
+                // through the normal `recovered()` path on the first serve.
+                // Log the clamped value below — with a zero config the enforced
+                // bound is 1ms, and the diagnostic must match it (CodeRabbit
+                // PR #720).
+                let bound_ms = self.cfg.restart_wedge_bound_ms.max(1);
+                let bound = Duration::from_millis(bound_ms);
+                if tokio::time::timeout(bound, self.actuator.restart_node())
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        bound_ms,
+                        "ZEB-970 watchdog: tier-2 restart exceeded its wall-clock bound — \
+                         likely wedged stopping the node; escalating (node may stay down \
+                         until app relaunch; a late completion still brings it up)"
+                    );
+                    self.memory.lock().expect("watchdog memory poisoned").phase = Phase::Escalated;
+                }
             }
             Verdict::Escalate => {
                 tracing::error!(
@@ -322,6 +360,7 @@ mod tests {
             tier1_cooldown_ms: 2000,
             tier2_cooldown_ms: 2000,
             max_restarts: 3,
+            restart_wedge_bound_ms: 2000,
         }
     }
 
@@ -740,6 +779,87 @@ mod tests {
             &mut m,
         );
         assert_eq!(v2, Verdict::ProbeNetwork);
+    }
+
+    /// Memory pre-armed one step before tier-2: a probe cooldown that has
+    /// elapsed without recovery, so the next stale+connected sample fires
+    /// `Verdict::RestartNode`.
+    fn pre_tier2_mem() -> WatchdogMemory {
+        WatchdogMemory {
+            served_ever: true,
+            phase: Phase::Cooldown {
+                since_ms: 0,
+                tier: Tier::Probe,
+            },
+            consecutive_restarts: 0,
+            baseline_served_ms: Some(1000),
+            last_action_ms: Some(0),
+            last_action_tier: Some(Tier::Probe),
+        }
+    }
+
+    /// ZEB-970: an actuator whose restart wedges forever — the field failure
+    /// (`stop_inner` stuck in the unbounded iroh close on a dead network).
+    struct WedgedActuator;
+    #[async_trait::async_trait]
+    impl RemediationActuator for WedgedActuator {
+        async fn probe_network(&self) {}
+        async fn restart_node(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier2_wedge_bound_escalates_instead_of_hanging() {
+        let mem = Arc::new(Mutex::new(pre_tier2_mem()));
+        let wd = RelayAcceptorWatchdog::new(
+            test_cfg(),
+            mem.clone(),
+            MockSensor {
+                last_served_ms: Some(1000),
+                connected: 2,
+            }, // persistently stale
+            WedgedActuator,
+            MockClock(Arc::new(AtomicU64::new(10_000))), // probe cooldown elapsed
+        );
+        // The tick must RETURN once the wedge bound (2s in test_cfg) fires.
+        // The outer bound is test-side only, far above the config bound, so a
+        // hang here is the ZEB-970 bug, not a tight-timing flake.
+        tokio::time::timeout(Duration::from_millis(60_000), wd.tick())
+            .await
+            .expect("tick must return at the wedge bound — hanging forever is the ZEB-970 bug");
+        assert_eq!(
+            mem.lock().unwrap().phase,
+            Phase::Escalated,
+            "a wedged tier-2 restart must escalate loudly, not park silently"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tier2_restart_within_bound_does_not_escalate() {
+        let mem = Arc::new(Mutex::new(pre_tier2_mem()));
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let wd = RelayAcceptorWatchdog::new(
+            test_cfg(),
+            mem.clone(),
+            MockSensor {
+                last_served_ms: Some(1000),
+                connected: 2,
+            },
+            RecordingActuator(actions.clone()),
+            MockClock(Arc::new(AtomicU64::new(10_000))),
+        );
+        wd.tick().await;
+        assert_eq!(*actions.lock().unwrap(), vec!["restart"]);
+        let m = *mem.lock().unwrap();
+        assert_eq!(
+            m.phase,
+            Phase::Cooldown {
+                since_ms: 10_000,
+                tier: Tier::Restart
+            },
+            "a restart that completes within the bound keeps the normal cooldown phase"
+        );
     }
 
     #[tokio::test]
