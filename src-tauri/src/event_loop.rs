@@ -4102,7 +4102,12 @@ pub async fn run(
     // Used to derive hop distance: ZID in this set → hop 1, else → hop 2.
     // Eagerly populated so capacity updates arriving before the first refresh
     // aren't misclassified as hop 2.
-    let mut direct_peer_zids: std::collections::HashSet<String> = direct_link_zids(&session).await;
+    let (boot_peer_zids, boot_router_zids) = direct_link_zids_by_hat(&session).await;
+    let mut direct_peer_zids: std::collections::HashSet<String> = boot_peer_zids
+        .iter()
+        .cloned()
+        .chain(boot_router_zids.iter().cloned())
+        .collect();
     // ZEB-622: previous zid-poll snapshot, kept SEPARATE from the overwrite-
     // style `direct_peer_zids` above (whose hop-distance consumers need the
     // current-snapshot semantics). SEEDED from the same boot-time snapshot
@@ -4115,8 +4120,9 @@ pub async fn run(
     let mut peer_refresh_counter: u64 = 0;
     // ZEB-971: publish the boot-time snapshot eagerly (same reasoning as the
     // eager `direct_peer_zids` above — a watchdog sample before the first
-    // refresh must not misread live peers as zero demand).
-    zenoh_transport_peers.replace(direct_peer_zids.clone());
+    // refresh must not misread live peers as zero demand). Hats kept split:
+    // peers are demand, routers are visible-but-not-demand (CodeAnt PR #721).
+    zenoh_transport_peers.replace(boot_peer_zids, boot_router_zids);
     // ZEB-971: per-peer consecutive-absent-poll counts for the zombie-link
     // reconcile. Bounded by the supervisor's Connected set (pruned each poll).
     let mut zombie_absent_streaks: std::collections::HashMap<[u8; 32], u32> =
@@ -4843,8 +4849,12 @@ pub async fn run(
                 // session-info calls under high message traffic.
                 peer_refresh_counter += 1;
                 if peer_refresh_counter.is_multiple_of(20) {
-                    let refreshed: Vec<String> =
-                        direct_link_zids(&session).await.into_iter().collect();
+                    let (peer_zids, router_zids) = direct_link_zids_by_hat(&session).await;
+                    let refreshed: Vec<String> = peer_zids
+                        .iter()
+                        .cloned()
+                        .chain(router_zids.iter().cloned())
+                        .collect();
                     // ZEB-622: any up-edge (a zid absent last poll, present now)
                     // bumps the transport epoch — community root-fetch /
                     // channel-backfill / mail-root latches re-arm (their drivers
@@ -4857,8 +4867,9 @@ pub async fn run(
                     // which tracks the same snapshot.
                     direct_peer_zids = transport_prev_zids.clone();
                     // ZEB-971: publish the snapshot for the watchdog's demand
-                    // gate …
-                    zenoh_transport_peers.replace(transport_prev_zids.clone());
+                    // gate — hats split, peers-only count as demand (CodeAnt
+                    // PR #721) …
+                    zenoh_transport_peers.replace(peer_zids, router_zids);
                     // … and reconcile zombie supervisor slots against it: a
                     // peer the supervisor holds `Connected` with no zenoh
                     // transport behind it (2 consecutive polls, ≥60s old)
@@ -8677,19 +8688,32 @@ where
 /// behavior. See CodeRabbit R2 on PR #125.
 const ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// ZEB-912: all directly-linked zids, regardless of the REMOTE session's mode.
-/// zenoh's session info partitions direct links by remote whatami (`peers_zid`
-/// vs `routers_zid` — an all-router mesh under HARMONY_ZENOH_MODE=router
-/// reports every link in `routers_zid`, probe-verified in the R3 spike doc).
-/// Hop-distance classification and ZEB-622 up-edge detection care about
-/// "directly linked", not the remote's mode — reading only `peers_zid` would
-/// silently blind both on router-mode runs.
-async fn direct_link_zids(session: &zenoh::Session) -> std::collections::HashSet<String> {
+/// Zenoh's directly-linked zids by remote hat: `(peer_zids, router_zids)`.
+///
+/// ZEB-912: zenoh's session info partitions direct links by remote whatami
+/// (`peers_zid` vs `routers_zid` — an all-router mesh under
+/// HARMONY_ZENOH_MODE=router reports every link in `routers_zid`,
+/// probe-verified in the R3 spike doc). Hop-distance classification and
+/// ZEB-622 up-edge detection care about "directly linked", not the remote's
+/// mode, so those consumers merge the two sets.
+///
+/// ZEB-971 (CodeAnt PR #721): the split exists because the watchdog's demand
+/// gate must NOT merge them — a router-hat transport is infrastructure, not a
+/// relay puller. Consequence on router-mode experimental runs: every link
+/// reads router-hat, demand reads zero, and the watchdog stays quiet — the
+/// safe failure direction (no auto-remediation) versus false self-restarts.
+async fn direct_link_zids_by_hat(
+    session: &zenoh::Session,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
     let info = session.info();
-    let mut set: std::collections::HashSet<String> =
+    let peers: std::collections::HashSet<String> =
         info.peers_zid().await.map(|z| z.to_string()).collect();
-    set.extend(info.routers_zid().await.map(|z| z.to_string()));
-    set
+    let routers: std::collections::HashSet<String> =
+        info.routers_zid().await.map(|z| z.to_string()).collect();
+    (peers, routers)
 }
 
 /// ZEB-971: minimum age of a supervisor `Connected` stamp before the zombie

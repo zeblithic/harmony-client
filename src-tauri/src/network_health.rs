@@ -1218,10 +1218,13 @@ impl CommunityRelayServingTelemetry {
     pub fn record_served(&self, peer: &[u8; 32]) {
         self.served.fetch_add(1, Ordering::Relaxed);
         let now = now_ms();
-        self.last_served_ms.store(now, Ordering::Relaxed);
+        // Max-merged (CodeRabbit PR #721): concurrent pull handlers race these
+        // stamps, and a stale sample must never regress newer evidence — the
+        // same never-regress rule `PeerTrafficRegistry` documents.
+        self.last_served_ms.fetch_max(now, Ordering::Relaxed);
         // ZEB-971: one clock sample stamps both — a serve IS an attempt, and
         // the two fields must never disagree about the same pull.
-        self.last_pull_attempt_ms.store(now, Ordering::Relaxed);
+        self.last_pull_attempt_ms.fetch_max(now, Ordering::Relaxed);
         let key = hex::encode(&peer[..4]);
         let mut peers = self.peers.lock().expect("relay serving peer map lock");
         let entry = peers.entry(key).or_insert((0, 0));
@@ -1241,12 +1244,16 @@ impl CommunityRelayServingTelemetry {
 
     pub fn record_rejected(&self) {
         self.rejected.fetch_add(1, Ordering::Relaxed);
-        self.last_pull_attempt_ms.store(now_ms(), Ordering::Relaxed);
+        // Max-merged — see `record_served`.
+        self.last_pull_attempt_ms
+            .fetch_max(now_ms(), Ordering::Relaxed);
     }
 
     pub fn record_failed(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
-        self.last_pull_attempt_ms.store(now_ms(), Ordering::Relaxed);
+        // Max-merged — see `record_served`.
+        self.last_pull_attempt_ms
+            .fetch_max(now_ms(), Ordering::Relaxed);
     }
 
     pub fn summary(&self) -> CommunityRelayServingHealth {
@@ -1291,7 +1298,14 @@ impl CommunityRelayServingTelemetry {
 /// handed to both writers and readers of that same lifetime.
 #[derive(Debug, Default)]
 pub struct ZenohTransportPeers {
-    zids: Mutex<std::collections::HashSet<String>>,
+    /// Peer-hat transports (`peers_zid()`) — the demand signal.
+    peers: Mutex<std::collections::HashSet<String>>,
+    /// Router-hat transports (`routers_zid()`). ZEB-971 (CodeAnt PR #721):
+    /// kept SEPARATE from `peers` — a router is infrastructure, not a relay
+    /// puller, so it must not count as serve demand; it is still a live
+    /// transport, so the zombie reconcile's `contains` must see it (or a
+    /// healthy router-hat fleet peer would be kick-churned).
+    routers: Mutex<std::collections::HashSet<String>>,
 }
 
 impl ZenohTransportPeers {
@@ -1299,24 +1313,36 @@ impl ZenohTransportPeers {
         Self::default()
     }
 
-    /// Replace the snapshot with the current poll — never merge, so a departed
-    /// transport disappears on the next poll instead of lingering as phantom
-    /// demand.
-    pub fn replace(&self, current: std::collections::HashSet<String>) {
-        *self.zids.lock().expect("zenoh transport peers lock") = current;
+    /// Replace both snapshots with the current poll — never merge, so a
+    /// departed transport disappears on the next poll instead of lingering as
+    /// phantom demand.
+    pub fn replace(
+        &self,
+        peers: std::collections::HashSet<String>,
+        routers: std::collections::HashSet<String>,
+    ) {
+        *self.peers.lock().expect("zenoh transport peers lock") = peers;
+        *self.routers.lock().expect("zenoh transport peers lock") = routers;
     }
 
-    /// Number of live zenoh transport peers as of the last poll.
-    pub fn count(&self) -> u32 {
-        self.zids.lock().expect("zenoh transport peers lock").len() as u32
+    /// Number of live PEER-hat transports as of the last poll — the watchdog's
+    /// demand signal. Routers deliberately excluded (see the field doc).
+    pub fn demand_count(&self) -> u32 {
+        self.peers.lock().expect("zenoh transport peers lock").len() as u32
     }
 
-    /// Whether `zid` had a live zenoh transport as of the last poll.
+    /// Whether `zid` had a live zenoh transport of EITHER hat as of the last
+    /// poll — the zombie reconcile's liveness check.
     pub fn contains(&self, zid: &str) -> bool {
-        self.zids
+        self.peers
             .lock()
             .expect("zenoh transport peers lock")
             .contains(zid)
+            || self
+                .routers
+                .lock()
+                .expect("zenoh transport peers lock")
+                .contains(zid)
     }
 }
 
@@ -4335,15 +4361,46 @@ mod tests {
     #[test]
     fn zenoh_transport_peers_cache_replaces_not_merges() {
         let cache = ZenohTransportPeers::new();
-        assert_eq!(cache.count(), 0, "empty until the first poll lands");
+        assert_eq!(cache.demand_count(), 0, "empty until the first poll lands");
         assert!(!cache.contains("aa"));
-        cache.replace(["aa".to_string(), "bb".to_string()].into_iter().collect());
-        assert_eq!(cache.count(), 2);
+        cache.replace(
+            ["aa".to_string(), "bb".to_string()].into_iter().collect(),
+            std::collections::HashSet::new(),
+        );
+        assert_eq!(cache.demand_count(), 2);
         assert!(cache.contains("aa"));
-        cache.replace(["bb".to_string()].into_iter().collect());
-        assert_eq!(cache.count(), 1, "replace semantics — aa must be gone");
+        cache.replace(
+            ["bb".to_string()].into_iter().collect(),
+            std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            cache.demand_count(),
+            1,
+            "replace semantics — aa must be gone"
+        );
         assert!(!cache.contains("aa"));
         assert!(cache.contains("bb"));
+    }
+
+    /// ZEB-971 (CodeAnt PR #721): a router-hat transport is infrastructure,
+    /// not a relay puller — it must NOT count as serve demand (an idle router
+    /// link would otherwise re-create the false-positive this gate exists to
+    /// kill). It MUST still count for `contains` — the zombie reconcile would
+    /// otherwise kick-churn a healthy router-hat fleet peer every two polls.
+    #[test]
+    fn router_transports_are_visible_but_not_demand() {
+        let cache = ZenohTransportPeers::new();
+        cache.replace(
+            ["peer1".to_string()].into_iter().collect(),
+            ["router1".to_string()].into_iter().collect(),
+        );
+        assert_eq!(cache.demand_count(), 1, "router does not count as demand");
+        assert!(cache.contains("peer1"));
+        assert!(
+            cache.contains("router1"),
+            "router IS a live transport for the zombie reconcile"
+        );
+        assert!(!cache.contains("nope"));
     }
 
     /// ZEB-971: every inbound pull outcome — served, rejected, failed — is

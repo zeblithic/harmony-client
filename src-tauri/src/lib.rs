@@ -3840,7 +3840,7 @@ impl crate::relay_acceptor_watchdog::ServingSensor for ProdWatchdogSensor {
             now_ms,
             last_served_ms,
             connected_peers,
-            zenoh_peers: self.zenoh_peers.count(),
+            zenoh_peers: self.zenoh_peers.demand_count(),
             last_pull_attempt_ms: self.telemetry.last_pull_attempt_ms(),
         }
     }
@@ -4115,7 +4115,10 @@ mod watchdog_wiring_tests {
         // A recorded serve makes it Some (the sentinel lifts), and stamps the
         // attempt; the zenoh cache count flows through (ZEB-971).
         tel.record_served(&[7u8; 32]);
-        zenoh_peers.replace(["z1".to_string(), "z2".to_string()].into_iter().collect());
+        zenoh_peers.replace(
+            ["z1".to_string(), "z2".to_string()].into_iter().collect(),
+            std::collections::HashSet::new(),
+        );
         let s1 = sensor.sample(99);
         assert_eq!(s1.now_ms, 99);
         assert!(s1.last_served_ms.is_some());
