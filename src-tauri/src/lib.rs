@@ -4025,6 +4025,7 @@ fn build_watchdog_restart_fn(
 /// task is detached and self-terminates on the node's shutdown watch — so a
 /// stop/restart ends it without a `NodeState` handle (which would otherwise
 /// abort the task mid-restart).
+#[allow(clippy::too_many_arguments)] // boot wiring fan-in, same shape as event_loop::run
 fn spawn_relay_acceptor_watchdog(
     telemetry: std::sync::Arc<crate::network_health::CommunityRelayServingTelemetry>,
     endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
