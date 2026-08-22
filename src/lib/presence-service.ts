@@ -27,12 +27,14 @@ interface PresenceUpdatedPayload {
 /**
  * ZEB-972: client-side staleness threshold. The backend evicts a silent owner
  * from the roster after 30 s (3× the 10 s beacon interval,
- * `community_presence::STALE_MS`), so under normal operation a cached row's
- * beacon stamp is never older than ~30 s plus event latency. 2× that TTL means
- * "the backend's eviction is overdue" — the sweep lives in the event loop and
- * is the SOLE eviction path, so an event-loop stall/death (the ZEB-970 wedge
- * incident) freezes rows in place and, without this guard, dots would stay
- * green forever. Generous enough to never flap during normal operation.
+ * `community_presence::STALE_MS`), and {@link PresenceService.refreshAll}
+ * re-pulls stamps every ~15 s, so under normal operation a cached row's beacon
+ * stamp is never older than ~25 s (10 s beacon cadence + 15 s poll). 2× the
+ * backend TTL means "the backend's eviction is overdue" — the sweep lives in
+ * the event loop and is the SOLE eviction path, so an event-loop stall/death
+ * (the ZEB-970 wedge incident) freezes rows in place and, without this guard,
+ * dots would stay green forever. Generous enough to never flap during normal
+ * operation.
  */
 export const PRESENCE_STALE_AFTER_MS = 60_000;
 
@@ -133,13 +135,15 @@ export class PresenceService {
   /**
    * ZEB-972: true iff this roster row may claim LIVE presence — the backend's
    * `online` flag AND a beacon fresh enough that the backend's 30 s eviction
-   * sweep is not overdue. Clock basis is safe: the stamp is the local
-   * backend's `now_ms` at beacon receipt, compared against the local frontend
-   * clock (same machine). Future-dated stamps (a backward local clock step
-   * put the receipt stamp ahead of `now`) are rejected too, mirroring the
-   * backend's ZEB-791 fail-closed sweep — accepting them would hold the row
-   * "fresh" for the whole skew if that eviction never reached us. Heals via
-   * the next beacon (~10 s), which carries a current-clock stamp.
+   * sweep is not overdue. Clock basis (Greptile PR #722): the backend keeps
+   * receipt stamps on its own MONOTONIC clock and rebases them onto the Unix
+   * epoch at every emission boundary (`online_owners_wall`), so `lastSeenMs`
+   * here is epoch ms comparable against this same-machine `Date.now()`.
+   * Future-dated stamps (a backward local clock step between the backend's
+   * rebase and this comparison) are rejected too, mirroring the backend's
+   * ZEB-791 fail-closed sweep — accepting them would hold the row "fresh" for
+   * the whole skew if that eviction never reached us. Heals via the next
+   * refresh (≤15 s), whose rebase runs against the stepped clock.
    */
   private isFresh(m: PresenceMemberDto): boolean {
     const age = this.nowFn() - m.lastSeenMs;
@@ -355,6 +359,39 @@ export class PresenceService {
     for (const id of [...this.callbacks.keys()]) {
       await this.unsubscribe(id).catch(() => {});
     }
+  }
+
+  /**
+   * ZEB-972 (Greptile PR #722): re-pull the authoritative roster snapshot for
+   * every subscribed community. The `presence-updated` push fires only on
+   * device-set CHANGES (bare beacon refreshes deliberately emit nothing to
+   * avoid event spam), so without a periodic re-fetch this cache's beacon
+   * stamps rot during stable rosters and every live peer would read stale
+   * ~60 s after the last roster change. App.svelte calls this on the same
+   * 15 s ticker that drives staleness recompute: worst-case fresh-stamp age
+   * is then ~10 s beacon + ~15 s poll ≪ {@link PRESENCE_STALE_AFTER_MS}.
+   *
+   * Failure handling is the honest direction by construction: a rejected
+   * fetch KEEPS that community's aging cache (rot → stale dots — the backend
+   * is suspect, which is exactly what stale means), never clears it. Fetches
+   * run in parallel and this never rejects. The narrow race with a push event
+   * (a poll read started before a device-set change can land after its event)
+   * is bounded by one IPC round-trip and self-heals on the next poll — same
+   * class as the ZEB-537 seed/push ordering, and `lastKnown` max-merge already
+   * protects the tooltip surface.
+   */
+  async refreshAll(): Promise<void> {
+    if (!this.adapter) return;
+    await Promise.allSettled(
+      [...this.callbacks.keys()].map(async (communityId) => {
+        try {
+          const members = await this.getPresence(communityId);
+          this.applyMembers(communityId, members);
+        } catch (e) {
+          console.warn(`PresenceService.refreshAll: keeping cache for ${communityId}:`, e);
+        }
+      }),
+    );
   }
 
   /** Replace a community's cached presence map and notify its subscriber. */

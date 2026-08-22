@@ -752,9 +752,20 @@
   // incident). A 15 s bump re-evaluates every dot through presenceFor without
   // any backend involvement, so a frozen roster degrades to `stale` within
   // ~PRESENCE_STALE_AFTER_MS + 15 s on the frontend's own clock.
+  //
+  // The same tick also re-pulls every subscribed roster (Greptile PR #722):
+  // pushes fire only on device-set changes, so cached beacon stamps rot during
+  // stable rosters — refreshAll is what keeps live peers reading fresh
+  // (~10 s beacon + ~15 s poll ≪ the 60 s threshold), while a wedged/dead
+  // backend fails the fetch (or serves frozen stamps) and rots into `stale`
+  // honestly. The synchronous bump stays first so pure staleness recompute
+  // never waits on IPC; the post-refresh bump makes applied snapshots visible.
   $effect(() => {
     const t = setInterval(() => {
       presenceVersion++;
+      void presenceService.refreshAll().then(() => {
+        presenceVersion++;
+      });
     }, 15_000);
     return () => clearInterval(t);
   });

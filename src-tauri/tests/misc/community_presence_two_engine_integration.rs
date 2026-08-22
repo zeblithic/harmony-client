@@ -229,12 +229,16 @@ async fn invisible_inner() {
     let registry_b = seeded_registry(community, &membership_key, &[(owner_a, device_a)]).await;
     let registry_a = seeded_registry(community, &membership_key, &[(owner_a, device_a)]).await;
 
-    let map_b = Arc::new(Mutex::new(CommunityPresenceMap::new()));
+    // ZEB-972: the subscriber now stamps receipts from the MAP's own clock,
+    // so the injectable test clock goes in via `new_with_clock`.
     let clock = Arc::new(AtomicU64::new(1_000));
     let now_ms: Arc<dyn Fn() -> u64 + Send + Sync> = {
         let c = clock.clone();
         Arc::new(move || c.load(Ordering::SeqCst))
     };
+    let map_b = Arc::new(Mutex::new(CommunityPresenceMap::new_with_clock(
+        Arc::clone(&now_ms),
+    )));
     let no_emit_sink: Arc<dyn harmony_app::node_event_sink::NodeEventSink> =
         Arc::new(harmony_app::node_event_sink::FanoutSink(vec![]));
 
@@ -249,7 +253,6 @@ async fn invisible_inner() {
         Arc::clone(&map_b),
         Arc::clone(&no_emit_sink),
         Arc::clone(&closing_b),
-        Arc::clone(&now_ms),
         // ZEB-599 Direction 1: throwaway resync sender (no receivers → no-op).
         tokio::sync::watch::channel(0u64).0,
         // ZEB-620 Task 5: no reconnect supervisor in this link-layer test.
@@ -386,16 +389,19 @@ async fn run_inner() {
     let registry_a = seeded_registry(community, &membership_key, &[(owner_a, device_a)]).await;
 
     // ── Shared map + injectable clock for B's subscriber ────────────────────
-    // The subscriber stamps `last_seen = now_ms()`; pinning it at 1_000 while A
-    // beacons lets the sweep phase advance logical time past STALE_MS without a
-    // real 30 s sleep.
-    let map_b = Arc::new(Mutex::new(CommunityPresenceMap::new()));
+    // The subscriber stamps `last_seen` from the map's clock (ZEB-972), so the
+    // injectable clock goes in via `new_with_clock`; pinning it at 1_000 while
+    // A beacons lets the sweep phase advance logical time past STALE_MS without
+    // a real 30 s sleep.
     let initial_last_seen: u64 = 1_000;
     let clock = Arc::new(AtomicU64::new(initial_last_seen));
     let now_ms: Arc<dyn Fn() -> u64 + Send + Sync> = {
         let c = clock.clone();
         Arc::new(move || c.load(Ordering::SeqCst))
     };
+    let map_b = Arc::new(Mutex::new(CommunityPresenceMap::new_with_clock(
+        Arc::clone(&now_ms),
+    )));
 
     // The subscriber takes a mode-agnostic NodeEventSink; this test asserts via
     // CommunityPresenceMap state, not emissions — so a no-op fanout sink.
@@ -415,7 +421,6 @@ async fn run_inner() {
         Arc::clone(&map_b),
         Arc::clone(&no_emit_sink),
         Arc::clone(&closing_b),
-        Arc::clone(&now_ms),
         // ZEB-599 Direction 1: throwaway resync sender (no receivers → no-op).
         tokio::sync::watch::channel(0u64).0,
         // ZEB-620 Task 5: no reconnect supervisor in this link-layer test.

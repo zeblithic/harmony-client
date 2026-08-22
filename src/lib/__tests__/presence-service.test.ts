@@ -385,3 +385,91 @@ describe('PresenceService staleness honesty (ZEB-972)', () => {
     expect(service.isOnlineAnywhere(OWNER_1)).toBe(false);
   });
 });
+
+describe('PresenceService.refreshAll (ZEB-972 Greptile: periodic stamp refresh)', () => {
+  // `presence-updated` fires only on device-set CHANGES (bare beacon refreshes
+  // deliberately emit nothing), so without a periodic re-fetch the frontend's
+  // stamps rot during stable rosters and every live peer would read stale
+  // ~60 s after the last roster change. refreshAll re-pulls the authoritative
+  // snapshot for every subscribed community; a fetch failure keeps the aging
+  // cache (rot → stale is the honest direction when the backend is suspect).
+  let now: number;
+  let service: PresenceService;
+  let adapter: ReturnType<typeof makeAdapter>;
+
+  function stamped(ownerIdHex: string, lastSeenMs: number): PresenceMemberDto {
+    return { ownerIdHex, online: true, lastSeenMs, deviceCount: 1 };
+  }
+
+  beforeEach(() => {
+    now = 1_000_000_000;
+    adapter = makeAdapter();
+    service = new PresenceService(adapter, { now: () => now });
+  });
+
+  it('re-fetches every subscribed community and un-rots aging stamps', async () => {
+    const rosters = new Map<string, PresenceMemberDto[]>([
+      [CID_A, [stamped(OWNER_1, now)]],
+      [CID_B, [stamped(OWNER_2, now)]],
+    ]);
+    (adapter.invoke as any).mockImplementation(async (cmd: string, args: any) => {
+      if (cmd === 'get_community_presence') return rosters.get(args.communityId) ?? [];
+      return undefined;
+    });
+    const onUpdateA = vi.fn();
+    const onUpdateB = vi.fn();
+    await service.subscribe(CID_A, onUpdateA);
+    await service.subscribe(CID_B, onUpdateB, { setActive: false });
+
+    // A stable roster, 2 min of silence from the push channel: stamps rot.
+    now += 120_000;
+    expect(service.presenceFor(OWNER_1).state).toBe('stale');
+    expect(service.isOnlineAnywhere(OWNER_2)).toBe(false);
+
+    // The backend was fine all along — a refresh pulls current stamps.
+    rosters.set(CID_A, [stamped(OWNER_1, now)]);
+    rosters.set(CID_B, [stamped(OWNER_2, now)]);
+    onUpdateA.mockClear();
+    onUpdateB.mockClear();
+    await service.refreshAll();
+
+    expect(service.presenceFor(OWNER_1).state).toBe('online');
+    expect(service.isOnlineAnywhere(OWNER_2)).toBe(true);
+    // Subscribers were notified with the refreshed rosters, per community.
+    expect(onUpdateA).toHaveBeenCalledWith(rosters.get(CID_A));
+    expect(onUpdateB).toHaveBeenCalledWith(rosters.get(CID_B));
+  });
+
+  it('keeps the aging cache for a community whose fetch rejects, while applying the ones that succeed', async () => {
+    let failA = false;
+    const rosters = new Map<string, PresenceMemberDto[]>([
+      [CID_A, [stamped(OWNER_1, now)]],
+      [CID_B, [stamped(OWNER_2, now)]],
+    ]);
+    (adapter.invoke as any).mockImplementation(async (cmd: string, args: any) => {
+      if (cmd === 'get_community_presence') {
+        if (failA && args.communityId === CID_A) throw new Error('node down');
+        return rosters.get(args.communityId) ?? [];
+      }
+      return undefined;
+    });
+    await service.subscribe(CID_A, vi.fn());
+    await service.subscribe(CID_B, vi.fn(), { setActive: false });
+
+    now += 120_000;
+    rosters.set(CID_B, [stamped(OWNER_2, now)]);
+    failA = true;
+    await service.refreshAll(); // must not throw
+
+    // CID_A kept its (now rotted) row — stale, not cleared to offline.
+    expect(service.presenceFor(OWNER_1).state).toBe('stale');
+    // CID_B applied its fresh snapshot.
+    expect(service.isOnlineAnywhere(OWNER_2)).toBe(true);
+  });
+
+  it('resolves without an adapter (and with nothing subscribed) without throwing', async () => {
+    const bare = new PresenceService();
+    await expect(bare.refreshAll()).resolves.toBeUndefined();
+    await expect(service.refreshAll()).resolves.toBeUndefined();
+  });
+});

@@ -250,6 +250,10 @@ pub struct OwnerPresence {
 pub struct PresenceMemberDto {
     pub owner_id_hex: String,
     pub online: bool,
+    /// Unix-epoch ms of the most recent beacon receipt (ZEB-972: rebased from
+    /// the map's monotonic clock via [`CommunityPresenceMap::online_owners_wall`]
+    /// — the frontend compares this against `Date.now()`, so a raw map stamp
+    /// must never land here).
     pub last_seen_ms: u64,
     pub device_count: u32,
 }
@@ -285,10 +289,19 @@ impl PresenceUpdatedPayload {
     }
 }
 
-#[derive(Debug)]
 pub struct CommunityPresenceMap {
     // community → device → entry
     inner: BTreeMap<SpaceId, BTreeMap<[u8; 32], PresenceEntry>>,
+    /// ZEB-972 (Greptile PR #722): the map's own monotonic presence clock —
+    /// ms since map creation by default. Every `apply`/`sweep` caller MUST
+    /// source `now_ms` from THIS clock (`now_ms()`), and every wire emission
+    /// MUST go through [`online_owners_wall`], which rebases receipt stamps
+    /// from this domain onto the Unix epoch. Owning the clock here (rather
+    /// than borrowing the event loop's `voice_now_ms`) is what makes writer
+    /// and reader share one base regardless of construction/boot ordering —
+    /// the seed IPC reads this map from outside the event loop and has no
+    /// access to the loop's `Instant`.
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// ZEB-600: node-global presence-visibility gate. `true` = broadcast beacons
     /// (visible); `false` = appear offline. Shared as an `Arc` handle with every
     /// presence publisher so `set_presence_visibility` takes effect live. Default
@@ -304,12 +317,35 @@ impl Default for CommunityPresenceMap {
     }
 }
 
+// Manual impl: the `clock` closure isn't `Debug`.
+impl std::fmt::Debug for CommunityPresenceMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommunityPresenceMap")
+            .field("inner", &self.inner)
+            .field("presence_visible", &self.presence_visible)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CommunityPresenceMap {
     pub fn new() -> Self {
+        let start = std::time::Instant::now();
+        Self::new_with_clock(Arc::new(move || start.elapsed().as_millis() as u64))
+    }
+
+    /// ZEB-972: test seam — inject a deterministic monotonic clock.
+    pub fn new_with_clock(clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
         Self {
             inner: BTreeMap::new(),
             presence_visible: Arc::new(AtomicBool::new(true)),
+            clock,
         }
+    }
+
+    /// The map's monotonic clock. `apply`/`sweep` callers source `now_ms`
+    /// here so receipt stamps and eviction math share one clock base.
+    pub fn now_ms(&self) -> u64 {
+        (self.clock)()
     }
 
     /// ZEB-600: clone the node-global visibility gate handle for a presence
@@ -430,6 +466,31 @@ impl CommunityPresenceMap {
                 owner,
                 device_count,
                 last_seen_ms,
+            })
+            .collect()
+    }
+
+    /// ZEB-972 (Greptile PR #722): [`online_owners`](Self::online_owners) with
+    /// `last_seen_ms` rebased from the map's monotonic clock onto the Unix
+    /// epoch (`epoch_now_ms − age`), for emission to the frontend — which
+    /// compares these stamps against `Date.now()`. Raw map stamps are
+    /// process-relative (ms since map creation) and MUST NOT cross the wire:
+    /// `Date.now() − raw_stamp` reads as decades, classifying every live peer
+    /// stale. Rebasing at read time (rather than storing wall stamps at
+    /// receipt) keeps monotonic as the domain of record — ages stay correct
+    /// across wall-clock steps, and the ZEB-791 sweep math is untouched.
+    /// `epoch_now_ms` is injected for test determinism; production callers
+    /// pass [`crate::file_sharing::now_epoch_ms`]. Saturating both ways: a
+    /// stamp can't exceed the same clock's `now` (no wrap on age), and an age
+    /// beyond `epoch_now_ms` clamps to 0 rather than wrapping far-future.
+    pub fn online_owners_wall(&self, c: &SpaceId, epoch_now_ms: u64) -> Vec<OwnerPresence> {
+        let mono_now = self.now_ms();
+        self.online_owners(c)
+            .into_iter()
+            .map(|mut o| {
+                let age = mono_now.saturating_sub(o.last_seen_ms);
+                o.last_seen_ms = epoch_now_ms.saturating_sub(age);
+                o
             })
             .collect()
     }
@@ -559,8 +620,9 @@ fn on_presence_roster_change(
 /// on change. Drops on any failure. Mirrors
 /// [`crate::voice_presence::spawn_voice_presence_subscriber`], minus mute/kick.
 ///
-/// `session` is an owned, cheaply-cloned `zenoh::Session`; `now_ms` is the
-/// loop's monotonic clock.
+/// `session` is an owned, cheaply-cloned `zenoh::Session`. Beacon receipt
+/// stamps come from the shared map's own clock (ZEB-972), not a caller-passed
+/// one — see [`CommunityPresenceMap::now_ms`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_community_presence_subscriber(
     session: zenoh::Session,
@@ -570,7 +632,6 @@ pub fn spawn_community_presence_subscriber(
     map: Arc<tokio::sync::Mutex<CommunityPresenceMap>>,
     app: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     closing: Arc<AtomicBool>,
-    now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
     // ZEB-599 Direction 1: bumped on a roster device-set change so channel-log
     // backfill drivers re-arm with a FULL reconcile — the fast, relay-mediated
     // analogue of the ~1h anti-entropy floor. A bump with no receivers is a
@@ -648,7 +709,11 @@ pub fn spawn_community_presence_subscriber(
             }
             let changed = {
                 let mut g = map.lock().await;
-                g.apply(&community, &signed.beacon, (now_ms)())
+                // ZEB-972: receipt stamps come from the MAP's clock (not the
+                // loop's voice clock) so `online_owners_wall`'s rebase math
+                // shares the writer's base.
+                let now = g.now_ms();
+                g.apply(&community, &signed.beacon, now)
             };
             if changed {
                 // ZEB-599 Direction 1: a roster device-set change means a new
@@ -672,7 +737,9 @@ pub fn spawn_community_presence_subscriber(
                 );
                 let members = {
                     let g = map.lock().await;
-                    g.online_owners(&community)
+                    // ZEB-972: epoch-rebased stamps — the frontend compares
+                    // against Date.now().
+                    g.online_owners_wall(&community, crate::file_sharing::now_epoch_ms())
                 };
                 crate::node_event_sink::emit_ser(
                     app.as_ref(),
@@ -1051,5 +1118,72 @@ mod tests {
         let c = SpaceId([7u8; 16]);
         assert!(m.apply(&c, &b(0x0a, 1, 100, 0), 1_000));
         assert_eq!(m.online_owners(&c).len(), 1);
+    }
+
+    // ── online_owners_wall (ZEB-972 Greptile clock-domain fix) ──────
+
+    /// The wire stamp must be Unix-epoch comparable: `online_owners_wall`
+    /// rebases the map-clock (monotonic) receipt stamp onto the caller's
+    /// epoch clock as `epoch_now − age`.
+    #[test]
+    fn online_owners_wall_rebases_monotonic_stamps_to_epoch() {
+        use std::sync::atomic::AtomicU64;
+        let t = Arc::new(AtomicU64::new(5_000));
+        let tc = Arc::clone(&t);
+        let mut m =
+            CommunityPresenceMap::new_with_clock(Arc::new(move || tc.load(Ordering::SeqCst)));
+        let c = SpaceId([7u8; 16]);
+        let now = m.now_ms();
+        assert!(m.apply(&c, &b(0x0a, 1, 100, 0), now));
+        // 7 s pass on the map's monotonic clock.
+        t.store(12_000, Ordering::SeqCst);
+        let epoch_now: u64 = 1_700_000_000_000;
+        let r = m.online_owners_wall(&c, epoch_now);
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            r[0].last_seen_ms,
+            epoch_now - 7_000,
+            "wall stamp = epoch_now − monotonic age"
+        );
+    }
+
+    /// Contract pin for the exact defect Greptile caught on PR #722: a stamp
+    /// emitted to the frontend must be comparable against `Date.now()`. With
+    /// the PRODUCTION clock (`new()`, ms since map creation), a raw
+    /// `last_seen_ms` is process-relative (≈0) and `Date.now() − stamp` reads
+    /// as decades — `online_owners_wall` must instead land within seconds of
+    /// the current epoch time for a just-applied beacon.
+    #[test]
+    fn online_owners_wall_stamps_are_epoch_comparable() {
+        let mut m = CommunityPresenceMap::new();
+        let c = SpaceId([7u8; 16]);
+        let now = m.now_ms();
+        assert!(m.apply(&c, &b(0x0a, 1, 100, 0), now));
+        let epoch_now = crate::file_sharing::now_epoch_ms();
+        let r = m.online_owners_wall(&c, epoch_now);
+        assert_eq!(r.len(), 1);
+        let drift = epoch_now.abs_diff(r[0].last_seen_ms);
+        assert!(
+            drift < 5_000,
+            "just-applied beacon must rebase to ~epoch-now (drift {drift} ms)"
+        );
+    }
+
+    /// Degenerate guard: an age larger than `epoch_now` saturates to 0 rather
+    /// than wrapping (u64 underflow would fabricate a far-future stamp).
+    #[test]
+    fn online_owners_wall_saturates_instead_of_wrapping() {
+        use std::sync::atomic::AtomicU64;
+        let t = Arc::new(AtomicU64::new(0));
+        let tc = Arc::clone(&t);
+        let mut m =
+            CommunityPresenceMap::new_with_clock(Arc::new(move || tc.load(Ordering::SeqCst)));
+        let c = SpaceId([7u8; 16]);
+        let now = m.now_ms();
+        assert!(m.apply(&c, &b(0x0a, 1, 100, 0), now));
+        t.store(10_000, Ordering::SeqCst);
+        // epoch_now smaller than the 10 s age → clamp to 0, never wrap.
+        let r = m.online_owners_wall(&c, 1_000);
+        assert_eq!(r[0].last_seen_ms, 0);
     }
 }
