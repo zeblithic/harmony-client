@@ -2005,9 +2005,11 @@ impl ChannelLog {
     /// — a caller bug or hostile feed that mixes events from
     /// different channels would otherwise silently corrupt the log
     /// (the per-stored-event binding isn't re-checked on reload —
-    /// only the manifest is). Returns `Ok(true)` if the seal
-    /// threshold has now been reached (caller should call
-    /// `seal_and_persist`); `Ok(false)` otherwise.
+    /// only the manifest is). ZEB-969: an event whose `ReconcileKey`
+    /// is already in the log is skipped — [`AppendOutcome::newly_appended`]
+    /// comes back `false` and no state is touched.
+    /// [`AppendOutcome::seal_ready`] is `true` once the tail has reached
+    /// the seal threshold (caller should call `seal_and_persist`).
     pub fn append(
         &mut self,
         event: SignedChannelEvent,
@@ -2027,7 +2029,11 @@ impl ChannelLog {
         // per-lane monotonic check no longer gates below-head reconcile
         // ingest, so append itself must refuse a ReconcileKey it already
         // holds — before any index/watermark/reaction state is touched.
-        if self.contains_reconcile_key(&event) {
+        // The key is computed ONCE and reused by the index insert below:
+        // reconcile_key runs a canonical-CBOR serialize + SHA-256, and
+        // append is the ingest hot path (CodeRabbit PR #719).
+        let key = reconcile_key(&event);
+        if self.contains_key(&key) {
             return Ok(AppendOutcome {
                 newly_appended: false,
                 seal_ready: self.tail.len() >= self.config.seal_threshold_events,
@@ -2042,7 +2048,7 @@ impl ChannelLog {
         // before the event is moved into the tail.
         raise_watermark(&mut self.device_watermarks, event.author(), event.at());
         // ZEB-592: maintain the RBSR reconcile index before the event moves.
-        self.maintain_reconcile_index(&event);
+        self.insert_reconcile_key(key);
         self.tail.push(event);
         Ok(AppendOutcome {
             newly_appended: true,
@@ -2535,16 +2541,20 @@ impl ChannelLog {
     /// Callers needing check-then-append atomicity must hold the same
     /// `&mut self` borrow across both (the engine's `log` lock does).
     pub fn contains_reconcile_key(&self, event: &SignedChannelEvent) -> bool {
-        let key = reconcile_key(event);
-        let pos = self.reconcile_entries.partition_point(|x| x.0 < key);
-        self.reconcile_entries.get(pos).is_some_and(|x| x.0 == key)
+        self.contains_key(&reconcile_key(event))
     }
 
-    /// ZEB-592: fold one event into the reconcile index at the `append` choke
-    /// point. `mem::take` lets the chunk index read the (pre-insert) entries
-    /// without a self-field borrow split.
-    fn maintain_reconcile_index(&mut self, event: &SignedChannelEvent) {
-        let key = reconcile_key(event);
+    /// Key-level presence check backing [`Self::contains_reconcile_key`];
+    /// `append` uses it directly so the key is hashed once per ingest.
+    fn contains_key(&self, key: &ReconcileKey) -> bool {
+        let pos = self.reconcile_entries.partition_point(|x| &x.0 < key);
+        self.reconcile_entries.get(pos).is_some_and(|x| &x.0 == key)
+    }
+
+    /// ZEB-592: fold one (precomputed) key into the reconcile index at the
+    /// `append` choke point. `mem::take` lets the chunk index read the
+    /// (pre-insert) entries without a self-field borrow split.
+    fn insert_reconcile_key(&mut self, key: ReconcileKey) {
         let hash = key.3;
         let pos = self.reconcile_entries.partition_point(|x| x.0 < key);
         if self.reconcile_entries.get(pos).is_some_and(|x| x.0 == key) {

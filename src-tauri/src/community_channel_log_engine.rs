@@ -1869,11 +1869,16 @@ impl ChannelLogEngine {
             // ZEB-969: INFO on purpose — the silent debug-only drop of these
             // events is what made the original data loss invisible in the
             // field. A heal is rare and worth a production log line.
+            // Identifiers are truncated (CodeRabbit PR #719): INFO lands in
+            // default production logs, which elsewhere carry only community
+            // and channel ids — a 4-byte author prefix and 8-char device
+            // prefix are enough to correlate a lane without accumulating
+            // full per-user identifiers at the default level.
             tracing::info!(
                 community_id = ?self.community_id,
                 channel_id = ?self.channel_id,
-                author = ?event.author(),
-                device = %event.at().device_id,
+                author = %hex::encode(&event.author().0[..4]),
+                device = %event.at().device_id.chars().take(8).collect::<String>(),
                 wall_ms = event.at().wall_ms,
                 logical = event.at().logical,
                 "below-head heal (ZEB-969): reconcile recovered an event the live race had sealed out"
@@ -4184,16 +4189,25 @@ mod tests {
             );
         }
         // E2E guard: a re-broadcast of the newest event must still replay-drop.
+        // Wait on the drop counter (not a fixed sleep) so the negative
+        // count assertion below can't spuriously pass before the receive
+        // loop has processed the packet (CodeRabbit PR #719).
         subscriber_tx
             .send(p_newer)
             .await
             .expect("send re-broadcast");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for(
+            || async { (engine2.replay_drop_count() >= 1).then_some(()) },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the re-broadcast must be observed dropping");
         assert_eq!(
             engine2.list_messages(None, 100).await.expect("list").len(),
             2,
             "re-broadcast of the newest event must not be re-accepted"
         );
+        engine2.shutdown().await.expect("respawn shutdown");
     }
 
     #[tokio::test]
