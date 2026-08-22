@@ -4426,7 +4426,6 @@ pub async fn run(
             let app_for_presence = app.clone();
             let closing_for_presence = Arc::clone(&closing);
             let map_for_presence = std::sync::Arc::clone(&community_presence_map);
-            let now_ms_for_presence = std::sync::Arc::clone(&voice_now_ms);
             // ZEB-599 Direction 1: presence-driven full-reconcile sender —
             // moved into the presence task, cloned per subscriber below.
             let presence_resync_tx_for_presence = presence_resync_tx;
@@ -4528,7 +4527,6 @@ pub async fn run(
                                     std::sync::Arc::clone(&map_for_presence),
                                     app_for_presence.clone(),
                                     Arc::clone(&closing_for_presence),
-                                    std::sync::Arc::clone(&now_ms_for_presence),
                                     // ZEB-599 Direction 1: kick channel-log
                                     // backfill drivers into a full reconcile
                                     // when this community's roster gains a
@@ -4591,7 +4589,6 @@ pub async fn run(
             let app_for_sweep = app.clone();
             let closing_for_sweep = Arc::clone(&closing);
             let map_for_sweep = std::sync::Arc::clone(&community_presence_map);
-            let now_ms_for_sweep = std::sync::Arc::clone(&voice_now_ms);
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_millis(
                     crate::community_presence::BEACON_INTERVAL_MS,
@@ -4603,7 +4600,10 @@ pub async fn run(
                     }
                     let evicted = {
                         let mut g = map_for_sweep.lock().await;
-                        g.sweep((now_ms_for_sweep)(), crate::community_presence::STALE_MS)
+                        // ZEB-972: eviction math runs on the MAP's clock —
+                        // the same base `apply` stamps receipts with.
+                        let now = g.now_ms();
+                        g.sweep(now, crate::community_presence::STALE_MS)
                     };
                     if evicted.is_empty() {
                         continue;
@@ -4616,7 +4616,8 @@ pub async fn run(
                     for community in communities {
                         let members = {
                             let g = map_for_sweep.lock().await;
-                            g.online_owners(&community)
+                            // ZEB-972: epoch-rebased stamps for the wire.
+                            g.online_owners_wall(&community, crate::file_sharing::now_epoch_ms())
                         };
                         crate::node_event_sink::emit_ser(
                             app_for_sweep.as_ref(),

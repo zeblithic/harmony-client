@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { PresenceService } from '../presence-service';
+import { PresenceService, PRESENCE_STALE_AFTER_MS } from '../presence-service';
 import type { PresenceMemberDto } from '../presence-service';
 import type { TauriAdapter } from '../zenoh-service';
 
@@ -25,7 +25,9 @@ const OWNER_1 = '11'.repeat(16);
 const OWNER_2 = '22'.repeat(16);
 
 function member(ownerIdHex: string, online: boolean): PresenceMemberDto {
-  return { ownerIdHex, online, lastSeenMs: 1000, deviceCount: online ? 1 : 0 };
+  // ZEB-972: a fresh beacon stamp — the service now freshness-gates `online`,
+  // so a fixture with an ancient lastSeenMs would read stale, not online.
+  return { ownerIdHex, online, lastSeenMs: Date.now(), deviceCount: online ? 1 : 0 };
 }
 
 describe('PresenceService', () => {
@@ -296,5 +298,178 @@ describe('PresenceService', () => {
     expect(service.isOnlineAnywhere(OWNER_1)).toBe(true);
     expect(service.isOnlineAnywhere(OWNER_1.toUpperCase())).toBe(true);
     expect(service.isOnlineAnywhere(OWNER_2)).toBe(false);
+  });
+});
+
+// ZEB-972 — client-side staleness honesty. The backend's 30 s TTL sweeper is
+// the SOLE eviction path for presence rows, and it lives in the event loop: if
+// that loop stalls or dies (the ZEB-970 wedge incident), rows freeze in place
+// and dots would stay green forever. These tests pin the client-side guard:
+// a row whose beacon is older than PRESENCE_STALE_AFTER_MS (2× the backend
+// TTL — possible only when backend eviction is overdue) reads `stale`, never
+// `online`, and an evicted row keeps its last-known beacon stamp for tooltips.
+describe('PresenceService staleness honesty (ZEB-972)', () => {
+  let now: number;
+  let service: PresenceService;
+  let adapter: ReturnType<typeof makeAdapter>;
+
+  function stamped(ownerIdHex: string, lastSeenMs: number): PresenceMemberDto {
+    return { ownerIdHex, online: true, lastSeenMs, deviceCount: 1 };
+  }
+
+  function push(members: PresenceMemberDto[], communityId = CID_A) {
+    adapter.listeners.get('presence-updated')!({ payload: { communityId, members } });
+  }
+
+  beforeEach(async () => {
+    now = 1_000_000_000;
+    adapter = makeAdapter();
+    service = new PresenceService(adapter, { now: () => now });
+    (adapter.invoke as any).mockImplementation(async (cmd: string) => {
+      if (cmd === 'get_community_presence') return [];
+      return undefined;
+    });
+    await service.subscribe(CID_A, vi.fn());
+  });
+
+  it('fresh beacon → online, carrying lastSeenMs', () => {
+    push([stamped(OWNER_1, now - 5_000)]);
+    expect(service.presenceFor(OWNER_1)).toEqual({ state: 'online', lastSeenMs: now - 5_000 });
+    expect(service.isOnline(OWNER_1)).toBe(true);
+  });
+
+  it('beacon exactly at the threshold is still online (boundary)', () => {
+    push([stamped(OWNER_1, now - PRESENCE_STALE_AFTER_MS)]);
+    expect(service.presenceFor(OWNER_1).state).toBe('online');
+  });
+
+  it('row present but beacon overdue for eviction → stale, and stale is excluded everywhere', () => {
+    const seen = now - 5_000;
+    push([stamped(OWNER_1, seen)]);
+    now += 120_000; // 2 min pass with no event and no eviction — the incident class
+    expect(service.presenceFor(OWNER_1)).toEqual({ state: 'stale', lastSeenMs: seen });
+    expect(service.isOnline(OWNER_1)).toBe(false);
+    expect(service.onlineCount(CID_A)).toBe(0);
+    expect(service.hasOthersOnline(CID_A, OWNER_2)).toBe(false);
+    expect(service.isOnlineAnywhere(OWNER_1)).toBe(false);
+  });
+
+  it('evicted row → offline, retaining the last-known beacon stamp for tooltips', () => {
+    const seen = now - 5_000;
+    push([stamped(OWNER_1, seen)]);
+    push([]); // backend sweep evicted the row
+    expect(service.presenceFor(OWNER_1)).toEqual({ state: 'offline', lastSeenMs: seen });
+    expect(service.isOnline(OWNER_1)).toBe(false);
+  });
+
+  it('never-seen owner → offline with no lastSeenMs', () => {
+    expect(service.presenceFor(OWNER_2)).toEqual({ state: 'offline' });
+  });
+
+  it('last-known stamp max-merges — an out-of-order older delivery cannot regress it', () => {
+    push([stamped(OWNER_1, now - 5_000)]);
+    push([stamped(OWNER_1, now - 50_000)]); // older stamp re-delivered
+    push([]);
+    expect(service.presenceFor(OWNER_1).lastSeenMs).toBe(now - 5_000);
+  });
+
+  it('a future-dated beacon stamp is not fresh — mirrors the backend ZEB-791 fail-closed sweep', () => {
+    // A backward local clock step can put a receipt stamp ahead of `now`. The
+    // backend evicts such rows on its next sweep (community_presence::sweep,
+    // ZEB-791); if that eviction never reaches us, the row must read stale —
+    // not immortally online. Heals via the next beacon (~10 s, fresh stamp).
+    push([stamped(OWNER_1, now + 120_000)]);
+    expect(service.presenceFor(OWNER_1).state).toBe('stale');
+    expect(service.isOnline(OWNER_1)).toBe(false);
+    expect(service.onlineCount(CID_A)).toBe(0);
+    expect(service.isOnlineAnywhere(OWNER_1)).toBe(false);
+  });
+});
+
+describe('PresenceService.refreshAll (ZEB-972 Greptile: periodic stamp refresh)', () => {
+  // `presence-updated` fires only on device-set CHANGES (bare beacon refreshes
+  // deliberately emit nothing), so without a periodic re-fetch the frontend's
+  // stamps rot during stable rosters and every live peer would read stale
+  // ~60 s after the last roster change. refreshAll re-pulls the authoritative
+  // snapshot for every subscribed community; a fetch failure keeps the aging
+  // cache (rot → stale is the honest direction when the backend is suspect).
+  let now: number;
+  let service: PresenceService;
+  let adapter: ReturnType<typeof makeAdapter>;
+
+  function stamped(ownerIdHex: string, lastSeenMs: number): PresenceMemberDto {
+    return { ownerIdHex, online: true, lastSeenMs, deviceCount: 1 };
+  }
+
+  beforeEach(() => {
+    now = 1_000_000_000;
+    adapter = makeAdapter();
+    service = new PresenceService(adapter, { now: () => now });
+  });
+
+  it('re-fetches every subscribed community and un-rots aging stamps', async () => {
+    const rosters = new Map<string, PresenceMemberDto[]>([
+      [CID_A, [stamped(OWNER_1, now)]],
+      [CID_B, [stamped(OWNER_2, now)]],
+    ]);
+    (adapter.invoke as any).mockImplementation(async (cmd: string, args: any) => {
+      if (cmd === 'get_community_presence') return rosters.get(args.communityId) ?? [];
+      return undefined;
+    });
+    const onUpdateA = vi.fn();
+    const onUpdateB = vi.fn();
+    await service.subscribe(CID_A, onUpdateA);
+    await service.subscribe(CID_B, onUpdateB, { setActive: false });
+
+    // A stable roster, 2 min of silence from the push channel: stamps rot.
+    now += 120_000;
+    expect(service.presenceFor(OWNER_1).state).toBe('stale');
+    expect(service.isOnlineAnywhere(OWNER_2)).toBe(false);
+
+    // The backend was fine all along — a refresh pulls current stamps.
+    rosters.set(CID_A, [stamped(OWNER_1, now)]);
+    rosters.set(CID_B, [stamped(OWNER_2, now)]);
+    onUpdateA.mockClear();
+    onUpdateB.mockClear();
+    await service.refreshAll();
+
+    expect(service.presenceFor(OWNER_1).state).toBe('online');
+    expect(service.isOnlineAnywhere(OWNER_2)).toBe(true);
+    // Subscribers were notified with the refreshed rosters, per community.
+    expect(onUpdateA).toHaveBeenCalledWith(rosters.get(CID_A));
+    expect(onUpdateB).toHaveBeenCalledWith(rosters.get(CID_B));
+  });
+
+  it('keeps the aging cache for a community whose fetch rejects, while applying the ones that succeed', async () => {
+    let failA = false;
+    const rosters = new Map<string, PresenceMemberDto[]>([
+      [CID_A, [stamped(OWNER_1, now)]],
+      [CID_B, [stamped(OWNER_2, now)]],
+    ]);
+    (adapter.invoke as any).mockImplementation(async (cmd: string, args: any) => {
+      if (cmd === 'get_community_presence') {
+        if (failA && args.communityId === CID_A) throw new Error('node down');
+        return rosters.get(args.communityId) ?? [];
+      }
+      return undefined;
+    });
+    await service.subscribe(CID_A, vi.fn());
+    await service.subscribe(CID_B, vi.fn(), { setActive: false });
+
+    now += 120_000;
+    rosters.set(CID_B, [stamped(OWNER_2, now)]);
+    failA = true;
+    await service.refreshAll(); // must not throw
+
+    // CID_A kept its (now rotted) row — stale, not cleared to offline.
+    expect(service.presenceFor(OWNER_1).state).toBe('stale');
+    // CID_B applied its fresh snapshot.
+    expect(service.isOnlineAnywhere(OWNER_2)).toBe(true);
+  });
+
+  it('resolves without an adapter (and with nothing subscribed) without throwing', async () => {
+    const bare = new PresenceService();
+    await expect(bare.refreshAll()).resolves.toBeUndefined();
+    await expect(service.refreshAll()).resolves.toBeUndefined();
   });
 });

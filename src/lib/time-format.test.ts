@@ -6,6 +6,7 @@ import {
   formatClockTime,
   formatDateOnly,
   formatMailRecency,
+  formatLastSeen,
   type TimeFormatPrefs,
 } from './time-format';
 
@@ -215,5 +216,38 @@ describe('formatMailRecency — DST boundaries (round, not floor)', () => {
     const ms = at(2026, 10, 1, 9, 0); // Sun 2026-11-01 — the 25h local day
     const now = at(2026, 10, 2, 10, 0); // Mon 2026-11-02
     expect(formatMailRecency(ms, now, prefs)).toBe(weekdayOf(ms));
+  });
+});
+
+// ZEB-972 — shared heartbeat-tolerant "last seen" recency label, lifted from
+// DevicesPanel so presence tooltips can reuse it. The `justNowUnderMin` floor
+// is the honesty knob: DevicesPanel keeps the default 10 (fleet re-stamp
+// cadence ~7.5 min), presence passes 1 (10 s beacons — a 2-minute-stale peer
+// must not read "just now").
+describe('formatLastSeen', () => {
+  const now = at(2026, 7, 21, 12, 0);
+
+  it('renders "just now" under the default 10-minute floor', () => {
+    expect(formatLastSeen(now - 30_000, now, prefs)).toBe('just now');
+    expect(formatLastSeen(now - 9 * 60_000, now, prefs)).toBe('just now');
+  });
+
+  it('approximate minute bucket past the floor, with ~ prefix', () => {
+    expect(formatLastSeen(now - 15 * 60_000, now, prefs)).toBe('~15m ago');
+  });
+
+  it('a lowered floor exposes minute resolution (presence dots)', () => {
+    expect(formatLastSeen(now - 2 * 60_000, now, prefs, { justNowUnderMin: 1 })).toBe('~2m ago');
+    expect(formatLastSeen(now - 30_000, now, prefs, { justNowUnderMin: 1 })).toBe('just now');
+  });
+
+  it('hour and day buckets', () => {
+    expect(formatLastSeen(now - 90 * 60_000, now, prefs)).toBe('~1h ago');
+    expect(formatLastSeen(now - 26 * 3_600_000, now, prefs)).toBe('1d ago');
+  });
+
+  it('falls back to the numeric date at 30+ days', () => {
+    const ms = now - 40 * 86_400_000;
+    expect(formatLastSeen(ms, now, prefs)).toBe(formatDateOnly(ms, prefs));
   });
 });

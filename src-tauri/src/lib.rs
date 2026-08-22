@@ -47382,10 +47382,13 @@ pub(crate) async fn get_community_presence_impl(
             .clone()
             .ok_or_else(|| g.owner_not_loaded_msg())?
     };
-    let owners = map
-        .lock()
-        .await
-        .online_owners(&crate::owner_state_types::SpaceId(cid_bytes));
+    // ZEB-972 (Greptile PR #722): epoch-rebased stamps — the map's raw
+    // `last_seen_ms` is monotonic (ms since map creation) and must never
+    // cross the wire, where the frontend compares against `Date.now()`.
+    let owners = map.lock().await.online_owners_wall(
+        &crate::owner_state_types::SpaceId(cid_bytes),
+        crate::file_sharing::now_epoch_ms(),
+    );
     Ok(owners
         .iter()
         .map(crate::community_presence::PresenceMemberDto::from_owner_presence)

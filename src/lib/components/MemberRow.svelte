@@ -2,6 +2,7 @@
   import type { CommunityMember } from '../types';
   import { POWER_THRESHOLDS } from '../types';
   import type { ResolvedCard } from '../member-card-service';
+  import { presenceDotLabel, type PresenceDisplay } from '../presence-service';
   import Avatar from './Avatar.svelte';
   import { nonEmpty } from '../display-label';
   // ZEB-946: the joined-date label honors the owner's date-order preference.
@@ -35,7 +36,7 @@
     onaction,
     resolveCard,
     resolveNickname,
-    isOnline,
+    presence,
     selfInvisible = false,
     onOpenCard,
     thresholds = POWER_THRESHOLDS,
@@ -49,9 +50,12 @@
      *  precedence over the broadcast profile-card name, matching the Friends
      *  panel's label ladder. */
     resolveNickname?: (ownerIdHex: string) => string | undefined;
-    /** ZEB-537: optional online-presence resolver. Reads through a parent
-     *  PresenceService; undefined → no dot (treated as offline). */
-    isOnline?: (ownerIdHex: string) => boolean;
+    /** ZEB-537/ZEB-972: optional three-state presence resolver. Reads through
+     *  a parent PresenceService (`presenceFor`); undefined → offline. Replaced
+     *  the boolean `isOnline` resolver so the dot can render `stale` (roster
+     *  row present but the beacon is overdue for backend eviction) honestly
+     *  instead of green, and surface "last seen" on offline rows. */
+    presence?: (ownerIdHex: string) => PresenceDisplay;
     /** ZEB-600: true when the viewer has "Appear offline" on. Only affects the
      *  self row — flips its always-online dot to a hollow "invisible" state so
      *  the viewer can confirm their own hidden status at a glance. */
@@ -185,20 +189,26 @@
   // presence-updated counter bump (in App.svelte) re-evaluates the dot live —
   // mirrors the displayName/label ladder. Undefined resolver → offline.
   // Self is always shown online: zenoh does not loop our own presence beacon
-  // back within a session, so `isOnline(self)` reads false even though we're
-  // clearly online — showing yourself "offline" in a community you're using
-  // is confusing and undermines trust in the indicator.
+  // back within a session, so the resolver reads offline for self even though
+  // we're clearly online — showing yourself "offline" in a community you're
+  // using is confusing and undermines trust in the indicator.
   // ZEB-600: when the viewer has "Appear offline" on, invert exactly that
   // hard-coded self branch so the one row we author reflects the choice.
-  let online = $derived(
-    isSelf ? !selfInvisible : isOnline ? isOnline(member.address) : false,
+  // ZEB-972: peers get the full three-state resolver — `stale` (beacon overdue
+  // for backend eviction) renders hollow with an honest last-seen title.
+  let peerPresence = $derived(
+    isSelf ? undefined : presence ? presence(member.address) : undefined,
   );
+  let online = $derived(isSelf ? !selfInvisible : peerPresence?.state === 'online');
+  let stale = $derived(!isSelf && peerPresence?.state === 'stale');
   // ZEB-600: the self row while invisible gets a distinct hollow look + label so
   // "you appear offline" is unmistakable (vs a peer who is merely offline).
   let selfHollow = $derived(isSelf && selfInvisible);
-  let dotTitle = $derived(
-    selfHollow ? 'Appearing offline' : online ? 'Online' : 'Offline',
-  );
+  let dotTitle = $derived.by(() => {
+    if (selfHollow) return 'Appearing offline';
+    if (isSelf) return 'Online';
+    return presenceDotLabel(peerPresence ?? { state: 'offline' }, Date.now(), $timeFormatPrefs);
+  });
 
   function handleMenuItemClick(action: KebabAction) {
     menuOpen = false;
@@ -248,6 +258,7 @@
   <span
     class="presence-dot"
     class:online
+    class:stale
     class:self-invisible={selfHollow}
     role="img"
     title={dotTitle}
@@ -332,6 +343,13 @@
   }
   .presence-dot.online {
     background: var(--presence-online);
+    border-color: var(--presence-online);
+  }
+  /* ZEB-972: roster row present but the beacon is overdue for backend eviction
+     — a hollow green ring reads "recently here, not confirmed live", distinct
+     from solid-online, muted-offline, and the dashed self-invisible ring. */
+  .presence-dot.stale {
+    background: transparent;
     border-color: var(--presence-online);
   }
   /* ZEB-600: self row while "Appear offline" is on — hollow with a dashed ring

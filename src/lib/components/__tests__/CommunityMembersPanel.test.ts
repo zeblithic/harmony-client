@@ -86,17 +86,17 @@ describe('CommunityMembersPanel', () => {
 
   it('shows an online count in the header (self + isOnline-true members)', async () => {
     // alice is self (always online); mark bob online via isOnline → 2 online.
-    const isOnline = (addr: string) => addr === bob.address;
-    const { container } = render(CommunityMembersPanel, { props: { ...baseProps(), isOnline } });
+    const presence = (addr: string) => ({ state: (addr === bob.address ? 'online' : 'offline') as 'online' | 'offline' });
+    const { container } = render(CommunityMembersPanel, { props: { ...baseProps(), presence } });
     await screen.findByText(/Alice/);
     expect(container.querySelector('.panel-title')?.textContent ?? '').toMatch(/2 online/);
   });
 
   it('excludes self from the online count when selfInvisible is on', async () => {
     // Same as above but the viewer is invisible → self is NOT counted → 1 online.
-    const isOnline = (addr: string) => addr === bob.address;
+    const presence = (addr: string) => ({ state: (addr === bob.address ? 'online' : 'offline') as 'online' | 'offline' });
     const { container } = render(CommunityMembersPanel, {
-      props: { ...baseProps(), isOnline, selfInvisible: true },
+      props: { ...baseProps(), presence, selfInvisible: true },
     });
     await screen.findByText(/Alice/);
     expect(container.querySelector('.panel-title')?.textContent ?? '').toMatch(/1 online/);
@@ -104,9 +104,9 @@ describe('CommunityMembersPanel', () => {
 
   it('sorts invisible self below actually-online members', async () => {
     // alice is self+invisible; bob is online. Online bob must float above alice.
-    const isOnline = (addr: string) => addr === bob.address;
+    const presence = (addr: string) => ({ state: (addr === bob.address ? 'online' : 'offline') as 'online' | 'offline' });
     render(CommunityMembersPanel, {
-      props: { ...baseProps(), isOnline, selfInvisible: true },
+      props: { ...baseProps(), presence, selfInvisible: true },
     });
     await screen.findByText(/Alice/);
     const activeList = screen.getByRole('list', { name: 'Active members' });
@@ -128,13 +128,13 @@ describe('CommunityMembersPanel', () => {
     };
     // Backend order bob(offline) then carol(online); no self in this list so
     // presence alone drives the sort.
-    const isOnline = (addr: string) => addr === carol.address;
+    const presence = (addr: string) => ({ state: (addr === carol.address ? 'online' : 'offline') as 'online' | 'offline' });
     render(CommunityMembersPanel, {
       props: {
         ...baseProps(),
         communityService: makeService([bob, carol]),
         ownAddress: 'nobody'.padEnd(32, '0'),
-        isOnline,
+        presence,
       },
     });
     await screen.findByText(/Carol/);
@@ -306,5 +306,20 @@ describe('moderation dialog resolves the target name through the ladder (ZEB-957
     });
     await openKickDialogFor(container, 'dddd1111');
     expect(screen.getByText(/Kick dddd1111 from/i)).toBeTruthy();
+  });
+});
+
+// ZEB-972 — a stale member (roster row present, beacon overdue for backend
+// eviction) must not inflate the header count or float with the online group.
+describe('CommunityMembersPanel — ZEB-972 stale presence honesty', () => {
+  it('excludes a stale member from the online count', async () => {
+    const presence = (addr: string) =>
+      addr === bob.address
+        ? { state: 'stale' as const, lastSeenMs: Date.now() - 2 * 60_000 }
+        : { state: 'offline' as const };
+    const { container } = render(CommunityMembersPanel, { props: { ...baseProps(), presence } });
+    await screen.findByText(/Alice/);
+    // Only self (alice, visible) counts — stale bob does not.
+    expect(container.querySelector('.panel-title')?.textContent ?? '').toMatch(/1 online/);
   });
 });

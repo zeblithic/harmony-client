@@ -1,4 +1,5 @@
 import type { TauriAdapter } from './zenoh-service';
+import { formatLastSeen, type TimeFormatPrefs } from './time-format';
 
 /**
  * Wire shape of a single member's presence, as returned by
@@ -21,6 +22,59 @@ export interface PresenceMemberDto {
 interface PresenceUpdatedPayload {
   communityId: string;
   members: PresenceMemberDto[];
+}
+
+/**
+ * ZEB-972: client-side staleness threshold. The backend evicts a silent owner
+ * from the roster after 30 s (3× the 10 s beacon interval,
+ * `community_presence::STALE_MS`), and {@link PresenceService.refreshAll}
+ * re-pulls stamps every ~15 s, so under normal operation a cached row's beacon
+ * stamp is never older than ~25 s (10 s beacon cadence + 15 s poll). 2× the
+ * backend TTL means "the backend's eviction is overdue" — the sweep lives in
+ * the event loop and is the SOLE eviction path, so an event-loop stall/death
+ * (the ZEB-970 wedge incident) freezes rows in place and, without this guard,
+ * dots would stay green forever. Generous enough to never flap during normal
+ * operation.
+ */
+export const PRESENCE_STALE_AFTER_MS = 60_000;
+
+/**
+ * ZEB-972: three-state presence for a dot renderer.
+ *  - `online`  — roster row present with a fresh beacon (≤ {@link PRESENCE_STALE_AFTER_MS}).
+ *  - `stale`   — roster row present but the beacon is overdue for backend
+ *                eviction: the push pipeline itself is suspect, so the dot must
+ *                stop claiming live presence.
+ *  - `offline` — no roster row (normal absence, including backend eviction).
+ */
+export type PresenceState = 'online' | 'stale' | 'offline';
+
+export interface PresenceDisplay {
+  state: PresenceState;
+  /**
+   * Wall-clock ms of the most recent beacon observed for this owner in ANY
+   * community this session (survives roster eviction — see `lastKnown`).
+   * Absent when no beacon has ever been observed this session.
+   */
+  lastSeenMs?: number;
+}
+
+/**
+ * ZEB-972: shared title/aria copy for a peer's presence dot, so MemberRow and
+ * ChannelMembersPanel can't drift apart. The 1-minute "just now" floor matches
+ * the 10 s beacon cadence (a stale row is ≥60 s old by definition, so its
+ * label is always a real "~Nm ago"). Self/invisible copy stays component-local
+ * — this covers peers only.
+ */
+export function presenceDotLabel(p: PresenceDisplay, now: number, prefs: TimeFormatPrefs): string {
+  const seen =
+    p.lastSeenMs === undefined
+      ? undefined
+      : formatLastSeen(p.lastSeenMs, now, prefs, { justNowUnderMin: 1 });
+  if (p.state === 'online') return 'Online';
+  if (p.state === 'stale') {
+    return seen === undefined ? 'Connection may be stale' : `Last seen ${seen} — connection may be stale`;
+  }
+  return seen === undefined ? 'Offline' : `Offline · last seen ${seen}`;
 }
 
 /**
@@ -54,6 +108,15 @@ export class PresenceService {
    * (e.g. mid community-switch) from leaking a stale "online" answer.
    */
   private activeCommunityId: string | null = null;
+  /**
+   * ZEB-972: ownerIdHex(lc) -> newest beacon stamp ever observed this session,
+   * across ALL communities. Max-merged in {@link applyMembers} and never
+   * cleared (session-scoped memory), so an owner evicted from every roster
+   * still yields a "last seen ~Xm ago" tooltip instead of a bare "Offline".
+   */
+  private lastKnown = new Map<string, number>();
+  /** ZEB-972: injectable clock for deterministic staleness tests. */
+  private nowFn: () => number;
 
   /**
    * Adapter is optional so callers can construct the service at boot (before
@@ -62,7 +125,30 @@ export class PresenceService {
    * adapter is absent — mirrors MemberCardService so a non-connected boot
    * never crashes. (ZEB-537.)
    */
-  constructor(private adapter?: TauriAdapter) {}
+  constructor(
+    private adapter?: TauriAdapter,
+    opts?: { now?: () => number },
+  ) {
+    this.nowFn = opts?.now ?? Date.now;
+  }
+
+  /**
+   * ZEB-972: true iff this roster row may claim LIVE presence — the backend's
+   * `online` flag AND a beacon fresh enough that the backend's 30 s eviction
+   * sweep is not overdue. Clock basis (Greptile PR #722): the backend keeps
+   * receipt stamps on its own MONOTONIC clock and rebases them onto the Unix
+   * epoch at every emission boundary (`online_owners_wall`), so `lastSeenMs`
+   * here is epoch ms comparable against this same-machine `Date.now()`.
+   * Future-dated stamps (a backward local clock step between the backend's
+   * rebase and this comparison) are rejected too, mirroring the backend's
+   * ZEB-791 fail-closed sweep — accepting them would hold the row "fresh" for
+   * the whole skew if that eviction never reached us. Heals via the next
+   * refresh (≤15 s), whose rebase runs against the stepped clock.
+   */
+  private isFresh(m: PresenceMemberDto): boolean {
+    const age = this.nowFn() - m.lastSeenMs;
+    return m.online && age >= 0 && age <= PRESENCE_STALE_AFTER_MS;
+  }
 
   /** Wire the Tauri adapter after it becomes available (post-boot). */
   setAdapter(adapter: TauriAdapter): void {
@@ -180,10 +266,30 @@ export class PresenceService {
    * answer. owner_id lookup is case-insensitive (keys are stored lowercased).
    */
   isOnline(ownerIdHex: string): boolean {
-    if (!this.activeCommunityId) return false;
-    return (
-      this.byCommunity.get(this.activeCommunityId)?.get(ownerIdHex.toLowerCase())?.online ?? false
-    );
+    return this.presenceFor(ownerIdHex).state === 'online';
+  }
+
+  /**
+   * ZEB-972: three-state presence for `ownerIdHex` in the ACTIVE community
+   * (same scoping and case-insensitivity as {@link isOnline}). This is the
+   * dot renderer's resolver: `online` needs a present row AND a fresh beacon;
+   * a present row with an eviction-overdue beacon is `stale` (the push
+   * pipeline is suspect — dot must stop claiming live presence); an absent
+   * row is `offline`, carrying the session's last-known beacon stamp when one
+   * exists so the tooltip can say "last seen ~Xm ago".
+   */
+  presenceFor(ownerIdHex: string): PresenceDisplay {
+    const key = ownerIdHex.toLowerCase();
+    const row = this.activeCommunityId
+      ? this.byCommunity.get(this.activeCommunityId)?.get(key)
+      : undefined;
+    if (row?.online) {
+      return this.isFresh(row)
+        ? { state: 'online', lastSeenMs: row.lastSeenMs }
+        : { state: 'stale', lastSeenMs: row.lastSeenMs };
+    }
+    const known = this.lastKnown.get(key);
+    return known === undefined ? { state: 'offline' } : { state: 'offline', lastSeenMs: known };
   }
 
   /**
@@ -196,7 +302,8 @@ export class PresenceService {
     const map = this.byCommunity.get(communityId);
     if (!map) return 0;
     let n = 0;
-    for (const m of map.values()) if (m.online) n++;
+    // ZEB-972: freshness-gated — a stale row must not inflate the header count.
+    for (const m of map.values()) if (this.isFresh(m)) n++;
     return n;
   }
 
@@ -210,8 +317,9 @@ export class PresenceService {
     const map = this.byCommunity.get(communityId);
     if (!map) return false;
     const self = selfOwnerIdHex.toLowerCase();
+    // ZEB-972: freshness-gated — a stale row must not light the sidebar dot.
     for (const m of map.values()) {
-      if (m.online && m.ownerIdHex.toLowerCase() !== self) return true;
+      if (this.isFresh(m) && m.ownerIdHex.toLowerCase() !== self) return true;
     }
     return false;
   }
@@ -223,8 +331,10 @@ export class PresenceService {
    */
   isOnlineAnywhere(ownerIdHex: string): boolean {
     const key = ownerIdHex.toLowerCase();
+    // ZEB-972: freshness-gated — a stale row must not light the DM-list dot.
     for (const map of this.byCommunity.values()) {
-      if (map.get(key)?.online) return true;
+      const m = map.get(key);
+      if (m && this.isFresh(m)) return true;
     }
     return false;
   }
@@ -251,11 +361,50 @@ export class PresenceService {
     }
   }
 
+  /**
+   * ZEB-972 (Greptile PR #722): re-pull the authoritative roster snapshot for
+   * every subscribed community. The `presence-updated` push fires only on
+   * device-set CHANGES (bare beacon refreshes deliberately emit nothing to
+   * avoid event spam), so without a periodic re-fetch this cache's beacon
+   * stamps rot during stable rosters and every live peer would read stale
+   * ~60 s after the last roster change. App.svelte calls this on the same
+   * 15 s ticker that drives staleness recompute: worst-case fresh-stamp age
+   * is then ~10 s beacon + ~15 s poll ≪ {@link PRESENCE_STALE_AFTER_MS}.
+   *
+   * Failure handling is the honest direction by construction: a rejected
+   * fetch KEEPS that community's aging cache (rot → stale dots — the backend
+   * is suspect, which is exactly what stale means), never clears it. Fetches
+   * run in parallel and this never rejects. The narrow race with a push event
+   * (a poll read started before a device-set change can land after its event)
+   * is bounded by one IPC round-trip and self-heals on the next poll — same
+   * class as the ZEB-537 seed/push ordering, and `lastKnown` max-merge already
+   * protects the tooltip surface.
+   */
+  async refreshAll(): Promise<void> {
+    if (!this.adapter) return;
+    await Promise.allSettled(
+      [...this.callbacks.keys()].map(async (communityId) => {
+        try {
+          const members = await this.getPresence(communityId);
+          this.applyMembers(communityId, members);
+        } catch (e) {
+          console.warn(`PresenceService.refreshAll: keeping cache for ${communityId}:`, e);
+        }
+      }),
+    );
+  }
+
   /** Replace a community's cached presence map and notify its subscriber. */
   private applyMembers(communityId: string, members: PresenceMemberDto[]): void {
     const map = new Map<string, PresenceMemberDto>();
     for (const m of members) {
-      map.set(m.ownerIdHex.toLowerCase(), m);
+      const key = m.ownerIdHex.toLowerCase();
+      map.set(key, m);
+      // ZEB-972: max-merge the session-wide last-known beacon stamp BEFORE the
+      // wholesale replace below discards evicted rows — max (not overwrite) so
+      // an out-of-order older delivery can't regress it.
+      const prev = this.lastKnown.get(key);
+      if (prev === undefined || m.lastSeenMs > prev) this.lastKnown.set(key, m.lastSeenMs);
     }
     this.byCommunity.set(communityId, map);
     try {

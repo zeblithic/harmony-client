@@ -187,6 +187,36 @@ export function formatMailRecency(
   return date.toLocaleDateString(localeArg(prefs), { month: 'short', day: 'numeric' });
 }
 
+/**
+ * Heartbeat-tolerant "last seen" recency label (ZEB-668 S4, lifted for
+ * ZEB-972): `just now` under the floor, then `~Nm ago` / `~Nh ago` minute and
+ * hour buckets, `Nd ago` under 30 days, and the numeric date beyond that. The
+ * `~` prefix marks approximate buckets (honesty ledger: last seen = last
+ * heartbeat/beacon observed, not live presence).
+ *
+ * `justNowUnderMin` is the honesty knob, matched to the signal's cadence:
+ * DevicesPanel keeps the default 10 (fleet re-stamp tick ~7.5 min, so anything
+ * younger genuinely is "just now"), presence dots pass 1 (10 s beacons — a
+ * 2-minute-stale peer must not read "just now"). `now` is injected so callers
+ * own the reference instant and unit tests stay deterministic.
+ */
+export function formatLastSeen(
+  ms: number,
+  now: number,
+  prefs: TimeFormatPrefs = DEFAULT_TIME_FORMAT_PREFS,
+  opts?: { justNowUnderMin?: number },
+): string {
+  const floor = opts?.justNowUnderMin ?? 10;
+  const min = Math.floor((now - ms) / 60_000);
+  if (min < floor) return 'just now';
+  if (min < 60) return `~${min}m ago`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `~${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d}d ago`;
+  return formatDateOnly(ms, prefs);
+}
+
 /** Full, unambiguous date + time (4-digit year) for a hover tooltip / `title`. */
 export function formatFullTimestamp(
   ms: number,
