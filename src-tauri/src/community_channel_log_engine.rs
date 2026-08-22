@@ -29,6 +29,20 @@ use crate::community_channel_log::{
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
+/// ZEB-969: which delivery path handed a packet to `process_inbound_packet`.
+/// `Reconcile` is the only path allowed to admit a fully-verified event whose
+/// HLC sits BELOW its author-lane head (healing a hole the live race sealed);
+/// `Live` keeps strict per-lane monotonicity. The legacy watermark-GET reply
+/// pages arrive via the live subscriber and are above-watermark by
+/// construction, so they never need — and never get — below-head admission.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IngestProvenance {
+    /// Live zenoh subscriber (gossip + legacy watermark-GET reply pages).
+    Live,
+    /// RBSR reconcile recovery (`rbsr_ingest_and_next`'s inline `Have`s).
+    Reconcile,
+}
+
 // ── Error type ──────────────────────────────────────────────────────────────
 
 #[derive(Error, Debug)]
@@ -635,7 +649,7 @@ impl ChannelLogEngine {
                         biased;
                         maybe = rx.recv() => {
                             let Some(packet) = maybe else { break; };
-                            me.process_inbound_packet(packet).await;
+                            me.process_inbound_packet(packet, IngestProvenance::Live).await;
                         }
                         _ = closing_notify.notified() => {
                             if closing.load(Ordering::SeqCst) { break; }
@@ -1641,7 +1655,11 @@ impl ChannelLogEngine {
         self.sink.emit("channel-log-degraded", payload);
     }
 
-    async fn process_inbound_packet(self: &Arc<Self>, packet: Vec<u8>) {
+    async fn process_inbound_packet(
+        self: &Arc<Self>,
+        packet: Vec<u8>,
+        provenance: IngestProvenance,
+    ) {
         // 1. Decrypt. ZEB-920: try the [current, previous] live candidates
         // (degraded [pinned]) so rotation skew heals in both directions.
         let open_keys = self.decrypt_channel_keys().await;
@@ -1684,21 +1702,39 @@ impl ChannelLogEngine {
         // is a `BTreeMap::new()` under the hood, so the throwaway
         // construction is cheap.
 
-        // 2a. Fast-path replay check.
+        // 2a. Fast-path replay check. For `Reconcile` provenance a Replay
+        // verdict is not final (ZEB-969): RBSR recovers events BELOW their
+        // lane head — that is the hole being healed — so only the log's
+        // ReconcileKey index can distinguish "already stored" from "missed".
+        // The tracker lock is released before the log lock is taken (never
+        // held together; the publish path orders log-then-tracker).
+        let mut below_head = false;
         {
-            let tracker = self.replay_tracker.lock().await;
-            if let Err(e) = tracker.would_accept(&event) {
-                tracing::debug!(
-                    community_id = ?self.community_id,
-                    channel_id = ?self.channel_id,
-                    err = ?e,
-                    "drop replay (fast-path)"
-                );
-                self.replay_drops
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
+            let replay_verdict = {
+                let tracker = self.replay_tracker.lock().await;
+                tracker.would_accept(&event)
+                // Tracker lock drops here so async verify doesn't hold it.
+            };
+            if let Err(e) = replay_verdict {
+                let known_duplicate = match provenance {
+                    IngestProvenance::Live => true,
+                    IngestProvenance::Reconcile => {
+                        self.log.lock().await.contains_reconcile_key(&event)
+                    }
+                };
+                if known_duplicate {
+                    tracing::debug!(
+                        community_id = ?self.community_id,
+                        channel_id = ?self.channel_id,
+                        err = ?e,
+                        "drop replay (fast-path)"
+                    );
+                    self.replay_drops
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                below_head = true;
             }
-            // Drop tracker lock here so async verify doesn't hold it.
         }
 
         // 2b. Async verification OUTSIDE the lock. Pass a throwaway
@@ -1742,19 +1778,29 @@ impl ChannelLogEngine {
 
         // 2c. Atomic re-check + commit under the lock. If a concurrent
         // receive of the same event won the race between 2a and 2c,
-        // check_and_advance returns Err(Replay) and we drop silently.
+        // check_and_advance returns Err(Replay): `Live` drops silently;
+        // `Reconcile` proceeds without advancing (ZEB-969) — a below-head
+        // event never moves the lane head, and step 3's append-level
+        // ReconcileKey dedup is the authoritative duplicate verdict.
         {
             let mut tracker = self.replay_tracker.lock().await;
             if let Err(e) = tracker.check_and_advance(&event) {
-                tracing::debug!(
-                    community_id = ?self.community_id,
-                    channel_id = ?self.channel_id,
-                    err = ?e,
-                    "drop replay (atomic-recheck)"
-                );
-                self.replay_drops
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
+                match provenance {
+                    IngestProvenance::Live => {
+                        tracing::debug!(
+                            community_id = ?self.community_id,
+                            channel_id = ?self.channel_id,
+                            err = ?e,
+                            "drop replay (atomic-recheck)"
+                        );
+                        self.replay_drops
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                    IngestProvenance::Reconcile => {
+                        below_head = true;
+                    }
+                }
             }
         }
 
@@ -1818,6 +1864,20 @@ impl ChannelLogEngine {
                 "drop duplicate at append (ReconcileKey present)"
             );
             return;
+        }
+        if below_head {
+            // ZEB-969: INFO on purpose — the silent debug-only drop of these
+            // events is what made the original data loss invisible in the
+            // field. A heal is rare and worth a production log line.
+            tracing::info!(
+                community_id = ?self.community_id,
+                channel_id = ?self.channel_id,
+                author = ?event.author(),
+                device = %event.at().device_id,
+                wall_ms = event.at().wall_ms,
+                logical = event.at().logical,
+                "below-head heal (ZEB-969): reconcile recovered an event the live race had sealed out"
+            );
         }
 
         // 4. Emit + notify flush.
@@ -2116,7 +2176,10 @@ impl ChannelLogEngine {
         };
         let ingested = have_packets.len();
         for packet in have_packets {
-            self.process_inbound_packet(packet).await;
+            // ZEB-969: RBSR provenance — recovered events may sit below
+            // their lane head (that is the hole being healed).
+            self.process_inbound_packet(packet, IngestProvenance::Reconcile)
+                .await;
         }
         // Recompute our own fingerprints over the (now-updated) log and narrow.
         let next = {
@@ -3785,6 +3848,110 @@ mod tests {
         // Oversize payload → None (cap-before-alloc; caller falls back).
         let oversize = vec![0u8; crate::community_channel_log::MAX_RBSR_MESSAGE_BYTES + 1];
         assert!(fix.engine.rbsr_respond(&oversize).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_below_head_event_still_drops() {
+        // ZEB-969 guard: Live ingest keeps strict per-lane monotonicity —
+        // below-head admission is reconcile-path-only.
+        let fx = build_engine_fixture(8, 250, 1000).await;
+        let newer = make_signed_event(
+            fx.community_id,
+            fx.channel_id,
+            fx.self_owner,
+            Hlc {
+                wall_ms: 2_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "new",
+            &fx.signing_key,
+        );
+        let older = make_signed_event(
+            fx.community_id,
+            fx.channel_id,
+            fx.self_owner,
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "old",
+            &fx.signing_key,
+        );
+        let p_newer =
+            crate::community_channel_log::encrypt_channel_packet(fx.engine.channel_key_ref(), &newer)
+                .expect("encrypt newer");
+        let p_older =
+            crate::community_channel_log::encrypt_channel_packet(fx.engine.channel_key_ref(), &older)
+                .expect("encrypt older");
+        fx.engine
+            .process_inbound_packet(p_newer, IngestProvenance::Live)
+            .await;
+        let drops_before = fx.engine.replay_drop_count();
+        fx.engine
+            .process_inbound_packet(p_older, IngestProvenance::Live)
+            .await;
+        assert_eq!(
+            fx.engine.replay_drop_count(),
+            drops_before + 1,
+            "below-head Live packet must replay-drop"
+        );
+        assert_eq!(fx.engine.log_for_test().lock().await.tail.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_below_head_event_heals() {
+        // ZEB-969 headline behavior: a fully-verified below-head event
+        // arriving via RBSR recovery is appended; the lane head is untouched.
+        let fx = build_engine_fixture(8, 250, 1000).await;
+        let newer = make_signed_event(
+            fx.community_id,
+            fx.channel_id,
+            fx.self_owner,
+            Hlc {
+                wall_ms: 2_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "new",
+            &fx.signing_key,
+        );
+        let older = make_signed_event(
+            fx.community_id,
+            fx.channel_id,
+            fx.self_owner,
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "old",
+            &fx.signing_key,
+        );
+        let p_newer =
+            crate::community_channel_log::encrypt_channel_packet(fx.engine.channel_key_ref(), &newer)
+                .expect("encrypt newer");
+        let p_older =
+            crate::community_channel_log::encrypt_channel_packet(fx.engine.channel_key_ref(), &older)
+                .expect("encrypt older");
+        fx.engine
+            .process_inbound_packet(p_newer, IngestProvenance::Live)
+            .await;
+        fx.engine
+            .process_inbound_packet(p_older, IngestProvenance::Reconcile)
+            .await;
+        {
+            let log = fx.engine.log_for_test().lock().await;
+            assert_eq!(log.tail.len(), 2, "below-head heal must append");
+        }
+        let tracker = fx.engine.replay_tracker.lock().await;
+        let key = (fx.channel_id, fx.self_owner, "test-device".to_string());
+        assert_eq!(
+            tracker.last_seen().get(&key).expect("lane present").wall_ms,
+            2_000,
+            "lane head must remain the max after a below-head heal"
+        );
     }
 
     #[tokio::test]
@@ -5539,7 +5706,9 @@ mod tests {
         let packet = encrypt_channel_packet(&fix.channel_key, &event).expect("encrypt");
 
         fix.engine.closing.store(true, Ordering::SeqCst);
-        fix.engine.process_inbound_packet(packet).await;
+        fix.engine
+            .process_inbound_packet(packet, IngestProvenance::Live)
+            .await;
 
         let listed = fix.engine.list_messages(None, 100).await.expect("list");
         assert!(
