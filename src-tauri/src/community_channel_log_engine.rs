@@ -29,6 +29,20 @@ use crate::community_channel_log::{
 use crate::community_membership::{ChannelId, MaterializedMembership};
 use crate::owner_state_types::{EpochKey, Hlc, OwnerAddr, SpaceId};
 
+/// ZEB-969: which delivery path handed a packet to `process_inbound_packet`.
+/// `Reconcile` is the only path allowed to admit a fully-verified event whose
+/// HLC sits BELOW its author-lane head (healing a hole the live race sealed);
+/// `Live` keeps strict per-lane monotonicity. The legacy watermark-GET reply
+/// pages arrive via the live subscriber and are above-watermark by
+/// construction, so they never need — and never get — below-head admission.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IngestProvenance {
+    /// Live zenoh subscriber (gossip + legacy watermark-GET reply pages).
+    Live,
+    /// RBSR reconcile recovery (`rbsr_ingest_and_next`'s inline `Have`s).
+    Reconcile,
+}
+
 // ── Error type ──────────────────────────────────────────────────────────────
 
 #[derive(Error, Debug)]
@@ -557,17 +571,12 @@ impl ChannelLogEngine {
         // backfill; it can't dedupe what it never saw). We walk every
         // sealed segment AND the tail to rebuild last_seen.
         //
-        // Iteration order matters: `ChannelLogReplayTracker::record`
-        // overwrites unconditionally (blind insert), so the LAST call
-        // for any (author, device) lane wins. Sealed segments hold the
-        // older history; the tail holds the most recent events. We
-        // walk segments first then tail so the tail's `record` calls
-        // win — this matches the natural ChannelLog::reload order
-        // (segments first, then tail). Reversing this order would
-        // regress the high-water mark whenever segments contain newer-
-        // than-tail events (possible in the post-tail-flush window
-        // before the next seal lands), allowing already-persisted
-        // events to be re-accepted on respawn.
+        // Iteration order no longer matters (ZEB-969): `record` is a
+        // max-fold, so walking segments and tail in any order yields
+        // each lane's max. This is load-bearing — a below-head event
+        // healed via RBSR sits late in storage order with an OLD stamp,
+        // and the pre-ZEB-969 blind-overwrite `record` would have
+        // regressed the lane head on respawn.
         //
         // Why call `record` directly (vs `check_and_advance`): on-disk
         // events were validated when first appended; re-running the
@@ -640,7 +649,7 @@ impl ChannelLogEngine {
                         biased;
                         maybe = rx.recv() => {
                             let Some(packet) = maybe else { break; };
-                            me.process_inbound_packet(packet).await;
+                            me.process_inbound_packet(packet, IngestProvenance::Live).await;
                         }
                         _ = closing_notify.notified() => {
                             if closing.load(Ordering::SeqCst) { break; }
@@ -1646,7 +1655,11 @@ impl ChannelLogEngine {
         self.sink.emit("channel-log-degraded", payload);
     }
 
-    async fn process_inbound_packet(self: &Arc<Self>, packet: Vec<u8>) {
+    async fn process_inbound_packet(
+        self: &Arc<Self>,
+        packet: Vec<u8>,
+        provenance: IngestProvenance,
+    ) {
         // 1. Decrypt. ZEB-920: try the [current, previous] live candidates
         // (degraded [pinned]) so rotation skew heals in both directions.
         let open_keys = self.decrypt_channel_keys().await;
@@ -1689,21 +1702,39 @@ impl ChannelLogEngine {
         // is a `BTreeMap::new()` under the hood, so the throwaway
         // construction is cheap.
 
-        // 2a. Fast-path replay check.
+        // 2a. Fast-path replay check. For `Reconcile` provenance a Replay
+        // verdict is not final (ZEB-969): RBSR recovers events BELOW their
+        // lane head — that is the hole being healed — so only the log's
+        // ReconcileKey index can distinguish "already stored" from "missed".
+        // The tracker lock is released before the log lock is taken (never
+        // held together; the publish path orders log-then-tracker).
+        let mut below_head = false;
         {
-            let tracker = self.replay_tracker.lock().await;
-            if let Err(e) = tracker.would_accept(&event) {
-                tracing::debug!(
-                    community_id = ?self.community_id,
-                    channel_id = ?self.channel_id,
-                    err = ?e,
-                    "drop replay (fast-path)"
-                );
-                self.replay_drops
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
+            let replay_verdict = {
+                let tracker = self.replay_tracker.lock().await;
+                tracker.would_accept(&event)
+                // Tracker lock drops here so async verify doesn't hold it.
+            };
+            if let Err(e) = replay_verdict {
+                let known_duplicate = match provenance {
+                    IngestProvenance::Live => true,
+                    IngestProvenance::Reconcile => {
+                        self.log.lock().await.contains_reconcile_key(&event)
+                    }
+                };
+                if known_duplicate {
+                    tracing::debug!(
+                        community_id = ?self.community_id,
+                        channel_id = ?self.channel_id,
+                        err = ?e,
+                        "drop replay (fast-path)"
+                    );
+                    self.replay_drops
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                below_head = true;
             }
-            // Drop tracker lock here so async verify doesn't hold it.
         }
 
         // 2b. Async verification OUTSIDE the lock. Pass a throwaway
@@ -1747,19 +1778,29 @@ impl ChannelLogEngine {
 
         // 2c. Atomic re-check + commit under the lock. If a concurrent
         // receive of the same event won the race between 2a and 2c,
-        // check_and_advance returns Err(Replay) and we drop silently.
+        // check_and_advance returns Err(Replay): `Live` drops silently;
+        // `Reconcile` proceeds without advancing (ZEB-969) — a below-head
+        // event never moves the lane head, and step 3's append-level
+        // ReconcileKey dedup is the authoritative duplicate verdict.
         {
             let mut tracker = self.replay_tracker.lock().await;
             if let Err(e) = tracker.check_and_advance(&event) {
-                tracing::debug!(
-                    community_id = ?self.community_id,
-                    channel_id = ?self.channel_id,
-                    err = ?e,
-                    "drop replay (atomic-recheck)"
-                );
-                self.replay_drops
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
+                match provenance {
+                    IngestProvenance::Live => {
+                        tracing::debug!(
+                            community_id = ?self.community_id,
+                            channel_id = ?self.channel_id,
+                            err = ?e,
+                            "drop replay (atomic-recheck)"
+                        );
+                        self.replay_drops
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                    IngestProvenance::Reconcile => {
+                        below_head = true;
+                    }
+                }
             }
         }
 
@@ -1792,13 +1833,13 @@ impl ChannelLogEngine {
         // engine start; the design already tolerates that (and the
         // replay-tracker advance at step 2c is discarded on shutdown,
         // since the tracker is rebuilt from the on-disk log at boot).
-        let appended = {
+        let outcome = {
             let mut log = self.log.lock().await;
             if self.closing.load(Ordering::SeqCst) {
                 return;
             }
             match log.append(event.clone()) {
-                Ok(_seal_ready) => true,
+                Ok(outcome) => Some(outcome),
                 Err(e) => {
                     tracing::error!(
                         community_id = ?self.community_id,
@@ -1807,12 +1848,41 @@ impl ChannelLogEngine {
                         "channel-log persist failed; degraded"
                     );
                     self.emit_degraded(&format!("persist: {e}"));
-                    false
+                    None
                 }
             }
         };
-        if !appended {
+        let Some(outcome) = outcome else {
             return;
+        };
+        if !outcome.newly_appended {
+            // ZEB-969: the append-level ReconcileKey dedup skipped the push.
+            // The log is unchanged, so a duplicate must never re-emit.
+            tracing::debug!(
+                community_id = ?self.community_id,
+                channel_id = ?self.channel_id,
+                "drop duplicate at append (ReconcileKey present)"
+            );
+            return;
+        }
+        if below_head {
+            // ZEB-969: INFO on purpose — the silent debug-only drop of these
+            // events is what made the original data loss invisible in the
+            // field. A heal is rare and worth a production log line.
+            // Identifiers are truncated (CodeRabbit PR #719): INFO lands in
+            // default production logs, which elsewhere carry only community
+            // and channel ids — a 4-byte author prefix and 8-char device
+            // prefix are enough to correlate a lane without accumulating
+            // full per-user identifiers at the default level.
+            tracing::info!(
+                community_id = ?self.community_id,
+                channel_id = ?self.channel_id,
+                author = %hex::encode(&event.author().0[..4]),
+                device = %event.at().device_id.chars().take(8).collect::<String>(),
+                wall_ms = event.at().wall_ms,
+                logical = event.at().logical,
+                "below-head heal (ZEB-969): reconcile recovered an event the live race had sealed out"
+            );
         }
 
         // 4. Emit + notify flush.
@@ -2111,7 +2181,10 @@ impl ChannelLogEngine {
         };
         let ingested = have_packets.len();
         for packet in have_packets {
-            self.process_inbound_packet(packet).await;
+            // ZEB-969: RBSR provenance — recovered events may sit below
+            // their lane head (that is the hole being healed).
+            self.process_inbound_packet(packet, IngestProvenance::Reconcile)
+                .await;
         }
         // Recompute our own fingerprints over the (now-updated) log and narrow.
         let next = {
@@ -3780,6 +3853,412 @@ mod tests {
         // Oversize payload → None (cap-before-alloc; caller falls back).
         let oversize = vec![0u8; crate::community_channel_log::MAX_RBSR_MESSAGE_BYTES + 1];
         assert!(fix.engine.rbsr_respond(&oversize).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_below_head_event_still_drops() {
+        // ZEB-969 guard: Live ingest keeps strict per-lane monotonicity —
+        // below-head admission is reconcile-path-only.
+        let fx = build_engine_fixture(8, 250, 1000).await;
+        let newer = make_signed_event(
+            fx.community_id,
+            fx.channel_id,
+            fx.self_owner,
+            Hlc {
+                wall_ms: 2_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "new",
+            &fx.signing_key,
+        );
+        let older = make_signed_event(
+            fx.community_id,
+            fx.channel_id,
+            fx.self_owner,
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "old",
+            &fx.signing_key,
+        );
+        let p_newer = crate::community_channel_log::encrypt_channel_packet(
+            fx.engine.channel_key_ref(),
+            &newer,
+        )
+        .expect("encrypt newer");
+        let p_older = crate::community_channel_log::encrypt_channel_packet(
+            fx.engine.channel_key_ref(),
+            &older,
+        )
+        .expect("encrypt older");
+        fx.engine
+            .process_inbound_packet(p_newer, IngestProvenance::Live)
+            .await;
+        let drops_before = fx.engine.replay_drop_count();
+        fx.engine
+            .process_inbound_packet(p_older, IngestProvenance::Live)
+            .await;
+        assert_eq!(
+            fx.engine.replay_drop_count(),
+            drops_before + 1,
+            "below-head Live packet must replay-drop"
+        );
+        assert_eq!(fx.engine.log_for_test().lock().await.tail.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_below_head_event_heals() {
+        // ZEB-969 headline behavior: a fully-verified below-head event
+        // arriving via RBSR recovery is appended; the lane head is untouched.
+        let fx = build_engine_fixture(8, 250, 1000).await;
+        let newer = make_signed_event(
+            fx.community_id,
+            fx.channel_id,
+            fx.self_owner,
+            Hlc {
+                wall_ms: 2_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "new",
+            &fx.signing_key,
+        );
+        let older = make_signed_event(
+            fx.community_id,
+            fx.channel_id,
+            fx.self_owner,
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "old",
+            &fx.signing_key,
+        );
+        let p_newer = crate::community_channel_log::encrypt_channel_packet(
+            fx.engine.channel_key_ref(),
+            &newer,
+        )
+        .expect("encrypt newer");
+        let p_older = crate::community_channel_log::encrypt_channel_packet(
+            fx.engine.channel_key_ref(),
+            &older,
+        )
+        .expect("encrypt older");
+        fx.engine
+            .process_inbound_packet(p_newer, IngestProvenance::Live)
+            .await;
+        fx.engine
+            .process_inbound_packet(p_older, IngestProvenance::Reconcile)
+            .await;
+        {
+            let log = fx.engine.log_for_test().lock().await;
+            assert_eq!(log.tail.len(), 2, "below-head heal must append");
+        }
+        let tracker = fx.engine.replay_tracker.lock().await;
+        let key = (fx.channel_id, fx.self_owner, "test-device".to_string());
+        assert_eq!(
+            tracker.last_seen().get(&key).expect("lane present").wall_ms,
+            2_000,
+            "lane head must remain the max after a below-head heal"
+        );
+    }
+
+    #[tokio::test]
+    async fn rbsr_heals_hole_below_advanced_lane_head() {
+        // ZEB-969 headline e2e (the 0.2.9 Koya↔Krile incident shape): the
+        // requester holds [e1, e4] of one author lane — the live race
+        // delivered the newest event first, sealing e2/e3 below the head —
+        // while the responder holds [e1, e2, e3, e4]. A real RBSR round must
+        // heal e2/e3 without moving the lane head, and a second identical
+        // round must be a no-op (append-level dedup).
+        let responder = build_engine_fixture(8, 250, 1000).await;
+        let requester = build_engine_fixture(8, 250, 1000).await;
+
+        let events: Vec<SignedChannelEvent> = (1..=4u64)
+            .map(|i| {
+                make_signed_event(
+                    responder.community_id,
+                    responder.channel_id,
+                    responder.self_owner,
+                    Hlc {
+                        wall_ms: i * 1_000,
+                        logical: 0,
+                        device_id: "test-device".to_string(),
+                    },
+                    &format!("e{i}"),
+                    &responder.signing_key,
+                )
+            })
+            .collect();
+        {
+            let mut log = responder.engine.log_for_test().lock().await;
+            for ev in &events {
+                log.append(ev.clone()).expect("responder append");
+            }
+        }
+        // Requester: e1 then e4 via Live — tracker head advances to e4.
+        for ev in [&events[0], &events[3]] {
+            let p = encrypt_channel_packet(requester.engine.channel_key_ref(), ev)
+                .expect("encrypt seed");
+            requester
+                .engine
+                .process_inbound_packet(p, IngestProvenance::Live)
+                .await;
+        }
+        assert_eq!(
+            requester.engine.log_for_test().lock().await.tail.len(),
+            2,
+            "seed: requester must hold exactly e1 + e4"
+        );
+
+        // Round 1: initial → respond → ingest.
+        let req = requester.engine.rbsr_build_initial().await;
+        let (sealed_reply, have_events, _seal_key) = responder
+            .engine
+            .rbsr_respond(&req)
+            .await
+            .expect("responder replies");
+        let mut frames = vec![sealed_reply];
+        for ev in &have_events {
+            frames.push(
+                encrypt_channel_packet(requester.engine.channel_key_ref(), ev)
+                    .expect("encrypt have"),
+            );
+        }
+        let step = requester.engine.rbsr_ingest_and_next(frames).await;
+        assert!(
+            !matches!(step, crate::event_loop::RbsrStep::Failed),
+            "healing round must not fail"
+        );
+        assert_eq!(
+            requester.engine.log_for_test().lock().await.tail.len(),
+            4,
+            "hole events e2/e3 must be healed into the log"
+        );
+        {
+            let tracker = requester.engine.replay_tracker.lock().await;
+            let key = (
+                requester.channel_id,
+                responder.self_owner,
+                "test-device".to_string(),
+            );
+            assert_eq!(
+                tracker.last_seen().get(&key).expect("lane present").wall_ms,
+                4_000,
+                "lane head must remain e4 after the heal"
+            );
+        }
+
+        // Round 2 on converged logs: whatever the responder still serves
+        // must dedupe to a no-op.
+        let req2 = requester.engine.rbsr_build_initial().await;
+        let (sealed_reply2, have_events2, _k2) = responder
+            .engine
+            .rbsr_respond(&req2)
+            .await
+            .expect("responder replies round 2");
+        let mut frames2 = vec![sealed_reply2];
+        for ev in &have_events2 {
+            frames2.push(
+                encrypt_channel_packet(requester.engine.channel_key_ref(), ev)
+                    .expect("encrypt have 2"),
+            );
+        }
+        let _ = requester.engine.rbsr_ingest_and_next(frames2).await;
+        assert_eq!(
+            requester.engine.log_for_test().lock().await.tail.len(),
+            4,
+            "a repeat round must append nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_rebuild_after_heal_keeps_lane_max() {
+        // ZEB-969: a healed below-head event sits LATE in storage order with
+        // an OLD stamp. The respawned engine's tracker rebuild must yield the
+        // lane MAX (max-fold record), not the last-walked event — otherwise a
+        // re-broadcast of the newest event would be re-accepted after boot.
+        let fix = build_engine_fixture(8, 5_000, 10_000).await;
+        let dir = fix.tmp.path().to_path_buf();
+        let community_id = fix.community_id;
+        let channel_id = fix.channel_id;
+        let self_owner = fix.self_owner;
+        let signing_key = Arc::clone(&fix.signing_key);
+        let channel_key = Arc::clone(&fix.channel_key);
+
+        let newer = make_signed_event(
+            community_id,
+            channel_id,
+            self_owner,
+            Hlc {
+                wall_ms: 2_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "new",
+            &signing_key,
+        );
+        let older = make_signed_event(
+            community_id,
+            channel_id,
+            self_owner,
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "old",
+            &signing_key,
+        );
+        let p_newer = encrypt_channel_packet(&channel_key, &newer).expect("encrypt newer");
+        let p_older = encrypt_channel_packet(&channel_key, &older).expect("encrypt older");
+        fix.engine
+            .process_inbound_packet(p_newer.clone(), IngestProvenance::Live)
+            .await;
+        fix.engine
+            .process_inbound_packet(p_older, IngestProvenance::Reconcile)
+            .await;
+        assert_eq!(
+            fix.engine.log_for_test().lock().await.tail.len(),
+            2,
+            "setup: heal must land — tail is [newer, older] in storage order"
+        );
+        fix.engine.flush_now().await.expect("flush_now");
+        fix.engine.shutdown().await.expect("shutdown");
+
+        let state = Arc::new(AlwaysJoinedState {
+            channel_id,
+            owner: self_owner,
+            enrolled_key: signing_key.verifying_key().to_bytes(),
+        });
+        let hlc_tracker: Arc<Mutex<harmony_crdt_sync::ReplayTracker<String, Hlc>>> =
+            Arc::new(Mutex::new(harmony_crdt_sync::ReplayTracker::new(
+                "test-device".to_string(),
+            )));
+        let (publisher_tx, _publisher_rx) = mpsc::channel(64);
+        let (subscriber_tx, subscriber_rx) = mpsc::channel(64);
+        let (query_request_tx, _query_request_rx) = mpsc::channel(8);
+        let (_rec_sink, sink) = recording_sink_pair();
+        let config = ChannelLogEngineConfig {
+            log_config: ChannelLogConfig {
+                seal_threshold_events: 8,
+            },
+            flush_debounce_ms: 5_000,
+            max_dirty_ms: 10_000,
+            ..Default::default()
+        };
+        let params = ChannelLogEngineParams {
+            community_id,
+            channel_id,
+            channel_key: Arc::clone(&channel_key),
+            live_key_source: None,
+            root_dir: dir,
+            state_at_hlc: state,
+            self_owner,
+            self_device_id: "test-device".to_string(),
+            signing_key: Arc::clone(&signing_key),
+            hlc_tracker,
+            adopt_floor: crate::hlc_adopt_floor::HlcAdoptFloor::new(),
+            sink,
+            config,
+            publisher_tx,
+            subscriber_rx,
+            query_request_tx,
+        };
+        let engine2 = ChannelLogEngine::new(params).await.expect("respawn");
+
+        // Both events survived the respawn…
+        assert_eq!(
+            engine2.list_messages(None, 100).await.expect("list").len(),
+            2,
+            "healed event must persist across respawn"
+        );
+        // …and the rebuilt lane head is the MAX, not the last-walked stamp.
+        {
+            let tracker = engine2.replay_tracker.lock().await;
+            let key = (channel_id, self_owner, "test-device".to_string());
+            assert_eq!(
+                tracker.last_seen().get(&key).expect("lane present").wall_ms,
+                2_000,
+                "rebuild must fold to the lane max despite the healed event \
+                 sitting last in storage order"
+            );
+        }
+        // E2E guard: a re-broadcast of the newest event must still replay-drop.
+        // Wait on the drop counter (not a fixed sleep) so the negative
+        // count assertion below can't spuriously pass before the receive
+        // loop has processed the packet (CodeRabbit PR #719).
+        subscriber_tx
+            .send(p_newer)
+            .await
+            .expect("send re-broadcast");
+        wait_for(
+            || async { (engine2.replay_drop_count() >= 1).then_some(()) },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the re-broadcast must be observed dropping");
+        assert_eq!(
+            engine2.list_messages(None, 100).await.expect("list").len(),
+            2,
+            "re-broadcast of the newest event must not be re-accepted"
+        );
+        engine2.shutdown().await.expect("respawn shutdown");
+    }
+
+    #[tokio::test]
+    async fn below_head_heal_requires_valid_signature() {
+        // ZEB-969: below-head admission never weakens verification — a
+        // corrupted-signature event on the Reconcile path is still dropped.
+        let fx = build_engine_fixture(8, 250, 1000).await;
+        let newer = make_signed_event(
+            fx.community_id,
+            fx.channel_id,
+            fx.self_owner,
+            Hlc {
+                wall_ms: 2_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "new",
+            &fx.signing_key,
+        );
+        let mut older = make_signed_event(
+            fx.community_id,
+            fx.channel_id,
+            fx.self_owner,
+            Hlc {
+                wall_ms: 1_000,
+                logical: 0,
+                device_id: "test-device".to_string(),
+            },
+            "old",
+            &fx.signing_key,
+        );
+        match &mut older {
+            SignedChannelEvent::Post { sig, .. } | SignedChannelEvent::React { sig, .. } => {
+                sig[0] ^= 0xFF;
+            }
+        }
+        let p_newer =
+            encrypt_channel_packet(fx.engine.channel_key_ref(), &newer).expect("encrypt newer");
+        let p_older = encrypt_channel_packet(fx.engine.channel_key_ref(), &older)
+            .expect("encrypt tampered older");
+        fx.engine
+            .process_inbound_packet(p_newer, IngestProvenance::Live)
+            .await;
+        fx.engine
+            .process_inbound_packet(p_older, IngestProvenance::Reconcile)
+            .await;
+        assert_eq!(
+            fx.engine.log_for_test().lock().await.tail.len(),
+            1,
+            "a tampered below-head event must be rejected by verify"
+        );
     }
 
     #[tokio::test]
@@ -5534,7 +6013,9 @@ mod tests {
         let packet = encrypt_channel_packet(&fix.channel_key, &event).expect("encrypt");
 
         fix.engine.closing.store(true, Ordering::SeqCst);
-        fix.engine.process_inbound_packet(packet).await;
+        fix.engine
+            .process_inbound_packet(packet, IngestProvenance::Live)
+            .await;
 
         let listed = fix.engine.list_messages(None, 100).await.expect("list");
         assert!(

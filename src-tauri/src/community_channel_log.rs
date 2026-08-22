@@ -808,6 +808,20 @@ pub(crate) fn decrypt_channel_packet_with_any(
     last
 }
 
+/// ZEB-969: what `ChannelLog::append` did with the event. `append` is the
+/// authoritative duplicate guard (ReconcileKey presence in the reconcile
+/// index, checked under the same borrow that pushes the tail) — callers
+/// gate emits on `newly_appended` so a duplicate is never re-surfaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendOutcome {
+    /// False when the event's ReconcileKey was already present — nothing
+    /// was pushed, nothing to emit.
+    pub newly_appended: bool,
+    /// The tail reached the seal threshold (pre-ZEB-969 `Ok(true)`);
+    /// caller should `seal_and_persist`.
+    pub seal_ready: bool,
+}
+
 /// ZEB-585: per-author-lane catch-up watermark. Keyed by the
 /// `(author, device_id)` lane — the SAME lane identity the replay tracker
 /// uses (see `replay_tracker_independent_lanes_per_author`): two authors
@@ -1126,16 +1140,23 @@ impl ChannelLogReplayTracker {
 
     /// Advance the tracker to record an accepted event. Caller must
     /// have already validated via `would_accept` (and authorization
-    /// checks). Idempotent for the same (key, hlc) pair only — calling
-    /// twice with the same event will overwrite with an identical
-    /// value but doesn't error.
+    /// checks). Max-fold (ZEB-969): a lane's `last_seen` only ever
+    /// moves forward — recording an event at or below the current head
+    /// is a no-op, never an error. This makes the engine's boot rebuild
+    /// order-independent: a healed below-head event sitting late in
+    /// storage order cannot regress the head on respawn.
     pub fn record(&mut self, event: &SignedChannelEvent) {
         let key = (
             *event.channel_id(),
             *event.author(),
             event.at().device_id.clone(),
         );
-        self.last_seen.insert(key, event.at().clone());
+        match self.last_seen.get(&key) {
+            Some(prev) if !event.at().is_strictly_newer_than(prev) => {}
+            _ => {
+                self.last_seen.insert(key, event.at().clone());
+            }
+        }
     }
 
     /// Combined check + advance for callers that already serialize
@@ -1984,10 +2005,15 @@ impl ChannelLog {
     /// — a caller bug or hostile feed that mixes events from
     /// different channels would otherwise silently corrupt the log
     /// (the per-stored-event binding isn't re-checked on reload —
-    /// only the manifest is). Returns `Ok(true)` if the seal
-    /// threshold has now been reached (caller should call
-    /// `seal_and_persist`); `Ok(false)` otherwise.
-    pub fn append(&mut self, event: SignedChannelEvent) -> Result<bool, ChannelLogPersistError> {
+    /// only the manifest is). ZEB-969: an event whose `ReconcileKey`
+    /// is already in the log is skipped — [`AppendOutcome::newly_appended`]
+    /// comes back `false` and no state is touched.
+    /// [`AppendOutcome::seal_ready`] is `true` once the tail has reached
+    /// the seal threshold (caller should call `seal_and_persist`).
+    pub fn append(
+        &mut self,
+        event: SignedChannelEvent,
+    ) -> Result<AppendOutcome, ChannelLogPersistError> {
         let community_id = event.community_id();
         let channel_id = event.channel_id();
         if *community_id != self.manifest.community_id || *channel_id != self.manifest.channel_id {
@@ -1999,6 +2025,20 @@ impl ChannelLog {
                 got: format!("{:?}/{:?}", community_id, channel_id),
             });
         }
+        // ZEB-969: authoritative duplicate guard. The replay tracker's
+        // per-lane monotonic check no longer gates below-head reconcile
+        // ingest, so append itself must refuse a ReconcileKey it already
+        // holds — before any index/watermark/reaction state is touched.
+        // The key is computed ONCE and reused by the index insert below:
+        // reconcile_key runs a canonical-CBOR serialize + SHA-256, and
+        // append is the ingest hot path (CodeRabbit PR #719).
+        let key = reconcile_key(&event);
+        if self.contains_key(&key) {
+            return Ok(AppendOutcome {
+                newly_appended: false,
+                seal_ready: self.tail.len() >= self.config.seal_threshold_events,
+            });
+        }
         // ZEB-536: maintain the derived reaction view at the single
         // append choke point (covers local react, inbound, backfill).
         if matches!(&event, SignedChannelEvent::React { .. }) {
@@ -2008,9 +2048,12 @@ impl ChannelLog {
         // before the event is moved into the tail.
         raise_watermark(&mut self.device_watermarks, event.author(), event.at());
         // ZEB-592: maintain the RBSR reconcile index before the event moves.
-        self.maintain_reconcile_index(&event);
+        self.insert_reconcile_key(key);
         self.tail.push(event);
-        Ok(self.tail.len() >= self.config.seal_threshold_events)
+        Ok(AppendOutcome {
+            newly_appended: true,
+            seal_ready: self.tail.len() >= self.config.seal_threshold_events,
+        })
     }
 
     /// Persist the active tail to `root/tail.cbor`. Atomic-rename via
@@ -2492,11 +2535,26 @@ impl ChannelLog {
         self.reconcile_entries = entries;
     }
 
-    /// ZEB-592: fold one event into the reconcile index at the `append` choke
-    /// point. `mem::take` lets the chunk index read the (pre-insert) entries
-    /// without a self-field borrow split.
-    fn maintain_reconcile_index(&mut self, event: &SignedChannelEvent) {
-        let key = reconcile_key(event);
+    /// ZEB-969: is this event's ReconcileKey already in the log? O(log n)
+    /// on the sorted reconcile index — the same identity RBSR reconciles
+    /// by (unique per event, `React`s included, unlike `event.id()`).
+    /// Callers needing check-then-append atomicity must hold the same
+    /// `&mut self` borrow across both (the engine's `log` lock does).
+    pub fn contains_reconcile_key(&self, event: &SignedChannelEvent) -> bool {
+        self.contains_key(&reconcile_key(event))
+    }
+
+    /// Key-level presence check backing [`Self::contains_reconcile_key`];
+    /// `append` uses it directly so the key is hashed once per ingest.
+    fn contains_key(&self, key: &ReconcileKey) -> bool {
+        let pos = self.reconcile_entries.partition_point(|x| &x.0 < key);
+        self.reconcile_entries.get(pos).is_some_and(|x| &x.0 == key)
+    }
+
+    /// ZEB-592: fold one (precomputed) key into the reconcile index at the
+    /// `append` choke point. `mem::take` lets the chunk index read the
+    /// (pre-insert) entries without a self-field borrow split.
+    fn insert_reconcile_key(&mut self, key: ReconcileKey) {
         let hash = key.3;
         let pos = self.reconcile_entries.partition_point(|x| x.0 < key);
         if self.reconcile_entries.get(pos).is_some_and(|x| x.0 == key) {
@@ -3583,7 +3641,7 @@ mod tests {
             .map(|&(w, l, d)| fixture_signed_event(w, l, d))
             .collect();
         for e in &events {
-            if log.append(e.clone()).expect("append") {
+            if log.append(e.clone()).expect("append").seal_ready {
                 log.seal_and_persist().expect("seal");
             }
         }
@@ -3651,19 +3709,19 @@ mod tests {
             .map(|i| fixture_signed_event(1000 + i * 100, 0, "dev-a"))
             .collect();
         for e in &common {
-            if a.append(e.clone()).expect("a append") {
+            if a.append(e.clone()).expect("a append").seal_ready {
                 a.seal_and_persist().expect("seal a");
             }
-            if b.append(e.clone()).expect("b append") {
+            if b.append(e.clone()).expect("b append").seal_ready {
                 b.seal_and_persist().expect("seal b");
             }
         }
         // Both hold dev-x's HIGH event (the per-device max).
         let x_high = fixture_signed_event(2500, 0, "dev-x");
-        if a.append(x_high.clone()).expect("a") {
+        if a.append(x_high.clone()).expect("a").seal_ready {
             a.seal_and_persist().expect("seal a");
         }
-        if b.append(x_high.clone()).expect("b") {
+        if b.append(x_high.clone()).expect("b").seal_ready {
             b.seal_and_persist().expect("seal b");
         }
         // Only A holds dev-x's LOW event — the within-one-device out-of-order
@@ -3671,7 +3729,7 @@ mod tests {
         // filters this 1500 event out forever; only RBSR's range fingerprint
         // detects the mismatch).
         let x_low = fixture_signed_event(1500, 0, "dev-x");
-        if a.append(x_low.clone()).expect("a") {
+        if a.append(x_low.clone()).expect("a").seal_ready {
             a.seal_and_persist().expect("seal a");
         }
 
@@ -3844,6 +3902,26 @@ mod tests {
             .check_and_advance(&stale)
             .expect_err("stale event must replay-reject");
         assert!(matches!(err, ChannelEventError::Replay { .. }));
+    }
+
+    #[test]
+    fn replay_tracker_record_does_not_regress_lane_head() {
+        // ZEB-969: `record` must be a max-fold. The engine's boot rebuild
+        // walks the persisted log in STORAGE order, and a healed below-head
+        // event sits late in the tail with an old stamp — blind overwrite
+        // would regress the lane head on respawn and re-open a
+        // duplicate-accept window on the live path.
+        let mut t = ChannelLogReplayTracker::new();
+        let newer = fixture_signed_event(2000, 0, "a-dev");
+        let older = fixture_signed_event(1000, 0, "a-dev");
+        t.record(&newer);
+        t.record(&older);
+        let key = (*newer.channel_id(), *newer.author(), "a-dev".to_string());
+        assert_eq!(
+            t.last_seen().get(&key).expect("lane present").wall_ms,
+            2000,
+            "an older stamp must not regress last_seen"
+        );
     }
 
     #[test]
@@ -4858,12 +4936,34 @@ mod tests {
         for i in 0..7 {
             let event = fixture_signed_event(100_000 + i, 0, "a-dev");
             assert!(
-                !log.append(event).expect("append"),
+                !log.append(event).expect("append").seal_ready,
                 "below threshold must not signal seal"
             );
         }
         assert_eq!(log.tail.len(), 7);
         assert!(log.manifest.segments.is_empty());
+    }
+
+    #[test]
+    fn channel_log_append_dedupes_by_reconcile_key() {
+        // ZEB-969: append is the authoritative duplicate guard — the same
+        // event (same ReconcileKey) appended twice must not enter the tail
+        // twice, regardless of replay-tracker state.
+        let cid = fixture_community(0xc0);
+        let chid = fixture_channel(0x01);
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut log = ChannelLog::new(
+            cid,
+            chid,
+            tmp.path().to_path_buf(),
+            ChannelLogConfig::default(),
+        );
+        let ev = fixture_signed_event(1_000, 0, "a-dev");
+        let first = log.append(ev.clone()).expect("first append");
+        assert!(first.newly_appended, "fresh event must append");
+        let second = log.append(ev).expect("duplicate append is not an error");
+        assert!(!second.newly_appended, "duplicate must be skipped");
+        assert_eq!(log.tail.len(), 1, "tail must hold the event exactly once");
     }
 
     #[test]
@@ -4880,13 +4980,16 @@ mod tests {
             },
         );
         for i in 0..3 {
-            assert!(!log
-                .append(fixture_signed_event(100_000 + i, 0, "a-dev"))
-                .expect("append"));
+            assert!(
+                !log.append(fixture_signed_event(100_000 + i, 0, "a-dev"))
+                    .expect("append")
+                    .seal_ready
+            );
         }
         assert!(
             log.append(fixture_signed_event(103_000, 0, "a-dev"))
-                .expect("append"),
+                .expect("append")
+                .seal_ready,
             "fourth event must signal seal at threshold=4"
         );
     }
@@ -6382,6 +6485,7 @@ mod tests {
         if log
             .append(post_event(MessageId([7; 16]), me, cid, chid, 13))
             .unwrap()
+            .seal_ready
         {
             log.seal_and_persist().unwrap();
         }
@@ -6413,7 +6517,8 @@ mod tests {
             .unwrap();
         let needs_seal = log
             .append(post_event(MessageId([0xEE; 16]), me, cid, chid, 2_000))
-            .unwrap();
+            .unwrap()
+            .seal_ready;
         assert!(needs_seal, "threshold=2 must signal seal after 2nd append");
         // Seal: writes segments/00000000.cbor and updates the manifest.
         log.seal_and_persist().unwrap();
