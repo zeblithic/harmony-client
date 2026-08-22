@@ -3836,6 +3836,10 @@ impl crate::relay_acceptor_watchdog::ServingSensor for ProdWatchdogSensor {
             now_ms,
             last_served_ms,
             connected_peers,
+            // ZEB-971: wired to the shared zenoh-transport cache + the
+            // telemetry attempt stamp in the sensor-wiring task below.
+            zenoh_peers: 0,
+            last_pull_attempt_ms: self.telemetry.last_pull_attempt_ms(),
         }
     }
 }

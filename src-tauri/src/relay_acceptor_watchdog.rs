@@ -1,10 +1,13 @@
 //! ZEB-803: self-healing watchdog for the community-relay acceptor.
 //!
 //! Pure decision core (`evaluate`) + a generic harness. The core is a state
-//! machine over three observed signals (last-served-pull time, connected-peer
-//! count, wall clock) that decides Hold / tier-1 probe / tier-2 restart /
-//! escalate. All correctness lives here and is unit-tested with injected values;
-//! the live levers sit behind the traits in the harness section.
+//! machine over the observed signals (last-served-pull time, zenoh transport
+//! peers, last inbound pull attempt, wall clock) that decides Hold / tier-1
+//! probe / tier-2 restart / escalate. ZEB-971: a stall means UNSERVED DEMAND —
+//! serve-staleness only counts while someone is actually present to serve
+//! (zenoh peers, or pull attempts arriving), so an idle node never
+//! self-restarts. All correctness lives here and is unit-tested with injected
+//! values; the live levers sit behind the traits in the harness section.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,7 +44,23 @@ pub struct WatchdogInputs {
     pub now_ms: u64,
     /// `None` = never served in this telemetry lifetime (the `0 → None` sentinel).
     pub last_served_ms: Option<u64>,
+    /// Reconnect-supervisor `Connected` count. ZEB-971: DIAGNOSTICS ONLY — the
+    /// supervisor's state machine can hold a zombie `Connected` long after the
+    /// transport died (the 0.2.9 field incident: `connected=1` for a peer
+    /// asleep 26.8h), so decisions key on `zenoh_peers` and
+    /// `last_pull_attempt_ms` instead. Kept in the inputs because the
+    /// supervisor-vs-zenoh disagreement in a WARN line is exactly what
+    /// diagnosed the incident.
     pub connected_peers: u32,
+    /// ZEB-971: zenoh's OWN live transport-peer count
+    /// ([`crate::network_health::ZenohTransportPeers`]). The demand signal — a
+    /// dead link drops out at the zenoh link lease, so this cannot go zombie.
+    pub zenoh_peers: u32,
+    /// ZEB-971: most recent inbound relay-pull ATTEMPT of any outcome
+    /// (served/rejected/failed). `None` = never attempted this lifetime. An
+    /// arriving pull is demand evidence even when zenoh reads zero peers
+    /// (e.g. a relay-mediated puller with no zenoh session).
+    pub last_pull_attempt_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,6 +87,12 @@ pub struct WatchdogMemory {
     pub baseline_served_ms: Option<u64>,
     pub last_action_ms: Option<u64>,
     pub last_action_tier: Option<Tier>,
+    /// ZEB-971: when zenoh demand last transitioned 0 → >0 (`None` while no
+    /// zenoh peer is present). Staleness is measured from
+    /// `max(last_served_ms, demand_since_ms)`, so a peer reconnecting after an
+    /// idle stretch grants a full stall-threshold grace window before the
+    /// accumulated idle staleness can count as a fault.
+    pub demand_since_ms: Option<u64>,
 }
 
 impl Default for WatchdogMemory {
@@ -79,6 +104,7 @@ impl Default for WatchdogMemory {
             baseline_served_ms: None,
             last_action_ms: None,
             last_action_tier: None,
+            demand_since_ms: None,
         }
     }
 }
@@ -108,15 +134,50 @@ fn recovered(inputs: &WatchdogInputs, mem: &WatchdogMemory) -> bool {
     }
 }
 
+fn stale_threshold_ms(cfg: &WatchdogConfig) -> u64 {
+    cfg.stale_multiplier as u64 * cfg.cadence_ms
+}
+
+/// ZEB-971: is there anyone to serve RIGHT NOW? Zenoh transport peers are
+/// live demand; a pull attempt within one stall window is recent demand. The
+/// supervisor's `connected_peers` deliberately does NOT count — it can hold a
+/// zombie `Connected` long after the transport died.
+fn demand_present(cfg: &WatchdogConfig, inputs: &WatchdogInputs) -> bool {
+    inputs.zenoh_peers > 0
+        || inputs
+            .last_pull_attempt_ms
+            .is_some_and(|t| inputs.now_ms.saturating_sub(t) <= stale_threshold_ms(cfg))
+}
+
+/// ZEB-971: a stall is UNSERVED DEMAND, not raw staleness. Serve-staleness is
+/// not evidence of malfunction when there was nobody to serve — the 0.2.9
+/// field false-positive fired at 26.8h of "staleness" that was simply the sole
+/// peer being asleep.
 fn stall_detected(cfg: &WatchdogConfig, inputs: &WatchdogInputs, mem: &WatchdogMemory) -> bool {
-    mem.served_ever
-        && inputs.connected_peers > 0
-        && match inputs.last_served_ms {
-            Some(ts) => {
-                inputs.now_ms.saturating_sub(ts) > cfg.stale_multiplier as u64 * cfg.cadence_ms
-            }
-            None => false,
-        }
+    if !mem.served_ever {
+        return false;
+    }
+    let Some(served_ms) = inputs.last_served_ms else {
+        return false;
+    };
+    let threshold = stale_threshold_ms(cfg);
+    // Path A — sustained zenoh demand unserved for a full threshold. Measured
+    // from `max(last_served, demand_since)`: staleness accumulated while no
+    // peer was present is not fault time, and a peer reconnecting after an
+    // idle stretch gets a full threshold of grace before this can fire.
+    // (`demand_since_ms` is `Some` only while `zenoh_peers > 0` — `evaluate`
+    // refreshes it from this same sample before dispatching here.)
+    let zenoh_stall = mem
+        .demand_since_ms
+        .is_some_and(|since| inputs.now_ms.saturating_sub(served_ms.max(since)) > threshold);
+    // Path B — pull attempts arriving in-window while serving is stale. The
+    // connection arriving is itself the demand proof (rejected/failed pulls
+    // included), and needs no zenoh session (relay-mediated pullers).
+    let attempt_stall = inputs.last_pull_attempt_ms.is_some_and(|attempt_ms| {
+        inputs.now_ms.saturating_sub(attempt_ms) <= threshold
+            && inputs.now_ms.saturating_sub(served_ms) > threshold
+    });
+    zenoh_stall || attempt_stall
 }
 
 fn fire_restart(
@@ -156,6 +217,15 @@ pub fn evaluate(
         mem.served_ever = true; // sticky
     }
 
+    // ZEB-971: track the zenoh-demand edge. `demand_since_ms` is the moment
+    // demand last went 0 → >0; it clears the instant zenoh reads empty, so
+    // the stall clock in `stall_detected` only runs while someone is present.
+    if inputs.zenoh_peers == 0 {
+        mem.demand_since_ms = None;
+    } else if mem.demand_since_ms.is_none() {
+        mem.demand_since_ms = Some(inputs.now_ms);
+    }
+
     match mem.phase {
         Phase::Escalated => {
             if recovered(inputs, mem) {
@@ -172,12 +242,14 @@ pub fn evaluate(
                 return Verdict::Hold; // still waiting to see if the remedy took
             }
             // ZEB-803 (CodeRabbit + CodeAnt): the stall gate is only re-checked
-            // for Tier 1. If every peer disconnected during the cooldown there is
+            // for Tier 1. If demand vanished during the cooldown there is
             // nothing to serve and a disruptive restart cannot help — re-arm
             // Normal so a fresh stall re-tries the cheap probe first, while
             // KEEPING `consecutive_restarts` so a genuinely persistent stall still
-            // escalates.
-            if inputs.connected_peers == 0 {
+            // escalates. ZEB-971: judged on the demand signals, not the
+            // supervisor count — a zombie `Connected` alone must not justify
+            // escalating the ladder.
+            if !demand_present(cfg, inputs) {
                 mem.phase = Phase::Normal;
                 return Verdict::Hold;
             }
@@ -364,10 +436,28 @@ mod tests {
         }
     }
 
+    /// Inputs with `peers` filling BOTH `connected_peers` and `zenoh_peers`
+    /// (the healthy case where the supervisor and zenoh agree) and no pull
+    /// attempt. Demand-gate tests construct `WatchdogInputs` explicitly to
+    /// pull the two counts apart.
+    fn inputs(now_ms: u64, last_served_ms: Option<u64>, peers: u32) -> WatchdogInputs {
+        WatchdogInputs {
+            now_ms,
+            last_served_ms,
+            connected_peers: peers,
+            zenoh_peers: peers,
+            last_pull_attempt_ms: None,
+        }
+    }
+
     fn served_mem() -> WatchdogMemory {
-        // a node that has served at least once, sitting Normal
+        // a node that has served at least once, sitting Normal — with zenoh
+        // demand present since t=0, so staleness measured from
+        // max(last_served, demand_since) reduces to the pre-ZEB-971 staleness
+        // in these scenario tests.
         WatchdogMemory {
             served_ever: true,
+            demand_since_ms: Some(0),
             ..WatchdogMemory::default()
         }
     }
@@ -384,15 +474,7 @@ mod tests {
     #[test]
     fn healthy_serve_holds() {
         let mut m = served_mem();
-        let v = evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 5000,
-                last_served_ms: Some(4000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        let v = evaluate(&test_cfg(), &inputs(5000, Some(4000), 2), &mut m);
         assert_eq!(v, Verdict::Hold);
         assert_eq!(m.phase, Phase::Normal);
     }
@@ -400,15 +482,7 @@ mod tests {
     #[test]
     fn never_served_holds_even_when_stale() {
         let mut m = WatchdogMemory::default(); // served_ever = false
-        let v = evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 100_000,
-                last_served_ms: None,
-                connected_peers: 5,
-            },
-            &mut m,
-        );
+        let v = evaluate(&test_cfg(), &inputs(100_000, None, 5), &mut m);
         assert_eq!(v, Verdict::Hold);
         assert!(!m.served_ever);
     }
@@ -416,30 +490,14 @@ mod tests {
     #[test]
     fn no_connected_peers_holds() {
         let mut m = served_mem();
-        let v = evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 10_000,
-                last_served_ms: Some(1000),
-                connected_peers: 0,
-            },
-            &mut m,
-        );
+        let v = evaluate(&test_cfg(), &inputs(10_000, Some(1000), 0), &mut m);
         assert_eq!(v, Verdict::Hold);
     }
 
     #[test]
     fn stall_fires_tier1_probe() {
         let mut m = served_mem();
-        let v = evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 10_000,
-                last_served_ms: Some(1000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        let v = evaluate(&test_cfg(), &inputs(10_000, Some(1000), 2), &mut m);
         assert_eq!(v, Verdict::ProbeNetwork);
         assert_eq!(
             m.phase,
@@ -455,25 +513,9 @@ mod tests {
     #[test]
     fn cooldown_probe_within_holds() {
         let mut m = served_mem();
-        evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 10_000,
-                last_served_ms: Some(1000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        evaluate(&test_cfg(), &inputs(10_000, Some(1000), 2), &mut m);
         // Δ = 1000 < 2000 cooldown, still stale → Hold
-        let v = evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 11_000,
-                last_served_ms: Some(1000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        let v = evaluate(&test_cfg(), &inputs(11_000, Some(1000), 2), &mut m);
         assert_eq!(v, Verdict::Hold);
         assert_eq!(
             m.phase,
@@ -487,25 +529,9 @@ mod tests {
     #[test]
     fn probe_recovery_resets() {
         let mut m = served_mem();
-        evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 10_000,
-                last_served_ms: Some(1000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        evaluate(&test_cfg(), &inputs(10_000, Some(1000), 2), &mut m);
         // a serve landed after the baseline (10_500 > 1000) → recovered
-        let v = evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 11_000,
-                last_served_ms: Some(10_500),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        let v = evaluate(&test_cfg(), &inputs(11_000, Some(10_500), 2), &mut m);
         assert_eq!(v, Verdict::Hold);
         assert_eq!(m.phase, Phase::Normal);
         assert_eq!(m.consecutive_restarts, 0);
@@ -515,25 +541,9 @@ mod tests {
     #[test]
     fn probe_failure_escalates_to_restart() {
         let mut m = served_mem();
-        evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 10_000,
-                last_served_ms: Some(1000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        evaluate(&test_cfg(), &inputs(10_000, Some(1000), 2), &mut m);
         // Δ = 2500 >= 2000 cooldown, still stale → tier-2 restart
-        let v = evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 12_500,
-                last_served_ms: Some(1000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        let v = evaluate(&test_cfg(), &inputs(12_500, Some(1000), 2), &mut m);
         assert_eq!(v, Verdict::RestartNode);
         assert_eq!(m.consecutive_restarts, 1);
         assert_eq!(
@@ -558,15 +568,7 @@ mod tests {
             ..WatchdogMemory::default()
         };
         // cooldown elapsed, not recovered, at cap → Escalate
-        let v = evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 5000,
-                last_served_ms: Some(1000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        let v = evaluate(&test_cfg(), &inputs(5000, Some(1000), 2), &mut m);
         assert_eq!(v, Verdict::Escalate);
         assert_eq!(m.phase, Phase::Escalated);
     }
@@ -580,27 +582,11 @@ mod tests {
             ..WatchdogMemory::default()
         };
         // not recovered → stays Escalated
-        let v1 = evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 5000,
-                last_served_ms: Some(1000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        let v1 = evaluate(&test_cfg(), &inputs(5000, Some(1000), 2), &mut m);
         assert_eq!(v1, Verdict::Hold);
         assert_eq!(m.phase, Phase::Escalated);
         // a fresh serve (2000 > 1000) → reset to Normal
-        let v2 = evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 6000,
-                last_served_ms: Some(2000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        let v2 = evaluate(&test_cfg(), &inputs(6000, Some(2000), 2), &mut m);
         assert_eq!(v2, Verdict::Hold);
         assert_eq!(m.phase, Phase::Normal);
     }
@@ -608,26 +594,10 @@ mod tests {
     #[test]
     fn served_ever_is_sticky_across_none() {
         let mut m = WatchdogMemory::default();
-        evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 1000,
-                last_served_ms: Some(500),
-                connected_peers: 1,
-            },
-            &mut m,
-        );
+        evaluate(&test_cfg(), &inputs(1000, Some(500), 1), &mut m);
         assert!(m.served_ever);
         // a later None sample (fresh telemetry after a restart) must not clear it
-        evaluate(
-            &test_cfg(),
-            &WatchdogInputs {
-                now_ms: 2000,
-                last_served_ms: None,
-                connected_peers: 1,
-            },
-            &mut m,
-        );
+        evaluate(&test_cfg(), &inputs(2000, None, 1), &mut m);
         assert!(m.served_ever);
     }
 
@@ -638,15 +608,7 @@ mod tests {
         let mut actions = Vec::new();
         // stale last_served fixed at 1000; step now by 3000 (> cooldown 2000) each tick
         for now in [5000u64, 8000, 11_000, 14_000, 17_000, 20_000] {
-            let v = evaluate(
-                &cfg,
-                &WatchdogInputs {
-                    now_ms: now,
-                    last_served_ms: Some(1000),
-                    connected_peers: 2,
-                },
-                &mut m,
-            );
+            let v = evaluate(&cfg, &inputs(now, Some(1000), 2), &mut m);
             if v != Verdict::Hold {
                 actions.push(v);
             }
@@ -661,6 +623,135 @@ mod tests {
                 Verdict::Escalate
             ]
         );
+    }
+
+    // --- ZEB-971 demand-gate tests ---
+
+    /// The 0.2.9 field incident shape: sole peer asleep 26.8h, staleness huge,
+    /// and the reconnect supervisor still holding a zombie `Connected`
+    /// (`connected=1`). With zero zenoh peers and no inbound pull attempt
+    /// there is NO demand — an idle node must never escalate toward a
+    /// self-restart, no matter how stale the serve stamp reads.
+    #[test]
+    fn idle_node_with_zombie_connected_but_no_demand_never_fires() {
+        let cfg = test_cfg();
+        let mut m = served_mem();
+        m.demand_since_ms = None;
+        for now in [100_000u64, 200_000, 300_000] {
+            let v = evaluate(
+                &cfg,
+                &WatchdogInputs {
+                    now_ms: now,
+                    last_served_ms: Some(1000),
+                    connected_peers: 1, // the zombie
+                    zenoh_peers: 0,
+                    last_pull_attempt_ms: None,
+                },
+                &mut m,
+            );
+            assert_eq!(v, Verdict::Hold);
+            assert_eq!(m.phase, Phase::Normal);
+        }
+    }
+
+    /// A peer reconnecting after an idle stretch grants a FULL stall-threshold
+    /// grace window: staleness accumulated while nobody was present is not
+    /// fault time. Without this, the demand gate would fire the instant the
+    /// sole peer came back (staleness already 26.8h > threshold).
+    #[test]
+    fn demand_reappearing_after_idle_gets_full_grace_window() {
+        let cfg = test_cfg(); // threshold = 3 * 1000 = 3000ms
+        let mut m = served_mem();
+        m.demand_since_ms = None; // idle until now
+        let present = |now_ms: u64| WatchdogInputs {
+            now_ms,
+            last_served_ms: Some(1000), // ancient — idle staleness
+            connected_peers: 1,
+            zenoh_peers: 1,
+            last_pull_attempt_ms: None,
+        };
+        let v0 = evaluate(&cfg, &present(100_000), &mut m);
+        assert_eq!(v0, Verdict::Hold, "demand just appeared — grace, not fire");
+        assert_eq!(m.demand_since_ms, Some(100_000), "demand edge stamped");
+        // within the grace window (Δ = 3000, not yet PAST the threshold)
+        let v1 = evaluate(&cfg, &present(103_000), &mut m);
+        assert_eq!(v1, Verdict::Hold);
+        // a full unserved threshold after the demand edge → genuine stall
+        let v2 = evaluate(&cfg, &present(103_500), &mut m);
+        assert_eq!(v2, Verdict::ProbeNetwork);
+    }
+
+    /// Pull attempts arriving without serves are demand even with zero zenoh
+    /// peers (a relay-mediated puller has no zenoh session) — rejected/failed
+    /// pulls while serving is stale must still fire the ladder.
+    #[test]
+    fn fresh_pull_attempts_without_serves_fire_with_zero_zenoh_peers() {
+        let cfg = test_cfg();
+        let mut m = served_mem();
+        m.demand_since_ms = None;
+        let v = evaluate(
+            &cfg,
+            &WatchdogInputs {
+                now_ms: 10_000,
+                last_served_ms: Some(1000),
+                connected_peers: 0,
+                zenoh_peers: 0,
+                last_pull_attempt_ms: Some(9_500), // arriving but not served
+            },
+            &mut m,
+        );
+        assert_eq!(v, Verdict::ProbeNetwork);
+    }
+
+    /// A stale attempt stamp is history, not demand: attempts outside one
+    /// stall window must not fire. (Guard: passes before and after ZEB-971 —
+    /// pins that the attempt path has a freshness window at all.)
+    #[test]
+    fn stale_pull_attempt_is_not_demand() {
+        let cfg = test_cfg();
+        let mut m = served_mem();
+        m.demand_since_ms = None;
+        let v = evaluate(
+            &cfg,
+            &WatchdogInputs {
+                now_ms: 100_000,
+                last_served_ms: Some(1000),
+                connected_peers: 0,
+                zenoh_peers: 0,
+                last_pull_attempt_ms: Some(1000), // ancient
+            },
+            &mut m,
+        );
+        assert_eq!(v, Verdict::Hold);
+        assert_eq!(m.phase, Phase::Normal);
+    }
+
+    /// Zenoh going dark during a cooldown re-arms Normal even while the
+    /// supervisor still claims a zombie `Connected` — nothing to serve, so a
+    /// disruptive restart cannot help (extends the ZEB-803 connected==0
+    /// re-arm to the demand signals).
+    #[test]
+    fn demand_gone_during_cooldown_rearms_normal_despite_zombie_connected() {
+        let cfg = test_cfg();
+        let mut m = served_mem();
+        let v0 = evaluate(&cfg, &inputs(10_000, Some(1000), 2), &mut m);
+        assert_eq!(v0, Verdict::ProbeNetwork);
+        // cooldown elapsed, still stale — but demand vanished; supervisor
+        // zombie alone must not justify a restart.
+        let v1 = evaluate(
+            &cfg,
+            &WatchdogInputs {
+                now_ms: 12_500,
+                last_served_ms: Some(1000),
+                connected_peers: 1, // zombie
+                zenoh_peers: 0,
+                last_pull_attempt_ms: None,
+            },
+            &mut m,
+        );
+        assert_eq!(v1, Verdict::Hold);
+        assert_eq!(m.phase, Phase::Normal, "no demand → re-arm, not restart");
+        assert_eq!(m.consecutive_restarts, 0);
     }
 
     // --- harness tests (direct tick() driving; no tokio-timer coordination) ---
@@ -678,11 +769,10 @@ mod tests {
     }
     impl ServingSensor for MockSensor {
         fn sample(&self, now_ms: u64) -> WatchdogInputs {
-            WatchdogInputs {
-                now_ms,
-                last_served_ms: self.last_served_ms,
-                connected_peers: self.connected,
-            }
+            // `connected` fills both peer counts — harness tests exercise the
+            // tier machinery, not the demand gate (that lives in the pure
+            // `evaluate` tests).
+            inputs(now_ms, self.last_served_ms, self.connected)
         }
     }
 
@@ -745,40 +835,20 @@ mod tests {
         let cfg = test_cfg();
         let mut m = served_mem();
         // Stall → Tier 1 probe, enters Cooldown{Probe}.
-        let v0 = evaluate(
-            &cfg,
-            &WatchdogInputs {
-                now_ms: 10_000,
-                last_served_ms: Some(1000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
+        let v0 = evaluate(&cfg, &inputs(10_000, Some(1000), 2), &mut m);
         assert_eq!(v0, Verdict::ProbeNetwork);
         // Cooldown elapsed, still stale, but ALL peers gone → re-arm Normal, NO restart.
-        let v1 = evaluate(
-            &cfg,
-            &WatchdogInputs {
-                now_ms: 12_500,
-                last_served_ms: Some(1000),
-                connected_peers: 0,
-            },
-            &mut m,
-        );
+        let v1 = evaluate(&cfg, &inputs(12_500, Some(1000), 0), &mut m);
         assert_eq!(v1, Verdict::Hold);
         assert_eq!(m.phase, Phase::Normal);
         assert_eq!(m.consecutive_restarts, 0);
-        // Peers return, still stale → a fresh PROBE (cheap lever first), not a restart.
-        let v2 = evaluate(
-            &cfg,
-            &WatchdogInputs {
-                now_ms: 20_000,
-                last_served_ms: Some(1000),
-                connected_peers: 2,
-            },
-            &mut m,
-        );
-        assert_eq!(v2, Verdict::ProbeNetwork);
+        // Peers return, still stale → ZEB-971 grace first (the returning peer
+        // must get a full unserved threshold before staleness counts) …
+        let v2 = evaluate(&cfg, &inputs(20_000, Some(1000), 2), &mut m);
+        assert_eq!(v2, Verdict::Hold, "fresh demand edge → grace, not fire");
+        // … then a fresh PROBE (cheap lever first), not a restart.
+        let v3 = evaluate(&cfg, &inputs(23_500, Some(1000), 2), &mut m);
+        assert_eq!(v3, Verdict::ProbeNetwork);
     }
 
     /// Memory pre-armed one step before tier-2: a probe cooldown that has
@@ -795,6 +865,7 @@ mod tests {
             baseline_served_ms: Some(1000),
             last_action_ms: Some(0),
             last_action_tier: Some(Tier::Probe),
+            demand_since_ms: Some(0),
         }
     }
 

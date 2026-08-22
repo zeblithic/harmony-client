@@ -1179,6 +1179,12 @@ pub struct CommunityRelayServingTelemetry {
     rejected: AtomicU64,
     failed: AtomicU64,
     last_served_ms: AtomicU64,
+    /// ZEB-971: wall-clock stamp of the most recent inbound pull ATTEMPT —
+    /// served, rejected, or failed alike. An arriving pull is demand evidence
+    /// regardless of outcome (the connection arriving is the proof), so the
+    /// watchdog's demand gate reads this rather than success-only stamps.
+    /// Same `0 → None` sentinel as `last_served_ms`.
+    last_pull_attempt_ms: AtomicU64,
     /// `peer_short → (last_served_ms, served_count)`.
     peers: Mutex<std::collections::HashMap<String, (u64, u64)>>,
 }
@@ -1198,12 +1204,24 @@ impl CommunityRelayServingTelemetry {
         }
     }
 
+    /// ZEB-971: the most recent inbound pull attempt of ANY outcome, `0 →
+    /// None` (never attempted in this telemetry lifetime).
+    pub(crate) fn last_pull_attempt_ms(&self) -> Option<u64> {
+        match self.last_pull_attempt_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
     /// Record one successfully served pull. `peer` is the remote iroh node id;
     /// only the first 4 bytes (8 hex chars) are retained (ZEB-329).
     pub fn record_served(&self, peer: &[u8; 32]) {
         self.served.fetch_add(1, Ordering::Relaxed);
         let now = now_ms();
         self.last_served_ms.store(now, Ordering::Relaxed);
+        // ZEB-971: one clock sample stamps both — a serve IS an attempt, and
+        // the two fields must never disagree about the same pull.
+        self.last_pull_attempt_ms.store(now, Ordering::Relaxed);
         let key = hex::encode(&peer[..4]);
         let mut peers = self.peers.lock().expect("relay serving peer map lock");
         let entry = peers.entry(key).or_insert((0, 0));
@@ -1223,10 +1241,12 @@ impl CommunityRelayServingTelemetry {
 
     pub fn record_rejected(&self) {
         self.rejected.fetch_add(1, Ordering::Relaxed);
+        self.last_pull_attempt_ms.store(now_ms(), Ordering::Relaxed);
     }
 
     pub fn record_failed(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
+        self.last_pull_attempt_ms.store(now_ms(), Ordering::Relaxed);
     }
 
     pub fn summary(&self) -> CommunityRelayServingHealth {
@@ -1258,6 +1278,45 @@ impl CommunityRelayServingTelemetry {
             last_served_ms: (last != 0).then_some(last),
             peers,
         }
+    }
+}
+
+/// ZEB-971: shared snapshot of zenoh's OWN live transport-peer view
+/// (`session.info().peers_zid()` + `routers_zid()`), written by the event
+/// loop's existing ~5s zid poll and read by the relay-acceptor watchdog's
+/// demand gate. Zenoh's view is the honest "someone is on the pub/sub layer
+/// with us" signal — unlike the reconnect supervisor's state machine, it
+/// cannot hold a zombie `Connected` (a dead link drops out at the zenoh link
+/// lease). One instance per node lifetime, created in `start_node_inner` and
+/// handed to both writers and readers of that same lifetime.
+#[derive(Debug, Default)]
+pub struct ZenohTransportPeers {
+    zids: Mutex<std::collections::HashSet<String>>,
+}
+
+impl ZenohTransportPeers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the snapshot with the current poll — never merge, so a departed
+    /// transport disappears on the next poll instead of lingering as phantom
+    /// demand.
+    pub fn replace(&self, current: std::collections::HashSet<String>) {
+        *self.zids.lock().expect("zenoh transport peers lock") = current;
+    }
+
+    /// Number of live zenoh transport peers as of the last poll.
+    pub fn count(&self) -> u32 {
+        self.zids.lock().expect("zenoh transport peers lock").len() as u32
+    }
+
+    /// Whether `zid` had a live zenoh transport as of the last poll.
+    pub fn contains(&self, zid: &str) -> bool {
+        self.zids
+            .lock()
+            .expect("zenoh transport peers lock")
+            .contains(zid)
     }
 }
 
@@ -4270,6 +4329,45 @@ pub fn __now_ms_for_ipc() -> u64 {
 mod tests {
     use super::*;
 
+    /// ZEB-971: the cache is a REPLACE-on-poll snapshot of zenoh's own peer
+    /// view — never a merge, so a departed transport disappears on the next
+    /// poll instead of lingering as phantom demand.
+    #[test]
+    fn zenoh_transport_peers_cache_replaces_not_merges() {
+        let cache = ZenohTransportPeers::new();
+        assert_eq!(cache.count(), 0, "empty until the first poll lands");
+        assert!(!cache.contains("aa"));
+        cache.replace(["aa".to_string(), "bb".to_string()].into_iter().collect());
+        assert_eq!(cache.count(), 2);
+        assert!(cache.contains("aa"));
+        cache.replace(["bb".to_string()].into_iter().collect());
+        assert_eq!(cache.count(), 1, "replace semantics — aa must be gone");
+        assert!(!cache.contains("aa"));
+        assert!(cache.contains("bb"));
+    }
+
+    /// ZEB-971: every inbound pull outcome — served, rejected, failed — is
+    /// demand evidence, so each must advance the attempt stamp. A serve stamps
+    /// BOTH fields from one clock sample (the two must never disagree).
+    #[test]
+    fn community_relay_telemetry_stamps_last_pull_attempt_on_every_outcome() {
+        let tel = CommunityRelayServingTelemetry::new();
+        assert_eq!(tel.last_pull_attempt_ms(), None, "never-attempted sentinel");
+        tel.record_rejected();
+        let after_reject = tel.last_pull_attempt_ms().expect("reject stamps attempt");
+        tel.record_failed();
+        let after_fail = tel.last_pull_attempt_ms().expect("failure stamps attempt");
+        assert!(after_fail >= after_reject);
+        tel.record_served(&[7u8; 32]);
+        let after_serve = tel.last_pull_attempt_ms().expect("serve stamps attempt");
+        assert!(after_serve >= after_fail);
+        assert_eq!(
+            tel.last_served_ms(),
+            Some(after_serve),
+            "a serve stamps served + attempt from the same clock sample"
+        );
+    }
+
     #[test]
     fn watchdog_health_serializes_camel_case() {
         use crate::relay_acceptor_watchdog::{Phase, Tier, WatchdogMemory};
@@ -4283,6 +4381,7 @@ mod tests {
             baseline_served_ms: Some(1000),
             last_action_ms: Some(5000),
             last_action_tier: Some(Tier::Restart),
+            demand_since_ms: None,
         };
         let h = RelayAcceptorWatchdogHealth::from_parts(&mem, Some(4200), 3);
         let v = serde_json::to_value(h).unwrap();
