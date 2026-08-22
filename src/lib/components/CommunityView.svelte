@@ -652,6 +652,7 @@
         {resolveCard}
         {resolveNickname}
         {presence}
+        {selfInvisible}
         {onOpenCard}
         collapsed={rightPanel !== 'members'}
       />

@@ -372,4 +372,16 @@ describe('PresenceService staleness honesty (ZEB-972)', () => {
     push([]);
     expect(service.presenceFor(OWNER_1).lastSeenMs).toBe(now - 5_000);
   });
+
+  it('a future-dated beacon stamp is not fresh — mirrors the backend ZEB-791 fail-closed sweep', () => {
+    // A backward local clock step can put a receipt stamp ahead of `now`. The
+    // backend evicts such rows on its next sweep (community_presence::sweep,
+    // ZEB-791); if that eviction never reaches us, the row must read stale —
+    // not immortally online. Heals via the next beacon (~10 s, fresh stamp).
+    push([stamped(OWNER_1, now + 120_000)]);
+    expect(service.presenceFor(OWNER_1).state).toBe('stale');
+    expect(service.isOnline(OWNER_1)).toBe(false);
+    expect(service.onlineCount(CID_A)).toBe(0);
+    expect(service.isOnlineAnywhere(OWNER_1)).toBe(false);
+  });
 });

@@ -21,6 +21,7 @@
     resolveCard,
     resolveNickname,
     presence,
+    selfInvisible = false,
     onOpenCard,
   }: {
     members: CommunityMember[];
@@ -50,6 +51,11 @@
      *  stale row (beacon overdue for backend eviction) renders honestly
      *  instead of green. Undefined → offline. */
     presence?: (ownerIdHex: string) => PresenceDisplay;
+    /** ZEB-600/ZEB-972 (CodeAnt PR #722): true when the viewer has "Appear
+     *  offline" on — the self row renders the hollow "invisible" dot, matching
+     *  MemberRow/CommunityMembersPanel so the two roster views never disagree
+     *  about the viewer's own configured visibility. */
+    selfInvisible?: boolean;
     /** ZEB-341: open the owner_id card popover for a member. Mirrors the
      *  Settings roster / message-author path so clicking a member in the
      *  always-visible roster opens their card instead of a dead no-op. */
@@ -91,16 +97,21 @@
   // Presence, mirroring MemberRow. Self is always shown online: zenoh does not
   // loop our own presence beacon back within a session, so the resolver would
   // otherwise read offline for self even though we're clearly online.
+  // ZEB-600/ZEB-972: unless "Appear offline" is on — then the self row gets
+  // the hollow "invisible" dot instead, matching the other roster views.
   // ZEB-972: peers get the full three-state resolver.
   function presenceOf(m: CommunityMember): PresenceDisplay {
-    if (m.address === ownAddress) return { state: 'online' };
+    if (m.address === ownAddress) return { state: selfInvisible ? 'offline' : 'online' };
     return presence?.(m.address) ?? { state: 'offline' };
   }
 
+  function selfHollow(m: CommunityMember): boolean {
+    return m.address === ownAddress && selfInvisible;
+  }
+
   function dotTitle(m: CommunityMember): string {
-    return m.address === ownAddress
-      ? 'Online'
-      : presenceDotLabel(presenceOf(m), Date.now(), $timeFormatPrefs);
+    if (m.address === ownAddress) return selfInvisible ? 'Appearing offline' : 'Online';
+    return presenceDotLabel(presenceOf(m), Date.now(), $timeFormatPrefs);
   }
 
   // The owner-card popover is the identity drill-down, so it shows the SIGNED
@@ -162,6 +173,7 @@
             class="presence-dot"
             class:online={presenceOf(m).state === 'online'}
             class:stale={presenceOf(m).state === 'stale'}
+            class:self-invisible={selfHollow(m)}
             role="img"
             title={dotTitle(m)}
             aria-label={dotTitle(m)}
@@ -271,6 +283,13 @@
   .presence-dot.stale {
     background: transparent;
     border-color: var(--presence-online);
+  }
+  /* ZEB-600/ZEB-972: self row while "Appear offline" is on — hollow with a
+     dashed ring, mirroring MemberRow's self-invisible dot. */
+  .presence-dot.self-invisible {
+    background: transparent;
+    border-style: dashed;
+    border-color: var(--text-muted);
   }
   .avatar-trigger {
     background: none;

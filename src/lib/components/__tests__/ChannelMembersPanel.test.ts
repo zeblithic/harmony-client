@@ -287,3 +287,28 @@ describe('ChannelMembersPanel — ZEB-972 stale presence honesty', () => {
     expect(dots[1]?.getAttribute('title')).toBe('Offline · last seen ~5m ago');
   });
 });
+
+// ZEB-972 (CodeAnt PR #722): the channel roster must honor "Appear offline"
+// like MemberRow/CommunityMembersPanel — one hollow view and one solid-green
+// view of the same self dot contradicted the setting.
+describe('ChannelMembersPanel — self-invisible dot', () => {
+  it('renders the self dot hollow/invisible (not online) when selfInvisible is on', () => {
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({ members: [self, member({ address: PEER })], selfInvisible: true }),
+    });
+    const firstRow = container.querySelector('.member-row'); // self sorts first
+    const dot = firstRow?.querySelector('.presence-dot');
+    expect(dot?.classList.contains('online')).toBe(false);
+    expect(dot?.classList.contains('self-invisible')).toBe(true);
+    expect(dot?.getAttribute('title')).toBe('Appearing offline');
+  });
+
+  it('keeps the self dot solid online when selfInvisible is off', () => {
+    const { container } = render(ChannelMembersPanel, {
+      props: baseProps({ members: [self, member({ address: PEER })] }),
+    });
+    const dot = container.querySelector('.member-row')?.querySelector('.presence-dot');
+    expect(dot?.classList.contains('online')).toBe(true);
+    expect(dot?.classList.contains('self-invisible')).toBe(false);
+  });
+});

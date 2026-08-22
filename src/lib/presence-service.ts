@@ -135,10 +135,15 @@ export class PresenceService {
    * `online` flag AND a beacon fresh enough that the backend's 30 s eviction
    * sweep is not overdue. Clock basis is safe: the stamp is the local
    * backend's `now_ms` at beacon receipt, compared against the local frontend
-   * clock (same machine).
+   * clock (same machine). Future-dated stamps (a backward local clock step
+   * put the receipt stamp ahead of `now`) are rejected too, mirroring the
+   * backend's ZEB-791 fail-closed sweep — accepting them would hold the row
+   * "fresh" for the whole skew if that eviction never reached us. Heals via
+   * the next beacon (~10 s), which carries a current-clock stamp.
    */
   private isFresh(m: PresenceMemberDto): boolean {
-    return m.online && this.nowFn() - m.lastSeenMs <= PRESENCE_STALE_AFTER_MS;
+    const age = this.nowFn() - m.lastSeenMs;
+    return m.online && age >= 0 && age <= PRESENCE_STALE_AFTER_MS;
   }
 
   /** Wire the Tauri adapter after it becomes available (post-boot). */
