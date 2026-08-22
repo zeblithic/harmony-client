@@ -1787,13 +1787,13 @@ impl ChannelLogEngine {
         // engine start; the design already tolerates that (and the
         // replay-tracker advance at step 2c is discarded on shutdown,
         // since the tracker is rebuilt from the on-disk log at boot).
-        let appended = {
+        let outcome = {
             let mut log = self.log.lock().await;
             if self.closing.load(Ordering::SeqCst) {
                 return;
             }
             match log.append(event.clone()) {
-                Ok(_seal_ready) => true,
+                Ok(outcome) => Some(outcome),
                 Err(e) => {
                     tracing::error!(
                         community_id = ?self.community_id,
@@ -1802,11 +1802,21 @@ impl ChannelLogEngine {
                         "channel-log persist failed; degraded"
                     );
                     self.emit_degraded(&format!("persist: {e}"));
-                    false
+                    None
                 }
             }
         };
-        if !appended {
+        let Some(outcome) = outcome else {
+            return;
+        };
+        if !outcome.newly_appended {
+            // ZEB-969: the append-level ReconcileKey dedup skipped the push.
+            // The log is unchanged, so a duplicate must never re-emit.
+            tracing::debug!(
+                community_id = ?self.community_id,
+                channel_id = ?self.channel_id,
+                "drop duplicate at append (ReconcileKey present)"
+            );
             return;
         }
 
