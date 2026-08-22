@@ -3879,12 +3879,16 @@ mod tests {
             "old",
             &fx.signing_key,
         );
-        let p_newer =
-            crate::community_channel_log::encrypt_channel_packet(fx.engine.channel_key_ref(), &newer)
-                .expect("encrypt newer");
-        let p_older =
-            crate::community_channel_log::encrypt_channel_packet(fx.engine.channel_key_ref(), &older)
-                .expect("encrypt older");
+        let p_newer = crate::community_channel_log::encrypt_channel_packet(
+            fx.engine.channel_key_ref(),
+            &newer,
+        )
+        .expect("encrypt newer");
+        let p_older = crate::community_channel_log::encrypt_channel_packet(
+            fx.engine.channel_key_ref(),
+            &older,
+        )
+        .expect("encrypt older");
         fx.engine
             .process_inbound_packet(p_newer, IngestProvenance::Live)
             .await;
@@ -3929,12 +3933,16 @@ mod tests {
             "old",
             &fx.signing_key,
         );
-        let p_newer =
-            crate::community_channel_log::encrypt_channel_packet(fx.engine.channel_key_ref(), &newer)
-                .expect("encrypt newer");
-        let p_older =
-            crate::community_channel_log::encrypt_channel_packet(fx.engine.channel_key_ref(), &older)
-                .expect("encrypt older");
+        let p_newer = crate::community_channel_log::encrypt_channel_packet(
+            fx.engine.channel_key_ref(),
+            &newer,
+        )
+        .expect("encrypt newer");
+        let p_older = crate::community_channel_log::encrypt_channel_packet(
+            fx.engine.channel_key_ref(),
+            &older,
+        )
+        .expect("encrypt older");
         fx.engine
             .process_inbound_packet(p_newer, IngestProvenance::Live)
             .await;
@@ -4176,7 +4184,10 @@ mod tests {
             );
         }
         // E2E guard: a re-broadcast of the newest event must still replay-drop.
-        subscriber_tx.send(p_newer).await.expect("send re-broadcast");
+        subscriber_tx
+            .send(p_newer)
+            .await
+            .expect("send re-broadcast");
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             engine2.list_messages(None, 100).await.expect("list").len(),
@@ -4219,8 +4230,8 @@ mod tests {
                 sig[0] ^= 0xFF;
             }
         }
-        let p_newer = encrypt_channel_packet(fx.engine.channel_key_ref(), &newer)
-            .expect("encrypt newer");
+        let p_newer =
+            encrypt_channel_packet(fx.engine.channel_key_ref(), &newer).expect("encrypt newer");
         let p_older = encrypt_channel_packet(fx.engine.channel_key_ref(), &older)
             .expect("encrypt tampered older");
         fx.engine
