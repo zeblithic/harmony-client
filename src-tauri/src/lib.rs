@@ -3992,6 +3992,10 @@ fn spawn_relay_acceptor_watchdog(
         tier1_cooldown_ms: cadence_ms.saturating_mul(2),
         tier2_cooldown_ms: cadence_ms.saturating_mul(2),
         max_restarts: 3,
+        // ZEB-970: 3 minutes dwarfs any healthy stop+start (a normal restart is
+        // seconds; the worst observed cold iroh bind is well under a minute)
+        // while staying far below the "down until someone notices" horizon.
+        restart_wedge_bound_ms: 180_000,
     };
     let sensor = ProdWatchdogSensor {
         telemetry,
