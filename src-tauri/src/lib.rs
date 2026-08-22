@@ -3818,10 +3818,14 @@ pub(crate) fn watchdog_memory(
 static WATCHDOG_TIER2_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Production sensor: reads live serving telemetry + connected-peer count.
+/// Production sensor: reads live serving telemetry, the supervisor's
+/// connected-peer count (diagnostics only — ZEB-971), and the demand signals
+/// (zenoh's own transport view + the inbound pull-attempt stamp).
 struct ProdWatchdogSensor {
     telemetry: std::sync::Arc<crate::network_health::CommunityRelayServingTelemetry>,
     resolver: crate::reachability_resolver::ReachabilityResolver,
+    /// ZEB-971: written by the event loop's ~5s zid poll.
+    zenoh_peers: std::sync::Arc<crate::network_health::ZenohTransportPeers>,
 }
 
 impl crate::relay_acceptor_watchdog::ServingSensor for ProdWatchdogSensor {
@@ -3836,9 +3840,7 @@ impl crate::relay_acceptor_watchdog::ServingSensor for ProdWatchdogSensor {
             now_ms,
             last_served_ms,
             connected_peers,
-            // ZEB-971: wired to the shared zenoh-transport cache + the
-            // telemetry attempt stamp in the sensor-wiring task below.
-            zenoh_peers: 0,
+            zenoh_peers: self.zenoh_peers.count(),
             last_pull_attempt_ms: self.telemetry.last_pull_attempt_ms(),
         }
     }
@@ -4027,6 +4029,7 @@ fn spawn_relay_acceptor_watchdog(
     telemetry: std::sync::Arc<crate::network_health::CommunityRelayServingTelemetry>,
     endpoint: std::sync::Arc<crate::iroh_endpoint::IrohEndpoint>,
     resolver: crate::reachability_resolver::ReachabilityResolver,
+    zenoh_peers: std::sync::Arc<crate::network_health::ZenohTransportPeers>,
     sink: std::sync::Arc<dyn crate::node_event_sink::NodeEventSink>,
     wry_handle: Option<tauri::AppHandle<tauri::Wry>>,
     owned_state: Option<std::sync::Arc<Mutex<NodeState>>>,
@@ -4070,6 +4073,7 @@ fn spawn_relay_acceptor_watchdog(
     let sensor = ProdWatchdogSensor {
         telemetry,
         resolver,
+        zenoh_peers,
     };
     let actuator = ProdWatchdogActuator {
         endpoint,
@@ -4093,21 +4097,29 @@ mod watchdog_wiring_tests {
     fn sensor_reports_last_served_and_maps_zero_to_none() {
         use crate::relay_acceptor_watchdog::ServingSensor;
         let tel = std::sync::Arc::new(crate::network_health::CommunityRelayServingTelemetry::new());
+        let zenoh_peers = std::sync::Arc::new(crate::network_health::ZenohTransportPeers::new());
         let sensor = ProdWatchdogSensor {
             telemetry: tel.clone(),
             resolver: crate::reachability_resolver::ReachabilityResolver::new(),
+            zenoh_peers: zenoh_peers.clone(),
         };
         // Never served yet → None (the 0 → None sentinel); no supervisor wired
-        // → connected 0; and the now_ms argument reaches the inputs.
+        // → connected 0; empty zenoh cache → 0 demand; no attempt yet.
         let s0 = sensor.sample(42);
         assert_eq!(s0.now_ms, 42);
         assert_eq!(s0.last_served_ms, None);
         assert_eq!(s0.connected_peers, 0);
-        // A recorded serve makes it Some (the sentinel lifts).
+        assert_eq!(s0.zenoh_peers, 0);
+        assert_eq!(s0.last_pull_attempt_ms, None);
+        // A recorded serve makes it Some (the sentinel lifts), and stamps the
+        // attempt; the zenoh cache count flows through (ZEB-971).
         tel.record_served(&[7u8; 32]);
+        zenoh_peers.replace(["z1".to_string(), "z2".to_string()].into_iter().collect());
         let s1 = sensor.sample(99);
         assert_eq!(s1.now_ms, 99);
         assert!(s1.last_served_ms.is_some());
+        assert_eq!(s1.last_pull_attempt_ms, s1.last_served_ms);
+        assert_eq!(s1.zenoh_peers, 2);
     }
 
     /// ZEB-970: the watchdog drops `restart_node`'s future at the wedge bound.
@@ -5191,6 +5203,13 @@ pub async fn start_node_inner(
         // Built unconditionally — without an owner identity no
         // receivers exist and the event loop's send_modify is a no-op.
         let (transport_epoch_tx, transport_epoch_rx) = tokio::sync::watch::channel(0u64);
+        // ZEB-971: shared snapshot of zenoh's own transport-peer view, written
+        // by the event loop's ~5s zid poll (the same poll that drives the
+        // transport epoch above) and read by the relay-acceptor watchdog's
+        // demand gate. Scoped to this node lifetime alongside the epoch
+        // channel.
+        let zenoh_transport_peers =
+            std::sync::Arc::new(crate::network_health::ZenohTransportPeers::new());
         // ZEB-599 Direction 1: presence-driven full-reconcile watch. The SENDER
         // goes to `event_loop::run`, which hands it to each community presence
         // subscriber — bumped whenever a new roster device (a new potential
@@ -13570,6 +13589,10 @@ pub async fn start_node_inner(
                         ingest_observer: Some(std::sync::Arc::clone(&addrbook_ingest_observer)),
                     }
                 });
+                // ZEB-971: writer end of the zenoh transport-peer snapshot for
+                // the event loop's zid poll (the original stays behind for the
+                // watchdog sensor spawn below).
+                let zenoh_transport_peers_for_loop = std::sync::Arc::clone(&zenoh_transport_peers);
                 // Mint Phase 2 sync: thread handles into event_loop::run.
                 let mint_sync_handles_for_loop = mint_sync_handles_opt;
                 // ZEB-417 SP1: thread the Notes adapter handles into
@@ -13785,6 +13808,10 @@ pub async fn start_node_inner(
                                 // 5s peer-refresh arm bumps it on every
                                 // never-before-seen zenoh session id.
                                 transport_epoch_tx,
+                                // ZEB-971: zenoh transport-peer snapshot the
+                                // same 5s arm publishes for the watchdog's
+                                // demand gate + zombie-link reconcile.
+                                zenoh_transport_peers_for_loop,
                                 // ZEB-702 T3 (Component B): owner-dataset engines
                                 // the epoch listener nudges to re-offer on a
                                 // transport up-edge.
@@ -14570,6 +14597,7 @@ pub async fn start_node_inner(
                                         std::sync::Arc::clone(t),
                                         std::sync::Arc::clone(ep_arc),
                                         reachability_resolver.clone(),
+                                        std::sync::Arc::clone(&zenoh_transport_peers),
                                         app.clone(),
                                         wry_handle.clone(),
                                         owned_state.clone(),

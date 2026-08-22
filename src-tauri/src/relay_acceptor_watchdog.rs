@@ -371,9 +371,18 @@ impl<S: ServingSensor, A: RemediationActuator, C: Clock> RelayAcceptorWatchdog<S
                 let staleness = inputs
                     .last_served_ms
                     .map(|t| inputs.now_ms.saturating_sub(t));
+                // ZEB-971: log every demand signal beside the supervisor count
+                // — the 0.2.9 incident was diagnosed off exactly this
+                // disagreement (supervisor `connected=1` vs zenoh 0), and this
+                // WARN is the record of which gate let the fire through.
+                let attempt_age_ms = inputs
+                    .last_pull_attempt_ms
+                    .map(|t| inputs.now_ms.saturating_sub(t));
                 tracing::warn!(
                     staleness_ms = ?staleness,
                     connected = inputs.connected_peers,
+                    zenoh_peers = inputs.zenoh_peers,
+                    attempt_age_ms = ?attempt_age_ms,
                     "ZEB-803 watchdog: relay serving stalled — tier 1 network_change()"
                 );
                 self.actuator.probe_network().await;
@@ -381,6 +390,7 @@ impl<S: ServingSensor, A: RemediationActuator, C: Clock> RelayAcceptorWatchdog<S
             Verdict::RestartNode => {
                 tracing::warn!(
                     connected = inputs.connected_peers,
+                    zenoh_peers = inputs.zenoh_peers,
                     "ZEB-803 watchdog: tier-1 probe did not restore serving — tier 2 full-node restart"
                 );
                 // ZEB-970: bound the restart. Without this, a `stop_inner`
